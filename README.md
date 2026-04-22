@@ -11,6 +11,7 @@ This repository holds the steward, the plugin SDK, the plugin tooling, and the e
 | [docs/CONCEPT.md](docs/CONCEPT.md) | The fabric contract. Essence, steward, racks, shelves, plugins, subjects, relations, projections, happenings. Read first. |
 | [docs/engineering/PLUGIN_CONTRACT.md](docs/engineering/PLUGIN_CONTRACT.md) | The universal plugin contract. Rust trait and Unix-socket wire protocol, two transports of one contract. |
 | [docs/engineering/PLUGIN_PACKAGING.md](docs/engineering/PLUGIN_PACKAGING.md) | Plugin manifest, identity, signing, filesystem layout on target, installation lifecycle, SDK and tooling. |
+| [docs/engineering/VENDOR_CONTRACT.md](docs/engineering/VENDOR_CONTRACT.md) | Vendor contract. Actor taxonomy, namespace governance, vendor commitments and privileges, distribution relationships, revocation pathways. |
 
 Further engineering-layer documents (subject identity, relation grammar, projection protocol, fast-path, steward startup) are deliberately open. See `docs/CONCEPT.md` section 10.
 

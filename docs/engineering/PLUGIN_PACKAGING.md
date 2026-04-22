@@ -108,16 +108,20 @@ Evo owns three roots on a Debian Trixie device. Nothing evo writes falls outside
     evo                                # The steward binary.
     evo-plugin-tool                    # SDK CLI.
   plugins/
-    vendor/                            # First-party evo plugins.
+    evo/                               # Plugins authored by the evo project itself.
       org.evo.example/
         manifest.toml
         plugin.bin
-    brand/                             # Distribution-shipped plugins.
+    distribution/                      # Plugins shipped by the distribution.
       org.volumio.playback.mpd/
         manifest.toml
         manifest.sig
         plugin.bin
-    local/                             # Operator-installed plugins. (Mirror path under /var, see below.)
+    vendor/                            # Plugins from enrolled vendors, bundled by the distribution.
+      com.fiio.dacs/
+        manifest.toml
+        manifest.sig
+        plugin.bin
   catalogue/
     default.toml                       # Distribution's default catalogue.
     schemas/                           # Shelf-shape schemas.
@@ -125,8 +129,11 @@ Evo owns three roots on a Debian Trixie device. Nothing evo writes falls outside
       metadata.v2.toml
   trust/
     evo.pem                            # Evo project's signing key.
-    brand/                             # Distribution brand keys.
+    distribution/                      # Distribution signing keys.
       volumio.pem
+    vendor/                            # Enrolled vendor keys bundled by the distribution.
+      fiio.pem
+      sony.pem
   share/
     docs/                              # Shipped documentation.
     examples/                          # Example manifests.
@@ -169,8 +176,8 @@ Evo owns three roots on a Debian Trixie device. Nothing evo writes falls outside
 
 The key split:
 
-- `/opt/evo/plugins/vendor/` and `/opt/evo/plugins/brand/`: immutable, owned by packages, updated only by package manager.
-- `/var/lib/evo/plugins/`: mutable, owned by operator, updated by dropping in artefacts or using `evo-plugin-tool`.
+- `/opt/evo/plugins/evo/`, `/opt/evo/plugins/distribution/`, and `/opt/evo/plugins/vendor/`: immutable, owned by packages, updated only by package manager. The three subdirectories separate plugins by actor position (see `VENDOR_CONTRACT.md` section 1).
+- `/var/lib/evo/plugins/`: mutable, owned by operator, updated by dropping in artefacts or using `evo-plugin-tool`. Plugins installed here carry their own signatures and trust keys from `/etc/evo/trust.d/`.
 
 ## 4. Plugin Identity
 
@@ -181,10 +188,11 @@ Reverse-DNS, lowercase, dot-separated. Must match the regex `^[a-z][a-z0-9]*(\.[
 Namespace conventions:
 
 - `org.evo.*` - reserved for evo project plugins.
-- `org.volumio.*` - Volumio distribution plugins.
-- `com.<vendor>.*` / `org.<project>.*` / `net.<project>.*` - third parties.
+- `org.volumio.*`, `org.<distribution>.*` - distribution plugins.
+- `com.<vendor>.*` - enrolled vendor plugins. Vendor namespace governance in `VENDOR_CONTRACT.md` section 4.
+- `org.<project>.*`, `net.<project>.*` - individual author plugins.
 
-A name is claimed by being the first to sign a plugin with that name. The trust root governs which keys may sign which name prefixes (Section 5).
+A name is claimed by namespace registration (vendors) or by being the first to sign a plugin with that name (individual authors). The trust root governs which keys may sign which name prefixes (Section 5).
 
 ### Versioning
 

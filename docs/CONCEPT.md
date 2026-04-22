@@ -45,13 +45,25 @@ Two classes of originator exist inside the fabric besides external requests. APP
 | Fast path | Real-time mutation channel alongside the structural slow path. |
 | Distribution | A curated catalogue plus plugin set, shipped as a branded device. |
 
-## 3. Distributions
+## 3. Distributions and Actors
 
 Evo is brand-neutral. A device ships as a DISTRIBUTION of evo: a catalogue declaration plus a plugin set plus branding. Multiple distributions can exist for different domains.
 
 The first distribution targets the audio-player domain. Its catalogue declares racks such as audio, audio sources, audio processing, artwork, metadata, branding, kiosk, networking, storage, library, appointments, watches, identity, lifecycle, observability. Its plugin set is curated for that domain. That distribution is shipped by the Volumio brand as a specific product.
 
 Evo itself ships no racks. The catalogue is data the distribution provides.
+
+Five actor positions exist in the evo ecosystem:
+
+| Position | Role |
+|----------|------|
+| Evo project | Maintains the steward, fabric, SDK, tooling. |
+| Distribution | Curates catalogue + plugin set + branding for a domain. |
+| Vendor | Commercial or organisational entity that signs plugins under a claimed namespace with formal commitments. |
+| Individual author | Person or small team signing plugins under their own name. |
+| Operator | The person running the device. Sole authority on local trust and revocation. |
+
+Full actor taxonomy, vendor contract, namespace governance, and trust-root relationships are in `docs/engineering/VENDOR_CONTRACT.md`.
 
 ## 4. Rack Catalogue
 
@@ -138,6 +150,7 @@ Concept-level decisions deferred to the engineering layer. Named here so downstr
 |---------------|--------------|
 | Plugin contract (trait + wire protocol) | `docs/engineering/PLUGIN_CONTRACT.md` |
 | Plugin manifest, signing, lifecycle, filesystem paths | `docs/engineering/PLUGIN_PACKAGING.md` |
+| Vendor contract, actor taxonomy, namespace governance | `docs/engineering/VENDOR_CONTRACT.md` |
 | Subject identity resolution | Future: `docs/engineering/SUBJECTS.md` |
 | Relation grammar | Future: `docs/engineering/RELATIONS.md` |
 | Projection subscription protocol | Future: `docs/engineering/PROJECTIONS.md` |
