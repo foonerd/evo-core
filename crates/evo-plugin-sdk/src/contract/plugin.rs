@@ -328,24 +328,22 @@ mod tests {
 
     #[test]
     fn health_status_serialises_lowercase() {
-        let j = serde_json::to_string(&HealthStatus::Degraded).unwrap_or_else(|_| {
-            // serde_json is not a dependency; use toml instead for test.
-            String::new()
-        });
-        // If serde_json is not available (it is not in this crate's deps),
-        // check via toml.
-        if j.is_empty() {
-            #[derive(Serialize)]
-            struct Wrap {
-                s: HealthStatus,
-            }
-            let t = toml::to_string(&Wrap {
-                s: HealthStatus::Degraded,
-            })
-            .unwrap();
-            assert!(t.contains(r#"s = "degraded""#));
-        } else {
-            assert_eq!(j, r#""degraded""#);
+        // Verify serde rename_all = "lowercase" by round-tripping through
+        // TOML (the crate's only serde-aware format dependency).
+        #[derive(Serialize, Deserialize)]
+        struct Wrap {
+            s: HealthStatus,
         }
+        let t = toml::to_string(&Wrap {
+            s: HealthStatus::Degraded,
+        })
+        .unwrap();
+        assert!(
+            t.contains(r#"s = "degraded""#),
+            "expected lowercase 'degraded' in TOML output, got: {t}"
+        );
+
+        let parsed: Wrap = toml::from_str(r#"s = "healthy""#).unwrap();
+        assert_eq!(parsed.s, HealthStatus::Healthy);
     }
 }
