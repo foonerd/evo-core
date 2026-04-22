@@ -989,8 +989,10 @@ impl AdmissionEngine {
     ///    that the child has not already exited. Times out after
     ///    [`SOCKET_READY_TIMEOUT`].
     /// 7. On a successful connection, splits the stream via
-    ///    `into_split()` and hands the owned halves to
-    ///    [`Self::admit_out_of_process_respondent`].
+    ///    `into_split()` and hands the owned halves to either
+    ///    [`Self::admit_out_of_process_respondent`] or
+    ///    [`Self::admit_out_of_process_warden`], selected by the
+    ///    manifest's `kind.interaction` field.
     /// 8. On success, retains the child handle on the admitted plugin
     ///    record so shutdown can wait on it.
     ///
@@ -1102,17 +1104,30 @@ impl AdmissionEngine {
 
         let (reader, writer) = stream.into_split();
 
-        // Hand off to the existing wire-admission path. On failure,
-        // kill+reap the child.
-        if let Err(e) = self
-            .admit_out_of_process_respondent(
-                manifest.clone(),
-                catalogue,
-                reader,
-                writer,
-            )
-            .await
-        {
+        // Hand off to the appropriate wire-admission path based on
+        // the manifest's interaction kind. On failure, kill+reap the
+        // child.
+        let admission_result = match manifest.kind.interaction {
+            InteractionShape::Respondent => {
+                self.admit_out_of_process_respondent(
+                    manifest.clone(),
+                    catalogue,
+                    reader,
+                    writer,
+                )
+                .await
+            }
+            InteractionShape::Warden => {
+                self.admit_out_of_process_warden(
+                    manifest.clone(),
+                    catalogue,
+                    reader,
+                    writer,
+                )
+                .await
+            }
+        };
+        if let Err(e) = admission_result {
             let _ = child.kill().await;
             let _ = child.wait().await;
             return Err(e);
@@ -2237,6 +2252,52 @@ response_budget_ms = 1000
         )
     }
 
+    /// Base manifest string for an example warden plugin. Targets
+    /// the `example.echo` shelf for convenience (the shelf is
+    /// neutral about kind). The caller substitutes the `transport`
+    /// block to produce variants.
+    fn example_warden_manifest_with_transport(
+        transport_block: &str,
+    ) -> String {
+        format!(
+            r#"
+[plugin]
+name = "org.evo.example.warden"
+version = "0.1.1"
+contract = 1
+
+[target]
+shelf = "example.echo"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "warden"
+
+{transport_block}
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+
+[capabilities.warden]
+custody_domain = "test"
+custody_exclusive = false
+course_correction_budget_ms = 1000
+custody_failure_mode = "abort"
+"#
+        )
+    }
+
     #[tokio::test]
     async fn admit_from_directory_rejects_missing_manifest() {
         let plugin_dir = tempfile::TempDir::new().unwrap();
@@ -2306,6 +2367,49 @@ response_budget_ms = 1000
         // Point at a binary that definitely does not exist.
         let manifest_text = example_manifest_with_transport(
             "[transport]\ntype = \"out-of-process\"\nexec = \"nonexistent-plugin-binary-xyz\"",
+        );
+        std::fs::write(
+            plugin_dir.path().join("manifest.toml"),
+            &manifest_text,
+        )
+        .unwrap();
+
+        let catalogue = example_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let r = engine
+            .admit_out_of_process_from_directory(
+                plugin_dir.path(),
+                runtime_dir.path(),
+                &catalogue,
+            )
+            .await;
+
+        match r {
+            Err(StewardError::Io { context, .. }) => {
+                assert!(
+                    context.contains("spawning"),
+                    "expected context to mention spawning, got {context:?}"
+                );
+            }
+            other => panic!("expected Io error, got {other:?}"),
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admit_from_directory_warden_manifest_reaches_spawn_step() {
+        // Pass 4e-c made admit_out_of_process_from_directory branch
+        // on manifest.kind.interaction. This test verifies that
+        // warden manifests get past the early validation (manifest
+        // parse, transport.kind check) and reach the spawn step.
+        // True end-to-end branch coverage (warden manifest routed to
+        // admit_out_of_process_warden, describe handshake, load)
+        // lives in the example-warden tests introduced in pass 4f,
+        // where a real warden binary is available.
+        let plugin_dir = tempfile::TempDir::new().unwrap();
+        let runtime_dir = tempfile::TempDir::new().unwrap();
+        let manifest_text = example_warden_manifest_with_transport(
+            "[transport]\ntype = \"out-of-process\"\nexec = \"nonexistent-warden-binary-xyz\"",
         );
         std::fs::write(
             plugin_dir.path().join("manifest.toml"),
