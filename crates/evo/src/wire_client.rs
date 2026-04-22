@@ -35,9 +35,14 @@
 //!
 //! ## Deferred
 //!
-//! Factory verbs, warden verbs, and user-interaction wire frames do
-//! not yet exist. The `EventSink` carries only the event kinds the
-//! current wire protocol supports.
+//! This wire client is respondent-only. The warden wire frames
+//! (`take_custody`, `course_correct`, `release_custody`,
+//! `report_custody_state`) exist in the SDK and can be emitted by
+//! plugins, but the steward has no warden admission path yet; that
+//! lands in pass 4e. If a warden-shaped event (`report_custody_state`)
+//! arrives on a respondent connection today, [`forward_event`] logs
+//! and drops it. Factory verbs and user-interaction wire frames still
+//! do not exist on the wire in any form.
 
 use crate::context::{
     LoggingStateReporter, RegistryRelationAnnouncer, RegistrySubjectAnnouncer,
@@ -679,16 +684,27 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::Unload { .. } => "unload",
         WireFrame::HealthCheck { .. } => "health_check",
         WireFrame::HandleRequest { .. } => "handle_request",
+        // Warden verbs: named here for diagnostic completeness.
+        // Steward-side warden admission lands in pass 4e; until then
+        // these frames should not appear on respondent connections,
+        // but if one does the name makes the log actionable.
+        WireFrame::TakeCustody { .. } => "take_custody",
+        WireFrame::CourseCorrect { .. } => "course_correct",
+        WireFrame::ReleaseCustody { .. } => "release_custody",
         WireFrame::DescribeResponse { .. } => "describe_response",
         WireFrame::LoadResponse { .. } => "load_response",
         WireFrame::UnloadResponse { .. } => "unload_response",
         WireFrame::HealthCheckResponse { .. } => "health_check_response",
         WireFrame::HandleRequestResponse { .. } => "handle_request_response",
+        WireFrame::TakeCustodyResponse { .. } => "take_custody_response",
+        WireFrame::CourseCorrectResponse { .. } => "course_correct_response",
+        WireFrame::ReleaseCustodyResponse { .. } => "release_custody_response",
         WireFrame::ReportState { .. } => "report_state",
         WireFrame::AnnounceSubject { .. } => "announce_subject",
         WireFrame::RetractSubject { .. } => "retract_subject",
         WireFrame::AssertRelation { .. } => "assert_relation",
         WireFrame::RetractRelation { .. } => "retract_relation",
+        WireFrame::ReportCustodyState { .. } => "report_custody_state",
         WireFrame::Error { .. } => "error",
     }
 }

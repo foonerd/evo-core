@@ -34,7 +34,7 @@ tokio = { version = "1", features = ["io-util", "net", "sync", "rt"], optional =
 base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "io-util", "net"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "io-util", "net"] }
 
 [lints]
 workspace = true

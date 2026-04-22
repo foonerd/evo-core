@@ -1,18 +1,30 @@
 //! Plugin-side wire server ("host").
 //!
-//! Drives a `Plugin + Respondent` over a single `AsyncRead + AsyncWrite`
-//! connection (Unix socket, tokio::io::duplex, TCP - anything that
-//! implements the async I/O traits). Handles the full protocol lifecycle
-//! per `docs/engineering/PLUGIN_CONTRACT.md` sections 6 through 11:
+//! Drives a plugin over a single `AsyncRead + AsyncWrite` connection
+//! (Unix socket, tokio::io::duplex, TCP - anything that implements the
+//! async I/O traits). Handles the full protocol lifecycle per
+//! `docs/engineering/PLUGIN_CONTRACT.md` sections 6 through 11.
 //!
-//! - Reads framed JSON wire messages from the reader.
-//! - Validates envelope fields: protocol version and plugin name on
+//! Two entry points exist, one per plugin interaction shape:
+//!
+//! - [`serve`] drives a [`Plugin`] + [`Respondent`]. Dispatches core
+//!   verbs (`describe`, `load`, `unload`, `health_check`) and
+//!   `handle_request`.
+//! - [`serve_warden`] drives a [`Plugin`] + [`Warden`]. Dispatches
+//!   the same core verbs and the custody verbs (`take_custody`,
+//!   `course_correct`, `release_custody`), and supplies a
+//!   wire-backed [`CustodyStateReporter`] via the [`Assignment`] on
+//!   each take-custody call.
+//!
+//! Both entry points:
+//!
+//! - Read framed JSON wire messages from the reader.
+//! - Validate envelope fields: protocol version and plugin name on
 //!   every frame.
-//! - Dispatches requests (`describe`, `load`, `unload`, `health_check`,
-//!   `handle_request`) to the plugin's trait methods.
-//! - Sends responses (or structured `Error` frames on failure) back to
+//! - Dispatch requests to the plugin's trait methods.
+//! - Send responses (or structured `Error` frames on failure) back to
 //!   the steward via a writer task.
-//! - Builds a `LoadContext` with wire-backed callback implementations so
+//! - Build a `LoadContext` with wire-backed callback implementations so
 //!   the plugin's async events (`report_state`, subject/relation
 //!   announcements and retractions) reach the steward as events on the
 //!   same stream.
@@ -29,33 +41,39 @@
 //! sends them to the channel.
 //!
 //! Callback implementations ([`WireStateReporter`],
-//! [`WireSubjectAnnouncer`], [`WireRelationAnnouncer`]) hold cloned
-//! `Sender` handles. When the plugin calls a callback, the implementation
-//! pushes a frame to the channel and the writer task forwards it.
+//! [`WireSubjectAnnouncer`], [`WireRelationAnnouncer`],
+//! [`WireCustodyStateReporter`]) hold cloned `Sender` handles. When
+//! the plugin calls a callback, the implementation pushes a frame to
+//! the channel and the writer task forwards it.
 //!
 //! ## Deferred
 //!
-//! Factory verbs (`announce_instance`, `retract_instance`), warden verbs
-//! (`take_custody` etc), and user-interaction requests have no wire
-//! representation in this SDK version. Their callback implementations
-//! ([`WireInstanceAnnouncer`], [`WireUserInteractionRequester`]) return
-//! `ReportError::Invalid` so plugins that try to use them on a wire
-//! transport get a clear error.
+//! Factory verbs (`announce_instance`, `retract_instance`) and
+//! user-interaction requests have no wire representation in this SDK
+//! version. Their callback implementations ([`WireInstanceAnnouncer`],
+//! [`WireUserInteractionRequester`]) return `ReportError::Invalid` so
+//! plugins that try to use them on a wire transport get a clear
+//! error.
 //!
 //! ## Concurrency
 //!
 //! The main dispatch loop is sequential: one request in flight at a
-//! time. Wardens would need to change this; respondents do not. Events
-//! from callbacks race with request handling; the mpsc channel
+//! time. The warden custody verbs do not change this; a single warden
+//! may hold multiple concurrent custodies, but the wire dispatcher
+//! processes one custody-verb frame at a time and relies on the
+//! plugin's own internal concurrency to handle overlapping work.
+//! Events from callbacks race with request handling; the mpsc channel
 //! serialises them into a single totally-ordered write stream.
 
 use crate::codec::{read_frame_json, write_frame_json, WireError};
 use crate::contract::{
-    CallDeadline, ExternalAddressing, InstanceAnnouncement, InstanceAnnouncer,
-    InstanceId, LoadContext, Plugin, PluginError, RelationAnnouncer,
-    RelationAssertion, RelationRetraction, ReportError, ReportPriority,
-    Request, Respondent, StateReporter, SubjectAnnouncement, SubjectAnnouncer,
-    UserInteraction, UserInteractionRequester,
+    Assignment, CallDeadline, CourseCorrection, CustodyHandle,
+    CustodyStateReporter, ExternalAddressing, HealthStatus,
+    InstanceAnnouncement, InstanceAnnouncer, InstanceId, LoadContext,
+    Plugin, PluginError, RelationAnnouncer, RelationAssertion,
+    RelationRetraction, ReportError, ReportPriority, Request, Respondent,
+    StateReporter, SubjectAnnouncement, SubjectAnnouncer,
+    UserInteraction, UserInteractionRequester, Warden,
 };
 use crate::wire::{WireFrame, PROTOCOL_VERSION};
 use std::future::Future;
@@ -373,7 +391,10 @@ where
             }
         }
 
-        // These are caught by the is_request() filter above; unreachable.
+        // Warden verbs (TakeCustody, CourseCorrect, ReleaseCustody)
+        // are requests but not valid for respondents. The `other`
+        // arm rejects them with a structured error so the steward
+        // can diagnose the mismatched plugin kind.
         other => error_frame(
             other.envelope().0,
             other.envelope().1,
@@ -417,16 +438,23 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::Unload { .. } => "unload",
         WireFrame::HealthCheck { .. } => "health_check",
         WireFrame::HandleRequest { .. } => "handle_request",
+        WireFrame::TakeCustody { .. } => "take_custody",
+        WireFrame::CourseCorrect { .. } => "course_correct",
+        WireFrame::ReleaseCustody { .. } => "release_custody",
         WireFrame::DescribeResponse { .. } => "describe_response",
         WireFrame::LoadResponse { .. } => "load_response",
         WireFrame::UnloadResponse { .. } => "unload_response",
         WireFrame::HealthCheckResponse { .. } => "health_check_response",
         WireFrame::HandleRequestResponse { .. } => "handle_request_response",
+        WireFrame::TakeCustodyResponse { .. } => "take_custody_response",
+        WireFrame::CourseCorrectResponse { .. } => "course_correct_response",
+        WireFrame::ReleaseCustodyResponse { .. } => "release_custody_response",
         WireFrame::ReportState { .. } => "report_state",
         WireFrame::AnnounceSubject { .. } => "announce_subject",
         WireFrame::RetractSubject { .. } => "retract_subject",
         WireFrame::AssertRelation { .. } => "assert_relation",
         WireFrame::RetractRelation { .. } => "retract_relation",
+        WireFrame::ReportCustodyState { .. } => "report_custody_state",
         WireFrame::Error { .. } => "error",
     }
 }
@@ -743,6 +771,352 @@ impl UserInteractionRequester for WireUserInteractionRequester {
     {
         Box::pin(async {
             Err(ReportError::Invalid(USER_INTERACTION_NOT_SUPPORTED.into()))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------
+// Warden serve path
+// ---------------------------------------------------------------------
+
+/// Serve one warden-plugin connection end-to-end.
+///
+/// Parallel to [`serve`] but for plugins implementing [`Warden`]
+/// rather than [`Respondent`]. Dispatches the four core verbs
+/// (`describe`, `load`, `unload`, `health_check`) plus the three
+/// custody verbs (`take_custody`, `course_correct`, `release_custody`)
+/// to the plugin's trait methods. Supplies each `take_custody` call
+/// with a wire-backed [`CustodyStateReporter`] via the
+/// [`Assignment::custody_state_reporter`] field, so state reports
+/// the warden emits during custody are forwarded to the steward on
+/// the same connection.
+///
+/// A warden-plugin connection that receives a `handle_request` frame
+/// returns a structured error; respondent verbs are not valid for
+/// wardens. The reverse - a respondent receiving a custody verb - is
+/// also rejected (see [`serve`]).
+///
+/// Consumes the plugin, runs the protocol loop until the peer closes
+/// the connection (cleanly, via `unload` then disconnect, or abruptly),
+/// and returns.
+pub async fn serve_warden<P, R, W>(
+    plugin: P,
+    config: HostConfig,
+    mut reader: R,
+    writer: W,
+) -> Result<(), HostError>
+where
+    P: Plugin + Warden + 'static,
+    R: AsyncRead + Send + Unpin,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let (tx, rx) = mpsc::channel::<WireFrame>(config.event_channel_capacity);
+    let writer_task = tokio::spawn(writer_loop(writer, rx));
+
+    let result =
+        dispatch_loop_warden(plugin, &config, &mut reader, tx).await;
+
+    match writer_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            if result.is_ok() {
+                return Err(HostError::WriterTask(format!("{e}")));
+            }
+            tracing::warn!(
+                error = %e,
+                "writer task failed after warden dispatch error"
+            );
+        }
+        Err(join_err) => {
+            if result.is_ok() {
+                return Err(HostError::WriterTask(format!(
+                    "writer task panicked: {join_err}"
+                )));
+            }
+            tracing::warn!(
+                error = %join_err,
+                "writer task panicked after warden dispatch error"
+            );
+        }
+    }
+
+    result
+}
+
+async fn dispatch_loop_warden<P, R>(
+    mut plugin: P,
+    config: &HostConfig,
+    reader: &mut R,
+    tx: mpsc::Sender<WireFrame>,
+) -> Result<(), HostError>
+where
+    P: Plugin + Warden + 'static,
+    R: AsyncRead + Unpin,
+{
+    let event_cid = Arc::new(AtomicU64::new(1));
+
+    loop {
+        let frame = match read_frame_json(reader).await {
+            Ok(f) => f,
+            Err(WireError::PeerClosed) => {
+                drop(tx);
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let (v, _cid, peer_plugin) = frame.envelope();
+        if v != PROTOCOL_VERSION {
+            return Err(HostError::VersionMismatch {
+                expected: PROTOCOL_VERSION,
+                actual: v,
+            });
+        }
+        if peer_plugin != config.plugin_name {
+            return Err(HostError::PluginMismatch {
+                expected: config.plugin_name.clone(),
+                actual: peer_plugin.to_string(),
+            });
+        }
+
+        if !frame.is_request() {
+            return Err(HostError::Protocol(format!(
+                "expected request frame, got {}",
+                variant_name(&frame)
+            )));
+        }
+
+        let response =
+            handle_warden_frame(&mut plugin, frame, config, &tx, &event_cid)
+                .await;
+
+        if tx.send(response).await.is_err() {
+            return Err(HostError::Protocol(
+                "writer task closed before response could be sent".into(),
+            ));
+        }
+    }
+}
+
+async fn handle_warden_frame<P>(
+    plugin: &mut P,
+    frame: WireFrame,
+    config: &HostConfig,
+    tx: &mpsc::Sender<WireFrame>,
+    event_cid: &Arc<AtomicU64>,
+) -> WireFrame
+where
+    P: Plugin + Warden + 'static,
+{
+    match frame {
+        WireFrame::Describe { v, cid, plugin: p } => {
+            let description = plugin.describe().await;
+            WireFrame::DescribeResponse {
+                v,
+                cid,
+                plugin: p,
+                description,
+            }
+        }
+
+        WireFrame::Load {
+            v,
+            cid,
+            plugin: p,
+            config: cfg,
+            state_dir,
+            credentials_dir,
+            deadline_ms,
+        } => {
+            let ctx = match build_load_context(
+                cfg,
+                state_dir,
+                credentials_dir,
+                deadline_ms,
+                tx.clone(),
+                event_cid.clone(),
+                &p,
+            ) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    return error_frame(v, cid, &p, e, true);
+                }
+            };
+
+            match plugin.load(&ctx).await {
+                Ok(()) => WireFrame::LoadResponse {
+                    v,
+                    cid,
+                    plugin: p,
+                },
+                Err(e) => plugin_error_to_frame(v, cid, &p, e),
+            }
+        }
+
+        WireFrame::Unload { v, cid, plugin: p } => {
+            match plugin.unload().await {
+                Ok(()) => WireFrame::UnloadResponse {
+                    v,
+                    cid,
+                    plugin: p,
+                },
+                Err(e) => plugin_error_to_frame(v, cid, &p, e),
+            }
+        }
+
+        WireFrame::HealthCheck { v, cid, plugin: p } => {
+            let report = plugin.health_check().await;
+            WireFrame::HealthCheckResponse {
+                v,
+                cid,
+                plugin: p,
+                report,
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Warden verbs.
+        // -----------------------------------------------------------
+        WireFrame::TakeCustody {
+            v,
+            cid,
+            plugin: p,
+            custody_type,
+            payload,
+            deadline_ms,
+        } => {
+            let deadline = deadline_ms
+                .map(|ms| Instant::now() + Duration::from_millis(ms));
+            // The reporter is attached to the Assignment and owned by
+            // the plugin for the duration of this custody. When the
+            // plugin drops it (at release_custody, or on plugin
+            // unload), the cloned mpsc sender inside it is dropped;
+            // the writer task is unaffected because many other
+            // senders typically exist. The reporter carries the
+            // plugin name baked in at construction time so no frame
+            // can escape with a mismatched name.
+            let reporter: Arc<dyn CustodyStateReporter> =
+                Arc::new(WireCustodyStateReporter {
+                    tx: tx.clone(),
+                    event_cid: event_cid.clone(),
+                    plugin_name: p.clone(),
+                });
+            let assignment = Assignment {
+                custody_type,
+                payload,
+                correlation_id: cid,
+                deadline,
+                custody_state_reporter: reporter,
+            };
+            match plugin.take_custody(assignment).await {
+                Ok(handle) => WireFrame::TakeCustodyResponse {
+                    v,
+                    cid,
+                    plugin: p,
+                    handle,
+                },
+                Err(e) => plugin_error_to_frame(v, cid, &p, e),
+            }
+        }
+
+        WireFrame::CourseCorrect {
+            v,
+            cid,
+            plugin: p,
+            handle,
+            correction_type,
+            payload,
+        } => {
+            let correction = CourseCorrection {
+                correction_type,
+                payload,
+                correlation_id: cid,
+            };
+            match plugin.course_correct(&handle, correction).await {
+                Ok(()) => WireFrame::CourseCorrectResponse {
+                    v,
+                    cid,
+                    plugin: p,
+                },
+                Err(e) => plugin_error_to_frame(v, cid, &p, e),
+            }
+        }
+
+        WireFrame::ReleaseCustody {
+            v,
+            cid,
+            plugin: p,
+            handle,
+        } => match plugin.release_custody(handle).await {
+            Ok(()) => WireFrame::ReleaseCustodyResponse {
+                v,
+                cid,
+                plugin: p,
+            },
+            Err(e) => plugin_error_to_frame(v, cid, &p, e),
+        },
+
+        // -----------------------------------------------------------
+        // Respondent verb rejected for wardens.
+        // -----------------------------------------------------------
+        WireFrame::HandleRequest {
+            v, cid, plugin: p, ..
+        } => error_frame(
+            v,
+            cid,
+            &p,
+            "warden received a respondent verb (handle_request)",
+            true,
+        ),
+
+        other => error_frame(
+            other.envelope().0,
+            other.envelope().1,
+            &config.plugin_name,
+            format!("unexpected frame: {}", variant_name(&other)),
+            true,
+        ),
+    }
+}
+
+/// Custody state reporter that pushes frames into the wire event
+/// channel.
+///
+/// Constructed on each [`WireFrame::TakeCustody`] and attached to the
+/// [`Assignment`] handed to the plugin's `take_custody` method.
+/// Owned by the plugin for the duration of the custody; dropping the
+/// reporter closes one copy of the mpsc sender but does not tear down
+/// the writer task (other senders typically exist).
+#[derive(Debug)]
+struct WireCustodyStateReporter {
+    tx: mpsc::Sender<WireFrame>,
+    event_cid: Arc<AtomicU64>,
+    plugin_name: String,
+}
+
+impl CustodyStateReporter for WireCustodyStateReporter {
+    fn report<'a>(
+        &'a self,
+        handle: &'a CustodyHandle,
+        payload: Vec<u8>,
+        health: HealthStatus,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let tx = self.tx.clone();
+        let plugin = self.plugin_name.clone();
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        let handle = handle.clone();
+        Box::pin(async move {
+            tx.send(WireFrame::ReportCustodyState {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                handle,
+                payload,
+                health,
+            })
+            .await
+            .map_err(|_| ReportError::ShuttingDown)
         })
     }
 }
@@ -1340,5 +1714,686 @@ mod tests {
         let v = serde_json::json!(["not", "an", "object"]);
         let err = json_value_to_toml_table(v).unwrap_err();
         assert!(err.contains("object"));
+    }
+
+    // ---------------------------------------------------------------
+    // Warden test plugin and serve_warden tests.
+    // ---------------------------------------------------------------
+
+    /// Minimal warden used by the serve_warden tests. Remembers every
+    /// custody interaction.
+    ///
+    /// If `report_payload_during_take` is Some, the warden emits one
+    /// [`WireFrame::ReportCustodyState`] via its
+    /// [`CustodyStateReporter`] during `take_custody`, before
+    /// returning the handle. This matches the pattern in
+    /// `subject_announcement_during_load_reaches_wire`: the plugin's
+    /// own trait method exercises the wire-backed callback, so the
+    /// test can observe the resulting event frame and response frame
+    /// on the wire without having to share the reporter across tasks.
+    #[derive(Default)]
+    struct TestWarden {
+        name: String,
+        custodies_taken: Arc<std::sync::Mutex<Vec<CustodyHandle>>>,
+        corrections_received: Arc<std::sync::Mutex<Vec<CourseCorrection>>>,
+        custodies_released: Arc<std::sync::Mutex<Vec<CustodyHandle>>>,
+        report_payload_during_take: Option<Vec<u8>>,
+        fail_take: bool,
+    }
+
+    impl Plugin for TestWarden {
+        fn describe(
+            &self,
+        ) -> impl Future<Output = PluginDescription> + Send + '_
+        {
+            let name = self.name.clone();
+            async move {
+                PluginDescription {
+                    identity: PluginIdentity {
+                        name,
+                        version: semver::Version::new(0, 1, 1),
+                        contract: 1,
+                    },
+                    runtime_capabilities: RuntimeCapabilities {
+                        request_types: vec![],
+                        accepts_custody: true,
+                        flags: Default::default(),
+                    },
+                    build_info: BuildInfo {
+                        plugin_build: "test".into(),
+                        sdk_version: crate::VERSION.into(),
+                        rustc_version: None,
+                        built_at: None,
+                    },
+                }
+            }
+        }
+
+        fn load<'a>(
+            &'a mut self,
+            _ctx: &'a LoadContext,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
+        {
+            async move { Ok(()) }
+        }
+
+        fn unload(
+            &mut self,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_
+        {
+            async move { Ok(()) }
+        }
+
+        fn health_check(
+            &self,
+        ) -> impl Future<Output = HealthReport> + Send + '_
+        {
+            async move { HealthReport::healthy() }
+        }
+    }
+
+    impl Warden for TestWarden {
+        fn take_custody<'a>(
+            &'a mut self,
+            assignment: Assignment,
+        ) -> impl Future<Output = Result<CustodyHandle, PluginError>>
+               + Send
+               + 'a
+        {
+            async move {
+                if self.fail_take {
+                    return Err(PluginError::Permanent(
+                        "refused to take custody".into(),
+                    ));
+                }
+                // Deterministic handle id tied to the assignment's
+                // correlation_id so tests can predict it.
+                let handle = CustodyHandle::new(format!(
+                    "custody-{}",
+                    assignment.correlation_id
+                ));
+                // Optionally emit one state report BEFORE returning.
+                // This exercises the wire-backed
+                // CustodyStateReporter on the same task as the
+                // dispatch loop, mirroring the working pattern in
+                // `subject_announcement_during_load_reaches_wire`.
+                if let Some(payload) = self.report_payload_during_take.clone()
+                {
+                    assignment
+                        .custody_state_reporter
+                        .report(&handle, payload, HealthStatus::Healthy)
+                        .await
+                        .ok();
+                }
+                self.custodies_taken.lock().unwrap().push(handle.clone());
+                Ok(handle)
+            }
+        }
+
+        fn course_correct<'a>(
+            &'a mut self,
+            _handle: &'a CustodyHandle,
+            correction: CourseCorrection,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
+        {
+            async move {
+                self.corrections_received.lock().unwrap().push(correction);
+                Ok(())
+            }
+        }
+
+        fn release_custody<'a>(
+            &'a mut self,
+            handle: CustodyHandle,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
+        {
+            async move {
+                self.custodies_released.lock().unwrap().push(handle);
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn warden_take_custody_returns_handle() {
+        let (client, server) = duplex_pair();
+        let (server_r, server_w) = tokio::io::split(server);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+
+        let plugin = TestWarden {
+            name: "org.test.warden".into(),
+            ..Default::default()
+        };
+        let host = tokio::spawn(serve_warden(
+            plugin,
+            HostConfig::new("org.test.warden"),
+            server_r,
+            server_w,
+        ));
+
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::TakeCustody {
+                v: PROTOCOL_VERSION,
+                cid: 10,
+                plugin: "org.test.warden".into(),
+                custody_type: "playback".into(),
+                payload: b"track-abc".to_vec(),
+                deadline_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        match read_frame_json(&mut client_r).await.unwrap() {
+            WireFrame::TakeCustodyResponse { cid, handle, .. } => {
+                assert_eq!(cid, 10);
+                assert_eq!(handle.id, "custody-10");
+            }
+            other => panic!("expected TakeCustodyResponse, got {other:?}"),
+        }
+
+        drop(client_w);
+        drop(client_r);
+        host.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn warden_take_custody_failure_returns_error_frame() {
+        let (client, server) = duplex_pair();
+        let (server_r, server_w) = tokio::io::split(server);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+
+        let plugin = TestWarden {
+            name: "org.test.warden".into(),
+            fail_take: true,
+            ..Default::default()
+        };
+        let host = tokio::spawn(serve_warden(
+            plugin,
+            HostConfig::new("org.test.warden"),
+            server_r,
+            server_w,
+        ));
+
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::TakeCustody {
+                v: PROTOCOL_VERSION,
+                cid: 11,
+                plugin: "org.test.warden".into(),
+                custody_type: "playback".into(),
+                payload: vec![],
+                deadline_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        match read_frame_json(&mut client_r).await.unwrap() {
+            WireFrame::Error { cid, fatal, message, .. } => {
+                assert_eq!(cid, 11);
+                assert!(!fatal);
+                assert!(message.contains("refused to take custody"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        drop(client_w);
+        drop(client_r);
+        host.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn warden_course_correct_roundtrip() {
+        let (client, server) = duplex_pair();
+        let (server_r, server_w) = tokio::io::split(server);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+
+        let corrections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plugin = TestWarden {
+            name: "org.test.warden".into(),
+            corrections_received: corrections.clone(),
+            ..Default::default()
+        };
+        let host = tokio::spawn(serve_warden(
+            plugin,
+            HostConfig::new("org.test.warden"),
+            server_r,
+            server_w,
+        ));
+
+        // First take a custody so we have a valid handle. Even though
+        // TestWarden does not actually validate the handle in
+        // course_correct, the steward-to-warden protocol expects a
+        // take before a correct.
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::TakeCustody {
+                v: PROTOCOL_VERSION,
+                cid: 20,
+                plugin: "org.test.warden".into(),
+                custody_type: "playback".into(),
+                payload: vec![],
+                deadline_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        let handle = match read_frame_json(&mut client_r).await.unwrap() {
+            WireFrame::TakeCustodyResponse { handle, .. } => handle,
+            other => panic!("expected TakeCustodyResponse, got {other:?}"),
+        };
+
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::CourseCorrect {
+                v: PROTOCOL_VERSION,
+                cid: 21,
+                plugin: "org.test.warden".into(),
+                handle: handle.clone(),
+                correction_type: "seek".into(),
+                payload: b"pos=42".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+
+        match read_frame_json(&mut client_r).await.unwrap() {
+            WireFrame::CourseCorrectResponse { cid, .. } => {
+                assert_eq!(cid, 21);
+            }
+            other => panic!("expected CourseCorrectResponse, got {other:?}"),
+        }
+
+        let received = corrections.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].correction_type, "seek");
+        assert_eq!(received[0].payload, b"pos=42");
+        assert_eq!(received[0].correlation_id, 21);
+
+        drop(client_w);
+        drop(client_r);
+        host.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn warden_release_custody_roundtrip() {
+        let (client, server) = duplex_pair();
+        let (server_r, server_w) = tokio::io::split(server);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+
+        let released = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plugin = TestWarden {
+            name: "org.test.warden".into(),
+            custodies_released: released.clone(),
+            ..Default::default()
+        };
+        let host = tokio::spawn(serve_warden(
+            plugin,
+            HostConfig::new("org.test.warden"),
+            server_r,
+            server_w,
+        ));
+
+        // Take, then release.
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::TakeCustody {
+                v: PROTOCOL_VERSION,
+                cid: 30,
+                plugin: "org.test.warden".into(),
+                custody_type: "playback".into(),
+                payload: vec![],
+                deadline_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        let handle = match read_frame_json(&mut client_r).await.unwrap() {
+            WireFrame::TakeCustodyResponse { handle, .. } => handle,
+            other => panic!("expected TakeCustodyResponse, got {other:?}"),
+        };
+
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::ReleaseCustody {
+                v: PROTOCOL_VERSION,
+                cid: 31,
+                plugin: "org.test.warden".into(),
+                handle: handle.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        match read_frame_json(&mut client_r).await.unwrap() {
+            WireFrame::ReleaseCustodyResponse { cid, .. } => {
+                assert_eq!(cid, 31);
+            }
+            other => panic!("expected ReleaseCustodyResponse, got {other:?}"),
+        }
+
+        let released_vec = released.lock().unwrap();
+        assert_eq!(released_vec.len(), 1);
+        assert_eq!(released_vec[0].id, handle.id);
+
+        drop(client_w);
+        drop(client_r);
+        host.await.unwrap().unwrap();
+    }
+
+    // Uses a multi-threaded runtime because the event frame + response
+    // frame arriving back-to-back can starve on a single-threaded
+    // runtime with three tasks (test, dispatch, writer).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warden_custody_state_report_reaches_wire() {
+        // Plugin emits one state report during take_custody. Test
+        // observes both frames on the wire.
+        let (client, server) = duplex_pair();
+        let (server_r, server_w) = tokio::io::split(server);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+
+        let plugin = TestWarden {
+            name: "org.test.warden".into(),
+            report_payload_during_take: Some(b"state=playing".to_vec()),
+            ..Default::default()
+        };
+        let host = tokio::spawn(serve_warden(
+            plugin,
+            HostConfig::new("org.test.warden"),
+            server_r,
+            server_w,
+        ));
+
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::TakeCustody {
+                v: PROTOCOL_VERSION,
+                cid: 40,
+                plugin: "org.test.warden".into(),
+                custody_type: "playback".into(),
+                payload: vec![],
+                deadline_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Two frames are expected: the event frame emitted by the
+        // plugin during take_custody, and the TakeCustodyResponse.
+        // Order is: the event fires before take_custody returns, but
+        // the mpsc channel serialises them in send order, so we
+        // expect the event first. Be tolerant of either order to
+        // keep the test robust against scheduling differences.
+        let first = read_frame_json(&mut client_r).await.unwrap();
+        let second = read_frame_json(&mut client_r).await.unwrap();
+
+        let (event, response) = match (&first, &second) {
+            (
+                WireFrame::ReportCustodyState { .. },
+                WireFrame::TakeCustodyResponse { .. },
+            ) => (&first, &second),
+            (
+                WireFrame::TakeCustodyResponse { .. },
+                WireFrame::ReportCustodyState { .. },
+            ) => (&second, &first),
+            _ => panic!(
+                "expected ReportCustodyState + TakeCustodyResponse, got {first:?} and {second:?}"
+            ),
+        };
+
+        match event {
+            WireFrame::ReportCustodyState {
+                plugin,
+                handle,
+                payload,
+                health,
+                ..
+            } => {
+                assert_eq!(plugin, "org.test.warden");
+                assert_eq!(handle.id, "custody-40");
+                assert_eq!(payload, b"state=playing");
+                assert_eq!(*health, HealthStatus::Healthy);
+            }
+            _ => unreachable!(),
+        }
+        match response {
+            WireFrame::TakeCustodyResponse { cid, handle, .. } => {
+                assert_eq!(*cid, 40);
+                assert_eq!(handle.id, "custody-40");
+            }
+            _ => unreachable!(),
+        }
+
+        drop(client_w);
+        drop(client_r);
+        host.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn warden_rejects_handle_request_frame() {
+        // A warden receiving a respondent verb returns an error frame
+        // and keeps the connection open.
+        let (client, server) = duplex_pair();
+        let (server_r, server_w) = tokio::io::split(server);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+
+        let plugin = TestWarden {
+            name: "org.test.warden".into(),
+            ..Default::default()
+        };
+        let host = tokio::spawn(serve_warden(
+            plugin,
+            HostConfig::new("org.test.warden"),
+            server_r,
+            server_w,
+        ));
+
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::HandleRequest {
+                v: PROTOCOL_VERSION,
+                cid: 50,
+                plugin: "org.test.warden".into(),
+                request_type: "ping".into(),
+                payload: vec![],
+                deadline_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        match read_frame_json(&mut client_r).await.unwrap() {
+            WireFrame::Error { cid, fatal, message, .. } => {
+                assert_eq!(cid, 50);
+                assert!(fatal);
+                assert!(message.contains("handle_request"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        drop(client_w);
+        drop(client_r);
+        host.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn respondent_rejects_warden_verb() {
+        // Mirror test on the respondent side: a respondent receiving
+        // a warden verb returns an error and keeps the connection open.
+        let (client, server) = duplex_pair();
+        let (server_r, server_w) = tokio::io::split(server);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+
+        let plugin = TestPlugin {
+            name: "org.test.x".into(),
+            ..Default::default()
+        };
+        let host = tokio::spawn(serve(
+            plugin,
+            HostConfig::new("org.test.x"),
+            server_r,
+            server_w,
+        ));
+
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::TakeCustody {
+                v: PROTOCOL_VERSION,
+                cid: 60,
+                plugin: "org.test.x".into(),
+                custody_type: "playback".into(),
+                payload: vec![],
+                deadline_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        match read_frame_json(&mut client_r).await.unwrap() {
+            WireFrame::Error { cid, fatal, message, .. } => {
+                assert_eq!(cid, 60);
+                assert!(fatal);
+                assert!(message.contains("take_custody"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        drop(client_w);
+        drop(client_r);
+        host.await.unwrap().unwrap();
+    }
+
+    // Multi-threaded for the same reason as the state-report test:
+    // the event frame + response frame arriving back-to-back need
+    // reliable scheduling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warden_full_custody_lifecycle() {
+        // End-to-end: describe -> load -> take (which emits one
+        // state report) -> course_correct -> release -> unload.
+        let (client, server) = duplex_pair();
+        let (server_r, server_w) = tokio::io::split(server);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+
+        let plugin = TestWarden {
+            name: "org.test.warden".into(),
+            report_payload_during_take: Some(b"state=playing".to_vec()),
+            ..Default::default()
+        };
+        let host = tokio::spawn(serve_warden(
+            plugin,
+            HostConfig::new("org.test.warden"),
+            server_r,
+            server_w,
+        ));
+
+        // Load.
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::Load {
+                v: PROTOCOL_VERSION,
+                cid: 1,
+                plugin: "org.test.warden".into(),
+                config: serde_json::json!({}),
+                state_dir: "/tmp/s".into(),
+                credentials_dir: "/tmp/c".into(),
+                deadline_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        match read_frame_json(&mut client_r).await.unwrap() {
+            WireFrame::LoadResponse { cid, .. } => assert_eq!(cid, 1),
+            other => panic!("expected LoadResponse, got {other:?}"),
+        }
+
+        // Take custody. The plugin emits one state report during
+        // take_custody; then the response arrives.
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::TakeCustody {
+                v: PROTOCOL_VERSION,
+                cid: 2,
+                plugin: "org.test.warden".into(),
+                custody_type: "playback".into(),
+                payload: b"track-1".to_vec(),
+                deadline_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        // Drain both frames in whichever order they arrive.
+        let first = read_frame_json(&mut client_r).await.unwrap();
+        let second = read_frame_json(&mut client_r).await.unwrap();
+        let handle = match (&first, &second) {
+            (
+                WireFrame::ReportCustodyState { .. },
+                WireFrame::TakeCustodyResponse { handle, .. },
+            ) => handle.clone(),
+            (
+                WireFrame::TakeCustodyResponse { handle, .. },
+                WireFrame::ReportCustodyState { .. },
+            ) => handle.clone(),
+            _ => panic!(
+                "expected ReportCustodyState + TakeCustodyResponse, got {first:?} and {second:?}"
+            ),
+        };
+
+        // Course correct.
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::CourseCorrect {
+                v: PROTOCOL_VERSION,
+                cid: 3,
+                plugin: "org.test.warden".into(),
+                handle: handle.clone(),
+                correction_type: "seek".into(),
+                payload: b"pos=10".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        match read_frame_json(&mut client_r).await.unwrap() {
+            WireFrame::CourseCorrectResponse { cid, .. } => assert_eq!(cid, 3),
+            other => panic!("expected CourseCorrectResponse, got {other:?}"),
+        }
+
+        // Release custody.
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::ReleaseCustody {
+                v: PROTOCOL_VERSION,
+                cid: 4,
+                plugin: "org.test.warden".into(),
+                handle: handle.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        match read_frame_json(&mut client_r).await.unwrap() {
+            WireFrame::ReleaseCustodyResponse { cid, .. } => assert_eq!(cid, 4),
+            other => panic!("expected ReleaseCustodyResponse, got {other:?}"),
+        }
+
+        // Unload.
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::Unload {
+                v: PROTOCOL_VERSION,
+                cid: 5,
+                plugin: "org.test.warden".into(),
+            },
+        )
+        .await
+        .unwrap();
+        match read_frame_json(&mut client_r).await.unwrap() {
+            WireFrame::UnloadResponse { cid, .. } => assert_eq!(cid, 5),
+            other => panic!("expected UnloadResponse, got {other:?}"),
+        }
+
+        drop(client_w);
+        drop(client_r);
+        host.await.unwrap().unwrap();
     }
 }

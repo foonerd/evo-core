@@ -17,8 +17,10 @@
 //! - [`codec`]: JSON codec and length-prefixed framing over async I/O
 //!   streams. Feature-gated on `wire`.
 //! - [`host`]: Plugin-side wire server. Drives a `Plugin + Respondent`
-//!   over a single async I/O connection, per `PLUGIN_CONTRACT.md`
-//!   sections 6 through 11. Feature-gated on `wire`.
+//!   via [`host::serve`] or a `Plugin + Warden` via
+//!   [`host::serve_warden`], each over a single async I/O connection,
+//!   per `PLUGIN_CONTRACT.md` sections 6 through 11. Feature-gated on
+//!   `wire`.
 //! - [`testing`]: (placeholder) Mock steward harness for plugin authors.
 //!   Populated in SDK pass 4.
 //!
@@ -110,7 +112,7 @@ pub use codec::{
 };
 #[cfg(feature = "wire")]
 pub use host::{
-    serve, HostConfig, HostError, DEFAULT_EVENT_CHANNEL_CAPACITY,
+    serve, serve_warden, HostConfig, HostError, DEFAULT_EVENT_CHANNEL_CAPACITY,
 };
 #[cfg(feature = "wire")]
 pub use wire::{WireFrame, PROTOCOL_VERSION};

@@ -39,18 +39,27 @@
 //!
 //! ## Types deliberately excluded from v0
 //!
-//! - Warden verbs (`take_custody`, `course_correct`, `release_custody`,
-//!   `report_custody_state`): wire representation comes in a later
-//!   subpass once the steward-side warden support is in place.
-//! - Factory verbs (`announce_instance`, `retract_instance`):
-//!   likewise deferred.
+//! - Factory verbs (`announce_instance`, `retract_instance`): deferred
+//!   to a later subpass.
 //! - User-interaction requests: deferred.
 //! - Hot reload (`reload_in_place`): deferred.
 //! - Cancellation frames: the v0 protocol relies on deadline expiry.
+//!
+//! ## Warden verbs
+//!
+//! Warden verbs (`take_custody`, `course_correct`, `release_custody`,
+//! `report_custody_state`) are covered as of SDK subpass 5a. See the
+//! variants clustered under the "warden verbs" comments below.
+//! `CustodyHandle`s round-trip across the wire in full (id plus
+//! `started_at`); `CourseCorrection` is not itself serialised on the
+//! wire, its fields (`correction_type`, `payload`) are flattened into
+//! the `CourseCorrect` frame to match the pattern used by
+//! `HandleRequest`.
 
 use crate::contract::{
-    ExternalAddressing, HealthReport, PluginDescription, RelationAssertion,
-    RelationRetraction, ReportPriority, SubjectAnnouncement,
+    CustodyHandle, ExternalAddressing, HealthReport, HealthStatus,
+    PluginDescription, RelationAssertion, RelationRetraction,
+    ReportPriority, SubjectAnnouncement,
 };
 use serde::{Deserialize, Serialize};
 
@@ -143,6 +152,65 @@ pub enum WireFrame {
     },
 
     // ---------------------------------------------------------------
+    // Steward -> Plugin: warden verbs (section 4).
+    // ---------------------------------------------------------------
+    /// `take_custody` request. The steward assigns work to a warden.
+    /// The warden returns a [`CustodyHandle`] identifying this custody,
+    /// which the steward uses for subsequent `course_correct` and
+    /// `release_custody` calls.
+    TakeCustody {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Custody type identifier, declared by the shelf shape.
+        custody_type: String,
+        /// Opaque assignment payload per the shelf shape. Base64-encoded
+        /// in JSON.
+        #[serde(with = "crate::codec::base64_bytes")]
+        payload: Vec<u8>,
+        /// Optional acceptance deadline in milliseconds from now.
+        deadline_ms: Option<u64>,
+    },
+
+    /// `course_correct` request. The steward modifies work under
+    /// ongoing custody without revoking it.
+    ///
+    /// The `handle` identifies which custody is being corrected; the
+    /// plugin side receives the full handle (not just its id) so the
+    /// trait call can be invoked with the original value.
+    CourseCorrect {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Handle identifying the custody to correct.
+        handle: CustodyHandle,
+        /// Correction type identifier, declared by the shelf shape.
+        correction_type: String,
+        /// Opaque correction payload. Base64-encoded in JSON.
+        #[serde(with = "crate::codec::base64_bytes")]
+        payload: Vec<u8>,
+    },
+
+    /// `release_custody` request. The steward instructs the warden to
+    /// wind down the work under custody.
+    ReleaseCustody {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Handle identifying the custody to release.
+        handle: CustodyHandle,
+    },
+
+    // ---------------------------------------------------------------
     // Plugin -> Steward: responses to the above requests. Same cid as
     // the request they answer.
     // ---------------------------------------------------------------
@@ -201,6 +269,38 @@ pub enum WireFrame {
         /// Response payload per the shelf shape. Base64-encoded in JSON.
         #[serde(with = "crate::codec::base64_bytes")]
         payload: Vec<u8>,
+    },
+
+    /// `take_custody` response: the handle the warden generated.
+    TakeCustodyResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Warden-generated handle identifying this custody.
+        handle: CustodyHandle,
+    },
+
+    /// `course_correct` response: success ack.
+    CourseCorrectResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// `release_custody` response: success ack.
+    ReleaseCustodyResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
     },
 
     // ---------------------------------------------------------------
@@ -278,6 +378,27 @@ pub enum WireFrame {
         retraction: RelationRetraction,
     },
 
+    /// Custody state report event. Warden publishes a state change for
+    /// a specific ongoing custody. Higher-volume than `ReportState`;
+    /// subject to the custody-specific rate-limiting policy per
+    /// `PLUGIN_CONTRACT.md` section 4.
+    ReportCustodyState {
+        /// Protocol version.
+        v: u16,
+        /// Event's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Handle identifying which custody this report is about.
+        handle: CustodyHandle,
+        /// Opaque payload per the shelf shape. Base64-encoded in JSON.
+        #[serde(with = "crate::codec::base64_bytes")]
+        payload: Vec<u8>,
+        /// Current health of the custody, independent of overall
+        /// plugin health.
+        health: HealthStatus,
+    },
+
     // ---------------------------------------------------------------
     // Error frames (bidirectional). When returned in response to a
     // request, `cid` matches the request; when returned in response
@@ -309,16 +430,23 @@ impl WireFrame {
             | Self::Unload { v, cid, plugin }
             | Self::HealthCheck { v, cid, plugin }
             | Self::HandleRequest { v, cid, plugin, .. }
+            | Self::TakeCustody { v, cid, plugin, .. }
+            | Self::CourseCorrect { v, cid, plugin, .. }
+            | Self::ReleaseCustody { v, cid, plugin, .. }
             | Self::DescribeResponse { v, cid, plugin, .. }
             | Self::LoadResponse { v, cid, plugin }
             | Self::UnloadResponse { v, cid, plugin }
             | Self::HealthCheckResponse { v, cid, plugin, .. }
             | Self::HandleRequestResponse { v, cid, plugin, .. }
+            | Self::TakeCustodyResponse { v, cid, plugin, .. }
+            | Self::CourseCorrectResponse { v, cid, plugin }
+            | Self::ReleaseCustodyResponse { v, cid, plugin }
             | Self::ReportState { v, cid, plugin, .. }
             | Self::AnnounceSubject { v, cid, plugin, .. }
             | Self::RetractSubject { v, cid, plugin, .. }
             | Self::AssertRelation { v, cid, plugin, .. }
             | Self::RetractRelation { v, cid, plugin, .. }
+            | Self::ReportCustodyState { v, cid, plugin, .. }
             | Self::Error { v, cid, plugin, .. } => (*v, *cid, plugin.as_str()),
         }
     }
@@ -332,6 +460,9 @@ impl WireFrame {
                 | Self::Unload { .. }
                 | Self::HealthCheck { .. }
                 | Self::HandleRequest { .. }
+                | Self::TakeCustody { .. }
+                | Self::CourseCorrect { .. }
+                | Self::ReleaseCustody { .. }
         )
     }
 
@@ -344,6 +475,9 @@ impl WireFrame {
                 | Self::UnloadResponse { .. }
                 | Self::HealthCheckResponse { .. }
                 | Self::HandleRequestResponse { .. }
+                | Self::TakeCustodyResponse { .. }
+                | Self::CourseCorrectResponse { .. }
+                | Self::ReleaseCustodyResponse { .. }
         )
     }
 
@@ -356,6 +490,7 @@ impl WireFrame {
                 | Self::RetractSubject { .. }
                 | Self::AssertRelation { .. }
                 | Self::RetractRelation { .. }
+                | Self::ReportCustodyState { .. }
         )
     }
 
@@ -468,6 +603,214 @@ mod tests {
         } else {
             panic!("expected HealthCheckResponse");
         }
+    }
+
+    #[test]
+    fn take_custody_round_trip() {
+        let orig = WireFrame::TakeCustody {
+            v: PROTOCOL_VERSION,
+            cid: 300,
+            plugin: sample_plugin(),
+            custody_type: "playback".into(),
+            payload: b"track-123".to_vec(),
+            deadline_ms: Some(2000),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"take_custody""#));
+        // Payload is base64 per the codec helper, just like
+        // HandleRequest.
+        assert!(
+            json.contains(r#""payload":"dHJhY2stMTIz""#),
+            "payload must be base64, got: {json}"
+        );
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn take_custody_response_round_trip() {
+        let orig = WireFrame::TakeCustodyResponse {
+            v: PROTOCOL_VERSION,
+            cid: 300,
+            plugin: sample_plugin(),
+            handle: CustodyHandle {
+                id: "custody-1".into(),
+                started_at: SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(1_700_000_000),
+            },
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"take_custody_response""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        // Verify the handle round-trips fully, not just the id:
+        // regression guard for a serialisation that might drop
+        // `started_at`.
+        if let WireFrame::TakeCustodyResponse { handle, .. } = back {
+            assert_eq!(handle.id, "custody-1");
+            assert_eq!(
+                handle.started_at,
+                SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(1_700_000_000)
+            );
+        } else {
+            panic!("expected TakeCustodyResponse");
+        }
+    }
+
+    #[test]
+    fn course_correct_round_trip() {
+        let orig = WireFrame::CourseCorrect {
+            v: PROTOCOL_VERSION,
+            cid: 301,
+            plugin: sample_plugin(),
+            handle: CustodyHandle {
+                id: "custody-1".into(),
+                started_at: SystemTime::UNIX_EPOCH,
+            },
+            correction_type: "seek".into(),
+            payload: b"position=42".to_vec(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"course_correct""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn course_correct_response_round_trip() {
+        let orig = WireFrame::CourseCorrectResponse {
+            v: PROTOCOL_VERSION,
+            cid: 301,
+            plugin: sample_plugin(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"course_correct_response""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn release_custody_round_trip() {
+        let orig = WireFrame::ReleaseCustody {
+            v: PROTOCOL_VERSION,
+            cid: 302,
+            plugin: sample_plugin(),
+            handle: CustodyHandle {
+                id: "custody-1".into(),
+                started_at: SystemTime::UNIX_EPOCH,
+            },
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"release_custody""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn release_custody_response_round_trip() {
+        let orig = WireFrame::ReleaseCustodyResponse {
+            v: PROTOCOL_VERSION,
+            cid: 302,
+            plugin: sample_plugin(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"release_custody_response""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn report_custody_state_round_trip() {
+        let orig = WireFrame::ReportCustodyState {
+            v: PROTOCOL_VERSION,
+            cid: 400,
+            plugin: sample_plugin(),
+            handle: CustodyHandle {
+                id: "custody-1".into(),
+                started_at: SystemTime::UNIX_EPOCH,
+            },
+            payload: b"position=123&state=playing".to_vec(),
+            health: HealthStatus::Healthy,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"report_custody_state""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn warden_request_frames_classify_as_requests() {
+        let take = WireFrame::TakeCustody {
+            v: PROTOCOL_VERSION,
+            cid: 1,
+            plugin: sample_plugin(),
+            custody_type: "x".into(),
+            payload: vec![],
+            deadline_ms: None,
+        };
+        assert!(take.is_request());
+        assert!(!take.is_response());
+        assert!(!take.is_event());
+
+        let correct = WireFrame::CourseCorrect {
+            v: PROTOCOL_VERSION,
+            cid: 2,
+            plugin: sample_plugin(),
+            handle: CustodyHandle::new("h"),
+            correction_type: "x".into(),
+            payload: vec![],
+        };
+        assert!(correct.is_request());
+
+        let release = WireFrame::ReleaseCustody {
+            v: PROTOCOL_VERSION,
+            cid: 3,
+            plugin: sample_plugin(),
+            handle: CustodyHandle::new("h"),
+        };
+        assert!(release.is_request());
+    }
+
+    #[test]
+    fn warden_response_frames_classify_as_responses() {
+        let take_r = WireFrame::TakeCustodyResponse {
+            v: PROTOCOL_VERSION,
+            cid: 1,
+            plugin: sample_plugin(),
+            handle: CustodyHandle::new("h"),
+        };
+        assert!(take_r.is_response());
+        assert!(!take_r.is_request());
+
+        let correct_r = WireFrame::CourseCorrectResponse {
+            v: PROTOCOL_VERSION,
+            cid: 2,
+            plugin: sample_plugin(),
+        };
+        assert!(correct_r.is_response());
+
+        let release_r = WireFrame::ReleaseCustodyResponse {
+            v: PROTOCOL_VERSION,
+            cid: 3,
+            plugin: sample_plugin(),
+        };
+        assert!(release_r.is_response());
+    }
+
+    #[test]
+    fn report_custody_state_classifies_as_event() {
+        let ev = WireFrame::ReportCustodyState {
+            v: PROTOCOL_VERSION,
+            cid: 1,
+            plugin: sample_plugin(),
+            handle: CustodyHandle::new("h"),
+            payload: vec![],
+            health: HealthStatus::Healthy,
+        };
+        assert!(ev.is_event());
+        assert!(!ev.is_request());
+        assert!(!ev.is_response());
     }
 
     #[test]
