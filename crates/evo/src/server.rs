@@ -127,6 +127,14 @@ struct ProjectionScopeWire {
     /// Walk direction.
     #[serde(default)]
     direction: WalkDirectionWire,
+    /// Maximum walk depth. Absent means the domain default
+    /// ([`crate::projections::DEFAULT_MAX_DEPTH`]).
+    #[serde(default)]
+    max_depth: Option<usize>,
+    /// Maximum visit count. Absent means the domain default
+    /// ([`crate::projections::DEFAULT_MAX_VISITS`]).
+    #[serde(default)]
+    max_visits: Option<usize>,
 }
 
 /// Wire form of [`WalkDirection`]. Accepts `forward`, `inverse`, or
@@ -155,10 +163,19 @@ impl From<WalkDirectionWire> for WalkDirection {
 
 impl From<ProjectionScopeWire> for ProjectionScope {
     fn from(w: ProjectionScopeWire) -> Self {
-        ProjectionScope {
+        let mut scope = ProjectionScope {
             relation_predicates: w.relation_predicates,
             direction: w.direction.into(),
+            max_depth: crate::projections::DEFAULT_MAX_DEPTH,
+            max_visits: crate::projections::DEFAULT_MAX_VISITS,
+        };
+        if let Some(d) = w.max_depth {
+            scope.max_depth = d;
         }
+        if let Some(v) = w.max_visits {
+            scope.max_visits = v;
+        }
+        scope
     }
 }
 
@@ -202,6 +219,10 @@ struct SubjectProjectionWire {
     claimants: Vec<String>,
     degraded: bool,
     degraded_reasons: Vec<DegradedReasonWire>,
+    /// True if the relation walk was truncated at or before the point
+    /// this projection was built. See
+    /// [`SubjectProjection::walk_truncated`].
+    walk_truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -221,6 +242,11 @@ struct RelatedSubjectWire {
     /// relation (the edge target is not in the subject registry).
     target_type: Option<String>,
     relation_claimants: Vec<String>,
+    /// Recursively composed projection for the other end of the edge,
+    /// when the scope's `max_depth` permitted expansion. `null`
+    /// otherwise. See [`RelatedSubject::nested`] for the non-expansion
+    /// rules.
+    nested: Option<Box<SubjectProjectionWire>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -254,6 +280,7 @@ impl From<SubjectProjection> for SubjectProjectionWire {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+            walk_truncated: p.walk_truncated,
         }
     }
 }
@@ -269,6 +296,9 @@ impl From<RelatedSubject> for RelatedSubjectWire {
             target_id: r.target_id,
             target_type: r.target_type,
             relation_claimants: r.relation_claimants,
+            nested: r
+                .nested
+                .map(|boxed| Box::new(SubjectProjectionWire::from(*boxed))),
         }
     }
 }
@@ -719,12 +749,14 @@ mod tests {
             claimants: vec!["p".into()],
             degraded: false,
             degraded_reasons: vec![],
+            walk_truncated: false,
         };
         let r = ClientResponse::Projection(p);
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("canonical_id"));
         assert!(s.contains("subject_type"));
         assert!(s.contains("composed_at_ms"));
+        assert!(s.contains("walk_truncated"));
         assert!(!s.contains("payload_b64"));
         assert!(!s.contains("\"error\""));
     }
@@ -750,10 +782,49 @@ mod tests {
         let w = ProjectionScopeWire {
             relation_predicates: vec!["a".into(), "b".into()],
             direction: WalkDirectionWire::Inverse,
+            max_depth: None,
+            max_visits: None,
         };
         let d: ProjectionScope = w.into();
         assert_eq!(d.relation_predicates, vec!["a", "b"]);
         assert!(matches!(d.direction, WalkDirection::Inverse));
+        assert_eq!(d.max_depth, crate::projections::DEFAULT_MAX_DEPTH);
+        assert_eq!(d.max_visits, crate::projections::DEFAULT_MAX_VISITS);
+    }
+
+    #[test]
+    fn projection_scope_wire_overrides_depth_and_visits() {
+        let w = ProjectionScopeWire {
+            relation_predicates: vec!["a".into()],
+            direction: WalkDirectionWire::Forward,
+            max_depth: Some(7),
+            max_visits: Some(42),
+        };
+        let d: ProjectionScope = w.into();
+        assert_eq!(d.max_depth, 7);
+        assert_eq!(d.max_visits, 42);
+    }
+
+    #[test]
+    fn client_request_parses_project_subject_with_depth() {
+        let json = r#"{
+            "op": "project_subject",
+            "canonical_id": "abc",
+            "scope": {
+                "relation_predicates": ["album_of"],
+                "direction": "forward",
+                "max_depth": 3,
+                "max_visits": 100
+            }
+        }"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::ProjectSubject { scope, .. } => {
+                assert_eq!(scope.max_depth, Some(3));
+                assert_eq!(scope.max_visits, Some(100));
+            }
+            other => panic!("expected ProjectSubject, got {other:?}"),
+        }
     }
 
     #[test]

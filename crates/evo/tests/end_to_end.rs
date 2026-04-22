@@ -312,6 +312,152 @@ async fn project_subject_roundtrips_through_socket() {
 }
 
 #[tokio::test]
+async fn project_subject_multi_hop_roundtrips_through_socket() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    // Build a 3-chain: track -> album -> artist.
+    let (track_id, album_id, artist_id) = {
+        let guard = engine.lock().await;
+        let registry = guard.registry();
+        let graph = guard.relation_graph();
+
+        let track_ann = SubjectAnnouncement::new(
+            "track",
+            vec![ExternalAddressing::new("mpd-path", "/x.flac")],
+        );
+        let album_ann = SubjectAnnouncement::new(
+            "album",
+            vec![ExternalAddressing::new("mbid", "album-123")],
+        );
+        let artist_ann = SubjectAnnouncement::new(
+            "artist",
+            vec![ExternalAddressing::new("mbid", "artist-456")],
+        );
+
+        let t = match registry.announce(&track_ann, "com.test.fixture").unwrap() {
+            evo::subjects::AnnounceOutcome::Created(id) => id,
+            other => panic!("expected Created for track, got {other:?}"),
+        };
+        let a = match registry.announce(&album_ann, "com.test.fixture").unwrap() {
+            evo::subjects::AnnounceOutcome::Created(id) => id,
+            other => panic!("expected Created for album, got {other:?}"),
+        };
+        let r = match registry.announce(&artist_ann, "com.test.fixture").unwrap() {
+            evo::subjects::AnnounceOutcome::Created(id) => id,
+            other => panic!("expected Created for artist, got {other:?}"),
+        };
+
+        graph.assert(&t, "rel", &a, "com.test.fixture", None).unwrap();
+        graph.assert(&a, "rel", &r, "com.test.fixture", None).unwrap();
+
+        (t, a, r)
+    };
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path)
+        .await
+        .expect("connect");
+
+    // Request with max_depth=3: expect track -> album (nested) ->
+    // artist (nested, leaf).
+    let req = format!(
+        r#"{{
+            "op": "project_subject",
+            "canonical_id": "{track_id}",
+            "scope": {{
+                "relation_predicates": ["rel"],
+                "direction": "forward",
+                "max_depth": 3
+            }}
+        }}"#
+    );
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    // Root: track.
+    assert_eq!(v["canonical_id"].as_str(), Some(track_id.as_str()));
+    assert_eq!(v["subject_type"].as_str(), Some("track"));
+    assert_eq!(v["walk_truncated"].as_bool(), Some(false));
+
+    // Level 1: album, nested.
+    let album_rel = &v["related"][0];
+    assert_eq!(album_rel["target_id"].as_str(), Some(album_id.as_str()));
+    assert_eq!(album_rel["target_type"].as_str(), Some("album"));
+    let album_nested = &album_rel["nested"];
+    assert!(
+        !album_nested.is_null(),
+        "album should carry nested projection at depth=3"
+    );
+    assert_eq!(
+        album_nested["canonical_id"].as_str(),
+        Some(album_id.as_str())
+    );
+
+    // Level 2: artist, nested, leaf (no further edges).
+    let artist_rel = &album_nested["related"][0];
+    assert_eq!(artist_rel["target_id"].as_str(), Some(artist_id.as_str()));
+    assert_eq!(artist_rel["target_type"].as_str(), Some("artist"));
+    let artist_nested = &artist_rel["nested"];
+    assert!(
+        !artist_nested.is_null(),
+        "artist should carry nested projection at depth=3"
+    );
+    assert_eq!(
+        artist_nested["related"].as_array().map(|a| a.len()),
+        Some(0),
+        "artist is a leaf: no outgoing relations"
+    );
+
+    // Follow-up request on the same connection: depth=1 (pre-4c
+    // behaviour) should emit a reference without nesting.
+    let shallow_req = format!(
+        r#"{{
+            "op": "project_subject",
+            "canonical_id": "{track_id}",
+            "scope": {{
+                "relation_predicates": ["rel"],
+                "direction": "forward",
+                "max_depth": 1
+            }}
+        }}"#
+    );
+    write_frame(&mut stream, shallow_req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    let shallow_rel = &v["related"][0];
+    assert_eq!(shallow_rel["target_id"].as_str(), Some(album_id.as_str()));
+    assert!(
+        shallow_rel["nested"].is_null(),
+        "depth=1 should not nest, got: {}",
+        shallow_rel["nested"]
+    );
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
 async fn invalid_op_returns_structured_error() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let socket_path = tmp.path().join("evo.sock");

@@ -56,6 +56,22 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+/// Default maximum relation walk depth applied by scope constructors.
+///
+/// A depth of 1 reproduces the pre-4c one-hop behaviour: related
+/// subjects are emitted as references with `nested = None`. Higher
+/// depths trigger recursive expansion up to the declared limit.
+pub const DEFAULT_MAX_DEPTH: usize = 1;
+
+/// Default ceiling on the number of subjects visited during a walk.
+/// Matches the relation-graph walk cap from `RELATIONS.md` section
+/// 5.3.
+///
+/// When a walk exceeds this cap, subjects beyond the limit are emitted
+/// as references with `nested = None` and the projection's
+/// `walk_truncated` flag is set per `PROJECTIONS.md` section 13.4.
+pub const DEFAULT_MAX_VISITS: usize = 1000;
+
 /// Projection shape version emitted by v0 subject projections.
 ///
 /// A projection's consumers negotiate against this number per
@@ -111,13 +127,47 @@ impl ProjectionEngine {
     /// Compose a [`SubjectProjection`] for a canonical subject ID.
     ///
     /// The projection contains the subject's addressings and, if the
-    /// scope declares any relation predicates, a flat list of related
-    /// subjects reached in one hop along those predicates.
+    /// scope declares any relation predicates and a non-zero
+    /// `max_depth`, a list of related subjects reached by traversing
+    /// those predicates.
+    ///
+    /// ## Walk depth
+    ///
+    /// `scope.max_depth` controls recursive expansion. At each level:
+    ///
+    /// - `remaining_depth == 0`: no related subjects included; only
+    ///   the subject's own addressings.
+    /// - `remaining_depth == 1`: related subjects emitted as
+    ///   references with `nested = None`.
+    /// - `remaining_depth >= 2`: related subjects expanded
+    ///   recursively; each carries a `nested: Some(Box<...>)`
+    ///   composed with the same scope and depth decremented by one.
+    ///
+    /// Already-visited subjects are emitted as references (cycle
+    /// guard): the walk will not re-expand a subject it has already
+    /// projected anywhere in the recursion. This also terminates
+    /// walks across cyclic graphs in finite time.
+    ///
+    /// ## Walk truncation
+    ///
+    /// `scope.max_visits` bounds the total number of distinct
+    /// subjects projected across the entire walk. When the cap is
+    /// hit, further subjects are emitted as references with
+    /// `nested = None` and the projection's `walk_truncated` flag is
+    /// set, per `PROJECTIONS.md` section 13.4. The root projection
+    /// carries the post-walk value of this flag; nested projections
+    /// carry the value at the time of their own construction, so a
+    /// consumer examining a nested projection's `walk_truncated`
+    /// tells it whether its own subtree (or any earlier-built
+    /// subtree) was truncated.
     ///
     /// ## Errors
     ///
     /// Returns [`ProjectionError::UnknownSubject`] if no subject with
-    /// the given ID is registered.
+    /// the given ID is registered at the root. Unknown subjects
+    /// encountered during recursion do not error; they appear as
+    /// related entries with `target_type = None` and are flagged
+    /// degraded.
     ///
     /// ## Degraded projections
     ///
@@ -125,17 +175,53 @@ impl ProjectionEngine {
     /// pointing at subjects that are no longer in the registry (the
     /// relation graph does not cascade-delete on subject forgetting,
     /// per `RELATIONS.md` deferred items). Such edges appear in the
-    /// output with `target_type = None`, and the projection is flagged
-    /// degraded with a [`DegradedReasonKind::DanglingRelation`] entry
-    /// for each dangling target.
+    /// output with `target_type = None`, and the containing
+    /// projection is flagged degraded with a
+    /// [`DegradedReasonKind::DanglingRelation`] entry for each
+    /// dangling target. Degraded reasons are local per level: a
+    /// nested projection's `degraded_reasons` reflect only its own
+    /// level's dangling relations, not its children's.
     pub fn project_subject(
         &self,
         canonical_id: &str,
         scope: &ProjectionScope,
     ) -> Result<SubjectProjection, ProjectionError> {
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut truncated: bool = false;
+        self.project_recursive(
+            canonical_id,
+            scope,
+            scope.max_depth,
+            &mut visited,
+            &mut truncated,
+        )
+    }
+
+    /// Recursive workhorse behind [`Self::project_subject`].
+    ///
+    /// `remaining_depth` is the depth budget for this level. When
+    /// zero, no related entries are built. When 1, related entries
+    /// are built as references (`nested = None`). When >= 2, related
+    /// entries are built with recursive nested projections.
+    ///
+    /// `visited` tracks every canonical ID visited across the entire
+    /// walk; subjects already in the set are emitted as references
+    /// without recursion (cycle guard). `truncated` is set when the
+    /// `max_visits` cap would be exceeded; once set, remains set for
+    /// the duration of the call chain.
+    fn project_recursive(
+        &self,
+        canonical_id: &str,
+        scope: &ProjectionScope,
+        remaining_depth: usize,
+        visited: &mut HashSet<String>,
+        truncated: &mut bool,
+    ) -> Result<SubjectProjection, ProjectionError> {
         let record = self.registry.describe(canonical_id).ok_or_else(|| {
             ProjectionError::UnknownSubject(canonical_id.to_string())
         })?;
+
+        visited.insert(record.id.clone());
 
         let addressings: Vec<AddressingEntry> = record
             .addressings
@@ -150,49 +236,56 @@ impl ProjectionEngine {
         let mut related: Vec<RelatedSubject> = Vec::new();
         let mut degraded_reasons: Vec<DegradedReason> = Vec::new();
 
-        for predicate in &scope.relation_predicates {
-            let include_forward = matches!(
-                scope.direction,
-                WalkDirection::Forward | WalkDirection::Both
-            );
-            let include_inverse = matches!(
-                scope.direction,
-                WalkDirection::Inverse | WalkDirection::Both
-            );
+        if remaining_depth > 0 && !scope.relation_predicates.is_empty() {
+            for predicate in &scope.relation_predicates {
+                let include_forward = matches!(
+                    scope.direction,
+                    WalkDirection::Forward | WalkDirection::Both
+                );
+                let include_inverse = matches!(
+                    scope.direction,
+                    WalkDirection::Inverse | WalkDirection::Both
+                );
 
-            if include_forward {
-                for target_id in self.graph.neighbours(
-                    canonical_id,
-                    predicate,
-                    WalkDirection::Forward,
-                ) {
-                    let entry = self.build_related(
-                        predicate,
-                        RelationDirection::Forward,
+                if include_forward {
+                    for target_id in self.graph.neighbours(
                         canonical_id,
-                        &target_id,
-                        &mut degraded_reasons,
-                    );
-                    related.push(entry);
+                        predicate,
+                        WalkDirection::Forward,
+                    ) {
+                        let entry = self.build_related(
+                            predicate,
+                            RelationDirection::Forward,
+                            canonical_id,
+                            &target_id,
+                            scope,
+                            remaining_depth,
+                            visited,
+                            truncated,
+                            &mut degraded_reasons,
+                        );
+                        related.push(entry);
+                    }
                 }
-            }
 
-            if include_inverse {
-                for source_id in self.graph.neighbours(
-                    canonical_id,
-                    predicate,
-                    WalkDirection::Inverse,
-                ) {
-                    // For an inverse edge the relation triple is
-                    // (source_id, predicate, canonical_id); the
-                    // claimants hang off that triple, not the reverse.
-                    let entry = self.build_related_inverse(
-                        predicate,
-                        &source_id,
+                if include_inverse {
+                    for source_id in self.graph.neighbours(
                         canonical_id,
-                        &mut degraded_reasons,
-                    );
-                    related.push(entry);
+                        predicate,
+                        WalkDirection::Inverse,
+                    ) {
+                        let entry = self.build_related_inverse(
+                            predicate,
+                            &source_id,
+                            canonical_id,
+                            scope,
+                            remaining_depth,
+                            visited,
+                            truncated,
+                            &mut degraded_reasons,
+                        );
+                        related.push(entry);
+                    }
                 }
             }
         }
@@ -210,21 +303,33 @@ impl ProjectionEngine {
             claimants,
             degraded,
             degraded_reasons,
+            walk_truncated: *truncated,
         })
     }
 
     /// Build a [`RelatedSubject`] entry for a forward edge from
-    /// `source_id` to `target_id` along `predicate`.
+    /// `source_id` to `target_id` along `predicate`, recursing if the
+    /// scope permits.
     ///
     /// If the target subject is not in the registry, the entry still
-    /// carries the target ID but `target_type` is `None`, and a
-    /// `DanglingRelation` degraded reason is appended to `degraded`.
+    /// carries the target ID but `target_type` is `None`, a
+    /// `DanglingRelation` degraded reason is appended to `degraded`,
+    /// and `nested` is `None`.
+    ///
+    /// If the target is already visited, or `remaining_depth <= 1`,
+    /// or the visit cap would be exceeded, `nested` is `None`.
+    /// Otherwise `nested` is `Some(Box::new(recursive_projection))`.
+    #[allow(clippy::too_many_arguments)]
     fn build_related(
         &self,
         predicate: &str,
         direction: RelationDirection,
         source_id: &str,
         target_id: &str,
+        scope: &ProjectionScope,
+        remaining_depth: usize,
+        visited: &mut HashSet<String>,
+        truncated: &mut bool,
         degraded: &mut Vec<DegradedReason>,
     ) -> RelatedSubject {
         let target_record = self.registry.describe(target_id);
@@ -247,12 +352,22 @@ impl ProjectionEngine {
             })
             .unwrap_or_default();
 
+        let nested = self.maybe_nest(
+            target_id,
+            target_type.as_ref(),
+            scope,
+            remaining_depth,
+            visited,
+            truncated,
+        );
+
         RelatedSubject {
             predicate: predicate.to_string(),
             direction,
             target_id: target_id.to_string(),
             target_type,
             relation_claimants,
+            nested,
         }
     }
 
@@ -263,12 +378,18 @@ impl ProjectionEngine {
     ///
     /// The output's `target_id` is the inverse neighbour (`source_id`
     /// of the underlying triple) - i.e. the other end of the edge from
-    /// the projection's perspective.
+    /// the projection's perspective. Nesting semantics are identical
+    /// to [`Self::build_related`].
+    #[allow(clippy::too_many_arguments)]
     fn build_related_inverse(
         &self,
         predicate: &str,
         source_id: &str,
         subject_id: &str,
+        scope: &ProjectionScope,
+        remaining_depth: usize,
+        visited: &mut HashSet<String>,
+        truncated: &mut bool,
         degraded: &mut Vec<DegradedReason>,
     ) -> RelatedSubject {
         let source_record = self.registry.describe(source_id);
@@ -291,21 +412,91 @@ impl ProjectionEngine {
             })
             .unwrap_or_default();
 
+        let nested = self.maybe_nest(
+            source_id,
+            source_type.as_ref(),
+            scope,
+            remaining_depth,
+            visited,
+            truncated,
+        );
+
         RelatedSubject {
             predicate: predicate.to_string(),
             direction: RelationDirection::Inverse,
             target_id: source_id.to_string(),
             target_type: source_type,
             relation_claimants,
+            nested,
+        }
+    }
+
+    /// Decide whether to recurse into a neighbour and produce its
+    /// nested projection.
+    ///
+    /// Returns `Some(projection)` when:
+    /// - `remaining_depth > 1` (we have depth budget to expand), AND
+    /// - the neighbour exists in the registry (`neighbour_type` is
+    ///   `Some`), AND
+    /// - the neighbour has not already been visited (cycle guard), AND
+    /// - the visit cap has not been exceeded.
+    ///
+    /// Otherwise returns `None`. When the visit cap is the reason,
+    /// sets `*truncated = true`.
+    fn maybe_nest(
+        &self,
+        neighbour_id: &str,
+        neighbour_type: Option<&String>,
+        scope: &ProjectionScope,
+        remaining_depth: usize,
+        visited: &mut HashSet<String>,
+        truncated: &mut bool,
+    ) -> Option<Box<SubjectProjection>> {
+        if remaining_depth <= 1 {
+            return None;
+        }
+        if neighbour_type.is_none() {
+            return None;
+        }
+        if visited.contains(neighbour_id) {
+            return None;
+        }
+        if visited.len() >= scope.max_visits {
+            *truncated = true;
+            return None;
+        }
+        match self.project_recursive(
+            neighbour_id,
+            scope,
+            remaining_depth - 1,
+            visited,
+            truncated,
+        ) {
+            Ok(p) => Some(Box::new(p)),
+            // A failure here is unreachable in practice: we checked
+            // that the neighbour exists in the registry. If a TOCTOU
+            // race somehow removed it between the describe() and the
+            // recursion, we emit a reference rather than error out.
+            Err(_) => None,
         }
     }
 }
 
 /// Scope declaration for a projection.
 ///
-/// A scope names which relation predicates to traverse and in which
-/// direction. An empty predicate list means no relations are included
-/// in the projection; only the subject's own addressings are returned.
+/// A scope names which relation predicates to traverse, in which
+/// direction, to what depth, and how many total subjects to visit
+/// before truncating. An empty predicate list or zero `max_depth`
+/// means no relations are included in the projection; only the
+/// subject's own addressings are returned.
+///
+/// Scope construction is chainable:
+///
+/// ```ignore
+/// let scope = ProjectionScope::forward(["album_of", "performed_by"])
+///     .with_max_depth(3)
+///     .with_max_visits(100);
+/// ```
 #[derive(Debug, Clone)]
 pub struct ProjectionScope {
     /// Predicates to traverse. Empty means no relation traversal.
@@ -316,21 +507,40 @@ pub struct ProjectionScope {
     /// - `Inverse`: include edges where this subject is the target.
     /// - `Both`: include both directions.
     pub direction: WalkDirection,
+    /// Maximum walk depth from the root subject.
+    ///
+    /// - `0`: no relations traversed; only root addressings.
+    /// - `1`: one-hop references; `nested` is `None` on every
+    ///   related entry.
+    /// - `>= 2`: recursive expansion; related entries carry nested
+    ///   [`SubjectProjection`] documents.
+    ///
+    /// Defaults to [`DEFAULT_MAX_DEPTH`].
+    pub max_depth: usize,
+    /// Upper bound on the number of distinct subjects projected
+    /// during a walk. When exceeded, further subjects are emitted as
+    /// references (nested = None) and the projection's
+    /// `walk_truncated` flag is set.
+    ///
+    /// Defaults to [`DEFAULT_MAX_VISITS`].
+    pub max_visits: usize,
 }
 
 impl ProjectionScope {
-    /// Construct an empty scope: no predicates, forward direction.
-    /// A projection composed with this scope will contain no related
-    /// subjects.
+    /// Construct an empty scope: no predicates, forward direction,
+    /// default depth and visit caps. A projection composed with this
+    /// scope will contain no related subjects.
     pub fn none() -> Self {
         Self {
             relation_predicates: Vec::new(),
             direction: WalkDirection::Forward,
+            max_depth: DEFAULT_MAX_DEPTH,
+            max_visits: DEFAULT_MAX_VISITS,
         }
     }
 
     /// Construct a scope traversing the given predicates in the
-    /// forward direction.
+    /// forward direction, with default depth and visit caps.
     pub fn forward<I, S>(predicates: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -339,11 +549,13 @@ impl ProjectionScope {
         Self {
             relation_predicates: predicates.into_iter().map(Into::into).collect(),
             direction: WalkDirection::Forward,
+            max_depth: DEFAULT_MAX_DEPTH,
+            max_visits: DEFAULT_MAX_VISITS,
         }
     }
 
     /// Construct a scope traversing the given predicates in the
-    /// inverse direction.
+    /// inverse direction, with default depth and visit caps.
     pub fn inverse<I, S>(predicates: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -352,11 +564,13 @@ impl ProjectionScope {
         Self {
             relation_predicates: predicates.into_iter().map(Into::into).collect(),
             direction: WalkDirection::Inverse,
+            max_depth: DEFAULT_MAX_DEPTH,
+            max_visits: DEFAULT_MAX_VISITS,
         }
     }
 
     /// Construct a scope traversing the given predicates in both
-    /// directions.
+    /// directions, with default depth and visit caps.
     pub fn both<I, S>(predicates: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -365,7 +579,21 @@ impl ProjectionScope {
         Self {
             relation_predicates: predicates.into_iter().map(Into::into).collect(),
             direction: WalkDirection::Both,
+            max_depth: DEFAULT_MAX_DEPTH,
+            max_visits: DEFAULT_MAX_VISITS,
         }
+    }
+
+    /// Override the maximum walk depth. See [`Self::max_depth`].
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth;
+        self
+    }
+
+    /// Override the maximum visit count. See [`Self::max_visits`].
+    pub fn with_max_visits(mut self, max_visits: usize) -> Self {
+        self.max_visits = max_visits;
+        self
     }
 }
 
@@ -377,9 +605,10 @@ impl Default for ProjectionScope {
 
 /// A pull-projected view of one canonical subject.
 ///
-/// Carries the subject's addressings, a flat list of one-hop related
-/// subjects reached per the scope, and metadata (shape version,
-/// composition timestamp, deduplicated claimants, degraded flag).
+/// Carries the subject's addressings, related subjects (possibly
+/// nested recursively per scope), and metadata (shape version,
+/// composition timestamp, deduplicated claimants, degraded flag,
+/// walk-truncated flag).
 #[derive(Debug, Clone)]
 pub struct SubjectProjection {
     /// Canonical subject ID this projection describes.
@@ -390,7 +619,9 @@ pub struct SubjectProjection {
     /// attribution.
     pub addressings: Vec<AddressingEntry>,
     /// Related subjects reached by traversing the scope's predicates
-    /// in the scope's declared direction(s). One hop only in v0.
+    /// in the scope's declared direction(s). Each entry may carry a
+    /// recursively composed `nested` [`SubjectProjection`] when the
+    /// scope's depth permits.
     pub related: Vec<RelatedSubject>,
     /// When this projection was composed.
     pub composed_at: SystemTime,
@@ -403,7 +634,16 @@ pub struct SubjectProjection {
     /// True iff [`Self::degraded_reasons`] is non-empty.
     pub degraded: bool,
     /// Reasons this projection is degraded, one entry per issue.
+    /// Local to this projection's level: a nested projection's
+    /// `degraded_reasons` do not include its children's reasons.
     pub degraded_reasons: Vec<DegradedReason>,
+    /// True if the walk was truncated at any point during or before
+    /// this projection's construction. A root projection with this
+    /// flag true means somewhere in the walk the `max_visits` cap
+    /// was reached; a nested projection with this flag true means
+    /// truncation happened at or before the point this sub-projection
+    /// was built. Per `PROJECTIONS.md` section 13.4.
+    pub walk_truncated: bool,
 }
 
 /// One addressing entry in a subject projection.
@@ -418,7 +658,13 @@ pub struct AddressingEntry {
 }
 
 /// One related-subject entry in a subject projection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Does not derive `PartialEq`/`Eq` because the recursive `nested`
+/// field would transitively require those bounds on
+/// [`SubjectProjection`], which carries a `SystemTime` composition
+/// timestamp - comparing projections by timestamp is rarely what a
+/// caller wants. Tests compare individual fields.
+#[derive(Debug, Clone)]
 pub struct RelatedSubject {
     /// Predicate name along which this edge was traversed.
     pub predicate: String,
@@ -435,6 +681,24 @@ pub struct RelatedSubject {
     pub target_type: Option<String>,
     /// Plugins claiming the underlying relation.
     pub relation_claimants: Vec<String>,
+    /// Recursively composed projection for the other end of this
+    /// edge, when the scope's `max_depth` permitted expansion.
+    ///
+    /// `None` means the subject was not expanded. Reasons for
+    /// non-expansion:
+    ///
+    /// - Scope depth was one (no recursion requested).
+    /// - The target was already visited elsewhere in the walk
+    ///   (cycle guard).
+    /// - The visit cap was reached (the containing projection's
+    ///   `walk_truncated` flag will be set).
+    /// - The target is not in the subject registry (a dangling
+    ///   relation; the containing projection is also flagged
+    ///   degraded).
+    ///
+    /// When `Some`, the nested projection is composed with the same
+    /// scope, but with the depth decremented by one.
+    pub nested: Option<Box<SubjectProjection>>,
 }
 
 /// Direction an edge was traversed, relative to the subject the
@@ -830,6 +1094,8 @@ mod tests {
         let s1 = ProjectionScope::none();
         assert!(s1.relation_predicates.is_empty());
         assert_eq!(s1.direction, WalkDirection::Forward);
+        assert_eq!(s1.max_depth, DEFAULT_MAX_DEPTH);
+        assert_eq!(s1.max_visits, DEFAULT_MAX_VISITS);
 
         let s2 = ProjectionScope::forward(["p1", "p2"]);
         assert_eq!(s2.relation_predicates.len(), 2);
@@ -840,5 +1106,270 @@ mod tests {
 
         let s4 = ProjectionScope::both(["p1"]);
         assert_eq!(s4.direction, WalkDirection::Both);
+    }
+
+    #[test]
+    fn projection_scope_builder_chains() {
+        let s = ProjectionScope::forward(["album_of"])
+            .with_max_depth(5)
+            .with_max_visits(42);
+        assert_eq!(s.max_depth, 5);
+        assert_eq!(s.max_visits, 42);
+        assert_eq!(s.relation_predicates, vec!["album_of".to_string()]);
+        assert_eq!(s.direction, WalkDirection::Forward);
+    }
+
+    #[test]
+    fn project_subject_default_depth_one_has_no_nested() {
+        // Confirm pre-4c behaviour is preserved: default depth is 1,
+        // related entries carry nested=None.
+        let reg = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let eng = ProjectionEngine::new(Arc::clone(&reg), Arc::clone(&graph));
+
+        let track_id = announce(&reg, "track", "s", "t1", "p");
+        let album_id = announce(&reg, "album", "s", "a1", "p");
+        graph.assert(&track_id, "album_of", &album_id, "p", None).unwrap();
+
+        let p = eng
+            .project_subject(
+                &track_id,
+                &ProjectionScope::forward(["album_of"]),
+            )
+            .unwrap();
+        assert_eq!(p.related.len(), 1);
+        assert!(p.related[0].nested.is_none());
+        assert!(!p.walk_truncated);
+    }
+
+    #[test]
+    fn project_subject_max_depth_zero_yields_no_related() {
+        let reg = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let eng = ProjectionEngine::new(Arc::clone(&reg), Arc::clone(&graph));
+
+        let track_id = announce(&reg, "track", "s", "t1", "p");
+        let album_id = announce(&reg, "album", "s", "a1", "p");
+        graph.assert(&track_id, "album_of", &album_id, "p", None).unwrap();
+
+        let scope = ProjectionScope::forward(["album_of"]).with_max_depth(0);
+        let p = eng.project_subject(&track_id, &scope).unwrap();
+        assert!(
+            p.related.is_empty(),
+            "expected no related with depth=0, got {:?}",
+            p.related
+        );
+    }
+
+    #[test]
+    fn project_subject_depth_two_expands_one_level() {
+        let reg = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let eng = ProjectionEngine::new(Arc::clone(&reg), Arc::clone(&graph));
+
+        // track -> album, album -> artist
+        let track_id = announce(&reg, "track", "s", "t1", "com.example.mpd");
+        let album_id =
+            announce(&reg, "album", "s", "a1", "com.example.metadata");
+        let artist_id =
+            announce(&reg, "artist", "s", "ar1", "com.example.metadata");
+        graph
+            .assert(
+                &track_id,
+                "album_of",
+                &album_id,
+                "com.example.metadata",
+                None,
+            )
+            .unwrap();
+        graph
+            .assert(
+                &album_id,
+                "album_of",
+                &artist_id,
+                "com.example.metadata",
+                None,
+            )
+            .unwrap();
+
+        let scope = ProjectionScope::forward(["album_of"]).with_max_depth(2);
+        let p = eng.project_subject(&track_id, &scope).unwrap();
+
+        assert_eq!(p.related.len(), 1);
+        let album_entry = &p.related[0];
+        assert_eq!(album_entry.target_id, album_id);
+        let nested = album_entry
+            .nested
+            .as_ref()
+            .expect("depth=2 should nest the album");
+        assert_eq!(nested.canonical_id, album_id);
+        assert_eq!(nested.subject_type, "album");
+        // The nested album's related should have artist as a
+        // reference-only (depth exhausted at that level).
+        assert_eq!(nested.related.len(), 1);
+        assert_eq!(nested.related[0].target_id, artist_id);
+        assert!(nested.related[0].nested.is_none());
+    }
+
+    #[test]
+    fn project_subject_depth_three_expands_two_levels() {
+        let reg = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let eng = ProjectionEngine::new(Arc::clone(&reg), Arc::clone(&graph));
+
+        // track -> album -> artist (chain of 3)
+        let track_id = announce(&reg, "track", "s", "t1", "p");
+        let album_id = announce(&reg, "album", "s", "a1", "p");
+        let artist_id = announce(&reg, "artist", "s", "ar1", "p");
+        graph.assert(&track_id, "rel", &album_id, "p", None).unwrap();
+        graph.assert(&album_id, "rel", &artist_id, "p", None).unwrap();
+
+        let scope = ProjectionScope::forward(["rel"]).with_max_depth(3);
+        let p = eng.project_subject(&track_id, &scope).unwrap();
+
+        let album = p.related[0]
+            .nested
+            .as_ref()
+            .expect("album should nest");
+        let artist = album.related[0]
+            .nested
+            .as_ref()
+            .expect("artist should nest at depth 3");
+        assert_eq!(artist.canonical_id, artist_id);
+        assert_eq!(artist.subject_type, "artist");
+        // Artist has no outgoing edges, so its related is empty.
+        assert!(artist.related.is_empty());
+    }
+
+    #[test]
+    fn project_subject_handles_cycles_without_infinite_recursion() {
+        let reg = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let eng = ProjectionEngine::new(Arc::clone(&reg), Arc::clone(&graph));
+
+        // A -> B -> C -> A (cycle)
+        let a = announce(&reg, "x", "s", "a", "p");
+        let b = announce(&reg, "x", "s", "b", "p");
+        let c = announce(&reg, "x", "s", "c", "p");
+        graph.assert(&a, "next", &b, "p", None).unwrap();
+        graph.assert(&b, "next", &c, "p", None).unwrap();
+        graph.assert(&c, "next", &a, "p", None).unwrap();
+
+        // Deep walk: should terminate because each subject is visited
+        // only once.
+        let scope = ProjectionScope::forward(["next"]).with_max_depth(100);
+        let p = eng.project_subject(&a, &scope).unwrap();
+
+        // a -> b (nested)
+        let b_proj = p.related[0]
+            .nested
+            .as_ref()
+            .expect("b should nest");
+        assert_eq!(b_proj.canonical_id, b);
+        // b -> c (nested)
+        let c_proj = b_proj.related[0]
+            .nested
+            .as_ref()
+            .expect("c should nest");
+        assert_eq!(c_proj.canonical_id, c);
+        // c -> a (cycle guard: nested=None, but the reference is
+        // still emitted)
+        assert_eq!(c_proj.related.len(), 1);
+        assert_eq!(c_proj.related[0].target_id, a);
+        assert!(
+            c_proj.related[0].nested.is_none(),
+            "cycle should not re-expand a: expected nested=None"
+        );
+        // walk_truncated should be false: cycles do not truncate.
+        assert!(!p.walk_truncated);
+    }
+
+    #[test]
+    fn project_subject_max_visits_truncates_and_flags() {
+        let reg = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let eng = ProjectionEngine::new(Arc::clone(&reg), Arc::clone(&graph));
+
+        // Hub with 5 spokes.
+        let hub = announce(&reg, "hub", "s", "hub", "p");
+        let mut spokes = Vec::new();
+        for i in 0..5 {
+            let id = announce(&reg, "spoke", "s", &format!("sp{i}"), "p");
+            graph.assert(&hub, "edge", &id, "p", None).unwrap();
+            // Give each spoke one further edge so depth-2 would want
+            // to expand them.
+            let leaf =
+                announce(&reg, "leaf", "s", &format!("leaf{i}"), "p");
+            graph.assert(&id, "edge", &leaf, "p", None).unwrap();
+            spokes.push(id);
+        }
+
+        // Cap visits at 3: we can fully project the hub + 2 spokes,
+        // remaining 3 spokes become references.
+        let scope = ProjectionScope::forward(["edge"])
+            .with_max_depth(2)
+            .with_max_visits(3);
+        let p = eng.project_subject(&hub, &scope).unwrap();
+
+        assert_eq!(p.related.len(), 5, "all 5 spokes listed as related");
+        let expanded_count =
+            p.related.iter().filter(|r| r.nested.is_some()).count();
+        assert!(
+            expanded_count < 5,
+            "expected truncation: some spokes should be references only"
+        );
+        assert!(
+            p.walk_truncated,
+            "root projection should be flagged walk_truncated"
+        );
+    }
+
+    #[test]
+    fn project_subject_diamond_shares_visit_set() {
+        let reg = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let eng = ProjectionEngine::new(Arc::clone(&reg), Arc::clone(&graph));
+
+        // Diamond: A -> B, A -> C, B -> D, C -> D.
+        // With depth >= 3 and forward direction, D should be
+        // expanded on the first path that reaches it and emitted as
+        // a reference on the second (cycle guard via visited set).
+        let a = announce(&reg, "x", "s", "a", "p");
+        let b = announce(&reg, "x", "s", "b", "p");
+        let c = announce(&reg, "x", "s", "c", "p");
+        let d = announce(&reg, "x", "s", "d", "p");
+        graph.assert(&a, "e", &b, "p", None).unwrap();
+        graph.assert(&a, "e", &c, "p", None).unwrap();
+        graph.assert(&b, "e", &d, "p", None).unwrap();
+        graph.assert(&c, "e", &d, "p", None).unwrap();
+
+        let scope = ProjectionScope::forward(["e"]).with_max_depth(5);
+        let p = eng.project_subject(&a, &scope).unwrap();
+
+        // Find b and c in a's related.
+        let b_entry = p
+            .related
+            .iter()
+            .find(|r| r.target_id == b)
+            .expect("b should be a related of a");
+        let c_entry = p
+            .related
+            .iter()
+            .find(|r| r.target_id == c)
+            .expect("c should be a related of a");
+
+        let b_proj = b_entry.nested.as_ref().expect("b should nest");
+        let c_proj = c_entry.nested.as_ref().expect("c should nest");
+
+        // Exactly one of b/c should have d nested; the other gets d
+        // as a reference only. The order depends on graph iteration
+        // order, so we check the invariant rather than which side
+        // expanded.
+        let b_d_nested = b_proj.related[0].nested.is_some();
+        let c_d_nested = c_proj.related[0].nested.is_some();
+        assert!(
+            b_d_nested ^ c_d_nested,
+            "exactly one of b, c should expand d; got b_nested={b_d_nested}, c_nested={c_d_nested}"
+        );
     }
 }
