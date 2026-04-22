@@ -156,5 +156,5 @@ Concept-level decisions deferred to the engineering layer. Named here so downstr
 | Relation grammar | `docs/engineering/RELATIONS.md` |
 | Projection subscription protocol | `docs/engineering/PROJECTIONS.md` |
 | Fast-path mechanism | `docs/engineering/FAST_PATH.md` |
-| Steward startup and essence enforcement | Future: `docs/engineering/STEWARD.md` |
+| Steward startup and essence enforcement | `docs/engineering/STEWARD.md` |
 | Trust class taxonomy detail | Covered in `PLUGIN_PACKAGING.md`. |

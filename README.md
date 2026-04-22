@@ -17,8 +17,7 @@ This repository holds the steward, the plugin SDK, the plugin tooling, and the e
 | [docs/engineering/RELATIONS.md](docs/engineering/RELATIONS.md) | Relation graph. Typed and directed subject-to-subject connections, catalogue-declared grammar, multi-claimant assertions, scoped walks, cardinality handling, merge and split cascade, operator overrides, persistence, happenings. |
 | [docs/engineering/PROJECTIONS.md](docs/engineering/PROJECTIONS.md) | Projection layer. Structural and federated queries, pull and push, catalogue-declared shapes, plugin contribution composition rules, subscription scopes, aggregation hints, caching, schema evolution, degraded states. |
 | [docs/engineering/FAST_PATH.md](docs/engineering/FAST_PATH.md) | Fast-path mutation channel. Catalogue-declared commands against active wardens, rack/subject addressing, budgets, ordering, idempotency, relationship to projections and happenings, audit. |
-
-Further engineering-layer documents (steward startup and essence enforcement) are deliberately open. See `docs/CONCEPT.md` section 10.
+| [docs/engineering/STEWARD.md](docs/engineering/STEWARD.md) | The steward process. Module structure, admission contracts, client-facing and plugin-facing protocols, shared state, concurrency model, configuration, deferred capabilities, invariants. |
 
 ## Distributions
 
@@ -26,7 +25,7 @@ Evo is domain-neutral. A device ships as a distribution of evo: a catalogue decl
 
 ## Status
 
-Engineering layer, plus a working v0 steward skeleton. See `crates/evo` for the runnable binary and `crates/evo-plugin-sdk` for the plugin SDK.
+Engineering layer plus a running v0 steward. Admits singleton respondents and wardens (in-process or over a Unix socket), maintains subject and relation registries, composes projections on demand, tracks active custodies in a ledger, and emits happenings on a bus. See `crates/evo` for the runnable binary, `crates/evo-plugin-sdk` for the plugin SDK, and `crates/evo-example-echo` / `crates/evo-example-warden` for reference plugins.
 
 ## License
 

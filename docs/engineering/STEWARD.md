@@ -16,7 +16,7 @@ The essence statement from `CONCEPT.md` is:
 
 > A device that plays audio from any reachable source, through a configurable audio path, to any present output, while presenting coherent information about what it is doing to any consumer that looks.
 
-The steward is the component that enforces this statement. It owns the catalogue, the subject registry, the relation graph, the projection layer, the admission pipeline, the client-facing socket, and (in the target state) the custody ledger, the happenings stream, the appointments engine, and the watches engine.
+The steward is the component that enforces this statement. It owns the catalogue, the subject registry, the relation graph, the projection layer, the admission pipeline, the client-facing socket, the custody ledger, and the happenings bus. The appointments engine and the watches engine from `CONCEPT.md` section 2 remain deferred.
 
 Everything else in evo is a plugin, a consumer, a document, or a build artefact. The steward is what runs on the device, and the steward is the thing that knows what the device is doing.
 
@@ -25,14 +25,16 @@ Everything else in evo is a plugin, a consumer, a document, or a build artefact.
 The steward's charter, in order of foundational-to-operational:
 
 1. Read the catalogue. Validate its shape. Refuse to start if the catalogue is malformed.
-2. Discover and admit plugins. Validate each plugin's manifest against the catalogue's slot declarations. Refuse plugins whose declarations do not match.
+2. Discover and admit plugins. Validate each plugin's manifest against the catalogue's slot declarations. Refuse plugins whose declarations do not match. Admit both respondent and warden plugins, in-process or out-of-process.
 3. For out-of-process plugins: spawn the plugin process, connect to its socket, drive its load lifecycle.
-4. Expose a client-facing socket. Dispatch plugin-request operations to admitted plugins. Compose and serve subject projections on demand.
+4. Expose a client-facing socket. Dispatch plugin-request operations to admitted plugins. Compose and serve subject projections on demand. Expose the custody ledger for external inspection.
 5. Maintain the subject registry. Reconcile plugin subject announcements into canonical identities.
 6. Maintain the relation graph. Record and retract relations claimed by plugins.
-7. On shutdown: drive every admitted plugin through unload. Release resources. Remove the socket.
+7. Maintain the custody ledger. Record every custody the steward hands to a warden, track each warden's state reports, drop entries on release.
+8. Emit happenings for custody transitions on a bus any interested party can subscribe to.
+9. On shutdown: drive every admitted plugin through unload. Release resources. Remove the socket.
 
-These seven are fully implemented in v0. Three more are defined in `CONCEPT.md` and deferred: custody ledger (section 12.2), appointments and watches (section 12.3), happenings stream (section 12.4).
+These nine are fully implemented. Remaining deferred concepts from `CONCEPT.md` section 2: appointments and watches, persistent state across restarts, a happenings subscription surface on the client socket, factory plugins.
 
 ## 3. Process Model
 
@@ -64,11 +66,13 @@ The `evo` crate is the steward. Its modules, and their responsibilities:
 | `error` | The steward's unified error type, `StewardError`. |
 | `subjects` | Subject registry. Canonical identity, addressing reconciliation, claimant tracking. Exposes `SubjectRegistry`, `SubjectRecord`, `AnnounceOutcome`. |
 | `relations` | Relation graph. Typed directed edges with multi-plugin claimant sets. Exposes `RelationGraph`, `WalkDirection`, `WalkScope`, `Relation`. |
+| `custody` | Custody ledger. Records active custodies keyed by `(plugin, handle_id)`. Updated on `take_custody`, every state report, and `release_custody`. Exposes `CustodyLedger`, `CustodyRecord`, `StateSnapshot`, `LedgerCustodyStateReporter`. |
 | `projections` | Projection engine. Composes subject projections on demand, including recursive relation walks with cycle guards and visit caps. Exposes `ProjectionEngine`, `ProjectionScope`, `SubjectProjection`. |
-| `admission` | Admission engine. Accepts plugins (singleton respondents are the only kind currently supported). Routes plugin requests to the admitted plugin for a shelf. Exposes `AdmissionEngine`. |
+| `admission` | Admission engine. Accepts plugins (singleton respondents and wardens, in-process or out-of-process). Routes plugin requests, custody verbs, and emits custody happenings on the bus. Exposes `AdmissionEngine`. |
 | `context` | The `LoadContext` handed to each plugin at load time. Carries the announcers and state reporters the plugin uses to push data back into the steward. |
-| `wire_client` | Wire-level client for out-of-process plugins. Wraps a connected socket; speaks the plugin-facing protocol. Exposes `WireClient`, `WireRespondent` (the adapter that makes a wire-backed plugin look like an in-process plugin to the admission engine). |
-| `server` | Client-facing Unix socket server. Accepts connections, reads length-prefixed JSON frames, dispatches plugin requests and projection queries. Exposes `Server`. |
+| `wire_client` | Wire-level client for out-of-process plugins. Wraps a connected socket; speaks the plugin-facing protocol. Exposes `WireClient`, `WireRespondent`, `WireWarden` (the adapters that make a wire-backed plugin look like an in-process plugin to the admission engine). |
+| `happenings` | Happenings bus. Streamed notifications for fabric transitions; carries custody variants in this version. Exposes `Happening` (`#[non_exhaustive]`) and `HappeningBus`. |
+| `server` | Client-facing Unix socket server. Accepts connections, reads length-prefixed JSON frames, dispatches plugin requests, projection queries, and custody-ledger snapshots. Exposes `Server`. |
 | `shutdown` | Signal-waiting helper. Exposes `wait_for_signal`. |
 
 Every module except `main` is public from the library crate. Tests may import any of them directly; integration tests in `tests/end_to_end.rs` do.
@@ -79,16 +83,19 @@ Admission is the process by which a plugin becomes part of the running fabric. T
 
 ### 5.1 Admission Contracts
 
-Two admission paths exist today, both for singleton respondents:
+Admission supports both respondent and warden interaction shapes, in-process or out-of-process:
 
 ```rust
 AdmissionEngine::admit_singleton_respondent(plugin, manifest, catalogue)
+AdmissionEngine::admit_singleton_warden(plugin, manifest, catalogue)
+AdmissionEngine::admit_out_of_process_respondent(manifest, catalogue, reader, writer)
+AdmissionEngine::admit_out_of_process_warden(manifest, catalogue, reader, writer)
 AdmissionEngine::admit_out_of_process_from_directory(plugin_dir, runtime_dir, catalogue)
 ```
 
-The in-process variant takes a constructed plugin instance directly. The out-of-process variant reads a manifest from a directory, spawns the plugin binary as a child process, waits for its Unix socket to appear, connects, and wraps the wire client in a `WireRespondent` adapter so the admission engine can treat it uniformly.
+The in-process variants take a constructed plugin instance directly. The low-level out-of-process variants take the reader and writer halves of a pre-established connection and are primarily used by tests that inject in-memory transports. Production callers go through `admit_out_of_process_from_directory`, which reads a manifest from a directory, spawns the plugin binary as a child process, waits for its Unix socket to appear, connects, and branches on `manifest.kind.interaction` to select the respondent or warden path.
 
-A lower-level out-of-process admission exists too (`admit_out_of_process_respondent<R, W>`), used by tests to inject in-memory transports. Production callers go through the directory-based form.
+Factory admission (`Instance::Factory`) is deferred; v0 supports singleton instances only.
 
 ### 5.2 Validation
 
@@ -100,7 +107,8 @@ Every admission validates the plugin's manifest against the catalogue:
 | Target shelf exists in catalogue | `StewardError::MissingShelf` |
 | Plugin `describe` returns an identity matching the manifest | `StewardError::IdentityMismatch` |
 | No plugin is already admitted on this shelf (singletons enforce this) | `StewardError::DuplicateShelf` |
-| Shelf-shape version is in the slot's supported range | Not yet enforced; see section 12.6 |
+| `manifest.kind.interaction` matches the admission path (respondent vs warden) | `StewardError::Admission` with a message naming the mismatch |
+| Shelf-shape version is in the slot's supported range | Not yet enforced; see section 12.4 |
 
 A validation failure during out-of-process admission is handled by tearing down the child process cleanly before returning the error (section 5.4).
 
@@ -144,12 +152,13 @@ Frames above 1 MiB are rejected as `Dispatch("frame too large")`. Zero-length fr
 
 ### 6.2 Request Shapes
 
-Every request carries an `op` discriminator. v0 defines two ops:
+Every request carries an `op` discriminator. v0 defines three ops:
 
 | Op | Purpose |
 |----|---------|
 | `request` | Dispatch a plugin request on a specific shelf. |
 | `project_subject` | Compose and return a federated subject projection. |
+| `list_active_custodies` | Snapshot the custody ledger. |
 
 Unknown ops return a structured error; they do not close the connection.
 
@@ -179,6 +188,16 @@ The steward base64-decodes the payload, assigns a correlation ID, constructs an 
 
 The `scope` field is optional. Omitting it or omitting its sub-fields yields a scope with no relation traversal, default depth (1), and default visit cap (1000). See `PROJECTIONS.md` section 4 for the projection shape emitted.
 
+#### `op = "list_active_custodies"`
+
+```json
+{ "op": "list_active_custodies" }
+```
+
+No arguments in v0. Returns every currently-held custody in the ledger. The response shape is documented in section 6.3.
+
+A future pass may add filter arguments (by plugin, by shelf); the empty-argument form is the base case and will remain valid.
+
 ### 6.3 Response Shapes
 
 Responses are untagged; variants are disambiguated by the distinct top-level fields of each shape.
@@ -187,6 +206,7 @@ Responses are untagged; variants are disambiguated by the distinct top-level fie
 |-------|------|
 | `{ "payload_b64": "..." }` | Plugin request succeeded. |
 | Full `SubjectProjection` with `canonical_id`, `subject_type`, `addressings`, `related`, `composed_at_ms`, `shape_version`, `claimants`, `degraded`, `degraded_reasons`, `walk_truncated` | Projection succeeded. |
+| `{ "active_custodies": [...] }` | `list_active_custodies` succeeded. Each array element has `plugin`, `handle_id`, `shelf`, `custody_type`, `last_state`, `started_at_ms`, `last_updated_ms`. `last_state` is `{ payload_b64, health, reported_at_ms }` or `null`. Optional fields (`shelf`, `custody_type`, `last_state`) serialise as `null` rather than being omitted. |
 | `{ "error": "..." }` | Any failure: unknown op, unknown shelf, unknown subject, plugin error, invalid JSON, invalid base64. |
 
 The `composed_at_ms` field is milliseconds since the UNIX epoch. Enumerated fields (`direction`, degraded `kind`) are snake_case strings.
@@ -232,24 +252,26 @@ At load time, each plugin receives a `LoadContext`:
 | `subject_announcer` | Announce and retract subjects. Goes to the shared `SubjectRegistry`. |
 | `relation_announcer` | Assert and retract relations. Goes to the shared `RelationGraph`. |
 | `state_reporter` | Push state reports (logged today; folded into rack projections when those land). |
-| `custody_state_reporter` | Warden-only; not yet wired. |
+| `custody_state_reporter` | Warden-only. Every assignment carries a `LedgerCustodyStateReporter` tagged with the warden's name; the reporter UPSERTs state snapshots into the custody ledger on every report. Out-of-process wardens install the same reporter in their wire-client event sink so `ReportCustodyState` frames arriving over the wire land in the same ledger. |
 | `user_interaction_requester` | Request a user-facing prompt; logged today, routed to kiosk or remote UI when those exist. |
 
 The announcers carry the plugin's identity (`claimant`) so the registry can track who said what. A plugin trying to retract a claim it did not make is rejected (`StewardError::ClaimantMismatch`).
 
 ## 8. Shared State
 
-The steward owns three long-lived stores, all held as `Arc<T>` and shared between the admission engine, the wire clients, and the projection engine.
+The steward owns five long-lived stores, all held as `Arc<T>` and shared between the admission engine, the wire clients, the projection engine, and the server.
 
 | Store | Type | Purpose |
 |-------|------|---------|
 | Subject registry | `Arc<SubjectRegistry>` | Canonical subject identities and their addressings. See `SUBJECTS.md`. |
 | Relation graph | `Arc<RelationGraph>` | Typed directed edges between subjects. See `RELATIONS.md`. |
-| Projection engine | `Arc<ProjectionEngine>` | Read-only composer over the above two. See `PROJECTIONS.md`. |
+| Custody ledger | `Arc<CustodyLedger>` | Active custodies keyed by `(plugin, handle_id)` with shelf, custody type, and most recent state snapshot. |
+| Happenings bus | `Arc<HappeningBus>` | Streamed notifications of fabric transitions. Backed by a tokio broadcast channel. |
+| Projection engine | `Arc<ProjectionEngine>` | Read-only composer over the subject registry and relation graph. See `PROJECTIONS.md`. |
 
 The admission engine is wrapped in an `Arc<Mutex<AdmissionEngine>>` and shared with the server. The server holds its own `Arc<ProjectionEngine>`.
 
-No store is persisted. Restart yields an empty fabric (section 12.5).
+No store is persisted. Restart yields an empty fabric (section 12.3).
 
 ## 9. Concurrency Model
 
@@ -259,9 +281,11 @@ The steward is asynchronous and single-process. Its concurrency primitives:
 |-----------|----------|
 | `tokio::sync::Mutex` | `AdmissionEngine` (admission and shutdown are serialised). |
 | `std::sync::Mutex` (inside registries) | Fine-grained internal locking of the subject registry and relation graph. Sync rather than async because these operations are short and call sites are typically sync. |
+| `std::sync::RwLock` (inside custody ledger) | Fine-grained internal locking of the custody ledger. Read-heavy (`describe`, `list_active`) with occasional writes (`record_custody`, `record_state`, `release_custody`). |
 | `Arc<AtomicBool>` | Liveness coordination in `WireClient`. |
 | `tokio::sync::mpsc` | Writer-task channels inside `WireClient`. |
 | `tokio::sync::oneshot` | Shutdown signalling. |
+| `tokio::sync::broadcast` | Happenings bus. Multiple consumers, each sees every happening emitted after subscribing; slow consumers get `Lagged` errors and recover. |
 | `tokio::spawn` | Accept loop task, per-connection handler tasks, per-plugin reader/writer tasks for out-of-process plugins. |
 
 The admission engine's mutex serialises admission and shutdown. Per-request handling grabs the admission mutex briefly, fetches the plugin, calls through, and releases. For the current singleton-respondent-only v0 this is not a bottleneck; it will become one when wardens produce high-frequency state reports. The fast path (`FAST_PATH.md`) is how that gets addressed.
@@ -313,43 +337,37 @@ Catalogue validation runs at steward startup. Malformed catalogues refuse startu
 
 These are documented in `CONCEPT.md` as fabric-level concepts but are not yet implemented in the steward. Each is named here so the next engineering document can pick it up.
 
-### 12.1 Warden Plugins
+Since this document was first authored, the following capabilities have moved from deferred to implemented: warden admission (in-process and wire), the custody ledger, the custody state reporter, `list_active_custodies` on the client socket, and the happenings bus (with custody variants; subscription surface still deferred - see 12.2).
 
-The plugin contract defines warden verbs (`take_custody`, `course_correct`, `release_custody`, `report_custody_state`) but the steward-side admission of wardens and the wire-protocol coverage of warden verbs is not yet implemented. Admission supports only singleton respondents. This is the obvious next wire-protocol extension.
-
-### 12.2 Custody Ledger
-
-A registry of active warden assignments and their state. The steward uses it to know which work is in flight, who holds it, and how to wind it down in shutdown order. Needed before wardens become useful. Not present today.
-
-### 12.3 Appointments and Watches
+### 12.1 Appointments and Watches
 
 Time-originated and condition-originated producers that feed instructions into the steward as if from outside. Needed for alarm clocks, sleep timers, automations, and condition-driven behaviours (e.g. "when networking goes up, mount NAS shares"). Not present today.
 
-### 12.4 Happenings Stream
+### 12.2 Happenings Subscription
 
-The outbound notification channel. Every projection is one read; every state transition is one happening. Consumers subscribe once and receive a stream of happenings, which they can combine with pull projections to maintain a live view. The steward today has projections (pull) but no happenings channel (push). `PROJECTIONS.md` section 8 documents the target subscription model.
+The happenings bus exists and emits custody transitions (`CustodyTaken`, `CustodyReleased`; `CustodyStateReported` still to be wired through the ledger reporter). External consumers cannot yet subscribe - the client socket has a `list_active_custodies` polling op but no streaming subscription op. Adding this is architecturally non-trivial because every existing op is request/response; a streaming op is the first exception in the client protocol. Needs its own pass.
 
-### 12.5 Subject and Relation Persistence
+### 12.3 Subject, Relation, and Ledger Persistence
 
-Subjects and relations live entirely in memory. Restarting the steward yields an empty registry and graph. This is fine for a skeleton; it is not fine for a device that must remember "this is the album art I reconciled for subject X" across a reboot. The engineering question is where the persistence boundary lives (steward-owned sled database, plugin-owned state, hybrid).
+All steward state lives entirely in memory. Restarting the steward yields empty stores. This is fine for a skeleton; it is not fine for a device that must remember "this is the album art I reconciled for subject X" or "this custody was live when we lost power" across a reboot. The engineering question is where the persistence boundary lives (steward-owned sled database, plugin-owned state, hybrid).
 
-### 12.6 Shape Version Enforcement
+### 12.4 Shape Version Enforcement
 
-Shelf shapes are versioned. Plugin manifests declare the shape version they satisfy. The catalogue slot declares its supported range. The steward today reads these values and stores them but does not yet refuse a plugin whose declared version is outside the slot's supported range. The enforcement is a small addition; the decision deferred in `CONCEPT.md` section 9 is the version-negotiation semantics (strict equality, SemVer-like range, tolerance window).
+Shelf shapes are versioned. Plugin manifests declare the shape version they satisfy. The catalogue slot declares its supported range. The steward today reads these values and stores them but does not yet refuse a plugin whose declared version is outside the slot's supported range. The enforcement is a small addition; the decision deferred in `CONCEPT.md` section 10 is the version-negotiation semantics (strict equality, SemVer-like range, tolerance window).
 
-### 12.7 Rack-Keyed Projections
+### 12.5 Rack-Keyed Projections
 
 Structural queries (`get_projection(rack = "audio")`) are documented in `PROJECTIONS.md` section 3.1 but not yet implemented. They require plugins to push shaped contributions to a state-report channel that the projection engine composes over. The steward-side groundwork (projection engine, subject registry, relation graph) exists; the plugin-facing state-report shape and the composition rules are what remain.
 
-### 12.8 Fast Path
+### 12.6 Fast Path
 
 The real-time mutation channel for parameter changes, transport commands, and volume - see `FAST_PATH.md`. Not yet implemented; the v0 client-facing socket serves everything through the same slow path.
 
-### 12.9 Factory Plugins
+### 12.7 Factory Plugins
 
 Factory plugins produce variable instances over time (USB drives appearing, peers being discovered). The plugin contract defines `announce_instance` and `retract_instance` verbs. The steward has an `instance_announcer` in `LoadContext` but admission does not yet support factory-kind plugins. Instances would register as separate occupants of their target shelves.
 
-### 12.10 User Interaction Routing
+### 12.8 User Interaction Routing
 
 Plugins can request user-facing prompts through `LoadContext::user_interaction_requester`. The steward logs these today. Target behaviour: route to a kiosk plugin if one is admitted, or to a remote UI via the client-facing socket.
 
@@ -366,6 +384,9 @@ These hold in every build of the steward and are enforced by the code paths desc
 7. A walk that would exceed `max_visits` emits further subjects as references and sets `walk_truncated` on every projection built at or after the truncation point.
 8. Shutdown drives every admitted plugin through `unload` before the steward exits. The socket file is removed on exit when possible.
 9. The steward process exits with status 0 only after a clean shutdown.
+10. Every successful `take_custody` UPSERTs the custody into the ledger and emits a `CustodyTaken` happening before returning.
+11. Every successful `release_custody` removes the ledger record and emits a `CustodyReleased` happening before returning.
+12. Happenings are emitted after the ledger write they describe. A subscriber that reacts to a happening by querying the ledger always sees the new state.
 
 ## 14. Observability
 
@@ -400,8 +421,7 @@ Both invariants are documented in the relevant test files and in `WIRE_PROTOCOL.
 
 | Decision | Where it belongs |
 |----------|------------------|
-| Wire format details for warden verbs | Pending subpass; extends `PLUGIN_CONTRACT.md` section 6. |
-| Projection subscription protocol | Pending; `PROJECTIONS.md` section 8 sketches it. |
+| Projection subscription protocol | Pending; `PROJECTIONS.md` section 8 sketches it. This overlaps with the happenings subscription surface (section 12.2 of this document). |
 | Fast-path mechanism | `FAST_PATH.md`. |
 | Trust-class-to-OS-primitive mapping | Pending; orthogonal to existing engineering docs. |
 | Catalogue-declared projection shapes | Pending; extends `PROJECTIONS.md` sections 3 and 4. |
