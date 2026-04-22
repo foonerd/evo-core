@@ -16,8 +16,9 @@ This repository holds the steward, the plugin SDK, the plugin tooling, and the e
 | [docs/engineering/SUBJECTS.md](docs/engineering/SUBJECTS.md) | Subject registry. Canonical identity, external addressings, announcements, equivalence and distinctness claims, reconciliation, merges and splits, provenance, operator overrides, persistence, happenings. |
 | [docs/engineering/RELATIONS.md](docs/engineering/RELATIONS.md) | Relation graph. Typed and directed subject-to-subject connections, catalogue-declared grammar, multi-claimant assertions, scoped walks, cardinality handling, merge and split cascade, operator overrides, persistence, happenings. |
 | [docs/engineering/PROJECTIONS.md](docs/engineering/PROJECTIONS.md) | Projection layer. Structural and federated queries, pull and push, catalogue-declared shapes, plugin contribution composition rules, subscription scopes, aggregation hints, caching, schema evolution, degraded states. |
+| [docs/engineering/FAST_PATH.md](docs/engineering/FAST_PATH.md) | Fast-path mutation channel. Catalogue-declared commands against active wardens, rack/subject addressing, budgets, ordering, idempotency, relationship to projections and happenings, audit. |
 
-Further engineering-layer documents (fast-path, steward startup) are deliberately open. See `docs/CONCEPT.md` section 10.
+Further engineering-layer documents (steward startup and essence enforcement) are deliberately open. See `docs/CONCEPT.md` section 10.
 
 ## Distributions
 
