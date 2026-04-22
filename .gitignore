@@ -1,0 +1,27 @@
+# Rust build artefacts
+/target/
+**/target/
+Cargo.lock
+
+# Editor and OS junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# Environment and local config
+.env
+.env.local
+
+# Generated documentation
+/book/
+/docs/_build/
+
+# Signing keys - never commit
+*.key
+*.pem
+!docs/**/*.pem.example

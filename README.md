@@ -1,1 +1,27 @@
 # evo-core
+
+Evo is a fabric for building appliance-class devices. A brand-neutral steward administers a declared catalogue of concerns, admits plugins that stock slots in that catalogue, and emits composed projections to any consumer.
+
+This repository holds the steward, the plugin SDK, the plugin tooling, and the engineering-layer contracts that govern plugin authoring.
+
+## Documents
+
+| Document | Purpose |
+|----------|---------|
+| [docs/CONCEPT.md](docs/CONCEPT.md) | The fabric contract. Essence, steward, racks, shelves, plugins, subjects, relations, projections, happenings. Read first. |
+| [docs/engineering/PLUGIN_CONTRACT.md](docs/engineering/PLUGIN_CONTRACT.md) | The universal plugin contract. Rust trait and Unix-socket wire protocol, two transports of one contract. |
+| [docs/engineering/PLUGIN_PACKAGING.md](docs/engineering/PLUGIN_PACKAGING.md) | Plugin manifest, identity, signing, filesystem layout on target, installation lifecycle, SDK and tooling. |
+
+Further engineering-layer documents (subject identity, relation grammar, projection protocol, fast-path, steward startup) are deliberately open. See `docs/CONCEPT.md` section 10.
+
+## Distributions
+
+Evo is domain-neutral. A device ships as a distribution of evo: a catalogue declaration plus a plugin set plus branding. The first distribution is audio-player-shaped, shipped as Volumio.
+
+## Status
+
+Engineering layer. Documents precede code. No crates yet.
+
+## License
+
+Apache 2.0. See [LICENSE](LICENSE).

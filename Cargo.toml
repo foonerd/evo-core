@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = []
+
+# Crates will be added here as they are authored. Engineering-layer
+# documents in docs/ precede code; this workspace stub exists so the
+# repository is cargo-recognisable from the outset.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+repository = "https://github.com/foonerd/evo-core"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
