@@ -24,6 +24,9 @@
 //! - [`wire_client`]: steward-side client for out-of-process plugins
 //!   speaking the wire protocol from `PLUGIN_CONTRACT.md` sections 6
 //!   through 11.
+//! - [`projections`]: pull-projection engine per `PROJECTIONS.md`. v0
+//!   supports federated (subject-keyed) queries with one-hop relation
+//!   traversal.
 //! - [`error`]: the steward's error type.
 //!
 //! This crate implements the v0 skeleton: in-process plugins only,
@@ -43,6 +46,7 @@ pub mod config;
 pub mod context;
 pub mod error;
 pub mod logging;
+pub mod projections;
 pub mod relations;
 pub mod server;
 pub mod shutdown;
