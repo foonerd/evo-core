@@ -31,6 +31,18 @@
 //! The crate version moves in lockstep with the `evo-core` workspace version;
 //! a plugin's `evo_min_version` manifest field refers to this workspace
 //! version.
+//!
+//! ## Logging
+//!
+//! Plugins log via the [`tracing`](https://crates.io/crates/tracing) crate.
+//! The evo project's logging conventions (log levels, field names, plugin
+//! identification) are defined in `docs/engineering/LOGGING.md`; plugin
+//! authors should follow those conventions so their plugins' log output is
+//! legible to operators alongside the steward's own output.
+//!
+//! The default log level on a production device is `warn`; plugins should
+//! emit `info` sparingly (only for operator-visible lifecycle events) and
+//! reserve `debug` and `trace` for developer-facing detail.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
