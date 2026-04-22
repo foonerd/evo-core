@@ -31,12 +31,16 @@ use evo_plugin_sdk::contract::{
     HealthReport, LoadContext, Plugin, PluginDescription, PluginError,
     Request, Respondent, Response,
 };
+use evo_plugin_sdk::manifest::TransportKind;
 use evo_plugin_sdk::Manifest;
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::UnixStream;
+use tokio::process::{Child, Command};
 
 /// Object-safe internal trait for admitted respondent plugins.
 ///
@@ -133,6 +137,19 @@ struct AdmittedPlugin {
     shelf: String,
     /// Type-erased handle for lifecycle and request dispatch.
     erased: Box<dyn ErasedRespondent>,
+    /// Child process handle, if this plugin was spawned by the steward
+    /// via [`AdmissionEngine::admit_out_of_process_from_directory`].
+    ///
+    /// The child is owned by the steward for its full lifetime. It is
+    /// waited on (or killed after a timeout) during
+    /// [`AdmissionEngine::shutdown`]. `kill_on_drop(true)` is set so
+    /// even if the engine is dropped without a shutdown call the child
+    /// is guaranteed to be reaped.
+    ///
+    /// `None` for in-process plugins and for out-of-process plugins
+    /// admitted via [`AdmissionEngine::admit_out_of_process_respondent`]
+    /// where the caller owns the child.
+    child: Option<Child>,
 }
 
 impl std::fmt::Debug for AdmittedPlugin {
@@ -141,6 +158,7 @@ impl std::fmt::Debug for AdmittedPlugin {
             .field("name", &self.name)
             .field("shelf", &self.shelf)
             .field("erased", &"<Box<dyn ErasedRespondent>>")
+            .field("child", &self.child.as_ref().map(|c| c.id()))
             .finish()
     }
 }
@@ -332,6 +350,7 @@ impl AdmissionEngine {
             name: manifest.plugin.name.clone(),
             shelf: shelf_qualified.clone(),
             erased,
+            child: None,
         };
 
         tracing::info!(
@@ -466,6 +485,7 @@ impl AdmissionEngine {
             name: manifest.plugin.name.clone(),
             shelf: shelf_qualified.clone(),
             erased,
+            child: None,
         };
 
         tracing::info!(
@@ -478,6 +498,176 @@ impl AdmissionEngine {
 
         self.by_shelf.insert(shelf_qualified.clone(), record);
         self.admission_order.push(shelf_qualified);
+
+        Ok(())
+    }
+
+    /// Admit an out-of-process plugin from its on-disk bundle.
+    ///
+    /// Full soup-to-nuts admission from a plugin directory:
+    ///
+    /// 1. Reads `<plugin_dir>/manifest.toml` and validates it.
+    /// 2. Requires `transport.kind == OutOfProcess`; returns an error
+    ///    for in-process manifests (those must be registered via
+    ///    [`Self::admit_singleton_respondent`] with a concrete Rust
+    ///    type).
+    /// 3. Resolves `transport.exec` relative to `plugin_dir`. Absolute
+    ///    paths in `exec` are honoured as-is.
+    /// 4. Computes a socket path under `runtime_dir` keyed by the
+    ///    plugin name: `<runtime_dir>/<plugin-name>.sock`.
+    /// 5. Spawns the plugin binary with that socket path as argv[1].
+    ///    The child is spawned with `kill_on_drop(true)` so it cannot
+    ///    outlive this engine even if shutdown is never called.
+    /// 6. Polls for the socket to become connectable while checking
+    ///    that the child has not already exited. Times out after
+    ///    [`SOCKET_READY_TIMEOUT`].
+    /// 7. On a successful connection, splits the stream via
+    ///    `into_split()` and hands the owned halves to
+    ///    [`Self::admit_out_of_process_respondent`].
+    /// 8. On success, retains the child handle on the admitted plugin
+    ///    record so shutdown can wait on it.
+    ///
+    /// On any failure the child is killed and reaped before the error
+    /// is returned; no partial state persists.
+    ///
+    /// ## Preconditions
+    ///
+    /// `runtime_dir` must exist and be writable by the steward user.
+    /// The caller is responsible for creating it (systemd
+    /// `RuntimeDirectory=evo`, a tempdir in tests, etc).
+    pub async fn admit_out_of_process_from_directory(
+        &mut self,
+        plugin_dir: &Path,
+        runtime_dir: &Path,
+        catalogue: &Catalogue,
+    ) -> Result<(), StewardError> {
+        // Read and validate the manifest from disk.
+        let manifest_path = plugin_dir.join("manifest.toml");
+        let manifest_text = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| {
+                StewardError::io(
+                    format!("reading {}", manifest_path.display()),
+                    e,
+                )
+            })?;
+        let manifest = Manifest::from_toml(&manifest_text)?;
+
+        // This entry point only handles out-of-process plugins. The
+        // in-process path requires a concrete Rust type that cannot be
+        // materialised from a manifest alone.
+        if manifest.transport.kind != TransportKind::OutOfProcess {
+            return Err(StewardError::Admission(format!(
+                "{}: admit_out_of_process_from_directory requires \
+                 transport.type = 'out-of-process', manifest declares {:?}",
+                manifest.plugin.name, manifest.transport.kind
+            )));
+        }
+
+        // Resolve the executable path. Relative paths in `exec` are
+        // relative to the plugin directory; absolute paths are used
+        // verbatim. Absolute paths bypass the plugin-bundle convention
+        // and are intended for test environments; production plugins
+        // should always use relative paths.
+        let exec_path = {
+            let raw = Path::new(&manifest.transport.exec);
+            if raw.is_absolute() {
+                raw.to_path_buf()
+            } else {
+                plugin_dir.join(raw)
+            }
+        };
+
+        // Compute the socket path. Dots in plugin names are valid in
+        // filenames on all supported platforms.
+        let socket_path =
+            runtime_dir.join(format!("{}.sock", manifest.plugin.name));
+
+        // Remove any stale socket from a previous crashed run. The
+        // child will also try to remove it before binding, but doing
+        // it here keeps the error surface clean if the child is not
+        // the expected evo plugin binary.
+        if socket_path.exists() {
+            if let Err(e) = std::fs::remove_file(&socket_path) {
+                return Err(StewardError::io(
+                    format!(
+                        "removing stale socket at {}",
+                        socket_path.display()
+                    ),
+                    e,
+                ));
+            }
+        }
+
+        // Spawn the child.
+        let mut child = Command::new(&exec_path)
+            .arg(&socket_path)
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| {
+                StewardError::io(
+                    format!(
+                        "spawning plugin binary {}",
+                        exec_path.display()
+                    ),
+                    e,
+                )
+            })?;
+
+        tracing::info!(
+            plugin = %manifest.plugin.name,
+            exec = %exec_path.display(),
+            socket = %socket_path.display(),
+            pid = child.id().unwrap_or(0),
+            "plugin process spawned"
+        );
+
+        // Wait for the socket to be ready, watching for early child
+        // exit. On any failure, kill+reap the child before returning.
+        let stream =
+            match wait_for_socket_ready(&socket_path, &mut child).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return Err(e);
+                }
+            };
+
+        let (reader, writer) = stream.into_split();
+
+        // Hand off to the existing wire-admission path. On failure,
+        // kill+reap the child.
+        if let Err(e) = self
+            .admit_out_of_process_respondent(
+                manifest.clone(),
+                catalogue,
+                reader,
+                writer,
+            )
+            .await
+        {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(e);
+        }
+
+        // Admission succeeded. Attach the child to the admitted
+        // record so shutdown can reap it.
+        let shelf_qualified = manifest.target.shelf.clone();
+        if let Some(record) = self.by_shelf.get_mut(&shelf_qualified) {
+            record.child = Some(child);
+        } else {
+            // Should be impossible: admit_out_of_process_respondent
+            // just inserted this record. If it is missing, something
+            // is deeply wrong; kill the child and log.
+            tracing::error!(
+                plugin = %manifest.plugin.name,
+                shelf = %shelf_qualified,
+                "admitted record missing after successful admission"
+            );
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
 
         Ok(())
     }
@@ -514,32 +704,28 @@ impl AdmissionEngine {
     /// order. Errors are logged but do not halt the shutdown sequence;
     /// the first error encountered (if any) is returned after all
     /// plugins have been attempted.
+    ///
+    /// For plugins spawned by the steward (via
+    /// [`Self::admit_out_of_process_from_directory`]), the shutdown
+    /// sequence is:
+    ///
+    /// 1. Send `unload` over the wire and await the response.
+    /// 2. Drop the wire client, closing the connection. The child
+    ///    sees EOF on its read half and its `serve()` returns.
+    /// 3. Wait for the child to exit, with a bounded timeout.
+    /// 4. If the timeout elapses, kill the child.
+    ///
+    /// Step 2 is essential: the child will not exit until its read
+    /// side sees EOF, so waiting for the child while still holding
+    /// the wire connection would deadlock.
     pub async fn shutdown(&mut self) -> Result<(), StewardError> {
         let mut first_err: Option<StewardError> = None;
 
         while let Some(shelf) = self.admission_order.pop() {
-            if let Some(mut plugin) = self.by_shelf.remove(&shelf) {
-                tracing::info!(
-                    plugin = %plugin.name,
-                    shelf = %plugin.shelf,
-                    "plugin unloading"
-                );
-                match plugin.erased.unload().await {
-                    Ok(()) => {
-                        tracing::info!(
-                            plugin = %plugin.name,
-                            "plugin unloaded"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            plugin = %plugin.name,
-                            error = %e,
-                            "plugin unload failed"
-                        );
-                        if first_err.is_none() {
-                            first_err = Some(StewardError::Plugin(e));
-                        }
+            if let Some(plugin) = self.by_shelf.remove(&shelf) {
+                if let Err(e) = unload_one_plugin(plugin).await {
+                    if first_err.is_none() {
+                        first_err = Some(e);
                     }
                 }
             }
@@ -548,6 +734,152 @@ impl AdmissionEngine {
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+}
+
+/// Timeout for child process exit during shutdown. After this elapses
+/// the steward stops waiting politely and kills the child.
+const CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Timeout for a freshly spawned plugin child to bind and accept on
+/// its Unix socket.
+const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Polling interval when waiting for a plugin socket to be ready.
+const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Unload a single admitted plugin, handling both in-process and
+/// out-of-process cases.
+///
+/// See [`AdmissionEngine::shutdown`] for the sequence rationale.
+async fn unload_one_plugin(
+    plugin: AdmittedPlugin,
+) -> Result<(), StewardError> {
+    let AdmittedPlugin {
+        name,
+        shelf,
+        mut erased,
+        child,
+    } = plugin;
+
+    tracing::info!(
+        plugin = %name,
+        shelf = %shelf,
+        "plugin unloading"
+    );
+
+    let unload_result = erased.unload().await;
+
+    match &unload_result {
+        Ok(()) => tracing::info!(plugin = %name, "plugin unloaded"),
+        Err(e) => tracing::error!(
+            plugin = %name,
+            error = %e,
+            "plugin unload failed"
+        ),
+    }
+
+    // Drop the erased handle before waiting on the child. For
+    // in-process plugins this is a no-op. For wire-backed plugins
+    // this drops the WireClient, which closes the writer channel,
+    // which drops the socket's writer half, which causes the child
+    // to see EOF on its read side. Waiting on the child while still
+    // holding the writer would deadlock.
+    drop(erased);
+
+    if let Some(mut child) = child {
+        wait_or_kill_child(&name, &mut child).await;
+    }
+
+    unload_result.map_err(StewardError::Plugin)
+}
+
+/// Wait for a plugin's child process to exit; after a bounded timeout
+/// kill it.
+///
+/// All errors are logged; none are propagated. The child is either
+/// reaped cleanly or forcibly killed, in both cases leaving no zombie.
+async fn wait_or_kill_child(name: &str, child: &mut Child) {
+    match tokio::time::timeout(CHILD_SHUTDOWN_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => {
+            if status.success() {
+                tracing::info!(
+                    plugin = %name,
+                    "plugin child exited cleanly"
+                );
+            } else {
+                tracing::warn!(
+                    plugin = %name,
+                    ?status,
+                    "plugin child exited with non-zero status"
+                );
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::error!(
+                plugin = %name,
+                error = %e,
+                "plugin child wait failed"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                plugin = %name,
+                timeout_ms = CHILD_SHUTDOWN_TIMEOUT.as_millis() as u64,
+                "plugin child did not exit after disconnection, killing"
+            );
+            if let Err(e) = child.kill().await {
+                tracing::error!(
+                    plugin = %name,
+                    error = %e,
+                    "plugin child kill failed"
+                );
+            }
+            // Reap the zombie regardless of kill success.
+            let _ = child.wait().await;
+        }
+    }
+}
+
+/// Poll the plugin socket until the child binds it, or the child
+/// exits, or the timeout elapses.
+///
+/// Returns the connected stream on success. On failure, the caller
+/// is responsible for killing and reaping the child.
+async fn wait_for_socket_ready(
+    socket_path: &Path,
+    child: &mut Child,
+) -> Result<UnixStream, StewardError> {
+    let deadline = Instant::now() + SOCKET_READY_TIMEOUT;
+    loop {
+        // If the child has already exited, stop polling.
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(StewardError::Admission(format!(
+                    "plugin child exited before socket was ready: {status:?}"
+                )));
+            }
+            Ok(None) => {} // still running
+            Err(e) => {
+                return Err(StewardError::Admission(format!(
+                    "error polling plugin child: {e}"
+                )));
+            }
+        }
+
+        match UnixStream::connect(socket_path).await {
+            Ok(stream) => return Ok(stream),
+            Err(_) if Instant::now() >= deadline => {
+                return Err(StewardError::Admission(format!(
+                    "timed out waiting for plugin socket at {} after {:?}",
+                    socket_path.display(),
+                    SOCKET_READY_TIMEOUT
+                )));
+            }
+            Err(_) => {
+                tokio::time::sleep(SOCKET_POLL_INTERVAL).await;
+            }
         }
     }
 }
@@ -1218,5 +1550,171 @@ response_budget_ms = 1000
             .unwrap();
         assert_eq!(record.claims.len(), 1);
         assert_eq!(record.claims[0].claimant, "org.test.ping");
+    }
+
+    // -----------------------------------------------------------------
+    // Tests for admit_out_of_process_from_directory error paths.
+    //
+    // These exercise the cheap failure paths that do not require a
+    // real plugin binary. End-to-end happy-path coverage lives in
+    // crates/evo-example-echo/tests/out_of_process.rs where a real
+    // binary is available via env!(CARGO_BIN_EXE_echo-wire).
+    // -----------------------------------------------------------------
+
+    /// Catalogue containing the `example.echo` shelf, matching the
+    /// manifests used by the out-of-process error-path tests below.
+    fn example_catalogue() -> Catalogue {
+        Catalogue::from_toml(
+            r#"
+[[racks]]
+name = "example"
+family = "domain"
+charter = "example rack for admission tests"
+
+[[racks.shelves]]
+name = "echo"
+shape = 1
+description = "echo plugin shelf"
+"#,
+        )
+        .unwrap()
+    }
+
+    /// Base manifest string for the example echo plugin. The caller
+    /// substitutes the `transport` block to produce variants.
+    fn example_manifest_with_transport(transport_block: &str) -> String {
+        format!(
+            r#"
+[plugin]
+name = "org.evo.example.echo"
+version = "0.1.1"
+contract = 1
+
+[target]
+shelf = "example.echo"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+{transport_block}
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+
+[capabilities.respondent]
+request_types = ["echo"]
+response_budget_ms = 1000
+"#
+        )
+    }
+
+    #[tokio::test]
+    async fn admit_from_directory_rejects_missing_manifest() {
+        let plugin_dir = tempfile::TempDir::new().unwrap();
+        let runtime_dir = tempfile::TempDir::new().unwrap();
+        let catalogue = example_catalogue();
+
+        let mut engine = AdmissionEngine::new();
+        let r = engine
+            .admit_out_of_process_from_directory(
+                plugin_dir.path(),
+                runtime_dir.path(),
+                &catalogue,
+            )
+            .await;
+
+        match r {
+            Err(StewardError::Io { context, .. }) => {
+                assert!(
+                    context.contains("manifest.toml"),
+                    "expected context to mention manifest.toml, got {context:?}"
+                );
+            }
+            other => panic!("expected Io error, got {other:?}"),
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admit_from_directory_rejects_in_process_manifest() {
+        let plugin_dir = tempfile::TempDir::new().unwrap();
+        let runtime_dir = tempfile::TempDir::new().unwrap();
+        let manifest_text = example_manifest_with_transport(
+            "[transport]\ntype = \"in-process\"\nexec = \"<compiled-in>\"",
+        );
+        std::fs::write(
+            plugin_dir.path().join("manifest.toml"),
+            &manifest_text,
+        )
+        .unwrap();
+
+        let catalogue = example_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let r = engine
+            .admit_out_of_process_from_directory(
+                plugin_dir.path(),
+                runtime_dir.path(),
+                &catalogue,
+            )
+            .await;
+
+        match r {
+            Err(StewardError::Admission(msg)) => {
+                assert!(
+                    msg.contains("out-of-process"),
+                    "expected message to mention out-of-process, got {msg:?}"
+                );
+            }
+            other => panic!("expected Admission error, got {other:?}"),
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admit_from_directory_reports_spawn_failure() {
+        let plugin_dir = tempfile::TempDir::new().unwrap();
+        let runtime_dir = tempfile::TempDir::new().unwrap();
+        // Point at a binary that definitely does not exist.
+        let manifest_text = example_manifest_with_transport(
+            "[transport]\ntype = \"out-of-process\"\nexec = \"nonexistent-plugin-binary-xyz\"",
+        );
+        std::fs::write(
+            plugin_dir.path().join("manifest.toml"),
+            &manifest_text,
+        )
+        .unwrap();
+
+        let catalogue = example_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let r = engine
+            .admit_out_of_process_from_directory(
+                plugin_dir.path(),
+                runtime_dir.path(),
+                &catalogue,
+            )
+            .await;
+
+        match r {
+            Err(StewardError::Io { context, .. }) => {
+                assert!(
+                    context.contains("spawning"),
+                    "expected context to mention spawning, got {context:?}"
+                );
+            }
+            other => panic!("expected Io error, got {other:?}"),
+        }
+        assert_eq!(engine.len(), 0);
     }
 }
