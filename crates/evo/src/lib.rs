@@ -14,6 +14,7 @@
 //! - [`cli`]: command-line argument parsing (clap derive).
 //! - [`catalogue`]: the rack/shelf catalogue the steward administers.
 //! - [`admission`]: the admission engine that runs plugin lifecycles.
+//! - [`subjects`]: the subject registry, implementing `SUBJECTS.md`.
 //! - [`context`]: concrete implementations of the SDK callback traits
 //!   supplied to plugins in their [`LoadContext`].
 //! - [`server`]: the client-facing Unix socket server.
@@ -40,5 +41,6 @@ pub mod error;
 pub mod logging;
 pub mod server;
 pub mod shutdown;
+pub mod subjects;
 
 pub use error::StewardError;

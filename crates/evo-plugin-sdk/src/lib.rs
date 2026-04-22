@@ -81,11 +81,12 @@ pub use manifest::Manifest;
 
 #[cfg(feature = "contract")]
 pub use contract::{
-    Assignment, BuildInfo, CallDeadline, CourseCorrection, CustodyHandle,
-    CustodyStateReporter, Factory, HealthCheck, HealthReport, HealthStatus,
-    InstanceAnnouncement, InstanceAnnouncer, InstanceId, LoadContext, Plugin,
-    PluginDescription, PluginError, PluginIdentity, ReportError,
-    ReportPriority, Request, Respondent, Response, RetractionPolicy,
-    RuntimeCapabilities, StateReporter, UserInteraction,
-    UserInteractionRequester, Warden,
+    Assignment, BuildInfo, CallDeadline, CanonicalSubjectId, ClaimConfidence,
+    CourseCorrection, CustodyHandle, CustodyStateReporter, ExternalAddressing,
+    Factory, HealthCheck, HealthReport, HealthStatus, InstanceAnnouncement,
+    InstanceAnnouncer, InstanceId, LoadContext, Plugin, PluginDescription,
+    PluginError, PluginIdentity, ReportError, ReportPriority, Request,
+    Respondent, Response, RetractionPolicy, RuntimeCapabilities,
+    StateReporter, SubjectAnnouncement, SubjectAnnouncer, SubjectClaim,
+    UserInteraction, UserInteractionRequester, Warden,
 };

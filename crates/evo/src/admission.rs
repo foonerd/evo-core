@@ -21,9 +21,10 @@
 use crate::catalogue::Catalogue;
 use crate::context::{
     LoggingInstanceAnnouncer, LoggingStateReporter,
-    LoggingUserInteractionRequester,
+    LoggingUserInteractionRequester, RegistrySubjectAnnouncer,
 };
 use crate::error::StewardError;
+use crate::subjects::SubjectRegistry;
 use evo_plugin_sdk::contract::{
     HealthReport, LoadContext, Plugin, PluginDescription, PluginError,
     Request, Respondent, Response,
@@ -146,12 +147,27 @@ impl std::fmt::Debug for AdmittedPlugin {
 ///
 /// Holds admitted plugins keyed by fully-qualified shelf name. v0 permits
 /// one plugin per shelf; additional admissions on the same shelf fail.
-#[derive(Default)]
+///
+/// Owns the shared subject registry used by admitted plugins. Plugins
+/// receive a `SubjectAnnouncer` in their `LoadContext` that writes to
+/// this registry tagged with the plugin's name.
 pub struct AdmissionEngine {
     /// Map of shelf name -> admitted plugin.
     by_shelf: HashMap<String, AdmittedPlugin>,
     /// Admission order, for reverse-order shutdown.
     admission_order: Vec<String>,
+    /// Subject registry shared with all admitted plugins.
+    registry: Arc<SubjectRegistry>,
+}
+
+impl Default for AdmissionEngine {
+    fn default() -> Self {
+        Self {
+            by_shelf: HashMap::new(),
+            admission_order: Vec::new(),
+            registry: Arc::new(SubjectRegistry::new()),
+        }
+    }
 }
 
 impl std::fmt::Debug for AdmissionEngine {
@@ -164,9 +180,25 @@ impl std::fmt::Debug for AdmissionEngine {
 }
 
 impl AdmissionEngine {
-    /// Construct an empty admission engine.
+    /// Construct an empty admission engine with a fresh subject registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct an admission engine sharing an existing subject
+    /// registry. Useful for tests that want to pre-populate or inspect
+    /// the registry from outside.
+    pub fn with_registry(registry: Arc<SubjectRegistry>) -> Self {
+        Self {
+            by_shelf: HashMap::new(),
+            admission_order: Vec::new(),
+            registry,
+        }
+    }
+
+    /// Borrow a handle to the subject registry used by this engine.
+    pub fn registry(&self) -> Arc<SubjectRegistry> {
+        Arc::clone(&self.registry)
     }
 
     /// Number of currently admitted plugins.
@@ -256,7 +288,7 @@ impl AdmissionEngine {
             )));
         }
 
-        let ctx = build_load_context(&manifest);
+        let ctx = build_load_context(&manifest, Arc::clone(&self.registry));
         erased.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
                 "{}: load failed: {}",
@@ -355,10 +387,14 @@ impl AdmissionEngine {
 
 /// Build a v0 LoadContext for a plugin.
 ///
-/// For v0 the context is trivial: empty config, temp-style paths that do
-/// not yet reflect the real on-device layout, no deadline, and logging
-/// callback implementations that do not do much beyond logging.
-fn build_load_context(manifest: &Manifest) -> LoadContext {
+/// The context carries per-plugin filesystem paths, empty config, no
+/// deadline, logging-only implementations of the state and interaction
+/// callbacks, and a real subject announcer backed by the supplied
+/// registry.
+fn build_load_context(
+    manifest: &Manifest,
+    registry: Arc<SubjectRegistry>,
+) -> LoadContext {
     let state_dir = PathBuf::from("/var/lib/evo/plugins")
         .join(&manifest.plugin.name)
         .join("state");
@@ -380,6 +416,10 @@ fn build_load_context(manifest: &Manifest) -> LoadContext {
         user_interaction_requester: Arc::new(
             LoggingUserInteractionRequester::new(manifest.plugin.name.clone()),
         ),
+        subject_announcer: Arc::new(RegistrySubjectAnnouncer::new(
+            registry,
+            manifest.plugin.name.clone(),
+        )),
     }
 }
 
@@ -697,5 +737,171 @@ response_budget_ms = 1000
         assert_eq!(engine.len(), 1);
         engine.shutdown().await.unwrap();
         assert_eq!(engine.len(), 0);
+    }
+
+    // A respondent that announces subjects during load() for testing
+    // the subject-registry wiring end-to-end.
+    struct AnnouncingRespondent {
+        name: String,
+        announcements: Vec<evo_plugin_sdk::contract::SubjectAnnouncement>,
+    }
+
+    impl Plugin for AnnouncingRespondent {
+        fn describe(
+            &self,
+        ) -> impl Future<Output = PluginDescription> + Send + '_ {
+            async move {
+                PluginDescription {
+                    identity: PluginIdentity {
+                        name: self.name.clone(),
+                        version: semver::Version::new(0, 1, 0),
+                        contract: 1,
+                    },
+                    runtime_capabilities: RuntimeCapabilities {
+                        request_types: vec!["ping".into()],
+                        accepts_custody: false,
+                        flags: Default::default(),
+                    },
+                    build_info: BuildInfo {
+                        plugin_build: "test".into(),
+                        sdk_version: "0.1.1".into(),
+                        rustc_version: None,
+                        built_at: None,
+                    },
+                }
+            }
+        }
+
+        fn load<'a>(
+            &'a mut self,
+            ctx: &'a LoadContext,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
+        {
+            async move {
+                for announcement in &self.announcements {
+                    ctx.subject_announcer
+                        .announce(announcement.clone())
+                        .await
+                        .map_err(|e| {
+                            PluginError::Permanent(format!(
+                                "subject announce failed: {e}"
+                            ))
+                        })?;
+                }
+                Ok(())
+            }
+        }
+
+        fn unload(
+            &mut self,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_
+        {
+            async move { Ok(()) }
+        }
+
+        fn health_check(
+            &self,
+        ) -> impl Future<Output = HealthReport> + Send + '_
+        {
+            async move { HealthReport::healthy() }
+        }
+    }
+
+    impl Respondent for AnnouncingRespondent {
+        fn handle_request<'a>(
+            &'a mut self,
+            req: &'a Request,
+        ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a
+        {
+            async move { Ok(Response::for_request(req, req.payload.clone())) }
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_subject_announcements_reach_the_registry() {
+        use evo_plugin_sdk::contract::{
+            ExternalAddressing, SubjectAnnouncement,
+        };
+
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+
+        let announcements = vec![
+            SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("mpd-path", "/music/a.flac")],
+            ),
+            SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("mpd-path", "/music/b.flac")],
+            ),
+        ];
+
+        let plugin = AnnouncingRespondent {
+            name: "org.test.ping".into(),
+            announcements,
+        };
+        engine
+            .admit_singleton_respondent(
+                plugin,
+                test_manifest("org.test.ping"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+
+        // Verify the registry saw the announcements.
+        let registry = engine.registry();
+        assert_eq!(registry.subject_count(), 2);
+        assert_eq!(registry.addressing_count(), 2);
+
+        let first = registry
+            .resolve(&evo_plugin_sdk::contract::ExternalAddressing::new(
+                "mpd-path",
+                "/music/a.flac",
+            ))
+            .unwrap();
+        let record = registry.describe(&first).unwrap();
+        assert_eq!(record.subject_type, "track");
+        assert_eq!(record.addressings.len(), 1);
+        assert_eq!(record.addressings[0].claimant, "org.test.ping");
+    }
+
+    #[tokio::test]
+    async fn with_registry_shares_registry_across_engines() {
+        use evo_plugin_sdk::contract::{
+            ExternalAddressing, SubjectAnnouncement,
+        };
+
+        let shared = Arc::new(SubjectRegistry::new());
+        // Pre-populate the registry outside the engine.
+        shared
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("pre", "populated")],
+                ),
+                "operator",
+            )
+            .unwrap();
+
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::with_registry(Arc::clone(&shared));
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        engine
+            .admit_singleton_respondent(
+                plugin,
+                test_manifest("org.test.ping"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+
+        // Engine sees the externally-populated registry.
+        assert_eq!(engine.registry().subject_count(), 1);
+        assert_eq!(shared.subject_count(), 1);
     }
 }

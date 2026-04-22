@@ -59,12 +59,13 @@ pub mod error;
 pub mod factory;
 pub mod plugin;
 pub mod respondent;
+pub mod subjects;
 pub mod warden;
 
 pub use context::{
     CallDeadline, CustodyStateReporter, InstanceAnnouncer, LoadContext,
-    ReportError, ReportPriority, StateReporter, UserInteraction,
-    UserInteractionRequester,
+    ReportError, ReportPriority, StateReporter, SubjectAnnouncer,
+    UserInteraction, UserInteractionRequester,
 };
 pub use error::PluginError;
 pub use factory::{Factory, InstanceAnnouncement, InstanceId, RetractionPolicy};
@@ -73,4 +74,8 @@ pub use plugin::{
     PluginDescription, PluginIdentity, RuntimeCapabilities,
 };
 pub use respondent::{Request, Respondent, Response};
+pub use subjects::{
+    CanonicalSubjectId, ClaimConfidence, ExternalAddressing,
+    SubjectAnnouncement, SubjectClaim,
+};
 pub use warden::{Assignment, CourseCorrection, CustodyHandle, Warden};

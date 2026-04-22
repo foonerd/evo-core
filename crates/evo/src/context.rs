@@ -13,12 +13,16 @@
 //! are future work.
 
 use evo_plugin_sdk::contract::{
-    CustodyHandle, CustodyStateReporter, HealthStatus, InstanceAnnouncement,
-    InstanceAnnouncer, InstanceId, ReportError, ReportPriority, StateReporter,
+    CustodyHandle, CustodyStateReporter, ExternalAddressing, HealthStatus,
+    InstanceAnnouncement, InstanceAnnouncer, InstanceId, ReportError,
+    ReportPriority, StateReporter, SubjectAnnouncement, SubjectAnnouncer,
     UserInteraction, UserInteractionRequester,
 };
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+
+use crate::subjects::SubjectRegistry;
 
 /// A trivial state reporter that logs each report and returns success.
 ///
@@ -182,6 +186,63 @@ impl CustodyStateReporter for LoggingCustodyStateReporter {
     }
 }
 
+/// Subject announcer backed by the subject registry.
+///
+/// Translates plugin announce/retract calls into registry operations,
+/// tagging every claim with the plugin's name.
+#[derive(Debug)]
+pub struct RegistrySubjectAnnouncer {
+    registry: Arc<SubjectRegistry>,
+    plugin_name: String,
+}
+
+impl RegistrySubjectAnnouncer {
+    /// Construct an announcer that writes to the given registry,
+    /// tagging claims with the given plugin name.
+    pub fn new(
+        registry: Arc<SubjectRegistry>,
+        plugin_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            registry,
+            plugin_name: plugin_name.into(),
+        }
+    }
+}
+
+impl SubjectAnnouncer for RegistrySubjectAnnouncer {
+    fn announce<'a>(
+        &'a self,
+        announcement: SubjectAnnouncement,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        let plugin_name = self.plugin_name.clone();
+        Box::pin(async move {
+            match registry.announce(&announcement, &plugin_name) {
+                Ok(_outcome) => Ok(()),
+                Err(e) => Err(ReportError::Invalid(format!("announce: {e}"))),
+            }
+        })
+    }
+
+    fn retract<'a>(
+        &'a self,
+        addressing: ExternalAddressing,
+        reason: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        let plugin_name = self.plugin_name.clone();
+        Box::pin(async move {
+            match registry.retract(&addressing, &plugin_name, reason) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(ReportError::Invalid(format!("retract: {e}"))),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +281,74 @@ mod tests {
             .report(&h, b"state".to_vec(), HealthStatus::Healthy)
             .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_announces() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            "org.test.announcer",
+        );
+        let announcement = SubjectAnnouncement::new(
+            "track",
+            vec![ExternalAddressing::new("test-scheme", "test-value")],
+        );
+        assert!(announcer.announce(announcement).await.is_ok());
+        assert_eq!(registry.subject_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_retracts() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            "org.test.announcer",
+        );
+        let announcement = SubjectAnnouncement::new(
+            "track",
+            vec![ExternalAddressing::new("test-scheme", "test-value")],
+        );
+        announcer.announce(announcement).await.unwrap();
+        assert_eq!(registry.subject_count(), 1);
+
+        let result = announcer
+            .retract(
+                ExternalAddressing::new("test-scheme", "test-value"),
+                Some("test cleanup".into()),
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(registry.subject_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_rejects_wrong_plugin_retract() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let announcer_a = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            "org.test.a",
+        );
+        let announcer_b = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            "org.test.b",
+        );
+        announcer_a
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("s", "v")],
+            ))
+            .await
+            .unwrap();
+        let result = announcer_b
+            .retract(ExternalAddressing::new("s", "v"), None)
+            .await;
+        assert!(matches!(result, Err(ReportError::Invalid(_))));
     }
 }

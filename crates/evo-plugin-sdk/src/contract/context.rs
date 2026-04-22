@@ -14,6 +14,7 @@
 
 use crate::contract::factory::{InstanceAnnouncement, InstanceId};
 use crate::contract::plugin::HealthStatus;
+use crate::contract::subjects::{ExternalAddressing, SubjectAnnouncement};
 use crate::contract::warden::CustodyHandle;
 use std::future::Future;
 use std::path::PathBuf;
@@ -85,6 +86,12 @@ pub struct LoadContext {
     /// Handle for requesting user interaction (auth flows, confirmations,
     /// pairing codes).
     pub user_interaction_requester: Arc<dyn UserInteractionRequester>,
+
+    /// Handle for announcing subjects to the steward. Plugins use this
+    /// to tell the steward about the things they know of; the steward
+    /// maintains the canonical subject registry per
+    /// `SUBJECTS.md`.
+    pub subject_announcer: Arc<dyn SubjectAnnouncer>,
 }
 
 impl std::fmt::Debug for LoadContext {
@@ -100,6 +107,7 @@ impl std::fmt::Debug for LoadContext {
                 "user_interaction_requester",
                 &"<Arc<dyn UserInteractionRequester>>",
             )
+            .field("subject_announcer", &"<Arc<dyn SubjectAnnouncer>>")
             .finish()
     }
 }
@@ -218,6 +226,45 @@ pub trait CustodyStateReporter: Send + Sync {
         handle: &'a CustodyHandle,
         payload: Vec<u8>,
         health: HealthStatus,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
+}
+
+/// Callback trait: plugin announces subjects to the steward.
+///
+/// Per `SUBJECTS.md` section 7. Plugins call `announce` to register
+/// subjects they know about; the steward either resolves the addressings
+/// to an existing subject or creates a new canonical subject. Plugins
+/// call `retract` to remove an addressing they no longer observe (file
+/// deleted, external service removed the item, etc.).
+///
+/// Plugins do not see canonical subject IDs. The announcer returns
+/// success or an error; the resolved identity stays inside the
+/// steward. Plugins continue to address subjects by their own native
+/// `ExternalAddressing` values.
+pub trait SubjectAnnouncer: Send + Sync {
+    /// Announce a subject.
+    ///
+    /// The announcement carries the subject type, one or more
+    /// external addressings, and optional equivalence or distinctness
+    /// claims. All addressings in a single announcement are treated as
+    /// equivalent (they refer to one subject).
+    ///
+    /// Returns `Ok(())` on success, or a `ReportError` if the steward
+    /// cannot accept the announcement (shutting down, plugin
+    /// deregistered, validation failure).
+    fn announce<'a>(
+        &'a self,
+        announcement: SubjectAnnouncement,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
+
+    /// Retract a previously-asserted addressing.
+    ///
+    /// Plugins may only retract addressings they themselves asserted.
+    /// Cross-plugin retractions are rejected with a `ReportError::Invalid`.
+    fn retract<'a>(
+        &'a self,
+        addressing: ExternalAddressing,
+        reason: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
 }
 
