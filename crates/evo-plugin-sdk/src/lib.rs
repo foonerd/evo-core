@@ -11,11 +11,11 @@
 //! - [`contract`]: Rust traits every plugin implements, per
 //!   `docs/engineering/PLUGIN_CONTRACT.md` sections 2 through 7. Feature-
 //!   gated on `contract` (enabled by default).
-//! - [`wire`]: (placeholder) Wire-protocol message types for out-of-process
-//!   plugins, per `PLUGIN_CONTRACT.md` sections 6, 9, 10. Populated in SDK
-//!   pass 3.
-//! - [`codec`]: (placeholder) JSON and CBOR codec implementations of the wire
-//!   schema. Populated in SDK pass 3.
+//! - [`wire`]: Wire-protocol message types for out-of-process plugins,
+//!   per `PLUGIN_CONTRACT.md` sections 6, 9, 10. Feature-gated on
+//!   `wire`.
+//! - [`codec`]: JSON codec and length-prefixed framing over async I/O
+//!   streams. Feature-gated on `wire`.
 //! - [`testing`]: (placeholder) Mock steward harness for plugin authors.
 //!   Populated in SDK pass 4.
 //!
@@ -29,6 +29,9 @@
 //!
 //! - `contract` (default): enables the [`contract`] module and its
 //!   dependency on `tracing`.
+//! - `wire` (default): enables the [`wire`] and [`codec`] modules,
+//!   which carry the out-of-process wire protocol. Pulls in
+//!   `serde_json` and `tokio` with `io-util`/`net` features.
 //! - `manifest`: always enabled; the manifest module is the SDK's
 //!   foundation and has no optional dependencies.
 //!
@@ -72,9 +75,12 @@ pub mod manifest;
 #[cfg(feature = "contract")]
 pub mod contract;
 
+#[cfg(feature = "wire")]
 pub mod codec;
-pub mod testing;
+#[cfg(feature = "wire")]
 pub mod wire;
+
+pub mod testing;
 
 pub use error::ManifestError;
 pub use manifest::Manifest;
@@ -91,3 +97,11 @@ pub use contract::{
     SubjectAnnouncement, SubjectAnnouncer, SubjectClaim, UserInteraction,
     UserInteractionRequester, Warden,
 };
+
+#[cfg(feature = "wire")]
+pub use codec::{
+    decode_json, encode_json, read_frame_json, write_frame_json, WireError,
+    MAX_FRAME_SIZE,
+};
+#[cfg(feature = "wire")]
+pub use wire::{WireFrame, PROTOCOL_VERSION};

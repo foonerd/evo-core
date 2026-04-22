@@ -8,13 +8,18 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["contract"]
+default = ["contract", "wire"]
 # The manifest module is always compiled; it has no optional dependencies
 # and is the SDK's foundation. Listed here for documentation.
 manifest = []
 # Plugin contract traits and supporting types. Pulls in tracing for
 # structured logging per docs/engineering/LOGGING.md.
 contract = ["dep:tracing"]
+# Wire protocol message types, JSON codec, and length-prefixed framing
+# over async I/O streams, per docs/engineering/PLUGIN_CONTRACT.md
+# sections 6, 9, and 10. Binary payloads are base64-encoded in JSON.
+# CBOR support is future work.
+wire = ["contract", "dep:serde_json", "dep:tokio", "dep:base64"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -24,6 +29,12 @@ semver = { version = "1", features = ["serde"] }
 regex = "1"
 once_cell = "1"
 tracing = { version = "0.1", optional = true }
+serde_json = { version = "1", optional = true }
+tokio = { version = "1", features = ["io-util", "net"], optional = true }
+base64 = { version = "0.22", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "io-util", "net"] }
 
 [lints]
 workspace = true

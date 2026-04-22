@@ -17,6 +17,7 @@ use crate::contract::plugin::HealthStatus;
 use crate::contract::relations::{RelationAssertion, RelationRetraction};
 use crate::contract::subjects::{ExternalAddressing, SubjectAnnouncement};
 use crate::contract::warden::CustodyHandle;
+use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -143,7 +144,10 @@ pub enum ReportError {
 /// Priority hint for state reports.
 ///
 /// Influences how the steward rate-limits and aggregates reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum ReportPriority {
     /// Bypass rate limiting. Use sparingly - state transitions, errors,
     /// anything an operator should see quickly.
@@ -347,5 +351,32 @@ mod tests {
         assert_eq!(format!("{e}"), "rate limited");
         let e = ReportError::Invalid("unknown instance".into());
         assert!(format!("{e}").contains("unknown instance"));
+    }
+
+    #[test]
+    fn report_priority_serialises_snake_case() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Wrap {
+            p: ReportPriority,
+        }
+        let urgent = toml::to_string(&Wrap {
+            p: ReportPriority::Urgent,
+        })
+        .unwrap();
+        assert!(urgent.contains(r#"p = "urgent""#));
+        let normal = toml::to_string(&Wrap {
+            p: ReportPriority::Normal,
+        })
+        .unwrap();
+        assert!(normal.contains(r#"p = "normal""#));
+        let best = toml::to_string(&Wrap {
+            p: ReportPriority::BestEffort,
+        })
+        .unwrap();
+        assert!(best.contains(r#"p = "best_effort""#));
+
+        let parsed: Wrap =
+            toml::from_str(r#"p = "best_effort""#).unwrap();
+        assert_eq!(parsed.p, ReportPriority::BestEffort);
     }
 }
