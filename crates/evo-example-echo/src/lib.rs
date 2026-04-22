@@ -70,7 +70,7 @@ impl Plugin for EchoPlugin {
             PluginDescription {
                 identity: PluginIdentity {
                     name: "org.evo.example.echo".to_string(),
-                    version: semver::Version::new(0, 1, 0),
+                    version: semver::Version::new(0, 1, 1),
                     contract: 1,
                 },
                 runtime_capabilities: RuntimeCapabilities {
@@ -80,7 +80,7 @@ impl Plugin for EchoPlugin {
                 },
                 build_info: BuildInfo {
                     plugin_build: env!("CARGO_PKG_VERSION").to_string(),
-                    sdk_version: "0.1.0".to_string(),
+                    sdk_version: evo_plugin_sdk::VERSION.to_string(),
                     rustc_version: None,
                     built_at: None,
                 },

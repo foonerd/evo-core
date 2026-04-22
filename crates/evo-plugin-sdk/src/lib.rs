@@ -61,6 +61,11 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Version of this SDK crate, read from the crate's Cargo.toml at build
+/// time. Plugins use this to populate [`contract::BuildInfo::sdk_version`]
+/// without hardcoding a string that drifts on every workspace bump.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod error;
 pub mod manifest;
 
