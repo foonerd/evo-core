@@ -21,6 +21,9 @@
 //! - [`server`]: the client-facing Unix socket server.
 //! - [`shutdown`]: graceful shutdown on SIGTERM / SIGINT / Ctrl-C.
 //! - [`logging`]: tracing subscriber setup per the LOGGING contract.
+//! - [`wire_client`]: steward-side client for out-of-process plugins
+//!   speaking the wire protocol from `PLUGIN_CONTRACT.md` sections 6
+//!   through 11.
 //! - [`error`]: the steward's error type.
 //!
 //! This crate implements the v0 skeleton: in-process plugins only,
@@ -44,5 +47,6 @@ pub mod relations;
 pub mod server;
 pub mod shutdown;
 pub mod subjects;
+pub mod wire_client;
 
 pub use error::StewardError;

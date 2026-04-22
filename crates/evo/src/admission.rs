@@ -347,6 +347,141 @@ impl AdmissionEngine {
         Ok(())
     }
 
+    /// Admit an out-of-process singleton respondent over the wire
+    /// protocol.
+    ///
+    /// Takes the reader and writer halves of an already-established
+    /// connection (Unix socket, TCP, test duplex) and a manifest.
+    /// Follows the same admission sequence as
+    /// [`Self::admit_singleton_respondent`]:
+    ///
+    /// 1. Validates manifest.
+    /// 2. Verifies target shelf exists and has matching shape.
+    /// 3. Verifies no plugin is already admitted on that shelf.
+    /// 4. Spawns a [`WireRespondent`](crate::wire_client::WireRespondent)
+    ///    against the reader/writer. The connect step performs the
+    ///    `describe` handshake; identity is validated against the
+    ///    manifest.
+    /// 5. Constructs a `LoadContext` and calls `load` on the
+    ///    respondent. The wire adapter forwards the load frame to the
+    ///    remote plugin and installs event callbacks so asynchronous
+    ///    events from the plugin reach the steward's registries.
+    /// 6. Registers the plugin for request dispatch.
+    ///
+    /// On any failure the wire client is dropped (cleanly closing the
+    /// connection) and an error is returned naming the specific reason.
+    pub async fn admit_out_of_process_respondent<R, W>(
+        &mut self,
+        manifest: Manifest,
+        catalogue: &Catalogue,
+        reader: R,
+        writer: W,
+    ) -> Result<(), StewardError>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        manifest.validate()?;
+
+        let shelf_qualified = manifest.target.shelf.clone();
+        let shelf = catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
+            StewardError::Admission(format!(
+                "{}: target shelf not in catalogue: {}",
+                manifest.plugin.name, shelf_qualified
+            ))
+        })?;
+
+        if shelf.shape != manifest.target.shape {
+            return Err(StewardError::Admission(format!(
+                "{}: manifest targets shape {} but catalogue shelf {} is shape {}",
+                manifest.plugin.name,
+                manifest.target.shape,
+                shelf_qualified,
+                shelf.shape
+            )));
+        }
+
+        if self.by_shelf.contains_key(&shelf_qualified) {
+            return Err(StewardError::Admission(format!(
+                "{}: shelf {} already occupied",
+                manifest.plugin.name, shelf_qualified
+            )));
+        }
+
+        // Connect and eagerly describe. If either the connection or
+        // the initial describe fails we return here with no partial
+        // state.
+        let respondent = crate::wire_client::WireRespondent::connect(
+            reader,
+            writer,
+            manifest.plugin.name.clone(),
+        )
+        .await
+        .map_err(|e| {
+            StewardError::Admission(format!(
+                "{}: wire connect failed: {}",
+                manifest.plugin.name, e
+            ))
+        })?;
+
+        let description = respondent.description();
+        if description.identity.name != manifest.plugin.name {
+            return Err(StewardError::Admission(format!(
+                "plugin describe() name {} does not match manifest name {}",
+                description.identity.name, manifest.plugin.name
+            )));
+        }
+        if description.identity.version != manifest.plugin.version {
+            return Err(StewardError::Admission(format!(
+                "{}: plugin describe() version {} does not match manifest version {}",
+                manifest.plugin.name,
+                description.identity.version,
+                manifest.plugin.version
+            )));
+        }
+        if description.identity.contract != manifest.plugin.contract {
+            return Err(StewardError::Admission(format!(
+                "{}: plugin describe() contract {} does not match manifest contract {}",
+                manifest.plugin.name,
+                description.identity.contract,
+                manifest.plugin.contract
+            )));
+        }
+
+        let mut erased: Box<dyn ErasedRespondent> = Box::new(respondent);
+
+        let ctx = build_load_context(
+            &manifest,
+            Arc::clone(&self.registry),
+            Arc::clone(&self.relation_graph),
+        );
+        erased.load(&ctx).await.map_err(|e| {
+            StewardError::Admission(format!(
+                "{}: load failed: {}",
+                manifest.plugin.name, e
+            ))
+        })?;
+
+        let record = AdmittedPlugin {
+            name: manifest.plugin.name.clone(),
+            shelf: shelf_qualified.clone(),
+            erased,
+        };
+
+        tracing::info!(
+            plugin = %record.name,
+            shelf = %record.shelf,
+            trust_class = ?manifest.trust.class,
+            transport = "wire",
+            "plugin admitted"
+        );
+
+        self.by_shelf.insert(shelf_qualified.clone(), record);
+        self.admission_order.push(shelf_qualified);
+
+        Ok(())
+    }
+
     /// Route a request to the plugin admitted on the given shelf.
     ///
     /// Returns an error if no plugin is admitted on that shelf, or if the
