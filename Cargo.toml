@@ -1,10 +1,12 @@
 [workspace]
 resolver = "2"
-members = []
+members = [
+    "crates/evo-plugin-sdk",
+]
 
-# Crates will be added here as they are authored. Engineering-layer
-# documents in docs/ precede code; this workspace stub exists so the
-# repository is cargo-recognisable from the outset.
+# Further crates will be added here as they are authored. Engineering-layer
+# documents in docs/ remain the source of truth; every public type in a
+# workspace crate has a corresponding citation in those documents.
 
 [workspace.package]
 version = "0.1.0"

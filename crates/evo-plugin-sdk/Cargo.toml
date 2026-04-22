@@ -1,0 +1,19 @@
+[package]
+name = "evo-plugin-sdk"
+description = "SDK for authoring plugins on the evo steward fabric."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "1"
+semver = { version = "1", features = ["serde"] }
+regex = "1"
+once_cell = "1"
+
+[lints]
+workspace = true
