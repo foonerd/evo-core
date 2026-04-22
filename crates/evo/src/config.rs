@@ -84,6 +84,22 @@ impl StewardConfig {
         }
     }
 
+    /// Load the config from a specified path. Errors if the file does
+    /// not exist.
+    ///
+    /// Use this when the path came from an explicit CLI flag: the user
+    /// asked for that specific file, so a missing file is a real error
+    /// rather than an invitation to fall back to defaults.
+    pub fn load_from_required(path: &Path) -> Result<Self, StewardError> {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            StewardError::io(format!("reading config {}", path.display()), e)
+        })?;
+        let cfg: Self = toml::from_str(&content).map_err(|e| {
+            StewardError::toml(format!("{}", path.display()), e)
+        })?;
+        Ok(cfg)
+    }
+
     /// Parse a config from a TOML string. Intended for tests.
     pub fn from_toml(input: &str) -> Result<Self, StewardError> {
         let cfg: Self = toml::from_str(input)
@@ -235,5 +251,12 @@ allow_unsigned = true
         let path = std::path::Path::new("/nonexistent/evo-test-never-exists.toml");
         let cfg = StewardConfig::load_from(path).unwrap();
         assert_eq!(cfg, StewardConfig::default());
+    }
+
+    #[test]
+    fn load_from_required_errors_on_missing_file() {
+        let path = std::path::Path::new("/nonexistent/evo-test-never-exists.toml");
+        let r = StewardConfig::load_from_required(path);
+        assert!(matches!(r, Err(StewardError::Io { .. })));
     }
 }

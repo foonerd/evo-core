@@ -1,31 +1,54 @@
 //! Evo steward binary entrypoint.
 //!
-//! A thin wrapper around the `evo` library: loads config, initialises
-//! logging, loads the catalogue, admits the v0 hardcoded echo plugin,
-//! runs the server until a shutdown signal, and drains cleanly.
+//! A thin wrapper around the `evo` library: parses CLI flags, loads
+//! config, initialises logging, loads the catalogue, admits the v0
+//! hardcoded echo plugin, runs the server until a shutdown signal, and
+//! drains cleanly.
 //!
 //! Tests do not touch this file; anything testable lives in the library.
 
 #![forbid(unsafe_code)]
 #![allow(missing_docs)]
 
+use std::path::PathBuf;
 use std::sync::Arc;
+
+use clap::Parser;
 use tokio::sync::Mutex;
 
 use evo::admission::AdmissionEngine;
 use evo::catalogue::Catalogue;
+use evo::cli::Args;
 use evo::config::StewardConfig;
 use evo::server::Server;
 use evo::shutdown::wait_for_signal;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load config first. Logging is not yet initialised here; any
-    // errors go to stderr as anyhow messages.
-    let config = StewardConfig::load()?;
+    // Parse CLI first. Clap handles --version and --help by printing and
+    // exiting with status 0; invalid flags exit with status 2.
+    let args = Args::parse();
 
-    // Initialise logging per LOGGING.md. From here on, use `tracing`.
-    evo::logging::init(&config)?;
+    // Load the config. If --config was given, missing file is an error;
+    // otherwise a missing default config silently falls back.
+    let config = match &args.config {
+        Some(path) => StewardConfig::load_from_required(path)?,
+        None => StewardConfig::load()?,
+    };
+
+    // Resolve effective paths. CLI flags override config values.
+    let catalogue_path: PathBuf = args
+        .catalogue
+        .clone()
+        .unwrap_or_else(|| config.catalogue.path.clone());
+    let socket_path: PathBuf = args
+        .socket
+        .clone()
+        .unwrap_or_else(|| config.steward.socket_path.clone());
+
+    // Initialise logging. CLI --log-level takes precedence over RUST_LOG
+    // and over config.steward.log_level; see logging::resolve_filter.
+    evo::logging::init(&config, args.log_level.as_deref())?;
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -33,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Load the catalogue.
-    let catalogue = Catalogue::load(&config.catalogue.path)?;
+    let catalogue = Catalogue::load(&catalogue_path)?;
     tracing::info!(
         racks = catalogue.racks.len(),
         shelves = catalogue
@@ -41,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
             .iter()
             .map(|r| r.shelves.len())
             .sum::<usize>(),
-        path = %config.catalogue.path.display(),
+        path = %catalogue_path.display(),
         "catalogue loaded"
     );
 
@@ -55,13 +78,10 @@ async fn main() -> anyhow::Result<()> {
     let engine = Arc::new(Mutex::new(engine));
 
     // Start the server.
-    let server = Server::new(
-        config.steward.socket_path.clone(),
-        Arc::clone(&engine),
-    );
+    let server = Server::new(socket_path.clone(), Arc::clone(&engine));
 
     tracing::warn!(
-        socket = %config.steward.socket_path.display(),
+        socket = %socket_path.display(),
         "evo ready"
     );
 

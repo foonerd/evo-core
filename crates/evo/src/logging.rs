@@ -2,8 +2,11 @@
 //!
 //! The steward installs a layered subscriber:
 //!
-//! - An `EnvFilter` layer that honours `RUST_LOG` if set, else the
-//!   `log_level` field from [`StewardConfig::steward`], else `warn`.
+//! - An `EnvFilter` layer whose precedence is:
+//!   1. `cli_override` (e.g. from `--log-level`), if given and valid.
+//!   2. `RUST_LOG`, if set and valid.
+//!   3. The `log_level` field from [`StewardConfig::steward`], if valid.
+//!   4. Hard-coded fallback of `warn`.
 //! - An `fmt` layer writing human-readable lines to stderr. systemd
 //!   captures this into journald automatically for service installs.
 //! - On Linux: an additional `tracing-journald` layer that emits the
@@ -19,13 +22,20 @@ use tracing_subscriber::{EnvFilter, Registry};
 
 /// Initialise the tracing subscriber.
 ///
+/// The `cli_override` parameter carries an optional log-level directive
+/// from the command line (e.g. `--log-level info`) which takes
+/// precedence over `RUST_LOG` and the config file.
+///
 /// Returns an error if the subscriber has already been installed (for
 /// example, if called twice). The binary should call this exactly once.
 ///
 /// Tests should not call this: leaving the global subscriber unset means
 /// tests run silently, which is what most unit tests want.
-pub fn init(config: &StewardConfig) -> Result<(), StewardError> {
-    let filter = resolve_filter(&config.steward.log_level);
+pub fn init(
+    config: &StewardConfig,
+    cli_override: Option<&str>,
+) -> Result<(), StewardError> {
+    let filter = resolve_filter(&config.steward.log_level, cli_override);
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
@@ -54,9 +64,9 @@ pub fn init(config: &StewardConfig) -> Result<(), StewardError> {
                     .with(filter)
                     .with(fmt_layer)
                     .try_init()
-                    .map_err(|e| {
+                    .map_err(|init_err| {
                         StewardError::Config(format!(
-                            "tracing subscriber init: {e}"
+                            "tracing subscriber init: {init_err}"
                         ))
                     })?;
                 tracing::debug!(
@@ -83,20 +93,36 @@ pub fn init(config: &StewardConfig) -> Result<(), StewardError> {
     Ok(())
 }
 
-/// Resolve the active `EnvFilter` per LOGGING.md section 3.
+/// Resolve the active `EnvFilter` per LOGGING.md section 3, with CLI
+/// override support.
 ///
 /// Precedence (highest wins):
-/// 1. `RUST_LOG` if it parses as a valid filter directive.
-/// 2. The supplied `config_level` if it parses as a valid filter
-///    directive (e.g. `"warn"` -> a filter admitting `warn` and above
-///    across all targets).
-/// 3. Hard-coded fallback of `warn`.
-fn resolve_filter(config_level: &str) -> EnvFilter {
+/// 1. `cli_override` if supplied and parses as a valid filter directive.
+/// 2. `RUST_LOG` if set and parses as a valid filter directive.
+/// 3. `config_level` if it parses as a valid filter directive.
+/// 4. Hard-coded fallback of `warn`.
+///
+/// If `cli_override` is supplied but fails to parse, a warning is
+/// written to stderr (tracing is not yet initialised here) and the
+/// resolution falls through to the next precedence level.
+fn resolve_filter(config_level: &str, cli_override: Option<&str>) -> EnvFilter {
+    if let Some(level) = cli_override {
+        match EnvFilter::try_new(level) {
+            Ok(f) => return f,
+            Err(e) => {
+                eprintln!(
+                    "evo: warning: invalid --log-level '{level}': {e}; falling back"
+                );
+            }
+        }
+    }
+
     if let Ok(s) = std::env::var("RUST_LOG") {
         if let Ok(f) = EnvFilter::try_new(&s) {
             return f;
         }
     }
+
     EnvFilter::try_new(config_level)
         .unwrap_or_else(|_| EnvFilter::new("warn"))
 }
@@ -107,23 +133,32 @@ mod tests {
 
     #[test]
     fn resolve_filter_defaults_to_warn_on_bad_input() {
-        // SAFETY: single-threaded test, no RUST_LOG interference.
         std::env::remove_var("RUST_LOG");
-        let f = resolve_filter("this-is-not-valid");
-        // If we got here without panic, the fallback worked. Best we can
-        // do without a richer EnvFilter introspection API.
-        let _ = f;
+        let _ = resolve_filter("this-is-not-valid", None);
     }
 
     #[test]
-    fn resolve_filter_accepts_warn() {
+    fn resolve_filter_accepts_warn_from_config() {
         std::env::remove_var("RUST_LOG");
-        let _ = resolve_filter("warn");
+        let _ = resolve_filter("warn", None);
     }
 
     #[test]
-    fn resolve_filter_accepts_info() {
+    fn resolve_filter_accepts_info_from_config() {
         std::env::remove_var("RUST_LOG");
-        let _ = resolve_filter("info");
+        let _ = resolve_filter("info", None);
+    }
+
+    #[test]
+    fn resolve_filter_cli_override_accepts_valid() {
+        std::env::remove_var("RUST_LOG");
+        let _ = resolve_filter("warn", Some("debug"));
+    }
+
+    #[test]
+    fn resolve_filter_cli_override_bad_falls_through() {
+        std::env::remove_var("RUST_LOG");
+        // Bad override -> falls through to config level.
+        let _ = resolve_filter("warn", Some("!!!not-a-valid-directive!!!"));
     }
 }

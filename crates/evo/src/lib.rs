@@ -11,6 +11,7 @@
 //!
 //! - [`config`]: steward configuration ([`config::StewardConfig`]), loaded
 //!   from `/etc/evo/evo.toml`.
+//! - [`cli`]: command-line argument parsing (clap derive).
 //! - [`catalogue`]: the rack/shelf catalogue the steward administers.
 //! - [`admission`]: the admission engine that runs plugin lifecycles.
 //! - [`context`]: concrete implementations of the SDK callback traits
@@ -32,6 +33,7 @@
 
 pub mod admission;
 pub mod catalogue;
+pub mod cli;
 pub mod config;
 pub mod context;
 pub mod error;
