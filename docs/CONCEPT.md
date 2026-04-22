@@ -152,7 +152,7 @@ Concept-level decisions deferred to the engineering layer. Named here so downstr
 | Plugin manifest, signing, lifecycle, filesystem paths | `docs/engineering/PLUGIN_PACKAGING.md` |
 | Vendor contract, actor taxonomy, namespace governance | `docs/engineering/VENDOR_CONTRACT.md` |
 | Logging conventions (levels, format, fields, plugin integration) | `docs/engineering/LOGGING.md` |
-| Subject identity resolution | Future: `docs/engineering/SUBJECTS.md` |
+| Subject identity resolution | `docs/engineering/SUBJECTS.md` |
 | Relation grammar | Future: `docs/engineering/RELATIONS.md` |
 | Projection subscription protocol | Future: `docs/engineering/PROJECTIONS.md` |
 | Fast-path mechanism | Future: `docs/engineering/FAST_PATH.md` |

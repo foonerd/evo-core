@@ -13,8 +13,9 @@ This repository holds the steward, the plugin SDK, the plugin tooling, and the e
 | [docs/engineering/PLUGIN_PACKAGING.md](docs/engineering/PLUGIN_PACKAGING.md) | Plugin manifest, identity, signing, filesystem layout on target, installation lifecycle, SDK and tooling. |
 | [docs/engineering/VENDOR_CONTRACT.md](docs/engineering/VENDOR_CONTRACT.md) | Vendor contract. Actor taxonomy, namespace governance, vendor commitments and privileges, distribution relationships, revocation pathways. |
 | [docs/engineering/LOGGING.md](docs/engineering/LOGGING.md) | Logging contract. Library, levels, default level, format, structured fields, logs-vs-happenings, plugin log integration. |
+| [docs/engineering/SUBJECTS.md](docs/engineering/SUBJECTS.md) | Subject registry. Canonical identity, external addressings, announcements, equivalence and distinctness claims, reconciliation, merges and splits, provenance, operator overrides, persistence, happenings. |
 
-Further engineering-layer documents (subject identity, relation grammar, projection protocol, fast-path, steward startup) are deliberately open. See `docs/CONCEPT.md` section 10.
+Further engineering-layer documents (relation grammar, projection protocol, fast-path, steward startup) are deliberately open. See `docs/CONCEPT.md` section 10.
 
 ## Distributions
 
@@ -22,7 +23,7 @@ Evo is domain-neutral. A device ships as a distribution of evo: a catalogue decl
 
 ## Status
 
-Engineering layer. Documents precede code. No crates yet.
+Engineering layer, plus a working v0 steward skeleton. See `crates/evo` for the runnable binary and `crates/evo-plugin-sdk` for the plugin SDK.
 
 ## License
 
