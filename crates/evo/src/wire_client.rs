@@ -33,24 +33,35 @@
 //! SDK's [`PluginError`] variants so the steward's admission engine
 //! can classify failures uniformly.
 //!
+//! ## Warden support
+//!
+//! Starting in pass 4e-b the wire client also drives [`Warden`]
+//! plugins: [`WireClient::take_custody`], [`WireClient::course_correct`]
+//! and [`WireClient::release_custody`] send the corresponding wire
+//! frames and parse the responses. [`WireWarden`] is the warden-side
+//! adapter, parallel to [`WireRespondent`], implementing
+//! [`ErasedWarden`](crate::admission::ErasedWarden). Custody state
+//! reports (`ReportCustodyState`) emitted by the remote warden are
+//! routed by [`forward_event`] to an optional
+//! [`CustodyStateReporter`] in the [`EventSink`]; when absent the
+//! frame is logged and dropped.
+//!
 //! ## Deferred
 //!
-//! This wire client is respondent-only. The warden wire frames
-//! (`take_custody`, `course_correct`, `release_custody`,
-//! `report_custody_state`) exist in the SDK and can be emitted by
-//! plugins, but the steward has no warden admission path yet; that
-//! lands in pass 4e. If a warden-shaped event (`report_custody_state`)
-//! arrives on a respondent connection today, [`forward_event`] logs
-//! and drops it. Factory verbs and user-interaction wire frames still
-//! do not exist on the wire in any form.
+//! Factory verbs and user-interaction wire frames still do not exist
+//! on the wire in any form.
+//!
+//! [`Warden`]: evo_plugin_sdk::contract::Warden
 
 use crate::context::{
-    LoggingStateReporter, RegistryRelationAnnouncer, RegistrySubjectAnnouncer,
+    LoggingCustodyStateReporter, LoggingStateReporter,
+    RegistryRelationAnnouncer, RegistrySubjectAnnouncer,
 };
 use crate::relations::RelationGraph;
 use crate::subjects::SubjectRegistry;
 use evo_plugin_sdk::codec::{read_frame_json, write_frame_json, WireError};
 use evo_plugin_sdk::contract::{
+    Assignment, CourseCorrection, CustodyHandle, CustodyStateReporter,
     HealthReport, LoadContext, PluginDescription, PluginError,
     RelationAnnouncer, Request, Response, StateReporter, SubjectAnnouncer,
 };
@@ -136,8 +147,14 @@ pub enum WireClientError {
 /// Callbacks the wire client invokes when events arrive from the
 /// remote plugin.
 ///
-/// Populated by [`WireRespondent::load`] from the `LoadContext`'s
-/// announcers; cleared after `unload` completes.
+/// Populated by [`WireRespondent::load`] or [`WireWarden::load`] from
+/// the `LoadContext`'s announcers; cleared after `unload` completes.
+///
+/// The `custody_state_reporter` slot is `None` for respondent
+/// connections (respondents never emit `ReportCustodyState` frames)
+/// and `Some` for warden connections. When a `ReportCustodyState`
+/// frame arrives and the slot is `None` [`forward_event`] logs and
+/// drops it.
 pub struct EventSink {
     /// Where to route `report_state` frames.
     pub state_reporter: Arc<dyn StateReporter>,
@@ -145,6 +162,9 @@ pub struct EventSink {
     pub subject_announcer: Arc<dyn SubjectAnnouncer>,
     /// Where to route `assert_relation` / `retract_relation` frames.
     pub relation_announcer: Arc<dyn RelationAnnouncer>,
+    /// Where to route `report_custody_state` frames. `None` for
+    /// respondent-backed sinks.
+    pub custody_state_reporter: Option<Arc<dyn CustodyStateReporter>>,
 }
 
 impl fmt::Debug for EventSink {
@@ -153,6 +173,12 @@ impl fmt::Debug for EventSink {
             .field("state_reporter", &"<Arc<dyn StateReporter>>")
             .field("subject_announcer", &"<Arc<dyn SubjectAnnouncer>>")
             .field("relation_announcer", &"<Arc<dyn RelationAnnouncer>>")
+            .field(
+                "custody_state_reporter",
+                &self.custody_state_reporter.as_ref().map(|_| {
+                    "<Arc<dyn CustodyStateReporter>>"
+                }),
+            )
             .finish()
     }
 }
@@ -482,6 +508,92 @@ impl WireClient {
             ))),
         }
     }
+
+    /// Send the `take_custody` verb. Uses the supplied correlation ID
+    /// as the wire frame's cid; the caller (typically
+    /// [`WireWarden::take_custody`]) sources it from the
+    /// [`Assignment::correlation_id`] so the custody handshake uses
+    /// the same id the steward allocated.
+    pub async fn take_custody(
+        &self,
+        correlation_id: u64,
+        custody_type: String,
+        payload: Vec<u8>,
+        deadline_ms: Option<u64>,
+    ) -> Result<CustodyHandle, WireClientError> {
+        let frame = WireFrame::TakeCustody {
+            v: PROTOCOL_VERSION,
+            cid: correlation_id,
+            plugin: self.plugin_name.clone(),
+            custody_type,
+            payload,
+            deadline_ms,
+        };
+        match self.request(correlation_id, frame).await? {
+            WireFrame::TakeCustodyResponse { handle, .. } => Ok(handle),
+            WireFrame::Error { message, fatal, .. } => {
+                Err(WireClientError::PluginReturnedError { message, fatal })
+            }
+            other => Err(WireClientError::Protocol(format!(
+                "expected take_custody_response, got {}",
+                variant_name(&other)
+            ))),
+        }
+    }
+
+    /// Send the `course_correct` verb. The correlation ID becomes the
+    /// wire frame's cid; the `CustodyHandle` is round-tripped
+    /// verbatim so the remote warden can look up its internal state
+    /// for this custody.
+    pub async fn course_correct(
+        &self,
+        correlation_id: u64,
+        handle: &CustodyHandle,
+        correction: CourseCorrection,
+    ) -> Result<(), WireClientError> {
+        let frame = WireFrame::CourseCorrect {
+            v: PROTOCOL_VERSION,
+            cid: correlation_id,
+            plugin: self.plugin_name.clone(),
+            handle: handle.clone(),
+            correction_type: correction.correction_type,
+            payload: correction.payload,
+        };
+        match self.request(correlation_id, frame).await? {
+            WireFrame::CourseCorrectResponse { .. } => Ok(()),
+            WireFrame::Error { message, fatal, .. } => {
+                Err(WireClientError::PluginReturnedError { message, fatal })
+            }
+            other => Err(WireClientError::Protocol(format!(
+                "expected course_correct_response, got {}",
+                variant_name(&other)
+            ))),
+        }
+    }
+
+    /// Send the `release_custody` verb. The handle is consumed.
+    pub async fn release_custody(
+        &self,
+        correlation_id: u64,
+        handle: CustodyHandle,
+    ) -> Result<(), WireClientError> {
+        let frame = WireFrame::ReleaseCustody {
+            v: PROTOCOL_VERSION,
+            cid: correlation_id,
+            plugin: self.plugin_name.clone(),
+            handle,
+        };
+        match self.request(correlation_id, frame).await? {
+            WireFrame::ReleaseCustodyResponse { .. } => Ok(()),
+            WireFrame::Error { message, fatal, .. } => {
+                Err(WireClientError::PluginReturnedError { message, fatal })
+            }
+            other => Err(WireClientError::Protocol(format!(
+                "expected release_custody_response, got {}",
+                variant_name(&other)
+            ))),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -653,6 +765,31 @@ async fn forward_event(frame: WireFrame, sink: &EventSink) {
                 );
             }
         }
+        WireFrame::ReportCustodyState {
+            handle,
+            payload,
+            health,
+            ..
+        } => match &sink.custody_state_reporter {
+            Some(reporter) => {
+                if let Err(e) =
+                    reporter.report(&handle, payload, health).await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        custody = %handle.id,
+                        "custody_state_reporter.report failed"
+                    );
+                }
+            }
+            None => {
+                tracing::warn!(
+                    custody = %handle.id,
+                    "report_custody_state arrived but event sink has no \
+                     custody reporter installed; dropping"
+                );
+            }
+        },
         _ => {
             // Not an event variant; forward_event is only called for
             // events per is_event() filter above.
@@ -684,10 +821,6 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::Unload { .. } => "unload",
         WireFrame::HealthCheck { .. } => "health_check",
         WireFrame::HandleRequest { .. } => "handle_request",
-        // Warden verbs: named here for diagnostic completeness.
-        // Steward-side warden admission lands in pass 4e; until then
-        // these frames should not appear on respondent connections,
-        // but if one does the name makes the log actionable.
         WireFrame::TakeCustody { .. } => "take_custody",
         WireFrame::CourseCorrect { .. } => "course_correct",
         WireFrame::ReleaseCustody { .. } => "release_custody",
@@ -845,10 +978,13 @@ impl crate::admission::ErasedRespondent for WireRespondent {
         Box::pin(async move {
             // Install event sink BEFORE sending the load frame so that
             // any events emitted during load() reach the registries.
+            // Respondents never emit ReportCustodyState so the
+            // custody_state_reporter slot is None.
             self.client.set_event_sink(EventSink {
                 state_reporter: Arc::clone(&ctx.state_reporter),
                 subject_announcer: Arc::clone(&ctx.subject_announcer),
                 relation_announcer: Arc::clone(&ctx.relation_announcer),
+                custody_state_reporter: None,
             });
 
             let config_json = toml_table_to_json_value(ctx.config.clone())
@@ -947,6 +1083,266 @@ impl crate::admission::ErasedRespondent for WireRespondent {
 }
 
 // ---------------------------------------------------------------------
+// WireWarden: adapter implementing ErasedWarden over a WireClient.
+// ---------------------------------------------------------------------
+
+/// Adapter that presents a [`WireClient`] as an
+/// [`ErasedWarden`](crate::admission::ErasedWarden).
+///
+/// Parallel to [`WireRespondent`] for the warden interaction shape.
+/// The admission engine treats a wire-backed warden indistinguishably
+/// from an in-process one; all transport concerns are hidden inside
+/// this adapter.
+///
+/// ## Describe caching
+///
+/// Same rationale as [`WireRespondent`]: `describe()` on the
+/// `ErasedWarden` trait is infallible, so we call it eagerly in
+/// [`WireWarden::connect`] and cache the result.
+///
+/// ## Custody state reporter
+///
+/// The warden's `load()` installs a [`LoggingCustodyStateReporter`]
+/// tagged with the plugin name in the [`EventSink`]. When the remote
+/// warden emits `ReportCustodyState` frames during an ongoing
+/// custody, the reader task routes them through this reporter. A
+/// future pass can replace `LoggingCustodyStateReporter` with a
+/// ledger-backed one without changing the adapter.
+///
+/// ## Assignment custody reporter is wire-redundant
+///
+/// The admission engine constructs an [`Assignment`] with a
+/// steward-side `custody_state_reporter`, but for wire wardens that
+/// specific `Arc` is not what the plugin ends up calling: the SDK's
+/// `serve_warden` substitutes its own wire-backed reporter on each
+/// `take_custody` on the plugin side. The admission engine's
+/// reporter is effectively dead-ended on the wire path today; it
+/// remains in the [`Assignment`] only for the in-process path.
+pub struct WireWarden {
+    client: WireClient,
+    cached_description: PluginDescription,
+}
+
+impl fmt::Debug for WireWarden {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WireWarden")
+            .field("client", &self.client)
+            .field(
+                "cached_description.identity",
+                &self.cached_description.identity,
+            )
+            .finish()
+    }
+}
+
+impl WireWarden {
+    /// Connect a wire warden over the given reader and writer.
+    ///
+    /// Spawns the client's background tasks, sends a `describe`
+    /// request, and caches the response.
+    pub async fn connect<R, W>(
+        reader: R,
+        writer: W,
+        plugin_name: String,
+    ) -> Result<Self, WireClientError>
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        let client = WireClient::spawn(reader, writer, plugin_name);
+        let cached_description = client.describe().await?;
+        Ok(Self {
+            client,
+            cached_description,
+        })
+    }
+
+    /// Borrow the cached plugin description.
+    pub fn description(&self) -> &PluginDescription {
+        &self.cached_description
+    }
+
+    /// Borrow the underlying wire client.
+    pub fn client(&self) -> &WireClient {
+        &self.client
+    }
+}
+
+impl crate::admission::ErasedWarden for WireWarden {
+    fn describe(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = PluginDescription> + Send + '_>> {
+        let desc = self.cached_description.clone();
+        Box::pin(async move { desc })
+    }
+
+    fn load<'a>(
+        &'a mut self,
+        ctx: &'a LoadContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // Install event sink BEFORE sending the load frame so that
+            // any events emitted during load() reach the registries,
+            // and so that subsequent ReportCustodyState frames during
+            // custody can be routed. The custody reporter is a
+            // logger tagged with the plugin name; future passes can
+            // substitute a ledger-backed reporter here.
+            let custody_reporter: Arc<dyn CustodyStateReporter> =
+                Arc::new(LoggingCustodyStateReporter::new(
+                    self.client.plugin_name().to_string(),
+                ));
+            self.client.set_event_sink(EventSink {
+                state_reporter: Arc::clone(&ctx.state_reporter),
+                subject_announcer: Arc::clone(&ctx.subject_announcer),
+                relation_announcer: Arc::clone(&ctx.relation_announcer),
+                custody_state_reporter: Some(custody_reporter),
+            });
+
+            let config_json = toml_table_to_json_value(ctx.config.clone())
+                .map_err(|e| {
+                    PluginError::Permanent(format!(
+                        "config conversion to JSON failed: {e}"
+                    ))
+                })?;
+
+            let deadline_ms = ctx.deadline.map(|d| {
+                d.remaining()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64
+            });
+
+            let state_dir =
+                ctx.state_dir.to_string_lossy().into_owned();
+            let credentials_dir =
+                ctx.credentials_dir.to_string_lossy().into_owned();
+
+            match self
+                .client
+                .load(config_json, state_dir, credentials_dir, deadline_ms)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    self.client.clear_event_sink();
+                    Err(wire_error_to_plugin_error(e, "wire load"))
+                }
+            }
+        })
+    }
+
+    fn unload(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let result = self.client.unload().await;
+            self.client.clear_event_sink();
+            match result {
+                Ok(()) => Ok(()),
+                Err(e) => Err(wire_error_to_plugin_error(e, "wire unload")),
+            }
+        })
+    }
+
+    fn health_check(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = HealthReport> + Send + '_>> {
+        Box::pin(async move {
+            match self.client.health_check().await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = %self.client.plugin_name(),
+                        error = %e,
+                        "wire health_check failed; reporting unhealthy"
+                    );
+                    HealthReport::unhealthy(format!(
+                        "wire health check failed: {e}"
+                    ))
+                }
+            }
+        })
+    }
+
+    fn take_custody<'a>(
+        &'a mut self,
+        assignment: Assignment,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            // Note: `assignment.custody_state_reporter` is not used on
+            // the wire path. See the WireWarden doc comment.
+            match self
+                .client
+                .take_custody(
+                    assignment.correlation_id,
+                    assignment.custody_type,
+                    assignment.payload,
+                    assignment.deadline.map(|d| {
+                        d.checked_duration_since(Instant::now())
+                            .unwrap_or_default()
+                            .as_millis()
+                            .min(u64::MAX as u128)
+                            as u64
+                    }),
+                )
+                .await
+            {
+                Ok(h) => Ok(h),
+                Err(e) => {
+                    Err(wire_error_to_plugin_error(e, "wire take_custody"))
+                }
+            }
+        })
+    }
+
+    fn course_correct<'a>(
+        &'a mut self,
+        handle: &'a CustodyHandle,
+        correction: CourseCorrection,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            match self
+                .client
+                .course_correct(correction.correlation_id, handle, correction)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(e) => Err(wire_error_to_plugin_error(
+                    e,
+                    "wire course_correct",
+                )),
+            }
+        })
+    }
+
+    fn release_custody<'a>(
+        &'a mut self,
+        handle: CustodyHandle,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // Release uses a fresh correlation id allocated from the
+            // client's internal counter. Unlike take_custody and
+            // course_correct (whose cids come from the admission
+            // engine's Assignment/CourseCorrection), release_custody
+            // has no steward-allocated cid.
+            let cid = self.client.next_cid();
+            match self.client.release_custody(cid, handle).await {
+                Ok(()) => Ok(()),
+                Err(e) => Err(wire_error_to_plugin_error(
+                    e,
+                    "wire release_custody",
+                )),
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------
 // TOML -> JSON config conversion
 // ---------------------------------------------------------------------
 
@@ -1005,6 +1401,10 @@ fn toml_value_to_json_value(
 /// Helper used from tests and the admission path: build an
 /// [`EventSink`] backed by the steward's registries, tagged with
 /// the given plugin name as claimant.
+///
+/// The `custody_state_reporter` slot is always `None` in the helper;
+/// callers that need one (the warden admission path) construct the
+/// sink directly.
 #[allow(dead_code)]
 pub(crate) fn registry_event_sink(
     plugin_name: &str,
@@ -1024,6 +1424,7 @@ pub(crate) fn registry_event_sink(
             graph,
             plugin_name.to_string(),
         )),
+        custody_state_reporter: None,
     }
 }
 
@@ -1037,10 +1438,10 @@ mod tests {
     use evo_plugin_sdk::contract::{
         BuildInfo, ExternalAddressing, HealthReport, HealthStatus, Plugin,
         PluginDescription, PluginError, PluginIdentity, RelationAssertion,
-        Request, Respondent, Response, RuntimeCapabilities,
-        SubjectAnnouncement,
+        ReportError, Request, Respondent, Response, RuntimeCapabilities,
+        SubjectAnnouncement, Warden,
     };
-    use evo_plugin_sdk::host::{serve, HostConfig};
+    use evo_plugin_sdk::host::{serve, serve_warden, HostConfig};
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
@@ -1545,5 +1946,483 @@ mod tests {
                 plugin_name.to_string(),
             )),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Warden-side tests (pass 4e-b).
+    //
+    // TestWarden is a minimal warden that records every custody
+    // interaction and can optionally emit one ReportCustodyState
+    // during take_custody. Emitting from inside the plugin's own
+    // trait method mirrors the SDK-side test pattern that avoids
+    // cross-task reporter sharing; see the matching 4d transcript
+    // note about why extracting a reporter from the plugin and
+    // calling it from the test task deadlocks.
+    // -----------------------------------------------------------------
+
+    #[derive(Default)]
+    struct TestWarden {
+        name: String,
+        loaded: Arc<AtomicBool>,
+        unloaded: Arc<AtomicBool>,
+        /// If Some, emit one ReportCustodyState frame during
+        /// take_custody before returning the handle.
+        report_payload_during_take: Option<Vec<u8>>,
+        fail_take: bool,
+    }
+
+    impl Plugin for TestWarden {
+        fn describe(
+            &self,
+        ) -> impl Future<Output = PluginDescription> + Send + '_
+        {
+            let name = self.name.clone();
+            async move {
+                PluginDescription {
+                    identity: PluginIdentity {
+                        name,
+                        version: semver::Version::new(0, 1, 1),
+                        contract: 1,
+                    },
+                    runtime_capabilities: RuntimeCapabilities {
+                        request_types: vec![],
+                        accepts_custody: true,
+                        flags: Default::default(),
+                    },
+                    build_info: BuildInfo {
+                        plugin_build: "test".into(),
+                        sdk_version: evo_plugin_sdk::VERSION.into(),
+                        rustc_version: None,
+                        built_at: None,
+                    },
+                }
+            }
+        }
+
+        fn load<'a>(
+            &'a mut self,
+            _ctx: &'a LoadContext,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
+        {
+            async move {
+                self.loaded.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        fn unload(
+            &mut self,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_
+        {
+            async move {
+                self.unloaded.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        fn health_check(
+            &self,
+        ) -> impl Future<Output = HealthReport> + Send + '_
+        {
+            async move {
+                if self.loaded.load(Ordering::Relaxed) {
+                    HealthReport::healthy()
+                } else {
+                    HealthReport::unhealthy("not loaded")
+                }
+            }
+        }
+    }
+
+    impl Warden for TestWarden {
+        fn take_custody<'a>(
+            &'a mut self,
+            assignment: Assignment,
+        ) -> impl Future<Output = Result<CustodyHandle, PluginError>>
+               + Send
+               + 'a
+        {
+            async move {
+                if self.fail_take {
+                    return Err(PluginError::Permanent(
+                        "refused to take custody".into(),
+                    ));
+                }
+                // Handle id is deterministic from the correlation_id
+                // so tests can predict it.
+                let handle = CustodyHandle::new(format!(
+                    "custody-{}",
+                    assignment.correlation_id
+                ));
+                if let Some(payload) =
+                    self.report_payload_during_take.clone()
+                {
+                    assignment
+                        .custody_state_reporter
+                        .report(&handle, payload, HealthStatus::Healthy)
+                        .await
+                        .ok();
+                }
+                Ok(handle)
+            }
+        }
+
+        fn course_correct<'a>(
+            &'a mut self,
+            _handle: &'a CustodyHandle,
+            _correction: CourseCorrection,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
+        {
+            async move { Ok(()) }
+        }
+
+        fn release_custody<'a>(
+            &'a mut self,
+            _handle: CustodyHandle,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
+        {
+            async move { Ok(()) }
+        }
+    }
+
+    /// Custody state reporter that records each call into a shared
+    /// `Vec`, for test observation of events routed through
+    /// [`forward_event`].
+    struct CapturingCustodyStateReporter {
+        captured: Arc<
+            std::sync::Mutex<Vec<(CustodyHandle, Vec<u8>, HealthStatus)>>,
+        >,
+    }
+
+    impl CustodyStateReporter for CapturingCustodyStateReporter {
+        fn report<'a>(
+            &'a self,
+            handle: &'a CustodyHandle,
+            payload: Vec<u8>,
+            health: HealthStatus,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>,
+        > {
+            let captured = Arc::clone(&self.captured);
+            let handle = handle.clone();
+            Box::pin(async move {
+                captured.lock().unwrap().push((handle, payload, health));
+                Ok(())
+            })
+        }
+    }
+
+    // Helper: stand up a serve_warden-backed host on two
+    // one-directional duplex pairs, mirroring connect_test_pair.
+    async fn connect_warden_test_pair(
+        plugin: TestWarden,
+    ) -> (
+        WireWarden,
+        JoinHandle<Result<(), evo_plugin_sdk::host::HostError>>,
+    ) {
+        let plugin_name = plugin.name.clone();
+
+        let (steward_to_plugin_w, steward_to_plugin_r) =
+            tokio::io::duplex(65536);
+        let (plugin_to_steward_w, plugin_to_steward_r) =
+            tokio::io::duplex(65536);
+
+        let host = tokio::spawn(serve_warden(
+            plugin,
+            HostConfig::new(plugin_name.clone()),
+            steward_to_plugin_r,
+            plugin_to_steward_w,
+        ));
+
+        let warden = WireWarden::connect(
+            plugin_to_steward_r,
+            steward_to_plugin_w,
+            plugin_name,
+        )
+        .await
+        .unwrap();
+        (warden, host)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warden_connect_caches_describe() {
+        let plugin = TestWarden {
+            name: "org.test.warden".into(),
+            ..Default::default()
+        };
+        let (warden, host) = connect_warden_test_pair(plugin).await;
+        assert_eq!(warden.description().identity.name, "org.test.warden");
+        assert!(warden.description().runtime_capabilities.accepts_custody);
+        drop(warden);
+        let _ = host.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warden_load_unload_roundtrip() {
+        use crate::admission::ErasedWarden;
+
+        let loaded = Arc::new(AtomicBool::new(false));
+        let unloaded = Arc::new(AtomicBool::new(false));
+        let plugin = TestWarden {
+            name: "org.test.warden".into(),
+            loaded: loaded.clone(),
+            unloaded: unloaded.clone(),
+            ..Default::default()
+        };
+        let (mut warden, host) = connect_warden_test_pair(plugin).await;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let ctx = test_load_context(
+            "org.test.warden",
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+        );
+
+        warden.load(&ctx).await.unwrap();
+        assert!(loaded.load(Ordering::Relaxed));
+        warden.unload().await.unwrap();
+        assert!(unloaded.load(Ordering::Relaxed));
+
+        drop(warden);
+        let _ = host.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warden_take_custody_returns_handle() {
+        use crate::admission::ErasedWarden;
+        use crate::context::LoggingCustodyStateReporter as LCR;
+
+        let plugin = TestWarden {
+            name: "org.test.warden".into(),
+            ..Default::default()
+        };
+        let (mut warden, host) = connect_warden_test_pair(plugin).await;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let ctx = test_load_context(
+            "org.test.warden",
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+        );
+        warden.load(&ctx).await.unwrap();
+
+        // Build an Assignment with cid 10. TestWarden produces
+        // handle id "custody-10" deterministically.
+        let reporter: Arc<dyn CustodyStateReporter> =
+            Arc::new(LCR::new("org.test.warden"));
+        let assignment = Assignment {
+            custody_type: "playback".into(),
+            payload: b"track-abc".to_vec(),
+            correlation_id: 10,
+            deadline: None,
+            custody_state_reporter: reporter,
+        };
+        let handle = warden.take_custody(assignment).await.unwrap();
+        assert_eq!(handle.id, "custody-10");
+
+        warden.unload().await.unwrap();
+        drop(warden);
+        let _ = host.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warden_take_custody_failure_maps_to_permanent_error() {
+        use crate::admission::ErasedWarden;
+        use crate::context::LoggingCustodyStateReporter as LCR;
+
+        let plugin = TestWarden {
+            name: "org.test.warden".into(),
+            fail_take: true,
+            ..Default::default()
+        };
+        let (mut warden, host) = connect_warden_test_pair(plugin).await;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let ctx = test_load_context(
+            "org.test.warden",
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+        );
+        warden.load(&ctx).await.unwrap();
+
+        let reporter: Arc<dyn CustodyStateReporter> =
+            Arc::new(LCR::new("org.test.warden"));
+        let assignment = Assignment {
+            custody_type: "playback".into(),
+            payload: vec![],
+            correlation_id: 11,
+            deadline: None,
+            custody_state_reporter: reporter,
+        };
+        let err = warden.take_custody(assignment).await.unwrap_err();
+        match err {
+            PluginError::Permanent(m) => {
+                assert!(m.contains("refused to take custody"));
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+
+        warden.unload().await.unwrap();
+        drop(warden);
+        let _ = host.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warden_course_correct_roundtrip() {
+        use crate::admission::ErasedWarden;
+        use crate::context::LoggingCustodyStateReporter as LCR;
+
+        let plugin = TestWarden {
+            name: "org.test.warden".into(),
+            ..Default::default()
+        };
+        let (mut warden, host) = connect_warden_test_pair(plugin).await;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let ctx = test_load_context(
+            "org.test.warden",
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+        );
+        warden.load(&ctx).await.unwrap();
+
+        // Take, then correct.
+        let reporter: Arc<dyn CustodyStateReporter> =
+            Arc::new(LCR::new("org.test.warden"));
+        let assignment = Assignment {
+            custody_type: "playback".into(),
+            payload: vec![],
+            correlation_id: 20,
+            deadline: None,
+            custody_state_reporter: reporter,
+        };
+        let handle = warden.take_custody(assignment).await.unwrap();
+
+        let correction = CourseCorrection {
+            correction_type: "seek".into(),
+            payload: b"pos=42".to_vec(),
+            correlation_id: 21,
+        };
+        warden.course_correct(&handle, correction).await.unwrap();
+
+        warden.unload().await.unwrap();
+        drop(warden);
+        let _ = host.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warden_release_custody_roundtrip() {
+        use crate::admission::ErasedWarden;
+        use crate::context::LoggingCustodyStateReporter as LCR;
+
+        let plugin = TestWarden {
+            name: "org.test.warden".into(),
+            ..Default::default()
+        };
+        let (mut warden, host) = connect_warden_test_pair(plugin).await;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let ctx = test_load_context(
+            "org.test.warden",
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+        );
+        warden.load(&ctx).await.unwrap();
+
+        let reporter: Arc<dyn CustodyStateReporter> =
+            Arc::new(LCR::new("org.test.warden"));
+        let assignment = Assignment {
+            custody_type: "playback".into(),
+            payload: vec![],
+            correlation_id: 30,
+            deadline: None,
+            custody_state_reporter: reporter,
+        };
+        let handle = warden.take_custody(assignment).await.unwrap();
+        warden.release_custody(handle).await.unwrap();
+
+        warden.unload().await.unwrap();
+        drop(warden);
+        let _ = host.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warden_custody_state_report_routes_through_sink() {
+        // End-to-end: the plugin emits one ReportCustodyState during
+        // take_custody. The frame travels over the wire and the
+        // reader task routes it through the EventSink's
+        // custody_state_reporter. We install a capturing reporter so
+        // the test can observe the routed call.
+        use crate::admission::ErasedWarden;
+
+        let plugin = TestWarden {
+            name: "org.test.warden".into(),
+            report_payload_during_take: Some(b"state=playing".to_vec()),
+            ..Default::default()
+        };
+        let (mut warden, host) = connect_warden_test_pair(plugin).await;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let ctx = test_load_context(
+            "org.test.warden",
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+        );
+        // ErasedWarden::load installs the default sink with a
+        // LoggingCustodyStateReporter.
+        warden.load(&ctx).await.unwrap();
+
+        // Overwrite the sink with one whose custody reporter
+        // captures to a shared Vec. The other announcers stay as
+        // loggers since this test does not exercise them.
+        let captured: Arc<
+            std::sync::Mutex<Vec<(CustodyHandle, Vec<u8>, HealthStatus)>>,
+        > = Arc::new(std::sync::Mutex::new(Vec::new()));
+        warden.client().set_event_sink(EventSink {
+            state_reporter: Arc::clone(&ctx.state_reporter),
+            subject_announcer: Arc::clone(&ctx.subject_announcer),
+            relation_announcer: Arc::clone(&ctx.relation_announcer),
+            custody_state_reporter: Some(Arc::new(
+                CapturingCustodyStateReporter {
+                    captured: Arc::clone(&captured),
+                },
+            )),
+        });
+
+        // Take custody. The plugin emits the state report BEFORE
+        // returning the handle; the SDK writer task sends the
+        // event frame before the response frame; the steward's
+        // reader task processes them in order (event first), so
+        // by the time take_custody returns the capturing
+        // reporter has already been called.
+        use crate::context::LoggingCustodyStateReporter as LCR;
+        let reporter: Arc<dyn CustodyStateReporter> =
+            Arc::new(LCR::new("org.test.warden"));
+        let assignment = Assignment {
+            custody_type: "playback".into(),
+            payload: vec![],
+            correlation_id: 40,
+            deadline: None,
+            custody_state_reporter: reporter,
+        };
+        let handle = warden.take_custody(assignment).await.unwrap();
+        assert_eq!(handle.id, "custody-40");
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0.id, "custody-40");
+        assert_eq!(captured[0].1, b"state=playing");
+        assert_eq!(captured[0].2, HealthStatus::Healthy);
+
+        drop(captured);
+        warden.unload().await.unwrap();
+        drop(warden);
+        let _ = host.await;
     }
 }

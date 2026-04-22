@@ -3,8 +3,8 @@
 //! The admission engine owns the admitted plugins and runs their
 //! lifecycles. It supports in-process singleton respondents and
 //! in-process singleton wardens, plus out-of-process singleton
-//! respondents over the wire protocol. Out-of-process wardens,
-//! factories, and multi-plugin shelves are future work.
+//! respondents and wardens over the wire protocol. Factories and
+//! multi-plugin shelves are future work.
 //!
 //! ## Type erasure
 //!
@@ -802,6 +802,138 @@ impl AdmissionEngine {
         }
 
         let mut handle = AdmittedHandle::Respondent(Box::new(respondent));
+
+        let ctx = build_load_context(
+            &manifest,
+            Arc::clone(&self.registry),
+            Arc::clone(&self.relation_graph),
+        );
+        handle.load(&ctx).await.map_err(|e| {
+            StewardError::Admission(format!(
+                "{}: load failed: {}",
+                manifest.plugin.name, e
+            ))
+        })?;
+
+        let record = AdmittedPlugin {
+            name: manifest.plugin.name.clone(),
+            shelf: shelf_qualified.clone(),
+            handle,
+            child: None,
+        };
+
+        tracing::info!(
+            plugin = %record.name,
+            shelf = %record.shelf,
+            kind = %record.handle.kind_name(),
+            trust_class = ?manifest.trust.class,
+            transport = "wire",
+            "plugin admitted"
+        );
+
+        self.by_shelf.insert(shelf_qualified.clone(), record);
+        self.admission_order.push(shelf_qualified);
+
+        Ok(())
+    }
+
+    /// Admit an out-of-process singleton warden over the wire
+    /// protocol.
+    ///
+    /// Parallel to [`Self::admit_out_of_process_respondent`] for the
+    /// warden interaction shape. Follows the same admission
+    /// sequence: manifest validation, shelf lookup, shape match,
+    /// duplicate check, interaction-kind check, wire connect +
+    /// describe handshake, identity verification, load.
+    ///
+    /// On any failure the wire client is dropped (cleanly closing
+    /// the connection) and an error is returned naming the specific
+    /// reason.
+    pub async fn admit_out_of_process_warden<R, W>(
+        &mut self,
+        manifest: Manifest,
+        catalogue: &Catalogue,
+        reader: R,
+        writer: W,
+    ) -> Result<(), StewardError>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        manifest.validate()?;
+
+        let shelf_qualified = manifest.target.shelf.clone();
+        let shelf = catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
+            StewardError::Admission(format!(
+                "{}: target shelf not in catalogue: {}",
+                manifest.plugin.name, shelf_qualified
+            ))
+        })?;
+
+        if shelf.shape != manifest.target.shape {
+            return Err(StewardError::Admission(format!(
+                "{}: manifest targets shape {} but catalogue shelf {} is shape {}",
+                manifest.plugin.name,
+                manifest.target.shape,
+                shelf_qualified,
+                shelf.shape
+            )));
+        }
+
+        if self.by_shelf.contains_key(&shelf_qualified) {
+            return Err(StewardError::Admission(format!(
+                "{}: shelf {} already occupied",
+                manifest.plugin.name, shelf_qualified
+            )));
+        }
+
+        if manifest.kind.interaction != InteractionShape::Warden {
+            return Err(StewardError::Admission(format!(
+                "{}: admit_out_of_process_warden requires kind.interaction \
+                 = 'warden', manifest declares {:?}",
+                manifest.plugin.name, manifest.kind.interaction
+            )));
+        }
+
+        // Connect and eagerly describe.
+        let warden = crate::wire_client::WireWarden::connect(
+            reader,
+            writer,
+            manifest.plugin.name.clone(),
+        )
+        .await
+        .map_err(|e| {
+            StewardError::Admission(format!(
+                "{}: wire connect failed: {}",
+                manifest.plugin.name, e
+            ))
+        })?;
+
+        let description = warden.description();
+        if description.identity.name != manifest.plugin.name {
+            return Err(StewardError::Admission(format!(
+                "plugin describe() name {} does not match manifest name {}",
+                description.identity.name, manifest.plugin.name
+            )));
+        }
+        if description.identity.version != manifest.plugin.version {
+            return Err(StewardError::Admission(format!(
+                "{}: plugin describe() version {} does not match manifest version {}",
+                manifest.plugin.name,
+                description.identity.version,
+                manifest.plugin.version
+            )));
+        }
+        if description.identity.contract != manifest.plugin.contract {
+            return Err(StewardError::Admission(format!(
+                "{}: plugin describe() contract {} does not match manifest contract {}",
+                manifest.plugin.name,
+                description.identity.contract,
+                manifest.plugin.contract
+            )));
+        }
+
+        let mut handle = AdmittedHandle::Warden(Box::new(warden));
 
         let ctx = build_load_context(
             &manifest,
