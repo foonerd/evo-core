@@ -14,6 +14,7 @@
 
 use crate::contract::factory::{InstanceAnnouncement, InstanceId};
 use crate::contract::plugin::HealthStatus;
+use crate::contract::relations::{RelationAssertion, RelationRetraction};
 use crate::contract::subjects::{ExternalAddressing, SubjectAnnouncement};
 use crate::contract::warden::CustodyHandle;
 use std::future::Future;
@@ -92,6 +93,11 @@ pub struct LoadContext {
     /// maintains the canonical subject registry per
     /// `SUBJECTS.md`.
     pub subject_announcer: Arc<dyn SubjectAnnouncer>,
+
+    /// Handle for asserting and retracting relations between subjects.
+    /// Plugins use this to claim edges in the subject graph; the
+    /// steward maintains the relation graph per `RELATIONS.md`.
+    pub relation_announcer: Arc<dyn RelationAnnouncer>,
 }
 
 impl std::fmt::Debug for LoadContext {
@@ -108,6 +114,7 @@ impl std::fmt::Debug for LoadContext {
                 &"<Arc<dyn UserInteractionRequester>>",
             )
             .field("subject_announcer", &"<Arc<dyn SubjectAnnouncer>>")
+            .field("relation_announcer", &"<Arc<dyn RelationAnnouncer>>")
             .finish()
     }
 }
@@ -265,6 +272,44 @@ pub trait SubjectAnnouncer: Send + Sync {
         &'a self,
         addressing: ExternalAddressing,
         reason: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
+}
+
+/// Callback trait: plugin asserts and retracts relations between
+/// subjects.
+///
+/// Per `RELATIONS.md` section 4. Plugins call `assert` to claim a
+/// directed edge between two subjects; `retract` removes their own
+/// claim. The steward records each claimant separately; a relation is
+/// not deleted until every claimant has retracted (or the subjects
+/// cease to exist).
+///
+/// Subjects referenced by addressing must already exist in the
+/// registry. Plugins announce subjects before asserting relations
+/// about them; assertions referencing unknown addressings are
+/// rejected with `ReportError::Invalid`.
+pub trait RelationAnnouncer: Send + Sync {
+    /// Assert a relation.
+    ///
+    /// Records the calling plugin as a claimant on the
+    /// `(source, predicate, target)` edge. If the edge does not
+    /// yet exist, the steward creates it; if it already exists with
+    /// other claimants, the calling plugin is added to the claimant
+    /// set.
+    fn assert<'a>(
+        &'a self,
+        assertion: RelationAssertion,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
+
+    /// Retract a previously-asserted relation claim.
+    ///
+    /// Removes the calling plugin's claim on the edge. If no
+    /// claimants remain afterward, the edge is deleted. Retracting
+    /// a relation the plugin never claimed returns
+    /// `ReportError::Invalid`.
+    fn retract<'a>(
+        &'a self,
+        retraction: RelationRetraction,
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
 }
 

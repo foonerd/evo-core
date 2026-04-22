@@ -21,9 +21,11 @@
 use crate::catalogue::Catalogue;
 use crate::context::{
     LoggingInstanceAnnouncer, LoggingStateReporter,
-    LoggingUserInteractionRequester, RegistrySubjectAnnouncer,
+    LoggingUserInteractionRequester, RegistryRelationAnnouncer,
+    RegistrySubjectAnnouncer,
 };
 use crate::error::StewardError;
+use crate::relations::RelationGraph;
 use crate::subjects::SubjectRegistry;
 use evo_plugin_sdk::contract::{
     HealthReport, LoadContext, Plugin, PluginDescription, PluginError,
@@ -148,9 +150,10 @@ impl std::fmt::Debug for AdmittedPlugin {
 /// Holds admitted plugins keyed by fully-qualified shelf name. v0 permits
 /// one plugin per shelf; additional admissions on the same shelf fail.
 ///
-/// Owns the shared subject registry used by admitted plugins. Plugins
-/// receive a `SubjectAnnouncer` in their `LoadContext` that writes to
-/// this registry tagged with the plugin's name.
+/// Owns the shared subject registry and relation graph used by admitted
+/// plugins. Plugins receive `SubjectAnnouncer` and `RelationAnnouncer`
+/// handles in their `LoadContext` that write to these stores tagged
+/// with the plugin's name.
 pub struct AdmissionEngine {
     /// Map of shelf name -> admitted plugin.
     by_shelf: HashMap<String, AdmittedPlugin>,
@@ -158,6 +161,8 @@ pub struct AdmissionEngine {
     admission_order: Vec<String>,
     /// Subject registry shared with all admitted plugins.
     registry: Arc<SubjectRegistry>,
+    /// Relation graph shared with all admitted plugins.
+    relation_graph: Arc<RelationGraph>,
 }
 
 impl Default for AdmissionEngine {
@@ -166,6 +171,7 @@ impl Default for AdmissionEngine {
             by_shelf: HashMap::new(),
             admission_order: Vec::new(),
             registry: Arc::new(SubjectRegistry::new()),
+            relation_graph: Arc::new(RelationGraph::new()),
         }
     }
 }
@@ -187,18 +193,40 @@ impl AdmissionEngine {
 
     /// Construct an admission engine sharing an existing subject
     /// registry. Useful for tests that want to pre-populate or inspect
-    /// the registry from outside.
+    /// the registry from outside. A fresh relation graph is created.
     pub fn with_registry(registry: Arc<SubjectRegistry>) -> Self {
         Self {
             by_shelf: HashMap::new(),
             admission_order: Vec::new(),
             registry,
+            relation_graph: Arc::new(RelationGraph::new()),
+        }
+    }
+
+    /// Construct an admission engine sharing existing subject registry
+    /// and relation graph handles. Useful for tests that exercise both
+    /// stores together, or for future dependency injection when the
+    /// steward carries persisted state across restarts.
+    pub fn with_registry_and_graph(
+        registry: Arc<SubjectRegistry>,
+        relation_graph: Arc<RelationGraph>,
+    ) -> Self {
+        Self {
+            by_shelf: HashMap::new(),
+            admission_order: Vec::new(),
+            registry,
+            relation_graph,
         }
     }
 
     /// Borrow a handle to the subject registry used by this engine.
     pub fn registry(&self) -> Arc<SubjectRegistry> {
         Arc::clone(&self.registry)
+    }
+
+    /// Borrow a handle to the relation graph used by this engine.
+    pub fn relation_graph(&self) -> Arc<RelationGraph> {
+        Arc::clone(&self.relation_graph)
     }
 
     /// Number of currently admitted plugins.
@@ -288,7 +316,11 @@ impl AdmissionEngine {
             )));
         }
 
-        let ctx = build_load_context(&manifest, Arc::clone(&self.registry));
+        let ctx = build_load_context(
+            &manifest,
+            Arc::clone(&self.registry),
+            Arc::clone(&self.relation_graph),
+        );
         erased.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
                 "{}: load failed: {}",
@@ -389,11 +421,12 @@ impl AdmissionEngine {
 ///
 /// The context carries per-plugin filesystem paths, empty config, no
 /// deadline, logging-only implementations of the state and interaction
-/// callbacks, and a real subject announcer backed by the supplied
-/// registry.
+/// callbacks, and real announcers backed by the supplied registry and
+/// graph.
 fn build_load_context(
     manifest: &Manifest,
     registry: Arc<SubjectRegistry>,
+    graph: Arc<RelationGraph>,
 ) -> LoadContext {
     let state_dir = PathBuf::from("/var/lib/evo/plugins")
         .join(&manifest.plugin.name)
@@ -417,7 +450,12 @@ fn build_load_context(
             LoggingUserInteractionRequester::new(manifest.plugin.name.clone()),
         ),
         subject_announcer: Arc::new(RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            manifest.plugin.name.clone(),
+        )),
+        relation_announcer: Arc::new(RegistryRelationAnnouncer::new(
             registry,
+            graph,
             manifest.plugin.name.clone(),
         )),
     }
@@ -903,5 +941,147 @@ response_budget_ms = 1000
         // Engine sees the externally-populated registry.
         assert_eq!(engine.registry().subject_count(), 1);
         assert_eq!(shared.subject_count(), 1);
+    }
+
+    // A respondent that announces two subjects and asserts a relation
+    // between them during load, for exercising the full subject +
+    // relation wiring end-to-end.
+    struct RelatingRespondent {
+        name: String,
+    }
+
+    impl Plugin for RelatingRespondent {
+        fn describe(
+            &self,
+        ) -> impl Future<Output = PluginDescription> + Send + '_ {
+            async move {
+                PluginDescription {
+                    identity: PluginIdentity {
+                        name: self.name.clone(),
+                        version: semver::Version::new(0, 1, 0),
+                        contract: 1,
+                    },
+                    runtime_capabilities: RuntimeCapabilities {
+                        request_types: vec!["ping".into()],
+                        accepts_custody: false,
+                        flags: Default::default(),
+                    },
+                    build_info: BuildInfo {
+                        plugin_build: "test".into(),
+                        sdk_version: "0.1.1".into(),
+                        rustc_version: None,
+                        built_at: None,
+                    },
+                }
+            }
+        }
+
+        fn load<'a>(
+            &'a mut self,
+            ctx: &'a LoadContext,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
+        {
+            use evo_plugin_sdk::contract::{
+                ExternalAddressing, RelationAssertion, SubjectAnnouncement,
+            };
+            async move {
+                ctx.subject_announcer
+                    .announce(SubjectAnnouncement::new(
+                        "track",
+                        vec![ExternalAddressing::new("s", "track-1")],
+                    ))
+                    .await
+                    .map_err(|e| {
+                        PluginError::Permanent(format!("announce: {e}"))
+                    })?;
+                ctx.subject_announcer
+                    .announce(SubjectAnnouncement::new(
+                        "album",
+                        vec![ExternalAddressing::new("s", "album-1")],
+                    ))
+                    .await
+                    .map_err(|e| {
+                        PluginError::Permanent(format!("announce: {e}"))
+                    })?;
+                ctx.relation_announcer
+                    .assert(RelationAssertion::new(
+                        ExternalAddressing::new("s", "track-1"),
+                        "album_of",
+                        ExternalAddressing::new("s", "album-1"),
+                    ))
+                    .await
+                    .map_err(|e| {
+                        PluginError::Permanent(format!("assert: {e}"))
+                    })?;
+                Ok(())
+            }
+        }
+
+        fn unload(
+            &mut self,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_
+        {
+            async move { Ok(()) }
+        }
+
+        fn health_check(
+            &self,
+        ) -> impl Future<Output = HealthReport> + Send + '_
+        {
+            async move { HealthReport::healthy() }
+        }
+    }
+
+    impl Respondent for RelatingRespondent {
+        fn handle_request<'a>(
+            &'a mut self,
+            req: &'a Request,
+        ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a
+        {
+            async move { Ok(Response::for_request(req, req.payload.clone())) }
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_relation_assertions_reach_the_graph() {
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+
+        let plugin = RelatingRespondent {
+            name: "org.test.ping".into(),
+        };
+        engine
+            .admit_singleton_respondent(
+                plugin,
+                test_manifest("org.test.ping"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+
+        let registry = engine.registry();
+        let graph = engine.relation_graph();
+        assert_eq!(registry.subject_count(), 2);
+        assert_eq!(graph.relation_count(), 1);
+
+        let source_id = registry
+            .resolve(&evo_plugin_sdk::contract::ExternalAddressing::new(
+                "s",
+                "track-1",
+            ))
+            .unwrap();
+        let target_id = registry
+            .resolve(&evo_plugin_sdk::contract::ExternalAddressing::new(
+                "s",
+                "album-1",
+            ))
+            .unwrap();
+        assert!(graph.exists(&source_id, "album_of", &target_id));
+
+        let record = graph
+            .describe_relation(&source_id, "album_of", &target_id)
+            .unwrap();
+        assert_eq!(record.claims.len(), 1);
+        assert_eq!(record.claims[0].claimant, "org.test.ping");
     }
 }

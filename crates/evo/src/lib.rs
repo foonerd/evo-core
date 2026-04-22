@@ -15,6 +15,7 @@
 //! - [`catalogue`]: the rack/shelf catalogue the steward administers.
 //! - [`admission`]: the admission engine that runs plugin lifecycles.
 //! - [`subjects`]: the subject registry, implementing `SUBJECTS.md`.
+//! - [`relations`]: the relation graph, implementing `RELATIONS.md`.
 //! - [`context`]: concrete implementations of the SDK callback traits
 //!   supplied to plugins in their [`LoadContext`].
 //! - [`server`]: the client-facing Unix socket server.
@@ -39,6 +40,7 @@ pub mod config;
 pub mod context;
 pub mod error;
 pub mod logging;
+pub mod relations;
 pub mod server;
 pub mod shutdown;
 pub mod subjects;

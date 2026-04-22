@@ -85,8 +85,9 @@ pub use contract::{
     CourseCorrection, CustodyHandle, CustodyStateReporter, ExternalAddressing,
     Factory, HealthCheck, HealthReport, HealthStatus, InstanceAnnouncement,
     InstanceAnnouncer, InstanceId, LoadContext, Plugin, PluginDescription,
-    PluginError, PluginIdentity, ReportError, ReportPriority, Request,
-    Respondent, Response, RetractionPolicy, RuntimeCapabilities,
-    StateReporter, SubjectAnnouncement, SubjectAnnouncer, SubjectClaim,
-    UserInteraction, UserInteractionRequester, Warden,
+    PluginError, PluginIdentity, RelationAnnouncer, RelationAssertion,
+    RelationRetraction, ReportError, ReportPriority, Request, Respondent,
+    Response, RetractionPolicy, RuntimeCapabilities, StateReporter,
+    SubjectAnnouncement, SubjectAnnouncer, SubjectClaim, UserInteraction,
+    UserInteractionRequester, Warden,
 };

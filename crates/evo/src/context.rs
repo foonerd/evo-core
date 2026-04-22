@@ -14,14 +14,16 @@
 
 use evo_plugin_sdk::contract::{
     CustodyHandle, CustodyStateReporter, ExternalAddressing, HealthStatus,
-    InstanceAnnouncement, InstanceAnnouncer, InstanceId, ReportError,
-    ReportPriority, StateReporter, SubjectAnnouncement, SubjectAnnouncer,
-    UserInteraction, UserInteractionRequester,
+    InstanceAnnouncement, InstanceAnnouncer, InstanceId, RelationAnnouncer,
+    RelationAssertion, RelationRetraction, ReportError, ReportPriority,
+    StateReporter, SubjectAnnouncement, SubjectAnnouncer, UserInteraction,
+    UserInteractionRequester,
 };
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::relations::RelationGraph;
 use crate::subjects::SubjectRegistry;
 
 /// A trivial state reporter that logs each report and returns success.
@@ -243,6 +245,117 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
     }
 }
 
+/// Relation announcer backed by the relation graph and subject
+/// registry.
+///
+/// Resolves the external addressings in an assertion to canonical
+/// subject IDs via the subject registry, then calls the graph's
+/// `assert` or `retract`. If either addressing does not resolve to a
+/// known subject, the announcement is rejected with
+/// `ReportError::Invalid`.
+#[derive(Debug)]
+pub struct RegistryRelationAnnouncer {
+    registry: Arc<SubjectRegistry>,
+    graph: Arc<RelationGraph>,
+    plugin_name: String,
+}
+
+impl RegistryRelationAnnouncer {
+    /// Construct an announcer that resolves addressings via `registry`
+    /// and writes relations into `graph`, tagging claims with the
+    /// given plugin name.
+    pub fn new(
+        registry: Arc<SubjectRegistry>,
+        graph: Arc<RelationGraph>,
+        plugin_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            registry,
+            graph,
+            plugin_name: plugin_name.into(),
+        }
+    }
+}
+
+impl RelationAnnouncer for RegistryRelationAnnouncer {
+    fn assert<'a>(
+        &'a self,
+        assertion: RelationAssertion,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        let graph = Arc::clone(&self.graph);
+        let plugin_name = self.plugin_name.clone();
+        Box::pin(async move {
+            let source_id = registry.resolve(&assertion.source).ok_or_else(
+                || {
+                    ReportError::Invalid(format!(
+                        "assert: source addressing {} is not registered",
+                        assertion.source
+                    ))
+                },
+            )?;
+            let target_id = registry.resolve(&assertion.target).ok_or_else(
+                || {
+                    ReportError::Invalid(format!(
+                        "assert: target addressing {} is not registered",
+                        assertion.target
+                    ))
+                },
+            )?;
+
+            graph
+                .assert(
+                    &source_id,
+                    &assertion.predicate,
+                    &target_id,
+                    &plugin_name,
+                    assertion.reason,
+                )
+                .map(|_outcome| ())
+                .map_err(|e| ReportError::Invalid(format!("assert: {e}")))
+        })
+    }
+
+    fn retract<'a>(
+        &'a self,
+        retraction: RelationRetraction,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        let graph = Arc::clone(&self.graph);
+        let plugin_name = self.plugin_name.clone();
+        Box::pin(async move {
+            let source_id = registry.resolve(&retraction.source).ok_or_else(
+                || {
+                    ReportError::Invalid(format!(
+                        "retract: source addressing {} is not registered",
+                        retraction.source
+                    ))
+                },
+            )?;
+            let target_id = registry.resolve(&retraction.target).ok_or_else(
+                || {
+                    ReportError::Invalid(format!(
+                        "retract: target addressing {} is not registered",
+                        retraction.target
+                    ))
+                },
+            )?;
+
+            graph
+                .retract(
+                    &source_id,
+                    &retraction.predicate,
+                    &target_id,
+                    &plugin_name,
+                    retraction.reason,
+                )
+                .map_err(|e| ReportError::Invalid(format!("retract: {e}")))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +463,134 @@ mod tests {
             .retract(ExternalAddressing::new("s", "v"), None)
             .await;
         assert!(matches!(result, Err(ReportError::Invalid(_))));
+    }
+
+    #[tokio::test]
+    async fn registry_relation_announcer_asserts() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+
+        // Pre-announce both subjects so the relation can resolve.
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            "org.test.a",
+        );
+
+        let assertion = RelationAssertion::new(
+            ExternalAddressing::new("mpd-path", "/a.flac"),
+            "album_of",
+            ExternalAddressing::new("mbid", "album-x"),
+        );
+        assert!(announcer.assert(assertion).await.is_ok());
+        assert_eq!(graph.relation_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_relation_announcer_rejects_unknown_source() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+
+        // Only announce the target.
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            "org.test.a",
+        );
+
+        let assertion = RelationAssertion::new(
+            ExternalAddressing::new("mpd-path", "/unknown.flac"),
+            "album_of",
+            ExternalAddressing::new("mbid", "album-x"),
+        );
+        let result = announcer.assert(assertion).await;
+        assert!(matches!(result, Err(ReportError::Invalid(_))));
+        assert_eq!(graph.relation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_relation_announcer_retracts() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("s", "a")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("s", "b")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            "org.test.a",
+        );
+
+        announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("s", "a"),
+                "p",
+                ExternalAddressing::new("s", "b"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(graph.relation_count(), 1);
+
+        announcer
+            .retract(RelationRetraction::new(
+                ExternalAddressing::new("s", "a"),
+                "p",
+                ExternalAddressing::new("s", "b"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(graph.relation_count(), 0);
     }
 }
