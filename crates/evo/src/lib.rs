@@ -18,6 +18,8 @@
 //! - [`relations`]: the relation graph, implementing `RELATIONS.md`.
 //! - [`context`]: concrete implementations of the SDK callback traits
 //!   supplied to plugins in their [`LoadContext`].
+//! - [`custody`]: the custody ledger, tracking every custody the
+//!   steward has handed to a warden.
 //! - [`server`]: the client-facing Unix socket server.
 //! - [`shutdown`]: graceful shutdown on SIGTERM / SIGINT / Ctrl-C.
 //! - [`logging`]: tracing subscriber setup per the LOGGING contract.
@@ -44,6 +46,7 @@ pub mod catalogue;
 pub mod cli;
 pub mod config;
 pub mod context;
+pub mod custody;
 pub mod error;
 pub mod logging;
 pub mod projections;
