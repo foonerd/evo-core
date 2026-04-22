@@ -1,0 +1,19 @@
+[package]
+name = "evo-example-echo"
+description = "Example singleton respondent plugin: echoes its input back."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+evo-plugin-sdk = { path = "../evo-plugin-sdk" }
+semver = { version = "1", features = ["serde"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

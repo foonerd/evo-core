@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/evo",
+    "crates/evo-example-echo",
     "crates/evo-plugin-sdk",
 ]
 

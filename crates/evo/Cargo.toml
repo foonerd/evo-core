@@ -1,0 +1,38 @@
+[package]
+name = "evo"
+description = "The evo steward. Administers a catalogue, admits plugins, emits projections."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "evo"
+path = "src/main.rs"
+
+[dependencies]
+evo-plugin-sdk = { path = "../evo-plugin-sdk" }
+evo-example-echo = { path = "../evo-example-echo" }
+
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "1"
+anyhow = "1"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+base64 = "0.22"
+semver = { version = "1", features = ["serde"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tracing-journald = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

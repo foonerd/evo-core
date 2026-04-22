@@ -1,0 +1,26 @@
+# Evo steward configuration.
+#
+# Install location: /etc/evo/evo.toml
+# All fields have defaults. A missing file is treated as "use defaults".
+
+[steward]
+# Log level per docs/engineering/LOGGING.md section 3. Overridden by
+# RUST_LOG if set. One of: error, warn, info, debug, trace.
+log_level = "warn"
+
+# Unix domain socket the steward listens on for client requests.
+# systemd RuntimeDirectory (via dist/systemd/evo.service) creates
+# /run/evo/ with appropriate ownership at service start.
+socket_path = "/run/evo/evo.sock"
+
+[catalogue]
+# Path to the catalogue TOML file. Distributions ship their default
+# catalogue at this path via their package; operators may override by
+# pointing this at a different file.
+path = "/opt/evo/catalogue/default.toml"
+
+[plugins]
+# Whether the steward admits unsigned plugins. Per
+# PLUGIN_PACKAGING.md section 5, unsigned plugins run only at sandbox
+# trust class. Default: false.
+allow_unsigned = false

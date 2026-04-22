@@ -1,0 +1,239 @@
+//! Steward configuration.
+//!
+//! The steward reads `/etc/evo/evo.toml` at startup. All fields have
+//! sensible defaults; the file may be absent entirely.
+//!
+//! Schema:
+//!
+//! ```toml
+//! [steward]
+//! log_level = "warn"
+//! socket_path = "/var/run/evo/evo.sock"
+//!
+//! [catalogue]
+//! path = "/opt/evo/catalogue/default.toml"
+//!
+//! [plugins]
+//! allow_unsigned = false
+//! ```
+
+use crate::error::StewardError;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// Default location of the steward's config file.
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/evo/evo.toml";
+
+/// Default location of the catalogue.
+pub const DEFAULT_CATALOGUE_PATH: &str = "/opt/evo/catalogue/default.toml";
+
+/// Default location of the steward's client-facing socket.
+pub const DEFAULT_SOCKET_PATH: &str = "/var/run/evo/evo.sock";
+
+/// Root of the steward's configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StewardConfig {
+    /// Core steward settings.
+    #[serde(default)]
+    pub steward: StewardSection,
+    /// Catalogue location.
+    #[serde(default)]
+    pub catalogue: CatalogueSection,
+    /// Plugin admission policy.
+    #[serde(default)]
+    pub plugins: PluginsSection,
+}
+
+impl Default for StewardConfig {
+    fn default() -> Self {
+        Self {
+            steward: StewardSection::default(),
+            catalogue: CatalogueSection::default(),
+            plugins: PluginsSection::default(),
+        }
+    }
+}
+
+impl StewardConfig {
+    /// Load the config from the default path, falling back to built-in
+    /// defaults if the file is absent.
+    ///
+    /// Returns an error only if the file exists but is malformed. A
+    /// missing file is treated as "use defaults" with a note written to
+    /// the caller's log via `tracing`.
+    pub fn load() -> Result<Self, StewardError> {
+        Self::load_from(Path::new(DEFAULT_CONFIG_PATH))
+    }
+
+    /// Load the config from a specified path.
+    pub fn load_from(path: &Path) -> Result<Self, StewardError> {
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                let cfg: Self = toml::from_str(&content).map_err(|e| {
+                    StewardError::toml(format!("{}", path.display()), e)
+                })?;
+                Ok(cfg)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Self::default())
+            }
+            Err(e) => Err(StewardError::io(
+                format!("reading config {}", path.display()),
+                e,
+            )),
+        }
+    }
+
+    /// Parse a config from a TOML string. Intended for tests.
+    pub fn from_toml(input: &str) -> Result<Self, StewardError> {
+        let cfg: Self = toml::from_str(input)
+            .map_err(|e| StewardError::toml("inline config", e))?;
+        Ok(cfg)
+    }
+}
+
+/// `[steward]` section.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StewardSection {
+    /// Log level filter. One of `error`, `warn`, `info`, `debug`, `trace`.
+    /// Overridden by `RUST_LOG` if set. Default: `warn`.
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+
+    /// Path to the Unix domain socket the steward listens on for client
+    /// requests.
+    #[serde(default = "default_socket_path")]
+    pub socket_path: PathBuf,
+}
+
+impl Default for StewardSection {
+    fn default() -> Self {
+        Self {
+            log_level: default_log_level(),
+            socket_path: default_socket_path(),
+        }
+    }
+}
+
+fn default_log_level() -> String {
+    "warn".to_string()
+}
+
+fn default_socket_path() -> PathBuf {
+    PathBuf::from(DEFAULT_SOCKET_PATH)
+}
+
+/// `[catalogue]` section.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogueSection {
+    /// Path to the catalogue TOML file.
+    #[serde(default = "default_catalogue_path")]
+    pub path: PathBuf,
+}
+
+impl Default for CatalogueSection {
+    fn default() -> Self {
+        Self {
+            path: default_catalogue_path(),
+        }
+    }
+}
+
+fn default_catalogue_path() -> PathBuf {
+    PathBuf::from(DEFAULT_CATALOGUE_PATH)
+}
+
+/// `[plugins]` section.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginsSection {
+    /// Whether unsigned plugins are admitted. Per `PLUGIN_PACKAGING.md`
+    /// section 5: unsigned plugins run only at `sandbox` class, only if
+    /// this flag is true. Default: false.
+    #[serde(default)]
+    pub allow_unsigned: bool,
+}
+
+impl Default for PluginsSection {
+    fn default() -> Self {
+        Self {
+            allow_unsigned: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_expected_paths() {
+        let cfg = StewardConfig::default();
+        assert_eq!(cfg.steward.log_level, "warn");
+        assert_eq!(
+            cfg.steward.socket_path,
+            PathBuf::from(DEFAULT_SOCKET_PATH)
+        );
+        assert_eq!(
+            cfg.catalogue.path,
+            PathBuf::from(DEFAULT_CATALOGUE_PATH)
+        );
+        assert!(!cfg.plugins.allow_unsigned);
+    }
+
+    #[test]
+    fn empty_toml_is_all_defaults() {
+        let cfg = StewardConfig::from_toml("").unwrap();
+        assert_eq!(cfg, StewardConfig::default());
+    }
+
+    #[test]
+    fn partial_toml_fills_defaults() {
+        let cfg = StewardConfig::from_toml(
+            r#"
+[steward]
+log_level = "info"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.steward.log_level, "info");
+        assert_eq!(cfg.steward.socket_path, default_socket_path());
+    }
+
+    #[test]
+    fn full_toml_round_trips() {
+        let cfg = StewardConfig::from_toml(
+            r#"
+[steward]
+log_level = "debug"
+socket_path = "/tmp/evo.sock"
+
+[catalogue]
+path = "/etc/evo/catalogue.toml"
+
+[plugins]
+allow_unsigned = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.steward.log_level, "debug");
+        assert_eq!(cfg.steward.socket_path, PathBuf::from("/tmp/evo.sock"));
+        assert_eq!(
+            cfg.catalogue.path,
+            PathBuf::from("/etc/evo/catalogue.toml")
+        );
+        assert!(cfg.plugins.allow_unsigned);
+    }
+
+    #[test]
+    fn malformed_toml_errors() {
+        let r = StewardConfig::from_toml("this is not [valid toml");
+        assert!(matches!(r, Err(StewardError::Toml { .. })));
+    }
+
+    #[test]
+    fn missing_file_returns_defaults() {
+        let path = std::path::Path::new("/nonexistent/evo-test-never-exists.toml");
+        let cfg = StewardConfig::load_from(path).unwrap();
+        assert_eq!(cfg, StewardConfig::default());
+    }
+}

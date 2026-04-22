@@ -1,0 +1,50 @@
+[Unit]
+Description=Evo steward
+Documentation=https://github.com/foonerd/evo-core
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/evo/bin/evo
+Restart=on-failure
+RestartSec=5s
+
+# Runtime user and group. Package installers create the `evo` system
+# account if it does not already exist.
+User=evo
+Group=evo
+
+# Ensure the runtime directory exists with sane permissions. systemd
+# creates /var/run/evo/ (= /run/evo/) owned by the service user so the
+# Unix socket can be bound there.
+RuntimeDirectory=evo
+RuntimeDirectoryMode=0755
+
+# Persistent state directory for subject registry, relation graph, and
+# per-plugin state. Created with ownership matching the service user.
+StateDirectory=evo
+StateDirectoryMode=0750
+
+# Read-only configuration. The steward writes nothing under /etc/evo.
+ConfigurationDirectory=evo
+ConfigurationDirectoryMode=0755
+
+# Hardening. Evo does not need a writable filesystem beyond its own
+# StateDirectory and RuntimeDirectory.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+
+# Per LOGGING.md: default log level is warn. Operators can override by
+# uncommenting the Environment line below or editing /etc/evo/evo.toml.
+# Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

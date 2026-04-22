@@ -1,0 +1,39 @@
+[plugin]
+name = "org.evo.example.echo"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "example.echo"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = ["echo"]
+response_budget_ms = 1000
