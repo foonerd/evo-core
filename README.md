@@ -14,8 +14,9 @@ This repository holds the steward, the plugin SDK, the plugin tooling, and the e
 | [docs/engineering/VENDOR_CONTRACT.md](docs/engineering/VENDOR_CONTRACT.md) | Vendor contract. Actor taxonomy, namespace governance, vendor commitments and privileges, distribution relationships, revocation pathways. |
 | [docs/engineering/LOGGING.md](docs/engineering/LOGGING.md) | Logging contract. Library, levels, default level, format, structured fields, logs-vs-happenings, plugin log integration. |
 | [docs/engineering/SUBJECTS.md](docs/engineering/SUBJECTS.md) | Subject registry. Canonical identity, external addressings, announcements, equivalence and distinctness claims, reconciliation, merges and splits, provenance, operator overrides, persistence, happenings. |
+| [docs/engineering/RELATIONS.md](docs/engineering/RELATIONS.md) | Relation graph. Typed and directed subject-to-subject connections, catalogue-declared grammar, multi-claimant assertions, scoped walks, cardinality handling, merge and split cascade, operator overrides, persistence, happenings. |
 
-Further engineering-layer documents (relation grammar, projection protocol, fast-path, steward startup) are deliberately open. See `docs/CONCEPT.md` section 10.
+Further engineering-layer documents (projection protocol, fast-path, steward startup) are deliberately open. See `docs/CONCEPT.md` section 10.
 
 ## Distributions
 
