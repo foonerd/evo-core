@@ -1,9 +1,10 @@
-//! End-to-end integration test for the steward skeleton.
+//! End-to-end integration tests for the steward skeleton.
 //!
-//! Starts a steward in the same process, connects a client to its Unix
-//! socket, sends an echo request, and verifies the roundtrip. Proves the
-//! config -> catalogue -> admission -> server -> plugin -> response chain
-//! works end-to-end.
+//! Start a steward in the same process, connect a client to its Unix
+//! socket, send requests, verify the responses. Proves the config ->
+//! catalogue -> admission -> server -> plugin -> response and
+//! config -> catalogue -> admission -> server -> projection-engine ->
+//! registry chains work end-to-end.
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -15,7 +16,9 @@ use tokio::sync::Mutex;
 
 use evo::admission::AdmissionEngine;
 use evo::catalogue::Catalogue;
+use evo::projections::ProjectionEngine;
 use evo::server::Server;
+use evo_plugin_sdk::contract::{ExternalAddressing, SubjectAnnouncement};
 
 const CATALOGUE_TOML: &str = r#"
 [[racks]]
@@ -30,15 +33,19 @@ shape = 1
 description = "Echoes inputs back."
 "#;
 
-#[tokio::test]
-async fn echo_roundtrip_through_socket() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
-    let socket_path = tmp.path().join("evo.sock");
-    let catalogue_path = tmp.path().join("catalogue.toml");
-    std::fs::write(&catalogue_path, CATALOGUE_TOML).expect("write catalogue");
-
-    // Load catalogue, admit the echo plugin.
+/// Build a steward harness: admission engine with the echo plugin
+/// admitted, a projection engine over its stores, and a ready-to-run
+/// server. The caller drives the server and is responsible for
+/// teardown.
+async fn build_harness(
+    socket_path: std::path::PathBuf,
+    catalogue_toml: &str,
+) -> (Arc<Mutex<AdmissionEngine>>, Arc<ProjectionEngine>, Server) {
+    let tmp_parent = socket_path.parent().unwrap().to_path_buf();
+    let catalogue_path = tmp_parent.join("catalogue.toml");
+    std::fs::write(&catalogue_path, catalogue_toml).expect("write catalogue");
     let catalogue = Catalogue::load(&catalogue_path).expect("catalogue");
+
     let mut engine = AdmissionEngine::new();
     let echo_plugin = evo_example_echo::EchoPlugin::new();
     let echo_manifest = evo_example_echo::manifest();
@@ -47,13 +54,29 @@ async fn echo_roundtrip_through_socket() {
         .await
         .expect("admit echo plugin");
 
+    let projections = Arc::new(ProjectionEngine::new(
+        engine.registry(),
+        engine.relation_graph(),
+    ));
     let engine = Arc::new(Mutex::new(engine));
-    let server = Server::new(socket_path.clone(), Arc::clone(&engine));
+    let server = Server::new(
+        socket_path,
+        Arc::clone(&engine),
+        Arc::clone(&projections),
+    );
 
-    // Shutdown channel. The test drives server shutdown explicitly at the
-    // end so the connection-handler cleanup is deterministic.
+    (engine, projections, server)
+}
+
+#[tokio::test]
+async fn echo_roundtrip_through_socket() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
     let server_socket = socket_path.clone();
     let server_task = tokio::spawn(async move {
         server
@@ -65,49 +88,23 @@ async fn echo_roundtrip_through_socket() {
         drop(server_socket);
     });
 
-    // Wait for the server to bind its socket. A retry loop is more
-    // robust than a fixed sleep on busy CI.
     wait_for_socket(&socket_path, Duration::from_secs(2))
         .await
         .expect("server socket became available");
 
-    // Connect as a client.
     let mut stream = UnixStream::connect(&socket_path)
         .await
         .expect("connect to steward socket");
 
-    // Send an echo request.
+    // Echo request in the new tagged shape.
     let payload = b"hello, evo";
     let request_json = format!(
-        r#"{{"shelf":"example.echo","request_type":"echo","payload_b64":"{}"}}"#,
+        r#"{{"op":"request","shelf":"example.echo","request_type":"echo","payload_b64":"{}"}}"#,
         B64.encode(payload)
     );
-    let request_bytes = request_json.as_bytes();
-    let request_len = (request_bytes.len() as u32).to_be_bytes();
-    stream.write_all(&request_len).await.expect("write len");
-    stream.write_all(request_bytes).await.expect("write body");
-    stream.flush().await.expect("flush");
+    write_frame(&mut stream, request_json.as_bytes()).await;
 
-    // Read the response.
-    let mut response_len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut response_len_buf)
-        .await
-        .expect("read response len");
-    let response_len = u32::from_be_bytes(response_len_buf) as usize;
-    assert!(response_len > 0, "response length must be non-zero");
-    assert!(
-        response_len < 64 * 1024,
-        "response length suspiciously large: {response_len}"
-    );
-
-    let mut response_body = vec![0u8; response_len];
-    stream
-        .read_exact(&mut response_body)
-        .await
-        .expect("read response body");
-
-    // Parse the response and verify the echoed payload.
+    let response_body = read_frame(&mut stream).await;
     let response_value: serde_json::Value =
         serde_json::from_slice(&response_body).expect("response JSON");
     let returned_b64 = response_value
@@ -122,14 +119,10 @@ async fn echo_roundtrip_through_socket() {
     let returned_payload = B64.decode(returned_b64).expect("base64 decode");
     assert_eq!(&returned_payload, payload);
 
-    // Close the client side of the connection cleanly.
     drop(stream);
-
-    // Signal shutdown and wait for the server task to complete.
     let _ = shutdown_tx.send(());
     server_task.await.expect("server task join");
 
-    // Drain the engine. Verifies unload runs without error.
     engine
         .lock()
         .await
@@ -142,23 +135,11 @@ async fn echo_roundtrip_through_socket() {
 async fn unknown_shelf_returns_structured_error() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let socket_path = tmp.path().join("evo.sock");
-    let catalogue_path = tmp.path().join("catalogue.toml");
-    std::fs::write(&catalogue_path, CATALOGUE_TOML).expect("write catalogue");
 
-    let catalogue = Catalogue::load(&catalogue_path).expect("catalogue");
-    let mut engine = AdmissionEngine::new();
-    let echo_plugin = evo_example_echo::EchoPlugin::new();
-    let echo_manifest = evo_example_echo::manifest();
-    engine
-        .admit_singleton_respondent(echo_plugin, echo_manifest, &catalogue)
-        .await
-        .expect("admit echo");
-
-    let engine = Arc::new(Mutex::new(engine));
-    let server = Server::new(socket_path.clone(), Arc::clone(&engine));
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
     let server_task = tokio::spawn(async move {
         server
             .run(async move {
@@ -176,27 +157,10 @@ async fn unknown_shelf_returns_structured_error() {
         .await
         .expect("connect");
 
-    // Address a shelf that does not exist.
-    let request_json =
-        r#"{"shelf":"does.not.exist","request_type":"echo","payload_b64":""}"#;
-    let request_len = (request_json.len() as u32).to_be_bytes();
-    stream.write_all(&request_len).await.expect("write len");
-    stream.write_all(request_json.as_bytes()).await.expect("write");
-    stream.flush().await.expect("flush");
+    let request_json = r#"{"op":"request","shelf":"does.not.exist","request_type":"echo","payload_b64":""}"#;
+    write_frame(&mut stream, request_json.as_bytes()).await;
 
-    let mut response_len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut response_len_buf)
-        .await
-        .expect("response len");
-    let response_len = u32::from_be_bytes(response_len_buf) as usize;
-
-    let mut response_body = vec![0u8; response_len];
-    stream
-        .read_exact(&mut response_body)
-        .await
-        .expect("response body");
-
+    let response_body = read_frame(&mut stream).await;
     let response_value: serde_json::Value =
         serde_json::from_slice(&response_body).expect("JSON");
     assert!(
@@ -210,6 +174,209 @@ async fn unknown_shelf_returns_structured_error() {
     server_task.await.expect("server task");
 
     engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn project_subject_roundtrips_through_socket() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    // Pre-populate a subject and a relation via the engine's shared
+    // registry and graph, standing in for a plugin contribution. This
+    // exercises the read path without requiring a plugin that
+    // announces subjects (the echo plugin does not).
+    let (track_id, album_id) = {
+        let guard = engine.lock().await;
+        let registry = guard.registry();
+        let graph = guard.relation_graph();
+
+        let track_ann = SubjectAnnouncement::new(
+            "track",
+            vec![ExternalAddressing::new("mpd-path", "/x.flac")],
+        );
+        let track_outcome =
+            registry.announce(&track_ann, "com.test.fixture").unwrap();
+        let track_id = match track_outcome {
+            evo::subjects::AnnounceOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        let album_ann = SubjectAnnouncement::new(
+            "album",
+            vec![ExternalAddressing::new("mbid", "album-123")],
+        );
+        let album_outcome =
+            registry.announce(&album_ann, "com.test.fixture").unwrap();
+        let album_id = match album_outcome {
+            evo::subjects::AnnounceOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        graph
+            .assert(
+                &track_id,
+                "album_of",
+                &album_id,
+                "com.test.fixture",
+                None,
+            )
+            .unwrap();
+
+        (track_id, album_id)
+    };
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path)
+        .await
+        .expect("connect");
+
+    // Minimal project request: no scope (no relation traversal).
+    let minimal_req = format!(
+        r#"{{"op":"project_subject","canonical_id":"{track_id}"}}"#
+    );
+    write_frame(&mut stream, minimal_req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["canonical_id"].as_str(), Some(track_id.as_str()));
+    assert_eq!(v["subject_type"].as_str(), Some("track"));
+    assert_eq!(v["shape_version"].as_u64(), Some(1));
+    assert_eq!(v["degraded"].as_bool(), Some(false));
+    assert_eq!(
+        v["addressings"].as_array().map(|a| a.len()),
+        Some(1)
+    );
+    assert_eq!(
+        v["addressings"][0]["scheme"].as_str(),
+        Some("mpd-path")
+    );
+    // No scope means no related subjects even though album_of exists.
+    assert_eq!(
+        v["related"].as_array().map(|a| a.len()),
+        Some(0)
+    );
+
+    // Scoped project request: include album_of forward.
+    let scoped_req = format!(
+        r#"{{
+            "op": "project_subject",
+            "canonical_id": "{track_id}",
+            "scope": {{
+                "relation_predicates": ["album_of"],
+                "direction": "forward"
+            }}
+        }}"#
+    );
+    write_frame(&mut stream, scoped_req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    let related = v["related"].as_array().expect("related array");
+    assert_eq!(related.len(), 1);
+    assert_eq!(related[0]["predicate"].as_str(), Some("album_of"));
+    assert_eq!(related[0]["direction"].as_str(), Some("forward"));
+    assert_eq!(related[0]["target_id"].as_str(), Some(album_id.as_str()));
+    assert_eq!(related[0]["target_type"].as_str(), Some("album"));
+
+    // Unknown subject yields an error response.
+    let bad_req =
+        r#"{"op":"project_subject","canonical_id":"not-a-real-id"}"#;
+    write_frame(&mut stream, bad_req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert!(
+        v["error"].as_str().unwrap_or("").contains("unknown subject"),
+        "expected unknown subject error, got: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn invalid_op_returns_structured_error() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path)
+        .await
+        .expect("connect");
+
+    let bad_req = r#"{"op":"who_knows","x":"y"}"#;
+    write_frame(&mut stream, bad_req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert!(
+        v["error"].as_str().is_some(),
+        "expected error response, got: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+// ---------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------
+
+async fn write_frame(stream: &mut UnixStream, body: &[u8]) {
+    let len = (body.len() as u32).to_be_bytes();
+    stream.write_all(&len).await.expect("write len");
+    stream.write_all(body).await.expect("write body");
+    stream.flush().await.expect("flush");
+}
+
+async fn read_frame(stream: &mut UnixStream) -> Vec<u8> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await.expect("read len");
+    let len = u32::from_be_bytes(len_buf) as usize;
+    assert!(len > 0, "response length must be non-zero");
+    assert!(
+        len < 1024 * 1024,
+        "response length suspiciously large: {len}"
+    );
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body).await.expect("read body");
+    body
 }
 
 /// Wait up to `timeout` for a Unix socket file to appear and accept

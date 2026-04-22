@@ -20,6 +20,7 @@ use evo::admission::AdmissionEngine;
 use evo::catalogue::Catalogue;
 use evo::cli::Args;
 use evo::config::StewardConfig;
+use evo::projections::ProjectionEngine;
 use evo::server::Server;
 use evo::shutdown::wait_for_signal;
 
@@ -73,12 +74,24 @@ async fn main() -> anyhow::Result<()> {
     admit_v0_plugins(&mut engine, &catalogue).await?;
     tracing::info!(plugins = engine.len(), "admission complete");
 
+    // Construct a projection engine sharing the admission engine's
+    // subject registry and relation graph. Plugins announce into the
+    // same stores the projection engine reads from.
+    let projections = Arc::new(ProjectionEngine::new(
+        engine.registry(),
+        engine.relation_graph(),
+    ));
+
     // Wrap engine for shared access between the server and the final
     // drain.
     let engine = Arc::new(Mutex::new(engine));
 
     // Start the server.
-    let server = Server::new(socket_path.clone(), Arc::clone(&engine));
+    let server = Server::new(
+        socket_path.clone(),
+        Arc::clone(&engine),
+        Arc::clone(&projections),
+    );
 
     tracing::warn!(
         socket = %socket_path.display(),
