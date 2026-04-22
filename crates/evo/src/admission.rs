@@ -31,6 +31,7 @@ use crate::context::{
 };
 use crate::custody::{CustodyLedger, LedgerCustodyStateReporter};
 use crate::error::StewardError;
+use crate::happenings::{Happening, HappeningBus};
 use crate::relations::RelationGraph;
 use crate::subjects::SubjectRegistry;
 use evo_plugin_sdk::contract::{
@@ -46,7 +47,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
@@ -380,6 +381,12 @@ pub struct AdmissionEngine {
     /// every custody handed out by [`Self::take_custody`] and every
     /// state report emitted by the holding warden.
     custody_ledger: Arc<CustodyLedger>,
+    /// Happenings bus. Receives [`Happening::CustodyTaken`] and
+    /// [`Happening::CustodyReleased`] from this engine's custody
+    /// verbs; receives [`Happening::CustodyStateReported`] from a
+    /// future pass that routes the ledger-backed custody state
+    /// reporter through the bus.
+    happening_bus: Arc<HappeningBus>,
     /// Monotonic counter for correlation IDs on warden custody verbs
     /// (`take_custody`, `course_correct`). Each call allocates a fresh
     /// ID. Engine-local, not persistent across restarts.
@@ -394,6 +401,7 @@ impl Default for AdmissionEngine {
             registry: Arc::new(SubjectRegistry::new()),
             relation_graph: Arc::new(RelationGraph::new()),
             custody_ledger: Arc::new(CustodyLedger::new()),
+            happening_bus: Arc::new(HappeningBus::new()),
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -424,6 +432,7 @@ impl AdmissionEngine {
             registry,
             relation_graph: Arc::new(RelationGraph::new()),
             custody_ledger: Arc::new(CustodyLedger::new()),
+            happening_bus: Arc::new(HappeningBus::new()),
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -442,6 +451,7 @@ impl AdmissionEngine {
             registry,
             relation_graph,
             custody_ledger: Arc::new(CustodyLedger::new()),
+            happening_bus: Arc::new(HappeningBus::new()),
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -466,6 +476,33 @@ impl AdmissionEngine {
             registry,
             relation_graph,
             custody_ledger,
+            happening_bus: Arc::new(HappeningBus::new()),
+            custody_cid_counter: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Construct an admission engine sharing existing subject
+    /// registry, relation graph, custody ledger, and happenings bus
+    /// handles.
+    ///
+    /// Parallel to [`Self::with_registry_graph_and_ledger`] for the
+    /// case where the caller also wants to share a preexisting bus.
+    /// Tests that assert on happenings emitted from the engine's
+    /// custody verbs use this constructor so the bus is reachable
+    /// both from the engine and from a subscriber held by the test.
+    pub fn with_registry_graph_ledger_and_bus(
+        registry: Arc<SubjectRegistry>,
+        relation_graph: Arc<RelationGraph>,
+        custody_ledger: Arc<CustodyLedger>,
+        happening_bus: Arc<HappeningBus>,
+    ) -> Self {
+        Self {
+            by_shelf: HashMap::new(),
+            admission_order: Vec::new(),
+            registry,
+            relation_graph,
+            custody_ledger,
+            happening_bus,
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -483,6 +520,11 @@ impl AdmissionEngine {
     /// Borrow a handle to the custody ledger used by this engine.
     pub fn custody_ledger(&self) -> Arc<CustodyLedger> {
         Arc::clone(&self.custody_ledger)
+    }
+
+    /// Borrow a handle to the happenings bus used by this engine.
+    pub fn happening_bus(&self) -> Arc<HappeningBus> {
+        Arc::clone(&self.happening_bus)
     }
 
     /// Number of currently admitted plugins.
@@ -1229,7 +1271,13 @@ impl AdmissionEngine {
     /// warden's plugin name, and dispatches to the warden's
     /// `take_custody`. On success, records the custody in the
     /// engine's [`CustodyLedger`] keyed by `(plugin_name, handle.id)`
-    /// with the full metadata (shelf, custody_type, handle).
+    /// with the full metadata (shelf, custody_type, handle), then
+    /// emits a [`Happening::CustodyTaken`] on the engine's
+    /// [`HappeningBus`].
+    ///
+    /// The happening is emitted AFTER the ledger write so any
+    /// subscriber that reacts to the happening by querying the
+    /// ledger will see the new record.
     ///
     /// If the warden emits an initial `ReportCustodyState` from
     /// within its own `take_custody` (typical for wire wardens),
@@ -1244,7 +1292,8 @@ impl AdmissionEngine {
     ///
     /// Returns the plugin's own error wrapped in
     /// [`StewardError::Plugin`] if the warden rejects the
-    /// assignment. On such failure the ledger is not written.
+    /// assignment. On such failure neither the ledger nor the bus
+    /// is written.
     pub async fn take_custody(
         &mut self,
         shelf: &str,
@@ -1252,11 +1301,13 @@ impl AdmissionEngine {
         payload: Vec<u8>,
         deadline: Option<Instant>,
     ) -> Result<CustodyHandle, StewardError> {
-        // Clone the ledger Arc up front for use after the warden
-        // call. After this point we hold a mutable borrow of
+        // Clone the ledger and bus Arcs up front for use after the
+        // warden call. After this point we hold a mutable borrow of
         // self.by_shelf through `plugin`, so accessing
-        // self.custody_ledger directly would conflict.
+        // self.custody_ledger or self.happening_bus directly would
+        // conflict.
         let ledger = Arc::clone(&self.custody_ledger);
+        let bus = Arc::clone(&self.happening_bus);
 
         let plugin = self.by_shelf.get_mut(shelf).ok_or_else(|| {
             StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
@@ -1308,6 +1359,19 @@ impl AdmissionEngine {
             &handle,
             &custody_type_for_ledger,
         );
+
+        // Emit the happening AFTER the ledger write so subscribers
+        // that react by re-querying the ledger see the new record.
+        // The owned Strings are moved into the happening since they
+        // are not used again; only handle.id is cloned because
+        // handle is returned to the caller.
+        bus.emit(Happening::CustodyTaken {
+            plugin: plugin_name,
+            handle_id: handle.id.clone(),
+            shelf: shelf_qualified,
+            custody_type: custody_type_for_ledger,
+            at: SystemTime::now(),
+        });
 
         Ok(handle)
     }
@@ -1375,9 +1439,10 @@ impl AdmissionEngine {
         shelf: &str,
         handle: CustodyHandle,
     ) -> Result<(), StewardError> {
-        // Clone the ledger Arc up front for the same reason as
-        // take_custody.
+        // Clone the ledger and bus Arcs up front for the same
+        // reason as take_custody.
         let ledger = Arc::clone(&self.custody_ledger);
+        let bus = Arc::clone(&self.happening_bus);
 
         let plugin = self.by_shelf.get_mut(shelf).ok_or_else(|| {
             StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
@@ -1405,6 +1470,16 @@ impl AdmissionEngine {
         // acknowledges the release. The removed record is
         // discarded; a future pass can expose it for archiving.
         ledger.release_custody(&plugin_name, &handle_id);
+
+        // Emit the released happening after the ledger drop so
+        // subscribers that react by re-querying the ledger see the
+        // record gone. Both owned strings are moved in; neither is
+        // used again.
+        bus.emit(Happening::CustodyReleased {
+            plugin: plugin_name,
+            handle_id,
+            at: SystemTime::now(),
+        });
 
         Ok(())
     }
@@ -3068,5 +3143,218 @@ custody_failure_mode = "abort"
 
         // Externally-held handle reflects the engine's recording.
         assert_eq!(ledger.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Happenings bus integration tests (pass 5b).
+    //
+    // Verify that take_custody and release_custody emit
+    // CustodyTaken / CustodyReleased on the engine's happening bus
+    // after the ledger updates. The bus's broadcast semantics are
+    // exercised by happenings::tests; these tests assert only on
+    // engine-originated emissions.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn take_custody_emits_custody_taken_happening() {
+        use crate::happenings::Happening;
+
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let warden = TestWarden {
+            name: "org.test.custody".into(),
+        };
+        engine
+            .admit_singleton_warden(
+                warden,
+                test_warden_manifest("org.test.custody"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+
+        // Subscribe BEFORE take_custody so the happening reaches us.
+        let mut rx = engine.happening_bus().subscribe();
+
+        let handle = engine
+            .take_custody(
+                "test.custody",
+                "playback".into(),
+                b"payload".to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let got = rx.recv().await.expect("recv CustodyTaken");
+        match got {
+            Happening::CustodyTaken {
+                plugin,
+                handle_id,
+                shelf,
+                custody_type,
+                ..
+            } => {
+                assert_eq!(plugin, "org.test.custody");
+                assert_eq!(handle_id, handle.id);
+                assert_eq!(shelf, "test.custody");
+                assert_eq!(custody_type, "playback");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn release_custody_emits_custody_released_happening() {
+        use crate::happenings::Happening;
+
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let warden = TestWarden {
+            name: "org.test.custody".into(),
+        };
+        engine
+            .admit_singleton_warden(
+                warden,
+                test_warden_manifest("org.test.custody"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+
+        let handle = engine
+            .take_custody(
+                "test.custody",
+                "playback".into(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Subscribe AFTER the take so only the release reaches us.
+        // This also verifies the "late subscriber misses earlier
+        // happenings" property at the engine level.
+        let mut rx = engine.happening_bus().subscribe();
+        let handle_id = handle.id.clone();
+
+        engine
+            .release_custody("test.custody", handle)
+            .await
+            .unwrap();
+
+        let got = rx.recv().await.expect("recv CustodyReleased");
+        match got {
+            Happening::CustodyReleased {
+                plugin,
+                handle_id: got_id,
+                ..
+            } => {
+                assert_eq!(plugin, "org.test.custody");
+                assert_eq!(got_id, handle_id);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn take_then_release_emits_both_in_order() {
+        use crate::happenings::Happening;
+
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let warden = TestWarden {
+            name: "org.test.custody".into(),
+        };
+        engine
+            .admit_singleton_warden(
+                warden,
+                test_warden_manifest("org.test.custody"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+
+        let mut rx = engine.happening_bus().subscribe();
+
+        let handle = engine
+            .take_custody(
+                "test.custody",
+                "playback".into(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .release_custody("test.custody", handle)
+            .await
+            .unwrap();
+
+        let first = rx.recv().await.expect("recv first");
+        assert!(
+            matches!(first, Happening::CustodyTaken { .. }),
+            "expected CustodyTaken first, got {first:?}"
+        );
+        let second = rx.recv().await.expect("recv second");
+        assert!(
+            matches!(second, Happening::CustodyReleased { .. }),
+            "expected CustodyReleased second, got {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_registry_graph_ledger_and_bus_shares_bus() {
+        use crate::custody::CustodyLedger;
+        use crate::happenings::HappeningBus;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let ledger = Arc::new(CustodyLedger::new());
+        let bus = Arc::new(HappeningBus::new());
+
+        let catalogue = test_catalogue();
+        let mut engine =
+            AdmissionEngine::with_registry_graph_ledger_and_bus(
+                Arc::clone(&registry),
+                Arc::clone(&graph),
+                Arc::clone(&ledger),
+                Arc::clone(&bus),
+            );
+
+        // All four shared handles match the engine's accessors.
+        assert!(Arc::ptr_eq(&ledger, &engine.custody_ledger()));
+        assert!(Arc::ptr_eq(&bus, &engine.happening_bus()));
+
+        // Subscribe through the externally-held bus; the engine's
+        // emit should reach us.
+        let mut rx = bus.subscribe();
+
+        let warden = TestWarden {
+            name: "org.test.custody".into(),
+        };
+        engine
+            .admit_singleton_warden(
+                warden,
+                test_warden_manifest("org.test.custody"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+        let _handle = engine
+            .take_custody(
+                "test.custody",
+                "playback".into(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let got = rx.recv().await.expect("recv from externally-held bus");
+        assert!(matches!(
+            got,
+            crate::happenings::Happening::CustodyTaken { .. }
+        ));
     }
 }
