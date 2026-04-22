@@ -18,7 +18,9 @@ use evo::admission::AdmissionEngine;
 use evo::catalogue::Catalogue;
 use evo::projections::ProjectionEngine;
 use evo::server::Server;
-use evo_plugin_sdk::contract::{ExternalAddressing, SubjectAnnouncement};
+use evo_plugin_sdk::contract::{
+    CustodyHandle, ExternalAddressing, HealthStatus, SubjectAnnouncement,
+};
 
 const CATALOGUE_TOML: &str = r#"
 [[racks]]
@@ -497,6 +499,146 @@ async fn invalid_op_returns_structured_error() {
     let _ = shutdown_tx.send(());
     server_task.await.expect("server task");
 
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn list_active_custodies_empty_when_none_taken() {
+    // End-to-end exercise of the pass 4h socket surface with an
+    // empty ledger. Verifies the op parses, the handler runs, and
+    // the response shape is `{"active_custodies": []}`.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path)
+        .await
+        .expect("connect");
+
+    let req = r#"{"op":"list_active_custodies"}"#;
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value =
+        serde_json::from_slice(&body).expect("JSON");
+    let arr = v["active_custodies"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected active_custodies array, got: {}",
+                String::from_utf8_lossy(&body)
+            )
+        });
+    assert_eq!(arr.len(), 0);
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn list_active_custodies_returns_populated_ledger() {
+    // Pre-populate the ledger from the test side (bypassing the
+    // take_custody path, which is covered by admission tests and
+    // wire_client tests), then query via the socket. Proves the
+    // socket surface for pass 4h: record -> ledger -> wire
+    // serialisation -> client JSON.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    // Populate the ledger directly. Release the engine lock before
+    // spawning the server so the server task is free to acquire it
+    // during handle_list_active_custodies.
+    {
+        let guard = engine.lock().await;
+        let ledger = guard.custody_ledger();
+        ledger.record_custody(
+            "org.test.warden",
+            "example.custody",
+            &CustodyHandle::new("custody-1"),
+            "playback",
+        );
+        ledger.record_state(
+            "org.test.warden",
+            "custody-1",
+            b"state=playing".to_vec(),
+            HealthStatus::Healthy,
+        );
+    }
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path)
+        .await
+        .expect("connect");
+
+    let req = r#"{"op":"list_active_custodies"}"#;
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value =
+        serde_json::from_slice(&body).expect("JSON");
+    let arr = v["active_custodies"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected active_custodies array, got: {}",
+                String::from_utf8_lossy(&body)
+            )
+        });
+    assert_eq!(arr.len(), 1);
+
+    let first = &arr[0];
+    assert_eq!(first["plugin"].as_str(), Some("org.test.warden"));
+    assert_eq!(first["handle_id"].as_str(), Some("custody-1"));
+    assert_eq!(first["shelf"].as_str(), Some("example.custody"));
+    assert_eq!(first["custody_type"].as_str(), Some("playback"));
+    assert_eq!(
+        first["last_state"]["health"].as_str(),
+        Some("healthy")
+    );
+    let decoded = B64
+        .decode(
+            first["last_state"]["payload_b64"]
+                .as_str()
+                .expect("payload_b64 string"),
+        )
+        .expect("base64 decode");
+    assert_eq!(decoded, b"state=playing");
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
     engine.lock().await.shutdown().await.expect("drain");
 }
 

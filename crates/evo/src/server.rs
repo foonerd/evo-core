@@ -40,6 +40,16 @@
 //! yields a scope with no relation traversal (empty predicates, forward
 //! direction).
 //!
+//! ### `op = "list_active_custodies"`: snapshot the custody ledger
+//!
+//! ```json
+//! { "op": "list_active_custodies" }
+//! ```
+//!
+//! v0 returns every active custody; no filter or scope arguments. A
+//! future pass can add filtering (by plugin, by shelf) without
+//! breaking this minimal shape.
+//!
 //! ## Response JSON
 //!
 //! Plugin-request success:
@@ -50,6 +60,23 @@
 //! Projection success: the full [`SubjectProjection`] serialised as
 //! described in `PROJECTIONS.md` section 4.4.
 //!
+//! `list_active_custodies` success:
+//! ```json
+//! { "active_custodies": [
+//!     { "plugin": "org.example.warden",
+//!       "handle_id": "custody-42",
+//!       "shelf": "example.custody",
+//!       "custody_type": "playback",
+//!       "last_state": {
+//!         "payload_b64": "cGxheWluZw==",
+//!         "health": "healthy",
+//!         "reported_at_ms": 1700000000000
+//!       },
+//!       "started_at_ms": 1700000000000,
+//!       "last_updated_ms": 1700000000050 }
+//! ] }
+//! ```
+//!
 //! Any failure:
 //! ```json
 //! { "error": "no plugin on shelf: foo.bar" }
@@ -58,6 +85,7 @@
 //! [`SubjectProjection`]: crate::projections::SubjectProjection
 
 use crate::admission::AdmissionEngine;
+use crate::custody::{CustodyRecord, StateSnapshot};
 use crate::error::StewardError;
 use crate::projections::{
     DegradedReason, DegradedReasonKind, ProjectionEngine, ProjectionError,
@@ -66,7 +94,7 @@ use crate::projections::{
 use crate::relations::WalkDirection;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use evo_plugin_sdk::contract::Request;
+use evo_plugin_sdk::contract::{HealthStatus, Request};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -114,6 +142,9 @@ enum ClientRequest {
         #[serde(default)]
         scope: ProjectionScopeWire,
     },
+    /// Snapshot the custody ledger - every currently-held custody the
+    /// steward has recorded. No fields; v0 returns everything.
+    ListActiveCustodies,
 }
 
 /// Wire form of [`ProjectionScope`]. See module-level docs for JSON
@@ -186,7 +217,8 @@ impl From<ProjectionScopeWire> for ProjectionScope {
 /// A response as it appears on the wire. Untagged: the variant is
 /// disambiguated by the distinct top-level fields of each shape
 /// (`payload_b64` for plugin success, `canonical_id`+`subject_type`
-/// for projections, `error` for failures).
+/// for projections, `active_custodies` for the ledger snapshot,
+/// `error` for failures).
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum ClientResponse {
@@ -197,6 +229,13 @@ enum ClientResponse {
     },
     /// Projection success.
     Projection(SubjectProjectionWire),
+    /// Active custodies snapshot. Shape:
+    /// `{ "active_custodies": [ <CustodyRecordWire>, ... ] }`.
+    ActiveCustodies {
+        /// Every currently-held custody in the steward's ledger.
+        /// Order is unspecified (the ledger is a HashMap).
+        active_custodies: Vec<CustodyRecordWire>,
+    },
     /// Any failure.
     Error {
         /// Human-readable error message.
@@ -310,6 +349,71 @@ impl From<DegradedReason> for DegradedReasonWire {
                 DegradedReasonKind::DanglingRelation => "dangling_relation",
             },
             detail: d.detail,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Wire types - custody ledger
+// ---------------------------------------------------------------------
+
+/// Wire form of [`CustodyRecord`]. Mirrors the domain shape but
+/// serialises timestamps as milliseconds since the UNIX epoch.
+/// `HealthStatus` comes through verbatim because the SDK type
+/// already serialises as a lowercase string.
+#[derive(Debug, Serialize)]
+struct CustodyRecordWire {
+    /// Canonical name of the warden plugin holding this custody.
+    plugin: String,
+    /// Warden-chosen handle id. Opaque to the steward.
+    handle_id: String,
+    /// Fully-qualified shelf, once recorded.
+    shelf: Option<String>,
+    /// Custody type the Assignment was tagged with, once recorded.
+    custody_type: Option<String>,
+    /// Most recent state snapshot, if any reports have been seen.
+    last_state: Option<StateSnapshotWire>,
+    /// When the record was first created in the ledger, ms since
+    /// UNIX epoch.
+    started_at_ms: u64,
+    /// When any field on the record was last changed, ms since
+    /// UNIX epoch.
+    last_updated_ms: u64,
+}
+
+/// Wire form of [`StateSnapshot`]. Payload is base64-encoded;
+/// `health` uses the SDK's built-in serde form (lowercase string);
+/// `reported_at` becomes `reported_at_ms`.
+#[derive(Debug, Serialize)]
+struct StateSnapshotWire {
+    /// Base64-encoded opaque payload from the plugin's state report.
+    payload_b64: String,
+    /// Health declared by the plugin at report time.
+    health: HealthStatus,
+    /// When the steward recorded the report, ms since UNIX epoch.
+    reported_at_ms: u64,
+}
+
+impl From<CustodyRecord> for CustodyRecordWire {
+    fn from(r: CustodyRecord) -> Self {
+        Self {
+            plugin: r.plugin,
+            handle_id: r.handle_id,
+            shelf: r.shelf,
+            custody_type: r.custody_type,
+            last_state: r.last_state.map(Into::into),
+            started_at_ms: system_time_to_ms(r.started_at),
+            last_updated_ms: system_time_to_ms(r.last_updated),
+        }
+    }
+}
+
+impl From<StateSnapshot> for StateSnapshotWire {
+    fn from(s: StateSnapshot) -> Self {
+        Self {
+            payload_b64: B64.encode(&s.payload),
+            health: s.health,
+            reported_at_ms: system_time_to_ms(s.reported_at),
         }
     }
 }
@@ -567,6 +671,9 @@ async fn process_frame(
             canonical_id,
             scope,
         } => handle_project_subject(projections, canonical_id, scope),
+        ClientRequest::ListActiveCustodies => {
+            handle_list_active_custodies(engine).await
+        }
     }
 }
 
@@ -622,6 +729,27 @@ fn handle_project_subject(
             error: format!("unknown subject: {id}"),
         },
     }
+}
+
+/// Snapshot the custody ledger (`op = "list_active_custodies"`).
+///
+/// Briefly locks the admission engine to clone the ledger Arc, then
+/// queries the ledger without holding the engine lock. The ledger
+/// has its own RwLock; contention with in-flight custody ops is
+/// limited to that.
+async fn handle_list_active_custodies(
+    engine: &Arc<Mutex<AdmissionEngine>>,
+) -> ClientResponse {
+    let ledger = {
+        let guard = engine.lock().await;
+        guard.custody_ledger()
+    };
+    let active_custodies: Vec<CustodyRecordWire> = ledger
+        .list_active()
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    ClientResponse::ActiveCustodies { active_custodies }
 }
 
 #[cfg(test)]
@@ -837,5 +965,153 @@ mod tests {
         let one_second_past_epoch =
             UNIX_EPOCH + std::time::Duration::from_secs(1);
         assert_eq!(system_time_to_ms(one_second_past_epoch), 1000);
+    }
+
+    // -----------------------------------------------------------------
+    // list_active_custodies tests (pass 4h).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn client_request_parses_list_active_custodies() {
+        let json = r#"{"op":"list_active_custodies"}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(r, ClientRequest::ListActiveCustodies));
+    }
+
+    #[test]
+    fn client_response_active_custodies_empty_serialises() {
+        let r = ClientResponse::ActiveCustodies {
+            active_custodies: vec![],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(v["active_custodies"].is_array());
+        assert_eq!(v["active_custodies"].as_array().unwrap().len(), 0);
+        // Distinctive key for the untagged enum variant.
+        assert!(!s.contains("payload_b64"));
+        assert!(!s.contains("\"error\""));
+    }
+
+    #[test]
+    fn client_response_active_custodies_populated_serialises() {
+        let rec = CustodyRecordWire {
+            plugin: "org.test.warden".into(),
+            handle_id: "c-1".into(),
+            shelf: Some("example.custody".into()),
+            custody_type: Some("playback".into()),
+            last_state: Some(StateSnapshotWire {
+                payload_b64: B64.encode(b"state=playing"),
+                health: HealthStatus::Healthy,
+                reported_at_ms: 1_700_000_000_050,
+            }),
+            started_at_ms: 1_700_000_000_000,
+            last_updated_ms: 1_700_000_000_050,
+        };
+        let r = ClientResponse::ActiveCustodies {
+            active_custodies: vec![rec],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let arr = v["active_custodies"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let first = &arr[0];
+        assert_eq!(first["plugin"].as_str(), Some("org.test.warden"));
+        assert_eq!(first["handle_id"].as_str(), Some("c-1"));
+        assert_eq!(first["shelf"].as_str(), Some("example.custody"));
+        assert_eq!(first["custody_type"].as_str(), Some("playback"));
+        assert_eq!(
+            first["last_state"]["health"].as_str(),
+            Some("healthy"),
+            "HealthStatus should serialise lowercase via the SDK derive"
+        );
+        assert_eq!(
+            first["last_state"]["reported_at_ms"].as_u64(),
+            Some(1_700_000_000_050)
+        );
+        assert_eq!(
+            first["started_at_ms"].as_u64(),
+            Some(1_700_000_000_000)
+        );
+        let decoded = B64
+            .decode(first["last_state"]["payload_b64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, b"state=playing");
+    }
+
+    #[test]
+    fn custody_record_wire_from_full_record() {
+        let snap = StateSnapshot {
+            payload: b"state=x".to_vec(),
+            health: HealthStatus::Degraded,
+            reported_at: UNIX_EPOCH
+                + std::time::Duration::from_millis(500),
+        };
+        let rec = CustodyRecord {
+            plugin: "org.test.warden".into(),
+            handle_id: "c-1".into(),
+            shelf: Some("example.custody".into()),
+            custody_type: Some("playback".into()),
+            last_state: Some(snap),
+            started_at: UNIX_EPOCH
+                + std::time::Duration::from_millis(100),
+            last_updated: UNIX_EPOCH
+                + std::time::Duration::from_millis(500),
+        };
+        let wire: CustodyRecordWire = rec.into();
+        assert_eq!(wire.plugin, "org.test.warden");
+        assert_eq!(wire.handle_id, "c-1");
+        assert_eq!(wire.shelf.as_deref(), Some("example.custody"));
+        assert_eq!(wire.custody_type.as_deref(), Some("playback"));
+        assert_eq!(wire.started_at_ms, 100);
+        assert_eq!(wire.last_updated_ms, 500);
+        let state = wire.last_state.expect("state");
+        assert_eq!(
+            B64.decode(&state.payload_b64).unwrap(),
+            b"state=x"
+        );
+        assert_eq!(state.health, HealthStatus::Degraded);
+        assert_eq!(state.reported_at_ms, 500);
+    }
+
+    #[test]
+    fn custody_record_wire_from_partial_record() {
+        // Simulates the state-report-first branch where record_custody
+        // has not yet filled in shelf/custody_type.
+        let rec = CustodyRecord {
+            plugin: "org.test.warden".into(),
+            handle_id: "c-1".into(),
+            shelf: None,
+            custody_type: None,
+            last_state: None,
+            started_at: UNIX_EPOCH
+                + std::time::Duration::from_millis(100),
+            last_updated: UNIX_EPOCH
+                + std::time::Duration::from_millis(100),
+        };
+        let wire: CustodyRecordWire = rec.into();
+        assert!(wire.shelf.is_none());
+        assert!(wire.custody_type.is_none());
+        assert!(wire.last_state.is_none());
+
+        // Optionals serialise as null, not as missing keys, which is
+        // more predictable for consumers.
+        let s = serde_json::to_string(&wire).unwrap();
+        assert!(s.contains("\"shelf\":null"));
+        assert!(s.contains("\"custody_type\":null"));
+        assert!(s.contains("\"last_state\":null"));
+    }
+
+    #[test]
+    fn state_snapshot_wire_from_conversion() {
+        let snap = StateSnapshot {
+            payload: b"xyz".to_vec(),
+            health: HealthStatus::Unhealthy,
+            reported_at: UNIX_EPOCH
+                + std::time::Duration::from_millis(2_500),
+        };
+        let wire: StateSnapshotWire = snap.into();
+        assert_eq!(B64.decode(&wire.payload_b64).unwrap(), b"xyz");
+        assert_eq!(wire.health, HealthStatus::Unhealthy);
+        assert_eq!(wire.reported_at_ms, 2_500);
     }
 }
