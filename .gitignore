@@ -25,3 +25,6 @@ Thumbs.db
 *.key
 *.pem
 !docs/**/*.pem.example
+
+# Archived artefacts
+.archive/
