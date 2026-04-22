@@ -1,42 +1,49 @@
 //! The admission engine.
 //!
 //! The admission engine owns the admitted plugins and runs their
-//! lifecycles. For v0 it supports only in-process singleton respondents;
-//! wardens, factories, out-of-process plugins, and multi-plugin shelves
-//! are future work.
+//! lifecycles. It supports in-process singleton respondents and
+//! in-process singleton wardens, plus out-of-process singleton
+//! respondents over the wire protocol. Out-of-process wardens,
+//! factories, and multi-plugin shelves are future work.
 //!
 //! ## Type erasure
 //!
-//! The SDK's public traits (`Plugin`, `Respondent`) use native async in
-//! traits with `impl Future + Send` return types. Those traits are not
-//! object-safe (native async traits cannot be `dyn`) so the admission
-//! engine cannot hold `Box<dyn Respondent>` directly.
+//! The SDK's public traits (`Plugin`, `Respondent`, `Warden`) use
+//! native async in traits with `impl Future + Send` return types.
+//! Those traits are not object-safe (native async traits cannot be
+//! `dyn`) so the admission engine cannot hold `Box<dyn Respondent>`
+//! or `Box<dyn Warden>` directly.
 //!
-//! The engine solves this with an internal object-safe trait
-//! [`ErasedRespondent`] and a generic adapter [`RespondentAdapter`] that
-//! implements it for any concrete `T: Respondent + 'static`. This keeps
-//! the public SDK traits zero-allocation while letting the engine store
-//! heterogeneous plugins in a single collection.
+//! The engine solves this with a pair of internal object-safe traits,
+//! [`ErasedRespondent`] and [`ErasedWarden`], and generic adapters
+//! [`RespondentAdapter`] and [`WardenAdapter`] that implement them
+//! for any concrete plugin type. An [`AdmittedHandle`] enum carries
+//! exactly one of the two variants per admission, decided from the
+//! manifest's `kind.interaction`. This keeps the public SDK traits
+//! zero-allocation while letting the engine store heterogeneous
+//! plugins in a single collection.
 
 use crate::catalogue::Catalogue;
 use crate::context::{
-    LoggingInstanceAnnouncer, LoggingStateReporter,
-    LoggingUserInteractionRequester, RegistryRelationAnnouncer,
-    RegistrySubjectAnnouncer,
+    LoggingCustodyStateReporter, LoggingInstanceAnnouncer,
+    LoggingStateReporter, LoggingUserInteractionRequester,
+    RegistryRelationAnnouncer, RegistrySubjectAnnouncer,
 };
 use crate::error::StewardError;
 use crate::relations::RelationGraph;
 use crate::subjects::SubjectRegistry;
 use evo_plugin_sdk::contract::{
-    HealthReport, LoadContext, Plugin, PluginDescription, PluginError,
-    Request, Respondent, Response,
+    Assignment, CourseCorrection, CustodyHandle, HealthReport, LoadContext,
+    Plugin, PluginDescription, PluginError, Request, Respondent, Response,
+    Warden,
 };
-use evo_plugin_sdk::manifest::TransportKind;
+use evo_plugin_sdk::manifest::{InteractionShape, TransportKind};
 use evo_plugin_sdk::Manifest;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
@@ -129,14 +136,201 @@ impl<T: Respondent + 'static> ErasedRespondent for RespondentAdapter<T> {
     }
 }
 
+/// Object-safe internal trait for admitted warden plugins.
+///
+/// Parallels [`ErasedRespondent`]: same four core verbs from `Plugin`,
+/// plus the three custody verbs from `Warden`. The engine stores
+/// wardens as `Box<dyn ErasedWarden>` inside an [`AdmittedHandle`].
+pub trait ErasedWarden: Send + Sync {
+    /// Dispatches to `Plugin::describe`.
+    fn describe(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = PluginDescription> + Send + '_>>;
+
+    /// Dispatches to `Plugin::load`.
+    fn load<'a>(
+        &'a mut self,
+        ctx: &'a LoadContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>;
+
+    /// Dispatches to `Plugin::unload`.
+    fn unload(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + '_>>;
+
+    /// Dispatches to `Plugin::health_check`.
+    fn health_check(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = HealthReport> + Send + '_>>;
+
+    /// Dispatches to `Warden::take_custody`.
+    fn take_custody<'a>(
+        &'a mut self,
+        assignment: Assignment,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a>,
+    >;
+
+    /// Dispatches to `Warden::course_correct`.
+    fn course_correct<'a>(
+        &'a mut self,
+        handle: &'a CustodyHandle,
+        correction: CourseCorrection,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>;
+
+    /// Dispatches to `Warden::release_custody`.
+    fn release_custody<'a>(
+        &'a mut self,
+        handle: CustodyHandle,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>;
+}
+
+/// Generic adapter: wraps any `T: Warden + 'static` as an
+/// [`ErasedWarden`]. Parallels [`RespondentAdapter`].
+pub struct WardenAdapter<T: Warden + 'static> {
+    inner: T,
+}
+
+impl<T: Warden + 'static> WardenAdapter<T> {
+    /// Wrap a concrete warden.
+    pub fn new(inner: T) -> Self {
+        Self { inner }
+    }
+
+    /// Unwrap the concrete warden. Useful for tests.
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+impl<T: Warden + 'static> ErasedWarden for WardenAdapter<T> {
+    fn describe(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = PluginDescription> + Send + '_>> {
+        Box::pin(Plugin::describe(&self.inner))
+    }
+
+    fn load<'a>(
+        &'a mut self,
+        ctx: &'a LoadContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(Plugin::load(&mut self.inner, ctx))
+    }
+
+    fn unload(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + '_>> {
+        Box::pin(Plugin::unload(&mut self.inner))
+    }
+
+    fn health_check(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = HealthReport> + Send + '_>> {
+        Box::pin(Plugin::health_check(&self.inner))
+    }
+
+    fn take_custody<'a>(
+        &'a mut self,
+        assignment: Assignment,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a>,
+    > {
+        Box::pin(Warden::take_custody(&mut self.inner, assignment))
+    }
+
+    fn course_correct<'a>(
+        &'a mut self,
+        handle: &'a CustodyHandle,
+        correction: CourseCorrection,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
+        Box::pin(Warden::course_correct(&mut self.inner, handle, correction))
+    }
+
+    fn release_custody<'a>(
+        &'a mut self,
+        handle: CustodyHandle,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
+        Box::pin(Warden::release_custody(&mut self.inner, handle))
+    }
+}
+
+/// A handle to an admitted plugin. Each admitted plugin is exactly one
+/// of these variants, disjoint and decided at admission time by the
+/// manifest's `kind.interaction` field.
+///
+/// All four core verbs (`describe`, `load`, `unload`, `health_check`)
+/// are common to both variants and exposed via inherent methods that
+/// dispatch through the enum. Kind-specific verbs are routed by the
+/// engine's public methods, which match on the variant and return a
+/// [`StewardError::Dispatch`] if the shelf's plugin kind does not
+/// match the caller's request (e.g. a `handle_request` on a warden
+/// shelf, or a `take_custody` on a respondent shelf).
+pub enum AdmittedHandle {
+    /// A respondent plugin: handles discrete request-response
+    /// exchanges via [`ErasedRespondent::handle_request`].
+    Respondent(Box<dyn ErasedRespondent>),
+    /// A warden plugin: takes sustained custody via
+    /// [`ErasedWarden::take_custody`], [`ErasedWarden::course_correct`],
+    /// [`ErasedWarden::release_custody`].
+    Warden(Box<dyn ErasedWarden>),
+}
+
+impl AdmittedHandle {
+    /// Dispatch to the inner plugin's `describe`.
+    async fn describe(&self) -> PluginDescription {
+        match self {
+            Self::Respondent(r) => r.describe().await,
+            Self::Warden(w) => w.describe().await,
+        }
+    }
+
+    /// Dispatch to the inner plugin's `load`.
+    async fn load(
+        &mut self,
+        ctx: &LoadContext,
+    ) -> Result<(), PluginError> {
+        match self {
+            Self::Respondent(r) => r.load(ctx).await,
+            Self::Warden(w) => w.load(ctx).await,
+        }
+    }
+
+    /// Dispatch to the inner plugin's `unload`.
+    async fn unload(&mut self) -> Result<(), PluginError> {
+        match self {
+            Self::Respondent(r) => r.unload().await,
+            Self::Warden(w) => w.unload().await,
+        }
+    }
+
+    /// Dispatch to the inner plugin's `health_check`.
+    async fn health_check(&self) -> HealthReport {
+        match self {
+            Self::Respondent(r) => r.health_check().await,
+            Self::Warden(w) => w.health_check().await,
+        }
+    }
+
+    /// Human-readable name of the interaction shape for diagnostics.
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Respondent(_) => "respondent",
+            Self::Warden(_) => "warden",
+        }
+    }
+}
+
 /// Internal record of one admitted plugin.
 struct AdmittedPlugin {
     /// Canonical plugin name, per the manifest.
     name: String,
     /// Fully-qualified shelf this plugin occupies (`<rack>.<shelf>`).
     shelf: String,
-    /// Type-erased handle for lifecycle and request dispatch.
-    erased: Box<dyn ErasedRespondent>,
+    /// Type-erased handle for lifecycle and dispatch. Exactly one of
+    /// the two variants per admission.
+    handle: AdmittedHandle,
     /// Child process handle, if this plugin was spawned by the steward
     /// via [`AdmissionEngine::admit_out_of_process_from_directory`].
     ///
@@ -157,7 +351,7 @@ impl std::fmt::Debug for AdmittedPlugin {
         f.debug_struct("AdmittedPlugin")
             .field("name", &self.name)
             .field("shelf", &self.shelf)
-            .field("erased", &"<Box<dyn ErasedRespondent>>")
+            .field("kind", &self.handle.kind_name())
             .field("child", &self.child.as_ref().map(|c| c.id()))
             .finish()
     }
@@ -181,6 +375,10 @@ pub struct AdmissionEngine {
     registry: Arc<SubjectRegistry>,
     /// Relation graph shared with all admitted plugins.
     relation_graph: Arc<RelationGraph>,
+    /// Monotonic counter for correlation IDs on warden custody verbs
+    /// (`take_custody`, `course_correct`). Each call allocates a fresh
+    /// ID. Engine-local, not persistent across restarts.
+    custody_cid_counter: Arc<AtomicU64>,
 }
 
 impl Default for AdmissionEngine {
@@ -190,6 +388,7 @@ impl Default for AdmissionEngine {
             admission_order: Vec::new(),
             registry: Arc::new(SubjectRegistry::new()),
             relation_graph: Arc::new(RelationGraph::new()),
+            custody_cid_counter: Arc::new(AtomicU64::new(1)),
         }
     }
 }
@@ -218,6 +417,7 @@ impl AdmissionEngine {
             admission_order: Vec::new(),
             registry,
             relation_graph: Arc::new(RelationGraph::new()),
+            custody_cid_counter: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -234,6 +434,7 @@ impl AdmissionEngine {
             admission_order: Vec::new(),
             registry,
             relation_graph,
+            custody_cid_counter: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -307,10 +508,19 @@ impl AdmissionEngine {
             )));
         }
 
-        let mut erased: Box<dyn ErasedRespondent> =
-            Box::new(RespondentAdapter::new(plugin));
+        if manifest.kind.interaction != InteractionShape::Respondent {
+            return Err(StewardError::Admission(format!(
+                "{}: admit_singleton_respondent requires kind.interaction \
+                 = 'respondent', manifest declares {:?}",
+                manifest.plugin.name, manifest.kind.interaction
+            )));
+        }
 
-        let description = erased.describe().await;
+        let mut handle = AdmittedHandle::Respondent(Box::new(
+            RespondentAdapter::new(plugin),
+        ));
+
+        let description = handle.describe().await;
         if description.identity.name != manifest.plugin.name {
             return Err(StewardError::Admission(format!(
                 "plugin describe() name {} does not match manifest name {}",
@@ -339,7 +549,7 @@ impl AdmissionEngine {
             Arc::clone(&self.registry),
             Arc::clone(&self.relation_graph),
         );
-        erased.load(&ctx).await.map_err(|e| {
+        handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
                 "{}: load failed: {}",
                 manifest.plugin.name, e
@@ -349,13 +559,129 @@ impl AdmissionEngine {
         let record = AdmittedPlugin {
             name: manifest.plugin.name.clone(),
             shelf: shelf_qualified.clone(),
-            erased,
+            handle,
             child: None,
         };
 
         tracing::info!(
             plugin = %record.name,
             shelf = %record.shelf,
+            kind = %record.handle.kind_name(),
+            trust_class = ?manifest.trust.class,
+            "plugin admitted"
+        );
+
+        self.by_shelf.insert(shelf_qualified.clone(), record);
+        self.admission_order.push(shelf_qualified);
+
+        Ok(())
+    }
+
+    /// Admit an in-process singleton warden.
+    ///
+    /// Parallel to [`Self::admit_singleton_respondent`]: runs the same
+    /// admission sequence (manifest validation, shelf lookup, shape
+    /// match, duplicate check, identity check, load) but stores the
+    /// plugin as an [`AdmittedHandle::Warden`].
+    ///
+    /// Additionally rejects manifests whose `kind.interaction` is not
+    /// `warden`. A respondent manifest passed to this method is a
+    /// type-system-undetectable misuse; the runtime check catches it.
+    pub async fn admit_singleton_warden<T>(
+        &mut self,
+        plugin: T,
+        manifest: Manifest,
+        catalogue: &Catalogue,
+    ) -> Result<(), StewardError>
+    where
+        T: Warden + 'static,
+    {
+        manifest.validate()?;
+
+        let shelf_qualified = manifest.target.shelf.clone();
+        let shelf = catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
+            StewardError::Admission(format!(
+                "{}: target shelf not in catalogue: {}",
+                manifest.plugin.name, shelf_qualified
+            ))
+        })?;
+
+        if shelf.shape != manifest.target.shape {
+            return Err(StewardError::Admission(format!(
+                "{}: manifest targets shape {} but catalogue shelf {} is shape {}",
+                manifest.plugin.name,
+                manifest.target.shape,
+                shelf_qualified,
+                shelf.shape
+            )));
+        }
+
+        if self.by_shelf.contains_key(&shelf_qualified) {
+            return Err(StewardError::Admission(format!(
+                "{}: shelf {} already occupied",
+                manifest.plugin.name, shelf_qualified
+            )));
+        }
+
+        if manifest.kind.interaction != InteractionShape::Warden {
+            return Err(StewardError::Admission(format!(
+                "{}: admit_singleton_warden requires kind.interaction \
+                 = 'warden', manifest declares {:?}",
+                manifest.plugin.name, manifest.kind.interaction
+            )));
+        }
+
+        let mut handle = AdmittedHandle::Warden(Box::new(
+            WardenAdapter::new(plugin),
+        ));
+
+        let description = handle.describe().await;
+        if description.identity.name != manifest.plugin.name {
+            return Err(StewardError::Admission(format!(
+                "plugin describe() name {} does not match manifest name {}",
+                description.identity.name, manifest.plugin.name
+            )));
+        }
+        if description.identity.version != manifest.plugin.version {
+            return Err(StewardError::Admission(format!(
+                "{}: plugin describe() version {} does not match manifest version {}",
+                manifest.plugin.name,
+                description.identity.version,
+                manifest.plugin.version
+            )));
+        }
+        if description.identity.contract != manifest.plugin.contract {
+            return Err(StewardError::Admission(format!(
+                "{}: plugin describe() contract {} does not match manifest contract {}",
+                manifest.plugin.name,
+                description.identity.contract,
+                manifest.plugin.contract
+            )));
+        }
+
+        let ctx = build_load_context(
+            &manifest,
+            Arc::clone(&self.registry),
+            Arc::clone(&self.relation_graph),
+        );
+        handle.load(&ctx).await.map_err(|e| {
+            StewardError::Admission(format!(
+                "{}: load failed: {}",
+                manifest.plugin.name, e
+            ))
+        })?;
+
+        let record = AdmittedPlugin {
+            name: manifest.plugin.name.clone(),
+            shelf: shelf_qualified.clone(),
+            handle,
+            child: None,
+        };
+
+        tracing::info!(
+            plugin = %record.name,
+            shelf = %record.shelf,
+            kind = %record.handle.kind_name(),
             trust_class = ?manifest.trust.class,
             "plugin admitted"
         );
@@ -427,6 +753,14 @@ impl AdmissionEngine {
             )));
         }
 
+        if manifest.kind.interaction != InteractionShape::Respondent {
+            return Err(StewardError::Admission(format!(
+                "{}: admit_out_of_process_respondent requires kind.interaction \
+                 = 'respondent', manifest declares {:?}",
+                manifest.plugin.name, manifest.kind.interaction
+            )));
+        }
+
         // Connect and eagerly describe. If either the connection or
         // the initial describe fails we return here with no partial
         // state.
@@ -467,14 +801,14 @@ impl AdmissionEngine {
             )));
         }
 
-        let mut erased: Box<dyn ErasedRespondent> = Box::new(respondent);
+        let mut handle = AdmittedHandle::Respondent(Box::new(respondent));
 
         let ctx = build_load_context(
             &manifest,
             Arc::clone(&self.registry),
             Arc::clone(&self.relation_graph),
         );
-        erased.load(&ctx).await.map_err(|e| {
+        handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
                 "{}: load failed: {}",
                 manifest.plugin.name, e
@@ -484,13 +818,14 @@ impl AdmissionEngine {
         let record = AdmittedPlugin {
             name: manifest.plugin.name.clone(),
             shelf: shelf_qualified.clone(),
-            erased,
+            handle,
             child: None,
         };
 
         tracing::info!(
             plugin = %record.name,
             shelf = %record.shelf,
+            kind = %record.handle.kind_name(),
             trust_class = ?manifest.trust.class,
             transport = "wire",
             "plugin admitted"
@@ -674,8 +1009,13 @@ impl AdmissionEngine {
 
     /// Route a request to the plugin admitted on the given shelf.
     ///
-    /// Returns an error if no plugin is admitted on that shelf, or if the
-    /// plugin returns an error.
+    /// Returns [`StewardError::Dispatch`] if no plugin is admitted on
+    /// that shelf, or if the plugin on that shelf is a warden (whose
+    /// verbs are [`Self::take_custody`], [`Self::course_correct`],
+    /// [`Self::release_custody`] - not `handle_request`).
+    ///
+    /// Returns the plugin's own error wrapped in
+    /// [`StewardError::Plugin`] if the plugin's handler fails.
     pub async fn handle_request(
         &mut self,
         shelf: &str,
@@ -684,7 +1024,146 @@ impl AdmissionEngine {
         let plugin = self.by_shelf.get_mut(shelf).ok_or_else(|| {
             StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
         })?;
-        plugin.erased.handle_request(&request).await.map_err(Into::into)
+        match &mut plugin.handle {
+            AdmittedHandle::Respondent(r) => {
+                r.handle_request(&request).await.map_err(Into::into)
+            }
+            AdmittedHandle::Warden(_) => Err(StewardError::Dispatch(format!(
+                "handle_request on shelf {shelf}: plugin is a warden, \
+                 not a respondent"
+            ))),
+        }
+    }
+
+    /// Deliver an assignment to the warden on the given shelf.
+    ///
+    /// Allocates a fresh correlation ID, constructs an [`Assignment`]
+    /// carrying a [`LoggingCustodyStateReporter`] tagged with the
+    /// warden's plugin name, and dispatches to the warden's
+    /// `take_custody`. A future pass will replace the logging
+    /// reporter with a ledger-backed implementation so custody
+    /// state reports are persisted; the signature here does not
+    /// change when that happens.
+    ///
+    /// Returns [`StewardError::Dispatch`] if no plugin is admitted
+    /// on that shelf, or if the plugin there is a respondent (whose
+    /// verb is [`Self::handle_request`] - not `take_custody`).
+    ///
+    /// Returns the plugin's own error wrapped in
+    /// [`StewardError::Plugin`] if the warden rejects the
+    /// assignment.
+    pub async fn take_custody(
+        &mut self,
+        shelf: &str,
+        custody_type: String,
+        payload: Vec<u8>,
+        deadline: Option<Instant>,
+    ) -> Result<CustodyHandle, StewardError> {
+        let plugin = self.by_shelf.get_mut(shelf).ok_or_else(|| {
+            StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
+        })?;
+        let warden = match &mut plugin.handle {
+            AdmittedHandle::Warden(w) => w,
+            AdmittedHandle::Respondent(_) => {
+                return Err(StewardError::Dispatch(format!(
+                    "take_custody on shelf {shelf}: plugin is a respondent, \
+                     not a warden"
+                )));
+            }
+        };
+
+        let correlation_id =
+            self.custody_cid_counter.fetch_add(1, Ordering::Relaxed);
+        let reporter: Arc<dyn evo_plugin_sdk::contract::CustodyStateReporter> =
+            Arc::new(LoggingCustodyStateReporter::new(plugin.name.clone()));
+        let assignment = Assignment {
+            custody_type,
+            payload,
+            correlation_id,
+            deadline,
+            custody_state_reporter: reporter,
+        };
+
+        warden.take_custody(assignment).await.map_err(Into::into)
+    }
+
+    /// Deliver a course correction to an ongoing custody on the given
+    /// shelf.
+    ///
+    /// Allocates a fresh correlation ID and constructs a
+    /// [`CourseCorrection`] the warden receives. The caller is
+    /// responsible for holding the [`CustodyHandle`] returned from
+    /// the prior [`Self::take_custody`] and passing it back verbatim.
+    ///
+    /// Returns [`StewardError::Dispatch`] for the same shelf-kind
+    /// mismatches as [`Self::take_custody`]. Returns
+    /// [`StewardError::Plugin`] on warden-side rejection (unknown
+    /// handle, correction-type not accepted, timeout, etc.).
+    pub async fn course_correct(
+        &mut self,
+        shelf: &str,
+        handle: &CustodyHandle,
+        correction_type: String,
+        payload: Vec<u8>,
+    ) -> Result<(), StewardError> {
+        let plugin = self.by_shelf.get_mut(shelf).ok_or_else(|| {
+            StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
+        })?;
+        let warden = match &mut plugin.handle {
+            AdmittedHandle::Warden(w) => w,
+            AdmittedHandle::Respondent(_) => {
+                return Err(StewardError::Dispatch(format!(
+                    "course_correct on shelf {shelf}: plugin is a \
+                     respondent, not a warden"
+                )));
+            }
+        };
+
+        let correlation_id =
+            self.custody_cid_counter.fetch_add(1, Ordering::Relaxed);
+        let correction = CourseCorrection {
+            correction_type,
+            payload,
+            correlation_id,
+        };
+
+        warden
+            .course_correct(handle, correction)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Gracefully terminate an ongoing custody on the given shelf.
+    ///
+    /// The warden is expected to wind down the work identified by
+    /// `handle`, emit a final state report, and return. After this
+    /// future resolves successfully the handle is consumed; passing
+    /// it to [`Self::course_correct`] or [`Self::release_custody`]
+    /// again is a caller bug and the warden's response is
+    /// implementation-defined.
+    ///
+    /// Returns [`StewardError::Dispatch`] for the same shelf-kind
+    /// mismatches as [`Self::take_custody`]. Returns
+    /// [`StewardError::Plugin`] on warden-side rejection.
+    pub async fn release_custody(
+        &mut self,
+        shelf: &str,
+        handle: CustodyHandle,
+    ) -> Result<(), StewardError> {
+        let plugin = self.by_shelf.get_mut(shelf).ok_or_else(|| {
+            StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
+        })?;
+        let warden = match &mut plugin.handle {
+            AdmittedHandle::Warden(w) => w,
+            AdmittedHandle::Respondent(_) => {
+                return Err(StewardError::Dispatch(format!(
+                    "release_custody on shelf {shelf}: plugin is a \
+                     respondent, not a warden"
+                )));
+            }
+        };
+
+        warden.release_custody(handle).await.map_err(Into::into)
     }
 
     /// Run a health check against every admitted plugin, returning a
@@ -693,7 +1172,7 @@ impl AdmissionEngine {
         let mut out = Vec::with_capacity(self.by_shelf.len());
         for shelf in &self.admission_order {
             if let Some(p) = self.by_shelf.get(shelf) {
-                let r = p.erased.health_check().await;
+                let r = p.handle.health_check().await;
                 out.push((p.name.clone(), r));
             }
         }
@@ -759,17 +1238,18 @@ async fn unload_one_plugin(
     let AdmittedPlugin {
         name,
         shelf,
-        mut erased,
+        mut handle,
         child,
     } = plugin;
 
     tracing::info!(
         plugin = %name,
         shelf = %shelf,
+        kind = %handle.kind_name(),
         "plugin unloading"
     );
 
-    let unload_result = erased.unload().await;
+    let unload_result = handle.unload().await;
 
     match &unload_result {
         Ok(()) => tracing::info!(plugin = %name, "plugin unloaded"),
@@ -786,7 +1266,7 @@ async fn unload_one_plugin(
     // which drops the socket's writer half, which causes the child
     // to see EOF on its read side. Waiting on the child while still
     // holding the writer would deadlock.
-    drop(erased);
+    drop(handle);
 
     if let Some(mut child) = child {
         wait_or_kill_child(&name, &mut child).await;
@@ -1019,6 +1499,11 @@ charter = "test rack"
 name = "ping"
 shape = 1
 description = "test shelf"
+
+[[racks.shelves]]
+name = "custody"
+shape = 1
+description = "test custody shelf for warden tests"
 "#,
         )
         .unwrap()
@@ -1715,6 +2200,407 @@ response_budget_ms = 1000
             }
             other => panic!("expected Io error, got {other:?}"),
         }
+        assert_eq!(engine.len(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Warden admission and dispatch tests.
+    //
+    // Exercise the in-process warden path introduced in pass 4e:
+    // - admit_singleton_warden happy path
+    // - rejection of cross-kind misuse (respondent manifest passed
+    //   to admit_singleton_warden, warden manifest passed to
+    //   admit_singleton_respondent)
+    // - dispatch routing (take_custody / course_correct /
+    //   release_custody go through, handle_request on a warden shelf
+    //   is refused, take_custody on a respondent shelf is refused)
+    // -----------------------------------------------------------------
+
+    /// A minimal warden for dispatch tests.
+    ///
+    /// Every verb returns success with predictable outputs. The
+    /// returned [`CustodyHandle`] uses the plugin's own name as the
+    /// handle id so tests can tell apart multiple admitted wardens
+    /// if they ever need to.
+    #[derive(Default)]
+    struct TestWarden {
+        name: String,
+    }
+
+    impl Plugin for TestWarden {
+        fn describe(
+            &self,
+        ) -> impl Future<Output = PluginDescription> + Send + '_ {
+            async move {
+                PluginDescription {
+                    identity: PluginIdentity {
+                        name: self.name.clone(),
+                        version: semver::Version::new(0, 1, 0),
+                        contract: 1,
+                    },
+                    runtime_capabilities: RuntimeCapabilities {
+                        request_types: vec![],
+                        accepts_custody: true,
+                        flags: Default::default(),
+                    },
+                    build_info: BuildInfo {
+                        plugin_build: "test".into(),
+                        sdk_version: "0.1.1".into(),
+                        rustc_version: None,
+                        built_at: None,
+                    },
+                }
+            }
+        }
+
+        fn load<'a>(
+            &'a mut self,
+            _ctx: &'a LoadContext,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
+        {
+            async move { Ok(()) }
+        }
+
+        fn unload(
+            &mut self,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_
+        {
+            async move { Ok(()) }
+        }
+
+        fn health_check(
+            &self,
+        ) -> impl Future<Output = HealthReport> + Send + '_ {
+            async move { HealthReport::healthy() }
+        }
+    }
+
+    impl Warden for TestWarden {
+        fn take_custody<'a>(
+            &'a mut self,
+            _assignment: Assignment,
+        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a
+        {
+            let name = self.name.clone();
+            async move { Ok(CustodyHandle::new(name)) }
+        }
+
+        fn course_correct<'a>(
+            &'a mut self,
+            _handle: &'a CustodyHandle,
+            _correction: CourseCorrection,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
+        {
+            async move { Ok(()) }
+        }
+
+        fn release_custody<'a>(
+            &'a mut self,
+            _handle: CustodyHandle,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
+        {
+            async move { Ok(()) }
+        }
+    }
+
+    /// Warden manifest targeting the `test.custody` shelf from
+    /// [`test_catalogue`].
+    fn test_warden_manifest(name: &str) -> Manifest {
+        let toml = format!(
+            r#"
+[plugin]
+name = "{name}"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "test.custody"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "warden"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+
+[capabilities.warden]
+custody_domain = "test"
+custody_exclusive = false
+course_correction_budget_ms = 1000
+custody_failure_mode = "abort"
+"#
+        );
+        Manifest::from_toml(&toml).unwrap()
+    }
+
+    #[tokio::test]
+    async fn admits_valid_warden() {
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let warden = TestWarden {
+            name: "org.test.custody".into(),
+        };
+        engine
+            .admit_singleton_warden(
+                warden,
+                test_warden_manifest("org.test.custody"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn admit_singleton_warden_rejects_respondent_manifest() {
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        // The warden here is a Warden-implementing Rust type, but the
+        // manifest says interaction = respondent. The kind check must
+        // catch this mismatch.
+        let warden = TestWarden {
+            name: "org.test.custody".into(),
+        };
+        let r = engine
+            .admit_singleton_warden(
+                warden,
+                // test_manifest targets test.ping with
+                // interaction=respondent.
+                test_manifest("org.test.custody"),
+                &catalogue,
+            )
+            .await;
+        match r {
+            Err(StewardError::Admission(msg)) => {
+                assert!(
+                    msg.contains("warden"),
+                    "expected message to mention warden, got {msg:?}"
+                );
+            }
+            other => panic!("expected Admission error, got {other:?}"),
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admit_singleton_respondent_rejects_warden_manifest() {
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        // TestRespondent passed to admit_singleton_respondent with a
+        // warden manifest. The kind check must catch this.
+        let plugin = TestRespondent {
+            name: "org.test.custody".into(),
+            ..Default::default()
+        };
+        let r = engine
+            .admit_singleton_respondent(
+                plugin,
+                test_warden_manifest("org.test.custody"),
+                &catalogue,
+            )
+            .await;
+        match r {
+            Err(StewardError::Admission(msg)) => {
+                assert!(
+                    msg.contains("respondent"),
+                    "expected message to mention respondent, got {msg:?}"
+                );
+            }
+            other => panic!("expected Admission error, got {other:?}"),
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn take_custody_dispatches_to_warden() {
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let warden = TestWarden {
+            name: "org.test.custody".into(),
+        };
+        engine
+            .admit_singleton_warden(
+                warden,
+                test_warden_manifest("org.test.custody"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+
+        let handle = engine
+            .take_custody(
+                "test.custody",
+                "playback".into(),
+                b"payload".to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+        // TestWarden uses its own plugin name as the handle id.
+        assert_eq!(handle.id, "org.test.custody");
+    }
+
+    #[tokio::test]
+    async fn course_correct_dispatches_to_warden() {
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let warden = TestWarden {
+            name: "org.test.custody".into(),
+        };
+        engine
+            .admit_singleton_warden(
+                warden,
+                test_warden_manifest("org.test.custody"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+
+        let handle = engine
+            .take_custody(
+                "test.custody",
+                "playback".into(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .course_correct(
+                "test.custody",
+                &handle,
+                "seek".into(),
+                b"pos=42".to_vec(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_custody_dispatches_to_warden() {
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let warden = TestWarden {
+            name: "org.test.custody".into(),
+        };
+        engine
+            .admit_singleton_warden(
+                warden,
+                test_warden_manifest("org.test.custody"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+
+        let handle = engine
+            .take_custody(
+                "test.custody",
+                "playback".into(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+        engine.release_custody("test.custody", handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_request_on_warden_shelf_errors() {
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let warden = TestWarden {
+            name: "org.test.custody".into(),
+        };
+        engine
+            .admit_singleton_warden(
+                warden,
+                test_warden_manifest("org.test.custody"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+
+        let req = Request {
+            request_type: "ping".into(),
+            payload: vec![],
+            correlation_id: 1,
+            deadline: None,
+        };
+        let r = engine.handle_request("test.custody", req).await;
+        match r {
+            Err(StewardError::Dispatch(msg)) => {
+                assert!(
+                    msg.contains("warden"),
+                    "expected message to mention warden, got {msg:?}"
+                );
+            }
+            other => panic!("expected Dispatch error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn take_custody_on_respondent_shelf_errors() {
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        engine
+            .admit_singleton_respondent(
+                plugin,
+                test_manifest("org.test.ping"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+
+        let r = engine
+            .take_custody("test.ping", "playback".into(), vec![], None)
+            .await;
+        match r {
+            Err(StewardError::Dispatch(msg)) => {
+                assert!(
+                    msg.contains("respondent"),
+                    "expected message to mention respondent, got {msg:?}"
+                );
+            }
+            other => panic!("expected Dispatch error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn warden_shutdown_unloads() {
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let warden = TestWarden {
+            name: "org.test.custody".into(),
+        };
+        engine
+            .admit_singleton_warden(
+                warden,
+                test_warden_manifest("org.test.custody"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.len(), 1);
+        engine.shutdown().await.unwrap();
         assert_eq!(engine.len(), 0);
     }
 }
