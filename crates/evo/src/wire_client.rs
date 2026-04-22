@@ -54,9 +54,10 @@
 //! [`Warden`]: evo_plugin_sdk::contract::Warden
 
 use crate::context::{
-    LoggingCustodyStateReporter, LoggingStateReporter,
-    RegistryRelationAnnouncer, RegistrySubjectAnnouncer,
+    LoggingStateReporter, RegistryRelationAnnouncer,
+    RegistrySubjectAnnouncer,
 };
+use crate::custody::{CustodyLedger, LedgerCustodyStateReporter};
 use crate::relations::RelationGraph;
 use crate::subjects::SubjectRegistry;
 use evo_plugin_sdk::codec::{read_frame_json, write_frame_json, WireError};
@@ -1102,12 +1103,14 @@ impl crate::admission::ErasedRespondent for WireRespondent {
 ///
 /// ## Custody state reporter
 ///
-/// The warden's `load()` installs a [`LoggingCustodyStateReporter`]
-/// tagged with the plugin name in the [`EventSink`]. When the remote
-/// warden emits `ReportCustodyState` frames during an ongoing
-/// custody, the reader task routes them through this reporter. A
-/// future pass can replace `LoggingCustodyStateReporter` with a
-/// ledger-backed one without changing the adapter.
+/// The warden's `load()` installs a [`LedgerCustodyStateReporter`]
+/// tagged with the plugin name in the [`EventSink`]. When the
+/// remote warden emits `ReportCustodyState` frames during an
+/// ongoing custody, the reader task routes them through this
+/// reporter, which UPSERTs into the shared
+/// [`CustodyLedger`](crate::custody::CustodyLedger). The ledger is
+/// supplied at [`WireWarden::connect`] time by the admission
+/// engine.
 ///
 /// ## Assignment custody reporter is wire-redundant
 ///
@@ -1121,6 +1124,7 @@ impl crate::admission::ErasedRespondent for WireRespondent {
 pub struct WireWarden {
     client: WireClient,
     cached_description: PluginDescription,
+    ledger: Arc<CustodyLedger>,
 }
 
 impl fmt::Debug for WireWarden {
@@ -1131,6 +1135,7 @@ impl fmt::Debug for WireWarden {
                 "cached_description.identity",
                 &self.cached_description.identity,
             )
+            .field("ledger_len", &self.ledger.len())
             .finish()
     }
 }
@@ -1139,11 +1144,15 @@ impl WireWarden {
     /// Connect a wire warden over the given reader and writer.
     ///
     /// Spawns the client's background tasks, sends a `describe`
-    /// request, and caches the response.
+    /// request, and caches the response. The supplied `ledger` is
+    /// used by [`WireWarden::load`] to construct a
+    /// [`LedgerCustodyStateReporter`] in the event sink; it is
+    /// typically the admission engine's shared ledger.
     pub async fn connect<R, W>(
         reader: R,
         writer: W,
         plugin_name: String,
+        ledger: Arc<CustodyLedger>,
     ) -> Result<Self, WireClientError>
     where
         R: AsyncRead + Send + Unpin + 'static,
@@ -1154,6 +1163,7 @@ impl WireWarden {
         Ok(Self {
             client,
             cached_description,
+            ledger,
         })
     }
 
@@ -1185,11 +1195,13 @@ impl crate::admission::ErasedWarden for WireWarden {
             // Install event sink BEFORE sending the load frame so that
             // any events emitted during load() reach the registries,
             // and so that subsequent ReportCustodyState frames during
-            // custody can be routed. The custody reporter is a
-            // logger tagged with the plugin name; future passes can
-            // substitute a ledger-backed reporter here.
+            // custody can be routed. The custody reporter is backed
+            // by the CustodyLedger supplied at connect time, so every
+            // state report the warden emits is UPSERTed into the
+            // ledger under (plugin_name, handle.id).
             let custody_reporter: Arc<dyn CustodyStateReporter> =
-                Arc::new(LoggingCustodyStateReporter::new(
+                Arc::new(LedgerCustodyStateReporter::new(
+                    Arc::clone(&self.ledger),
                     self.client.plugin_name().to_string(),
                 ));
             self.client.set_event_sink(EventSink {
@@ -2134,10 +2146,12 @@ mod tests {
             plugin_to_steward_w,
         ));
 
+        let ledger = Arc::new(CustodyLedger::new());
         let warden = WireWarden::connect(
             plugin_to_steward_r,
             steward_to_plugin_w,
             plugin_name,
+            ledger,
         )
         .await
         .unwrap();
@@ -2375,7 +2389,11 @@ mod tests {
             Arc::clone(&graph),
         );
         // ErasedWarden::load installs the default sink with a
-        // LoggingCustodyStateReporter.
+        // LedgerCustodyStateReporter pointing at the ledger that
+        // was supplied at WireWarden::connect time. This test
+        // immediately overrides the sink to observe routing; see
+        // `warden_state_report_lands_in_ledger_via_default_sink`
+        // for the non-override path.
         warden.load(&ctx).await.unwrap();
 
         // Overwrite the sink with one whose custody reporter
@@ -2421,6 +2439,90 @@ mod tests {
         assert_eq!(captured[0].2, HealthStatus::Healthy);
 
         drop(captured);
+        warden.unload().await.unwrap();
+        drop(warden);
+        let _ = host.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn warden_state_report_lands_in_ledger_via_default_sink() {
+        // Verifies that without any sink override, state reports
+        // emitted by the warden over the wire land in the
+        // CustodyLedger supplied at WireWarden::connect time.
+        // Covers the default code path installed by
+        // ErasedWarden::load - pass 4g-b integration.
+        use crate::admission::ErasedWarden;
+        use crate::context::LoggingCustodyStateReporter as LCR;
+
+        let plugin = TestWarden {
+            name: "org.test.warden".into(),
+            report_payload_during_take: Some(b"state=playing".to_vec()),
+            ..Default::default()
+        };
+        let plugin_name = plugin.name.clone();
+
+        let (steward_to_plugin_w, steward_to_plugin_r) =
+            tokio::io::duplex(65536);
+        let (plugin_to_steward_w, plugin_to_steward_r) =
+            tokio::io::duplex(65536);
+
+        let host = tokio::spawn(serve_warden(
+            plugin,
+            HostConfig::new(plugin_name.clone()),
+            steward_to_plugin_r,
+            plugin_to_steward_w,
+        ));
+
+        let ledger = Arc::new(CustodyLedger::new());
+        let mut warden = WireWarden::connect(
+            plugin_to_steward_r,
+            steward_to_plugin_w,
+            plugin_name.clone(),
+            Arc::clone(&ledger),
+        )
+        .await
+        .unwrap();
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let ctx = test_load_context(
+            &plugin_name,
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+        );
+        warden.load(&ctx).await.unwrap();
+
+        // The Assignment's reporter is dead-ended on the wire path
+        // (the plugin uses its own wire-backed reporter internally).
+        // Supply a logger here to document the signature; the wire
+        // path ignores it.
+        let reporter: Arc<dyn CustodyStateReporter> =
+            Arc::new(LCR::new(plugin_name.clone()));
+        let assignment = Assignment {
+            custody_type: "playback".into(),
+            payload: vec![],
+            correlation_id: 55,
+            deadline: None,
+            custody_state_reporter: reporter,
+        };
+        let handle = warden.take_custody(assignment).await.unwrap();
+        assert_eq!(handle.id, "custody-55");
+
+        // The ledger now has a record keyed by (plugin_name,
+        // "custody-55") containing only the state-report fields.
+        // The engine-side record_custody call that would add
+        // shelf/custody_type is not exercised by this test - that
+        // path is covered by take_custody_records_in_ledger in the
+        // admission module.
+        let rec = ledger
+            .describe(&plugin_name, "custody-55")
+            .expect("ledger should contain the state report");
+        assert!(rec.shelf.is_none());
+        assert!(rec.custody_type.is_none());
+        let state = rec.last_state.expect("state snapshot");
+        assert_eq!(state.payload, b"state=playing");
+        assert_eq!(state.health, HealthStatus::Healthy);
+
         warden.unload().await.unwrap();
         drop(warden);
         let _ = host.await;

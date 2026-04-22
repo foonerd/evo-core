@@ -25,10 +25,11 @@
 
 use crate::catalogue::Catalogue;
 use crate::context::{
-    LoggingCustodyStateReporter, LoggingInstanceAnnouncer,
-    LoggingStateReporter, LoggingUserInteractionRequester,
-    RegistryRelationAnnouncer, RegistrySubjectAnnouncer,
+    LoggingInstanceAnnouncer, LoggingStateReporter,
+    LoggingUserInteractionRequester, RegistryRelationAnnouncer,
+    RegistrySubjectAnnouncer,
 };
+use crate::custody::{CustodyLedger, LedgerCustodyStateReporter};
 use crate::error::StewardError;
 use crate::relations::RelationGraph;
 use crate::subjects::SubjectRegistry;
@@ -375,6 +376,10 @@ pub struct AdmissionEngine {
     registry: Arc<SubjectRegistry>,
     /// Relation graph shared with all admitted plugins.
     relation_graph: Arc<RelationGraph>,
+    /// Custody ledger shared with the wire-warden adapter. Tracks
+    /// every custody handed out by [`Self::take_custody`] and every
+    /// state report emitted by the holding warden.
+    custody_ledger: Arc<CustodyLedger>,
     /// Monotonic counter for correlation IDs on warden custody verbs
     /// (`take_custody`, `course_correct`). Each call allocates a fresh
     /// ID. Engine-local, not persistent across restarts.
@@ -388,6 +393,7 @@ impl Default for AdmissionEngine {
             admission_order: Vec::new(),
             registry: Arc::new(SubjectRegistry::new()),
             relation_graph: Arc::new(RelationGraph::new()),
+            custody_ledger: Arc::new(CustodyLedger::new()),
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -417,6 +423,7 @@ impl AdmissionEngine {
             admission_order: Vec::new(),
             registry,
             relation_graph: Arc::new(RelationGraph::new()),
+            custody_ledger: Arc::new(CustodyLedger::new()),
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -434,6 +441,31 @@ impl AdmissionEngine {
             admission_order: Vec::new(),
             registry,
             relation_graph,
+            custody_ledger: Arc::new(CustodyLedger::new()),
+            custody_cid_counter: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Construct an admission engine sharing existing subject
+    /// registry, relation graph, and custody ledger handles.
+    ///
+    /// Parallel to [`Self::with_registry_and_graph`] for the case
+    /// where the caller also wants to share a preexisting ledger.
+    /// Useful for tests that assert on both engine dispatch and
+    /// ledger state from outside the engine, and for future
+    /// dependency injection when the steward carries persisted
+    /// ledger state across restarts.
+    pub fn with_registry_graph_and_ledger(
+        registry: Arc<SubjectRegistry>,
+        relation_graph: Arc<RelationGraph>,
+        custody_ledger: Arc<CustodyLedger>,
+    ) -> Self {
+        Self {
+            by_shelf: HashMap::new(),
+            admission_order: Vec::new(),
+            registry,
+            relation_graph,
+            custody_ledger,
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -446,6 +478,11 @@ impl AdmissionEngine {
     /// Borrow a handle to the relation graph used by this engine.
     pub fn relation_graph(&self) -> Arc<RelationGraph> {
         Arc::clone(&self.relation_graph)
+    }
+
+    /// Borrow a handle to the custody ledger used by this engine.
+    pub fn custody_ledger(&self) -> Arc<CustodyLedger> {
+        Arc::clone(&self.custody_ledger)
     }
 
     /// Number of currently admitted plugins.
@@ -895,11 +932,14 @@ impl AdmissionEngine {
             )));
         }
 
-        // Connect and eagerly describe.
+        // Connect and eagerly describe. Hands the shared custody
+        // ledger to WireWarden so its load() installs a
+        // LedgerCustodyStateReporter in the event sink.
         let warden = crate::wire_client::WireWarden::connect(
             reader,
             writer,
             manifest.plugin.name.clone(),
+            Arc::clone(&self.custody_ledger),
         )
         .await
         .map_err(|e| {
@@ -1185,12 +1225,18 @@ impl AdmissionEngine {
     /// Deliver an assignment to the warden on the given shelf.
     ///
     /// Allocates a fresh correlation ID, constructs an [`Assignment`]
-    /// carrying a [`LoggingCustodyStateReporter`] tagged with the
+    /// carrying a [`LedgerCustodyStateReporter`] tagged with the
     /// warden's plugin name, and dispatches to the warden's
-    /// `take_custody`. A future pass will replace the logging
-    /// reporter with a ledger-backed implementation so custody
-    /// state reports are persisted; the signature here does not
-    /// change when that happens.
+    /// `take_custody`. On success, records the custody in the
+    /// engine's [`CustodyLedger`] keyed by `(plugin_name, handle.id)`
+    /// with the full metadata (shelf, custody_type, handle).
+    ///
+    /// If the warden emits an initial `ReportCustodyState` from
+    /// within its own `take_custody` (typical for wire wardens),
+    /// that state report may reach the ledger before this method
+    /// records the custody metadata. The ledger's UPSERT semantics
+    /// merge the two events into one record regardless of arrival
+    /// order.
     ///
     /// Returns [`StewardError::Dispatch`] if no plugin is admitted
     /// on that shelf, or if the plugin there is a respondent (whose
@@ -1198,7 +1244,7 @@ impl AdmissionEngine {
     ///
     /// Returns the plugin's own error wrapped in
     /// [`StewardError::Plugin`] if the warden rejects the
-    /// assignment.
+    /// assignment. On such failure the ledger is not written.
     pub async fn take_custody(
         &mut self,
         shelf: &str,
@@ -1206,6 +1252,12 @@ impl AdmissionEngine {
         payload: Vec<u8>,
         deadline: Option<Instant>,
     ) -> Result<CustodyHandle, StewardError> {
+        // Clone the ledger Arc up front for use after the warden
+        // call. After this point we hold a mutable borrow of
+        // self.by_shelf through `plugin`, so accessing
+        // self.custody_ledger directly would conflict.
+        let ledger = Arc::clone(&self.custody_ledger);
+
         let plugin = self.by_shelf.get_mut(shelf).ok_or_else(|| {
             StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
         })?;
@@ -1219,10 +1271,19 @@ impl AdmissionEngine {
             }
         };
 
+        // Clone fields we need after the await point. custody_type
+        // is consumed by the Assignment below so clone it first.
+        let plugin_name = plugin.name.clone();
+        let shelf_qualified = plugin.shelf.clone();
+        let custody_type_for_ledger = custody_type.clone();
+
         let correlation_id =
             self.custody_cid_counter.fetch_add(1, Ordering::Relaxed);
         let reporter: Arc<dyn evo_plugin_sdk::contract::CustodyStateReporter> =
-            Arc::new(LoggingCustodyStateReporter::new(plugin.name.clone()));
+            Arc::new(LedgerCustodyStateReporter::new(
+                Arc::clone(&ledger),
+                plugin_name.clone(),
+            ));
         let assignment = Assignment {
             custody_type,
             payload,
@@ -1231,7 +1292,24 @@ impl AdmissionEngine {
             custody_state_reporter: reporter,
         };
 
-        warden.take_custody(assignment).await.map_err(Into::into)
+        let handle: CustodyHandle = warden
+            .take_custody(assignment)
+            .await
+            .map_err(StewardError::from)?;
+
+        // Record the successful take in the ledger. UPSERT - if an
+        // early state report from within the plugin's take_custody
+        // already created a partial record, this call merges in the
+        // metadata and preserves the earlier started_at and
+        // last_state.
+        ledger.record_custody(
+            &plugin_name,
+            &shelf_qualified,
+            &handle,
+            &custody_type_for_ledger,
+        );
+
+        Ok(handle)
     }
 
     /// Deliver a course correction to an ongoing custody on the given
@@ -1297,6 +1375,10 @@ impl AdmissionEngine {
         shelf: &str,
         handle: CustodyHandle,
     ) -> Result<(), StewardError> {
+        // Clone the ledger Arc up front for the same reason as
+        // take_custody.
+        let ledger = Arc::clone(&self.custody_ledger);
+
         let plugin = self.by_shelf.get_mut(shelf).ok_or_else(|| {
             StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
         })?;
@@ -1310,7 +1392,21 @@ impl AdmissionEngine {
             }
         };
 
-        warden.release_custody(handle).await.map_err(Into::into)
+        // Clone before handle is consumed by the warden call.
+        let plugin_name = plugin.name.clone();
+        let handle_id = handle.id.clone();
+
+        warden
+            .release_custody(handle)
+            .await
+            .map_err(StewardError::from)?;
+
+        // Drop the record from the ledger after the warden
+        // acknowledges the release. The removed record is
+        // discarded; a future pass can expose it for archiving.
+        ledger.release_custody(&plugin_name, &handle_id);
+
+        Ok(())
     }
 
     /// Run a health check against every admitted plugin, returning a
@@ -2838,5 +2934,139 @@ custody_failure_mode = "abort"
         assert_eq!(engine.len(), 1);
         engine.shutdown().await.unwrap();
         assert_eq!(engine.len(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Custody ledger integration tests (pass 4g-b).
+    //
+    // Verify that take_custody and release_custody on the engine
+    // propagate into the engine's CustodyLedger. In-process wardens
+    // reach this via AdmissionEngine's own record_custody/
+    // release_custody calls; out-of-process wardens additionally
+    // reach it via the LedgerCustodyStateReporter installed in the
+    // WireWarden's EventSink (tested in wire_client::tests and
+    // evo-example-warden integration tests).
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn take_custody_records_in_ledger() {
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let warden = TestWarden {
+            name: "org.test.custody".into(),
+        };
+        engine
+            .admit_singleton_warden(
+                warden,
+                test_warden_manifest("org.test.custody"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.custody_ledger().len(), 0);
+
+        let handle = engine
+            .take_custody(
+                "test.custody",
+                "playback".into(),
+                b"payload".to_vec(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let ledger = engine.custody_ledger();
+        assert_eq!(ledger.len(), 1);
+        let rec = ledger
+            .describe("org.test.custody", &handle.id)
+            .expect("ledger should have recorded the custody");
+        assert_eq!(rec.plugin, "org.test.custody");
+        assert_eq!(rec.handle_id, handle.id);
+        assert_eq!(rec.shelf.as_deref(), Some("test.custody"));
+        assert_eq!(rec.custody_type.as_deref(), Some("playback"));
+        // TestWarden does not emit state reports during take_custody,
+        // so last_state is None until something updates it. A warden
+        // that reports would populate this field via the reporter in
+        // the Assignment.
+        assert!(rec.last_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn release_custody_removes_from_ledger() {
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let warden = TestWarden {
+            name: "org.test.custody".into(),
+        };
+        engine
+            .admit_singleton_warden(
+                warden,
+                test_warden_manifest("org.test.custody"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+
+        let handle = engine
+            .take_custody(
+                "test.custody",
+                "playback".into(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.custody_ledger().len(), 1);
+
+        engine
+            .release_custody("test.custody", handle)
+            .await
+            .unwrap();
+        assert_eq!(engine.custody_ledger().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn with_registry_graph_and_ledger_shares_ledger() {
+        use crate::custody::CustodyLedger;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let ledger = Arc::new(CustodyLedger::new());
+
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::with_registry_graph_and_ledger(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&ledger),
+        );
+
+        // Both handles (the externally-held one and the engine's
+        // accessor) point at the same underlying ledger.
+        assert!(Arc::ptr_eq(&ledger, &engine.custody_ledger()));
+
+        let warden = TestWarden {
+            name: "org.test.custody".into(),
+        };
+        engine
+            .admit_singleton_warden(
+                warden,
+                test_warden_manifest("org.test.custody"),
+                &catalogue,
+            )
+            .await
+            .unwrap();
+
+        let _handle = engine
+            .take_custody(
+                "test.custody",
+                "playback".into(),
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Externally-held handle reflects the engine's recording.
+        assert_eq!(ledger.len(), 1);
     }
 }
