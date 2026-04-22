@@ -154,7 +154,7 @@ Concept-level decisions deferred to the engineering layer. Named here so downstr
 | Logging conventions (levels, format, fields, plugin integration) | `docs/engineering/LOGGING.md` |
 | Subject identity resolution | `docs/engineering/SUBJECTS.md` |
 | Relation grammar | `docs/engineering/RELATIONS.md` |
-| Projection subscription protocol | Future: `docs/engineering/PROJECTIONS.md` |
+| Projection subscription protocol | `docs/engineering/PROJECTIONS.md` |
 | Fast-path mechanism | Future: `docs/engineering/FAST_PATH.md` |
 | Steward startup and essence enforcement | Future: `docs/engineering/STEWARD.md` |
 | Trust class taxonomy detail | Covered in `PLUGIN_PACKAGING.md`. |
