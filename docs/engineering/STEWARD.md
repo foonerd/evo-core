@@ -66,12 +66,12 @@ The `evo` crate is the steward. Its modules, and their responsibilities:
 | `error` | The steward's unified error type, `StewardError`. |
 | `subjects` | Subject registry. Canonical identity, addressing reconciliation, claimant tracking. Exposes `SubjectRegistry`, `SubjectRecord`, `AnnounceOutcome`. |
 | `relations` | Relation graph. Typed directed edges with multi-plugin claimant sets. Exposes `RelationGraph`, `WalkDirection`, `WalkScope`, `Relation`. |
-| `custody` | Custody ledger. Records active custodies keyed by `(plugin, handle_id)`. Updated on `take_custody`, every state report, and `release_custody`. Exposes `CustodyLedger`, `CustodyRecord`, `StateSnapshot`, `LedgerCustodyStateReporter`. |
+| `custody` | Custody ledger. Records active custodies keyed by `(plugin, handle_id)`. Updated on `take_custody`, every state report, and `release_custody`. Exposes `CustodyLedger`, `CustodyRecord`, `StateSnapshot`, `LedgerCustodyStateReporter`. Full treatment in `CUSTODY.md`. |
 | `projections` | Projection engine. Composes subject projections on demand, including recursive relation walks with cycle guards and visit caps. Exposes `ProjectionEngine`, `ProjectionScope`, `SubjectProjection`. |
 | `admission` | Admission engine. Accepts plugins (singleton respondents and wardens, in-process or out-of-process). Routes plugin requests, custody verbs, and emits custody happenings on the bus. Exposes `AdmissionEngine`. |
 | `context` | The `LoadContext` handed to each plugin at load time. Carries the announcers and state reporters the plugin uses to push data back into the steward. |
 | `wire_client` | Wire-level client for out-of-process plugins. Wraps a connected socket; speaks the plugin-facing protocol. Exposes `WireClient`, `WireRespondent`, `WireWarden` (the adapters that make a wire-backed plugin look like an in-process plugin to the admission engine). |
-| `happenings` | Happenings bus. Streamed notifications for fabric transitions; carries custody variants in this version. Exposes `Happening` (`#[non_exhaustive]`) and `HappeningBus`. |
+| `happenings` | Happenings bus. Streamed notifications for fabric transitions; carries custody variants in this version. Exposes `Happening` (`#[non_exhaustive]`) and `HappeningBus`. Full treatment in `HAPPENINGS.md`. |
 | `server` | Client-facing Unix socket server. Accepts connections, reads length-prefixed JSON frames, dispatches plugin requests, projection queries, and custody-ledger snapshots. Exposes `Server`. |
 | `shutdown` | Signal-waiting helper. Exposes `wait_for_signal`. |
 
