@@ -9,11 +9,17 @@ patch bumps for incremental work (including internal breaking changes), minor bu
 for public-surface breaking changes, major bumps for milestones. Docs-only changes
 do not bump.
 
+v0.1.8 is the first tagged release. Versions prior to 0.1.8 existed only as
+workspace-version values in source; they were not tagged and have no release
+artefacts. Consult the git log for pre-0.1.8 history.
+
 ## [Unreleased]
 
 (none)
 
 ## [0.1.8] - 2026-04-23
+
+First tagged release.
 
 ### Changed
 
@@ -48,12 +54,12 @@ do not bump.
 ### Rationale
 
 The hardcoded admission was in tension with `BOUNDARY.md` section 6, which
-states that distributions do not ship the example plugins. v0.1.7's behaviour
-would have required every `evo-device-<vendor>` repository to include a
-compatibility shim in its catalogue. The fix restores framework/distribution
-boundary discipline without loss of functionality: the example plugins remain
-available for tests and as reference implementations; they simply no longer
-force themselves into production binaries.
+states that distributions do not ship the example plugins. Without this change,
+every `evo-device-<vendor>` repository would have had to carry a compatibility
+shim in its catalogue. The fix restores framework/distribution boundary
+discipline without loss of functionality: the example plugins remain available
+for tests and as reference implementations; they simply no longer force
+themselves into production binaries.
 
 ### Verification
 
@@ -61,18 +67,5 @@ force themselves into production binaries.
   end-to-end, and SDK suites. Zero failures.
 - `cargo build --workspace` clean.
 
-## [0.1.7] - earlier
-
-Baseline for this changelog. v0.1.7 delivered the complete engineering doc set
-(including BOUNDARY.md, CATALOGUE.md, CONFIG.md, SCHEMAS.md, CLIENT_API.md,
-FRONTEND.md, PLUGIN_AUTHORING.md, BUILDING.md, DEVELOPING.md) plus Mermaid
-diagrams across core documents. The implementation shipped the steward with
-happenings bus, custody ledger, custody state reporter, `list_active_custodies`
-client op, and `subscribe_happenings` streaming op.
-
-Earlier versions are not recorded in this changelog; consult the git log for
-history prior to v0.1.7.
-
 [Unreleased]: https://github.com/foonerd/evo-core/compare/v0.1.8...HEAD
-[0.1.8]: https://github.com/foonerd/evo-core/compare/v0.1.7...v0.1.8
-[0.1.7]: https://github.com/foonerd/evo-core/releases/tag/v0.1.7
+[0.1.8]: https://github.com/foonerd/evo-core/releases/tag/v0.1.8
