@@ -23,18 +23,25 @@
 //! admission events, factory instance lifecycle, etc.) without
 //! breaking existing match arms.
 //!
-//! ## Integration points (later passes)
+//! ## Integration points
 //!
-//! - Pass 5b: [`AdmissionEngine`](crate::admission::AdmissionEngine)
-//!   emits [`Happening::CustodyTaken`] and [`Happening::CustodyReleased`]
+//! - [`AdmissionEngine`](crate::admission::AdmissionEngine) emits
+//!   [`Happening::CustodyTaken`] and [`Happening::CustodyReleased`]
 //!   from `take_custody` and `release_custody` after ledger updates.
-//! - Pass 5c: [`LedgerCustodyStateReporter`](crate::custody::LedgerCustodyStateReporter)
-//!   emits [`Happening::CustodyStateReported`] after writing to the
-//!   ledger.
-//! - Pass 5d: [`server`](crate::server) adds a subscription op that
-//!   streams happenings out over the client socket. This is the
-//!   first streaming surface in the client protocol and will need
-//!   its own dedicated pass.
+//! - [`LedgerCustodyStateReporter`](crate::custody::LedgerCustodyStateReporter)
+//!   emits [`Happening::CustodyStateReported`] after writing every
+//!   state snapshot to the ledger. The reporter is installed in
+//!   every warden's [`LoadContext`](evo_plugin_sdk::contract::LoadContext)
+//!   (in-process path via the admission engine's assignment, wire
+//!   path via [`WireWarden`](crate::wire_client::WireWarden)'s event
+//!   sink).
+//!
+//! ## Deferred
+//!
+//! - A client-socket subscription op that streams happenings out to
+//!   external consumers remains deferred (see `STEWARD.md` section
+//!   12.2). It is the first streaming op in the client protocol and
+//!   needs its own pass.
 //!
 //! ## Not a log
 //!

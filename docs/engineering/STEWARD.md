@@ -252,7 +252,7 @@ At load time, each plugin receives a `LoadContext`:
 | `subject_announcer` | Announce and retract subjects. Goes to the shared `SubjectRegistry`. |
 | `relation_announcer` | Assert and retract relations. Goes to the shared `RelationGraph`. |
 | `state_reporter` | Push state reports (logged today; folded into rack projections when those land). |
-| `custody_state_reporter` | Warden-only. Every assignment carries a `LedgerCustodyStateReporter` tagged with the warden's name; the reporter UPSERTs state snapshots into the custody ledger on every report. Out-of-process wardens install the same reporter in their wire-client event sink so `ReportCustodyState` frames arriving over the wire land in the same ledger. |
+| `custody_state_reporter` | Warden-only. Every assignment carries a `LedgerCustodyStateReporter` tagged with the warden's name; the reporter UPSERTs state snapshots into the custody ledger on every report and then emits a `CustodyStateReported` happening on the happenings bus. Out-of-process wardens install the same reporter in their wire-client event sink so `ReportCustodyState` frames arriving over the wire land in the same ledger and emit the same happening. |
 | `user_interaction_requester` | Request a user-facing prompt; logged today, routed to kiosk or remote UI when those exist. |
 
 The announcers carry the plugin's identity (`claimant`) so the registry can track who said what. A plugin trying to retract a claim it did not make is rejected (`StewardError::ClaimantMismatch`).
@@ -345,7 +345,7 @@ Time-originated and condition-originated producers that feed instructions into t
 
 ### 12.2 Happenings Subscription
 
-The happenings bus exists and emits custody transitions (`CustodyTaken`, `CustodyReleased`; `CustodyStateReported` still to be wired through the ledger reporter). External consumers cannot yet subscribe - the client socket has a `list_active_custodies` polling op but no streaming subscription op. Adding this is architecturally non-trivial because every existing op is request/response; a streaming op is the first exception in the client protocol. Needs its own pass.
+The happenings bus exists and emits every custody transition: `CustodyTaken`, `CustodyReleased`, and `CustodyStateReported`. External consumers cannot yet subscribe - the client socket has a `list_active_custodies` polling op but no streaming subscription op. Adding this is architecturally non-trivial because every existing op is request/response; a streaming op is the first exception in the client protocol. Needs its own pass.
 
 ### 12.3 Subject, Relation, and Ledger Persistence
 

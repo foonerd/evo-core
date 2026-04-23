@@ -975,13 +975,15 @@ impl AdmissionEngine {
         }
 
         // Connect and eagerly describe. Hands the shared custody
-        // ledger to WireWarden so its load() installs a
-        // LedgerCustodyStateReporter in the event sink.
+        // ledger and happenings bus to WireWarden so its load()
+        // installs a LedgerCustodyStateReporter in the event sink
+        // that updates both.
         let warden = crate::wire_client::WireWarden::connect(
             reader,
             writer,
             manifest.plugin.name.clone(),
             Arc::clone(&self.custody_ledger),
+            Arc::clone(&self.happening_bus),
         )
         .await
         .map_err(|e| {
@@ -1333,6 +1335,7 @@ impl AdmissionEngine {
         let reporter: Arc<dyn evo_plugin_sdk::contract::CustodyStateReporter> =
             Arc::new(LedgerCustodyStateReporter::new(
                 Arc::clone(&ledger),
+                Arc::clone(&bus),
                 plugin_name.clone(),
             ));
         let assignment = Assignment {

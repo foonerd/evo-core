@@ -58,6 +58,7 @@ use crate::context::{
     RegistrySubjectAnnouncer,
 };
 use crate::custody::{CustodyLedger, LedgerCustodyStateReporter};
+use crate::happenings::HappeningBus;
 use crate::relations::RelationGraph;
 use crate::subjects::SubjectRegistry;
 use evo_plugin_sdk::codec::{read_frame_json, write_frame_json, WireError};
@@ -1107,10 +1108,16 @@ impl crate::admission::ErasedRespondent for WireRespondent {
 /// tagged with the plugin name in the [`EventSink`]. When the
 /// remote warden emits `ReportCustodyState` frames during an
 /// ongoing custody, the reader task routes them through this
-/// reporter, which UPSERTs into the shared
-/// [`CustodyLedger`](crate::custody::CustodyLedger). The ledger is
-/// supplied at [`WireWarden::connect`] time by the admission
-/// engine.
+/// reporter, which on every report does two things, in order:
+///
+/// 1. UPSERTs the state snapshot into the shared
+///    [`CustodyLedger`](crate::custody::CustodyLedger).
+/// 2. Emits a
+///    [`Happening::CustodyStateReported`](crate::happenings::Happening::CustodyStateReported)
+///    on the shared [`HappeningBus`].
+///
+/// Both the ledger and the bus are supplied at
+/// [`WireWarden::connect`] time by the admission engine.
 ///
 /// ## Assignment custody reporter is wire-redundant
 ///
@@ -1125,6 +1132,7 @@ pub struct WireWarden {
     client: WireClient,
     cached_description: PluginDescription,
     ledger: Arc<CustodyLedger>,
+    bus: Arc<HappeningBus>,
 }
 
 impl fmt::Debug for WireWarden {
@@ -1136,6 +1144,7 @@ impl fmt::Debug for WireWarden {
                 &self.cached_description.identity,
             )
             .field("ledger_len", &self.ledger.len())
+            .field("bus_receiver_count", &self.bus.receiver_count())
             .finish()
     }
 }
@@ -1144,15 +1153,16 @@ impl WireWarden {
     /// Connect a wire warden over the given reader and writer.
     ///
     /// Spawns the client's background tasks, sends a `describe`
-    /// request, and caches the response. The supplied `ledger` is
-    /// used by [`WireWarden::load`] to construct a
-    /// [`LedgerCustodyStateReporter`] in the event sink; it is
-    /// typically the admission engine's shared ledger.
+    /// request, and caches the response. The supplied `ledger` and
+    /// `bus` are used by [`WireWarden::load`] to construct a
+    /// [`LedgerCustodyStateReporter`] in the event sink; both are
+    /// typically the admission engine's shared handles.
     pub async fn connect<R, W>(
         reader: R,
         writer: W,
         plugin_name: String,
         ledger: Arc<CustodyLedger>,
+        bus: Arc<HappeningBus>,
     ) -> Result<Self, WireClientError>
     where
         R: AsyncRead + Send + Unpin + 'static,
@@ -1164,6 +1174,7 @@ impl WireWarden {
             client,
             cached_description,
             ledger,
+            bus,
         })
     }
 
@@ -1196,12 +1207,15 @@ impl crate::admission::ErasedWarden for WireWarden {
             // any events emitted during load() reach the registries,
             // and so that subsequent ReportCustodyState frames during
             // custody can be routed. The custody reporter is backed
-            // by the CustodyLedger supplied at connect time, so every
-            // state report the warden emits is UPSERTed into the
-            // ledger under (plugin_name, handle.id).
+            // by the CustodyLedger and HappeningBus supplied at
+            // connect time: every state report the warden emits is
+            // UPSERTed into the ledger under (plugin_name, handle.id)
+            // and a CustodyStateReported happening is emitted on the
+            // bus after the ledger write.
             let custody_reporter: Arc<dyn CustodyStateReporter> =
                 Arc::new(LedgerCustodyStateReporter::new(
                     Arc::clone(&self.ledger),
+                    Arc::clone(&self.bus),
                     self.client.plugin_name().to_string(),
                 ));
             self.client.set_event_sink(EventSink {
@@ -2147,11 +2161,13 @@ mod tests {
         ));
 
         let ledger = Arc::new(CustodyLedger::new());
+        let bus = Arc::new(HappeningBus::new());
         let warden = WireWarden::connect(
             plugin_to_steward_r,
             steward_to_plugin_w,
             plugin_name,
             ledger,
+            bus,
         )
         .await
         .unwrap();
@@ -2474,11 +2490,13 @@ mod tests {
         ));
 
         let ledger = Arc::new(CustodyLedger::new());
+        let bus = Arc::new(HappeningBus::new());
         let mut warden = WireWarden::connect(
             plugin_to_steward_r,
             steward_to_plugin_w,
             plugin_name.clone(),
             Arc::clone(&ledger),
+            Arc::clone(&bus),
         )
         .await
         .unwrap();

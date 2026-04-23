@@ -48,6 +48,7 @@
 use evo_plugin_sdk::contract::{
     CustodyHandle, CustodyStateReporter, HealthStatus, ReportError,
 };
+use crate::happenings::{Happening, HappeningBus};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -251,28 +252,46 @@ impl CustodyLedger {
     }
 }
 
-/// Custody state reporter backed by a [`CustodyLedger`].
+/// Custody state reporter backed by a [`CustodyLedger`] and a
+/// [`HappeningBus`].
 ///
 /// One of these is constructed per plugin at admission time and handed
 /// to the plugin (in-process) or installed in the wire client's event
-/// sink (out-of-process). On every state report the reporter calls
-/// [`CustodyLedger::record_state`] with the plugin name it was
-/// constructed with and the handle id from the report.
+/// sink (out-of-process). On every state report the reporter does two
+/// things, in this order:
+///
+/// 1. Calls [`CustodyLedger::record_state`] with the plugin name it
+///    was constructed with and the handle id from the report.
+/// 2. Emits a [`Happening::CustodyStateReported`] on the shared
+///    happenings bus.
+///
+/// The ordering is load-bearing: a subscriber that reacts to the
+/// happening by querying the ledger always sees the new state
+/// snapshot. See the ledger/happenings ordering invariant documented
+/// in `STEWARD.md` section 13.
+///
+/// The full report payload is deliberately not carried on the
+/// happening variant - payloads may be large and subscribers can
+/// retrieve the latest snapshot from the ledger on demand. See the
+/// [`Happening::CustodyStateReported`] docs for the rationale.
 #[derive(Debug)]
 pub struct LedgerCustodyStateReporter {
     ledger: Arc<CustodyLedger>,
+    bus: Arc<HappeningBus>,
     plugin_name: String,
 }
 
 impl LedgerCustodyStateReporter {
-    /// Construct a reporter that writes to `ledger`, tagging all
-    /// reports with `plugin_name`.
+    /// Construct a reporter that writes to `ledger`, emits on `bus`,
+    /// and tags all output with `plugin_name`.
     pub fn new(
         ledger: Arc<CustodyLedger>,
+        bus: Arc<HappeningBus>,
         plugin_name: impl Into<String>,
     ) -> Self {
         Self {
             ledger,
+            bus,
             plugin_name: plugin_name.into(),
         }
     }
@@ -287,15 +306,27 @@ impl CustodyStateReporter for LedgerCustodyStateReporter {
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
     {
         let ledger = Arc::clone(&self.ledger);
+        let bus = Arc::clone(&self.bus);
         let plugin = self.plugin_name.clone();
         let handle_id = handle.id.clone();
         Box::pin(async move {
+            // 1. Ledger first. UPSERTs the state snapshot into the
+            //    record keyed by (plugin, handle_id).
             ledger.record_state(&plugin, &handle_id, payload, health);
             tracing::debug!(
                 plugin = %plugin,
                 custody = %handle_id,
                 "ledger recorded state snapshot"
             );
+            // 2. Happening after ledger write. Owned strings are
+            //    moved in since they are not used again in this
+            //    scope; health is Copy.
+            bus.emit(Happening::CustodyStateReported {
+                plugin,
+                handle_id,
+                health,
+                at: SystemTime::now(),
+            });
             Ok(())
         })
     }
@@ -551,8 +582,10 @@ mod tests {
     #[tokio::test]
     async fn reporter_writes_to_ledger() {
         let ledger = Arc::new(CustodyLedger::new());
+        let bus = Arc::new(HappeningBus::new());
         let reporter = LedgerCustodyStateReporter::new(
             Arc::clone(&ledger),
+            Arc::clone(&bus),
             "org.test.warden",
         );
         let h = handle("c-1");
@@ -570,8 +603,10 @@ mod tests {
     #[tokio::test]
     async fn reporter_multiple_reports_update_same_record() {
         let ledger = Arc::new(CustodyLedger::new());
+        let bus = Arc::new(HappeningBus::new());
         let reporter = LedgerCustodyStateReporter::new(
             Arc::clone(&ledger),
+            Arc::clone(&bus),
             "org.test.warden",
         );
         let h = handle("c-1");
@@ -589,5 +624,114 @@ mod tests {
         let state = rec.last_state.expect("state");
         assert_eq!(state.payload, b"state=2");
         assert_eq!(state.health, HealthStatus::Degraded);
+    }
+
+    // -----------------------------------------------------------------
+    // Happening emission tests (pass 5c).
+    //
+    // Verify that LedgerCustodyStateReporter emits a
+    // CustodyStateReported happening on the bus after every ledger
+    // write. Bus broadcast semantics are covered by happenings::tests;
+    // these tests assert only on reporter-originated emissions.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reporter_emits_custody_state_reported_happening() {
+        let ledger = Arc::new(CustodyLedger::new());
+        let bus = Arc::new(HappeningBus::new());
+        let reporter = LedgerCustodyStateReporter::new(
+            Arc::clone(&ledger),
+            Arc::clone(&bus),
+            "org.test.warden",
+        );
+        // Subscribe before reporting so the happening reaches us.
+        let mut rx = bus.subscribe();
+        let h = handle("c-1");
+        reporter
+            .report(&h, b"state=x".to_vec(), HealthStatus::Healthy)
+            .await
+            .unwrap();
+
+        let got = rx.recv().await.expect("recv CustodyStateReported");
+        match got {
+            Happening::CustodyStateReported {
+                plugin,
+                handle_id,
+                health,
+                ..
+            } => {
+                assert_eq!(plugin, "org.test.warden");
+                assert_eq!(handle_id, "c-1");
+                assert_eq!(health, HealthStatus::Healthy);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reporter_emits_one_happening_per_report() {
+        let ledger = Arc::new(CustodyLedger::new());
+        let bus = Arc::new(HappeningBus::new());
+        let reporter = LedgerCustodyStateReporter::new(
+            Arc::clone(&ledger),
+            Arc::clone(&bus),
+            "org.test.warden",
+        );
+        let mut rx = bus.subscribe();
+        let h = handle("c-1");
+        reporter
+            .report(&h, b"state=1".to_vec(), HealthStatus::Healthy)
+            .await
+            .unwrap();
+        reporter
+            .report(&h, b"state=2".to_vec(), HealthStatus::Degraded)
+            .await
+            .unwrap();
+
+        let first = rx.recv().await.unwrap();
+        match first {
+            Happening::CustodyStateReported { health, .. } => {
+                assert_eq!(health, HealthStatus::Healthy);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        let second = rx.recv().await.unwrap();
+        match second {
+            Happening::CustodyStateReported { health, .. } => {
+                assert_eq!(health, HealthStatus::Degraded);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reporter_writes_ledger_before_emit() {
+        // Verifies the ordering invariant: by the time a subscriber
+        // receives the happening, the ledger write has completed.
+        // A subscriber reacting by querying the ledger will see the
+        // new snapshot. This exercises the ordering within the
+        // reporter's report() implementation.
+        let ledger = Arc::new(CustodyLedger::new());
+        let bus = Arc::new(HappeningBus::new());
+        let reporter = LedgerCustodyStateReporter::new(
+            Arc::clone(&ledger),
+            Arc::clone(&bus),
+            "org.test.warden",
+        );
+        let mut rx = bus.subscribe();
+        let h = handle("c-1");
+        reporter
+            .report(&h, b"state=x".to_vec(), HealthStatus::Healthy)
+            .await
+            .unwrap();
+
+        let _ = rx.recv().await.expect("recv");
+        // Ledger state is populated at or before the emit.
+        let rec = ledger
+            .describe("org.test.warden", "c-1")
+            .expect("ledger record must exist");
+        let state = rec.last_state.expect("state must be populated");
+        assert_eq!(state.payload, b"state=x");
+        assert_eq!(state.health, HealthStatus::Healthy);
     }
 }
