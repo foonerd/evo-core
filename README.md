@@ -9,6 +9,7 @@ This repository holds the steward, the plugin SDK, the plugin tooling, and the e
 | Document | Purpose |
 |----------|---------|
 | [docs/CONCEPT.md](docs/CONCEPT.md) | The fabric contract. Essence, steward, racks, shelves, plugins, subjects, relations, projections, happenings. Read first. |
+| [docs/engineering/BOUNDARY.md](docs/engineering/BOUNDARY.md) | Framework/distribution boundary. Where evo-core ends and `evo-device-<vendor>` begins, the four contracts that cross the boundary, what evo-core must not contain, distribution integrator checklist. |
 | [docs/engineering/PLUGIN_CONTRACT.md](docs/engineering/PLUGIN_CONTRACT.md) | The universal plugin contract. Rust trait and Unix-socket wire protocol, two transports of one contract. |
 | [docs/engineering/PLUGIN_PACKAGING.md](docs/engineering/PLUGIN_PACKAGING.md) | Plugin manifest, identity, signing, filesystem layout on target, installation lifecycle, SDK and tooling. |
 | [docs/engineering/VENDOR_CONTRACT.md](docs/engineering/VENDOR_CONTRACT.md) | Vendor contract. Actor taxonomy, namespace governance, vendor commitments and privileges, distribution relationships, revocation pathways. |
@@ -23,7 +24,7 @@ This repository holds the steward, the plugin SDK, the plugin tooling, and the e
 
 ## Distributions
 
-Evo is domain-neutral. A device ships as a distribution of evo: a catalogue declaration plus a plugin set plus branding. The first distribution is audio-player-shaped, shipped as Volumio.
+Evo is domain-neutral. A device ships as a distribution of evo in its own `evo-device-<vendor>` repository: a catalogue declaration plus a plugin set plus branding plus frontend plus packaging. The framework imposes no upper bound on how many distributions exist or which vendors they target. The first distribution is `evo-device-volumio`, which uses Volumio's existing device functions as its reference feature set. See [docs/engineering/BOUNDARY.md](docs/engineering/BOUNDARY.md) for the boundary contract.
 
 ## Status
 
