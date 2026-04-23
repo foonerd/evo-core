@@ -224,8 +224,17 @@ A **bridge plugin** is a respondent that runs on the steward's side, terminates 
 
 Shape:
 
-```
-[Remote consumer]  <--remote protocol-->  [Bridge plugin]  <--client socket-->  [Steward]
+```mermaid
+flowchart LR
+    RC["Remote Consumer<br/>browser / mobile / HA"]
+
+    subgraph device ["ON-DEVICE"]
+        BP["<b>Bridge Plugin</b><br/>HTTP / WS / MQTT / gRPC"]
+        S["Steward"]
+        BP <-->|client socket| S
+    end
+
+    RC <==>|"remote protocol<br/>TLS · auth · rate limit"| BP
 ```
 
 The bridge plugin:

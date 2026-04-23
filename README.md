@@ -10,29 +10,14 @@ The framework knows nothing about audio, streaming services, DACs, protocols, or
 
 ## Architecture
 
-```
-                        YOUR DISTRIBUTION
-                       evo-device-<vendor>
+```mermaid
+flowchart TB
+    dist["<b>YOUR DISTRIBUTION · evo-device-&lt;vendor&gt;</b><br/><br/>catalogue · plugins · branding · packaging"]
+    core["<b>THE STEWARD · evo-core</b><br/><br/>catalogue · admission · subjects · relations<br/>custody ledger · projections · happenings bus"]
+    cons["<b>CONSUMERS</b><br/><br/>frontend · CLIs · bridges · automation"]
 
-         catalogue  +  plugins  +  branding  +  packaging
-   =============================================================
-                  the four contracts at the boundary
-   =============================================================
-
-                            THE STEWARD
-      +-----------------------------------------------------+
-      |   catalogue       subject registry    custody       |
-      |   admission       relation graph      ledger        |
-      |   projections     happenings bus                    |
-      +-----------------------------------------------------+
-                                                      evo-core
-
-   =============================================================
-                           client socket
-   =============================================================
-
-         frontend  +  CLIs  +  bridges  +  automation
-                            CONSUMERS
+    dist ==>|four contracts at the boundary| core
+    core ==>|client socket| cons
 ```
 
 Three layers, four contracts at the top boundary (plugin SDK, plugin wire protocol, plugin packaging, catalogue shape), one contract at the bottom (client socket protocol). Everything above and below evo-core lives in a distribution; evo-core holds the middle.

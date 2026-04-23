@@ -81,6 +81,22 @@ Every module except `main` is public from the library crate. Tests may import an
 
 Admission is the process by which a plugin becomes part of the running fabric. The admission engine is the steward's sole entry point for plugins.
 
+```mermaid
+stateDiagram-v2
+    [*] --> Discovered
+    Discovered --> Validated : manifest OK, shelf exists
+    Validated --> Loading : admit
+    Loading --> Loaded : load Ok
+    Loading --> Failed : load Err
+    Loaded --> Unloading : shutdown or drain
+    Unloading --> [*] : unload returns
+    Failed --> [*] : teardown
+
+    note right of Loaded : handles requests, emits state reports, takes custody
+```
+
+The lifecycle is the same for respondents and wardens, in-process and wire. The wire variant adds a child-process spawn between Discovered and Validated (section 5.3) and a child-process teardown on Unloading and Failed (section 5.4); the state shape is otherwise identical.
+
 ### 5.1 Admission Contracts
 
 Admission supports both respondent and warden interaction shapes, in-process or out-of-process:

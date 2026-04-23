@@ -134,6 +134,26 @@ Every custody happening is emitted after the ledger operation it describes compl
 | `CustodyReleased` | `CustodyLedger::release_custody` |
 | `CustodyStateReported` | `CustodyLedger::record_state` |
 
+```mermaid
+sequenceDiagram
+    participant E as Emission site
+    participant L as Ledger
+    participant B as Bus
+    participant S as Subscriber
+
+    Note over E,L: Step 1 - authoritative write
+    E->>L: record_custody / record_state / release
+    L-->>E: returned
+
+    Note over E,B: Step 2 - emission (after write completes)
+    E->>B: emit(Happening)
+    B->>S: deliver
+
+    Note over S,L: Subscriber may query ledger
+    S->>L: snapshot (optional)
+    L-->>S: state consistent with happening
+```
+
 This ordering is the basis for the "consistent view" property in section 1. A subscriber that reacts to any of these happenings by querying the ledger sees a state consistent with the happening's semantics:
 
 - After `CustodyTaken`: the record exists, `shelf` and `custody_type` populated.

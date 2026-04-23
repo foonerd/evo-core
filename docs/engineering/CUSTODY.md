@@ -92,6 +92,27 @@ The ledger keeps exactly one snapshot per record. Older payloads are overwritten
 
 Wire wardens emit their initial `ReportCustodyState` frame from within their own `take_custody` trait method, before the response frame is written back. On the steward side the reader task processes the event frame before the response frame resolves the oneshot that the engine's `take_custody` is awaiting. Consequently, the ledger's `record_state` may run before the engine's `record_custody`.
 
+```mermaid
+sequenceDiagram
+    participant E as Engine
+    participant W as Wire Warden
+    participant L as Ledger
+    participant B as Bus
+
+    E->>W: take_custody frame
+    activate W
+    Note over E,W: warden emits state report before returning
+    W-->>E: ReportCustodyState frame
+    E->>L: record_state (partial record)
+    E->>B: emit CustodyStateReported
+    W-->>E: take_custody response
+    deactivate W
+    E->>L: record_custody (merges shelf + type)
+    E->>B: emit CustodyTaken
+
+    Note over E,B: record fully populated regardless of arrival order
+```
+
 This race is not a bug. Making it a bug would require either serialising warden-side emission (paying latency on every custody for one race that UPSERT handles for free) or plumbing synchronisation through the wire protocol (coupling the plugin contract to a steward-side implementation detail). The ledger absorbs it instead.
 
 Both `record_custody` and `record_state` are merge operations:

@@ -29,6 +29,29 @@ Every plugin is exactly one of four kinds. Two orthogonal axes define the kinds:
 
 Decision tree:
 
+```mermaid
+flowchart TD
+    Q1{What does<br/>your plugin do?}
+    Q1 -->|answer discrete requests| R{How many<br/>instances?}
+    Q1 -->|hold sustained work| W{How many<br/>instances?}
+
+    R -->|one forever| SR[<b>Singleton<br/>Respondent</b><br/><i>easiest start</i>]
+    R -->|many, event-driven| FR[Factory<br/>Respondent<br/><i>deferred in v0</i>]
+    W -->|one forever| SW[<b>Singleton<br/>Warden</b>]
+    W -->|many, event-driven| FW[Factory<br/>Warden<br/><i>deferred in v0</i>]
+
+    SR --> T{Transport?}
+    SW --> T
+
+    T -->|same process<br/>Rust only<br/>lowest latency| IP[<b>in-process</b>]
+    T -->|separate process<br/>any language<br/>isolation| WT[<b>wire</b>]
+
+    style FR stroke-dasharray: 5 5
+    style FW stroke-dasharray: 5 5
+```
+
+In prose:
+
 - **Singleton Respondent** (easiest). You answer discrete requests and there is exactly one of you. Examples: a metadata lookup plugin, an album-art provider, a codec identifier, a filesystem-scan respondent. Start here if you are learning the SDK.
 - **Singleton Warden**. You hold sustained work and there is exactly one of you. Examples: the active playback engine, the kiosk surface, the NAS mount orchestrator.
 - **Factory Respondent**. Your instances come and go driven by external events; each instance answers requests. Examples: a USB-collection reader (one instance per connected USB drive), a discovered-peer responder (one instance per peer).

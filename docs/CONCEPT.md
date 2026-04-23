@@ -24,25 +24,20 @@ Every contribution is keyed to one or more SUBJECTS. The steward keeps a canonic
 
 Consumers never address plugins. They address the steward, either by rack (structural query) or by subject (federated query). The steward composes contributions from every rack that has opinions about the subject, walks related subjects within a declared scope, and emits a PROJECTION. All outbound behaviour of the system is either a projection on demand or a streamed HAPPENING on the fabric's notification surface. There is no side channel.
 
-```
-                  +---------------+
-                  |   CONSUMERS   |
-                  +-------+-------+
-                          |
-                          |  projections / happenings
-                          v
-   +----------------------+-----------------------+
-   |                                              |
-   |                  THE STEWARD                 |
-   |         (sole authority; no side channel)    |
-   |                                              |
-   |   catalogue       subjects       relations   |
-   |   admission       projections    ledger      |
-   |   happenings bus                             |
-   |                                              |
-   +-----^---------^---------^---------^----------+
-         |         |         |         |
-      plugin    plugin    plugin    plugin
+```mermaid
+flowchart TB
+    P1[plugin]
+    P2[plugin]
+    P3[plugin]
+    P4[plugin]
+    S["<b>THE STEWARD</b><br/><i>sole authority · no side channel</i><br/><br/>catalogue · subjects · relations<br/>admission · projections · ledger<br/>happenings bus"]
+    C["<b>CONSUMERS</b>"]
+
+    P1 -->|stock slots| S
+    P2 --> S
+    P3 --> S
+    P4 --> S
+    S -->|projections / happenings| C
 ```
 
 Plugins stock slots on the steward and never address each other. Consumers address the steward, never plugins. The steward composes contributions around subjects and emits projections or happenings. This is the hub discipline the rest of the document assumes.
