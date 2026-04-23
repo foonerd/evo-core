@@ -11,6 +11,7 @@ This repository holds the steward, the plugin SDK, the plugin tooling, and the e
 | [docs/CONCEPT.md](docs/CONCEPT.md) | The fabric contract. Essence, steward, racks, shelves, plugins, subjects, relations, projections, happenings. Read first. |
 | [docs/engineering/BOUNDARY.md](docs/engineering/BOUNDARY.md) | Framework/distribution boundary. Where evo-core ends and `evo-device-<vendor>` begins, the four contracts that cross the boundary, what evo-core must not contain, distribution integrator checklist. |
 | [docs/engineering/PLUGIN_CONTRACT.md](docs/engineering/PLUGIN_CONTRACT.md) | The universal plugin contract. Rust trait and Unix-socket wire protocol, two transports of one contract. |
+| [docs/engineering/PLUGIN_AUTHORING.md](docs/engineering/PLUGIN_AUTHORING.md) | Plugin-authoring tutorial. Decision tree for plugin shape, complete walkthroughs for respondents and wardens, manifest authoring, testing, before-you-ship checklist, common pitfalls. |
 | [docs/engineering/PLUGIN_PACKAGING.md](docs/engineering/PLUGIN_PACKAGING.md) | Plugin manifest, identity, signing, filesystem layout on target, installation lifecycle, SDK and tooling. |
 | [docs/engineering/VENDOR_CONTRACT.md](docs/engineering/VENDOR_CONTRACT.md) | Vendor contract. Actor taxonomy, namespace governance, vendor commitments and privileges, distribution relationships, revocation pathways. |
 | [docs/engineering/LOGGING.md](docs/engineering/LOGGING.md) | Logging contract. Library, levels, default level, format, structured fields, logs-vs-happenings, plugin log integration. |
