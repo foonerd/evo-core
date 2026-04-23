@@ -23,6 +23,7 @@ This repository holds the steward, the plugin SDK, the plugin tooling, and the e
 | [docs/engineering/FAST_PATH.md](docs/engineering/FAST_PATH.md) | Fast-path mutation channel. Catalogue-declared commands against active wardens, rack/subject addressing, budgets, ordering, idempotency, relationship to projections and happenings, audit. |
 | [docs/engineering/STEWARD.md](docs/engineering/STEWARD.md) | The steward process. Module structure, admission contracts, client-facing and plugin-facing protocols, shared state, concurrency model, configuration, deferred capabilities, invariants. |
 | [docs/engineering/BUILDING.md](docs/engineering/BUILDING.md) | Building evo-core binaries. Supported targets (primary / secondary / opportunistic), cross-compilation recipes, the `cross` tool, release build tuning, glibc vs musl, testing cross-compiled binaries, release artefact policy. |
+| [docs/engineering/CLIENT_API.md](docs/engineering/CLIENT_API.md) | Client API reference for consumers. Connection, framing, all four ops with JSON transcripts, complete worked examples in Python, Node.js, TypeScript, Go, Rust, shell, and C; query-then-subscribe consistent-view pattern; performance notes; non-goals. |
 
 ## Distributions
 
