@@ -26,6 +26,10 @@ This repository holds the steward, the plugin SDK, the plugin tooling, and the e
 
 Evo is domain-neutral. A device ships as a distribution of evo in its own `evo-device-<vendor>` repository: a catalogue declaration plus a plugin set plus branding plus frontend plus packaging. The framework imposes no upper bound on how many distributions exist or which vendors they target. The first distribution is `evo-device-volumio`, which uses Volumio's existing device functions as its reference feature set. See [docs/engineering/BOUNDARY.md](docs/engineering/BOUNDARY.md) for the boundary contract.
 
+## Contributing
+
+Developer workflow, prerequisites, local running, test commands, and repository conventions are documented in [DEVELOPING.md](DEVELOPING.md). Start there if you just cloned the repository.
+
 ## Status
 
 Engineering layer plus a running v0 steward. Admits singleton respondents and wardens (in-process or over a Unix socket), maintains subject and relation registries, composes projections on demand, tracks active custodies in a ledger, and emits happenings on a bus. See `crates/evo` for the runnable binary, `crates/evo-plugin-sdk` for the plugin SDK, and `crates/evo-example-echo` / `crates/evo-example-warden` for reference plugins.
