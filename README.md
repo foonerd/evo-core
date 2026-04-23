@@ -149,11 +149,13 @@ The doc set is grouped by what you are trying to do.
 
 ## Status
 
-v0.1.7. 360 tests passing across the workspace.
+v0.1.8. 360 tests passing across the workspace.
 
-Implemented: the steward runs and admits singleton respondents and wardens (in-process or over a Unix socket). Subject registry and relation graph maintained. Projections composed on demand with federated subject queries and relation walks. Custody ledger tracks active warden-held work. Happenings bus emits every custody transition. Client socket protocol with four ops (`request`, `project_subject`, `list_active_custodies`, `subscribe_happenings`). Wire protocol end-to-end tested with in-process and out-of-process plugins.
+Implemented: the steward runs and admits singleton respondents and wardens (in-process or over a Unix socket). Subject registry and relation graph maintained. Projections composed on demand with federated subject queries and relation walks. Custody ledger tracks active warden-held work. Happenings bus emits every custody transition. Client socket protocol with four ops (`request`, `project_subject`, `list_active_custodies`, `subscribe_happenings`). Wire protocol end-to-end tested with in-process and out-of-process plugins. The shipped binary has no hardcoded plugin admissions; distributions drive admission via their own harnesses until plugin discovery lands.
 
-Deferred (see `STEWARD.md` section 12 for the full list): appointments and watches, persistence across restart, factory plugins, fast-path mutation channel, shape-version enforcement, rack-keyed projections.
+Deferred (see `STEWARD.md` section 12 for the full list): appointments and watches, persistence across restart, factory plugins, fast-path mutation channel, shape-version enforcement, rack-keyed projections, plugin discovery.
+
+See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 Reference crates to look at: [`crates/evo`](crates/evo) (the steward), [`crates/evo-plugin-sdk`](crates/evo-plugin-sdk) (the SDK), [`crates/evo-example-echo`](crates/evo-example-echo) and [`crates/evo-example-warden`](crates/evo-example-warden) (reference plugins, in-process and wire).
 
