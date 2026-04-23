@@ -35,9 +35,9 @@
 //! - [`error`]: the steward's error type.
 //!
 //! This crate implements the v0 skeleton: in-process plugins only,
-//! singleton respondents only, one hardcoded plugin, a minimal socket
-//! protocol. The engineering layer documents in `docs/engineering/` are
-//! the source of truth for where this is going.
+//! singleton respondents and wardens, no dynamic plugin discovery yet,
+//! a minimal socket protocol. The engineering layer documents in
+//! `docs/engineering/` are the source of truth for where this is going.
 //!
 //! [`LoadContext`]: evo_plugin_sdk::contract::LoadContext
 

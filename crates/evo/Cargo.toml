@@ -13,7 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 evo-plugin-sdk = { path = "../evo-plugin-sdk" }
-evo-example-echo = { path = "../evo-example-echo" }
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -34,6 +33,7 @@ uuid = { version = "1", features = ["v4"] }
 tracing-journald = "0.3"
 
 [dev-dependencies]
+evo-example-echo = { path = "../evo-example-echo" }
 tempfile = "3"
 
 [lints]

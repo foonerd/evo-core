@@ -58,7 +58,7 @@ The `evo` crate is the steward. Its modules, and their responsibilities:
 
 | Module | Role |
 |--------|------|
-| `main.rs` | Binary entrypoint: parse CLI, load config, initialise logging, load catalogue, admit v0 plugins, construct projection engine, construct server, wait for shutdown, drain. Not a library module. |
+| `main.rs` | Binary entrypoint: parse CLI, load config, initialise logging, load catalogue, construct an empty admission engine, construct projection engine, construct server, wait for shutdown, drain. Not a library module. The shipped binary has no hardcoded plugin admissions; plugin discovery is deferred (section 12.9). Tests construct `AdmissionEngine` directly and call its `admit_*` methods; the example plugin crates are `dev-dependencies`, not production dependencies. |
 | `cli` | `clap`-based argument parser. Exposes `Args`. |
 | `config` | TOML config loader with default fallback and required-file variant. Exposes `StewardConfig`. |
 | `logging` | `tracing_subscriber` setup. Resolves log filter from CLI, config, and `RUST_LOG` in that precedence order. Emits to `journald` in production, ANSI stderr in development. |
@@ -415,6 +415,14 @@ Factory plugins produce variable instances over time (USB drives appearing, peer
 ### 12.8 User Interaction Routing
 
 Plugins can request user-facing prompts through `LoadContext::user_interaction_requester`. The steward logs these today. Target behaviour: route to a kiosk plugin if one is admitted, or to a remote UI via the client-facing socket.
+
+### 12.9 Plugin Discovery
+
+The shipped steward binary admits no plugins on its own. An empty `AdmissionEngine` is constructed at startup; without further action it stays empty for the life of the process. This is a valid running state (the steward faithfully serves a catalogue with no contributors) and is the correct default for distributions whose catalogue should not be forced to accommodate the framework's test fixtures.
+
+Dynamic discovery of plugin artefacts on disk (walking `/var/lib/evo/plugins/` and `/opt/evo/plugins/`, reading each manifest, admitting each plugin) is the expected production path and is deferred. When it lands, the binary's startup sequence grows a discovery step between catalogue load and server construction; the admission engine's API does not change, and distributions that want to drive admission themselves (via a custom binary or a test harness) continue to work.
+
+Until discovery lands, distributions exercising plugins do so through integration harnesses that construct an `AdmissionEngine` directly and call its `admit_*` methods. This is the same pattern the steward's own tests use (see `tests/end_to_end.rs` and the `tests/` directories of the example plugin crates).
 
 ## 13. Invariants
 

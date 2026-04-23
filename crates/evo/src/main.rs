@@ -1,9 +1,14 @@
 //! Evo steward binary entrypoint.
 //!
 //! A thin wrapper around the `evo` library: parses CLI flags, loads
-//! config, initialises logging, loads the catalogue, admits the v0
-//! hardcoded echo plugin, runs the server until a shutdown signal, and
-//! drains cleanly.
+//! config, initialises logging, loads the catalogue, constructs an
+//! empty admission engine, runs the server until a shutdown signal,
+//! and drains cleanly.
+//!
+//! Plugins are admitted by a plugin-discovery pass (deferred; see
+//! `STEWARD.md` section 12) or, in tests, by integration harnesses
+//! that construct an [`AdmissionEngine`] directly and call its
+//! `admit_*` methods. The shipped binary has no hardcoded admissions.
 //!
 //! Tests do not touch this file; anything testable lives in the library.
 
@@ -69,9 +74,11 @@ async fn main() -> anyhow::Result<()> {
         "catalogue loaded"
     );
 
-    // Construct the admission engine and admit the hardcoded v0 plugins.
-    let mut engine = AdmissionEngine::new();
-    admit_v0_plugins(&mut engine, &catalogue).await?;
+    // Construct the admission engine. The shipped binary admits no
+    // plugins on its own; plugin discovery is a deferred capability
+    // (see `STEWARD.md` section 12). Distributions that need to
+    // exercise plugins today do so through integration harnesses.
+    let engine = AdmissionEngine::new();
     tracing::info!(plugins = engine.len(), "admission complete");
 
     // Construct a projection engine sharing the admission engine's
@@ -144,22 +151,5 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tracing::warn!("evo exited");
-    Ok(())
-}
-
-/// Admit the v0 hardcoded plugin set.
-///
-/// For v0 this is just the echo example plugin. Once dynamic plugin
-/// discovery exists, this function goes away and the admission engine is
-/// populated by walking `/var/lib/evo/plugins/` and `/opt/evo/plugins/`.
-async fn admit_v0_plugins(
-    engine: &mut AdmissionEngine,
-    catalogue: &Catalogue,
-) -> anyhow::Result<()> {
-    let echo_plugin = evo_example_echo::EchoPlugin::new();
-    let echo_manifest = evo_example_echo::manifest();
-    engine
-        .admit_singleton_respondent(echo_plugin, echo_manifest, catalogue)
-        .await?;
     Ok(())
 }
