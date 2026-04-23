@@ -34,7 +34,7 @@ The steward's charter, in order of foundational-to-operational:
 8. Emit happenings for custody transitions on a bus any interested party can subscribe to.
 9. On shutdown: drive every admitted plugin through unload. Release resources. Remove the socket.
 
-These nine are fully implemented. Remaining deferred concepts from `CONCEPT.md` section 2: appointments and watches, persistent state across restarts, a happenings subscription surface on the client socket, factory plugins.
+These nine are fully implemented. Remaining deferred concepts from `CONCEPT.md` section 2: appointments and watches, persistent state across restarts, factory plugins.
 
 ## 3. Process Model
 
@@ -152,13 +152,14 @@ Frames above 1 MiB are rejected as `Dispatch("frame too large")`. Zero-length fr
 
 ### 6.2 Request Shapes
 
-Every request carries an `op` discriminator. v0 defines three ops:
+Every request carries an `op` discriminator. v0 defines four ops:
 
-| Op | Purpose |
-|----|---------|
-| `request` | Dispatch a plugin request on a specific shelf. |
-| `project_subject` | Compose and return a federated subject projection. |
-| `list_active_custodies` | Snapshot the custody ledger. |
+| Op | Purpose | Shape |
+|----|---------|-------|
+| `request` | Dispatch a plugin request on a specific shelf. | Request / response. |
+| `project_subject` | Compose and return a federated subject projection. | Request / response. |
+| `list_active_custodies` | Snapshot the custody ledger. | Request / response. |
+| `subscribe_happenings` | Stream every happening the bus emits. | Streaming: promotes the connection to streaming mode. |
 
 Unknown ops return a structured error; they do not close the connection.
 
@@ -198,6 +199,22 @@ No arguments in v0. Returns every currently-held custody in the ledger. The resp
 
 A future pass may add filter arguments (by plugin, by shelf); the empty-argument form is the base case and will remain valid.
 
+#### `op = "subscribe_happenings"`
+
+```json
+{ "op": "subscribe_happenings" }
+```
+
+No arguments in v0. This is the only streaming op in the v0 protocol: once the server accepts the subscription, the connection becomes output-only for the lifetime of the subscription. Clients that need both subscription and other ops open two connections.
+
+The server's frame sequence after accepting a subscription:
+
+1. An immediate `{"subscribed": true}` ack, written after the server calls `bus.subscribe()` on the happenings bus. Any happening emitted after the client reads the ack is guaranteed to reach it.
+2. A `{"happening": {...}}` frame for each subsequent happening. The inner object is internally-tagged by `type` (`custody_taken`, `custody_released`, `custody_state_reported`) with variant-specific fields. The happening variant reference lives in `HAPPENINGS.md` section 3.
+3. A `{"lagged": n}` frame if the subscriber falls behind the bus's buffer (tokio `broadcast::error::RecvError::Lagged`), carrying the number of dropped happenings. Subscribers recover by re-querying the authoritative store (the ledger for custody) and continuing to consume.
+
+The subscription ends when the client closes the connection or the server shuts down. There is no explicit unsubscribe frame.
+
 ### 6.3 Response Shapes
 
 Responses are untagged; variants are disambiguated by the distinct top-level fields of each shape.
@@ -207,13 +224,18 @@ Responses are untagged; variants are disambiguated by the distinct top-level fie
 | `{ "payload_b64": "..." }` | Plugin request succeeded. |
 | Full `SubjectProjection` with `canonical_id`, `subject_type`, `addressings`, `related`, `composed_at_ms`, `shape_version`, `claimants`, `degraded`, `degraded_reasons`, `walk_truncated` | Projection succeeded. |
 | `{ "active_custodies": [...] }` | `list_active_custodies` succeeded. Each array element has `plugin`, `handle_id`, `shelf`, `custody_type`, `last_state`, `started_at_ms`, `last_updated_ms`. `last_state` is `{ payload_b64, health, reported_at_ms }` or `null`. Optional fields (`shelf`, `custody_type`, `last_state`) serialise as `null` rather than being omitted. |
+| `{ "subscribed": true }` | Ack written once at the start of a `subscribe_happenings` subscription, after the server has registered on the bus. |
+| `{ "happening": {...} }` | Streamed. One frame per emitted happening. Inner object is internally-tagged by `type` (`custody_taken`, `custody_released`, `custody_state_reported`). All variants carry `plugin`, `handle_id`, and `at_ms` (milliseconds since the UNIX epoch); variant-specific fields per `HAPPENINGS.md` section 3.1. |
+| `{ "lagged": n }` | Streamed. Emitted when the subscriber has fallen behind the bus's buffer; `n` is the number of dropped happenings. |
 | `{ "error": "..." }` | Any failure: unknown op, unknown shelf, unknown subject, plugin error, invalid JSON, invalid base64. |
 
-The `composed_at_ms` field is milliseconds since the UNIX epoch. Enumerated fields (`direction`, degraded `kind`) are snake_case strings.
+The `composed_at_ms` and `at_ms` fields are milliseconds since the UNIX epoch. Enumerated fields (`direction`, degraded `kind`, happening `type`, `health`) are snake_case or lowercase strings.
 
 ### 6.4 Connection Lifecycle
 
 Connections persist for the lifetime of the client or until the steward's accept loop exits. Multiple frames on one connection are supported; the server reads, processes, and writes each frame sequentially.
+
+A connection that sends a `subscribe_happenings` op transitions to streaming mode for the remainder of its lifetime: the server no longer reads from the connection, only writes. Frames the client writes after the subscribe op are ignored and sit in the socket buffer; clients should not expect further request/response semantics on a subscribed connection. Use a separate connection for non-subscription ops.
 
 When a connection handler encounters an I/O error or a malformed frame header, the connection is closed. Structured errors (unknown op, unknown shelf, invalid JSON) do not close the connection.
 
@@ -337,15 +359,22 @@ Catalogue validation runs at steward startup. Malformed catalogues refuse startu
 
 These are documented in `CONCEPT.md` as fabric-level concepts but are not yet implemented in the steward. Each is named here so the next engineering document can pick it up.
 
-Since this document was first authored, the following capabilities have moved from deferred to implemented: warden admission (in-process and wire), the custody ledger, the custody state reporter, `list_active_custodies` on the client socket, and the happenings bus (with custody variants; subscription surface still deferred - see 12.2).
+Since this document was first authored, the following capabilities have moved from deferred to implemented: warden admission (in-process and wire), the custody ledger, the custody state reporter, `list_active_custodies` on the client socket, the happenings bus (with custody variants), and the `subscribe_happenings` streaming op.
 
 ### 12.1 Appointments and Watches
 
 Time-originated and condition-originated producers that feed instructions into the steward as if from outside. Needed for alarm clocks, sleep timers, automations, and condition-driven behaviours (e.g. "when networking goes up, mount NAS shares"). Not present today.
 
-### 12.2 Happenings Subscription
+### 12.2 Happenings Subscription Enrichment
 
-The happenings bus exists and emits every custody transition: `CustodyTaken`, `CustodyReleased`, and `CustodyStateReported`. External consumers cannot yet subscribe - the client socket has a `list_active_custodies` polling op but no streaming subscription op. Adding this is architecturally non-trivial because every existing op is request/response; a streaming op is the first exception in the client protocol. Needs its own pass.
+The `subscribe_happenings` op streams every happening from the bus to external consumers (section 6.2). Enrichment beyond v0 is deferred:
+
+- **Server-side filtering**: today a subscriber receives every happening and filters client-side. A filtered subscription (by variant, by plugin, by shelf) becomes attractive as the variant set grows.
+- **Aggregation and coalescing**: high-frequency state reports could be coalesced (at most one `CustodyStateReported` per handle per N ms) to reduce noise for subscribers that only care about coarse transitions.
+- **Additional variants**: the bus carries custody transitions today. Subject/relation/admission events are plausible future additions; the `#[non_exhaustive]` enum and forward-compatible wire shape are ready for them.
+- **Durable replay**: happenings are transient. Persisting a bounded history (for audit or observability) would be its own rack, cross-cut with `HAPPENINGS.md` section 11.4.
+
+See `HAPPENINGS.md` section 11 for the full list of enrichment items and design rationales.
 
 ### 12.3 Subject, Relation, and Ledger Persistence
 
@@ -421,7 +450,7 @@ Both invariants are documented in the relevant test files and in `WIRE_PROTOCOL.
 
 | Decision | Where it belongs |
 |----------|------------------|
-| Projection subscription protocol | Pending; `PROJECTIONS.md` section 8 sketches it. This overlaps with the happenings subscription surface (section 12.2 of this document). |
+| Projection subscription protocol | Pending; `PROJECTIONS.md` section 8 sketches it. The `subscribe_happenings` op (section 6.2) is the design precedent: streaming response from a single input, connection promoted to output-only for the subscription's lifetime, ack frame before the first event. Projection subscriptions will likely follow the same shape. |
 | Fast-path mechanism | `FAST_PATH.md`. |
 | Trust-class-to-OS-primitive mapping | Pending; orthogonal to existing engineering docs. |
 | Catalogue-declared projection shapes | Pending; extends `PROJECTIONS.md` sections 3 and 4. |

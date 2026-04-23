@@ -171,7 +171,7 @@ let all = ledger.list_active();
 
 The steward exposes `list_active_custodies` over the client socket as an op with no arguments. The response is the full snapshot in the shape documented in `STEWARD.md` section 6.3.
 
-This is a polling surface. A consumer that wants live updates combines it with the happenings bus once the subscription op lands (section 11.1). Today, external consumers poll.
+This is a polling surface. A consumer that wants live updates combines it with the `subscribe_happenings` streaming op on the same socket: the ledger gives current state at subscription time, the bus gives transitions from that point forward. Together they are the complete external view of the custody surface.
 
 ### 7.3 Not Exposed
 
@@ -210,11 +210,7 @@ For historical observation use happenings: every ledger-writing event emits a ha
 
 ## 11. Deferred
 
-### 11.1 Client-socket Subscription Surface
-
-External consumers see the ledger only through the polling `list_active_custodies` op. A streaming happenings subscription op on the client socket is its own pass; see `STEWARD.md` section 12.2.
-
-### 11.2 Persistence
+### 11.1 Persistence
 
 The ledger lives entirely in memory. A steward restart yields an empty ledger; in-flight custodies on wardens that survive the restart have no steward-side record. The engineering question is where the persistence boundary lives:
 
@@ -226,14 +222,14 @@ The ledger lives entirely in memory. A steward restart yields an empty ledger; i
 
 Cross-cut with subject and relation persistence (`STEWARD.md` section 12.3); one persistence pass covers all three.
 
-### 11.3 Full State-report History
+### 11.2 Full State-report History
 
 The ledger keeps only `last_state`. A bounded ring buffer of the last N snapshots per record would let consumers inspect recent state without subscribing to happenings. Low priority; no current consumer needs it.
 
-### 11.4 Release Archival
+### 11.3 Release Archival
 
 `release_custody` returns the removed record, but the ledger does not retain it. A future "recently released" surface (bounded, time-windowed) would help consumers that want to see what just ended. Out of scope for v0.
 
-### 11.5 Course-correction Bookkeeping
+### 11.4 Course-correction Bookkeeping
 
 `course_correct` does not currently touch the ledger. A future pass could bump `last_updated` and/or carry the correction in a dedicated field. Low priority; wardens that emit a state report after a correction (as most will) bump `last_updated` naturally through the reporter.

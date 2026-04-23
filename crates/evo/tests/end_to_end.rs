@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 
 use evo::admission::AdmissionEngine;
 use evo::catalogue::Catalogue;
+use evo::happenings::{Happening, HappeningBus};
 use evo::projections::ProjectionEngine;
 use evo::server::Server;
 use evo_plugin_sdk::contract::{
@@ -636,6 +637,126 @@ async fn list_active_custodies_returns_populated_ledger() {
         .expect("base64 decode");
     assert_eq!(decoded, b"state=playing");
 
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn subscribe_happenings_delivers_ack_and_events() {
+    // End-to-end exercise of the pass 5d socket surface. Subscribe,
+    // read the ack, emit happenings on the bus from the test side,
+    // verify the happening frames arrive correctly. Uses direct bus
+    // emission rather than take_custody/release_custody because the
+    // engine's custody verbs require a warden admitted on the shelf;
+    // the subscription flow is independent of which source emits to
+    // the bus, so a direct emit is a cleaner test fixture.
+    //
+    // The ack is load-bearing for this test: because the server's
+    // bus.subscribe() runs before the ack is written, once the client
+    // has read the ack any subsequent emit on the bus is guaranteed
+    // to reach the subscriber. Without the ack the test would be
+    // timing-coupled (emit might land before subscribe registers).
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path)
+        .await
+        .expect("connect");
+
+    // Grab a handle to the bus so we can emit from the test side.
+    // Taken BEFORE sending the subscribe op so the Arc clone is
+    // ready to use as soon as the ack is read.
+    let bus: std::sync::Arc<HappeningBus> = {
+        let guard = engine.lock().await;
+        guard.happening_bus()
+    };
+
+    // Send subscribe_happenings.
+    write_frame(&mut stream, br#"{"op":"subscribe_happenings"}"#).await;
+
+    // Read the ack. The ack is written AFTER the server's
+    // bus.subscribe() call, so any emit after this point reaches the
+    // subscriber.
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(
+        v["subscribed"].as_bool(),
+        Some(true),
+        "expected subscribed ack, got: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Emit CustodyTaken on the bus.
+    bus.emit(Happening::CustodyTaken {
+        plugin: "org.test.warden".into(),
+        handle_id: "c-1".into(),
+        shelf: "example.custody".into(),
+        custody_type: "playback".into(),
+        at: std::time::SystemTime::now(),
+    });
+
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(
+        v["happening"]["type"].as_str(),
+        Some("custody_taken"),
+        "got: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        v["happening"]["plugin"].as_str(),
+        Some("org.test.warden")
+    );
+    assert_eq!(v["happening"]["handle_id"].as_str(), Some("c-1"));
+    assert_eq!(
+        v["happening"]["shelf"].as_str(),
+        Some("example.custody")
+    );
+    assert_eq!(
+        v["happening"]["custody_type"].as_str(),
+        Some("playback")
+    );
+    assert!(
+        v["happening"]["at_ms"].as_u64().is_some(),
+        "at_ms must be present"
+    );
+
+    // Emit a second happening of a different variant to verify the
+    // stream stays open and delivers subsequent events.
+    bus.emit(Happening::CustodyReleased {
+        plugin: "org.test.warden".into(),
+        handle_id: "c-1".into(),
+        at: std::time::SystemTime::now(),
+    });
+
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(
+        v["happening"]["type"].as_str(),
+        Some("custody_released")
+    );
+    assert_eq!(v["happening"]["handle_id"].as_str(), Some("c-1"));
+
+    // Client disconnects; subscription task exits cleanly.
     drop(stream);
     let _ = shutdown_tx.send(());
     server_task.await.expect("server task");

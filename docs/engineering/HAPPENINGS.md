@@ -195,11 +195,19 @@ The bus has three production emission sites today:
 - `AdmissionEngine::release_custody`: emits `CustodyReleased` after `release_custody`.
 - `LedgerCustodyStateReporter::report`: emits `CustodyStateReported` after `record_state`. Installed in every admitted warden (in-process and wire), so every state report from any warden ends with an emission.
 
-A fourth site lands when the subscription op on the client socket ships (see 11.1): the server subscribes on behalf of external consumers.
+A fourth site exists on the client-socket surface: when a client sends `subscribe_happenings`, the server subscribes on its behalf and forwards every happening as a frame. See section 9.2.
 
-### 9.2 Not Yet Exposed Externally
+### 9.2 External Subscribers (client socket)
 
-The bus is not reachable from outside the steward process today. External consumers rely on polling (`list_active_custodies` on the client socket). The streaming op that turns the bus into a pushable external surface is its own pass.
+The steward exposes the bus to external consumers via the `subscribe_happenings` op on the client socket. When a client sends this op, the server:
+
+1. Calls `bus.subscribe()` to register a receiver.
+2. Writes a `{"subscribed": true}` ack frame.
+3. Enters a loop writing one frame per happening until the client disconnects.
+
+The ack ordering is load-bearing: by the time the client reads the ack, the server has already subscribed, so any happening emitted after the ack is guaranteed to reach the client. Wire-level details are in `STEWARD.md` section 6.2.
+
+Subscriptions are the only streaming surface in the v0 client protocol; every other op is request/response.
 
 ### 9.3 Not Plugin-facing (Currently)
 
@@ -219,26 +227,22 @@ A future design decision may allow plugins to contribute to a constrained set of
 
 ## 11. Deferred
 
-### 11.1 Client-socket Subscription Op
-
-The single largest deferred item. Today the bus exists only inside the steward process. A streaming `subscribe_happenings` op on the client socket would expose it to external consumers: the server subscribes on behalf of the client, forwards every happening as a frame, and respects client-side back-pressure. This is the first streaming op in the client protocol; every existing op is request/response. Needs its own pass; see `STEWARD.md` section 12.2.
-
-### 11.2 Additional Variants
+### 11.1 Additional Variants
 
 Categories identified for future work (see 3.2). The pattern is mechanically simple: add a variant, add an emission site, add tests. The design work is deciding what belongs on each variant; consumer needs drive that.
 
-### 11.3 Per-rack or Per-subject Filtering
+### 11.2 Per-rack or Per-subject Filtering
 
 Today a subscriber receives every happening on the bus and filters client-side. If variant count grows, a server-side filtered subscription (subscribe only to `CustodyStateReported` for `plugin = X`, or only to transitions on a specific subject) becomes attractive. Adds complexity to the bus; not justified yet.
 
-### 11.4 Aggregation / Coalescing
+### 11.3 Aggregation / Coalescing
 
 A warden that emits state reports at 10 Hz produces 10 happenings per second per custody. For subscribers that care only about coarse transitions, coalescing (emit at most one `CustodyStateReported` per handle per 100 ms) would reduce noise. Plausible future enhancement; not essential for current workloads.
 
-### 11.5 Persistence / Observability Integration
+### 11.4 Persistence / Observability Integration
 
 Bridging happenings into the observability rack (when it lands) for durable historical replay. Design question deferred to the rack itself; the bus is happy to be a data source for such a bridge, and the bridge is a plugin like any other.
 
-### 11.6 Plugin-authored Happenings
+### 11.5 Plugin-authored Happenings
 
 Whether (and how) plugins can contribute to specific happening variants directly, rather than only through the typed announcer API. Open design question; no current need.

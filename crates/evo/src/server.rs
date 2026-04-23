@@ -50,6 +50,36 @@
 //! future pass can add filtering (by plugin, by shelf) without
 //! breaking this minimal shape.
 //!
+//! ### `op = "subscribe_happenings"`: stream live fabric transitions
+//!
+//! ```json
+//! { "op": "subscribe_happenings" }
+//! ```
+//!
+//! No arguments in v0. This is the first streaming op in the client
+//! protocol: once the server accepts the subscription, the connection
+//! becomes output-only for the lifetime of the subscription. Sending
+//! further requests on the same connection is not supported; clients
+//! that need both subscription and other ops open two connections.
+//!
+//! Sequence of frames the server writes after accepting a
+//! subscription:
+//!
+//! 1. An immediate `{"subscribed": true}` ack, signalling the
+//!    subscriber is registered on the bus. Any happening emitted
+//!    after the client sees this ack will be delivered.
+//! 2. A `{"happening": {...}}` frame for each subsequent happening.
+//!    The inner object is internally-tagged by `type`
+//!    (`custody_taken`, `custody_released`, `custody_state_reported`)
+//!    with variant-specific fields. See the Response JSON section.
+//! 3. A `{"lagged": n}` frame if the subscriber falls behind the
+//!    bus's buffer, carrying the number of dropped happenings.
+//!    Subscribers recover by re-querying the authoritative store
+//!    (the ledger for custody) and continuing to consume.
+//!
+//! The subscription ends when the client closes the connection or
+//! the server is shut down. There is no explicit unsubscribe frame.
+//!
 //! ## Response JSON
 //!
 //! Plugin-request success:
@@ -77,6 +107,33 @@
 //! ] }
 //! ```
 //!
+//! `subscribe_happenings` ack (written once, immediately after the
+//! op is accepted):
+//! ```json
+//! { "subscribed": true }
+//! ```
+//!
+//! Happening frame (streamed, one per emitted happening):
+//! ```json
+//! { "happening": {
+//!     "type": "custody_taken",
+//!     "plugin": "org.example.warden",
+//!     "handle_id": "custody-42",
+//!     "shelf": "example.custody",
+//!     "custody_type": "playback",
+//!     "at_ms": 1700000000000
+//! } }
+//! ```
+//!
+//! The `type` field is `custody_taken`, `custody_released`, or
+//! `custody_state_reported`; fields vary per variant. See the
+//! `HAPPENINGS.md` engineering doc for the variant reference.
+//!
+//! Lagged notification (streamed when the subscriber falls behind):
+//! ```json
+//! { "lagged": 17 }
+//! ```
+//!
 //! Any failure:
 //! ```json
 //! { "error": "no plugin on shelf: foo.bar" }
@@ -87,6 +144,7 @@
 use crate::admission::AdmissionEngine;
 use crate::custody::{CustodyRecord, StateSnapshot};
 use crate::error::StewardError;
+use crate::happenings::{Happening, HappeningBus};
 use crate::projections::{
     DegradedReason, DegradedReasonKind, ProjectionEngine, ProjectionError,
     ProjectionScope, RelatedSubject, RelationDirection, SubjectProjection,
@@ -103,7 +161,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 
 /// Maximum size of a single JSON frame. Prevents malicious or malformed
 /// clients from forcing the steward to allocate unbounded memory.
@@ -145,6 +203,10 @@ enum ClientRequest {
     /// Snapshot the custody ledger - every currently-held custody the
     /// steward has recorded. No fields; v0 returns everything.
     ListActiveCustodies,
+    /// Subscribe to the happenings bus. No arguments in v0. Promotes
+    /// the connection to streaming mode; see module-level docs for
+    /// the sequence of frames the server emits.
+    SubscribeHappenings,
 }
 
 /// Wire form of [`ProjectionScope`]. See module-level docs for JSON
@@ -235,6 +297,30 @@ enum ClientResponse {
         /// Every currently-held custody in the steward's ledger.
         /// Order is unspecified (the ledger is a HashMap).
         active_custodies: Vec<CustodyRecordWire>,
+    },
+    /// Subscription acknowledgement. Written once, immediately after
+    /// the server accepts a `subscribe_happenings` op and has
+    /// registered its receiver on the bus. The field is always `true`;
+    /// its sole purpose is the distinctive top-level key `subscribed`
+    /// for the untagged-enum disambiguation.
+    Subscribed {
+        /// Always `true`. Present so the key `subscribed` distinguishes
+        /// this variant from every other `ClientResponse` shape.
+        subscribed: bool,
+    },
+    /// One happening from the subscription stream.
+    Happening {
+        /// The happening itself, shaped per [`HappeningWire`].
+        happening: HappeningWire,
+    },
+    /// Notification that the subscriber fell behind the bus's buffer
+    /// and missed `lagged` happenings. Subscribers recover by
+    /// re-querying the authoritative store (the ledger for custody)
+    /// and continuing to consume.
+    Lagged {
+        /// Number of happenings dropped since the last successful
+        /// delivery.
+        lagged: u64,
     },
     /// Any failure.
     Error {
@@ -428,6 +514,99 @@ fn system_time_to_ms(t: SystemTime) -> u64 {
 }
 
 // ---------------------------------------------------------------------
+// Wire types - happenings (streaming subscription)
+// ---------------------------------------------------------------------
+
+/// Wire form of [`Happening`]. Internally tagged by `type`
+/// (snake_case); every variant carries an `at_ms` timestamp in
+/// milliseconds since the UNIX epoch. Mirrors the domain enum one-for-
+/// one; new variants on [`Happening`] require a new variant here
+/// plus a match arm in the `From<Happening>` impl.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum HappeningWire {
+    /// Wire form of [`Happening::CustodyTaken`].
+    CustodyTaken {
+        /// Canonical name of the warden plugin.
+        plugin: String,
+        /// Warden-chosen handle id.
+        handle_id: String,
+        /// Fully-qualified shelf.
+        shelf: String,
+        /// Custody type tag from the Assignment.
+        custody_type: String,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::CustodyReleased`].
+    CustodyReleased {
+        /// Canonical name of the warden plugin.
+        plugin: String,
+        /// Handle id of the released custody.
+        handle_id: String,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::CustodyStateReported`].
+    CustodyStateReported {
+        /// Canonical name of the warden plugin.
+        plugin: String,
+        /// Handle id the report pertains to.
+        handle_id: String,
+        /// Health declared by the plugin at report time. Uses the
+        /// SDK type's built-in lowercase serialisation.
+        health: HealthStatus,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
+}
+
+impl From<Happening> for HappeningWire {
+    fn from(h: Happening) -> Self {
+        // Exhaustive match: the `#[non_exhaustive]` attribute on
+        // `Happening` applies to external crates, not within the
+        // defining crate. If a new variant is added, this match
+        // stops compiling, forcing the wire type to be updated in
+        // lockstep - which is exactly what we want.
+        match h {
+            Happening::CustodyTaken {
+                plugin,
+                handle_id,
+                shelf,
+                custody_type,
+                at,
+            } => HappeningWire::CustodyTaken {
+                plugin,
+                handle_id,
+                shelf,
+                custody_type,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::CustodyReleased {
+                plugin,
+                handle_id,
+                at,
+            } => HappeningWire::CustodyReleased {
+                plugin,
+                handle_id,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::CustodyStateReported {
+                plugin,
+                handle_id,
+                health,
+                at,
+            } => HappeningWire::CustodyStateReported {
+                plugin,
+                handle_id,
+                health,
+                at_ms: system_time_to_ms(at),
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // The server
 // ---------------------------------------------------------------------
 
@@ -578,86 +757,136 @@ impl Server {
 
 /// Handle one accepted client connection.
 ///
-/// Reads frames in a loop until the client closes the connection. Each
-/// frame is processed independently; an error handling one frame closes
-/// the connection.
+/// Reads frames in a loop until the client closes the connection.
+/// Each non-streaming frame is processed independently and produces a
+/// single response. If a frame is a `subscribe_happenings` op the
+/// connection transitions to streaming mode for the remainder of its
+/// lifetime: [`run_subscription`] takes over the write half and the
+/// connection's read half is no longer consumed.
+///
+/// Errors handling one frame close the connection.
 async fn handle_connection(
     mut stream: UnixStream,
     engine: Arc<Mutex<AdmissionEngine>>,
     projections: Arc<ProjectionEngine>,
 ) -> Result<(), StewardError> {
     loop {
-        let mut len_buf = [0u8; 4];
-        match stream.read_exact(&mut len_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(());
-            }
+        let body = match read_frame_body(&mut stream).await? {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+
+        let req: ClientRequest = match serde_json::from_slice(&body) {
+            Ok(r) => r,
             Err(e) => {
-                return Err(StewardError::io("reading frame length", e));
+                write_response_frame(
+                    &mut stream,
+                    &ClientResponse::Error {
+                        error: format!("invalid JSON: {e}"),
+                    },
+                )
+                .await?;
+                continue;
             }
+        };
+
+        if matches!(req, ClientRequest::SubscribeHappenings) {
+            // Promote the connection to streaming mode. Acquire the
+            // bus Arc under a brief engine lock, then release it so
+            // the streaming loop does not hold the engine lock across
+            // await points.
+            let bus = {
+                let guard = engine.lock().await;
+                guard.happening_bus()
+            };
+            return run_subscription(stream, bus).await;
         }
 
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len == 0 {
-            return Err(StewardError::Dispatch(
-                "zero-length frame".to_string(),
-            ));
-        }
-        if len > MAX_FRAME_SIZE {
-            return Err(StewardError::Dispatch(format!(
-                "frame too large: {len} bytes (max {MAX_FRAME_SIZE})"
-            )));
-        }
-
-        let mut body = vec![0u8; len];
-        stream.read_exact(&mut body).await.map_err(|e| {
-            StewardError::io("reading frame body", e)
-        })?;
-
-        let response = process_frame(&body, &engine, &projections).await;
-
-        let response_bytes = serde_json::to_vec(&response).map_err(|e| {
-            StewardError::Dispatch(format!("serialising response: {e}"))
-        })?;
-
-        if response_bytes.len() > u32::MAX as usize {
-            return Err(StewardError::Dispatch(
-                "response too large".to_string(),
-            ));
-        }
-
-        let response_len = (response_bytes.len() as u32).to_be_bytes();
-        stream.write_all(&response_len).await.map_err(|e| {
-            StewardError::io("writing response length", e)
-        })?;
-        stream.write_all(&response_bytes).await.map_err(|e| {
-            StewardError::io("writing response body", e)
-        })?;
-        stream.flush().await.map_err(|e| {
-            StewardError::io("flushing response", e)
-        })?;
+        let response = dispatch_request(req, &engine, &projections).await;
+        write_response_frame(&mut stream, &response).await?;
     }
 }
 
-/// Parse, dispatch, and produce a [`ClientResponse`] for one frame.
+/// Read one length-prefixed frame body from the stream.
 ///
-/// Never panics; parse failures and dispatch failures both yield an
-/// error response rather than bubbling up to close the connection.
-async fn process_frame(
-    body: &[u8],
+/// Returns `Ok(None)` if the peer closed cleanly before any bytes of
+/// the next frame arrived (`UnexpectedEof` on the length read). Any
+/// other read error, or a malformed length header, returns
+/// `Err(StewardError)`.
+async fn read_frame_body(
+    stream: &mut UnixStream,
+) -> Result<Option<Vec<u8>>, StewardError> {
+    let mut len_buf = [0u8; 4];
+    match stream.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(StewardError::io("reading frame length", e));
+        }
+    }
+
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 {
+        return Err(StewardError::Dispatch(
+            "zero-length frame".to_string(),
+        ));
+    }
+    if len > MAX_FRAME_SIZE {
+        return Err(StewardError::Dispatch(format!(
+            "frame too large: {len} bytes (max {MAX_FRAME_SIZE})"
+        )));
+    }
+
+    let mut body = vec![0u8; len];
+    stream
+        .read_exact(&mut body)
+        .await
+        .map_err(|e| StewardError::io("reading frame body", e))?;
+    Ok(Some(body))
+}
+
+/// Serialise a [`ClientResponse`] and write it as a length-prefixed
+/// frame to the stream.
+async fn write_response_frame(
+    stream: &mut UnixStream,
+    response: &ClientResponse,
+) -> Result<(), StewardError> {
+    let bytes = serde_json::to_vec(response).map_err(|e| {
+        StewardError::Dispatch(format!("serialising response: {e}"))
+    })?;
+    if bytes.len() > u32::MAX as usize {
+        return Err(StewardError::Dispatch(
+            "response too large".to_string(),
+        ));
+    }
+    let len = (bytes.len() as u32).to_be_bytes();
+    stream
+        .write_all(&len)
+        .await
+        .map_err(|e| StewardError::io("writing response length", e))?;
+    stream
+        .write_all(&bytes)
+        .await
+        .map_err(|e| StewardError::io("writing response body", e))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| StewardError::io("flushing response", e))?;
+    Ok(())
+}
+
+/// Dispatch a parsed non-streaming request to produce a
+/// [`ClientResponse`].
+///
+/// Never panics; dispatch failures surface as `ClientResponse::Error`
+/// rather than bubbling up to close the connection.
+async fn dispatch_request(
+    req: ClientRequest,
     engine: &Arc<Mutex<AdmissionEngine>>,
     projections: &Arc<ProjectionEngine>,
 ) -> ClientResponse {
-    let req: ClientRequest = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(e) => {
-            return ClientResponse::Error {
-                error: format!("invalid JSON: {e}"),
-            };
-        }
-    };
-
     match req {
         ClientRequest::Request {
             shelf,
@@ -673,6 +902,83 @@ async fn process_frame(
         } => handle_project_subject(projections, canonical_id, scope),
         ClientRequest::ListActiveCustodies => {
             handle_list_active_custodies(engine).await
+        }
+        ClientRequest::SubscribeHappenings => {
+            // Intercepted in handle_connection; should not reach here.
+            // Defensive: surface an error rather than panicking in case
+            // a future refactor moves the intercept.
+            ClientResponse::Error {
+                error: "internal: subscribe_happenings reached dispatch path"
+                    .into(),
+            }
+        }
+    }
+}
+
+/// Stream happenings from `bus` over `stream` until the client
+/// disconnects or the bus is dropped.
+///
+/// ## Sequence
+///
+/// 1. `bus.subscribe()` is called BEFORE the `{"subscribed": true}`
+///    ack is written. This order is load-bearing: a happening emitted
+///    between the subscribe and the ack is buffered by the receiver
+///    and delivered on the next `recv()`; if the order were reversed,
+///    such a happening could be missed.
+/// 2. The ack is written. If writing fails the client has disconnected
+///    before receiving it; we return cleanly.
+/// 3. A loop reads happenings from the receiver and writes them to
+///    the stream. On `RecvError::Lagged(n)` we emit a `Lagged` frame
+///    and continue; on `RecvError::Closed` (the bus was dropped,
+///    which does not happen in normal operation because the engine
+///    holds an `Arc<HappeningBus>` for its lifetime) we return
+///    cleanly; on write failure we return cleanly (client gone).
+///
+/// The `engine` is intentionally not passed in: the subscription
+/// streams from the bus alone and does not need to lock the engine.
+async fn run_subscription(
+    mut stream: UnixStream,
+    bus: Arc<HappeningBus>,
+) -> Result<(), StewardError> {
+    // Subscribe first so happenings emitted before the ack reach the
+    // client.
+    let mut rx = bus.subscribe();
+
+    // Send the ack. If the client is gone we return cleanly.
+    let ack = ClientResponse::Subscribed { subscribed: true };
+    if write_response_frame(&mut stream, &ack).await.is_err() {
+        return Ok(());
+    }
+
+    loop {
+        match rx.recv().await {
+            Ok(happening) => {
+                let frame = ClientResponse::Happening {
+                    happening: happening.into(),
+                };
+                if write_response_frame(&mut stream, &frame)
+                    .await
+                    .is_err()
+                {
+                    // Client disconnected.
+                    return Ok(());
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                let frame = ClientResponse::Lagged { lagged: n };
+                if write_response_frame(&mut stream, &frame)
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                // Bus was dropped; cannot happen while the engine is
+                // alive, but handle it defensively so the subscription
+                // exits cleanly rather than spinning.
+                return Ok(());
+            }
         }
     }
 }
@@ -1113,5 +1419,184 @@ mod tests {
         assert_eq!(B64.decode(&wire.payload_b64).unwrap(), b"xyz");
         assert_eq!(wire.health, HealthStatus::Unhealthy);
         assert_eq!(wire.reported_at_ms, 2_500);
+    }
+
+    // -----------------------------------------------------------------
+    // subscribe_happenings tests (pass 5d).
+    //
+    // Cover parsing of the op, serialisation of the three streaming
+    // response shapes (Subscribed, Happening, Lagged), and the
+    // From<Happening> conversion for all three current variants.
+    // The streaming flow itself is covered by the end-to-end
+    // integration test in tests/end_to_end.rs.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn client_request_parses_subscribe_happenings() {
+        let json = r#"{"op":"subscribe_happenings"}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(r, ClientRequest::SubscribeHappenings));
+    }
+
+    #[test]
+    fn client_response_subscribed_serialises() {
+        let r = ClientResponse::Subscribed { subscribed: true };
+        let s = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["subscribed"].as_bool(), Some(true));
+        // Distinctive key; must not collide with other variants.
+        assert!(!s.contains("payload_b64"));
+        assert!(!s.contains("\"error\""));
+        assert!(!s.contains("happening"));
+        assert!(!s.contains("lagged"));
+        assert!(!s.contains("active_custodies"));
+    }
+
+    #[test]
+    fn client_response_happening_serialises() {
+        let r = ClientResponse::Happening {
+            happening: HappeningWire::CustodyTaken {
+                plugin: "org.test.warden".into(),
+                handle_id: "c-1".into(),
+                shelf: "example.custody".into(),
+                custody_type: "playback".into(),
+                at_ms: 1_700_000_000_000,
+            },
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            v["happening"]["type"].as_str(),
+            Some("custody_taken")
+        );
+        assert_eq!(
+            v["happening"]["plugin"].as_str(),
+            Some("org.test.warden")
+        );
+        assert_eq!(
+            v["happening"]["handle_id"].as_str(),
+            Some("c-1")
+        );
+        assert_eq!(
+            v["happening"]["shelf"].as_str(),
+            Some("example.custody")
+        );
+        assert_eq!(
+            v["happening"]["custody_type"].as_str(),
+            Some("playback")
+        );
+        assert_eq!(
+            v["happening"]["at_ms"].as_u64(),
+            Some(1_700_000_000_000)
+        );
+        // Distinctive top-level key.
+        assert!(!s.contains("\"subscribed\""));
+        assert!(!s.contains("\"error\""));
+        assert!(!s.contains("\"lagged\""));
+        assert!(!s.contains("active_custodies"));
+    }
+
+    #[test]
+    fn client_response_lagged_serialises() {
+        let r = ClientResponse::Lagged { lagged: 17 };
+        let s = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["lagged"].as_u64(), Some(17));
+        // Distinctive top-level key.
+        assert!(!s.contains("\"subscribed\""));
+        assert!(!s.contains("\"happening\""));
+        assert!(!s.contains("\"error\""));
+    }
+
+    #[test]
+    fn happening_wire_from_custody_taken() {
+        let h = Happening::CustodyTaken {
+            plugin: "org.test.warden".into(),
+            handle_id: "c-1".into(),
+            shelf: "example.custody".into(),
+            custody_type: "playback".into(),
+            at: UNIX_EPOCH + std::time::Duration::from_millis(1_500),
+        };
+        let wire: HappeningWire = h.into();
+        match wire {
+            HappeningWire::CustodyTaken {
+                plugin,
+                handle_id,
+                shelf,
+                custody_type,
+                at_ms,
+            } => {
+                assert_eq!(plugin, "org.test.warden");
+                assert_eq!(handle_id, "c-1");
+                assert_eq!(shelf, "example.custody");
+                assert_eq!(custody_type, "playback");
+                assert_eq!(at_ms, 1_500);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn happening_wire_from_custody_released() {
+        let h = Happening::CustodyReleased {
+            plugin: "org.test.warden".into(),
+            handle_id: "c-1".into(),
+            at: UNIX_EPOCH + std::time::Duration::from_millis(2_000),
+        };
+        let wire: HappeningWire = h.into();
+        match wire {
+            HappeningWire::CustodyReleased {
+                plugin,
+                handle_id,
+                at_ms,
+            } => {
+                assert_eq!(plugin, "org.test.warden");
+                assert_eq!(handle_id, "c-1");
+                assert_eq!(at_ms, 2_000);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn happening_wire_from_custody_state_reported() {
+        let h = Happening::CustodyStateReported {
+            plugin: "org.test.warden".into(),
+            handle_id: "c-1".into(),
+            health: HealthStatus::Degraded,
+            at: UNIX_EPOCH + std::time::Duration::from_millis(3_000),
+        };
+        let wire: HappeningWire = h.into();
+        match wire {
+            HappeningWire::CustodyStateReported {
+                plugin,
+                handle_id,
+                health,
+                at_ms,
+            } => {
+                assert_eq!(plugin, "org.test.warden");
+                assert_eq!(handle_id, "c-1");
+                assert_eq!(health, HealthStatus::Degraded);
+                assert_eq!(at_ms, 3_000);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn happening_wire_state_reported_health_serialises_lowercase() {
+        // HealthStatus comes through via its SDK serde derive, which
+        // renames to lowercase. Guard against any wire-type override.
+        let wire = HappeningWire::CustodyStateReported {
+            plugin: "org.test.warden".into(),
+            handle_id: "c-1".into(),
+            health: HealthStatus::Unhealthy,
+            at_ms: 0,
+        };
+        let s = serde_json::to_string(&wire).unwrap();
+        assert!(
+            s.contains("\"health\":\"unhealthy\""),
+            "expected lowercase 'unhealthy' in output, got: {s}"
+        );
     }
 }
