@@ -107,6 +107,7 @@ The doc set is grouped by what you are trying to do.
 |----------|---------------|
 | [CONCEPT.md](docs/CONCEPT.md) | new to evo. Read this first. The fabric contract: essence, steward, racks, shelves, plugins, subjects, relations, projections, happenings. |
 | [BOUNDARY.md](docs/engineering/BOUNDARY.md) | about to start an `evo-device-<vendor>` repository, or deciding whether a change belongs in the framework or a distribution. Defines the four contracts across the boundary and the distribution-integrator checklist. |
+| [SCHEMAS.md](docs/engineering/SCHEMAS.md) | looking for any schema at all. Consolidated authoritative reference for every TOML file, JSON shape, wire frame, happening variant, and data structure across the fabric. |
 | [DEVELOPING.md](DEVELOPING.md) | cloning this repository to hack on the framework itself. Prerequisites, build, test, run locally, repo conventions. |
 
 ### Build on evo (plugin authors)
@@ -114,15 +115,15 @@ The doc set is grouped by what you are trying to do.
 | Document | Purpose |
 |----------|---------|
 | [PLUGIN_AUTHORING.md](docs/engineering/PLUGIN_AUTHORING.md) | Tutorial. Walkthroughs for respondents and wardens, in-process and wire. Manifest authoring, testing, before-you-ship checklist, common pitfalls. |
-| [PLUGIN_CONTRACT.md](docs/engineering/PLUGIN_CONTRACT.md) | Spec. The universal plugin contract in Rust trait and Unix-socket wire form, kept strictly aligned. |
-| [PLUGIN_PACKAGING.md](docs/engineering/PLUGIN_PACKAGING.md) | Manifest schema, identity, signing, filesystem layout on target, installation lifecycle. |
+| [PLUGIN_CONTRACT.md](docs/engineering/PLUGIN_CONTRACT.md) | Spec. The universal plugin contract in Rust trait and Unix-socket wire form, kept strictly aligned. Schema details in SCHEMAS.md section 4.2. |
+| [PLUGIN_PACKAGING.md](docs/engineering/PLUGIN_PACKAGING.md) | Manifest narrative, identity, signing, filesystem layout on target, installation lifecycle. Schema details in SCHEMAS.md section 3.1. |
 | [VENDOR_CONTRACT.md](docs/engineering/VENDOR_CONTRACT.md) | Who signs what. Actor taxonomy, namespace governance, vendor commitments, distribution relationships, revocation pathways. |
 
 ### Integrate with evo (consumers, frontends, bridges)
 
 | Document | Purpose |
 |----------|---------|
-| [CLIENT_API.md](docs/engineering/CLIENT_API.md) | The consumer-facing protocol with JSON transcripts for every op and complete worked examples in Python, Node.js, TypeScript, Go, Rust, shell, and C. |
+| [CLIENT_API.md](docs/engineering/CLIENT_API.md) | The consumer-facing protocol with JSON transcripts for every op and complete worked examples in Python, Node.js, TypeScript, Go, Rust, shell, and C. Schema details in SCHEMAS.md section 4.1. |
 | [FRONTEND.md](docs/engineering/FRONTEND.md) | Where the frontend runs, what technology it uses, and how it reaches the steward. Eleven deployment shapes, the bridge-plugin pattern for remote interfaces (HTTP / WebSocket / MQTT / gRPC / proprietary), compositional patterns. |
 
 ### Reference (engineering internals)
@@ -130,6 +131,8 @@ The doc set is grouped by what you are trying to do.
 | Document | Purpose |
 |----------|---------|
 | [STEWARD.md](docs/engineering/STEWARD.md) | The steward process. Module structure, admission, shared state, concurrency model, configuration, invariants, deferred capabilities. |
+| [CATALOGUE.md](docs/engineering/CATALOGUE.md) | Narrative on authoring a `catalogue.toml`. Racks, shelves, predicates, shape versioning, anti-patterns, evolution. Schema in SCHEMAS.md section 3.2. |
+| [CONFIG.md](docs/engineering/CONFIG.md) | Narrative on the steward's runtime configuration. File location, precedence (CLI > env > config > default), operational patterns. Schema in SCHEMAS.md section 3.3. |
 | [SUBJECTS.md](docs/engineering/SUBJECTS.md) | Subject registry. Canonical identity, external addressings, reconciliation. |
 | [RELATIONS.md](docs/engineering/RELATIONS.md) | Relation graph. Typed directed edges, scoped walks, multi-plugin claimants. |
 | [PROJECTIONS.md](docs/engineering/PROJECTIONS.md) | Projection layer. Federated queries, composition rules, degraded states. |
