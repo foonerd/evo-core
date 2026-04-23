@@ -21,6 +21,7 @@ This repository holds the steward, the plugin SDK, the plugin tooling, and the e
 | [docs/engineering/HAPPENINGS.md](docs/engineering/HAPPENINGS.md) | Happenings bus. Live notification surface for fabric transitions, current custody variants, `#[non_exhaustive]` variant contract, broadcast semantics, ordering relative to ledger writes, payload policy, integration points. |
 | [docs/engineering/FAST_PATH.md](docs/engineering/FAST_PATH.md) | Fast-path mutation channel. Catalogue-declared commands against active wardens, rack/subject addressing, budgets, ordering, idempotency, relationship to projections and happenings, audit. |
 | [docs/engineering/STEWARD.md](docs/engineering/STEWARD.md) | The steward process. Module structure, admission contracts, client-facing and plugin-facing protocols, shared state, concurrency model, configuration, deferred capabilities, invariants. |
+| [docs/engineering/BUILDING.md](docs/engineering/BUILDING.md) | Building evo-core binaries. Supported targets (primary / secondary / opportunistic), cross-compilation recipes, the `cross` tool, release build tuning, glibc vs musl, testing cross-compiled binaries, release artefact policy. |
 
 ## Distributions
 
@@ -28,7 +29,7 @@ Evo is domain-neutral. A device ships as a distribution of evo in its own `evo-d
 
 ## Contributing
 
-Developer workflow, prerequisites, local running, test commands, and repository conventions are documented in [DEVELOPING.md](DEVELOPING.md). Start there if you just cloned the repository.
+Developer workflow, prerequisites, local running, test commands, and repository conventions are documented in [DEVELOPING.md](DEVELOPING.md). Start there if you just cloned the repository. For cross-architecture and release builds see [docs/engineering/BUILDING.md](docs/engineering/BUILDING.md).
 
 ## Status
 
