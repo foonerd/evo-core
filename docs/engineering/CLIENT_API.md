@@ -994,9 +994,9 @@ The steward's admission-engine mutex is held briefly per request (section 9 of `
 
 Things this protocol deliberately does not do:
 
-- **Authentication.** Connection implies trust. The distribution chooses who can open the socket.
-- **Transport encryption.** Unix sockets are local; no TLS.
-- **TCP transport.** Cross-machine access is out of scope; if a distribution needs it, the right shape is a bridge plugin, not a protocol change.
+- **Authentication.** Connection implies trust. The distribution chooses who can open the socket via filesystem permissions.
+- **Transport encryption.** Unix sockets are local; no TLS on the core protocol.
+- **TCP transport on the core protocol.** The steward's client socket stays Unix-local. Cross-machine access is implemented by a **bridge plugin** that terminates the Unix socket locally and exposes its own remote interface (HTTP, WebSocket, MQTT, gRPC, whatever the scenario demands). This keeps the core trusted boundary simple while leaving remote access fully available. See `FRONTEND.md` for the bridge pattern and the technology choices it enables.
 - **Multiple requests in flight per connection.** One request at a time; pipeline across connections.
 - **Server push for non-streaming ops.** Only `subscribe_happenings` streams.
 - **Schema negotiation.** The op discriminator, response shapes, and error format are part of the steward's version contract. Distributions pin a steward version and the shapes are fixed.

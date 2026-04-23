@@ -24,6 +24,7 @@ This repository holds the steward, the plugin SDK, the plugin tooling, and the e
 | [docs/engineering/STEWARD.md](docs/engineering/STEWARD.md) | The steward process. Module structure, admission contracts, client-facing and plugin-facing protocols, shared state, concurrency model, configuration, deferred capabilities, invariants. |
 | [docs/engineering/BUILDING.md](docs/engineering/BUILDING.md) | Building evo-core binaries. Supported targets (primary / secondary / opportunistic), cross-compilation recipes, the `cross` tool, release build tuning, glibc vs musl, testing cross-compiled binaries, release artefact policy. |
 | [docs/engineering/CLIENT_API.md](docs/engineering/CLIENT_API.md) | Client API reference for consumers. Connection, framing, all four ops with JSON transcripts, complete worked examples in Python, Node.js, TypeScript, Go, Rust, shell, and C; query-then-subscribe consistent-view pattern; performance notes; non-goals. |
+| [docs/engineering/FRONTEND.md](docs/engineering/FRONTEND.md) | Frontend positioning. Frontend is a distribution choice, not a framework decision. Three orthogonal axes (deployment, technology, integration), eleven deployment shapes, the bridge-plugin pattern for remote interfaces, compositional patterns, security and trust, non-prescription. |
 
 ## Distributions
 
