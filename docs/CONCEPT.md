@@ -24,6 +24,29 @@ Every contribution is keyed to one or more SUBJECTS. The steward keeps a canonic
 
 Consumers never address plugins. They address the steward, either by rack (structural query) or by subject (federated query). The steward composes contributions from every rack that has opinions about the subject, walks related subjects within a declared scope, and emits a PROJECTION. All outbound behaviour of the system is either a projection on demand or a streamed HAPPENING on the fabric's notification surface. There is no side channel.
 
+```
+                  +---------------+
+                  |   CONSUMERS   |
+                  +-------+-------+
+                          |
+                          |  projections / happenings
+                          v
+   +----------------------+-----------------------+
+   |                                              |
+   |                  THE STEWARD                 |
+   |         (sole authority; no side channel)    |
+   |                                              |
+   |   catalogue       subjects       relations   |
+   |   admission       projections    ledger      |
+   |   happenings bus                             |
+   |                                              |
+   +-----^---------^---------^---------^----------+
+         |         |         |         |
+      plugin    plugin    plugin    plugin
+```
+
+Plugins stock slots on the steward and never address each other. Consumers address the steward, never plugins. The steward composes contributions around subjects and emits projections or happenings. This is the hub discipline the rest of the document assumes.
+
 Two classes of originator exist inside the fabric besides external requests. APPOINTMENTS originate actions from time. WATCHES originate actions from observed conditions. Both produce instructions the steward dispatches as if from outside. The CUSTODY LEDGER tracks work entrusted to WARDENS - plugins that take custody of long-running operations. A separate FAST PATH serves real-time mutation without recomposition.
 
 | Fabric concept | One-line role |
