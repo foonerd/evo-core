@@ -22,7 +22,10 @@ toml = "0.8"
 semver = { version = "1", features = ["serde"] }
 tar = "0.4"
 flate2 = "1"
-xz2 = "0.1"
+# `static` forces lzma-sys to compile bundled liblzma with the target `CC_*`
+# (see .github/scripts/ci-msrv-cargo-env.sh). Without it, pkg-config would use
+# the host system lib, which breaks cross-compilation in CI.
+xz2 = { version = "0.1", features = ["static"] }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 tempfile = "3"
 walkdir = "2"
