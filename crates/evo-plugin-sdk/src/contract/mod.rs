@@ -46,6 +46,20 @@
 //! stays on the zero-allocation form; the callback path accepts one
 //! boxed allocation per call.
 //!
+//! ### Clippy
+//!
+//! This shape triggers `clippy::manual_async_fn`, which suggests rewriting
+//! to `async fn` in trait position. On stable Rust, trait-position
+//! `async fn` does not carry `Send` bounds on the returned future, which
+//! is incompatible with the steward's multi-threaded dispatch. The lint
+//! is a known false positive for this pattern. evo-core disables it at
+//! the workspace level (`[workspace.lints.clippy] manual_async_fn =
+//! "allow"` in the root `Cargo.toml`). Downstream workspaces that depend
+//! on this SDK need the same allow in their own root `Cargo.toml`;
+//! workspace lints do not propagate across workspaces. See
+//! `docs/engineering/PLUGIN_AUTHORING.md` section 3 for the plugin-author
+//! guidance.
+//!
 //! ## Cancellation
 //!
 //! Every trait method returns a future. Futures are cancellable by dropping.

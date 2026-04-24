@@ -21,3 +21,20 @@ repository = "https://github.com/foonerd/evo-core"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+
+[workspace.lints.clippy]
+# The SDK's trait contract uses
+#   fn foo() -> impl Future<Output = T> + Send + '_
+# rather than `async fn foo() -> T`. On stable Rust, trait-position
+# `async fn` does not carry Send bounds on the returned future, which
+# breaks the steward's tokio multi-threaded dispatch. #[async_trait]
+# boxes per call and the fast path (Plugin/Respondent/Warden/Factory)
+# rejects that allocation. See crates/evo-plugin-sdk/src/contract/mod.rs
+# "Async style" for the full rationale. Clippy's manual_async_fn
+# suggests a rewrite that is incompatible with this contract; we allow
+# it here at the workspace level so every crate inherits the decision.
+#
+# Downstream `evo-device-<vendor>` workspaces that depend on
+# evo-plugin-sdk need the same allow in their own workspace Cargo.toml.
+# Workspace lints do not propagate across workspaces.
+manual_async_fn = "allow"
