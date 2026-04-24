@@ -1,0 +1,42 @@
+[package]
+name = "evo-plugin-tool"
+description = "CLI: lint, sign, verify, pack, install (PLUGIN_TOOL.md, GAPS [20])."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "evo-plugin-tool"
+path = "src/main.rs"
+
+[dependencies]
+evo-plugin-sdk = { path = "../evo-plugin-sdk" }
+evo-trust = { path = "../evo-trust" }
+
+ed25519-dalek = { version = "2.1", features = ["std", "pkcs8", "pem", "alloc"] }
+clap = { version = "4", features = ["derive", "string"] }
+anyhow = "1"
+toml = "0.8"
+semver = { version = "1", features = ["serde"] }
+tar = "0.4"
+flate2 = "1"
+xz2 = "0.1"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+tempfile = "3"
+walkdir = "2"
+ureq = "2.9"
+
+[dev-dependencies]
+# Integration tests generate deterministic ed25519 keys, write
+# PKCS#8 PEM private keys the tool reads via --key, and build
+# archives with custom top-level names to exercise the rename rule.
+ed25519-dalek = { version = "2.1", features = ["std", "pkcs8", "pem", "alloc"] }
+pkcs8 = { version = "0.10", features = ["pem"] }
+tempfile = "3"
+tar = "0.4"
+flate2 = "1"
+
+[lints]
+workspace = true

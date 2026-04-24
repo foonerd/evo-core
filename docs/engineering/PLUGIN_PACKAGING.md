@@ -160,7 +160,9 @@ Evo owns three roots on a Debian Trixie device. Nothing evo writes falls outside
   state/
     subjects/                          # Subject registry persistence.
     relations/                         # Relation graph persistence.
-  plugins/                             # Operator-installed third-party plugin artefacts.
+  plugin-stage/                        # Incoming bundles before evo-plugin-tool promotes them; NOT a search_root.
+    (uploads: archives or loose dirs, operator or UI; cleared on successful install)
+  plugins/                             # Operator-installed third-party plugin artefacts (discovered here).
     net.example.myplugin/
       manifest.toml
       manifest.sig
@@ -177,7 +179,8 @@ Evo owns three roots on a Debian Trixie device. Nothing evo writes falls outside
 The key split:
 
 - `/opt/evo/plugins/evo/`, `/opt/evo/plugins/distribution/`, and `/opt/evo/plugins/vendor/`: immutable, owned by packages, updated only by package manager. The three subdirectories separate plugins by actor position (see `VENDOR_CONTRACT.md` section 1).
-- `/var/lib/evo/plugins/`: mutable, owned by operator, updated by dropping in artefacts or using `evo-plugin-tool`. Plugins installed here carry their own signatures and trust keys from `/etc/evo/trust.d/`.
+- `/var/lib/evo/plugins/`: mutable, owned by operator, **final** location the steward’s `search_roots` scan for out-of-process bundles. Updated by **direct drop-in**, by **`evo-plugin-tool install` promoting from** `/var/lib/evo/plugin-stage/` (or a path the tool accepts), or by a **distribution installer** that writes this tree. Plugins under `plugins/` use signatures and trust keys as in section 5.
+- `/var/lib/evo/plugin-stage/`: **staging only**. Uploads and partial extracts live here until `evo-plugin-tool` verifies and moves (or copies atomically) into `plugins/`. The default `search_roots` in `CONFIG.md` do **not** list `plugin-stage/`, so half-installed trees are not admitted by accident.
 
 ## 4. Plugin Identity
 
@@ -298,17 +301,36 @@ Administration is performed by consumers projecting the `plugins` rack and issui
 
 ## 7. Installation Lifecycle
 
+Two **complementary** ways to get a plugin onto a device; product lines use one or both. What follows is normative for how the **artefact** reaches the path the steward actually scans.
+
+### Strategy A — distribution or system installer
+
+A **first-party** or **OS-level** installer (Debian package, OTA image layer, Yocto recipe, `install.sh`, or vendor-specific runbook) **places the plugin bundle** where it must live—often under `/opt/evo/plugins/...` for system-owned plugins, or directly under `/var/lib/evo/plugins/<name>/` for operator scope—and **adds everything else the product needs**: unit files, udev rules, supplementary `plugins.d` snippets, `CapabilityBoundingSet=`, and any paths outside the single bundle directory. The steward does not run the installer; it only sees the **final** tree. This strategy is how sealed appliances ship curated plugins and platform integration.
+
+### Strategy B — stage folder + `evo-plugin-tool`
+
+The operator (or a web / desktop UI on the device) **uploads** a packed or loose bundle into **`/var/lib/evo/plugin-stage/`** (default staging root; a distribution MAY configure another directory, but that directory **must** remain **outside** the steward’s `search_roots` until the tool promotes the bundle). **`evo-plugin-tool` is then responsible** for the whole promotion path, not the steward:
+
+1. **Unwrap** the archive (`.tar.gz` / `.tar.xz` / `.zip`) or accept an unpacked directory, normalising to a single top-level plugin directory per section 9.
+2. **Lint** the manifest and **verify** the signature and trust policy (same rules as the running steward, using the same trust material or flags as `verify`).
+3. **Promote** atomically into `/var/lib/evo/plugins/<plugin.name>/` (or another `--to` / configured target that **is** in `search_roots`), with ownership and mode appropriate to the product (e.g. evo service user).
+4. **Clean up** the stage copy on success; leave a clear log and no duplicate half-tree under a search root on failure.
+5. Optionally **fetch** when `install` is given a URL; same subsequent steps.
+6. **Enable** (or instruct the operator to **restart** the steward) per product policy; until gap work lands, the documented behaviour is “steward rediscovers on restart or the tool signals an out-of-band reload policy” (see `GAPS.md` and `STEWARD.md`).
+
+The steward’s **discovery** path is unchanged: it only walks configured `search_roots` (see `CONFIG.md`). The tool must never leave a only-partially-valid bundle in a `search_root`.
+
 ### Install (drop-in)
 
-1. Operator places plugin directory under `/var/lib/evo/plugins/<n>/`.
+1. Operator places a **ready** plugin directory under `/var/lib/evo/plugins/<n>/` (or another configured search root) **after** the bundle is complete (manifest, artefact, and `manifest.sig` when using signed admission).
 2. Steward detects via inotify (or at next startup).
 3. Steward validates: manifest schema, contract version, shelf-shape compatibility, signature, trust, prerequisites, resource declaration.
 4. On success: plugin is registered, `load` delivered, admission happening emitted.
 5. On failure: plugin is recorded as refused with a specific reason, happening emitted.
 
-### Install (via tool)
+### Install (via `evo-plugin-tool`, from archive, stage path, or URL)
 
-Operators using `evo-plugin-tool install <path-or-url>` get the same flow plus fetch, verify, and drop-in handled by the tool.
+Operators (or UIs) using **`evo-plugin-tool install`**: source is a **path** in **`plugin-stage/`** (or anywhere readable), a **file** in one of the **archive** formats, or a **URL**; the tool runs **Strategy B** steps above, then the same **drop-in** discovery path applies once the final directory exists. First-party **Strategy A** installs that already wrote under `search_roots` do not require the tool for the bundle itself; they may still use the tool for **`lint`** and **`verify`** in CI.
 
 ### Enable / disable
 
@@ -344,8 +366,8 @@ A third-party plugin author, without access to evo internals, receives:
 | Read stable shelf shapes. | `/opt/evo/catalogue/schemas/` on any device; published in the evo-catalogue-schemas repository. |
 | Write a plugin in any language. | Out-of-process transport, standardised wire protocol. |
 | Write a plugin in Rust with maximum convenience. | `evo-plugin-sdk` crate. |
-| Package with evo-project tools. | `evo-plugin-tool lint`, `sign`, `verify`, `pack`. |
-| Ship to a device. | Drop-in to `/var/lib/evo/plugins/<n>/` or the tool's `install` command. |
+| Package with evo-project tools. | `evo-plugin-tool lint`, `sign`, `verify`, `pack` (archives: `.tar.gz` / `.tar.xz` / `.zip`; see §9). |
+| Ship to a device. | **Strategy A:** distribution installer writes final paths. **Strategy B:** upload to `plugin-stage/`, then `evo-plugin-tool install` promotes to `plugins/<n>/` (see section 7). Or direct drop-in if the bundle is already complete. |
 | Receive a specific admission or refusal reason. | The admission happening carries the reason in structured form. |
 | Target versioned shelves. | Shelf shapes are independently versioned; plugins declare which version they satisfy. |
 | Isolation from other plugins. | Out-of-process transport guarantees it; in-process plugins are reviewed first-party. |
@@ -363,6 +385,8 @@ A third-party author does not receive:
 
 ## 9. SDK and Tooling
 
+**Implementation contract for GAPS [20]:** normative build decisions (v1 subcommands, `install` rules, trust parity, exit codes, archive list) are in **`PLUGIN_TOOL.md`**. This section remains the high-level product contract.
+
 Provided by the evo project, in this repo:
 
 ### `evo-plugin-sdk` (Rust crate)
@@ -378,10 +402,30 @@ Provided by the evo project, in this repo:
 - `lint <plugin-dir>`: validate manifest against schema.
 - `sign <plugin-dir> --key <keyfile>`: produce `manifest.sig`.
 - `verify <plugin-dir>`: check signature against trust root (local or passed).
-- `pack <plugin-dir> --out <archive>`: produce a distributable tarball.
-- `install <archive-or-dir>`: drop into correct path, verify, enable.
-- `uninstall <n>`: remove artefact, preserve state.
+- `pack <plugin-dir> --out <path>`: produce a distributable **plugin bundle archive** (see below). The tool selects the format from the file extension, or from an explicit `--format` flag when the path is ambiguous.
+- `install <source> [--to <search-root-child>] ...`: end-to-end **Strategy B** (section 7): accept an archive (same formats as **pack**), a local directory, or a **URL**; run **lint** + **verify**; **promote** from **`plugin-stage/`** (or a given path) into the final plugin directory under a configured search root (default: `/var/lib/evo/plugins/<plugin.name>/`); **not** leave partial trees in a `search_root` on failure. Optional flags for trust dirs and trust policy match `verify`. **Enable** / restart policy is product-specific; the tool documents what it can signal.
+- `uninstall <n>`: remove artefact from the installed plugin path, preserve state.
 - `purge <n>`: remove artefact and state.
+
+#### Plugin bundle archives (`pack` / `install`)
+
+A **plugin bundle** is a single directory on disk (containing `manifest.toml`, the artefact, and `manifest.sig` after signing). **Pack** wraps that directory in a standard archive; **install** unwraps (from a **stage** path, a local file, or a **URL**) and **promotes** into the final `plugins/<name>/` tree per **Strategy B** in section 7. The **inner layout** is identical for every format: one top-level directory per archive (the plugin bundle), not a bare scatter of files at the archive root.
+
+**Supported container / compression formats:**
+
+| Kind | Typical extensions | Role |
+|------|-------------------|------|
+| **gzip’d tar** | `.tar.gz`, `.tgz` | Default, universal on Unix-like systems, easy streaming. |
+| **xz’d tar** | `.tar.xz`, `.txz` | Smaller artefacts, common where xz is already in the build chain (e.g. many Linux distributions). |
+| **Zip** | `.zip` | Friendly to **Windows** and to operators using GUI tools; no tar dependency. |
+
+**Normative rules:**
+
+- **Semantic equivalence:** Unpacking any of the three formats for the same input directory yields the same file tree; only the **container and compression** differ. Verification (`verify`) and admission operate on the unpacked tree, not on the archive bitstream.
+- **Default:** If the implementation fixes a default when both `--out` and `--format` are omitted, it is **`.tar.gz`**.
+- **Discovery:** `install` must recognise all three by **magic bytes** or extension so mis-renamed files still work where feasible (zip and xz have distinct signatures; tar variants share `ustar` after decompression, so extension + `file(1)`-style sniffing is acceptable).
+
+Distributions and CI may standardise on one format for a product line; the evo project tests **all three** in the `evo-plugin-tool` integration matrix so authors are not locked to a single host OS.
 
 ### Example plugins
 

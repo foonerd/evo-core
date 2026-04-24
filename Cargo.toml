@@ -5,6 +5,7 @@ members = [
     "crates/evo-example-echo",
     "crates/evo-example-warden",
     "crates/evo-plugin-sdk",
+    "crates/evo-plugin-tool",
     "crates/evo-trust",
 ]
 

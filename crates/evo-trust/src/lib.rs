@@ -1,9 +1,16 @@
 //! Trust root loading, install digests, ed25519 plugin signatures, and
 //! revocations. See `docs/engineering/PLUGIN_PACKAGING.md` section 5.
 //!
-//! OS-level trust class enforcement (gap [12]) is out of this crate: this
-//! library only determines the effective [`TrustClass`] the steward should
-//! apply; the process still spawns with the same user until [12] lands.
+//! Scope split for gap [12]: this crate determines the effective
+//! [`evo_plugin_sdk::manifest::TrustClass`] the steward should apply to
+//! an out-of-process plugin based on its signature, its signing key's
+//! authorisation, and its install digest. It does not spawn the plugin
+//! and does not touch OS identity. Per-class UID/GID for out-of-process
+//! spawns lives behind the opt-in `[plugins.security]` config in
+//! `crates/evo/src/admission.rs` (see `PLUGIN_PACKAGING.md` section 5).
+//! Seccomp, capabilities, namespaces, and any deeper sandboxing remain
+//! distribution-owned; the reference path for Linux distributions is in
+//! `PLUGIN_PACKAGING.md` section 5.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

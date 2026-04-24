@@ -17,6 +17,108 @@ artefacts. Consult the git log for pre-0.1.8 history.
 
 ### Added
 
+- **Phase 2 second tightening (post-[20]/[12] empirical closure)**:
+  eleven items closed in a single commit; no gap re-opens.
+  `evo-plugin-tool --degrade-trust` could not be disabled from the
+  CLI because clap's default `SetTrue` action on a bool field with
+  `default_value_t = true` is one-way, so the strict-trust path
+  (`TrustOptions { degrade_trust: false }`) was unreachable from
+  the tool even though the library supported it and was tested
+  there - replaced with `--strict-trust` (off by default, opts in
+  to refusal) on Verify and Install; call sites invert via
+  `degrade_trust: !strict_trust`. Clap usage errors exited 2 by
+  default, colliding with the documented trust/signature exit 2
+  (PLUGIN_TOOL.md section 8) - `main` now uses `Cli::try_parse()`
+  and maps clap error kinds (DisplayHelp / DisplayVersion /
+  DisplayHelpOnMissingArgumentOrSubcommand -> 0; everything else
+  -> 1). Zip pack and extract silently dropped Unix mode, so a
+  bundle packed as `.zip` and installed landed with `plugin.bin`
+  at mode `0644` instead of `0755` and could not be executed at
+  admission - `archive.rs` now reads mode on pack via
+  `SimpleFileOptions::unix_permissions` and restores on extract
+  via `std::fs::Permissions::from_mode` from the zip entry's
+  `unix_mode()`; `#[cfg(unix)]`-guarded with no-op non-Unix
+  fallback. `install` was not atomic; `copy_dir_all(&bundle,
+  &dest)` could leave a partial tree in a `search_root` on
+  mid-copy I/O failure, violating PLUGIN_TOOL.md section 3 -
+  replaced with a stage-and-rename pattern: copy to a hidden
+  sibling `.<plugin.name>.installing.<pid>` first, `fs::rename`
+  into `dest` after the copy succeeds. `install::chown_tree`
+  wrapped `Command::status()`'s `io::Error` with
+  `anyhow::anyhow!`, losing the downcast pedigree so
+  `exit_code::code_from_error` returned exit 1 instead of exit 3
+  on chown launch failures - replaced with `.with_context(...)`
+  which preserves the `io::Error` through the anyhow chain.
+  Empirical coverage:
+  `crates/evo-plugin-tool/tests/cli_integration.rs` (new) with 18
+  tests driving the compiled binary via `std::process::Command`
+  (`env!("CARGO_BIN_EXE_evo-plugin-tool")`), covering every
+  documented exit code (0 / 1 / 2 / 3), the full sign-then-verify
+  round-trip for happy and sad paths, all three archive formats
+  with Unix mode preservation on the installed `plugin.bin`
+  (including the previously-failing zip path), install from local
+  directory, install rejection of unsigned bundles with an
+  empty-search-root invariant asserted, the PLUGIN_TOOL.md
+  section 2 archive-top-level-rename rule, the
+  staging-directory-not-left-behind invariant on success, and the
+  clap-error exit-code remapping for unknown subcommands and
+  unknown flags. Deterministic ed25519 seeds (`[0xAA; 32]`,
+  `[0xBB; 32]`) keep failures reproducible. `#![cfg(unix)]` -
+  Primary targets in `BUILDING.md` section 3 are all Unix.
+  `crates/evo-plugin-tool/tests/cli_smoke.rs` removed; its
+  `--help` check is now part of the integration suite alongside
+  `--version`, unknown-subcommand, and unknown-flag exit-code
+  tests. Hygiene: `crates/evo-trust/src/lib.rs` module rustdoc
+  rewritten to reflect the gap [12] PARTIAL scope split (trust
+  class decision in `evo-trust`; OS identity in
+  `crates/evo/src/admission.rs` behind `[plugins.security]`;
+  deeper sandboxing distribution-owned). URL install error wraps
+  `archive::extract` with a contextual message so "downloaded
+  URL did not contain a recognised plugin archive" is the
+  operator-facing diagnostic rather than "unrecognised archive:
+  /tmp/.../download". Pack `--format` help text corrected from
+  `tar_gz, tar_xz, zip` (the Rust variant names) to `tar-gz,
+  tar-xz, zip` (clap's kebab-case rendering, which is what the
+  user actually types). `crates/evo-plugin-tool/Cargo.toml`
+  gained a `[dev-dependencies]` block listing `ed25519-dalek`,
+  `pkcs8` (with the `pem` feature), `tempfile`, `tar`, and
+  `flate2`; binary-only crates do not expose `[dependencies]` to
+  integration tests. `GAPS.md` "Phase 2 (partial) - [13] and
+  [14]" Resolution Log entry's outcome line and "Remaining:"
+  sentence corrected - both still named [20] as pending even
+  though [20] closed v1 in an earlier commit. New "Phase 2
+  second tightening" Resolution Log entry appended.
+
+- **`crates/evo-plugin-tool`:** first implementation of the `evo-plugin-tool`
+  binary (`lint`, `sign`, `verify`, `pack`, `install`) as a thin CLI on
+  `evo-plugin-sdk` and `evo_trust`, with archives per `PLUGIN_PACKAGING` §9,
+  `install` URL cap (`--max-url-bytes`, default 256 MiB), optional `--chown`
+  via `chown(1)` on Unix, and **exit codes** 0–4 from `exit_code` +
+  `anyhow::Error::is` for trust / ureq / I/O. `uninstall` / `purge` remain
+  Phase 5. `GAPS` [20] closed for v1; `PLUGIN_TOOL.md` status updated.
+
+- **`docs/engineering/PLUGIN_TOOL.md`:** GAPS [20] normative spec for
+  `evo-plugin-tool` — v1 includes `lint` `sign` `verify` `pack` `install`
+  (uninstall/purge stay Phase 5); promote/rename to `plugin.name` when
+  the bundle top-level name differs; versatile `install` (path, stage,
+  HTTP(S) URL) with required safety limits; optional `--chown`; `sign` /
+  `verify` through `evo_trust` with `verify` defaults following the
+  steward; archive formats per `PLUGIN_PACKAGING` §9; **exit codes** 0–4
+  for CI/UI; default `pack` name with or without version; binary
+  `/opt/evo/bin/evo-plugin-tool` beside `evo`. `README` and
+  `PLUGIN_PACKAGING` §9 pointer; `GAPS` [20] **Decision: IMPLEMENT**
+  (pending) with this doc as authority.
+
+- **`PLUGIN_PACKAGING` §7 and §9** — installation: **Strategy A** (distribution
+  / system installer places final paths and extra OS integration) vs
+  **Strategy B** (upload to **`/var/lib/evo/plugin-stage/`**,
+  **`evo-plugin-tool install`** unpacks, verifies, promotes to
+  `plugins/<name>/`, must not leave partial trees in `search_roots`);
+  `plugin-stage/` added to the **§3** tree (not a `search_root`); third-party
+  table and `install` / archive text updated. §9 `pack` / `install`
+  archive contract: **`.tar.gz` / `.tgz`**, **`.tar.xz` / `.txz`**, and
+  **`.zip`** (same inner layout; default gzip’d tar; test matrix).
+
 - **Deployment stages and signing (dev / test / prod):** Authoritative
   documentation is now **`BOUNDARY.md` section 6.2** (stage tables, two
   Mermaid flowcharts, admission-path summary, cross-references). The

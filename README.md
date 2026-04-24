@@ -117,6 +117,7 @@ The doc set is grouped by what you are trying to do.
 | [PLUGIN_AUTHORING.md](docs/engineering/PLUGIN_AUTHORING.md) | Tutorial. Walkthroughs for respondents and wardens, in-process and wire. Manifest authoring, testing, before-you-ship checklist, common pitfalls. |
 | [PLUGIN_CONTRACT.md](docs/engineering/PLUGIN_CONTRACT.md) | Spec. The universal plugin contract in Rust trait and Unix-socket wire form, kept strictly aligned. Schema details in SCHEMAS.md section 4.2. |
 | [PLUGIN_PACKAGING.md](docs/engineering/PLUGIN_PACKAGING.md) | Manifest narrative, identity, signing, filesystem layout on target, installation lifecycle. Schema details in SCHEMAS.md section 3.1. |
+| [PLUGIN_TOOL.md](docs/engineering/PLUGIN_TOOL.md) | GAPS [20]: `evo-plugin-tool` implementation contract (subcommands, trust parity, install/URL, exit codes, archives). Complements PLUGIN_PACKAGING §9. |
 | [VENDOR_CONTRACT.md](docs/engineering/VENDOR_CONTRACT.md) | Who signs what. Actor taxonomy, namespace governance, vendor commitments, distribution relationships, revocation pathways. |
 
 ### Integrate with evo (consumers, frontends, bridges)

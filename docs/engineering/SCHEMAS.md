@@ -464,7 +464,7 @@ enable = <bool>                    # default false; when false, uid/gid tables i
 | `allow_unsigned` | bool | no | `false` | If `true`, unsigned plugins are admitted (at `sandbox` trust class only; see `VENDOR_CONTRACT.md`). |
 | `plugin_data_root` | string (path) | no | `"/var/lib/evo/plugins"` | Parent for per-plugin `state/` and `credentials/`. |
 | `runtime_dir` | string (path) | no | `"/var/run/evo/plugins"` | Directory for out-of-process plugin socket files `*.sock`. Paralleling the steward's own socket at `/var/run/evo/evo.sock` per FHS. |
-| `search_roots` | array of paths | no | `["/opt/evo/plugins", "/var/lib/evo/plugins"]` | Plugin bundle search order; later entry wins on duplicate `plugin.name`. |
+| `search_roots` | array of paths | no | `["/opt/evo/plugins", "/var/lib/evo/plugins"]` | Plugin bundle search order; later entry wins on duplicate `plugin.name`. Must **not** include `plugin-stage/` (incoming uploads); see `PLUGIN_PACKAGING.md` section 7. |
 | `trust_dir_opt` | string (path) | no | `"/opt/evo/trust"` | `*.pem` public keys; each `x.pem` requires `x.meta.toml` (see `PLUGIN_PACKAGING.md` §5). |
 | `trust_dir_etc` | string (path) | no | `"/etc/evo/trust.d"` | Additional operator `*.pem` keys. |
 | `revocations_path` | string (path) | no | `"/etc/evo/revocations.toml"` | Install-digest revocations. Missing file is an empty set. |
