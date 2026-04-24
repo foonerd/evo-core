@@ -24,12 +24,25 @@
 //! ## What's deferred
 //!
 //! - Persistence to disk (section 13).
-//! - Operator overrides file (section 12).
 //! - Full reconciliation algorithm (section 9.4).
 //! - Merge and split operations (section 10).
 //! - Subject happenings stream (section 14): replaced by tracing events
 //!   at `info` level until the happenings infrastructure exists.
 //! - Garbage collection beyond "delete when no addressings remain".
+//!
+//! Operator-facing override tooling is split between an OUT OF SCOPE
+//! decision and an IN SCOPE framework obligation. An in-steward
+//! override channel (a file or admin socket the steward reads as a
+//! parallel source of truth to plugin claims) is deliberately out of
+//! scope; see `BOUNDARY.md` section 6.1 and `GAPS.md` Resolution Log
+//! [28]. The companion IN SCOPE work (gap [29], Phase 3) adds the
+//! framework primitives a distribution administration plugin needs
+//! to implement complete correction: privileged cross-plugin retract,
+//! plugin-exposed merge and split, and administration-rack vocabulary.
+//! Today the subject registry offers same-plugin retract + re-announce
+//! via the `SubjectAnnouncer` callback, plus counter-claims at higher
+//! confidence for equivalence/distinctness (section 9.2 precedence).
+//! Cross-plugin corrections await [29].
 //!
 //! ## Concurrency
 //!

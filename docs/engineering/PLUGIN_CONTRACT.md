@@ -151,6 +151,14 @@ Request/response correlation: every steward-to-plugin message includes a `cid` (
 
 Errors are messages with an `error` field at the top level instead of verb-specific fields.
 
+### 9.1 Configuration Value Encoding
+
+The `load` verb carries the plugin's configuration as a JSON object (or CBOR equivalent) in a `config` field. The steward reads the on-disk configuration source (typically TOML) and converts it to the wire encoding at the boundary.
+
+TOML datetime values have no native JSON representation and are rejected at this conversion. A plugin's configuration that must carry a date or time across the wire represents it as an ISO-8601 string; the plugin parses on receipt. The steward emits a clear error naming the offending key if this rule is violated, and the plugin's `load` returns a permanent error in that case.
+
+In-process plugins are not affected: they receive the `toml::Table` through `LoadContext` verbatim and may handle datetimes natively. The constraint applies only to wire-transported configuration. Out-of-process plugin authors should document any datetime-shaped config fields as expecting string encoding so operators populate them correctly.
+
 ## 10. Identity on the Wire
 
 Every message exchanged between steward and plugin carries the plugin's canonical name (reverse-DNS, e.g. `org.evo.example.metadata.localtags`). The steward validates this name against the manifest at every message. A mismatch closes the connection.

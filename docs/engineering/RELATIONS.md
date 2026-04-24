@@ -334,41 +334,11 @@ Plugins that had claims on those relations are not notified individually; the st
 
 ## 9. Operator Overrides
 
-### 9.1 Override File
+In-steward operator-override channels (a file or admin socket the steward reads as a parallel source of truth to plugin claims) are out of scope for the framework. Operator-facing correction tooling is built by a distribution as an administration plugin composing framework primitives.
 
-Overrides live in `/etc/evo/relations.overrides.toml`. Optional; a missing file means no overrides.
+Today's primitives are limited: same-plugin retract per section 4.3 with a corrected re-assertion, and additive relation claims that coexist with contrary claims (the multi-claimant model of section 4.2 does not suppress). Cross-plugin retract and relation suppression (marking a relation so walks and projections hide it) require additional framework primitives scheduled in gap [29] (Phase 3).
 
-```toml
-# Force a relation to exist.
-[[assert]]
-source    = { id = "a1b2c3d4-..." }
-predicate = "album_of"
-target    = { id = "e5f6a7b8-..." }
-reason    = "Manual correction: plugins disagree."
-
-# Force a relation to NOT exist. Overrides any plugin claims.
-[[forbid]]
-source    = { id = "..." }
-predicate = "performed_by"
-target    = { id = "..." }
-reason    = "Incorrect match despite fuzzy metadata."
-```
-
-Addressings may be used instead of IDs; the steward resolves them at load time.
-
-### 9.2 Precedence
-
-Operator overrides beat every plugin claim:
-
-- A `[[assert]]` override creates a relation regardless of plugin claims. It persists even if no plugin asserts it.
-- A `[[forbid]]` override prevents a relation from existing. Plugin assertions that would create it are silently suppressed (with a `warn` log entry).
-- A forbid on a currently-existing relation removes it on load and emits `RelationForgotten`.
-
-### 9.3 Reload
-
-The file is loaded at startup and re-read on SIGHUP, consistent with subject overrides.
-
-A malformed file fails the reload with the previous state preserved. Errors are logged at `error` level.
+`BOUNDARY.md` section 6.1 is the authoritative document for this split. It scopes framework obligations (gap [28] OUT OF SCOPE, gap [29] IN SCOPE), describes the administration-plugin pattern, and carries a reference override-file schema whose directives are annotated with their implementation status against the as-shipped framework. Specifications previously drafted in this section have been relocated there.
 
 ## 10. Provenance and Audit
 
@@ -402,7 +372,6 @@ Active relation provenance persists for the life of the relation. Forgotten rela
 ### 11.1 What Persists
 
 - All active relations and their provenance.
-- The operator overrides file (durable copy).
 - The audit log of forgotten relations.
 
 ### 11.2 Location
@@ -468,7 +437,6 @@ Consumers subscribe to relation happenings to invalidate cached projections span
 | Walk algorithm (BFS, DFS, indexed precomputation) and its performance bounds | Engineering implementation pass |
 | In-memory cache strategy for hot neighbours | Engineering implementation pass |
 | Back-pressure mechanism for plugins asserting relations faster than the graph can ingest | Engineering implementation pass |
-| Whether operator overrides can define new predicates not present in the catalogue | Decided no for now; may revisit |
 | Rate-limiting and coalescing of `RelationCardinalityViolation` happenings when a bad plugin floods assertions | Engineering implementation pass |
 | Bulk-import API for initial catalogue population (e.g. first-run scan of a large library) | SDK pass 3 or later |
 | Whether walks can filter on relation provenance (e.g. "ignore claims from plugin X") | Future refinement; unclear the use case justifies complexity |

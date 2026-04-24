@@ -49,6 +49,30 @@ artefacts. Consult the git log for pre-0.1.8 history.
   consequence on lockfile entries.
 - `README.md` documentation index updated to list `MSRV.md` under the
   Operations section alongside `BUILDING.md`.
+- `docs/engineering/SUBJECTS.md` section 12 rewritten from a full
+  operator-overrides specification to a short pointer at
+  `BOUNDARY.md` section 6.1. Section 9.2 rule 1 ("operator overrides
+  always win") removed; remaining reconciliation rules renumbered and a
+  paragraph added clarifying that admin-plugin claims enter reconciliation
+  like any other plugin's claims, with `asserted` confidence the lever a
+  distribution uses to give them dominant weight. Sections 13.1 and 16 no
+  longer reference operator overrides.
+- `docs/engineering/RELATIONS.md` section 9 rewritten from a full
+  operator-overrides specification to a short pointer at `BOUNDARY.md`
+  section 6.1. Sections 11.1 and 14 no longer reference operator overrides.
+- `crates/evo/src/subjects.rs` and `crates/evo/src/relations.rs` module
+  headers: "Operator overrides file" removed from the "What's deferred"
+  list and replaced with a paragraph naming the out-of-scope decision
+  and pointing at `BOUNDARY.md` section 6.1.
+- `GAPS.md` gap inventory updated to reflect the Phase 0 decisions: [18]
+  IN SCOPE (implementation scheduled for Phase 6), [28] RESOLVED -
+  OUT OF SCOPE with narrowed scope (specifically the in-steward
+  override channel; the broader operator-correction concern split out
+  as [29]), [29] NEW gap opened IN SCOPE (Framework Correction
+  Primitives for Administration Plugins; Phase 3), LE-3 and LE-4
+  RESOLVED - IMPLEMENTED. The Phased Execution Order, Grouping by
+  Architectural Layer, and Phase 7 wording are updated to include
+  [29] and the narrowed [28] scope.
 
 ### Added
 
@@ -73,6 +97,39 @@ artefacts. Consult the git log for pre-0.1.8 history.
   the host entry additionally runs `cargo test`. This turns "MSRV 1.85 on
   host" into "MSRV 1.85 empirically verified on every target the project
   publicly commits to".
+- `docs/engineering/BOUNDARY.md` section 6.1 (new): "Runtime Data
+  Correction and Operator Overrides". Documents the responsibility split
+  between what is OUT OF SCOPE for the framework (the in-steward
+  override channel, gap [28]) and what is IN SCOPE (framework
+  correction primitives for administration plugins, gap [29]; Phase 3).
+  Describes the distribution-authored administration-plugin pattern,
+  scopes what works today against the as-shipped framework (same-plugin
+  retract + re-announce; counter-claims at `asserted` confidence for
+  subject equivalence/distinctness; additive relation claims) against
+  what requires gap [29] (privileged cross-plugin retract, plugin-
+  exposed subject merge and split, relation suppression, administration
+  rack vocabulary, reference administration plugin), and carries a
+  reference override-file TOML schema with per-directive annotations of
+  implementation status (relocated and re-scoped from the former
+  `SUBJECTS.md` section 12 and `RELATIONS.md` section 9). Distribution
+  authors on any platform find both the boundary and the framework
+  obligations named where they read first.
+- `docs/engineering/PLUGIN_CONTRACT.md` section 9.1 (new):
+  "Configuration Value Encoding". Documents the wire-boundary constraint
+  that TOML datetime values have no JSON representation and must be
+  encoded as ISO-8601 strings in wire-transported configuration. The
+  constraint was already enforced in `wire_client.rs`; this surfaces it
+  where plugin authors read the wire contract. Resolves loose end LE-3.
+- `GAPS.md` gap [29] (new): Framework Correction Primitives for
+  Administration Plugins. Companion IN SCOPE gap opened as part of the
+  [28] split. Scheduled for Phase 3 with six sub-concerns (privileged
+  cross-plugin retract, plugin-exposed subject merge, plugin-exposed
+  subject split, relation suppression, administration rack vocabulary
+  in CATALOGUE.md, reference administration plugin `crates/evo-example-admin`).
+- `GAPS.md` Resolution Log entries for [28] (OUT OF SCOPE, narrowed
+  scope, with spec relocation and companion [29] reference), LE-3
+  (IMPLEMENTED as documentation), and LE-4 (IMPLEMENTED as code
+  removal).
 
 ### Removed
 
@@ -82,6 +139,18 @@ artefacts. Consult the git log for pre-0.1.8 history.
   therefore Rust 1.85). With MSRV aligned to Trixie's rustc, the unpinned
   `clap = "4"` resolves cleanly. Removing the pin also restores normal
   security-patch uptake for clap.
+- `registry_event_sink` convenience helper in
+  `crates/evo/src/wire_client.rs`. The helper carried `#[allow(dead_code)]`
+  and had no production or test call sites; tests construct `EventSink`
+  struct literals inline through the `test_load_context` helper. Four
+  module-scope imports used only by the test module's outer scope
+  (`RegistrySubjectAnnouncer`, `RegistryRelationAnnouncer`,
+  `SubjectRegistry`, `RelationGraph`) are now gated with `#[cfg(test)]`
+  so non-test builds do not flag them as unused. A fifth name
+  (`LoggingStateReporter`), previously imported at module scope solely
+  for the removed helper, is dropped entirely; the test module
+  re-imports it inside `test_load_context`'s inner `use` statement as
+  needed. Resolves loose end LE-4.
 
 ### Rationale
 

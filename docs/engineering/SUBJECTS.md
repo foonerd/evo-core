@@ -309,11 +309,12 @@ Reconciliation runs every time a new claim or announcement introduces conflict w
 
 ### 9.2 The Core Rules
 
-1. Operator overrides (section 12) always win. No claim can override an operator directive.
-2. `distinct` claims beat `equivalent` claims of equal or lower confidence.
-3. Among `equivalent` claims, higher confidence wins.
-4. Among `equivalent` claims of equal confidence, the most recent wins.
-5. Rules 1-4 applied transitively: if A is equivalent to B and B is equivalent to C, then A is equivalent to C unless contradicted by a distinct claim at a higher or equal priority.
+1. `distinct` claims beat `equivalent` claims of equal or lower confidence.
+2. Among `equivalent` claims, higher confidence wins.
+3. Among `equivalent` claims of equal confidence, the most recent wins.
+4. Rules 1-3 applied transitively: if A is equivalent to B and B is equivalent to C, then A is equivalent to C unless contradicted by a distinct claim at a higher or equal priority.
+
+Operator-driven corrections (a distribution's admin plugin retracting a wrong claim and asserting a corrected one) enter the reconciliation the same way any other claim does. The admin plugin has no special precedence in the framework; its claims are weighed by the same confidence and recency rules. A distribution that wants admin-plugin claims to dominate plugin-originated ones issues them at `asserted` confidence, which beats `inferred` and `tentative` through rule 2. See `BOUNDARY.md` section 6.1 for the correction path.
 
 ### 9.3 Conflicts
 
@@ -404,51 +405,11 @@ All provenance is retained for the life of the subject. Deleted subjects retain 
 
 ## 12. Operator Overrides
 
-### 12.1 Override File
+In-steward operator-override channels (a file or admin socket the steward reads as a parallel source of truth to plugin claims) are out of scope for the framework. Operator-facing correction tooling is built by a distribution as an administration plugin composing framework primitives.
 
-Overrides live in `/etc/evo/subjects.overrides.toml`. The file is optional; a missing file means no overrides.
+Today's primitives cover equivalence and distinctness corrections: same-plugin retract + re-announce per section 7.5, and counter-claims at higher confidence per section 9.2 precedence. Cross-plugin retract (when the claiming plugin cannot or will not cooperate), subject type correction the administration plugin did not originate, and merge/split require additional framework primitives scheduled in gap [29] (Phase 3).
 
-Schema:
-
-```toml
-# Force two addressings to be equivalent.
-[[equivalent]]
-a = { scheme = "spotify", value = "track:X" }
-b = { scheme = "mbid",    value = "abc-def" }
-reason = "Manual correction: known mismapping in Spotify catalogue."
-
-# Force two addressings to be distinct.
-[[distinct]]
-a = { scheme = "spotify", value = "track:Y" }
-b = { scheme = "spotify", value = "track:Z" }
-reason = "Different remasters; acoustic fingerprint collides."
-
-# Force a subject's type.
-[[force_type]]
-id = "a1b2c3d4-..."
-type = "album"
-reason = "Incorrectly registered as track by legacy plugin."
-
-# Delete an addressing from the registry.
-[[forget_addressing]]
-scheme = "mpd-path"
-value = "/music/orphan.flac"
-reason = "File deleted; plugin never retracted."
-```
-
-### 12.2 Precedence
-
-Operator overrides beat every plugin claim. This is absolute. A plugin reasserting a conflicting claim produces no effect except a `warn`-level log entry noting the suppressed assertion.
-
-### 12.3 Reload
-
-The overrides file is loaded at startup and re-read on SIGHUP. A successful reload triggers a reconciliation pass; changes propagate to happenings.
-
-A malformed overrides file fails the reload and leaves the previous state intact; an error is logged at `error` level. The steward never enters a state where overrides are partially applied.
-
-### 12.4 Override Audit
-
-Override applications are audited with the same provenance surface as plugin claims. A `describe(id)` on a subject whose identity is shaped by an override returns the override as the claimant, not a plugin.
+`BOUNDARY.md` section 6.1 is the authoritative document for this split. It scopes framework obligations (gap [28] OUT OF SCOPE, gap [29] IN SCOPE), describes the administration-plugin pattern, and carries a reference override-file schema whose directives are annotated with their implementation status against the as-shipped framework. Specifications previously drafted in this section have been relocated there.
 
 ## 13. Persistence
 
@@ -459,7 +420,6 @@ The entire registry persists across steward restarts:
 - Subject records (ID, type, addressings, timestamps).
 - Provenance records.
 - Alias records from past merges and splits.
-- A durable copy of the last-applied overrides file.
 
 Plugin-internal state is NOT in this scope; plugins manage their own persistence under their per-plugin state directory per `PLUGIN_PACKAGING.md` section 3.
 
@@ -522,7 +482,6 @@ Happenings are the primary mechanism by which consumers stay current with subjec
 | Wire format for subject announcements and claims | SDK pass 3 |
 | Algorithm used by reconciliation and its complexity bound | Engineering implementation pass |
 | Whether confidence levels interact with claimant trust class (a `tentative` claim from a `platform`-trust plugin vs `asserted` from `standard`) | Future refinement, pending real-world conflict patterns |
-| Operator override UI beyond the TOML file | Future product layer |
 | Migration strategy when a distribution changes its subject type catalogue | Distribution contract, to be defined |
 | Garbage collection of subjects with no addressings and no references in the relation graph | Engineering implementation pass; needs relation graph to exist first |
 | Whether plugins may subscribe to happenings about subjects they did not claim | SDK pass 3 and `PROJECTIONS.md` |

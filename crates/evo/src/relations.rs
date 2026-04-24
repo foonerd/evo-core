@@ -35,10 +35,23 @@
 //!   references. A follow-up pass wires the subject registry to the
 //!   graph for cascade cleanup.
 //! - Persistence to disk (section 13).
-//! - Operator overrides file (section 12).
 //! - Relation happenings stream (section 14): surfaced via tracing
 //!   events at `info`/`warn` levels until the happenings
 //!   infrastructure exists.
+//!
+//! Operator-facing override tooling is split between an OUT OF SCOPE
+//! decision and an IN SCOPE framework obligation. An in-steward
+//! override channel (a file or admin socket the steward reads as a
+//! parallel source of truth to plugin claims) is deliberately out of
+//! scope; see `BOUNDARY.md` section 6.1 and `GAPS.md` Resolution Log
+//! [28]. The companion IN SCOPE work (gap [29], Phase 3) adds the
+//! framework primitives a distribution administration plugin needs to
+//! implement complete correction: privileged cross-plugin retract,
+//! relation suppression, and administration-rack vocabulary. Today
+//! the graph offers same-plugin retract + corrected assertion via the
+//! `RelationAnnouncer` callback. Counter-claims add to the
+//! multi-claimant set (section 4.2) but do not suppress contrary
+//! claims; relation suppression awaits [29].
 //!
 //! ## Concurrency
 //!

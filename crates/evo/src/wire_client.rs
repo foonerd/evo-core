@@ -53,12 +53,13 @@
 //!
 //! [`Warden`]: evo_plugin_sdk::contract::Warden
 
-use crate::context::{
-    LoggingStateReporter, RegistryRelationAnnouncer, RegistrySubjectAnnouncer,
-};
+#[cfg(test)]
+use crate::context::{RegistryRelationAnnouncer, RegistrySubjectAnnouncer};
 use crate::custody::{CustodyLedger, LedgerCustodyStateReporter};
 use crate::happenings::HappeningBus;
+#[cfg(test)]
 use crate::relations::RelationGraph;
+#[cfg(test)]
 use crate::subjects::SubjectRegistry;
 use evo_plugin_sdk::codec::{read_frame_json, write_frame_json, WireError};
 use evo_plugin_sdk::contract::{
@@ -1393,41 +1394,6 @@ fn toml_value_to_json_value(
         }
         Value::Table(t) => toml_table_to_json_value(t)?,
     })
-}
-
-// ---------------------------------------------------------------------
-// Convenience: build an EventSink backed by a plugin name and the
-// steward's registries.
-// ---------------------------------------------------------------------
-
-/// Helper used from tests and the admission path: build an
-/// [`EventSink`] backed by the steward's registries, tagged with
-/// the given plugin name as claimant.
-///
-/// The `custody_state_reporter` slot is always `None` in the helper;
-/// callers that need one (the warden admission path) construct the
-/// sink directly.
-#[allow(dead_code)]
-pub(crate) fn registry_event_sink(
-    plugin_name: &str,
-    registry: Arc<SubjectRegistry>,
-    graph: Arc<RelationGraph>,
-) -> EventSink {
-    EventSink {
-        state_reporter: Arc::new(LoggingStateReporter::new(
-            plugin_name.to_string(),
-        )),
-        subject_announcer: Arc::new(RegistrySubjectAnnouncer::new(
-            Arc::clone(&registry),
-            plugin_name.to_string(),
-        )),
-        relation_announcer: Arc::new(RegistryRelationAnnouncer::new(
-            registry,
-            graph,
-            plugin_name.to_string(),
-        )),
-        custody_state_reporter: None,
-    }
 }
 
 // =====================================================================

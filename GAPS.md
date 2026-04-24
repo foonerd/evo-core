@@ -33,6 +33,106 @@ Items are worked one at a time. For each item:
 3. If OUT OF SCOPE: list every doc, schema field, and code stub that must change to remove the promise.
 4. Execute. Commit. Strike the item. Append to the Resolution Log at the bottom.
 
+## Phased Execution Order
+
+Agreed 2026-04-24. Governs the sequence in which items below are closed. The constraint is that v0.1.9 does not ship until every numbered gap, every DC-* contradiction, and every LE-* loose end resolves to IMPLEMENTED or OUT OF SCOPE. No intermediate tags are cut between v0.1.8 and v0.1.9; work lands on main as normal commits and the version number does not move until the register is empty.
+
+### Phase 0 - Close the meta-work
+
+Purpose: stop the inventory from lying; avoid building on fuzzy scope.
+
+- Append Resolution Log entries for landed doc fixes (DC-1, DC-3, DC-4) and the partial DC-2 doc fix.
+- Tighten stale Notes on [9] and [10] to reflect the post-reconciliation state.
+- Split [28] (operator overrides) into [28] narrowed to the in-steward override channel (OUT OF SCOPE) and [29] framework correction primitives for administration plugins (IN SCOPE, scheduled for Phase 3). BOUNDARY.md section 6.1 documents both halves of the split honestly (what is OOS, what is IN SCOPE, what works today against the as-shipped framework, what requires [29]).
+- Close LE-3: document the wire TOML datetime constraint in PLUGIN_CONTRACT.md.
+- Close LE-4: remove the `registry_event_sink` helper from `wire_client.rs`.
+
+[18] is NOT a Phase 0 item. It was considered as an OUT OF SCOPE candidate and decided IN SCOPE on 2026-04-24. See Phase 6 for its implementation schedule.
+
+### Phase 1 - Bootstrap: steward loads a real device
+
+Order inside phase: [1] then [22] then [17] decision.
+
+- [1] Plugin Discovery. Walks `/opt/evo/plugins/` and `/var/lib/evo/plugins/`, loads manifests, admits via AdmissionEngine. Unblocks every subsequent phase: tests stop requiring custom admission harnesses and distributions stop carrying one.
+- [22] Plugin Credentials and State Directories. Pairs with [1]: steward creates and permissions `/var/lib/evo/plugins/<name>/credentials/` (0600) and `/var/lib/evo/plugins/<name>/state/`. Avoids paths existing by luck.
+- [17] Essence Enforcement at Startup. Either IMPLEMENT a minimal operational-catalogue predicate, or OUT OF SCOPE with an explicit statement that an empty catalogue is a valid running state. The decision is deliberately punted from Phase 0 because the right answer depends on what [1] surfaces during implementation.
+
+### Phase 2 - Security and supply chain
+
+One vertical slice: manifest trust becomes real, not text. Includes the sign / verify / pack half of the plugin tool so operators have a single workflow from day one.
+
+Design first: trust model (keys, roots, digest algorithm, canonical signing payload). Then:
+
+- [13] Signature verification. ed25519 over manifest plus artefact digest; trust root loading from `/opt/evo/trust/` and `/etc/evo/trust.d/`.
+- [14] Revocation. Digest-based entries in `/etc/evo/revocations.toml`.
+- [12] Trust class OS enforcement. Map the trust-class taxonomy to seccomp, namespaces, capabilities, and user separation per PLUGIN_PACKAGING section 5.
+- [23] Manifest resource and prerequisite declarations. Enforce, or explicitly strip the fields that cannot be enforced. Must align with whatever [12] actually provides at the OS level.
+- [20] evo-plugin-tool sign / verify / pack subcommands. Parallel with [13] / [14]. The remaining subcommands (install / uninstall / purge / lint) land in Phase 5.
+
+LE-1 (mock harness) is optional in this phase; typically better after SDK surfaces stabilise.
+
+### Phase 3 - Durable fabric (data plane)
+
+Order: [7] then [25] then [26] then [11] then [10] then [27] then [29].
+
+Rationale: persistence design first (so scope is known), then catalogue becomes law (predicate and type validation), then cardinality and dangling-edge cleanup build on grounded predicates and types, then [29] adds the trust-gated correction primitives that require a grounded grammar and clean graph to be safe.
+
+- [7] Persistence. Subjects, relations, custody ledger survive restart. Scope per STEWARD plus a design doc added during this phase.
+- [25] Predicate existence validation at assertion.
+- [26] Subject type validation against catalogue.
+- [11] Inverse predicate consistency.
+- [10] Relation cardinality enforcement. Runs after predicates, types, and inverses are grounded.
+- [27] Dangling relation GC on subject forget.
+- [29] Framework correction primitives for administration plugins. Privileged cross-plugin retract, plugin-exposed subject merge and split, relation suppression, administration rack vocabulary in CATALOGUE.md, reference administration plugin (`crates/evo-example-admin`). Runs last in this phase because it depends on a grounded grammar ([25], [26], [11], [10]) and on dangling-edge hygiene ([27]) to be safely trust-gated, and because its privilege story ([12] from Phase 2) must be settled. SDK-level gating can proceed in parallel with Phase 2 if the trust-class model is clear early; OS-level enforcement folds in with [12].
+
+### Phase 4 - Coordination plane (time, conditions, instances, latency)
+
+Shared instruction-model design first (used by [2] and [3]). Then:
+
+- [2] Appointments Rack. Time-originated instructions, alarm records, RTC wake programming.
+- [3] Watches Rack. Condition-originated instructions on the same instruction API as [2].
+- [4] Factory Plugin Admission. In-process and wire both. Partial transport coverage does NOT close the gap (from the gap's own text).
+- [8] Fast Path. Landed last so latency budgets are not redesigned twice.
+
+### Phase 5 - Admin surface and tool ecosystem
+
+- [15] Plugins Administration Rack. Stewards `plugins.installed` / `plugins.admission` / `plugins.operator` shelves from real state. Depends on [7] persistence and [1] discovery.
+- [9] Shelf shape version semantics. Range negotiation and the "supported range" data model. Do when [15] and the catalogue are active.
+- [19] Catalogue schemas repository. Sibling repo `evo-catalogue-schemas` with per-shelf TOML shape definitions. Pairs with [9].
+- [20] evo-plugin-tool remainder (install / uninstall / purge / lint). Completes the tool started in Phase 2.
+
+### Phase 6 - Consumers and plugin contracts
+
+- [5] User interaction routing. End-to-end prompt routing across in-process, wire, and consumer surface. The wire path currently returns a hard protocol error; resolution covers both transports.
+- [6] Rack-keyed projections. State-report channel plus composition.
+- [16] Projection push subscriptions. After [6] establishes the composition.
+- [18] Happenings enrichment. Four sub-concerns, scheduled together because they share the happenings-stream surface:
+  - Server-side filtering of the happenings stream (consumer subscribes with filter criteria; steward only sends matching events).
+  - Aggregation/coalescing (rate-limited updates where many rapid happenings collapse into one).
+  - Additional variant types as concrete needs surface (not a blanket "more variants"; each new variant is justified by a consumer use case at implementation time).
+  - Durable replay ("give me every happening since timestamp T"). Depends on Phase 3 persistence ([7]) for cross-restart replay; in-memory ring-buffer replay is available earlier if needed.
+- [24] Runtime capabilities dispatch. Gate `request_type` at the admission engine, not only inside the plugin.
+- [21] Hot reload. After load lifecycle (and possibly [15] operator verbs) are stable.
+
+### Phase 7 - Remainders
+
+With [28] closed in Phase 0 (OUT OF SCOPE, narrowed to the in-steward override channel), [29] scheduled into Phase 3 (IN SCOPE; the framework correction primitives for administration plugins), and [18] scheduled into Phase 6 (IN SCOPE), Phase 7 catches any straggler LE-* items that did not close earlier:
+
+- LE-1 (SDK testing module) if it did not close during Phase 2. It is listed as optional there, so may arrive here.
+- LE-2 (wire protocol v1 feature list) closes implicitly when [4], [5], and [21] all close. Phase 7 verifies the list in `crates/evo-plugin-sdk/src/wire.rs` reflects the final state and updates it if needed.
+
+If every LE-* item is already closed by the time Phases 1-6 complete, Phase 7 is empty and v0.1.9 can tag.
+
+### Parallelism
+
+After Phase 1: Phases 2 and 3 can overlap if the interface between "catalogue in hand" and "trust for plugins" is agreed early. Phases 4 and 5 share dependencies: [15] wants [7] and [1] both done. Phase 6 waits on admission and client-protocol stories being stable.
+
+### Rules so the order does not rot
+
+- One Resolution Log entry per closed item, naming IMPLEMENT (with commit hash) or OUT OF SCOPE (with the exact list of doc and schema removals).
+- "Almost closed" is not closed. Partial transport coverage for [4], for example, does not close that gap.
+- Re-visit OUT OF SCOPE decisions at the end of every two phases. The framework must not accumulate features it will not own.
+
 ## Grouping by Architectural Layer
 
 The inventory is numbered sequentially to preserve references from prior discussion. The table below orients the items by the architectural layer each belongs to.
@@ -40,7 +140,7 @@ The inventory is numbered sequentially to preserve references from prior discuss
 - A. Bootstrap and Operational Truth: [1], [15], [17], [19], [20]
 - B. Security and Supply Chain: [12], [13], [14], [22], [23]
 - C. Coordination Plane (fabric producers): [2], [3], [4], [8]
-- D. Data Plane (subjects, relations, projections, persistence): [6], [7], [10], [11], [16], [25], [26], [27], [28]
+- D. Data Plane (subjects, relations, projections, persistence): [6], [7], [10], [11], [16], [25], [26], [27], [28], [29]
 - E. Plugin Behavior Contract: [5], [9], [21], [24]
 - F. Observability and Policy: [18]
 
@@ -89,12 +189,14 @@ These are not numbered gaps in the inventory; they are honest boundaries for int
 ### [LE-3] TOML datetimes not supported on plugin wire
 
 - `crates/evo/src/wire_client.rs` reports an error for TOML `datetime` values in frames that use TOML conversion. Integrators must use wire-safe encodings.
-- Document in PLUGIN_CONTRACT or STEWARD as a hard constraint, or add support; until then, behaviour is intentional and must be discoverable in docs.
+- Status: RESOLVED - IMPLEMENTED (documentation).
+- Resolution: PLUGIN_CONTRACT.md section 9.1 (new) documents the constraint explicitly in the message-schema section where plugin authors read wire format. Behaviour unchanged (already enforced in `wire_client.rs`); the gap was purely that the constraint was undiscoverable.
 
 ### [LE-4] `registry_event_sink` in wire_client is allow(dead_code)
 
 - Helper at `wire_client.rs` is unused in production; kept for test-style construction. Creates maintenance noise and vendor questions.
-- Resolution: use it, gate with `#[cfg(test)]`, or remove in favour of explicit `EventSink` construction at call sites.
+- Status: RESOLVED - IMPLEMENTED (code removal).
+- Resolution: helper and its preceding comment divider removed from `wire_client.rs`. No production or test call sites existed; tests construct `EventSink` struct literals inline via `test_load_context`. Four supporting imports used only by the test module's outer scope (`RegistrySubjectAnnouncer`, `RegistryRelationAnnouncer`, `SubjectRegistry`, `RelationGraph`) gated with `#[cfg(test)]`. A fifth name (`LoggingStateReporter`) that had been imported at module scope solely for the removed helper was dropped entirely; the test module re-imports it inside `test_load_context`'s own `use` statement as needed.
 
 ## Gap Inventory
 
@@ -177,7 +279,7 @@ These are not numbered gaps in the inventory; they are honest boundaries for int
 - Author hits: a shelf cannot evolve while preserving compatibility with older plugins. Every shape bump forces every plugin to upgrade in lockstep.
 - Status: OPEN
 - Decision:
-- Notes: correction from prior wording. The issue is incomplete evolution semantics (range negotiation missing), not "any mismatch admits silently" - admission is strict. See [DC-1] for the contradicting doc that must be fixed regardless.
+- Notes: the issue is incomplete evolution semantics (range negotiation and the "supported range" data model are missing). Admission itself enforces strict equality correctly. The former doc-vs-code contradiction on this was closed as DC-1 in commit `cc5173e`; see the Resolution Log. Scheduled for Phase 5.
 
 ### [10] Relation Cardinality Enforcement
 
@@ -186,7 +288,7 @@ These are not numbered gaps in the inventory; they are honest boundaries for int
 - Author hits: a predicate declared "at_most_one" accepts unlimited assertions. The grammar is decorative.
 - Status: OPEN
 - Decision:
-- Notes: see [DC-2] - catalogue.rs comments claim warnings are logged; they are not.
+- Notes: DC-2's doc portion closed in commit `75dfc9e` (CATALOGUE no longer claims warnings are emitted). The code gap remains: `relations.rs` silently accepts any cardinality. Scheduled for Phase 3, after [25], [26], and [11] ground predicate and type validation.
 
 ### [11] Inverse Predicate Consistency
 
@@ -255,10 +357,13 @@ These are not numbered gaps in the inventory; they are honest boundaries for int
 
 - Promised: STEWARD section 12.2 lists server-side filtering, aggregation/coalescing, additional variants, durable replay.
 - On disk: broadcast firehose, client-side filtering only.
-- Candidate for OUT OF SCOPE classification: the bus as shipped is coherent; enrichment is genuinely a future feature set rather than a broken promise. The only legitimate product-policy call in the inventory.
-- Status: OPEN
-- Decision:
-- Notes:
+- Status: OPEN - IN SCOPE (decided; implementation scheduled for Phase 6)
+- Decision: IN SCOPE. The enrichment work stays in the framework. Rationale: the four sub-concerns (server-side filtering, coalescing, additional variants, durable replay) share the happenings-stream surface. Delivering them once in the framework gives every distribution the same consumer contract rather than fragmenting the surface across per-distribution implementations. The multi-distribution framework posture (any platform: Debian-based, Yocto-based, FreeBSD, macOS, Android, Buildroot, Alpine, vendor-custom) favours owning cross-cutting producer concerns in evo-core.
+- Notes: scheduled for Phase 6 per the Phased Execution Order section. Implementation splits into four sub-concerns:
+  - Server-side filtering of the happenings stream (consumer subscribes with filter criteria; steward only sends matching events).
+  - Aggregation/coalescing (rate-limited updates where many rapid happenings collapse into one).
+  - Additional variant types as concrete needs surface (each new variant justified by a consumer use case at implementation time; not a blanket expansion).
+  - Durable replay ("give me every happening since timestamp T"). Depends on Phase 3 persistence (gap [7]) for cross-restart replay; in-memory ring-buffer replay is available earlier if needed.
 
 ### [19] Catalogue Schemas Repository
 
@@ -341,17 +446,98 @@ These are not numbered gaps in the inventory; they are honest boundaries for int
 - Decision:
 - Notes:
 
-### [28] Operator Overrides for Subjects and Relations
+### [28] In-Steward Operator-Override Channel
 
-- Promised: subjects.rs and relations.rs both acknowledge operator-override files as an intended mechanism for correcting identity reconciliation mistakes and removing bad assertions.
-- On disk: no loader, no file format, no override application in the announcement pipeline.
-- Operator hits: cannot correct a subject reconciliation mistake, cannot remove a wrongly-asserted relation, short of plugin restart with corrected data.
-- Status: OPEN
-- Decision:
-- Notes: this is an explicit candidate for OUT OF SCOPE if operator-side override is judged to belong in a future administration layer rather than in the steward itself.
+- Promised (pre-decision): SUBJECTS.md section 12 and RELATIONS.md section 9 specified operator-override TOML files at `/etc/evo/subjects.overrides.toml` and `/etc/evo/relations.overrides.toml` that the steward itself would read, parse, and apply as a parallel source of truth to plugin claims, with SIGHUP reload and absolute precedence over every plugin claim.
+- On disk (pre-decision): no loader, no file format, no override application in the announcement pipeline. The spec described an unimplemented feature.
+- Status: RESOLVED - OUT OF SCOPE (narrowed scope: specifically the in-steward override channel; the broader operator-correction concern is the subject of gap [29]).
+- Decision: OUT OF SCOPE for the in-steward override channel. An override channel in the steward itself creates a second source of truth parallel to plugin claims with different trust, reload, and audit semantics; that complexity must be earned by a distribution use case rather than imposed by the framework. Operator-facing correction tooling is a distribution responsibility per BOUNDARY.md section 6.1, composed from framework primitives.
+- Notes: the broader operator-correction concern is NOT dropped. The gap was split during Phase 0 once it became clear that the as-shipped framework lacks the primitives a distribution administration plugin needs to implement complete correction tooling (cross-plugin retract, plugin-exposed merge/split, relation suppression, administration rack vocabulary, reference administration plugin). Those primitives are now tracked as gap [29] (IN SCOPE, Phase 3). BOUNDARY.md section 6.1 documents both halves of the split honestly: what is OUT OF SCOPE (this gap), what IS in scope (gap [29]), what works today against the as-shipped framework, and what requires [29]. The reference override-file schema is relocated into BOUNDARY.md section 6.1 with each directive annotated by implementation status so distribution implementers plan staged rollout.
+
+### [29] Framework Correction Primitives for Administration Plugins
+
+- Promised: BOUNDARY.md section 6.1 (new in this commit) describes an administration-plugin pattern for operator-facing data correction. The pattern's completeness depends on a set of framework primitives that do not exist today. Specifically: SUBJECTS.md section 7.5 and RELATIONS.md section 4.3 scope retraction to the asserting plugin; SUBJECTS.md section 10 describes merge and split as operator operations but exposes no plugin-callable API; RELATIONS.md 4.2 has no relation-suppression primitive; CATALOGUE.md has no standard administration-rack vocabulary; no reference administration plugin exists.
+- On disk: same-plugin retract + re-announce works. Counter-claims at `asserted` confidence work for subject equivalence/distinctness per SUBJECTS.md 9.2 precedence. Additive relation claims work but do not suppress contrary claims. Cross-plugin retract, plugin-exposed subject merge/split, relation suppression, administration-rack vocabulary, reference administration plugin: none exist.
+- Distribution hits: a distribution building an administration plugin per BOUNDARY.md 6.1 covers equivalence/distinctness corrections and additive relation claims but cannot implement cross-plugin addressing removal, subject type correction the admin plugin did not originate, merge, split, or relation suppression from within the plugin API the framework provides.
+- Status: OPEN - IN SCOPE (decided 2026-04-24; implementation scheduled for Phase 3)
+- Decision: IN SCOPE. Without these primitives the administration-plugin pattern BOUNDARY.md 6.1 describes is partial. Because the primitives touch subject registry and relation graph internals and must be trust-gated, they are framework-owned; the alternative (every distribution reimplementing or working around the missing surface) is not achievable and would fragment the contract consumers see.
+- Notes: scheduled for Phase 3 per the Phased Execution Order. Implementation splits into six sub-concerns that share the data-plane touchpoint but are each independently reviewable:
+  - Privileged cross-plugin retraction: SDK addition; trust-class-gated in the admission engine; provenance captures the retracting administration plugin's identity; new happening variants for cross-plugin retract audit.
+  - Plugin-exposed subject merge: SDK addition; SUBJECTS.md section 10.1 semantics; trust-gated; `SubjectMerged` happening already specified, now wired to the plugin-callable path.
+  - Plugin-exposed subject split: SDK addition; SUBJECTS.md section 10.2 semantics; trust-gated; partition strategy carried in the call.
+  - Relation suppression: design and implementation in the relation graph (suppressed-flag claim kind or equivalent); walk layer and projection layer filter suppressed relations; new `RelationSuppressed` happening.
+  - Standard administration rack vocabulary in CATALOGUE.md: per-distribution catalogues stock standard shelf shapes for admin surfaces if they want operator correction tooling.
+  - Reference administration plugin (`crates/evo-example-admin`): new crate in the workspace; demonstrates the full mechanism end-to-end; companion integration test exercises cross-plugin retract, merge, split, and relation suppression against a realistic test fixture.
+  Trust class dependency: privilege-gating for the cross-plugin primitives interacts with gap [12] (Trust Class OS Enforcement, Phase 2). [29] can proceed in parallel with the rest of Phase 3 provided the trust-class model is clear by the end of Phase 2; otherwise [29]'s SDK-level gating can be declared upfront and the OS-level enforcement folded in when [12] lands.
 
 ## Resolution Log
 
-Entries appended here as gaps close. Each entry names the gap, the chosen outcome (IMPLEMENT or OUT OF SCOPE), the commit or commit series that realised it, and the date. This log is the permanent record; the gap entries above are struck through or removed as they close.
+Entries appended here as gaps close. Each entry names the item, the chosen outcome (IMPLEMENT or OUT OF SCOPE), the commit or commit series that realised it, and the rationale. This log is the permanent record; the gap entries above are struck through or removed as they close.
 
-(empty)
+### DC-1 - Shape-version doc reconciliation
+
+Outcome: IMPLEMENTED. Doc-only change; the code was already correct and this was purely reconciling the documentation to match admission.rs behaviour.
+
+Summary: CATALOGUE section 4.2 and 7.1, STEWARD section 12.4, and SCHEMAS (manifest `target.shape` constraint, rules 3.1.3, and schema versioning table) now state strict equality as the admission rule today. The open work of range negotiation and the "supported range" data model is distinguished as gap [9] and scheduled for Phase 5. SCHEMAS cross-references [13] where signing is still aspirational.
+
+Commits: `cc5173e`.
+
+### DC-2 - Cardinality-warning doc reconciliation (partial)
+
+Outcome: PARTIAL. The documentation portion is IMPLEMENTED; the behavioural portion remains as gap [10].
+
+Summary: CATALOGUE sections 5.2 and 7.1 now state the truth, namely that no warning is emitted on cardinality violation today. The behavioural work (actually enforcing cardinality on assertion) stays under gap [10] and is scheduled for Phase 3.
+
+Commits (docs): `75dfc9e`.
+
+### DC-3 - projections.rs module header reconciliation
+
+Outcome: IMPLEMENTED. Doc-only change.
+
+Summary: The `crates/evo/src/projections.rs` module header previously stated the client-socket pull query for projections was unimplemented. It is in fact implemented: `op: "project_subject"` in `server.rs` dispatches to `ProjectionEngine::project_subject`. Module docs updated to match. Remaining projection work stays under gaps [6] (rack-keyed) and [16] (push subscription), both scheduled for Phase 6.
+
+Commits: `75dfc9e`.
+
+### DC-4 - happenings.rs module header reconciliation
+
+Outcome: IMPLEMENTED. Doc-only change.
+
+Summary: The `crates/evo/src/happenings.rs` module header previously stated the `subscribe_happenings` op was deferred. It is in fact implemented in `server.rs` and streams from `HappeningBus`. Module docs updated to match. Enrichment, durable replay, and server-side filtering remain under gap [18] and STEWARD section 12.2; disposition of [18] is decided in Phase 0.
+
+Commits: `75dfc9e`.
+
+### [28] - In-Steward Operator-Override Channel
+
+Outcome: OUT OF SCOPE (narrowed from the original gap's broader scope). The framework does not gain an in-steward override channel that reads a file or admin socket as a parallel source of truth to plugin claims. The broader operator-correction concern was split during Phase 0: this decision (OUT OF SCOPE for the in-steward channel) and gap [29] (IN SCOPE for framework correction primitives a distribution administration plugin can compose).
+
+Rationale: the steward is not an admin panel. Adding an in-steward override channel creates a second source of truth parallel to plugin claims with different trust, reload, and audit. That complexity is warranted only when a specific distribution use case justifies it, and must be earned by the distribution rather than imposed by the framework. The concern is not silently dropped: BOUNDARY.md section 6.1 documents the division of responsibilities honestly, names what works today with the as-shipped framework (same-plugin retract+re-announce; counter-claims at `asserted` confidence for equivalence/distinctness; additive relation claims), names what requires gap [29] (privileged cross-plugin retract, plugin-exposed merge/split, relation suppression, administration rack vocabulary, reference administration plugin), and carries a reference override-file TOML schema whose directives are annotated by implementation status so distribution implementers plan staged rollout.
+
+Changes:
+
+- BOUNDARY.md section 6.1 (new): Runtime Data Correction and Operator Overrides. States the in-steward-channel OOS decision, cross-references gap [29] for the companion IN SCOPE work, describes the administration-plugin pattern, scopes what works today against the as-shipped framework versus what requires [29], and carries an annotated reference TOML schema.
+- SUBJECTS.md section 12: rewritten from full spec to pointer at BOUNDARY.md section 6.1.
+- SUBJECTS.md section 9.2: rule 1 (operator overrides always win) removed; rules renumbered; new paragraph on admin-plugin claims.
+- SUBJECTS.md section 13.1 and 16: incidental references removed.
+- RELATIONS.md section 9: rewritten from full spec to pointer at BOUNDARY.md section 6.1.
+- RELATIONS.md section 11.1 and 14: incidental references removed.
+- crates/evo/src/subjects.rs and crates/evo/src/relations.rs module headers: deferred-bullet removed, OOS paragraph added that distinguishes the in-steward-channel OOS decision (this gap) from the correction-primitives IN SCOPE work (gap [29]) and names what works today on the same-plugin path.
+
+Follow-on: gap [29] (Framework Correction Primitives for Administration Plugins) opened as the IN SCOPE companion, scheduled for Phase 3.
+
+Commits: this commit.
+
+### LE-3 - Wire TOML datetime constraint documented
+
+Outcome: IMPLEMENTED (documentation).
+
+Summary: `crates/evo/src/wire_client.rs` has always rejected `toml::Value::Datetime` at the wire-edge config conversion with a clear error message. The constraint was undocumented in the plugin-facing contract, leaving wire-plugin authors to discover it at runtime. PLUGIN_CONTRACT.md section 9.1 (new) documents the constraint in the message-schema section: TOML datetimes have no JSON representation and must be encoded as ISO-8601 strings in wire-transported configuration. In-process plugins receive `toml::Table` verbatim through `LoadContext` and are unaffected. No code change; behaviour was already correct and is now discoverable.
+
+Commits: this commit.
+
+### LE-4 - registry_event_sink helper removed
+
+Outcome: IMPLEMENTED (code removal).
+
+Summary: `crates/evo/src/wire_client.rs` carried a `#[allow(dead_code)]` `pub(crate) fn registry_event_sink(...)` helper that built an `EventSink` from a plugin name and the steward's registries. The helper had no production or test call sites; tests construct `EventSink` struct literals inline through the `test_load_context` helper. The helper and its preceding comment divider are removed. Four module-scope imports used only by the test module's outer scope (`RegistrySubjectAnnouncer`, `RegistryRelationAnnouncer`, `SubjectRegistry`, `RelationGraph`) are gated with `#[cfg(test)]` so non-test builds do not flag them as unused. A fifth name (`LoggingStateReporter`) that had been imported at module scope solely for the removed helper is dropped entirely; the test module re-imports it inside `test_load_context`'s inner `use` statement as needed. Verification gate (fmt, clippy, tests, build) must pass.
+
+Commits: this commit.

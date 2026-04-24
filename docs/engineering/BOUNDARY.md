@@ -108,6 +108,145 @@ A distribution MAY additionally maintain:
 
 None of these cross the boundary back into evo-core.
 
+### 6.1 Runtime Data Correction and Operator Overrides
+
+This subsection documents a responsibility split that every distribution shipping evo must plan for explicitly. One half is a boundary that evo-core does not cross (operator correction is not an in-steward channel). The other half is a set of framework primitives the framework owes distributions so that their correction tooling can actually be complete. Both are named here, in the boundary document, so that no distribution reaches this point by accident and so that the framework's obligations are as explicit as the distribution's.
+
+**The concern.** A running fabric accumulates runtime state: subjects in the registry, relations in the graph, provenance records. Plugins assert and retract as the world changes. Identity reconciliation (`SUBJECTS.md` section 9) produces a canonical subject per real-world thing. Relation assertions (`RELATIONS.md` section 4) populate a typed graph.
+
+This state can become wrong.
+
+- Two plugins announce the same real-world track under different canonical identities because their equivalence claims fail to link up.
+- A fuzzy-matching metadata plugin asserts `performed_by` between a track and the wrong artist because title and duration collide with a namesake.
+- A plugin exits uncleanly without retracting its claims, leaving stale addressings no operator can dislodge through the plugin path.
+- A user visibly sees the wrong album art on their HMI and presses a button expecting the device to correct it.
+
+Something must be able to correct this state.
+
+**Out of scope for the framework (gap [28]).** An out-of-band administrative channel in the steward itself. Specifically:
+
+- No operator-override file read by the steward as a parallel source of truth to plugin claims.
+- No admin socket or admin API exposed by the steward that rewrites the subject registry or relation graph from outside plugin claims.
+- No in-steward privilege that bypasses the plugin lifecycle.
+- No `/etc/evo/subjects.overrides.toml` or `/etc/evo/relations.overrides.toml` in the steward's filesystem contract.
+
+An override channel in the steward creates a second source of truth parallel to plugin claims with different trust, reload, and audit semantics. That complexity is warranted only when specific distribution use cases justify it and must be earned by the distribution, not imposed by the framework.
+
+**In scope for the framework (gap [29], Phase 3).** A set of SDK-exposed, trust-class-gated primitives that a distribution-authored administration plugin can compose into complete operator-facing correction tooling. Without these primitives, the administration-plugin pattern below is partial: some correction cases work today, others are unreachable from within the plugin API the framework provides. The primitives tracked under gap [29] are:
+
+- **Privileged cross-plugin retraction.** Today `SUBJECTS.md` section 7.5 and `RELATIONS.md` section 4.3 scope retraction to the claiming plugin. An elevated-trust administration plugin needs the capability to retract another plugin's claims when the owning plugin cannot or will not (stale addressings from a crashed plugin, corrections a non-admin plugin cannot perform on itself). Provenance captures the retracting administration plugin's identity so audit remains intact.
+- **Plugin-exposed subject merge and split.** `SUBJECTS.md` section 10 describes merge and split as "operator operations". Today the framework exposes no plugin-callable API for them. Gap [29] exposes both through the SDK, trust-gated, so an administration plugin can drive them on operator request.
+- **Relation suppression.** Relations are multi-claimant (`RELATIONS.md` 4.2); counter-claims add, they do not subtract. An administration plugin needs a framework-level way to mark a relation as suppressed that the walk and projection layers honour. Gap [29] specifies the mechanism (a suppressed-flag claim kind, a new `RelationSuppressed` happening, and walk/projection filtering).
+- **Standard administration-rack vocabulary in CATALOGUE.md.** Catalogues that take operator correction seriously declare an `administration` rack with standard shelves. Declaring the rack is how a distribution says "I take this responsibility". Consumers (admin panels, diagnostic tools) target the standard vocabulary instead of per-distribution shapes.
+- **Reference administration plugin.** `crates/evo-example-admin` (new), parallel to `evo-example-echo` and `evo-example-warden`. Reads the reference override-file shape below, drives the framework primitives above end-to-end. Distributions fork, extend, or use verbatim.
+
+**What works today, before gap [29] lands.** Distributions that want to begin shipping correction tooling ahead of Phase 3 have a meaningful but incomplete surface:
+
+- **Same-plugin retract + re-announce.** A plugin that made a wrong claim can retract its own addressings (`SUBJECTS.md` 7.5) or relation claims (`RELATIONS.md` 4.3) and issue corrected ones. This is the correct path when the plugin is still running, cooperative, and fixable from within.
+- **Counter-claims for subject equivalence and distinctness.** An administration plugin that sees a wrong reconciliation can assert an equivalence or distinctness claim at `asserted` confidence; `SUBJECTS.md` section 9.2 gives the higher-confidence claim precedence, and the administration plugin's correction becomes the reconciliation outcome.
+- **Additive relation claims.** An administration plugin can assert a correct relation that coexists with any contrary plugin claims. Consumers see both; the graph does not suppress until gap [29]'s relation-suppression primitive lands.
+
+What does NOT work today: cross-plugin retraction, type correction of subjects the administration plugin did not claim, merge, split, and relation suppression. These require gap [29].
+
+**What a distribution builds.** Any combination of the following, shaped to the product:
+
+- **An administration plugin.** A distribution-authored plugin admitted through the normal admission path. It reads whatever input the distribution deems authoritative (an override file, an admin HTTP endpoint, a UI-originated instruction, a vendor-specific management protocol) and drives correction through the framework surfaces that exist today (counter-claims at `asserted` confidence; additive relation claims; same-plugin retractions on its own claims) plus whatever the distribution finds acceptable to defer until [29] lands. Its trust class (per `PLUGIN_PACKAGING.md`) reflects its elevated role and will gate access to [29] primitives when they ship.
+- **An operator-facing surface.** An HMI button, a CLI, a web admin panel, a mobile app. Collects operator intent and routes it to the administration plugin (directly via a distribution-specific socket, or through the steward's client protocol via a consumer-level instruction routed to the administration plugin's shelf).
+- **Policy.** Who may request a correction (owner / admin / authenticated driver / anyone). What is auditable. What requires confirmation. How corrections propagate to other user-visible surfaces.
+- **File format, if one is wanted.** A distribution that wants a TOML override file (for operators editing by hand or for orchestration tools writing declaratively) chooses its schema. A reference shape is provided below; a distribution may adopt, extend, replace, or ignore it.
+
+**Reference override-file schema (distribution guidance, not framework contract).**
+
+Distributions that implement a TOML override file may find the following shape a useful starting point. It was worked out during evo-core's engineering layer and is preserved here so distributions do not re-derive it from scratch. Adopt, extend, replace, or ignore as suits the product. The framework does not read this file; only the distribution's administration plugin does, and that plugin is free to choose any format it prefers.
+
+Each directive is annotated with its implementation status against the as-shipped framework so a distribution can plan a staged rollout.
+
+Subject overrides:
+
+```toml
+# Force two addressings to be equivalent. Administration plugin
+# asserts an equivalence claim at `asserted` confidence;
+# SUBJECTS.md 9.2 gives it precedence over `inferred` and
+# `tentative` claims.
+# Status: implementable today.
+[[equivalent]]
+a = { scheme = "spotify", value = "track:X" }
+b = { scheme = "mbid",    value = "abc-def" }
+reason = "Manual correction: known mismapping in Spotify catalogue."
+
+# Force two addressings to be distinct. Administration plugin
+# asserts a distinctness claim; SUBJECTS.md 9.2 gives distinctness
+# precedence over equivalence of equal or lower confidence.
+# Status: implementable today.
+[[distinct]]
+a = { scheme = "spotify", value = "track:Y" }
+b = { scheme = "spotify", value = "track:Z" }
+reason = "Different remasters; acoustic fingerprint collides."
+
+# Correct a subject's type. Requires the original claiming plugin
+# to retract and re-announce under the corrected type, OR the
+# cross-plugin type-correction primitive from gap [29].
+# Status: requires gap [29].
+[[force_type]]
+id = "a1b2c3d4-..."
+type = "album"
+reason = "Incorrectly registered as track by legacy plugin."
+
+# Remove an addressing whose owning plugin will not retract.
+# Requires the privileged cross-plugin retract primitive from
+# gap [29].
+# Status: requires gap [29].
+[[forget_addressing]]
+scheme = "mpd-path"
+value = "/music/orphan.flac"
+reason = "File deleted; plugin never retracted."
+```
+
+Relation overrides:
+
+```toml
+# Force a relation to exist. Administration plugin asserts the
+# relation as its own claim. The relation coexists with any
+# contrary plugin claims today (relations are multi-claimant;
+# consumers see all claims).
+# Status: implementable today, with caveat: cannot remove
+# contrary claims until gap [29]'s relation-suppression
+# primitive lands.
+[[assert]]
+source    = { id = "a1b2c3d4-..." }
+predicate = "album_of"
+target    = { id = "e5f6a7b8-..." }
+reason    = "Manual correction: plugins disagree."
+
+# Suppress a relation. No equivalent exists in the as-shipped
+# framework; counter-claims add to the graph, they do not
+# subtract. Requires gap [29]'s relation-suppression primitive.
+# Status: requires gap [29].
+[[forbid]]
+source    = { id = "..." }
+predicate = "performed_by"
+target    = { id = "..." }
+reason    = "Incorrect match despite fuzzy metadata."
+```
+
+**Key points for the distribution implementer.**
+
+- Plan for a staged rollout. Ship the administration plugin with what works today (counter-claims for subject equivalence/distinctness; additive relation claims that coexist with contrary plugin claims; same-plugin retractions). Close the remaining gaps (cross-plugin retract, type correction, merge, split, relation suppression) when gap [29] lands in Phase 3.
+- Every correction that lands in the registry or graph does so as a plugin claim (the administration plugin's claim, or eventually a privileged retraction attributed to the administration plugin). The single-source-of-truth invariant is preserved; audit flows through the normal provenance surface.
+- Reload semantics (SIGHUP, file-watch, polling) are the administration plugin's concern, not the steward's.
+- Audit of operator actions is stored in whatever surface the administration plugin chooses (its own log, journald, a distribution-specific database). Plugin-claim provenance in the subject registry and relation graph already captures the audit of the resulting data changes.
+- Trust of the administration plugin is a distribution and operator concern. `VENDOR_CONTRACT.md` position 5 (operator sovereignty over trust) applies: the operator decides what administration plugin runs on their device. Gap [29]'s trust-class gating for the privileged primitives makes this sovereignty enforceable.
+
+**Cross-references.**
+
+- `SUBJECTS.md` section 7.5 (plugin retract contract for subject addressings; same-plugin only today).
+- `RELATIONS.md` section 4.3 (plugin retract contract for relation claims; same-plugin only today).
+- `SUBJECTS.md` section 10 (merge and split semantics; plugin-callable API scheduled for gap [29]).
+- `PLUGIN_PACKAGING.md` (manifest, trust class, signing for the administration plugin).
+- `VENDOR_CONTRACT.md` (trust and key authorisation for distribution-shipped administration tooling).
+- `GAPS.md` Resolution Log entry for [28] (the OUT OF SCOPE decision for the in-steward channel).
+- `GAPS.md` gap [29] (the IN SCOPE companion: framework correction primitives for administration plugins; Phase 3).
+
 ## 7. What a Distribution MAY Replace vs MUST Accept
 
 The boundary is bidirectional. Some choices are the distribution's; some are the framework's.
