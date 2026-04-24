@@ -16,11 +16,14 @@
 //! [plugins]
 //! allow_unsigned = false
 //! # plugin_data_root, runtime_dir, search_roots,
-//! # trust_dir_opt, trust_dir_etc, revocations_path, degrade_trust:
+//! # trust_dir_opt, trust_dir_etc, revocations_path, degrade_trust, security:
 //! # see CONFIG.md section 3 / SCHEMAS.md section 3.3.
 //! ```
 
+use std::collections::BTreeMap;
+
 use crate::error::StewardError;
+use evo_plugin_sdk::manifest::TrustClass;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -230,6 +233,11 @@ pub struct PluginsSection {
     /// refusing. If `false`, that situation is a hard error.
     #[serde(default = "default_degrade_trust")]
     pub degrade_trust: bool,
+    /// Optional per-trust-class Unix identity for out-of-process plugin
+    /// spawns. See [`PluginsSecurityConfig`]. Default: disabled; all
+    /// plugins run as the steward user.
+    #[serde(default)]
+    pub security: PluginsSecurityConfig,
 }
 
 fn default_plugin_data_root_path() -> PathBuf {
@@ -274,7 +282,51 @@ impl Default for PluginsSection {
             trust_dir_etc: default_trust_dir_etc(),
             revocations_path: default_revocations_path(),
             degrade_trust: default_degrade_trust(),
+            security: PluginsSecurityConfig::default(),
         }
+    }
+}
+
+/// Configures optional per-trust-class OS identity for out-of-process
+/// plugin processes (`[plugins.security]` in `evo.toml`). When disabled
+/// (the default), the steward’s behaviour is unchanged: every plugin
+/// process runs as the same user as the steward. When enabled, classes
+/// listed in [`Self::uid`] (and optional [`Self::gid`]) are applied on
+/// Unix with `setgid` / `setuid` before `exec` (see
+/// `std::os::unix::process::CommandExt`). Distributions that enable this
+/// must create the corresponding system users and file/socket DAC as
+/// appropriate; the steward does not implement seccomp, capabilities, or
+/// namespace isolation. See `PLUGIN_PACKAGING.md` section 5.
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginsSecurityConfig {
+    /// When `true`, spawns that have a `uid` entry for the effective
+    /// trust class use that identity. When `false` (the default), `uid`
+    /// and `gid` are ignored.
+    #[serde(default)]
+    pub enable: bool,
+    /// Per effective [`TrustClass`], the Unix user ID of the child
+    /// process. TOML keys are lowercase: `platform`, `privileged`, etc.
+    /// Classes not present here spawn as the steward.
+    #[serde(default)]
+    pub uid: BTreeMap<TrustClass, u32>,
+    /// Per-class GID. If a class is absent, its UID (from `uid`) is
+    /// used as the GID.
+    #[serde(default)]
+    pub gid: BTreeMap<TrustClass, u32>,
+}
+
+impl PluginsSecurityConfig {
+    /// Returns the `(uid, gid)` to apply to the child when [`Self::enable`]
+    /// is true and `uid` contains an entry for `class`. GID defaults to
+    /// the same as UID when not overridden in `gid`. Returns `None` when
+    /// identity mapping is disabled or this class is not listed in `uid`.
+    pub fn uid_gid_for_class(&self, class: TrustClass) -> Option<(u32, u32)> {
+        if !self.enable {
+            return None;
+        }
+        let uid = self.uid.get(&class).copied()?;
+        let gid = self.gid.get(&class).copied().unwrap_or(uid);
+        Some((uid, gid))
     }
 }
 
@@ -302,6 +354,8 @@ mod tests {
         assert_eq!(cfg.plugins.trust_dir_etc, default_trust_dir_etc());
         assert_eq!(cfg.plugins.revocations_path, default_revocations_path());
         assert!(cfg.plugins.degrade_trust);
+        assert!(!cfg.plugins.security.enable);
+        assert!(cfg.plugins.security.uid.is_empty());
     }
 
     #[test]
@@ -346,6 +400,55 @@ allow_unsigned = true
             PathBuf::from("/etc/evo/catalogue.toml")
         );
         assert!(cfg.plugins.allow_unsigned);
+    }
+
+    #[test]
+    fn plugins_security_toml_parses() {
+        let cfg = StewardConfig::from_toml(
+            r#"
+[plugins.security]
+enable = true
+
+[plugins.security.uid]
+standard = 2001
+sandbox = 2002
+
+[plugins.security.gid]
+sandbox = 2003
+"#,
+        )
+        .unwrap();
+        assert!(cfg.plugins.security.enable);
+        assert_eq!(
+            *cfg.plugins.security.uid.get(&TrustClass::Standard).unwrap(),
+            2001
+        );
+        assert_eq!(
+            cfg.plugins
+                .security
+                .uid_gid_for_class(TrustClass::Standard)
+                .unwrap(),
+            (2001, 2001)
+        );
+        assert_eq!(
+            cfg.plugins
+                .security
+                .uid_gid_for_class(TrustClass::Sandbox)
+                .unwrap(),
+            (2002, 2003)
+        );
+    }
+
+    #[test]
+    fn plugins_security_uid_gid_for_class_respects_enable() {
+        let mut s = PluginsSecurityConfig {
+            enable: false,
+            uid: BTreeMap::from([(TrustClass::Platform, 99)]),
+            ..Default::default()
+        };
+        assert_eq!(s.uid_gid_for_class(TrustClass::Platform), None);
+        s.enable = true;
+        assert_eq!(s.uid_gid_for_class(TrustClass::Platform), Some((99, 99)));
     }
 
     #[test]

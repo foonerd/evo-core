@@ -17,6 +17,16 @@ artefacts. Consult the git log for pre-0.1.8 history.
 
 ### Added
 
+- **Optional per-trust-class OS identity (GAPS [12] PARTIAL):** `[plugins.security]`
+  in `StewardConfig` with `enable`, per-class `uid` and `gid` maps;
+  `PluginsSecurityConfig::uid_gid_for_class` and
+  `AdmissionEngine::set_plugins_security`. On Unix, out-of-process
+  plugin spawns use `setgid`/`setuid` when a mapping exists for the
+  *effective* trust class after verification. Default remains one
+  service identity for all plugins. Documented in `CONFIG.md`, `STEWARD.md`
+  11.1, `SCHEMAS.md` 3.3, `PLUGIN_PACKAGING.md` §5 (admission vs optional
+  OS), and `GAPS.md` [12].
+
 - **Phase 2 tightening (post-closure, GAPS [13], [14])**: end-to-end
   coverage for `evo_trust::verify_out_of_process_bundle` in
   `crates/evo-trust/tests/verify.rs` (twelve tests: valid signature

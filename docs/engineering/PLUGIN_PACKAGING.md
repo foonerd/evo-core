@@ -210,15 +210,21 @@ At install time, the steward computes the install digest as `SHA-256(manifest.to
 
 ### Trust classes
 
-Five tiers, declared in the manifest, enforced by the steward, authorised by the signing key.
+Five tiers, declared in the manifest, **authorised at admission** by the signing key and the steward’s admission policy (`degrade_trust`, `allow_unsigned`).
 
-| Trust class | Permitted behaviours |
-|-------------|----------------------|
+| Trust class | Semantics in the fabric and packaging (normative) |
+|-------------|--------------------------------------------------|
 | `platform` | May run in-process. May hold system-wide custody (power, network). Typically first-party. |
-| `privileged` | May run as a separate process with elevated OS capabilities (CAP_NET_ADMIN, specific sudoers). |
-| `standard` | May run as a separate process as the evo service user. Outbound network per manifest declaration. |
-| `unprivileged` | May run as a separate process in a restricted user/namespace. No outbound network unless declared and approved. |
-| `sandbox` | Runs inside a sandbox (seccomp, namespace, or Wasm). No direct syscalls. |
+| `privileged` | May run as a separate process; distribution may map this to elevated OS capabilities (e.g. capability sets, `sudo` fragments, device access). |
+| `standard` | May run as a separate process; typical appliances run the whole evo service as a single install-time user (see `CONFIG.md`). |
+| `unprivileged` | Weaker or restricted behaviour in the product contract; the manifest signals intent to consumers and to signing policy. |
+| `sandbox` | Most constrained in contract (e.g. unsigned admission only when the operator allows it; Wasm or heavily isolated builds in some products). |
+
+**What the steward enforces by default (always):** signature and key authorisation, effective `TrustClass` on the record, and the transport/admission rules in this repository.
+
+**What is optional in `evo.toml` (Unix):** the steward can apply **per effective trust class** a mapped Unix **UID and GID** to out-of-process child processes via `[plugins.security]` in `CONFIG.md` / `SCHEMAS.md` (opt-in, default off). A typical high-quality A/V appliance may leave this disabled: one service user, predictable real-time and device access, trust concentrated at the image and signing level.
+
+**What remains distribution- or product-specific** unless integrated elsewhere: seccomp profiles, additional Linux capabilities, network namespaces, SELinux, Android sandbox, and so on. Those are not hard requirements of the evo core steward; a distribution maps the trust table to its OS in the way that matches its product (e.g. locked appliance, desktop, or automotive build).
 
 ### Signing
 

@@ -430,6 +430,16 @@ trust_dir_opt = "<path>"           # optional; default "/opt/evo/trust"
 trust_dir_etc = "<path>"           # optional; default "/etc/evo/trust.d"
 revocations_path = "<path>"        # optional; default "/etc/evo/revocations.toml"
 degrade_trust = <bool>             # optional; default true
+
+# Optional: per-trust-class Unix identity for out-of-process plugin
+# spawns; default = disabled (entire [plugins.security] is optional)
+[plugins.security]
+enable = <bool>                    # default false; when false, uid/gid tables ignored
+[plugins.security.uid]             # optional: keys are trust class names, values are u32
+# platform = 2010
+# standard = 2011
+[plugins.security.gid]            # optional; if a class is missing, gid = uid for that class
+# sandbox = 2015
 ```
 
 #### 3.3.2 Field Reference
@@ -459,6 +469,9 @@ degrade_trust = <bool>             # optional; default true
 | `trust_dir_etc` | string (path) | no | `"/etc/evo/trust.d"` | Additional operator `*.pem` keys. |
 | `revocations_path` | string (path) | no | `"/etc/evo/revocations.toml"` | Install-digest revocations. Missing file is an empty set. |
 | `degrade_trust` | bool | no | `true` | If a signing key is weaker than the manifest’s declared class, admit at the key’s max instead of refusing. |
+| `security.enable` | bool | no | `false` | When `true` (Unix), out-of-process spawns with a `security.uid` entry for the *effective* trust class use that UID; optional per-class GID in `security.gid`, defaulting the GID to the UID. |
+| `security.uid` | table | no | (empty) | Map trust class (string key, same names as the manifest) → UID. Unmapped classes: child runs as the steward. |
+| `security.gid` | table | no | (empty) | Optional per-class GID; if absent for a class, that class’s GID = its UID. |
 
 #### 3.3.3 File Location and Override Precedence
 
@@ -472,7 +485,7 @@ Per-field overrides (highest precedence first):
 - `log_level`: `--log-level` CLI flag > `RUST_LOG` env var > `config.steward.log_level` > hardcoded `"warn"`.
 - `socket_path`: `--socket` CLI flag > `config.steward.socket_path` > default.
 - `catalogue.path`: `--catalogue` CLI flag > `config.catalogue.path` > default.
-- `allow_unsigned`, `plugin_data_root`, `runtime_dir`, `search_roots`, `trust_dir_opt`, `trust_dir_etc`, `revocations_path`, `degrade_trust`: config file only.
+- `allow_unsigned`, `plugin_data_root`, `runtime_dir`, `search_roots`, `trust_dir_opt`, `trust_dir_etc`, `revocations_path`, `degrade_trust`, `plugins.security.*`: config file only.
 
 #### 3.3.4 Example
 

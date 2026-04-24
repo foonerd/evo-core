@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         config.plugins.plugin_data_root.clone(),
     );
     engine.set_plugin_trust(Some(trust));
+    engine.set_plugins_security(config.plugins.security.clone());
     plugin_discovery::discover_and_admit(&mut engine, &catalogue, &config)
         .await?;
 

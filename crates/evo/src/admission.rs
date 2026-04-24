@@ -24,6 +24,7 @@
 //! plugins in a single collection.
 
 use crate::catalogue::Catalogue;
+use crate::config::PluginsSecurityConfig;
 use crate::context::{
     LoggingInstanceAnnouncer, LoggingStateReporter,
     LoggingUserInteractionRequester, RegistryRelationAnnouncer,
@@ -403,6 +404,10 @@ pub struct AdmissionEngine {
     /// Optional: signature and revocation state for disk-bundled
     /// out-of-process plugins. `None` skips trust checks (harnesses).
     plugin_trust: Option<Arc<PluginTrustState>>,
+    /// Optional per-class Unix UID/GID for out-of-process spawns (see
+    /// [`StewardConfig`](crate::config::StewardConfig) `[plugins.security]`).
+    /// Default: disabled. Ignored on non-Unix.
+    plugins_security: PluginsSecurityConfig,
 }
 
 fn default_plugin_data_root() -> PathBuf {
@@ -421,6 +426,7 @@ impl Default for AdmissionEngine {
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
             plugin_data_root: default_plugin_data_root(),
             plugin_trust: None,
+            plugins_security: PluginsSecurityConfig::default(),
         }
     }
 }
@@ -493,6 +499,15 @@ impl AdmissionEngine {
         self.plugin_trust = trust;
     }
 
+    /// Set optional per-trust-class OS identity for out-of-process plugin
+    /// spawns. The shipped `evo` binary passes
+    /// [`StewardConfig::plugins`](crate::config::StewardConfig) `.security`
+    /// here. `Default` is the no-op: every plugin process runs as the
+    /// steward user.
+    pub fn set_plugins_security(&mut self, security: PluginsSecurityConfig) {
+        self.plugins_security = security;
+    }
+
     /// Construct an admission engine sharing an existing subject
     /// registry. Useful for tests that want to pre-populate or inspect
     /// the registry from outside. A fresh relation graph is created.
@@ -507,6 +522,7 @@ impl AdmissionEngine {
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
             plugin_data_root: default_plugin_data_root(),
             plugin_trust: None,
+            plugins_security: PluginsSecurityConfig::default(),
         }
     }
 
@@ -528,6 +544,7 @@ impl AdmissionEngine {
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
             plugin_data_root: default_plugin_data_root(),
             plugin_trust: None,
+            plugins_security: PluginsSecurityConfig::default(),
         }
     }
 
@@ -555,6 +572,7 @@ impl AdmissionEngine {
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
             plugin_data_root: default_plugin_data_root(),
             plugin_trust: None,
+            plugins_security: PluginsSecurityConfig::default(),
         }
     }
 
@@ -583,6 +601,7 @@ impl AdmissionEngine {
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
             plugin_data_root: default_plugin_data_root(),
             plugin_trust: None,
+            plugins_security: PluginsSecurityConfig::default(),
         }
     }
 
@@ -1154,7 +1173,12 @@ impl AdmissionEngine {
     ///    plugin name: `<runtime_dir>/<plugin-name>.sock`.
     /// 5. Spawns the plugin binary with that socket path as argv[1].
     ///    The child is spawned with `kill_on_drop(true)` so it cannot
-    ///    outlive this engine even if shutdown is never called.
+    ///    outlive this engine even if shutdown is never called. On Unix,
+    ///    if [`Self::set_plugins_security`] was used and
+    ///    [`PluginsSecurityConfig::uid_gid_for_class`](crate::config::PluginsSecurityConfig::uid_gid_for_class)
+    ///    returns an identity for the effective trust class, the child
+    ///    is launched under that `setuid` / `setgid` identity; otherwise
+    ///    it runs as the steward.
     /// 6. Polls for the socket to become connectable while checking
     ///    that the child has not already exited. Times out after
     ///    [`SOCKET_READY_TIMEOUT`].
@@ -1264,17 +1288,36 @@ impl AdmissionEngine {
             }
         }
 
-        // Spawn the child.
-        let mut child = Command::new(&exec_path)
-            .arg(&socket_path)
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                StewardError::io(
-                    format!("spawning plugin binary {}", exec_path.display()),
-                    e,
-                )
-            })?;
+        // Spawn the child. Optional [plugins.security] applies per
+        // effective trust class on Unix; non-Unix targets ignore the map.
+        let mut cmd = Command::new(&exec_path);
+        cmd.arg(&socket_path).kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            if let Some((uid, gid)) = self
+                .plugins_security
+                .uid_gid_for_class(manifest.trust.class)
+            {
+                // Inherent methods on `tokio::process::Command` (Unix)
+                // mirror `std::os::unix::process::CommandExt`. Apply gid
+                // before uid to match the usual drop-privilege order.
+                cmd.gid(gid);
+                cmd.uid(uid);
+                tracing::info!(
+                    plugin = %manifest.plugin.name,
+                    class = ?manifest.trust.class,
+                    uid,
+                    gid,
+                    "plugin process will run as mapped OS identity (plugins.security)"
+                );
+            }
+        }
+        let mut child = cmd.spawn().map_err(|e| {
+            StewardError::io(
+                format!("spawning plugin binary {}", exec_path.display()),
+                e,
+            )
+        })?;
 
         tracing::info!(
             plugin = %manifest.plugin.name,

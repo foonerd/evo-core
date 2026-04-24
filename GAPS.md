@@ -61,7 +61,7 @@ Order inside phase was: [1] then [22] then [17] decision.
 
 ### Phase 2 - Security and supply chain
 
-Status: **partial** — [13] and [14] closed; [12], [20], and [23] open.
+Status: **partial** — [13] and [14] closed; [12] opt-in OS identity (PARTIAL, see below); [20] and [23] open.
 
 One vertical slice: manifest trust becomes real, not text. Includes the sign / verify / pack half of the plugin tool so operators have a single workflow from day one.
 
@@ -69,7 +69,7 @@ Design first: trust model (keys, roots, digest algorithm, canonical signing payl
 
 - [13] Signature verification. **Closed** — `evo-trust` + `AdmissionEngine::set_plugin_trust` + `[plugins]` trust path fields; see gap inventory.
 - [14] Revocation. **Closed** — `RevocationSet` and install-digest check. Default path `/etc/evo/revocations.toml` (configurable).
-- [12] Trust class OS enforcement. Map the trust-class taxonomy to seccomp, namespaces, capabilities, and user separation per PLUGIN_PACKAGING section 5.
+- [12] Trust class OS enforcement. **PARTIAL** — optional `[plugins.security]` (per-class UID/GID on OOP spawns, Unix; default off). Seccomp, namespaces, and capability sets remain distribution-owned; see gap [12] body and `PLUGIN_PACKAGING` §5.
 - [23] Manifest resource and prerequisite declarations. Enforce, or explicitly strip the fields that cannot be enforced. Must align with whatever [12] actually provides at the OS level.
 - [20] evo-plugin-tool sign / verify / pack subcommands. Parallel with [13] / [14]. The remaining subcommands (install / uninstall / purge / lint) land in Phase 5.
 
@@ -305,12 +305,12 @@ These are not numbered gaps in the inventory; they are honest boundaries for int
 
 ### [12] Trust Class OS Enforcement
 
-- Promised: PLUGIN_PACKAGING section 5 defines five trust tiers with distinct OS-level privilege envelopes (seccomp, namespaces, capabilities, user separation).
-- On disk: trust class is a string in the manifest, stored by the admission engine, never consulted for OS privilege. Every out-of-process plugin runs as the same user with identical capabilities.
-- Operator hits: a manifest declaring class = "sandbox" runs identically to one declaring class = "platform". The trust taxonomy is a comment.
-- Status: OPEN
-- Decision:
-- Notes:
+- Promised: PLUGIN_PACKAGING section 5 describes trust tiers, admission binding to signing keys, and (optionally) per-class OS identity on out-of-process spawns. Heavier isolation (seccomp, caps, namespaces) remains product- or distribution-owned.
+- On disk: effective `TrustClass` is set at admission. Optional `[plugins.security]` in `StewardConfig` may map `TrustClass` to UID/GID; when enabled, `AdmissionEngine` applies `setuid` / `setgid` on Unix before `exec` for the matching class. When disabled (default) or a class is unmapped, the child runs as the steward user. Seccomp / capability sets are not set by the steward in-tree.
+- Operator hits: with default config, OOP plugins match legacy behaviour (same user as the steward). Operators who need separation enable `[plugins.security]` and provision system users, socket and state directory permissions, and any further sandboxing in systemd, LSM, or the image. See `CONFIG.md` and `StewardConfig` `plugins.security`.
+- Status: PARTIAL — opt-in OS identity
+- Decision: `plugins.security` optional UID/GID in config + spawn wiring (Unix). Deeper per-tier seccomp/namespace/cap enforcement remains **OUT OF SCOPE** for a minimal core unless added later (see PLUGIN_PACKAGING §5 split).
+- Notes: Bit-perfect / single-service-user products may leave this off; "security-freak" or multi-tenant packagers can turn it on. Android/automotive shapes use their own sandbox; this file documents the Linux reference path.
 
 ### [13] Plugin Signature Verification
 
@@ -578,9 +578,9 @@ Verification: the standard gate (`cargo fmt --all -- --check`, `cargo clippy --w
 
 ### Phase 2 (partial) — [13] and [14]
 
-Outcome: [13] and [14] RESOLVED — IMPLEMENTED; [12], [20], and [23] remain OPEN in Phase 2.
+Outcome: [13] and [14] RESOLVED — IMPLEMENTED; [12] PARTIAL (opt-in `plugins.security`); [20] and [23] remain OPEN in Phase 2.
 
-Summary: New `crates/evo-trust` provides install digest, `manifest.sig` ed25519 verification, PEM + `*.meta.toml` trust roots, name-prefix and `max_trust_class` authorisation with `degrade_trust` policy, and `revocations.toml` digest set. `StewardConfig` `[plugins]` adds `trust_dir_opt`, `trust_dir_etc`, `revocations_path`, and `degrade_trust`. `AdmissionEngine` holds `Option<Arc<PluginTrustState>>` and `set_plugin_trust`; the binary always loads trust. Harnesses that omit `set_plugin_trust` skip crypto (existing tests). Remaining: `evo-plugin-tool` (sign/verify/pack), OS-level trust-class mapping ([12]), manifest resource enforcement ([23]).
+Summary: New `crates/evo-trust` provides install digest, `manifest.sig` ed25519 verification, PEM + `*.meta.toml` trust roots, name-prefix and `max_trust_class` authorisation with `degrade_trust` policy, and `revocations.toml` digest set. `StewardConfig` `[plugins]` adds `trust_dir_opt`, `trust_dir_etc`, `revocations_path`, and `degrade_trust`. `AdmissionEngine` holds `Option<Arc<PluginTrustState>>` and `set_plugin_trust`; the binary always loads trust. Harnesses that omit `set_plugin_trust` skip crypto (existing tests). Later: `StewardConfig` `[plugins.security]`, `AdmissionEngine::set_plugins_security`, and Unix setuid/spawn for mapped trust classes (see [12] PARTIAL and Phase 2 tightening if applicable). Remaining: `evo-plugin-tool` (sign/verify/pack), deeper per-tier seccomp/caps (optional, not required to close [12] further), manifest resource enforcement ([23]).
 
 Changes: `crates/evo-trust/` (new crate), `Cargo.toml` (workspace members addition), `crates/evo/Cargo.toml` (evo-trust path dependency), `crates/evo/src/admission.rs`, `crates/evo/src/config.rs`, `crates/evo/src/main.rs`, `crates/evo/src/plugin_trust.rs`, `Cargo.lock`, `docs/engineering/SCHEMAS.md` (section 3.3), `docs/engineering/CONFIG.md` (section 3.3), `CHANGELOG.md`, `GAPS.md` (this file), `crates/evo-example-echo/tests/discovery.rs` (`..Default::default()` on `PluginsSection`).
 

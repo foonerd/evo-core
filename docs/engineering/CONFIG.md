@@ -103,6 +103,14 @@ allow_unsigned = false
 
 **`revocations_path`** is the TOML file of revoked install digests (default `/etc/evo/revocations.toml`); a missing file means no revocations. **`degrade_trust`** (default `true`) allows admission at the signing key’s `max_trust_class` when the manifest asks for a stronger class, instead of refusing.
 
+**`[plugins.security]`** (optional) controls whether out-of-process plugin binaries are started under a **mapped Unix user and group** per *effective* trust class. Default: disabled (`enable = false`), so every plugin process runs as the same user as the steward (the usual case for a dedicated streamer or appliance with one service account). If you set `enable = true`, supply `[plugins.security.uid]` (and optionally `[plugins.security.gid]`) with **lowercase** class keys (`platform`, `privileged`, `standard`, `unprivileged`, `sandbox`). A class that is not listed in `uid` is still started as the steward. The distribution must create the system users, align socket and `plugin_data_root` permissions, and understand that the steward does **not** set seccomp or additional capabilities. See `SCHEMAS.md` section 3.3, `GAPS.md` [12], and `PLUGIN_PACKAGING.md` section 5.
+
+```toml
+# Optional; all omitted or enable = false → legacy behaviour
+[plugins.security]
+enable = false
+```
+
 There is deliberately no field to turn off admission validation entirely, lower trust requirements globally, or disable signature checking for particular plugins. Admission policy is binary: signed plugins with valid trust, or unsigned plugins at `sandbox` if explicitly allowed.
 
 ## 4. Precedence: CLI, Env, Config, Default
@@ -115,7 +123,7 @@ For fields that can be set from multiple sources, the precedence order (highest 
 | `socket_path` | `--socket` CLI | `config.steward.socket_path` | - | default `/var/run/evo/evo.sock` |
 | `catalogue.path` | `--catalogue` CLI | `config.catalogue.path` | - | default `/opt/evo/catalogue/default.toml` |
 | `allow_unsigned` | `config.plugins.allow_unsigned` | - | - | default `false` |
-| `plugins.*` (incl. trust and discovery paths) | `config.plugins.*` | - | - | see `SCHEMAS.md` 3.3 |
+| `plugins.*` (incl. trust, discovery, `security`) | `config.plugins.*` | - | - | see `SCHEMAS.md` 3.3 |
 
 Notes:
 

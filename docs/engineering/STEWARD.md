@@ -344,7 +344,7 @@ Every plugin manifest declares a trust class:
 | `Unprivileged` | Third-party; runs under seccomp and with no filesystem capability beyond its own plugin directory. |
 | `Sandbox` | Experimental; full isolation, strictest enforcement. |
 
-v0 reads the trust class from the manifest and records it in the admission engine. It does not yet enforce differential privilege at the OS level: all out-of-process plugins today run as the same user with the same capabilities as the steward. The enforcement mapping to OS primitives (user, groups, capabilities, seccomp, namespace isolation) is deferred (`CONCEPT.md` section 9).
+v0 records the *effective* trust class from the manifest and admission. **Optional** (default off) `[plugins.security]` in the steward config maps effective trust class to a Unix **UID and GID** for out-of-process spawns. When disabled or a class is unmapped, OOP plugins run as the same user as the steward. Seccomp, capability bounding sets, and namespace isolation are **not** set by the core steward; a distribution layers those via systemd, OCI, LSM, or product-specific integration (`CONCEPT.md` section 9, `GAPS.md` [12]).
 
 ## 11. Configuration and Catalogue
 
@@ -373,6 +373,7 @@ The effective configuration surfaces (full schema in `SCHEMAS.md` section 3.3, n
 | `plugins.trust_dir_etc` | `/etc/evo/trust.d` | Operator-installed `*.pem` public keys (union with `trust_dir_opt`). |
 | `plugins.revocations_path` | `/etc/evo/revocations.toml` | Install-digest revocation list; missing file is an empty set. |
 | `plugins.degrade_trust` | `true` | If a signing key's `max_trust_class` is weaker than the declared class, admit at the key's max instead of refusing. |
+| `plugins.security` | (disabled) | Optional `[plugins.security]` in `CONFIG.md` / `SCHEMAS.md`: per-class `uid`/`gid` for OOP plugin processes on Unix; `enable` defaults to `false`. |
 
 ### 11.2 Catalogue
 
