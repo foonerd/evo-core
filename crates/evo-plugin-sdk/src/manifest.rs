@@ -117,6 +117,61 @@ impl Manifest {
 
         Ok(())
     }
+
+    /// Check the manifest's `[prerequisites]` against the running
+    /// environment.
+    ///
+    /// This is the in-scope half of gap [23] (Manifest Resource and
+    /// Prerequisite Declarations). Two fields are enforceable from
+    /// core with no distribution-level machinery and are checked here:
+    ///
+    /// - `evo_min_version` is compared against the running evo
+    ///   steward's own version (typically `env!("CARGO_PKG_VERSION")`
+    ///   parsed as a [`Version`]). If the manifest demands a newer
+    ///   framework than is running, admission is refused with
+    ///   [`ManifestError::EvoVersionTooLow`].
+    /// - `os_family` is compared against the host OS string
+    ///   (typically [`std::env::consts::OS`] at the call site). The
+    ///   special value `"any"` always matches; otherwise exact
+    ///   equality is required. Mismatch produces
+    ///   [`ManifestError::OsFamilyMismatch`].
+    ///
+    /// The remaining `[prerequisites]` and `[resources]` fields
+    /// (`outbound_network`, `filesystem_scopes`, `max_memory_mb`,
+    /// `max_cpu_percent`) are explicitly out of scope for core
+    /// enforcement: they require cgroups, network namespaces, bind
+    /// mounts, or LSM policy that the steward does not own. Those
+    /// fields remain documented in the manifest so distributions
+    /// can enforce them via systemd unit directives, cgroup manager
+    /// orchestration, or image-level policy. See
+    /// `PLUGIN_PACKAGING.md` section 2 ("Enforcement scope") for
+    /// the full split.
+    ///
+    /// This method is independent of [`Manifest::validate`] because
+    /// the environment parameters are not intrinsic to the manifest
+    /// itself; the steward supplies them at admission time. Callers
+    /// that want the complete admission precheck should call
+    /// [`Manifest::validate`] first, then this method.
+    pub fn check_prerequisites(
+        &self,
+        evo_version: &Version,
+        host_os: &str,
+    ) -> Result<(), ManifestError> {
+        if self.prerequisites.evo_min_version > *evo_version {
+            return Err(ManifestError::EvoVersionTooLow {
+                required: self.prerequisites.evo_min_version.clone(),
+                running: evo_version.clone(),
+            });
+        }
+        let required_os = self.prerequisites.os_family.as_str();
+        if required_os != "any" && required_os != host_os {
+            return Err(ManifestError::OsFamilyMismatch {
+                required: self.prerequisites.os_family.clone(),
+                running: host_os.to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// The `[plugin]` section: identity and version.
@@ -721,5 +776,111 @@ instance_ttl_seconds = 0
         })
         .unwrap();
         assert!(toml_snippet.contains(r#"type = "out-of-process""#));
+    }
+
+    // -----------------------------------------------------------------
+    // check_prerequisites: gap [23] in-scope half.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn check_prerequisites_accepts_matching_os_and_lower_required_version() {
+        let m = Manifest::from_toml(valid_singleton_respondent()).unwrap();
+        // Fixture declares evo_min_version = 0.1.0, os_family = linux.
+        m.check_prerequisites(&Version::new(0, 1, 8), "linux")
+            .expect("should admit: running version >= required, os matches");
+    }
+
+    #[test]
+    fn check_prerequisites_accepts_equal_required_version() {
+        let m = Manifest::from_toml(valid_singleton_respondent()).unwrap();
+        // Boundary: running version exactly equals required.
+        m.check_prerequisites(&Version::new(0, 1, 0), "linux")
+            .expect("equal version must pass; the check is strict >");
+    }
+
+    #[test]
+    fn check_prerequisites_rejects_required_version_above_running() {
+        let m = Manifest::from_toml(valid_singleton_respondent()).unwrap();
+        // Fixture requires >= 0.1.0; pretend we are running 0.0.9.
+        match m.check_prerequisites(&Version::new(0, 0, 9), "linux") {
+            Err(ManifestError::EvoVersionTooLow { required, running }) => {
+                assert_eq!(required, Version::new(0, 1, 0));
+                assert_eq!(running, Version::new(0, 0, 9));
+            }
+            other => panic!("expected EvoVersionTooLow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_prerequisites_rejects_future_major() {
+        // A plugin built against a future major must be refused by a
+        // current-major steward even if the minor would satisfy.
+        let toml = valid_singleton_respondent().replace(
+            r#"evo_min_version = "0.1.0""#,
+            r#"evo_min_version = "1.0.0""#,
+        );
+        let m = Manifest::from_toml(&toml).unwrap();
+        assert!(matches!(
+            m.check_prerequisites(&Version::new(0, 9, 9), "linux"),
+            Err(ManifestError::EvoVersionTooLow { .. })
+        ));
+    }
+
+    #[test]
+    fn check_prerequisites_accepts_os_family_any() {
+        // os_family = "any" matches every host OS, including ones the
+        // steward has never seen before.
+        let toml = valid_singleton_respondent()
+            .replace(r#"os_family = "linux""#, r#"os_family = "any""#);
+        let m = Manifest::from_toml(&toml).unwrap();
+        m.check_prerequisites(&Version::new(0, 1, 8), "linux")
+            .unwrap();
+        m.check_prerequisites(&Version::new(0, 1, 8), "macos")
+            .unwrap();
+        m.check_prerequisites(&Version::new(0, 1, 8), "freebsd")
+            .unwrap();
+        // Even an OS string the SDK's schema has no opinion about.
+        m.check_prerequisites(&Version::new(0, 1, 8), "plan9")
+            .unwrap();
+    }
+
+    #[test]
+    fn check_prerequisites_accepts_matching_specific_os_family() {
+        let toml = valid_singleton_respondent()
+            .replace(r#"os_family = "linux""#, r#"os_family = "macos""#);
+        let m = Manifest::from_toml(&toml).unwrap();
+        m.check_prerequisites(&Version::new(0, 1, 8), "macos")
+            .expect("exact match should pass");
+    }
+
+    #[test]
+    fn check_prerequisites_rejects_mismatched_os_family() {
+        // Fixture declares os_family = linux; simulate a macOS host.
+        let m = Manifest::from_toml(valid_singleton_respondent()).unwrap();
+        match m.check_prerequisites(&Version::new(0, 1, 8), "macos") {
+            Err(ManifestError::OsFamilyMismatch { required, running }) => {
+                assert_eq!(required, "linux");
+                assert_eq!(running, "macos");
+            }
+            other => panic!("expected OsFamilyMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_prerequisites_rejects_version_before_os() {
+        // When both checks would fail, version is tested first. Pin
+        // the order so a future refactor does not silently swap them
+        // (which would change the error surface callers observe).
+        let toml = valid_singleton_respondent()
+            .replace(
+                r#"evo_min_version = "0.1.0""#,
+                r#"evo_min_version = "9.9.9""#,
+            )
+            .replace(r#"os_family = "linux""#, r#"os_family = "macos""#);
+        let m = Manifest::from_toml(&toml).unwrap();
+        assert!(matches!(
+            m.check_prerequisites(&Version::new(0, 1, 8), "linux"),
+            Err(ManifestError::EvoVersionTooLow { .. })
+        ));
     }
 }

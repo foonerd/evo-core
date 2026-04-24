@@ -17,6 +17,70 @@ artefacts. Consult the git log for pre-0.1.8 history.
 
 ### Added
 
+- **Phase 2 closure ([23] split resolution, [12] PARTIAL reconciliation,
+  admission call-site ordering, doc update)**: gap [23] RESOLVED
+  (IMPLEMENTED in-scope + OUT OF SCOPE out-of-scope); gap [12] reconciled
+  from PARTIAL to the same IMPLEMENTED + OUT OF SCOPE shape. Phase 2 is
+  now closed: every numbered gap ([12], [13], [14], [20], [23]) resolves
+  to IMPLEMENTED or OUT OF SCOPE, and the PARTIAL label is gone from the
+  project (it breached the project's own Standard rule "there is no
+  third option"). The SDK and admission-side code for [23]'s in-scope
+  half (`Manifest::check_prerequisites`, `ManifestError::EvoVersionTooLow`
+  / `OsFamilyMismatch`, `check_manifest_prerequisites(&manifest)?` in
+  every admission entry point, thirteen combined tests) had already
+  landed; the gap inventory and the framework-vs-distribution doc had
+  not caught up. This entry records the reconciliation plus one code
+  consistency fix. `crates/evo/src/admission.rs`: four admission
+  paths (`admit_singleton_respondent`, `admit_singleton_warden`,
+  `admit_out_of_process_respondent`, `admit_out_of_process_warden`)
+  called `check_manifest_prerequisites(&manifest)?` after shelf lookup,
+  shape check, and duplicate-shelf check; `admit_out_of_process_from_directory`
+  correctly called it right after the manifest parse. Error precedence
+  therefore varied by path when a manifest violated both prerequisites
+  and shelf: from-directory surfaced the framework-version error,
+  the other four surfaced the shelf error. Moved the call in the
+  four affected paths to immediately after `manifest.validate()?`,
+  before shelf lookup; "can this steward run this plugin at all" is
+  a more fundamental gate than "is this shelf in the catalogue", so
+  the fundamental gate fires first on every admission path.
+  `docs/engineering/PLUGIN_PACKAGING.md` section 2: added a normative
+  "Enforcement scope" subsection after the manifest schema. Two tables
+  list the fields the evo-core steward enforces at admission (with the
+  exact enforcement mechanism per field: name regex, contract-version
+  equality, shelf-shape equality, kind-vs-capabilities consistency,
+  trust-class key authorisation, `evo_min_version` semver check,
+  `os_family` equality, transport-kind and transport-exec checks) and
+  the fields that are distribution-owned (with the typical OS
+  enforcement point per field: systemd `MemoryMax=` / `CPUQuota=` /
+  `RestrictAddressFamilies=` / `ProtectSystem=` / `ReadWritePaths=`,
+  cgroups v2, network and mount namespaces, LSM policy). A closing
+  paragraph states core's position: the distribution-owned fields are
+  contract text a plugin author declares and a distribution reads; a
+  distribution may enforce them or leave them advisory depending on
+  product posture, and deeper isolation (seccomp, capabilities, SELinux,
+  Android sandbox) sits with the distribution too. Cross-references
+  `BOUNDARY.md` section 6.2 for the broader line. `GAPS.md` gap [23]:
+  Status OPEN -> RESOLVED; `On disk` and `Operator hits` rewritten
+  to describe the implemented code path and the distribution split;
+  `Decision` enumerates both halves (in-scope IMPLEMENTED: evo_min_version,
+  os_family, with test counts; out-of-scope: the four distribution-owned
+  fields with their typical enforcement mechanisms); `Notes` draws the
+  parallel with [12] and names the hypothetical future widening
+  (steward orchestrating its own cgroups) as explicitly OUT OF SCOPE
+  for v0.1.x. `GAPS.md` gap [12]: Status PARTIAL -> RESOLVED with the
+  same IMPLEMENTED + OUT OF SCOPE enumeration, naming
+  `AdmissionEngine::set_plugins_security` and the
+  `admit_out_of_process_from_directory` spawn path as the IMPLEMENTED
+  in-scope half, and seccomp / Linux capabilities / network namespaces
+  / SELinux / AppArmor / Android sandbox / hypervisor isolation as the
+  out-of-scope half. `GAPS.md` Phased Execution Order, Phase 2 block:
+  status `partial` -> `closed`; per-gap bullets for [12] and [23]
+  updated to name the IMPLEMENTED-in-scope + OUT-OF-SCOPE-out-of-scope
+  split; LE-1 sentence extended to name the Phase 7 slide path. New
+  "Phase 2 closure" Resolution Log entry appended. Verification: the
+  standard gate must pass; the existing thirteen [23]-related tests
+  continue to pass unchanged after the call-site reorder.
+
 - **Phase 2 second tightening (post-[20]/[12] empirical closure)**:
   eleven items closed in a single commit; no gap re-opens.
   `evo-plugin-tool --degrade-trust` could not be disabled from the

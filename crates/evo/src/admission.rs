@@ -659,6 +659,7 @@ impl AdmissionEngine {
         T: Respondent + 'static,
     {
         manifest.validate()?;
+        check_manifest_prerequisites(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
         let shelf =
@@ -776,6 +777,7 @@ impl AdmissionEngine {
         T: Warden + 'static,
     {
         manifest.validate()?;
+        check_manifest_prerequisites(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
         let shelf =
@@ -907,6 +909,7 @@ impl AdmissionEngine {
         W: tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
         manifest.validate()?;
+        check_manifest_prerequisites(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
         let shelf =
@@ -1043,6 +1046,7 @@ impl AdmissionEngine {
         W: tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
         manifest.validate()?;
+        check_manifest_prerequisites(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
         let shelf =
@@ -1214,6 +1218,7 @@ impl AdmissionEngine {
                 )
             })?;
         let mut manifest = Manifest::from_toml(&manifest_text)?;
+        check_manifest_prerequisites(&manifest)?;
 
         // This entry point only handles out-of-process plugins. The
         // in-process path requires a concrete Rust type that cannot be
@@ -1836,6 +1841,42 @@ async fn wait_for_socket_ready(
     }
 }
 
+/// Enforce `[prerequisites]` from gap [23]'s in-scope half.
+///
+/// Called from every `admit_*` entry point after `manifest.validate()`.
+/// Checks:
+/// - `evo_min_version` against the evo steward's own version (compiled
+///   in via `env!("CARGO_PKG_VERSION")`).
+/// - `os_family` against the host OS (`std::env::consts::OS`). The
+///   special value `"any"` always matches.
+///
+/// The remaining `[prerequisites]` and `[resources]` fields
+/// (`outbound_network`, `filesystem_scopes`, `max_memory_mb`,
+/// `max_cpu_percent`) are out of scope for core: they require
+/// distribution-owned machinery (cgroups, network namespaces, bind
+/// mounts). Those fields remain in the manifest so distributions
+/// can enforce them via systemd / image policy. See
+/// `PLUGIN_PACKAGING.md` section 2 ("Enforcement scope") and the
+/// [23] Resolution Log entry in `GAPS.md` for the split.
+fn check_manifest_prerequisites(
+    manifest: &Manifest,
+) -> Result<(), StewardError> {
+    // `unwrap_or_else` rather than `expect` so a bizarre crate
+    // version (e.g. "0.1.8+dirty" in a fork) gives a runnable error
+    // surface rather than a panic inside admission. In practice the
+    // workspace pins `version.workspace = true` to a clean semver.
+    let evo_version = match semver::Version::parse(env!("CARGO_PKG_VERSION")) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(StewardError::Admission(format!(
+                "evo's own CARGO_PKG_VERSION is not valid semver: {e}"
+            )));
+        }
+    };
+    manifest.check_prerequisites(&evo_version, std::env::consts::OS)?;
+    Ok(())
+}
+
 /// Build a v0 LoadContext for a plugin.
 ///
 /// The context carries per-plugin filesystem paths, empty config, no
@@ -2003,6 +2044,7 @@ class = "platform"
 
 [prerequisites]
 evo_min_version = "0.1.0"
+os_family = "any"
 
 [resources]
 max_memory_mb = 16
@@ -2085,6 +2127,7 @@ class = "platform"
 
 [prerequisites]
 evo_min_version = "0.1.0"
+os_family = "any"
 
 [resources]
 max_memory_mb = 16
@@ -2551,6 +2594,7 @@ class = "platform"
 
 [prerequisites]
 evo_min_version = "0.1.0"
+os_family = "any"
 
 [resources]
 max_memory_mb = 16
@@ -2593,6 +2637,7 @@ class = "platform"
 
 [prerequisites]
 evo_min_version = "0.1.0"
+os_family = "any"
 
 [resources]
 max_memory_mb = 16
@@ -2865,6 +2910,7 @@ class = "platform"
 
 [prerequisites]
 evo_min_version = "0.1.0"
+os_family = "any"
 
 [resources]
 max_memory_mb = 16
@@ -3717,5 +3763,131 @@ custody_failure_mode = "abort"
             }
         }
         assert_eq!(engine.len(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Gap [23] IN-SCOPE enforcement: evo_min_version, os_family.
+    //
+    // The out-of-scope half (resource caps, outbound_network,
+    // filesystem_scopes) is distribution-owned per
+    // PLUGIN_PACKAGING.md section 2. Those fields remain
+    // parsed-but-advisory in core. Only the two environment-level
+    // checks below run at admission.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn admit_refuses_manifest_requiring_future_evo_version() {
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        // 99.0.0 exceeds any realistic steward version.
+        let mut manifest = test_manifest("org.test.ping");
+        manifest.prerequisites.evo_min_version = semver::Version::new(99, 0, 0);
+        let r = engine
+            .admit_singleton_respondent(plugin, manifest, &catalogue)
+            .await;
+        match r {
+            Err(StewardError::Manifest(
+                evo_plugin_sdk::ManifestError::EvoVersionTooLow {
+                    required,
+                    ..
+                },
+            )) => {
+                assert_eq!(required, semver::Version::new(99, 0, 0));
+            }
+            other => panic!("expected EvoVersionTooLow, got {other:?}"),
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admit_accepts_manifest_with_equal_evo_version() {
+        // Setting evo_min_version to the steward's own version must
+        // admit: the check is strict >, not >=.
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        let mut manifest = test_manifest("org.test.ping");
+        manifest.prerequisites.evo_min_version =
+            semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        engine
+            .admit_singleton_respondent(plugin, manifest, &catalogue)
+            .await
+            .expect("equal version must admit");
+        assert_eq!(engine.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn admit_refuses_manifest_with_mismatched_os_family() {
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        // An OS string that matches no supported host.
+        let mut manifest = test_manifest("org.test.ping");
+        manifest.prerequisites.os_family = "plan9".to_string();
+        let r = engine
+            .admit_singleton_respondent(plugin, manifest, &catalogue)
+            .await;
+        match r {
+            Err(StewardError::Manifest(
+                evo_plugin_sdk::ManifestError::OsFamilyMismatch {
+                    required,
+                    ..
+                },
+            )) => {
+                assert_eq!(required, "plan9");
+            }
+            other => panic!("expected OsFamilyMismatch, got {other:?}"),
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admit_accepts_manifest_with_os_family_any() {
+        // "any" must pass regardless of host OS. Every fixture
+        // above defaults to this; this test pins the behaviour
+        // explicitly so a future refactor that narrows "any" is
+        // caught.
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        let mut manifest = test_manifest("org.test.ping");
+        manifest.prerequisites.os_family = "any".to_string();
+        engine
+            .admit_singleton_respondent(plugin, manifest, &catalogue)
+            .await
+            .expect("os_family = any must always admit");
+        assert_eq!(engine.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn admit_accepts_manifest_with_matching_specific_os_family() {
+        // Use std::env::consts::OS as the declared os_family. On
+        // Linux this is "linux", on macOS "macos", etc.
+        let catalogue = test_catalogue();
+        let mut engine = AdmissionEngine::new();
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        let mut manifest = test_manifest("org.test.ping");
+        manifest.prerequisites.os_family = std::env::consts::OS.to_string();
+        engine
+            .admit_singleton_respondent(plugin, manifest, &catalogue)
+            .await
+            .expect("os_family matching host must admit");
+        assert_eq!(engine.len(), 1);
     }
 }

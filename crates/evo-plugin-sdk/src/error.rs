@@ -42,4 +42,27 @@ pub enum ManifestError {
     /// without a `[capabilities.warden]` table.
     #[error("inconsistent capabilities: {0}")]
     InconsistentCapabilities(String),
+
+    /// The manifest's `prerequisites.evo_min_version` is strictly greater
+    /// than the evo steward's own version. The plugin requires a newer
+    /// framework than is running.
+    #[error("manifest requires evo >= {required}, running {running}")]
+    EvoVersionTooLow {
+        /// Minimum evo version the manifest declares.
+        required: semver::Version,
+        /// Version of the running evo steward.
+        running: semver::Version,
+    },
+
+    /// The manifest's `prerequisites.os_family` is neither `"any"` nor
+    /// a match for the host operating system (see `std::env::consts::OS`).
+    #[error(
+        "manifest requires os_family = {required:?}, running on {running:?}"
+    )]
+    OsFamilyMismatch {
+        /// OS family string declared by the manifest.
+        required: String,
+        /// OS family string of the running host.
+        running: String,
+    },
 }

@@ -96,6 +96,36 @@ instance_ttl_seconds = 0              # 0 = no TTL, instances live until retract
 
 Additional sections may be declared by specific shelves' shapes. The steward validates the full manifest against the target shelf's published schema before admission.
 
+### Enforcement scope
+
+The manifest is parsed and validated by the SDK (`evo-plugin-sdk`) and enforced at admission by the steward (`evo`). Not every declared field is enforced from core: some fields gate admission itself, others are advisory to core and enforced by the distribution at the OS level. The split is normative.
+
+**Enforced by the evo-core steward at admission** (admission refuses on violation):
+
+| Field | How core enforces |
+|-------|-------------------|
+| `plugin.name` | Reverse-DNS regex in section 4. |
+| `plugin.contract` | Strict equality with `evo_plugin_sdk::manifest::SUPPORTED_CONTRACT_VERSION`. |
+| `target.shelf` | Must resolve in the loaded catalogue. |
+| `target.shape` | Strict equality with the catalogue shelf's declared shape. |
+| `kind` vs `capabilities` | Sub-tables present iff consistent with `kind.instance` and `kind.interaction`. |
+| `trust.class` | Signature-key authorisation in section 5; effective class may be degraded per policy. |
+| `prerequisites.evo_min_version` | Strict-less-than check against the running steward's semver version. |
+| `prerequisites.os_family` | Equality with `std::env::consts::OS`, or the special value `"any"`. |
+| `transport.type` | `admit_out_of_process_from_directory` refuses `in-process`. |
+| `transport.exec` | Must resolve (relative or absolute) to a file the steward can spawn. |
+
+**Distribution-owned** (parsed and preserved in the manifest, but not enforced by core; enforcement is expected at the OS level via systemd unit directives, cgroups v2, network namespaces, bind mounts, or LSM policy, chosen per product line):
+
+| Field | Typical enforcement point |
+|-------|---------------------------|
+| `prerequisites.outbound_network` | Network namespace, nftables, eBPF, or systemd `RestrictAddressFamilies=`. |
+| `prerequisites.filesystem_scopes` | Bind mounts, `ProtectSystem=`, `ReadWritePaths=`, chroot, mount namespaces. |
+| `resources.max_memory_mb` | systemd `MemoryMax=`, cgroup `memory.max`. |
+| `resources.max_cpu_percent` | systemd `CPUQuota=`, cgroup `cpu.max`. |
+
+Core's position on the distribution-owned fields: they are **contract text** a plugin author declares and a distribution reads. A plugin that declares `max_memory_mb = 16` is making a promise to the distribution packager, who decides how to hold the plugin to that promise. A distribution that does not care (for example, a single-tenant A/V appliance with all plugins reviewed first-party) may leave the declarations advisory and unenforced. A distribution that does care (multi-tenant, untrusted third-party plugins, regulated environments) configures its systemd / cgroup / namespace layer to enforce them. The same split applies to deeper isolation (`seccomp`, Linux capabilities, SELinux domains, Android sandbox): distribution-owned, not part of the evo-core admission contract. See `BOUNDARY.md` section 6.2 for the framework-vs-distribution line.
+
 ## 3. Filesystem Layout on Target
 
 Evo owns three roots on a Debian Trixie device. Nothing evo writes falls outside these roots.
