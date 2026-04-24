@@ -155,18 +155,10 @@ jobs:
             musl-tools
       - name: Install musl.cc cross (aarch64-unknown-linux-musl)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          curl -fSL --retry 3 "https://musl.cc/aarch64-linux-musl-cross.tgz" -o /tmp/musl-aarch64.tgz
-          sudo tar -xzf /tmp/musl-aarch64.tgz -C /opt
-          test -x /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc
-          echo /opt/aarch64-linux-musl-cross/bin >> "$GITHUB_PATH"
+        run: bash .github/scripts/ci-install-musl-cc-tarball.sh aarch64-linux-musl-cross
       - name: Install musl.cc cross (armv7-unknown-linux-musleabihf)
         if: matrix.target == 'armv7-unknown-linux-musleabihf'
-        run: |
-          curl -fSL --retry 3 "https://musl.cc/armv7l-linux-musleabihf-cross.tgz" -o /tmp/musl-armv7.tgz
-          sudo tar -xzf /tmp/musl-armv7.tgz -C /opt
-          test -x /opt/armv7l-linux-musleabihf-cross/bin/armv7l-linux-musleabihf-gcc
-          echo /opt/armv7l-linux-musleabihf-cross/bin >> "$GITHUB_PATH"
+        run: bash .github/scripts/ci-install-musl-cc-tarball.sh armv7l-linux-musleabihf-cross
       - name: Install Rust 1.85 with target ${{ matrix.target }}
         uses: dtolnay/rust-toolchain@1.85
         with:
