@@ -13,7 +13,7 @@ use crate::catalogue::Catalogue;
 use crate::config::StewardConfig;
 use crate::error::StewardError;
 
-/// Scan [`StewardConfig::search_roots`], then admit each discovered
+/// Scan `config.plugins.search_roots`, then admit each discovered
 /// out-of-process singleton bundle. Duplicate `plugin.name` values use the
 /// path from the last matching search root. Factory plugins and
 /// non-out-of-process transports are skipped with a warning.
