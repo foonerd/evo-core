@@ -16,6 +16,10 @@ A device that performs the work declared in its catalogue, by composing contribu
 
 Everything in this document is derivable from this sentence plus the fabric vocabulary. Anything in a built system that does not serve a rack declared in the catalogue is not essence; it is a plugin contribution that has found the wrong home, or it does not belong.
 
+### 1.1 Framework and distribution boundary (read first)
+
+Evo-core is the **framework** (steward, plugin SDK, wire and client protocols, packaging contract, engineering docs). A **device** is a **distribution**: curated catalogue, plugin set, branding, packaging, and product integration. The normative split—what crosses the interface, what each side MUST NOT own, and the review test for new work—is **only** in [`BOUNDARY.md`](engineering/BOUNDARY.md). The root [`GAPS.md`](../GAPS.md) file begins with the same **Boundary first** rule for closing documented gaps. Resolve boundary questions in `BOUNDARY.md` before treating a line item as an evo-core implementation task; the framework does not subsume the product, and the product does not patch the steward.
+
 ## 2. Fabric
 
 The product is a STEWARD that administers a CATALOGUE. The catalogue is organised into RACKS. Each rack holds SHELVES. Each shelf has one or more SLOTS of declared SHAPE. PLUGINS stock slots. The steward is the sole authority; plugins never communicate directly.
@@ -120,7 +124,7 @@ Full plugin contract is defined in `docs/engineering/PLUGIN_CONTRACT.md`. Packag
 | Plugin transport | Two transports of one contract: in-process (Rust trait, compiled into the steward or loaded as cdylib) and out-of-process (Unix-socket protocol, any language). |
 | Plugin delivery | Each plugin is an independently versioned artefact with a declared manifest. |
 | Trust classes | Declared in manifests, enforced by the steward, authorised by the signing key used. |
-| Versioning | Shelf shapes are versioned. Plugin manifests declare the shape version they satisfy. The steward refuses plugins whose declared version is not in the slot's supported range. |
+| Versioning | Shelf shapes are versioned. Plugin manifests declare the shape version they satisfy. The steward enforces **equality** of manifest `target.shape` with the shelf `shape` (range negotiation per slot is not yet the data model; see `GAPS.md` gap [9] and `STEWARD.md` 12.4). |
 | Catalogue as data | Rack and shelf declarations are TOML the steward reads, not code. Adding a new rack is a catalogue edit plus the plugins to stock it. The steward is unchanged. |
 | Domain neutrality | The steward has no knowledge of audio, networking, any service, any protocol. All domain knowledge lives in catalogues and plugins. |
 

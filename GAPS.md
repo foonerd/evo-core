@@ -4,6 +4,17 @@ Status: working document tracking the integrity audit of evo-core against its ow
 Audience: evo-core maintainers, distribution authors who have been told the framework promises these capabilities.
 Lifetime: this file exists until every gap below resolves to either IMPLEMENTED or EXPLICITLY OUT OF SCOPE. When the last gap closes, this file is deleted.
 
+## Boundary first
+
+**Read `docs/engineering/BOUNDARY.md` before triaging this list.** The split between **evo-core** (framework: steward, SDK, contracts) and a **distribution** (for example `evo-device-<vendor>`: catalogue, product plugins, branding, OS packaging) is the thick line. Nothing in this file is "optional" work in the wrong repository.
+
+- **What belongs in evo-core** is anything that **implements a published contract** the framework owns: the four hard contracts and two soft contracts in `BOUNDARY.md` section 3 (Plugin SDK, plugin wire, packaging, client socket; catalogue shape; paths), without naming a product, protocol, service, or hardware ([`BOUNDARY.md` section 4–5](docs/engineering/BOUNDARY.md)).
+- **What belongs to the device vendor** is the **catalogue contents**, the **plugin set**, **branding**, **frontend**, **image/packaging**, and **product-specific** trust and release process ([`BOUNDARY.md` section 6](docs/engineering/BOUNDARY.md)). If a "gap" is really "our product still needs X" and X is not a steward contract, the resolution is **OUT OF SCOPE** for evo-core: move the work to the distribution or drop the promise from core docs.
+- **OUT OF SCOPE** is not a failure: it is **moving the boundary** so the framework stops claiming what the vendor will actually implement (see **Standard** above, second bullet).
+- **IMPLEMENT** is for **incomplete** behaviour inside a promise evo-core already makes; the resolution updates code, tests, and **the same** contracts a distribution already consumes.
+
+If a line item is ambiguous, ask: *Would this still make sense for a non-audio, non-Volumio distribution?* If no, it is not an evo-core gap unless the **contract** is being widened in core first ([`BOUNDARY.md` section 5](docs/engineering/BOUNDARY.md), last paragraph).
+
 ## Standard
 
 Every gap below resolves to exactly one of two outcomes. There is no third option.

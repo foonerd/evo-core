@@ -8,6 +8,8 @@ Evo-core is a framework. A device is a product. This document states where the f
 
 If you are about to start a distribution repository, read this document first. If you are about to add something to evo-core, read section 5 ("What evo-core MUST NOT Contain") before you write code.
 
+**Gap triage** (`GAPS.md` at the repository root) is ordered the same way: the **Boundary first** section there points back here. Incomplete framework behaviour and misplaced product work are both failures; the boundary tells them apart.
+
 ## 1. Purpose
 
 The fabric concept ("a device that plays audio from any reachable source, through a configurable audio path, to any present output, while presenting coherent information about what it is doing to any consumer that looks") describes what a product does. The steward enforces the concept regardless of what specifically is being played, over what, to whom. That separation is not stylistic. It is the reason the framework can serve many products without being rewritten for each.
