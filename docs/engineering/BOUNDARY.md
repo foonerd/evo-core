@@ -2,7 +2,7 @@
 
 Status: engineering-layer statement of the boundary between the framework and a distribution.
 Audience: evo-core maintainers, distribution authors, plugin authors working at the distribution level, operators integrating evo into a product.
-Vocabulary: per `docs/CONCEPT.md`. Cross-references: `STEWARD.md`, `PLUGIN_CONTRACT.md`, `PLUGIN_PACKAGING.md`, `VENDOR_CONTRACT.md`.
+Vocabulary: per `docs/CONCEPT.md`. Cross-references: `STEWARD.md`, `PLUGIN_CONTRACT.md`, `PLUGIN_PACKAGING.md`, `VENDOR_CONTRACT.md`. **Signing and deployment stages (dev / test / prod)** are specified in **section 6.2** (distributions) with a Mermaid diagram; `CONFIG.md` §3.4 is a short pointer to the same model.
 
 Evo-core is a framework. A device is a product. This document states where the framework ends, where the device begins, and what contract connects them. Every engineering doc in this repository assumes the boundary is understood; this one makes it explicit.
 
@@ -96,7 +96,7 @@ An `evo-device-<vendor>` repository owns one product's worth of concerns. The sh
 | **Frontend** | One or more consumers of the client socket. Technology unconstrained (see `FRONTEND.md`). May live in the same repository or a sibling `evo-device-<vendor>-ui` repository. |
 | **Distribution-level config defaults** | Steward config defaults suited to this product (socket path, log level, runtime directory, plugin directory). |
 | **Packaging** | How the steward binary, the plugins, the catalogue, the branding, and the frontend become an installable artefact: Debian packages, an OS image, a containerised deployment, whatever the product demands. |
-| **Trust material** | The distribution's signing key, and possibly bundled vendor keys for pre-approved third parties. See `VENDOR_CONTRACT.md` sections 3 and 5. |
+| **Trust material** | The distribution's signing key, and possibly bundled vendor keys for pre-approved third parties. See `VENDOR_CONTRACT.md` sections 3 and 5. **How trust policy varies across dev, test, and production** (including the closed vs *open* product line) is normative in **section 6.2**. |
 | **Release process** | Tag scheme, build pipeline, evo-core version pin, testing matrix. Entirely distribution-defined. |
 
 A distribution MAY additionally maintain:
@@ -246,6 +246,83 @@ reason    = "Incorrect match despite fuzzy metadata."
 - `VENDOR_CONTRACT.md` (trust and key authorisation for distribution-shipped administration tooling).
 - `GAPS.md` Resolution Log entry for [28] (the OUT OF SCOPE decision for the in-steward channel).
 - `GAPS.md` gap [29] (the IN SCOPE companion: framework correction primitives for administration plugins; Phase 3).
+
+### 6.2 Deployment stages: signing and trust (dev, test, prod)
+
+This section is the **authoritative place** for the relationship between **how a distribution develops**, **how it tests**, and **how it ships** relative to **plugin signing** and the steward's `plugins.allow_unsigned` field (`CONFIG.md` / `SCHEMAS.md` section 3.3).
+
+Evo-core does **not** add a `deployment_stage` or `environment` key. The framework exposes:
+
+- `plugins.allow_unsigned` (and the rest of `[plugins]`), and
+- trust roots in `/opt/evo/trust/` and `/etc/evo/trust.d/`,
+
+per `VENDOR_CONTRACT.md` and `PLUGIN_PACKAGING.md` section 5.
+
+A **distribution** maps the three **valid** stages to concrete `evo.toml` files, CI jobs, and OS images. Product lines may document stricter local rules. The model below is the **reference** contract; **closed** and **open** in production are two supported outcomes for shipping devices.
+
+| Stage | Signing expectation | `allow_unsigned` in the effective `evo.toml` (typical) | What it means |
+|-------|---------------------|--------------------------------------------------------|---------------|
+| **dev** | **Developer’s discretion**: local keys in `trust.d` optional; iterate with unsigned OOP bundles when the tree allows it (`allow_unsigned = true` or test harnesses without `set_plugin_trust`). | Often `true` in a developer’s local `evo.toml` for speed. | **Not** a guarantee that admission matches production. |
+| **test** (integration, QA, CI) | **Optional per job**: some pipelines use **unsigned** plugins for narrow cases; a **full** test of the supply chain and admission path **must** use **signed** bundles and a trust root consistent with `PLUGIN_PACKAGING` §5 (sign, verify, `max_trust_class`, `degrade_trust`, revocations, etc.). | Mixed. | Partial coverage may omit signing; a claim of “we tested the full security story” does not. |
+| **prod, closed** | Proprietary/curated device image: **enforced** signing. Only keys you ship admit plugins; **unsigned** bundles are **refused**. | `false` (steward default). | Sealed appliance; normal proprietary product. |
+| **prod, open system** | The **vendor** explicitly opts in to a community- or extensibility-friendly line: `allow_unsigned = true` in the **baked** `evo.toml` so unsigned out-of-process plugins can load at **sandbox** (see `VENDOR_CONTRACT.md`). | `true`. | A **product choice**, not a steward flag. Operators must be told unsigned code is allowed at the lowest trust tier. |
+
+**At admission time (framework contract)** the steward applies one rule independent of *stage*: verify signature if trust state is set; if unsigned and disallowed, refuse; if unsigned and `allow_unsigned`, admit at `sandbox` only. *Stage* is a **packaging and policy** lens on the same binary.
+
+**Diagram — stages, signing strictness, and the two production outcomes**
+
+```mermaid
+flowchart TB
+  DEV["<b>dev</b><br/>Signing: team discretion / local keys in trust.d optional"]
+  D_U[Unsigned OOP when<br/>allow_unsigned = true or harness has no trust]
+  DEV --> D_U
+
+  TEST["<b>test</b> (CI, QA)"]
+  T_F["Full path: signed bundles +<br/>trust per PLUGIN_PACKAGING section 5"]
+  T_Q["Narrow: unsigned for<br/>a limited check"]
+  TEST --> T_F
+  TEST --> T_Q
+
+  PROD["<b>prod</b>"]
+  P_C["<b>Closed / proprietary</b><br/>allow_unsigned: false · sealed image"]
+  P_O["<b>Open system (vendor opt-in)</b><br/>allow_unsigned: true · unsigned at sandbox"]
+  PROD --> P_C
+  PROD --> P_O
+
+  D_U --> TEST
+  T_F --> PROD
+  T_Q --> PROD
+```
+
+**Admission at runtime (independent of stage name)**
+
+```mermaid
+flowchart TB
+  B["Out-of-process plugin bundle on disk"]
+  T["Steward: plugin_trust set?"]
+  H["Admit: verification skipped, harnesses and some tests only"]
+  V["verify_out_of_process_bundle succeeded?"]
+  C["allow_unsigned?"]
+  AD["Admit at effective TrustClass"]
+  S["Admit at sandbox only"]
+  R["Refuse admission"]
+  B --> T
+  T -->|no| H
+  T -->|yes| V
+  V -->|yes| AD
+  V -->|no| C
+  C -->|yes| S
+  C -->|no| R
+```
+
+The first diagram is a **distribution** workflow. The second is a simplified **steward** decision flow (all rectangle nodes for wide Mermaid compatibility; no `+` or rhombus-only edge cases). The **no** branch from "plugin_trust set?" is the harness path: if `set_plugin_trust` was not called, verification is skipped (`admit_out_of_process_from_directory`); integration tests and **dev** harnesses use that on purpose. The production `evo` main always supplies trust, so the **yes** branch runs `verify_out_of_process_bundle` before admit or the `allow_unsigned` branch. See `crates/evo/src/admission.rs` and `plugin_trust.rs`.
+
+**Cross-references**
+
+- `CONFIG.md` section 3.4 — short summary; points here.
+- `PLUGIN_PACKAGING.md` section 5 (admission) — same pointer.
+- `GAPS.md` [13], [14] — what "signed" and "revoked" mean in code.
+- `VENDOR_CONTRACT.md` — trust root positions and `sandbox` for unsigned when allowed.
 
 ## 7. What a Distribution MAY Replace vs MUST Accept
 

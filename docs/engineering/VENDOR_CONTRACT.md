@@ -20,6 +20,8 @@ Evo recognises five actor positions. Each has a defined relationship to the fabr
 
 A DISTRIBUTION is always also a VENDOR at the distribution level. Volumio is a distribution (it ships a curated catalogue and plugin set) and a vendor (it signs its own plugins under `org.volumio.*`). The distinction matters when Volumio ships a plugin authored by FiiO: Volumio is the distribution, FiiO is the vendor, and the plugin ships under one or the other's namespace per the joint-trust arrangement (Section 7).
 
+**Deployment stages and signing (dev, test, prod, open vs closed products)** are a **distribution and packaging** concern, not a new steward string in `evo.toml`. The reference model, tables, and Mermaid figures live in `BOUNDARY.md` section 6.2. `CONFIG.md` and `PLUGIN_PACKAGING` point there.
+
 This document's subject is position 3. Positions 1, 2, 4, 5 appear where they interact with vendors.
 
 ## 2. What Constitutes a Vendor

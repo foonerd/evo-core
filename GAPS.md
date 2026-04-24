@@ -6,7 +6,7 @@ Lifetime: this file exists until every gap below resolves to either IMPLEMENTED 
 
 ## Boundary first
 
-**Read `docs/engineering/BOUNDARY.md` before triaging this list.** The split between **evo-core** (framework: steward, SDK, contracts) and a **distribution** (for example `evo-device-<vendor>`: catalogue, product plugins, branding, OS packaging) is the thick line. Nothing in this file is "optional" work in the wrong repository.
+**Read `docs/engineering/BOUNDARY.md` before triaging this list.** The split between **evo-core** (framework: steward, SDK, contracts) and a **distribution** (for example `evo-device-<vendor>`: catalogue, product plugins, branding, OS packaging) is the thick line. Nothing in this file is "optional" work in the wrong repository. **Dev / test / prod signing and `allow_unsigned` expectations** for distributions are in **BOUNDARY.md section 6.2** (not a `stage` key in the steward).
 
 - **What belongs in evo-core** is anything that **implements a published contract** the framework owns: the four hard contracts and two soft contracts in `BOUNDARY.md` section 3 (Plugin SDK, plugin wire, packaging, client socket; catalogue shape; paths), without naming a product, protocol, service, or hardware ([`BOUNDARY.md` section 4–5](docs/engineering/BOUNDARY.md)).
 - **What belongs to the device vendor** is the **catalogue contents**, the **plugin set**, **branding**, **frontend**, **image/packaging**, and **product-specific** trust and release process ([`BOUNDARY.md` section 6](docs/engineering/BOUNDARY.md)). If a "gap" is really "our product still needs X" and X is not a steward contract, the resolution is **OUT OF SCOPE** for evo-core: move the work to the distribution or drop the promise from core docs.

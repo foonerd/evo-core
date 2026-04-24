@@ -2,7 +2,7 @@
 
 Status: engineering-layer narrative for the steward's runtime configuration.
 Audience: distribution packagers, operators running evo on a device, developers running a local steward.
-Schema authority: `SCHEMAS.md` section 3.3. This document covers concepts, usage, precedence, and operational guidance; SCHEMAS.md defines fields and validation rules.
+Schema authority: `SCHEMAS.md` section 3.3. This document covers concepts, usage, precedence, and operational guidance. The **authoritative** dev / test / prod signing model is `BOUNDARY.md` section 6.2; section 3.4 below is a one-screen summary. SCHEMAS.md defines fields and validation rules.
 Related: `STEWARD.md` section 10 (the steward's configuration module in context), `DEVELOPING.md` section 5 (local-development configuration), `BUILDING.md` (packaging considerations), `CATALOGUE.md` (the catalogue file the steward reads).
 
 ## 1. Purpose
@@ -91,7 +91,7 @@ allow_unsigned = false
 # search_roots = ["/opt/evo/plugins", "/var/lib/evo/plugins"]
 ```
 
-**`allow_unsigned`** controls whether plugins without valid signatures may be admitted. Default: `false`, which is what production deployments want. When `true`, unsigned plugins are admitted at `sandbox` trust class only (see `VENDOR_CONTRACT.md` for the trust hierarchy). Development and testing typically turn this on; production leaves it off.
+**`allow_unsigned`** controls whether plugins without valid signatures may be admitted. Default: `false`, which is what production deployments want. When `true`, unsigned plugins are admitted at `sandbox` trust class only (see `VENDOR_CONTRACT.md` for the trust hierarchy). How this maps to **dev**, **test**, and **prod** is **normative in `BOUNDARY.md` section 6.2** (Mermaid diagrams there); the steward does not carry a `deployment_stage` field. Section 3.4 is a short recap.
 
 **`plugin_data_root`** is the parent for each plugin’s `state/` and `credentials/` directories. Default: `/var/lib/evo/plugins`. The steward creates those subdirectories (mode `0700` on Unix) before admitting a discovered out-of-process plugin. Must align with `PLUGIN_PACKAGING.md` on your distribution.
 
@@ -112,6 +112,10 @@ enable = false
 ```
 
 There is deliberately no field to turn off admission validation entirely, lower trust requirements globally, or disable signature checking for particular plugins. Admission policy is binary: signed plugins with valid trust, or unsigned plugins at `sandbox` if explicitly allowed.
+
+### 3.4 Deployment stages (dev, test, and prod) — pointer
+
+The **full** reference (tables, Mermaid, admission summary, and cross-refs) lives in **`BOUNDARY.md` section 6.2** — the boundary between framework knobs and what a **distribution** commits to per stage. Evo-core has no `stage` or `environment` string in `evo.toml`. You choose `plugins.allow_unsigned` and your trust material per your **dev** checkout, your **test**/CI `evo.toml`, and your **prod** image; **open** and **closed** product lines in production are both modelled in that section.
 
 ## 4. Precedence: CLI, Env, Config, Default
 
@@ -179,7 +183,7 @@ cargo run -p evo -- \
     --log-level info
 ```
 
-`allow_unsigned = true` is enabled for development because in-tree plugins are not signed. A production deployment leaves it off and signs every plugin.
+`allow_unsigned = true` is enabled for development because in-tree plugins are not signed. This is the **dev** pattern in `BOUNDARY.md` §6.2. A closed production image leaves it off and signs every plugin; an **open** product may ship `true` with eyes open (see that section, **prod, open system**).
 
 ### 5.2 Production (packaged distribution)
 
@@ -203,6 +207,8 @@ The file may be the defaults declared explicitly (as above) or effectively empty
 Both are equivalent. The explicit form documents the paths for operators reading the file; the empty form signals "we accept all defaults". Pick the one that suits the distribution's operational culture.
 
 ### 5.3 Testing
+
+**Test**-stage policy (`BOUNDARY.md` §6.2) is mixed: the same `evo` binary is used, but the **test harness** or CI job chooses whether the config allows unsigned plugins and whether bundles are signed. Pipelines that assert on trust, revocations, or `max_trust_class` should use a dedicated `evo.toml` (or inline config) with `allow_unsigned = false` and trust keys, matching production rules as closely as the test intends.
 
 Integration tests that spin up a steward against a scratch catalogue typically pass all config via CLI:
 
@@ -254,4 +260,5 @@ None of these are committed. When any of them land, they land in the config sche
 - `CATALOGUE.md` - the catalogue file this config points at.
 - `LOGGING.md` - the logging subsystem `log_level` controls.
 - `VENDOR_CONTRACT.md` - the trust hierarchy `allow_unsigned` interacts with.
+- `BOUNDARY.md` section 6.2 - authoritative dev / test / prod / open signing model (Mermaid, tables); §3.4 in this file is a pointer.
 - `BUILDING.md` - packaging considerations for shipping config.

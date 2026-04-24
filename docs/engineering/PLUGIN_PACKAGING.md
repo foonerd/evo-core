@@ -259,6 +259,8 @@ The evo project's own key is authorised for `org.evo.*` at `platform` class. A d
 
 ### Admission policy
 
+**Deployment context:** Distributions are expected to align `allow_unsigned` and trust roots with **dev**, **test**, and **prod** (and the **open** vs **closed** production line) as described in **`BOUNDARY.md` section 6.2** (tables and Mermaid). `CONFIG.md` §3.4 points to the same model.
+
 At plugin admission, the steward:
 
 1. Loads `manifest.toml`.

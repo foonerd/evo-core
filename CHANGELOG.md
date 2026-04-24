@@ -17,6 +17,13 @@ artefacts. Consult the git log for pre-0.1.8 history.
 
 ### Added
 
+- **Deployment stages and signing (dev / test / prod):** Authoritative
+  documentation is now **`BOUNDARY.md` section 6.2** (stage tables, two
+  Mermaid flowcharts, admission-path summary, cross-references). The
+  framework still exposes only `allow_unsigned` and trust paths, not a
+  `stage` string. `CONFIG.md` §3.4 and `PLUGIN_PACKAGING` §5 admission
+  point at §6.2; `CONFIG` sections 5.1 and 5.3 cross-link.
+
 - **Optional per-trust-class OS identity (GAPS [12] PARTIAL):** `[plugins.security]`
   in `StewardConfig` with `enable`, per-class `uid` and `gid` maps;
   `PluginsSecurityConfig::uid_gid_for_class` and
