@@ -33,10 +33,12 @@
 //!   supports federated (subject-keyed) queries with one-hop relation
 //!   traversal.
 //! - [`error`]: the steward's error type.
+//! - [`plugin_discovery`]: optional scan of configured search roots and
+//!   admission of out-of-process plugins (used by the shipped binary).
 //!
-//! This crate implements the v0 skeleton: in-process plugins only,
-//! singleton respondents and wardens, no dynamic plugin discovery yet,
-//! a minimal socket protocol. The engineering layer documents in
+//! This crate implements the v0 skeleton: singleton respondents and
+//! wardens, plugin discovery for out-of-process bundles, and a minimal
+//! socket protocol. The engineering layer documents in
 //! `docs/engineering/` are the source of truth for where this is going.
 //!
 //! [`LoadContext`]: evo_plugin_sdk::contract::LoadContext
@@ -53,6 +55,7 @@ pub mod custody;
 pub mod error;
 pub mod happenings;
 pub mod logging;
+pub mod plugin_discovery;
 pub mod projections;
 pub mod relations;
 pub mod server;

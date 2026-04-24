@@ -396,6 +396,13 @@ pub struct AdmissionEngine {
     /// (`take_custody`, `course_correct`). Each call allocates a fresh
     /// ID. Engine-local, not persistent across restarts.
     custody_cid_counter: Arc<AtomicU64>,
+    /// Root for per-plugin `state/` and `credentials/` (see
+    /// `PLUGIN_PACKAGING.md`: `/var/lib/evo/plugins/<name>/...`).
+    plugin_data_root: PathBuf,
+}
+
+fn default_plugin_data_root() -> PathBuf {
+    PathBuf::from(crate::config::DEFAULT_PLUGIN_DATA_ROOT)
 }
 
 impl Default for AdmissionEngine {
@@ -408,6 +415,7 @@ impl Default for AdmissionEngine {
             custody_ledger: Arc::new(CustodyLedger::new()),
             happening_bus: Arc::new(HappeningBus::new()),
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
+            plugin_data_root: default_plugin_data_root(),
         }
     }
 }
@@ -427,6 +435,51 @@ impl AdmissionEngine {
         Self::default()
     }
 
+    /// Like [`Self::new`], with a custom per-plugin data root (state and
+    /// credentials directories). The shipped binary takes this from
+    /// `StewardConfig`.
+    pub fn with_plugin_data_root(data_root: PathBuf) -> Self {
+        Self {
+            plugin_data_root: data_root,
+            ..Self::default()
+        }
+    }
+
+    /// Builder-style setter for the plugin data root on an existing
+    /// engine. Chainable with any of the `with_registry*` constructors
+    /// when the caller wants to share preexisting registries, graphs,
+    /// ledgers, or buses *and* customise the per-plugin data root
+    /// (typically a tempdir in integration tests).
+    ///
+    /// [`Self::with_plugin_data_root`] is the normal path for
+    /// production callers that only need the data root customised. Use
+    /// this method when composing shared-store constructors with a
+    /// non-default data root so the load path does not silently bind
+    /// to the production `/var/lib/evo/plugins` location.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use evo::admission::AdmissionEngine;
+    /// use evo::subjects::SubjectRegistry;
+    ///
+    /// let shared = Arc::new(SubjectRegistry::new());
+    /// let tmp = tempfile::tempdir().unwrap();
+    /// let engine = AdmissionEngine::with_registry(shared)
+    ///     .with_data_root(tmp.path().to_path_buf());
+    /// ```
+    pub fn with_data_root(mut self, data_root: PathBuf) -> Self {
+        self.plugin_data_root = data_root;
+        self
+    }
+
+    /// Root under which per-plugin `state/` and `credentials/` paths are
+    /// built for [`LoadContext`].
+    pub fn plugin_data_root(&self) -> &Path {
+        &self.plugin_data_root
+    }
+
     /// Construct an admission engine sharing an existing subject
     /// registry. Useful for tests that want to pre-populate or inspect
     /// the registry from outside. A fresh relation graph is created.
@@ -439,6 +492,7 @@ impl AdmissionEngine {
             custody_ledger: Arc::new(CustodyLedger::new()),
             happening_bus: Arc::new(HappeningBus::new()),
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
+            plugin_data_root: default_plugin_data_root(),
         }
     }
 
@@ -458,6 +512,7 @@ impl AdmissionEngine {
             custody_ledger: Arc::new(CustodyLedger::new()),
             happening_bus: Arc::new(HappeningBus::new()),
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
+            plugin_data_root: default_plugin_data_root(),
         }
     }
 
@@ -483,6 +538,7 @@ impl AdmissionEngine {
             custody_ledger,
             happening_bus: Arc::new(HappeningBus::new()),
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
+            plugin_data_root: default_plugin_data_root(),
         }
     }
 
@@ -509,6 +565,7 @@ impl AdmissionEngine {
             custody_ledger,
             happening_bus,
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
+            plugin_data_root: default_plugin_data_root(),
         }
     }
 
@@ -630,6 +687,7 @@ impl AdmissionEngine {
         }
 
         let ctx = build_load_context(
+            &self.plugin_data_root,
             &manifest,
             Arc::clone(&self.registry),
             Arc::clone(&self.relation_graph),
@@ -745,6 +803,7 @@ impl AdmissionEngine {
         }
 
         let ctx = build_load_context(
+            &self.plugin_data_root,
             &manifest,
             Arc::clone(&self.registry),
             Arc::clone(&self.relation_graph),
@@ -890,6 +949,7 @@ impl AdmissionEngine {
         let mut handle = AdmittedHandle::Respondent(Box::new(respondent));
 
         let ctx = build_load_context(
+            &self.plugin_data_root,
             &manifest,
             Arc::clone(&self.registry),
             Arc::clone(&self.relation_graph),
@@ -1028,6 +1088,7 @@ impl AdmissionEngine {
         let mut handle = AdmittedHandle::Warden(Box::new(warden));
 
         let ctx = build_load_context(
+            &self.plugin_data_root,
             &manifest,
             Arc::clone(&self.registry),
             Arc::clone(&self.relation_graph),
@@ -1695,14 +1756,13 @@ async fn wait_for_socket_ready(
 /// callbacks, and real announcers backed by the supplied registry and
 /// graph.
 fn build_load_context(
+    plugin_data_root: &Path,
     manifest: &Manifest,
     registry: Arc<SubjectRegistry>,
     graph: Arc<RelationGraph>,
 ) -> LoadContext {
-    let state_dir = PathBuf::from("/var/lib/evo/plugins")
-        .join(&manifest.plugin.name)
-        .join("state");
-    let credentials_dir = PathBuf::from("/var/lib/evo/plugins")
+    let state_dir = plugin_data_root.join(&manifest.plugin.name).join("state");
+    let credentials_dir = plugin_data_root
         .join(&manifest.plugin.name)
         .join("credentials");
 
@@ -3255,6 +3315,60 @@ custody_failure_mode = "abort"
             matches!(second, Happening::CustodyReleased { .. }),
             "expected CustodyReleased second, got {second:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn with_data_root_overrides_default_on_shared_store_constructors() {
+        // The four `with_registry*` constructors set the plugin data
+        // root to the compile-time default. Tests that want shared
+        // stores and a scratch data root compose them via
+        // `with_data_root`. This test verifies the builder wiring on
+        // all four constructors so the footgun does not re-emerge.
+        use crate::custody::CustodyLedger;
+        use crate::happenings::HappeningBus;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let custom = tmp.path().to_path_buf();
+
+        let reg = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let ledger = Arc::new(CustodyLedger::new());
+        let bus = Arc::new(HappeningBus::new());
+
+        let e1 = AdmissionEngine::with_registry(Arc::clone(&reg))
+            .with_data_root(custom.clone());
+        assert_eq!(e1.plugin_data_root(), custom.as_path());
+
+        let e2 = AdmissionEngine::with_registry_and_graph(
+            Arc::clone(&reg),
+            Arc::clone(&graph),
+        )
+        .with_data_root(custom.clone());
+        assert_eq!(e2.plugin_data_root(), custom.as_path());
+
+        let e3 = AdmissionEngine::with_registry_graph_and_ledger(
+            Arc::clone(&reg),
+            Arc::clone(&graph),
+            Arc::clone(&ledger),
+        )
+        .with_data_root(custom.clone());
+        assert_eq!(e3.plugin_data_root(), custom.as_path());
+
+        let e4 = AdmissionEngine::with_registry_graph_ledger_and_bus(
+            Arc::clone(&reg),
+            Arc::clone(&graph),
+            Arc::clone(&ledger),
+            Arc::clone(&bus),
+        )
+        .with_data_root(custom.clone());
+        assert_eq!(e4.plugin_data_root(), custom.as_path());
+
+        // And that the shared handles are still shared after the
+        // builder hop, not replaced by the data-root setter.
+        assert!(Arc::ptr_eq(&reg, &e4.registry()));
+        assert!(Arc::ptr_eq(&graph, &e4.relation_graph()));
+        assert!(Arc::ptr_eq(&ledger, &e4.custody_ledger()));
+        assert!(Arc::ptr_eq(&bus, &e4.happening_bus()));
     }
 
     #[tokio::test]

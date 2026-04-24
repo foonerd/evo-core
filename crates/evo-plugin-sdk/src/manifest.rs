@@ -190,9 +190,24 @@ pub struct Transport {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum TransportKind {
-    /// Loaded into the steward process: compiled in, or cdylib.
+    /// Loaded into the steward process at build time.
+    ///
+    /// In this codebase in-process means compiled-in: the admission
+    /// engine accepts these only through typed Rust API calls
+    /// (`admit_singleton_respondent` / `admit_singleton_warden`),
+    /// never from disk-based discovery. Runtime dynamic-library
+    /// loading (cdylib via `dlopen`) is not supported: the steward
+    /// declares `#![forbid(unsafe_code)]`, which would be required
+    /// to wrap `dlopen` safely. A `manifest.toml` on disk declaring
+    /// `transport.type = "in-process"` is therefore never admitted
+    /// by the shipped binary and is skipped by `plugin_discovery`
+    /// with a warning.
     InProcess,
-    /// Runs as a separate process; communicates over Unix socket.
+    /// Runs as a separate process; communicates with the steward
+    /// over a Unix domain socket speaking the wire protocol defined
+    /// in `PLUGIN_CONTRACT.md` sections 6 through 11. Plugin
+    /// discovery admits this kind at runtime from bundles under
+    /// `plugins.search_roots`.
     OutOfProcess,
 }
 

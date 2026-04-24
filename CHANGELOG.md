@@ -15,7 +15,78 @@ artefacts. Consult the git log for pre-0.1.8 history.
 
 ## [Unreleased]
 
+### Added
+
+- **Phase 1 tightening (post-closure, GAPS [1], [17], [22])**: end-to-end
+  coverage for `plugin_discovery::discover_and_admit` in
+  `crates/evo-example-echo/tests/discovery.rs` (staged layout, flat
+  layout, dedup across roots, empty search_roots, missing search_root).
+  These compose the walker with `admit_out_of_process_from_directory`
+  and a real `echo-wire` binary, covering the specific code path the
+  shipped `evo` binary runs at startup. `AdmissionEngine::with_data_root`
+  builder-style setter chains with any `with_registry*` constructor so
+  tests combining shared stores with a scratch data root no longer
+  silently bind to the production `/var/lib/evo/plugins` location (unit
+  test `with_data_root_overrides_default_on_shared_store_constructors`
+  verifies all four constructors). `config::DEFAULT_PLUGIN_RUNTIME_DIR`
+  public constant for distribution authors and systemd unit authors.
+- **Phase 1 (GAPS [1], [22], [17])**: Configurable plugin discovery
+  (`plugins.search_roots`, `plugin_data_root`, `runtime_dir` in
+  `StewardConfig`), per-plugin `state/` and `credentials/` directory
+  creation before out-of-process admission, `plugin_discovery` module
+  and startup wiring in `main.rs`, and `AdmissionEngine::plugin_data_root`
+  driving all `LoadContext` paths. Empty catalogue or zero admitted
+  plugins remains a valid startup state with explicit `info` logging
+  (gap [17] closed as out-of-scope for in-framework hard failure).
+
 ### Changed
+
+- `plugins.runtime_dir` default changed from `/var/lib/evo/plugins`
+  (coincidentally equal to `plugin_data_root`) to `/var/run/evo/plugins`,
+  aligning with FHS and paralleling the steward's own client socket at
+  `/var/run/evo/evo.sock`. Distributions using modern systemd typically
+  expose this via `RuntimeDirectory=evo/plugins`, which creates
+  `/run/evo/plugins` (the canonical location on merged-`/usr` systems
+  where `/var/run` symlinks to `/run`). The previous default mixed
+  persistent state (per-plugin `state/`, `credentials/`) and runtime
+  state (sockets cleaned on reboot) in a single tree, which FHS
+  separates by design; the new default honours that separation.
+- `plugin_discovery::log_admission_outcome` promoted the
+  catalogue-declares-shelves-but-no-admissions branch from `info` to
+  `warn`. The situation is still not a hard framework failure (gap [17]
+  stays OUT OF SCOPE) but it is a plausible operational anomaly
+  (misconfigured `plugins.search_roots`, stale bundles, all manifests
+  skipped as factory or in-process) and deserves visibility at the
+  default `warn` log level. The empty-catalogue branch remains `info`
+  because it is genuinely benign. Log message extended with an
+  actionable hint naming the three common causes.
+- `docs/engineering/STEWARD.md` section 11.1 config table refreshed
+  to match the post-Phase-1 reality: default config path corrected to
+  `/etc/evo/evo.toml`, `catalogue.path` default corrected to
+  `/opt/evo/catalogue/default.toml`, and the stale
+  "not yet surfaced as config" row for `plugins.runtime_dir` replaced
+  with full rows for `plugins.allow_unsigned`, `plugin_data_root`,
+  `runtime_dir`, and `search_roots`. Cross-reference to
+  `SCHEMAS.md` section 3.3 added so readers know where the
+  authoritative schema lives.
+- `docs/engineering/STEWARD.md` section 16 "Open Decisions": the
+  "Essence enforcement at startup" row was stale (closed as OUT OF
+  SCOPE in Phase 1, gap [17]). Removed from the open-decisions table
+  and replaced with an explicit closing note pointing at section 12.9
+  and gap [17] so future readers do not re-open the decision.
+- `docs/engineering/CONFIG.md` section 3.3 runtime_dir narrative
+  updated to reflect the new FHS-aligned default and to reference
+  systemd's `RuntimeDirectory=` idiom.
+- `docs/engineering/SCHEMAS.md` section 3.3 runtime_dir default
+  updated in the shape block and the field reference table.
+- `crates/evo-plugin-sdk/src/manifest.rs` `TransportKind::InProcess`
+  rustdoc clarified: in this codebase in-process means compiled-in
+  only. Runtime dynamic-library loading (cdylib via `dlopen`) is not
+  supported because the steward declares `#![forbid(unsafe_code)]`.
+  The previous doc mentioned cdylib as a secondary in-process path
+  without naming why it is unreachable in this codebase; the
+  clarification closes that ambiguity so plugin authors reading the
+  contract know what is and is not admissible.
 
 - Workspace MSRV raised from `1.80` to `1.85` in response to the Rust
   ecosystem's broad adoption of edition 2024 (stabilised in Rust 1.85 on

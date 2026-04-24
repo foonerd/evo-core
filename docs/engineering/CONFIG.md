@@ -13,13 +13,14 @@ The steward reads a TOML file at startup to learn:
 - Where to bind its client socket.
 - Where to find the catalogue.
 - Whether to admit unsigned plugins.
+- Where to scan for plugin bundles, where to place per-plugin `state/` and `credentials/`, and where to create Unix sockets for out-of-process plugins (see `[plugins]` below).
 
 That is all. The config file is deliberately small: the steward's job is defined by the catalogue and the plugins it admits, not by its own configuration. Distributions that want more elaborate runtime behaviour encode it in plugins, not in config.
 
 This document covers:
 
 - File location and resolution order
-- The three config sections and what they mean
+- The top-level config sections and what they mean
 - How CLI flags and environment variables interact with the config
 - Common deployment patterns
 - Pointers to the full schema (`SCHEMAS.md` section 3.3) and related docs
@@ -48,9 +49,9 @@ A missing default file and a present-but-empty file behave the same: all default
 
 This means operators can write a minimal config file that only sets the one or two fields they care about and rely on defaults for everything else. The full schema in `SCHEMAS.md` section 3.3 is what you *can* set, not what you *must* set.
 
-## 3. The Three Sections
+## 3. The Top-Level Sections
 
-The config is structured as three top-level tables. Full schema in `SCHEMAS.md` section 3.3.
+The config is structured as top-level tables. Full schema in `SCHEMAS.md` section 3.3.
 
 ### 3.1 `[steward]`
 
@@ -79,14 +80,24 @@ path = "/opt/evo/catalogue/default.toml"
 
 ### 3.3 `[plugins]`
 
-Plugin admission policy.
+Plugin admission policy, discovery locations, and filesystem paths for load context.
 
 ```toml
 [plugins]
 allow_unsigned = false
+# Optional; defaults are suitable for a typical device tree:
+# plugin_data_root = "/var/lib/evo/plugins"
+# runtime_dir = "/var/run/evo/plugins"
+# search_roots = ["/opt/evo/plugins", "/var/lib/evo/plugins"]
 ```
 
 **`allow_unsigned`** controls whether plugins without valid signatures may be admitted. Default: `false`, which is what production deployments want. When `true`, unsigned plugins are admitted at `sandbox` trust class only (see `VENDOR_CONTRACT.md` for the trust hierarchy). Development and testing typically turn this on; production leaves it off.
+
+**`plugin_data_root`** is the parent for each plugin’s `state/` and `credentials/` directories. Default: `/var/lib/evo/plugins`. The steward creates those subdirectories (mode `0700` on Unix) before admitting a discovered out-of-process plugin. Must align with `PLUGIN_PACKAGING.md` on your distribution.
+
+**`runtime_dir`** is where the steward places `<plugin_name>.sock` for out-of-process plugins. Default: `/var/run/evo/plugins`, paralleling the steward's own socket at `/var/run/evo/evo.sock` per FHS. The directory must exist and be writable; the binary creates it at startup if missing (along with `plugin_data_root`). Distributions using modern systemd typically expose this via `RuntimeDirectory=evo/plugins`, which creates `/run/evo/plugins` (the canonical location on merged-`/usr` systems where `/var/run` is a symlink to `/run`).
+
+**`search_roots`** is an ordered list of directories to walk for `manifest.toml` in each plugin bundle. Default: `/opt/evo/plugins` first, then `/var/lib/evo/plugins`. If the same `plugin.name` appears under two roots, the later root in the list wins. Layout (staged `evo` / `distribution` / `vendor` vs flat) follows `PLUGIN_PACKAGING.md` and the `plugin_discovery` module.
 
 There is deliberately no field to turn off admission validation entirely, lower trust requirements globally, or disable signature checking for particular plugins. Admission policy is binary: signed plugins with valid trust, or unsigned plugins at `sandbox` if explicitly allowed.
 
@@ -100,6 +111,7 @@ For fields that can be set from multiple sources, the precedence order (highest 
 | `socket_path` | `--socket` CLI | `config.steward.socket_path` | - | default `/var/run/evo/evo.sock` |
 | `catalogue.path` | `--catalogue` CLI | `config.catalogue.path` | - | default `/opt/evo/catalogue/default.toml` |
 | `allow_unsigned` | `config.plugins.allow_unsigned` | - | - | default `false` |
+| `plugins.plugin_data_root`, `runtime_dir`, `search_roots` | `config.plugins.*` | - | - | see `SCHEMAS.md` 3.3 |
 
 Notes:
 

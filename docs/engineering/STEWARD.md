@@ -58,7 +58,7 @@ The `evo` crate is the steward. Its modules, and their responsibilities:
 
 | Module | Role |
 |--------|------|
-| `main.rs` | Binary entrypoint: parse CLI, load config, initialise logging, load catalogue, construct an empty admission engine, construct projection engine, construct server, wait for shutdown, drain. Not a library module. The shipped binary has no hardcoded plugin admissions; plugin discovery is deferred (section 12.9). Tests construct `AdmissionEngine` directly and call its `admit_*` methods; the example plugin crates are `dev-dependencies`, not production dependencies. |
+| `main.rs` | Binary entrypoint: parse CLI, load config, initialise logging, load catalogue, run plugin discovery (`plugin_discovery` module), construct projection engine, construct server, wait for shutdown, drain. Not a library module. The shipped binary does not hardcode which plugins load; it discovers out-of-process singletons from configured search roots. Tests and custom binaries may still construct `AdmissionEngine` directly. |
 | `cli` | `clap`-based argument parser. Exposes `Args`. |
 | `config` | TOML config loader with default fallback and required-file variant. Exposes `StewardConfig`. |
 | `logging` | `tracing_subscriber` setup. Resolves log filter from CLI, config, and `RUST_LOG` in that precedence order. Emits to `journald` in production, ANSI stderr in development. |
@@ -69,6 +69,7 @@ The `evo` crate is the steward. Its modules, and their responsibilities:
 | `custody` | Custody ledger. Records active custodies keyed by `(plugin, handle_id)`. Updated on `take_custody`, every state report, and `release_custody`. Exposes `CustodyLedger`, `CustodyRecord`, `StateSnapshot`, `LedgerCustodyStateReporter`. Full treatment in `CUSTODY.md`. |
 | `projections` | Projection engine. Composes subject projections on demand, including recursive relation walks with cycle guards and visit caps. Exposes `ProjectionEngine`, `ProjectionScope`, `SubjectProjection`. |
 | `admission` | Admission engine. Accepts plugins (singleton respondents and wardens, in-process or out-of-process). Routes plugin requests, custody verbs, and emits custody happenings on the bus. Exposes `AdmissionEngine`. |
+| `plugin_discovery` | Walks `plugins.search_roots` from config, creates per-plugin `state/` and `credentials/` under the data root, and admits out-of-process singletons. Skips factory and in-process bundles with warnings. |
 | `context` | The `LoadContext` handed to each plugin at load time. Carries the announcers and state reporters the plugin uses to push data back into the steward. |
 | `wire_client` | Wire-level client for out-of-process plugins. Wraps a connected socket; speaks the plugin-facing protocol. Exposes `WireClient`, `WireRespondent`, `WireWarden` (the adapters that make a wire-backed plugin look like an in-process plugin to the admission engine). |
 | `happenings` | Happenings bus. Streamed notifications for fabric transitions; carries custody variants in this version. Exposes `Happening` (`#[non_exhaustive]`) and `HappeningBus`. Full treatment in `HAPPENINGS.md`. |
@@ -354,17 +355,20 @@ The steward's configuration is a TOML file. CLI flags override the file; absent 
 | Source | Precedence |
 |--------|-----------|
 | `--config <path>` | Highest. File must exist; missing file is an error. |
-| Default path (`/etc/evo/config.toml`) | Optional. Missing file silently falls back to defaults. |
+| Default path (`/etc/evo/evo.toml`) | Optional. Missing file silently falls back to defaults. |
 | Environment (`RUST_LOG` for logging only) | Lowest. |
 
-The effective configuration surfaces:
+The effective configuration surfaces (full schema in `SCHEMAS.md` section 3.3, narrative in `CONFIG.md`):
 
 | Key | Default | Purpose |
 |-----|---------|---------|
-| `catalogue.path` | `/etc/evo/catalogue.toml` | Where to read the catalogue. |
+| `catalogue.path` | `/opt/evo/catalogue/default.toml` | Where to read the catalogue. |
 | `steward.socket_path` | `/var/run/evo/evo.sock` | Client-facing socket location. |
 | `steward.log_level` | `warn` | Default log filter; overridden by `--log-level` and `RUST_LOG`. |
-| `plugins.runtime_dir` | not yet surfaced as config | Where out-of-process plugin sockets are created. |
+| `plugins.allow_unsigned` | `false` | If `true`, unsigned plugins admit at `sandbox` trust class only. |
+| `plugins.plugin_data_root` | `/var/lib/evo/plugins` | Parent for per-plugin `state/` and `credentials/`. |
+| `plugins.runtime_dir` | `/var/run/evo/plugins` | Directory for out-of-process plugin socket files. |
+| `plugins.search_roots` | `["/opt/evo/plugins", "/var/lib/evo/plugins"]` | Ordered bundle search roots; later entry wins on duplicate `plugin.name`. |
 
 ### 11.2 Catalogue
 
@@ -421,11 +425,11 @@ Plugins can request user-facing prompts through `LoadContext::user_interaction_r
 
 ### 12.9 Plugin Discovery
 
-The shipped steward binary admits no plugins on its own. An empty `AdmissionEngine` is constructed at startup; without further action it stays empty for the life of the process. This is a valid running state (the steward faithfully serves a catalogue with no contributors) and is the correct default for distributions whose catalogue should not be forced to accommodate the framework's test fixtures.
+The shipped binary runs a discovery pass after the catalogue loads and before the server is constructed. It walks each path in `plugins.search_roots` (default: `/opt/evo/plugins` then `/var/lib/evo/plugins`; a plugin name in a later root overrides the same name in an earlier root). Staged directory layout under `evo` / `distribution` / `vendor` (per `PLUGIN_PACKAGING.md`) and flat “each child directory is a bundle” layout are both supported. Each bundle must contain a `manifest.toml`. Only out-of-process singletons are admitted; factory plugins and in-process transport are skipped with a warning.
 
-Dynamic discovery of plugin artefacts on disk (walking `/var/lib/evo/plugins/` and `/opt/evo/plugins/`, reading each manifest, admitting each plugin) is the expected production path and is deferred. When it lands, the binary's startup sequence grows a discovery step between catalogue load and server construction; the admission engine's API does not change, and distributions that want to drive admission themselves (via a custom binary or a test harness) continue to work.
+Per-plugin `state/` and `credentials/` directories are created under `plugins.plugin_data_root` (default `/var/lib/evo/plugins`) before each admission. Sockets for out-of-process plugins live in `plugins.runtime_dir` (default: same as the data root).
 
-Until discovery lands, distributions exercising plugins do so through integration harnesses that construct an `AdmissionEngine` directly and call its `admit_*` methods. This is the same pattern the steward's own tests use (see `tests/end_to_end.rs` and the `tests/` directories of the example plugin crates).
+An empty `AdmissionEngine` after discovery is still a valid state (for example, empty catalogue, or catalogue with no matching shelves, or only skipped bundles). The steward logs this at `info` so the situation is not silent. Distributions and tests may still build a custom binary that constructs an `AdmissionEngine` directly and call `admit_*` (see `tests/end_to_end.rs` and the example plugin crates' tests).
 
 ## 13. Invariants
 
@@ -481,6 +485,7 @@ Both invariants are documented in the relevant test files and in `WIRE_PROTOCOL.
 | Fast-path mechanism | `FAST_PATH.md`. |
 | Trust-class-to-OS-primitive mapping | Pending; orthogonal to existing engineering docs. |
 | Catalogue-declared projection shapes | Pending; extends `PROJECTIONS.md` sections 3 and 4. |
-| Essence enforcement at startup | Pending; engineering-layer decision on what constitutes "enough fabric to declare the device operational". |
 
 Each is open because the current implementation does not constrain the answer and each is large enough to deserve its own document when picked up.
+
+Essence enforcement at startup is **not** open: Phase 1 closed it as OUT OF SCOPE in the framework (gap [17]). A running steward with an empty catalogue or zero admitted plugins is a valid state; section 12.9 describes the `warn`-level signal when the catalogue declares shelves but discovery admits none. A stricter operational gate is a distribution concern, not a framework one.

@@ -422,7 +422,10 @@ socket_path = "<path>"            # optional; default "/var/run/evo/evo.sock"
 path = "<path>"                   # optional; default "/opt/evo/catalogue/default.toml"
 
 [plugins]
-allow_unsigned = <bool>           # optional; default false
+allow_unsigned = <bool>         # optional; default false
+plugin_data_root = "<path>"        # optional; default "/var/lib/evo/plugins"
+runtime_dir = "<path>"             # optional; default "/var/run/evo/plugins"
+search_roots = ["<path>", ...]     # optional; default ["/opt/evo/plugins", "/var/lib/evo/plugins"]
 ```
 
 #### 3.3.2 Field Reference
@@ -445,6 +448,9 @@ allow_unsigned = <bool>           # optional; default false
 | Field | Type | Required | Default | Constraint |
 |-------|------|----------|---------|------------|
 | `allow_unsigned` | bool | no | `false` | If `true`, unsigned plugins are admitted (at `sandbox` trust class only; see `VENDOR_CONTRACT.md`). |
+| `plugin_data_root` | string (path) | no | `"/var/lib/evo/plugins"` | Parent for per-plugin `state/` and `credentials/`. |
+| `runtime_dir` | string (path) | no | `"/var/run/evo/plugins"` | Directory for out-of-process plugin socket files `*.sock`. Paralleling the steward's own socket at `/var/run/evo/evo.sock` per FHS. |
+| `search_roots` | array of paths | no | `["/opt/evo/plugins", "/var/lib/evo/plugins"]` | Plugin bundle search order; later entry wins on duplicate `plugin.name`. |
 
 #### 3.3.3 File Location and Override Precedence
 
@@ -458,7 +464,7 @@ Per-field overrides (highest precedence first):
 - `log_level`: `--log-level` CLI flag > `RUST_LOG` env var > `config.steward.log_level` > hardcoded `"warn"`.
 - `socket_path`: `--socket` CLI flag > `config.steward.socket_path` > default.
 - `catalogue.path`: `--catalogue` CLI flag > `config.catalogue.path` > default.
-- `allow_unsigned`: config file only.
+- `allow_unsigned`, `plugin_data_root`, `runtime_dir`, `search_roots`: config file only.
 
 #### 3.3.4 Example
 

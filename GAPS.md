@@ -51,11 +51,13 @@ Purpose: stop the inventory from lying; avoid building on fuzzy scope.
 
 ### Phase 1 - Bootstrap: steward loads a real device
 
-Order inside phase: [1] then [22] then [17] decision.
+Status: **closed** (see Resolution Log: Phase 1).
 
-- [1] Plugin Discovery. Walks `/opt/evo/plugins/` and `/var/lib/evo/plugins/`, loads manifests, admits via AdmissionEngine. Unblocks every subsequent phase: tests stop requiring custom admission harnesses and distributions stop carrying one.
-- [22] Plugin Credentials and State Directories. Pairs with [1]: steward creates and permissions `/var/lib/evo/plugins/<name>/credentials/` (0600) and `/var/lib/evo/plugins/<name>/state/`. Avoids paths existing by luck.
-- [17] Essence Enforcement at Startup. Either IMPLEMENT a minimal operational-catalogue predicate, or OUT OF SCOPE with an explicit statement that an empty catalogue is a valid running state. The decision is deliberately punted from Phase 0 because the right answer depends on what [1] surfaces during implementation.
+Order inside phase was: [1] then [22] then [17] decision.
+
+- [1] Plugin Discovery. Walks `/opt/evo/plugins/` and `/var/lib/evo/plugins/` (configurable), loads manifests, admits out-of-process singletons via `AdmissionEngine`. Staged (`evo`/`distribution`/`vendor`) vs flat layout per `PLUGIN_PACKAGING.md`.
+- [22] Plugin Credentials and State Directories. Pairs with [1]: steward creates `state/` and `credentials/` under the configured data root with mode `0700` on Unix; `build_load_context` and discovery share that root.
+- [17] Essence Enforcement at Startup. **OUT OF SCOPE** for refusing startup: an empty catalogue and/or zero admitted plugins is a valid running state; the steward logs this explicitly at `info` after discovery (see gap [17] in the inventory).
 
 ### Phase 2 - Security and supply chain
 
@@ -203,11 +205,11 @@ These are not numbered gaps in the inventory; they are honest boundaries for int
 ### [1] Plugin Discovery
 
 - Promised: concept implies the steward loads plugins; PLUGIN_PACKAGING section 3 documents /opt/evo/plugins/ and /var/lib/evo/plugins/ as the paths the steward reads.
-- On disk: main.rs constructs an empty AdmissionEngine and never calls admit_*. Nothing walks either directory.
-- Author hits: plugin installed to the documented path does not load. Device cannot run.
-- Status: OPEN
-- Decision:
-- Notes:
+- On disk: `crates/evo/src/plugin_discovery.rs` walks configured `plugins.search_roots` (defaults: `/opt/evo/plugins` then `/var/lib/evo/plugins`, later root wins on duplicate `plugin.name`), classifies staged vs flat trees, and calls `admit_out_of_process_from_directory` for each out-of-process singleton. Factory and non-out-of-process manifests are skipped with a warning. `main.rs` wires discovery after catalogue load.
+- Author hits: (closed) a plugin in the default locations is considered for admission when its manifest and catalogue target match existing admission rules.
+- Status: RESOLVED — IMPLEMENTED
+- Decision: IMPLEMENT. Configurable `search_roots`; same-name dedup with later root overriding earlier.
+- Notes: In-process and factory plugins are not discoverable on this path (gaps [4] and transport shape remain for factory).
 
 ### [2] Appointments Rack
 
@@ -347,11 +349,11 @@ These are not numbered gaps in the inventory; they are honest boundaries for int
 ### [17] Essence Enforcement at Startup
 
 - Promised: CONCEPT section 9 names "enough fabric to advertise the device as operational" as an open decision.
-- On disk: steward starts against any catalogue, including empty, and serves empty responses.
-- Operator hits: a broken plugin set produces a running steward that reports "no custody, no subjects" rather than refusing to come up.
-- Status: OPEN
-- Decision:
-- Notes:
+- On disk: steward still starts against any catalogue, including empty, and serves responses; there is no mandatory "operational" predicate that refuses startup. After plugin discovery, `plugin_discovery` logs at `info` when no plugins were admitted (distinguishing empty catalogue vs non-empty catalogue with no admissions).
+- Operator hits: a broken or empty plugin set still yields a running steward; operators who need a stricter device gate build it in the distribution (health checks, frontend, or a wrapper), not in evo-core.
+- Status: RESOLVED — EXPLICITLY OUT OF SCOPE (in-framework refusal to start)
+- Decision: OUT OF SCOPE for a steward-side "must not start empty" rule in v0.x. A running steward with zero plugins and/or an empty catalogue is valid. The framework logs the situation at startup so it is not silent confusion.
+- Notes: A future minimal operational predicate remains a product concern unless CONCEPT is revised to require in-framework enforcement.
 
 ### [18] Happenings Enrichment
 
@@ -394,12 +396,12 @@ These are not numbered gaps in the inventory; they are honest boundaries for int
 
 ### [22] Plugin Credentials and State Directories
 
-- Promised: PLUGIN_PACKAGING section 3 documents /var/lib/evo/plugins/<n>/credentials/ mode 0600 and /var/lib/evo/plugins/<n>/state/; LoadContext carries credentials_dir and state_dir paths.
-- On disk: paths are passed into LoadContext as strings; the steward never creates these directories, never sets modes, never enforces isolation between plugins.
-- Operator hits: a plugin that writes to its credentials/ directory succeeds or fails based on whether the path happens to exist and be writable. Operator-provisioned credentials have no defined placement ceremony.
-- Status: OPEN
-- Decision:
-- Notes:
+- Promised: PLUGIN_PACKAGING section 3 documents /var/lib/evo/plugins/<n>/credentials/ and state trees; LoadContext carries credentials_dir and state_dir paths.
+- On disk: `AdmissionEngine` takes `plugin_data_root` (default `/var/lib/evo/plugins`); `build_load_context` joins `/<name>/state` and `/<name>/credentials`. `plugin_discovery::ensure_plugin_state_and_credentials` creates those directories before out-of-process admission, mode `0700` on Unix for each directory. In-process admission paths use the same root from the engine.
+- Operator hits: (closed) default layout is created for discovered out-of-process plugins; file-level `0600` on credential *files* remains the plugin’s responsibility.
+- Status: RESOLVED — IMPLEMENTED
+- Decision: IMPLEMENT directory creation and configurable root; align all load paths with `plugin_data_root`.
+- Notes: Distros may pre-create or override permissions; steward ensures presence before spawn when using discovery.
 
 ### [23] Manifest Resource and Prerequisite Declarations
 
@@ -541,3 +543,33 @@ Outcome: IMPLEMENTED (code removal).
 Summary: `crates/evo/src/wire_client.rs` carried a `#[allow(dead_code)]` `pub(crate) fn registry_event_sink(...)` helper that built an `EventSink` from a plugin name and the steward's registries. The helper had no production or test call sites; tests construct `EventSink` struct literals inline through the `test_load_context` helper. The helper and its preceding comment divider are removed. Four module-scope imports used only by the test module's outer scope (`RegistrySubjectAnnouncer`, `RegistryRelationAnnouncer`, `SubjectRegistry`, `RelationGraph`) are gated with `#[cfg(test)]` so non-test builds do not flag them as unused. A fifth name (`LoggingStateReporter`) that had been imported at module scope solely for the removed helper is dropped entirely; the test module re-imports it inside `test_load_context`'s inner `use` statement as needed. Verification gate (fmt, clippy, tests, build) must pass.
 
 Commits: this commit.
+
+### Phase 1 - [1], [22], [17]
+
+Outcome: [1] and [22] IMPLEMENTED; [17] OUT OF SCOPE for in-steward startup refusal, with explicit `info` logging at startup after discovery.
+
+Summary: `plugin_discovery` scans `plugins.search_roots` (defaults `/opt/evo/plugins` then `/var/lib/evo/plugins`, dedup with later root winning), applies staged vs flat directory layout, creates `state/` and `credentials/` under `plugins.plugin_data_root` before admitting each out-of-process singleton, and calls `admit_out_of_process_from_directory` with `plugins.runtime_dir` for socket paths. `AdmissionEngine` stores `plugin_data_root`; `build_load_context` uses it for all load paths. Gap [17] closes with documented validity of empty catalogues / zero plugins plus logging, not a hard start failure in the framework.
+
+Changes: `crates/evo/src/plugin_discovery.rs`, `crates/evo/src/config.rs` (`[plugins]` extensions), `crates/evo/src/admission.rs`, `crates/evo/src/main.rs`, `docs/engineering/CONFIG.md`, `docs/engineering/SCHEMAS.md` section 3.3, `docs/engineering/STEWARD.md` (main/discovery), `GAPS.md` gap inventory, `CHANGELOG.md` [Unreleased].
+
+### Phase 1 tightening - empirical closure, FHS, API, docs
+
+Outcome: IMPLEMENTED. Post-closure cleanup for the three Phase 1 gaps. No gap re-opens; this entry records the work that brings the Phase 1 closure from structurally complete to empirically complete and operationally consistent.
+
+Summary: verification identified six items worth closing before declaring Phase 1 empirically done on a greenfield industrial-grade codebase:
+
+1. The walker `plugin_discovery::discover_and_admit` - the exact code path the shipped `evo` binary runs at startup - had no end-to-end coverage composing search-root iteration, staged-vs-flat detection, dedup, `ensure_plugin_state_and_credentials`, and `admit_out_of_process_from_directory` together against a real plugin binary. Unit tests covered directory detection only; `from_directory.rs` in both example crates covered admission from a single explicit directory but bypassed the walker. `crates/evo-example-echo/tests/discovery.rs` is new and carries five tests (staged layout, flat layout, dedup across roots, empty search_roots, missing search_root) that each instantiate a `StewardConfig`, call `discover_and_admit`, and assert admission plus per-plugin directory creation, socket creation, and a request round-trip where applicable.
+
+2. `AdmissionEngine`'s four `with_registry*` constructors set `plugin_data_root` to the compile-time default and ignored any custom path. Production callers (main.rs) use `with_plugin_data_root` and were unaffected; tests that combined `with_registry*` with a scratch data root silently bound to the production `/var/lib/evo/plugins` location. `with_data_root(mut self, PathBuf) -> Self` added as a builder-style setter chainable with any of the four shared-store constructors; unit test `with_data_root_overrides_default_on_shared_store_constructors` verifies the wiring on all four.
+
+3. `plugins.runtime_dir` default changed from `/var/lib/evo/plugins` (coincidentally equal to `plugin_data_root`) to `/var/run/evo/plugins`. The previous default mixed persistent state (`state/`, `credentials/`) and runtime state (sockets cleaned on reboot) in a single tree; FHS separates these by design, and the steward's own client socket at `/var/run/evo/evo.sock` already honoured that separation. The new default brings plugin sockets into the same parent. Distributions using modern systemd expose `/var/run/evo/plugins` via `RuntimeDirectory=evo/plugins` which creates `/run/evo/plugins` on merged-`/usr` systems. New public const `config::DEFAULT_PLUGIN_RUNTIME_DIR` parallels `DEFAULT_PLUGIN_DATA_ROOT`.
+
+4. `plugin_discovery::log_admission_outcome` promoted the "catalogue declares shelves but no plugins were admitted" branch from `info` to `warn` so the operational anomaly is visible at the default `warn` log level. Gap [17] stays OUT OF SCOPE (empty admission remains a valid state, not a hard framework failure); this change is a visibility fix, not a policy change. The empty-catalogue branch stays `info` because it is genuinely benign. Log message now names the three common causes (search_roots misconfiguration, manifest validity, out-of-process-only discovery).
+
+5. `STEWARD.md` section 11.1 config table carried three stale values: the default config path was `/etc/evo/config.toml` (correct: `/etc/evo/evo.toml`), `catalogue.path` default was `/etc/evo/catalogue.toml` (correct: `/opt/evo/catalogue/default.toml`), and `plugins.runtime_dir` was labelled "not yet surfaced as config" (surfaced in Phase 1). All three corrected; the plugins block expanded to cover `allow_unsigned`, `plugin_data_root`, `runtime_dir`, and `search_roots`. Cross-reference to `SCHEMAS.md` section 3.3 added so readers know where the authoritative schema lives. Section 16 "Open Decisions" row for "Essence enforcement at startup" removed (closed as OUT OF SCOPE in Phase 1, gap [17]) and replaced with an explicit closing note so future readers do not re-open the decision.
+
+6. SDK `TransportKind::InProcess` rustdoc previously read "Loaded into the steward process: compiled in, or cdylib", inviting the reader to imagine a cdylib-via-dlopen path that is not reachable in this codebase (the steward declares `#![forbid(unsafe_code)]`, which would be required to wrap `dlopen`). Doc now states the real behaviour: in-process means compiled-in, plugin discovery never admits `transport.type = "in-process"` from disk, and a cdylib path would require lifting the unsafe-code prohibition first.
+
+Changes: `crates/evo/src/plugin_discovery.rs` (log promotion), `crates/evo/src/admission.rs` (`with_data_root` + test), `crates/evo/src/config.rs` (`DEFAULT_PLUGIN_RUNTIME_DIR`, new default for `runtime_dir`), `crates/evo-plugin-sdk/src/manifest.rs` (`TransportKind::InProcess` doc), `crates/evo-example-echo/tests/discovery.rs` (new), `docs/engineering/STEWARD.md` (section 11.1 and section 16), `docs/engineering/CONFIG.md` (section 3.3), `docs/engineering/SCHEMAS.md` (section 3.3), `CHANGELOG.md` [Unreleased], this file.
+
+Verification: the standard gate (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --all-targets --locked`, `cargo build --workspace --locked`) must pass, and `discovery.rs` must pass on the host entry of the CI MSRV matrix (where `CARGO_BIN_EXE_echo-wire` is set).

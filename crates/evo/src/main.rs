@@ -5,10 +5,10 @@
 //! empty admission engine, runs the server until a shutdown signal,
 //! and drains cleanly.
 //!
-//! Plugins are admitted by a plugin-discovery pass (deferred; see
-//! `STEWARD.md` section 12) or, in tests, by integration harnesses
-//! that construct an [`AdmissionEngine`] directly and call its
-//! `admit_*` methods. The shipped binary has no hardcoded admissions.
+//! Plugins are admitted by a discovery pass over configured search
+//! roots (see the `plugin_discovery` module) or, in tests, by integration
+//! harnesses that construct an [`AdmissionEngine`] directly and call its
+//! `admit_*` methods.
 //!
 //! Tests do not touch this file; anything testable lives in the library.
 
@@ -25,6 +25,7 @@ use evo::admission::AdmissionEngine;
 use evo::catalogue::Catalogue;
 use evo::cli::Args;
 use evo::config::StewardConfig;
+use evo::plugin_discovery;
 use evo::projections::ProjectionEngine;
 use evo::server::Server;
 use evo::shutdown::wait_for_signal;
@@ -71,12 +72,14 @@ async fn main() -> anyhow::Result<()> {
         "catalogue loaded"
     );
 
-    // Construct the admission engine. The shipped binary admits no
-    // plugins on its own; plugin discovery is a deferred capability
-    // (see `STEWARD.md` section 12). Distributions that need to
-    // exercise plugins today do so through integration harnesses.
-    let engine = AdmissionEngine::new();
-    tracing::info!(plugins = engine.len(), "admission complete");
+    // Construct the admission engine and run plugin discovery
+    // (out-of-process singletons only; see `plugin_discovery` and
+    // `GAPS.md` phase 1).
+    let mut engine = AdmissionEngine::with_plugin_data_root(
+        config.plugins.plugin_data_root.clone(),
+    );
+    plugin_discovery::discover_and_admit(&mut engine, &catalogue, &config)
+        .await?;
 
     // Construct a projection engine sharing the admission engine's
     // subject registry and relation graph. Plugins announce into the

@@ -15,6 +15,7 @@
 //!
 //! [plugins]
 //! allow_unsigned = false
+//! # plugin_data_root, runtime_dir, search_roots: see CONFIG.md / SCHEMAS.md
 //! ```
 
 use crate::error::StewardError;
@@ -29,6 +30,25 @@ pub const DEFAULT_CATALOGUE_PATH: &str = "/opt/evo/catalogue/default.toml";
 
 /// Default location of the steward's client-facing socket.
 pub const DEFAULT_SOCKET_PATH: &str = "/var/run/evo/evo.sock";
+
+/// Default per-plugin data root: `<this>/<plugin_name>/state` and
+/// `credentials/` (see `PLUGIN_PACKAGING.md`).
+pub const DEFAULT_PLUGIN_DATA_ROOT: &str = "/var/lib/evo/plugins";
+
+/// Default runtime directory for out-of-process plugin sockets.
+///
+/// Aligns with FHS: runtime state (sockets, pidfiles) lives under
+/// `/var/run/` (symlink to `/run/` on merged-`/usr` systems),
+/// alongside the steward's own client socket at
+/// `/var/run/evo/evo.sock`. Distributions using modern systemd expose
+/// this via `RuntimeDirectory=evo/plugins`.
+pub const DEFAULT_PLUGIN_RUNTIME_DIR: &str = "/var/run/evo/plugins";
+
+/// Default out-of-process plugin search order: read-only system tree
+/// first, then `/var` (same plugin name in a later root replaces an
+/// earlier one).
+const DEFAULT_PLUGIN_SEARCH_ROOTS: [&str; 2] =
+    ["/opt/evo/plugins", "/var/lib/evo/plugins"];
 
 /// Root of the steward's configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -150,13 +170,59 @@ fn default_catalogue_path() -> PathBuf {
 }
 
 /// `[plugins]` section.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginsSection {
     /// Whether unsigned plugins are admitted. Per `PLUGIN_PACKAGING.md`
     /// section 5: unsigned plugins run only at `sandbox` class, only if
     /// this flag is true. Default: false.
     #[serde(default)]
     pub allow_unsigned: bool,
+    /// Root for each plugin’s `state/` and `credentials/` subdirectories
+    /// (`<plugin_data_root>/<name>/...`). Default:
+    /// [`DEFAULT_PLUGIN_DATA_ROOT`].
+    #[serde(default = "default_plugin_data_root_path")]
+    pub plugin_data_root: PathBuf,
+    /// Directory in which the steward places Unix domain sockets
+    /// `<runtime_dir>/<plugin_name>.sock` for out-of-process plugins.
+    /// Must exist and be writable before admission; the binary creates
+    /// it at startup if missing. Default:
+    /// [`DEFAULT_PLUGIN_RUNTIME_DIR`] (`/var/run/evo/plugins`),
+    /// paralleling the steward's own socket at `/var/run/evo/evo.sock`
+    /// per FHS.
+    #[serde(default = "default_plugin_runtime_dir")]
+    pub runtime_dir: PathBuf,
+    /// Directories to scan for plugin bundles (`manifest.toml` in each
+    /// bundle). Processed in order: a duplicate `plugin.name` in a
+    /// later root replaces the earlier path. Default: `/opt/evo/plugins`
+    /// then [`DEFAULT_PLUGIN_DATA_ROOT`].
+    #[serde(default = "default_plugin_search_roots")]
+    pub search_roots: Vec<PathBuf>,
+}
+
+fn default_plugin_data_root_path() -> PathBuf {
+    PathBuf::from(DEFAULT_PLUGIN_DATA_ROOT)
+}
+
+fn default_plugin_runtime_dir() -> PathBuf {
+    PathBuf::from(DEFAULT_PLUGIN_RUNTIME_DIR)
+}
+
+fn default_plugin_search_roots() -> Vec<PathBuf> {
+    DEFAULT_PLUGIN_SEARCH_ROOTS
+        .iter()
+        .map(|s| PathBuf::from(*s))
+        .collect()
+}
+
+impl Default for PluginsSection {
+    fn default() -> Self {
+        Self {
+            allow_unsigned: false,
+            plugin_data_root: default_plugin_data_root_path(),
+            runtime_dir: default_plugin_runtime_dir(),
+            search_roots: default_plugin_search_roots(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +236,15 @@ mod tests {
         assert_eq!(cfg.steward.socket_path, PathBuf::from(DEFAULT_SOCKET_PATH));
         assert_eq!(cfg.catalogue.path, PathBuf::from(DEFAULT_CATALOGUE_PATH));
         assert!(!cfg.plugins.allow_unsigned);
+        assert_eq!(
+            cfg.plugins.plugin_data_root,
+            default_plugin_data_root_path()
+        );
+        assert_eq!(
+            cfg.plugins.runtime_dir,
+            PathBuf::from(DEFAULT_PLUGIN_RUNTIME_DIR)
+        );
+        assert_eq!(cfg.plugins.search_roots, default_plugin_search_roots());
     }
 
     #[test]
