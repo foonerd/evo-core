@@ -36,11 +36,11 @@
 //!   `merge`, `newest`, `exclusive`): v0 has no shape-declared fields
 //!   beyond subject identity and outgoing/incoming relations, so no
 //!   composition rule is yet exercised.
-//! - Push subscriptions: a separate subpass adds streamed updates on
-//!   top of this pull foundation.
-//! - Wire protocol exposure: admitted consumers cannot yet ask the
-//!   steward for projections over the wire; a follow-up subpass bolts
-//!   pull projections onto the server.
+//! - **Push** subscriptions: streamed live updates on top of pull, as
+//!   in `PROJECTIONS.md` section 8, are not implemented (gap [16]).
+//! - **Client socket**: **pull** `op: "project_subject"` is implemented
+//!   in `server.rs` and uses this engine; the gap is push and rack-keyed
+//!   work, not first-class wire access for subject projections.
 //! - Caching: projections are recomposed on every call.
 //!
 //! ## Concurrency

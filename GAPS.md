@@ -49,6 +49,42 @@ These are not gaps in the inventory sense; they are places where the documentati
 - Code does: relations.rs does not emit such warnings; assertions succeed silently regardless of declared cardinality.
 - Resolution: either the comment or the behaviour changes. Since gap [10] chooses the IMPLEMENT direction (cardinality becomes enforced), the comment is correct in spirit and the behaviour must come up to meet it.
 
+### [DC-3] projections.rs module header claimed wire pull was unimplemented
+
+- Doc said: `crates/evo/src/projections.rs` stated that clients could not yet request projections over the wire and that a follow-up would bolt pull queries onto the server.
+- Code does: `server.rs` exposes `op: "project_subject"` and dispatches to `ProjectionEngine::project_subject`. Pull projections over the client socket are implemented.
+- Resolution: module docs updated to match. Remaining work stays under gap [6] (rack-keyed), [16] (push subscription), and the other bullets still listed in that file.
+
+### [DC-4] happenings.rs module header claimed the subscription op was unimplemented
+
+- Doc said: `crates/evo/src/happenings.rs` described the client-socket subscription that streams happenings as "remains deferred."
+- Code does: `op: "subscribe_happenings"` is implemented in `server.rs` and streams from `HappeningBus`. In-process bus and client subscription both exist.
+- Resolution: module docs updated to state the truth. Enrichment, durable replay, and server-side filtering remain under gap [18] and `STEWARD.md` 12.2, not "no subscription op."
+
+## SDK and code-surface loose ends
+
+These are not numbered gaps in the inventory; they are honest boundaries for integrators and tooling. Each either closes with a doc/code fix, ships the missing surface, or is explicitly out of scope for evo-core.
+
+### [LE-1] Plugin SDK `testing` module is a placeholder
+
+- `crates/evo-plugin-sdk/src/testing.rs` is a stub; `lib.rs` labels it placeholder. There is no mock steward for plugin authors.
+- Resolution: implement the harness, or mark OUT OF SCOPE and narrow `lib.rs` and this file to say authors must use integration tests with a real `AdmissionEngine` until then.
+
+### [LE-2] Wire protocol v1 excludes features listed in `wire.rs`
+
+- `crates/evo-plugin-sdk/src/wire.rs` documents which verbs are not on the wire until `PROTOCOL_VERSION` bumps. Aligns with gaps [4], [5], [21].
+- Remains true; no code change required except keeping the list in sync when gaps close.
+
+### [LE-3] TOML datetimes not supported on plugin wire
+
+- `crates/evo/src/wire_client.rs` reports an error for TOML `datetime` values in frames that use TOML conversion. Integrators must use wire-safe encodings.
+- Document in PLUGIN_CONTRACT or STEWARD as a hard constraint, or add support; until then, behaviour is intentional and must be discoverable in docs.
+
+### [LE-4] `registry_event_sink` in wire_client is allow(dead_code)
+
+- Helper at `wire_client.rs` is unused in production; kept for test-style construction. Creates maintenance noise and vendor questions.
+- Resolution: use it, gate with `#[cfg(test)]`, or remove in favour of explicit `EventSink` construction at call sites.
+
 ## Gap Inventory
 
 ### [1] Plugin Discovery

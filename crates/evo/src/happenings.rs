@@ -36,12 +36,18 @@
 //!   path via [`WireWarden`](crate::wire_client::WireWarden)'s event
 //!   sink).
 //!
-//! ## Deferred
+//! ## Client socket
 //!
-//! - A client-socket subscription op that streams happenings out to
-//!   external consumers remains deferred (see `STEWARD.md` section
-//!   12.2). It is the first streaming op in the client protocol and
-//!   needs its own pass.
+//! The steward exposes `op: "subscribe_happenings"` on the Unix client
+//! socket; see `server.rs` and `STEWARD.md` section 6. That op registers
+//! the connection on this bus and streams serialised [`Happening`]s.
+//! A connection in subscription mode is output-only for its lifetime
+//! (see `STEWARD.md` / `server` module docs).
+//!
+//! What is still not implemented is the larger story in `STEWARD.md`
+//! section 12.2: server-side filtering, aggregation, extra variants, and
+//! durable replay. Those are tracked as gap [18] in `GAPS.md`, not as
+//! "missing the subscription op."
 //!
 //! ## Not a log
 //!
