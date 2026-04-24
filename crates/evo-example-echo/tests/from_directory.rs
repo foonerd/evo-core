@@ -125,8 +125,7 @@ response_budget_ms = 1000
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admit_from_directory_full_lifecycle() {
-    let plugin_dir =
-        tempfile::TempDir::new().expect("creating plugin tempdir");
+    let plugin_dir = tempfile::TempDir::new().expect("creating plugin tempdir");
     let runtime_dir =
         tempfile::TempDir::new().expect("creating runtime tempdir");
 
@@ -148,8 +147,7 @@ async fn admit_from_directory_full_lifecycle() {
 
     // Verify the steward actually created the socket under
     // runtime_dir with the canonical name.
-    let expected_socket =
-        runtime_dir.path().join("org.evo.example.echo.sock");
+    let expected_socket = runtime_dir.path().join("org.evo.example.echo.sock");
     assert!(
         expected_socket.exists(),
         "expected steward to create socket at {}",
@@ -184,8 +182,7 @@ async fn admit_from_directory_rejects_shelf_already_occupied() {
     // Admit once, then attempt a second admission from the same
     // directory. The second should fail because the first plugin
     // already occupies example.echo.
-    let plugin_dir =
-        tempfile::TempDir::new().expect("creating plugin tempdir");
+    let plugin_dir = tempfile::TempDir::new().expect("creating plugin tempdir");
     let runtime_dir =
         tempfile::TempDir::new().expect("creating runtime tempdir");
 
@@ -219,7 +216,8 @@ async fn admit_from_directory_rejects_shelf_already_occupied() {
         Err(e) => {
             let msg = format!("{e}");
             assert!(
-                msg.contains("already occupied") || msg.contains("example.echo"),
+                msg.contains("already occupied")
+                    || msg.contains("example.echo"),
                 "expected error to mention shelf occupation, got {msg}"
             );
         }

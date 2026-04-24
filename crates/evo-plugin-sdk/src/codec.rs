@@ -75,7 +75,9 @@ pub mod base64_bytes {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(d)?;
-        STANDARD.decode(s.as_bytes()).map_err(serde::de::Error::custom)
+        STANDARD
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -145,9 +147,7 @@ where
 ///
 /// Returns [`WireError::PeerClosed`] if the reader returns EOF before
 /// the full length prefix arrives.
-pub async fn read_frame_json<R>(
-    reader: &mut R,
-) -> Result<WireFrame, WireError>
+pub async fn read_frame_json<R>(reader: &mut R) -> Result<WireFrame, WireError>
 where
     R: AsyncRead + Unpin,
 {

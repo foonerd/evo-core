@@ -205,7 +205,18 @@ pub struct Trust {
 }
 
 /// Trust classes per `PLUGIN_PACKAGING.md` section 5.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum TrustClass {
     /// Highest class. In-process residency. System-wide custody.
@@ -600,17 +611,24 @@ instance_ttl_seconds = 0
 
     #[test]
     fn rejects_unsupported_contract_version() {
-        let toml = valid_singleton_respondent().replace("contract = 1", "contract = 2");
+        let toml = valid_singleton_respondent()
+            .replace("contract = 1", "contract = 2");
         match Manifest::from_toml(&toml) {
-            Err(ManifestError::UnsupportedContractVersion(v)) => assert_eq!(v, 2),
-            other => panic!("expected UnsupportedContractVersion, got {other:?}"),
+            Err(ManifestError::UnsupportedContractVersion(v)) => {
+                assert_eq!(v, 2)
+            }
+            other => {
+                panic!("expected UnsupportedContractVersion, got {other:?}")
+            }
         }
     }
 
     #[test]
     fn rejects_warden_interaction_without_warden_capabilities() {
-        let toml = valid_singleton_respondent()
-            .replace(r#"interaction = "respondent""#, r#"interaction = "warden""#);
+        let toml = valid_singleton_respondent().replace(
+            r#"interaction = "respondent""#,
+            r#"interaction = "warden""#,
+        );
         assert!(matches!(
             Manifest::from_toml(&toml),
             Err(ManifestError::InconsistentCapabilities(_))
@@ -621,10 +639,8 @@ instance_ttl_seconds = 0
     fn rejects_singleton_with_factory_capabilities() {
         // Start from the factory-warden manifest and turn its instance back to
         // singleton without removing the factory capabilities section.
-        let toml = valid_factory_warden().replace(
-            r#"instance = "factory""#,
-            r#"instance = "singleton""#,
-        );
+        let toml = valid_factory_warden()
+            .replace(r#"instance = "factory""#, r#"instance = "singleton""#);
         assert!(matches!(
             Manifest::from_toml(&toml),
             Err(ManifestError::InconsistentCapabilities(_))
@@ -635,7 +651,8 @@ instance_ttl_seconds = 0
     fn rejects_factory_without_factory_capabilities() {
         let mut toml = valid_singleton_respondent().to_string();
         // Flip to factory without adding [capabilities.factory].
-        toml = toml.replace(r#"instance = "singleton""#, r#"instance = "factory""#);
+        toml = toml
+            .replace(r#"instance = "singleton""#, r#"instance = "factory""#);
         assert!(matches!(
             Manifest::from_toml(&toml),
             Err(ManifestError::InconsistentCapabilities(_))

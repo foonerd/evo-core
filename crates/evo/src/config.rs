@@ -31,7 +31,7 @@ pub const DEFAULT_CATALOGUE_PATH: &str = "/opt/evo/catalogue/default.toml";
 pub const DEFAULT_SOCKET_PATH: &str = "/var/run/evo/evo.sock";
 
 /// Root of the steward's configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct StewardConfig {
     /// Core steward settings.
     #[serde(default)]
@@ -42,16 +42,6 @@ pub struct StewardConfig {
     /// Plugin admission policy.
     #[serde(default)]
     pub plugins: PluginsSection,
-}
-
-impl Default for StewardConfig {
-    fn default() -> Self {
-        Self {
-            steward: StewardSection::default(),
-            catalogue: CatalogueSection::default(),
-            plugins: PluginsSection::default(),
-        }
-    }
 }
 
 impl StewardConfig {
@@ -160,21 +150,13 @@ fn default_catalogue_path() -> PathBuf {
 }
 
 /// `[plugins]` section.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct PluginsSection {
     /// Whether unsigned plugins are admitted. Per `PLUGIN_PACKAGING.md`
     /// section 5: unsigned plugins run only at `sandbox` class, only if
     /// this flag is true. Default: false.
     #[serde(default)]
     pub allow_unsigned: bool,
-}
-
-impl Default for PluginsSection {
-    fn default() -> Self {
-        Self {
-            allow_unsigned: false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -185,14 +167,8 @@ mod tests {
     fn defaults_match_expected_paths() {
         let cfg = StewardConfig::default();
         assert_eq!(cfg.steward.log_level, "warn");
-        assert_eq!(
-            cfg.steward.socket_path,
-            PathBuf::from(DEFAULT_SOCKET_PATH)
-        );
-        assert_eq!(
-            cfg.catalogue.path,
-            PathBuf::from(DEFAULT_CATALOGUE_PATH)
-        );
+        assert_eq!(cfg.steward.socket_path, PathBuf::from(DEFAULT_SOCKET_PATH));
+        assert_eq!(cfg.catalogue.path, PathBuf::from(DEFAULT_CATALOGUE_PATH));
         assert!(!cfg.plugins.allow_unsigned);
     }
 
@@ -248,14 +224,16 @@ allow_unsigned = true
 
     #[test]
     fn missing_file_returns_defaults() {
-        let path = std::path::Path::new("/nonexistent/evo-test-never-exists.toml");
+        let path =
+            std::path::Path::new("/nonexistent/evo-test-never-exists.toml");
         let cfg = StewardConfig::load_from(path).unwrap();
         assert_eq!(cfg, StewardConfig::default());
     }
 
     #[test]
     fn load_from_required_errors_on_missing_file() {
-        let path = std::path::Path::new("/nonexistent/evo-test-never-exists.toml");
+        let path =
+            std::path::Path::new("/nonexistent/evo-test-never-exists.toml");
         let r = StewardConfig::load_from_required(path);
         assert!(matches!(r, Err(StewardError::Io { .. })));
     }

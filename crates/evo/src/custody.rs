@@ -45,10 +45,10 @@
 //! history can add a bounded ring buffer per record; the public API
 //! of this module does not foreclose that.
 
+use crate::happenings::{Happening, HappeningBus};
 use evo_plugin_sdk::contract::{
     CustodyHandle, CustodyStateReporter, HealthStatus, ReportError,
 };
-use crate::happenings::{Happening, HappeningBus};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -240,10 +240,7 @@ impl CustodyLedger {
 
     /// Number of active records.
     pub fn len(&self) -> usize {
-        self.entries
-            .read()
-            .expect("ledger lock poisoned")
-            .len()
+        self.entries.read().expect("ledger lock poisoned").len()
     }
 
     /// True if the ledger holds no records.
@@ -573,8 +570,7 @@ mod tests {
 
         let all = ledger.list_active();
         assert_eq!(all.len(), 3);
-        let mut ids: Vec<_> =
-            all.iter().map(|r| r.handle_id.clone()).collect();
+        let mut ids: Vec<_> = all.iter().map(|r| r.handle_id.clone()).collect();
         ids.sort();
         assert_eq!(ids, vec!["c-1", "c-2", "c-3"]);
     }

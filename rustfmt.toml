@@ -1,0 +1,21 @@
+# rustfmt configuration for evo-core.
+#
+# Codebase convention: 80-column formatting. This is a deliberate
+# aesthetic choice inherited from the project's traditional-layout
+# style; rustfmt's default is 100. Committing this config pins the
+# project-wide decision so every contributor's editor and every CI
+# run produce identical output, with no tribal knowledge required.
+#
+# Downstream `evo-device-<vendor>` distributions may adopt the same
+# settings for consistency with upstream, or choose their own.
+# rustfmt.toml is per-workspace; it does not propagate across
+# workspace boundaries.
+#
+# Everything else uses rustfmt stable defaults. No other settings
+# are overridden.
+
+max_width = 80
+
+# Force Unix line endings regardless of contributor platform. Windows
+# contributors with CRLF-configured editors get LF in the repository.
+newline_style = "Unix"

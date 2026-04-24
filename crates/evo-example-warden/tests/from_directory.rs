@@ -124,8 +124,7 @@ custody_failure_mode = "abort"
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admit_from_directory_warden_full_lifecycle() {
-    let plugin_dir =
-        tempfile::TempDir::new().expect("creating plugin tempdir");
+    let plugin_dir = tempfile::TempDir::new().expect("creating plugin tempdir");
     let runtime_dir =
         tempfile::TempDir::new().expect("creating runtime tempdir");
 
@@ -208,8 +207,7 @@ async fn admit_from_directory_warden_rejects_shelf_already_occupied() {
     // Admit once, then attempt a second admission from the same
     // directory. The second should fail because the first warden
     // already occupies example.custody.
-    let plugin_dir =
-        tempfile::TempDir::new().expect("creating plugin tempdir");
+    let plugin_dir = tempfile::TempDir::new().expect("creating plugin tempdir");
     let runtime_dir =
         tempfile::TempDir::new().expect("creating runtime tempdir");
 
@@ -251,11 +249,7 @@ async fn admit_from_directory_warden_rejects_shelf_already_occupied() {
         }
         Ok(()) => panic!("expected duplicate admission to fail"),
     }
-    assert_eq!(
-        engine.len(),
-        1,
-        "first plugin should remain admitted"
-    );
+    assert_eq!(engine.len(), 1, "first plugin should remain admitted");
 
     // Clean shutdown.
     engine.shutdown().await.expect("shutdown");

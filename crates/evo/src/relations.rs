@@ -379,9 +379,7 @@ impl RelationGraph {
         claimant: &str,
         reason: Option<String>,
     ) -> Result<AssertOutcome, StewardError> {
-        if source_id.is_empty()
-            || predicate.is_empty()
-            || target_id.is_empty()
+        if source_id.is_empty() || predicate.is_empty() || target_id.is_empty()
         {
             return Err(StewardError::Dispatch(
                 "assert: empty source, predicate, or target".into(),
@@ -624,10 +622,7 @@ impl RelationGraph {
             );
         }
 
-        WalkResult {
-            visited,
-            truncated,
-        }
+        WalkResult { visited, truncated }
     }
 }
 
@@ -642,17 +637,13 @@ mod tests {
         assert_eq!(g.claim_count(), 0);
         assert!(!g.exists("s", "p", "t"));
         assert!(g.describe_relation("s", "p", "t").is_none());
-        assert!(g
-            .neighbours("s", "p", WalkDirection::Forward)
-            .is_empty());
+        assert!(g.neighbours("s", "p", WalkDirection::Forward).is_empty());
     }
 
     #[test]
     fn assert_creates_relation() {
         let g = RelationGraph::new();
-        let o = g
-            .assert("s1", "album_of", "a1", "p.scanner", None)
-            .unwrap();
+        let o = g.assert("s1", "album_of", "a1", "p.scanner", None).unwrap();
         assert_eq!(o, AssertOutcome::Created);
         assert_eq!(g.relation_count(), 1);
         assert_eq!(g.claim_count(), 1);
@@ -765,9 +756,7 @@ mod tests {
     fn walk_zero_depth_returns_start_only() {
         let g = RelationGraph::new();
         g.assert("a", "p", "b", "p1", None).unwrap();
-        let scope = WalkScope::new()
-            .with_predicates(["p"])
-            .with_max_depth(0);
+        let scope = WalkScope::new().with_predicates(["p"]).with_max_depth(0);
         let r = g.walk("a", &scope);
         assert_eq!(r.visited.len(), 1);
         assert_eq!(r.visited[0].canonical_id, "a");
@@ -781,9 +770,7 @@ mod tests {
         let g = RelationGraph::new();
         g.assert("a", "p", "b", "p1", None).unwrap();
         g.assert("a", "p", "c", "p1", None).unwrap();
-        let scope = WalkScope::new()
-            .with_predicates(["p"])
-            .with_max_depth(1);
+        let scope = WalkScope::new().with_predicates(["p"]).with_max_depth(1);
         let r = g.walk("a", &scope);
         assert_eq!(r.visited.len(), 3);
         assert_eq!(r.visited[0].canonical_id, "a");
@@ -807,21 +794,15 @@ mod tests {
         g.assert("b", "p", "c", "p1", None).unwrap();
         g.assert("c", "p", "d", "p1", None).unwrap();
 
-        let s1 = WalkScope::new()
-            .with_predicates(["p"])
-            .with_max_depth(1);
+        let s1 = WalkScope::new().with_predicates(["p"]).with_max_depth(1);
         let r1 = g.walk("a", &s1);
         assert_eq!(r1.visited.len(), 2);
 
-        let s2 = WalkScope::new()
-            .with_predicates(["p"])
-            .with_max_depth(2);
+        let s2 = WalkScope::new().with_predicates(["p"]).with_max_depth(2);
         let r2 = g.walk("a", &s2);
         assert_eq!(r2.visited.len(), 3);
 
-        let s3 = WalkScope::new()
-            .with_predicates(["p"])
-            .with_max_depth(99);
+        let s3 = WalkScope::new().with_predicates(["p"]).with_max_depth(99);
         let r3 = g.walk("a", &s3);
         assert_eq!(r3.visited.len(), 4);
     }
@@ -833,9 +814,7 @@ mod tests {
         g.assert("b", "p", "c", "p1", None).unwrap();
         g.assert("c", "p", "a", "p1", None).unwrap();
 
-        let scope = WalkScope::new()
-            .with_predicates(["p"])
-            .with_max_depth(10);
+        let scope = WalkScope::new().with_predicates(["p"]).with_max_depth(10);
         let r = g.walk("a", &scope);
         // Should visit each node exactly once despite cycle.
         assert_eq!(r.visited.len(), 3);
@@ -861,14 +840,8 @@ mod tests {
     fn walk_max_visits_truncates() {
         let g = RelationGraph::new();
         for i in 0..10 {
-            g.assert(
-                "hub",
-                "p",
-                &format!("spoke{i}"),
-                "p1",
-                None,
-            )
-            .unwrap();
+            g.assert("hub", "p", &format!("spoke{i}"), "p1", None)
+                .unwrap();
         }
         let scope = WalkScope::new()
             .with_predicates(["p"])

@@ -83,7 +83,9 @@ pub use context::{
     SubjectAnnouncer, UserInteraction, UserInteractionRequester,
 };
 pub use error::PluginError;
-pub use factory::{Factory, InstanceAnnouncement, InstanceId, RetractionPolicy};
+pub use factory::{
+    Factory, InstanceAnnouncement, InstanceId, RetractionPolicy,
+};
 pub use plugin::{
     BuildInfo, HealthCheck, HealthReport, HealthStatus, Plugin,
     PluginDescription, PluginIdentity, RuntimeCapabilities,

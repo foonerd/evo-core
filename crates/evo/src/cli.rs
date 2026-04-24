@@ -90,7 +90,8 @@ mod tests {
 
     #[test]
     fn parses_config_only() {
-        let args = Args::try_parse_from(["evo", "--config", "/etc/evo.toml"]).unwrap();
+        let args =
+            Args::try_parse_from(["evo", "--config", "/etc/evo.toml"]).unwrap();
         assert_eq!(args.config.as_deref(), Some(Path::new("/etc/evo.toml")));
         assert!(args.catalogue.is_none());
     }

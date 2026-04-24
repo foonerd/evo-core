@@ -148,10 +148,7 @@ impl Plugin for WardenPlugin {
         _ctx: &'a LoadContext,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         async move {
-            tracing::info!(
-                plugin = "org.evo.example.warden",
-                "plugin load"
-            );
+            tracing::info!(plugin = "org.evo.example.warden", "plugin load");
             self.loaded = true;
             Ok(())
         }
@@ -306,14 +303,13 @@ impl Warden for WardenPlugin {
                 ));
             }
 
-            let tracked = self.custodies.remove(&handle.id).ok_or_else(
-                || {
+            let tracked =
+                self.custodies.remove(&handle.id).ok_or_else(|| {
                     PluginError::Permanent(format!(
                         "unknown custody handle: {}",
                         handle.id
                     ))
-                },
-            )?;
+                })?;
 
             tracing::info!(
                 plugin = "org.evo.example.warden",
@@ -357,15 +353,11 @@ mod tests {
             handle: &'a CustodyHandle,
             payload: Vec<u8>,
             health: HealthStatus,
-        ) -> Pin<
-            Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>,
-        > {
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
             let handle = handle.clone();
             Box::pin(async move {
-                self.reports
-                    .lock()
-                    .unwrap()
-                    .push((handle, payload, health));
+                self.reports.lock().unwrap().push((handle, payload, health));
                 Ok(())
             })
         }
@@ -448,8 +440,7 @@ mod tests {
         p.loaded = true;
         let reporter: Arc<dyn CustodyStateReporter> =
             Arc::new(CapturingReporter::default());
-        let handle =
-            p.take_custody(assignment(reporter, 7)).await.unwrap();
+        let handle = p.take_custody(assignment(reporter, 7)).await.unwrap();
 
         let correction = CourseCorrection {
             correction_type: "seek".into(),
@@ -481,8 +472,7 @@ mod tests {
         p.loaded = true;
         let reporter: Arc<dyn CustodyStateReporter> =
             Arc::new(CapturingReporter::default());
-        let handle =
-            p.take_custody(assignment(reporter, 5)).await.unwrap();
+        let handle = p.take_custody(assignment(reporter, 5)).await.unwrap();
         assert_eq!(p.active_custody_count(), 1);
 
         p.release_custody(handle).await.unwrap();

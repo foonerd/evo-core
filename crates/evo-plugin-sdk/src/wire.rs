@@ -58,8 +58,8 @@
 
 use crate::contract::{
     CustodyHandle, ExternalAddressing, HealthReport, HealthStatus,
-    PluginDescription, RelationAssertion, RelationRetraction,
-    ReportPriority, SubjectAnnouncement,
+    PluginDescription, RelationAssertion, RelationRetraction, ReportPriority,
+    SubjectAnnouncement,
 };
 use serde::{Deserialize, Serialize};
 

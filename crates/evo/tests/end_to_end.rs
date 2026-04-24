@@ -62,11 +62,8 @@ async fn build_harness(
         engine.relation_graph(),
     ));
     let engine = Arc::new(Mutex::new(engine));
-    let server = Server::new(
-        socket_path,
-        Arc::clone(&engine),
-        Arc::clone(&projections),
-    );
+    let server =
+        Server::new(socket_path, Arc::clone(&engine), Arc::clone(&projections));
 
     (engine, projections, server)
 }
@@ -156,9 +153,7 @@ async fn unknown_shelf_returns_structured_error() {
         .await
         .expect("socket available");
 
-    let mut stream = UnixStream::connect(&socket_path)
-        .await
-        .expect("connect");
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
 
     let request_json = r#"{"op":"request","shelf":"does.not.exist","request_type":"echo","payload_b64":""}"#;
     write_frame(&mut stream, request_json.as_bytes()).await;
@@ -167,7 +162,10 @@ async fn unknown_shelf_returns_structured_error() {
     let response_value: serde_json::Value =
         serde_json::from_slice(&response_body).expect("JSON");
     assert!(
-        response_value.get("error").and_then(|v| v.as_str()).is_some(),
+        response_value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .is_some(),
         "expected error field in response, got: {}",
         String::from_utf8_lossy(&response_body)
     );
@@ -219,13 +217,7 @@ async fn project_subject_roundtrips_through_socket() {
         };
 
         graph
-            .assert(
-                &track_id,
-                "album_of",
-                &album_id,
-                "com.test.fixture",
-                None,
-            )
+            .assert(&track_id, "album_of", &album_id, "com.test.fixture", None)
             .unwrap();
 
         (track_id, album_id)
@@ -245,14 +237,11 @@ async fn project_subject_roundtrips_through_socket() {
         .await
         .expect("socket available");
 
-    let mut stream = UnixStream::connect(&socket_path)
-        .await
-        .expect("connect");
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
 
     // Minimal project request: no scope (no relation traversal).
-    let minimal_req = format!(
-        r#"{{"op":"project_subject","canonical_id":"{track_id}"}}"#
-    );
+    let minimal_req =
+        format!(r#"{{"op":"project_subject","canonical_id":"{track_id}"}}"#);
     write_frame(&mut stream, minimal_req.as_bytes()).await;
     let body = read_frame(&mut stream).await;
     let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
@@ -260,19 +249,10 @@ async fn project_subject_roundtrips_through_socket() {
     assert_eq!(v["subject_type"].as_str(), Some("track"));
     assert_eq!(v["shape_version"].as_u64(), Some(1));
     assert_eq!(v["degraded"].as_bool(), Some(false));
-    assert_eq!(
-        v["addressings"].as_array().map(|a| a.len()),
-        Some(1)
-    );
-    assert_eq!(
-        v["addressings"][0]["scheme"].as_str(),
-        Some("mpd-path")
-    );
+    assert_eq!(v["addressings"].as_array().map(|a| a.len()), Some(1));
+    assert_eq!(v["addressings"][0]["scheme"].as_str(), Some("mpd-path"));
     // No scope means no related subjects even though album_of exists.
-    assert_eq!(
-        v["related"].as_array().map(|a| a.len()),
-        Some(0)
-    );
+    assert_eq!(v["related"].as_array().map(|a| a.len()), Some(0));
 
     // Scoped project request: include album_of forward.
     let scoped_req = format!(
@@ -296,13 +276,15 @@ async fn project_subject_roundtrips_through_socket() {
     assert_eq!(related[0]["target_type"].as_str(), Some("album"));
 
     // Unknown subject yields an error response.
-    let bad_req =
-        r#"{"op":"project_subject","canonical_id":"not-a-real-id"}"#;
+    let bad_req = r#"{"op":"project_subject","canonical_id":"not-a-real-id"}"#;
     write_frame(&mut stream, bad_req.as_bytes()).await;
     let body = read_frame(&mut stream).await;
     let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
     assert!(
-        v["error"].as_str().unwrap_or("").contains("unknown subject"),
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unknown subject"),
         "expected unknown subject error, got: {}",
         String::from_utf8_lossy(&body)
     );
@@ -341,21 +323,28 @@ async fn project_subject_multi_hop_roundtrips_through_socket() {
             vec![ExternalAddressing::new("mbid", "artist-456")],
         );
 
-        let t = match registry.announce(&track_ann, "com.test.fixture").unwrap() {
+        let t = match registry.announce(&track_ann, "com.test.fixture").unwrap()
+        {
             evo::subjects::AnnounceOutcome::Created(id) => id,
             other => panic!("expected Created for track, got {other:?}"),
         };
-        let a = match registry.announce(&album_ann, "com.test.fixture").unwrap() {
+        let a = match registry.announce(&album_ann, "com.test.fixture").unwrap()
+        {
             evo::subjects::AnnounceOutcome::Created(id) => id,
             other => panic!("expected Created for album, got {other:?}"),
         };
-        let r = match registry.announce(&artist_ann, "com.test.fixture").unwrap() {
-            evo::subjects::AnnounceOutcome::Created(id) => id,
-            other => panic!("expected Created for artist, got {other:?}"),
-        };
+        let r =
+            match registry.announce(&artist_ann, "com.test.fixture").unwrap() {
+                evo::subjects::AnnounceOutcome::Created(id) => id,
+                other => panic!("expected Created for artist, got {other:?}"),
+            };
 
-        graph.assert(&t, "rel", &a, "com.test.fixture", None).unwrap();
-        graph.assert(&a, "rel", &r, "com.test.fixture", None).unwrap();
+        graph
+            .assert(&t, "rel", &a, "com.test.fixture", None)
+            .unwrap();
+        graph
+            .assert(&a, "rel", &r, "com.test.fixture", None)
+            .unwrap();
 
         (t, a, r)
     };
@@ -374,9 +363,7 @@ async fn project_subject_multi_hop_roundtrips_through_socket() {
         .await
         .expect("socket available");
 
-    let mut stream = UnixStream::connect(&socket_path)
-        .await
-        .expect("connect");
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
 
     // Request with max_depth=3: expect track -> album (nested) ->
     // artist (nested, leaf).
@@ -482,9 +469,7 @@ async fn invalid_op_returns_structured_error() {
         .await
         .expect("socket available");
 
-    let mut stream = UnixStream::connect(&socket_path)
-        .await
-        .expect("connect");
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
 
     let bad_req = r#"{"op":"who_knows","x":"y"}"#;
     write_frame(&mut stream, bad_req.as_bytes()).await;
@@ -528,23 +513,18 @@ async fn list_active_custodies_empty_when_none_taken() {
         .await
         .expect("socket available");
 
-    let mut stream = UnixStream::connect(&socket_path)
-        .await
-        .expect("connect");
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
 
     let req = r#"{"op":"list_active_custodies"}"#;
     write_frame(&mut stream, req.as_bytes()).await;
     let body = read_frame(&mut stream).await;
-    let v: serde_json::Value =
-        serde_json::from_slice(&body).expect("JSON");
-    let arr = v["active_custodies"]
-        .as_array()
-        .unwrap_or_else(|| {
-            panic!(
-                "expected active_custodies array, got: {}",
-                String::from_utf8_lossy(&body)
-            )
-        });
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    let arr = v["active_custodies"].as_array().unwrap_or_else(|| {
+        panic!(
+            "expected active_custodies array, got: {}",
+            String::from_utf8_lossy(&body)
+        )
+    });
     assert_eq!(arr.len(), 0);
 
     drop(stream);
@@ -600,23 +580,18 @@ async fn list_active_custodies_returns_populated_ledger() {
         .await
         .expect("socket available");
 
-    let mut stream = UnixStream::connect(&socket_path)
-        .await
-        .expect("connect");
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
 
     let req = r#"{"op":"list_active_custodies"}"#;
     write_frame(&mut stream, req.as_bytes()).await;
     let body = read_frame(&mut stream).await;
-    let v: serde_json::Value =
-        serde_json::from_slice(&body).expect("JSON");
-    let arr = v["active_custodies"]
-        .as_array()
-        .unwrap_or_else(|| {
-            panic!(
-                "expected active_custodies array, got: {}",
-                String::from_utf8_lossy(&body)
-            )
-        });
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    let arr = v["active_custodies"].as_array().unwrap_or_else(|| {
+        panic!(
+            "expected active_custodies array, got: {}",
+            String::from_utf8_lossy(&body)
+        )
+    });
     assert_eq!(arr.len(), 1);
 
     let first = &arr[0];
@@ -624,10 +599,7 @@ async fn list_active_custodies_returns_populated_ledger() {
     assert_eq!(first["handle_id"].as_str(), Some("custody-1"));
     assert_eq!(first["shelf"].as_str(), Some("example.custody"));
     assert_eq!(first["custody_type"].as_str(), Some("playback"));
-    assert_eq!(
-        first["last_state"]["health"].as_str(),
-        Some("healthy")
-    );
+    assert_eq!(first["last_state"]["health"].as_str(), Some("healthy"));
     let decoded = B64
         .decode(
             first["last_state"]["payload_b64"]
@@ -678,9 +650,7 @@ async fn subscribe_happenings_delivers_ack_and_events() {
         .await
         .expect("socket available");
 
-    let mut stream = UnixStream::connect(&socket_path)
-        .await
-        .expect("connect");
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
 
     // Grab a handle to the bus so we can emit from the test side.
     // Taken BEFORE sending the subscribe op so the Arc clone is
@@ -722,19 +692,10 @@ async fn subscribe_happenings_delivers_ack_and_events() {
         "got: {}",
         String::from_utf8_lossy(&body)
     );
-    assert_eq!(
-        v["happening"]["plugin"].as_str(),
-        Some("org.test.warden")
-    );
+    assert_eq!(v["happening"]["plugin"].as_str(), Some("org.test.warden"));
     assert_eq!(v["happening"]["handle_id"].as_str(), Some("c-1"));
-    assert_eq!(
-        v["happening"]["shelf"].as_str(),
-        Some("example.custody")
-    );
-    assert_eq!(
-        v["happening"]["custody_type"].as_str(),
-        Some("playback")
-    );
+    assert_eq!(v["happening"]["shelf"].as_str(), Some("example.custody"));
+    assert_eq!(v["happening"]["custody_type"].as_str(), Some("playback"));
     assert!(
         v["happening"]["at_ms"].as_u64().is_some(),
         "at_ms must be present"
@@ -750,10 +711,7 @@ async fn subscribe_happenings_delivers_ack_and_events() {
 
     let body = read_frame(&mut stream).await;
     let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
-    assert_eq!(
-        v["happening"]["type"].as_str(),
-        Some("custody_released")
-    );
+    assert_eq!(v["happening"]["type"].as_str(), Some("custody_released"));
     assert_eq!(v["happening"]["handle_id"].as_str(), Some("c-1"));
 
     // Client disconnects; subscription task exits cleanly.
@@ -796,10 +754,8 @@ async fn wait_for_socket(
 ) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if path.exists() {
-            if UnixStream::connect(path).await.is_ok() {
-                return Ok(());
-            }
+        if path.exists() && UnixStream::connect(path).await.is_ok() {
+            return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(

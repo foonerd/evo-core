@@ -62,7 +62,9 @@ pub trait Plugin: Send + Sync {
     ///
     /// Safe to call whether or not `load` was called or succeeded. A
     /// never-loaded plugin's `unload` is a no-op returning `Ok(())`.
-    fn unload(&mut self) -> impl Future<Output = Result<(), PluginError>> + Send + '_;
+    fn unload(
+        &mut self,
+    ) -> impl Future<Output = Result<(), PluginError>> + Send + '_;
 
     /// Report current health.
     ///

@@ -69,11 +69,11 @@ use crate::codec::{read_frame_json, write_frame_json, WireError};
 use crate::contract::{
     Assignment, CallDeadline, CourseCorrection, CustodyHandle,
     CustodyStateReporter, ExternalAddressing, HealthStatus,
-    InstanceAnnouncement, InstanceAnnouncer, InstanceId, LoadContext,
-    Plugin, PluginError, RelationAnnouncer, RelationAssertion,
-    RelationRetraction, ReportError, ReportPriority, Request, Respondent,
-    StateReporter, SubjectAnnouncement, SubjectAnnouncer,
-    UserInteraction, UserInteractionRequester, Warden,
+    InstanceAnnouncement, InstanceAnnouncer, InstanceId, LoadContext, Plugin,
+    PluginError, RelationAnnouncer, RelationAssertion, RelationRetraction,
+    ReportError, ReportPriority, Request, Respondent, StateReporter,
+    SubjectAnnouncement, SubjectAnnouncer, UserInteraction,
+    UserInteractionRequester, Warden,
 };
 use crate::wire::{WireFrame, PROTOCOL_VERSION};
 use std::future::Future;
@@ -334,22 +334,14 @@ where
             };
 
             match plugin.load(&ctx).await {
-                Ok(()) => WireFrame::LoadResponse {
-                    v,
-                    cid,
-                    plugin: p,
-                },
+                Ok(()) => WireFrame::LoadResponse { v, cid, plugin: p },
                 Err(e) => plugin_error_to_frame(v, cid, &p, e),
             }
         }
 
         WireFrame::Unload { v, cid, plugin: p } => {
             match plugin.unload().await {
-                Ok(()) => WireFrame::UnloadResponse {
-                    v,
-                    cid,
-                    plugin: p,
-                },
+                Ok(()) => WireFrame::UnloadResponse { v, cid, plugin: p },
                 Err(e) => plugin_error_to_frame(v, cid, &p, e),
             }
         }
@@ -372,8 +364,8 @@ where
             payload,
             deadline_ms,
         } => {
-            let deadline =
-                deadline_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+            let deadline = deadline_ms
+                .map(|ms| Instant::now() + Duration::from_millis(ms));
             let req = Request {
                 request_type,
                 payload,
@@ -497,8 +489,8 @@ fn build_load_context(
             plugin_name: plugin_name.to_string(),
         });
 
-    let deadline =
-        deadline_ms.map(|ms| CallDeadline(Instant::now() + Duration::from_millis(ms)));
+    let deadline = deadline_ms
+        .map(|ms| CallDeadline(Instant::now() + Duration::from_millis(ms)));
 
     Ok(LoadContext {
         config,
@@ -813,8 +805,7 @@ where
     let (tx, rx) = mpsc::channel::<WireFrame>(config.event_channel_capacity);
     let writer_task = tokio::spawn(writer_loop(writer, rx));
 
-    let result =
-        dispatch_loop_warden(plugin, &config, &mut reader, tx).await;
+    let result = dispatch_loop_warden(plugin, &config, &mut reader, tx).await;
 
     match writer_task.await {
         Ok(Ok(())) => {}
@@ -944,22 +935,14 @@ where
             };
 
             match plugin.load(&ctx).await {
-                Ok(()) => WireFrame::LoadResponse {
-                    v,
-                    cid,
-                    plugin: p,
-                },
+                Ok(()) => WireFrame::LoadResponse { v, cid, plugin: p },
                 Err(e) => plugin_error_to_frame(v, cid, &p, e),
             }
         }
 
         WireFrame::Unload { v, cid, plugin: p } => {
             match plugin.unload().await {
-                Ok(()) => WireFrame::UnloadResponse {
-                    v,
-                    cid,
-                    plugin: p,
-                },
+                Ok(()) => WireFrame::UnloadResponse { v, cid, plugin: p },
                 Err(e) => plugin_error_to_frame(v, cid, &p, e),
             }
         }
@@ -1033,11 +1016,9 @@ where
                 correlation_id: cid,
             };
             match plugin.course_correct(&handle, correction).await {
-                Ok(()) => WireFrame::CourseCorrectResponse {
-                    v,
-                    cid,
-                    plugin: p,
-                },
+                Ok(()) => {
+                    WireFrame::CourseCorrectResponse { v, cid, plugin: p }
+                }
                 Err(e) => plugin_error_to_frame(v, cid, &p, e),
             }
         }
@@ -1048,11 +1029,7 @@ where
             plugin: p,
             handle,
         } => match plugin.release_custody(handle).await {
-            Ok(()) => WireFrame::ReleaseCustodyResponse {
-                v,
-                cid,
-                plugin: p,
-            },
+            Ok(()) => WireFrame::ReleaseCustodyResponse { v, cid, plugin: p },
             Err(e) => plugin_error_to_frame(v, cid, &p, e),
         },
 
@@ -1152,8 +1129,7 @@ mod tests {
     impl Plugin for TestPlugin {
         fn describe(
             &self,
-        ) -> impl Future<Output = PluginDescription> + Send + '_
-        {
+        ) -> impl Future<Output = PluginDescription> + Send + '_ {
             let name = self.name.clone();
             async move {
                 PluginDescription {
@@ -1180,19 +1156,17 @@ mod tests {
         fn load<'a>(
             &'a mut self,
             ctx: &'a LoadContext,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
             async move {
                 if self.fail_load {
-                    return Err(PluginError::Permanent("refused to load".into()));
+                    return Err(PluginError::Permanent(
+                        "refused to load".into(),
+                    ));
                 }
                 if let Some(a) = &self.announce_subject_on_load {
-                    ctx.subject_announcer
-                        .announce(a.clone())
-                        .await
-                        .map_err(|e| {
-                            PluginError::Permanent(format!("announce: {e}"))
-                        })?;
+                    ctx.subject_announcer.announce(a.clone()).await.map_err(
+                        |e| PluginError::Permanent(format!("announce: {e}")),
+                    )?;
                 }
                 self.loaded.store(true, Ordering::Relaxed);
                 Ok(())
@@ -1201,8 +1175,7 @@ mod tests {
 
         fn unload(
             &mut self,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
             async move {
                 self.unloaded.store(true, Ordering::Relaxed);
                 Ok(())
@@ -1211,8 +1184,7 @@ mod tests {
 
         fn health_check(
             &self,
-        ) -> impl Future<Output = HealthReport> + Send + '_
-        {
+        ) -> impl Future<Output = HealthReport> + Send + '_ {
             async move {
                 if self.loaded.load(Ordering::Relaxed) {
                     HealthReport::healthy()
@@ -1482,7 +1454,12 @@ mod tests {
         .unwrap();
 
         match read_frame_json(&mut client_r).await.unwrap() {
-            WireFrame::Error { cid, fatal, message, .. } => {
+            WireFrame::Error {
+                cid,
+                fatal,
+                message,
+                ..
+            } => {
                 assert_eq!(cid, 1);
                 assert!(!fatal);
                 assert!(message.contains("refused to load"));
@@ -1686,7 +1663,7 @@ mod tests {
         let v = serde_json::json!({
             "key": "value",
             "n": 42,
-            "f": 3.14,
+            "f": 2.5,
             "b": true,
             "nested": {
                 "inner": "x"
@@ -1696,7 +1673,7 @@ mod tests {
         let t = json_value_to_toml_table(v).unwrap();
         assert_eq!(t.get("key").unwrap().as_str(), Some("value"));
         assert_eq!(t.get("n").unwrap().as_integer(), Some(42));
-        assert_eq!(t.get("f").unwrap().as_float(), Some(3.14));
+        assert_eq!(t.get("f").unwrap().as_float(), Some(2.5));
         assert_eq!(t.get("b").unwrap().as_bool(), Some(true));
         assert!(t.get("nested").unwrap().as_table().is_some());
         assert!(t.get("list").unwrap().as_array().is_some());
@@ -1744,8 +1721,7 @@ mod tests {
     impl Plugin for TestWarden {
         fn describe(
             &self,
-        ) -> impl Future<Output = PluginDescription> + Send + '_
-        {
+        ) -> impl Future<Output = PluginDescription> + Send + '_ {
             let name = self.name.clone();
             async move {
                 PluginDescription {
@@ -1772,22 +1748,19 @@ mod tests {
         fn load<'a>(
             &'a mut self,
             _ctx: &'a LoadContext,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
             async move { Ok(()) }
         }
 
         fn unload(
             &mut self,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
             async move { Ok(()) }
         }
 
         fn health_check(
             &self,
-        ) -> impl Future<Output = HealthReport> + Send + '_
-        {
+        ) -> impl Future<Output = HealthReport> + Send + '_ {
             async move { HealthReport::healthy() }
         }
     }
@@ -1796,9 +1769,7 @@ mod tests {
         fn take_custody<'a>(
             &'a mut self,
             assignment: Assignment,
-        ) -> impl Future<Output = Result<CustodyHandle, PluginError>>
-               + Send
-               + 'a
+        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a
         {
             async move {
                 if self.fail_take {
@@ -1817,8 +1788,7 @@ mod tests {
                 // CustodyStateReporter on the same task as the
                 // dispatch loop, mirroring the working pattern in
                 // `subject_announcement_during_load_reaches_wire`.
-                if let Some(payload) = self.report_payload_during_take.clone()
-                {
+                if let Some(payload) = self.report_payload_during_take.clone() {
                     assignment
                         .custody_state_reporter
                         .report(&handle, payload, HealthStatus::Healthy)
@@ -1834,8 +1804,7 @@ mod tests {
             &'a mut self,
             _handle: &'a CustodyHandle,
             correction: CourseCorrection,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
             async move {
                 self.corrections_received.lock().unwrap().push(correction);
                 Ok(())
@@ -1845,8 +1814,7 @@ mod tests {
         fn release_custody<'a>(
             &'a mut self,
             handle: CustodyHandle,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
             async move {
                 self.custodies_released.lock().unwrap().push(handle);
                 Ok(())
@@ -1931,7 +1899,12 @@ mod tests {
         .unwrap();
 
         match read_frame_json(&mut client_r).await.unwrap() {
-            WireFrame::Error { cid, fatal, message, .. } => {
+            WireFrame::Error {
+                cid,
+                fatal,
+                message,
+                ..
+            } => {
                 assert_eq!(cid, 11);
                 assert!(!fatal);
                 assert!(message.contains("refused to take custody"));
@@ -2006,11 +1979,13 @@ mod tests {
             other => panic!("expected CourseCorrectResponse, got {other:?}"),
         }
 
-        let received = corrections.lock().unwrap();
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0].correction_type, "seek");
-        assert_eq!(received[0].payload, b"pos=42");
-        assert_eq!(received[0].correlation_id, 21);
+        {
+            let received = corrections.lock().unwrap();
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].correction_type, "seek");
+            assert_eq!(received[0].payload, b"pos=42");
+            assert_eq!(received[0].correlation_id, 21);
+        }
 
         drop(client_w);
         drop(client_r);
@@ -2074,9 +2049,11 @@ mod tests {
             other => panic!("expected ReleaseCustodyResponse, got {other:?}"),
         }
 
-        let released_vec = released.lock().unwrap();
-        assert_eq!(released_vec.len(), 1);
-        assert_eq!(released_vec[0].id, handle.id);
+        {
+            let released_vec = released.lock().unwrap();
+            assert_eq!(released_vec.len(), 1);
+            assert_eq!(released_vec[0].id, handle.id);
+        }
 
         drop(client_w);
         drop(client_r);
@@ -2205,7 +2182,12 @@ mod tests {
         .unwrap();
 
         match read_frame_json(&mut client_r).await.unwrap() {
-            WireFrame::Error { cid, fatal, message, .. } => {
+            WireFrame::Error {
+                cid,
+                fatal,
+                message,
+                ..
+            } => {
                 assert_eq!(cid, 50);
                 assert!(fatal);
                 assert!(message.contains("handle_request"));
@@ -2252,7 +2234,12 @@ mod tests {
         .unwrap();
 
         match read_frame_json(&mut client_r).await.unwrap() {
-            WireFrame::Error { cid, fatal, message, .. } => {
+            WireFrame::Error {
+                cid,
+                fatal,
+                message,
+                ..
+            } => {
                 assert_eq!(cid, 60);
                 assert!(fatal);
                 assert!(message.contains("take_custody"));

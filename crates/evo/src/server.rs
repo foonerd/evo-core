@@ -522,6 +522,14 @@ fn system_time_to_ms(t: SystemTime) -> u64 {
 /// milliseconds since the UNIX epoch. Mirrors the domain enum one-for-
 /// one; new variants on [`Happening`] require a new variant here
 /// plus a match arm in the `From<Happening>` impl.
+///
+/// The shared `Custody` prefix on variants is deliberate: it mirrors
+/// the wire-protocol JSON names (`custody_taken`, `custody_released`,
+/// `custody_state_reported`) documented in `SCHEMAS.md` and
+/// `CLIENT_API.md`. Renaming the variants would either change the
+/// emitted JSON (breaking every consumer) or require per-variant
+/// `#[serde(rename = "...")]` attributes (uglier than this allow).
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum HappeningWire {
@@ -686,7 +694,10 @@ impl Server {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 return Err(StewardError::io(
-                    format!("removing stale socket {}", self.socket_path.display()),
+                    format!(
+                        "removing stale socket {}",
+                        self.socket_path.display()
+                    ),
                     e,
                 ));
             }
@@ -829,9 +840,7 @@ async fn read_frame_body(
 
     let len = u32::from_be_bytes(len_buf) as usize;
     if len == 0 {
-        return Err(StewardError::Dispatch(
-            "zero-length frame".to_string(),
-        ));
+        return Err(StewardError::Dispatch("zero-length frame".to_string()));
     }
     if len > MAX_FRAME_SIZE {
         return Err(StewardError::Dispatch(format!(
@@ -857,9 +866,7 @@ async fn write_response_frame(
         StewardError::Dispatch(format!("serialising response: {e}"))
     })?;
     if bytes.len() > u32::MAX as usize {
-        return Err(StewardError::Dispatch(
-            "response too large".to_string(),
-        ));
+        return Err(StewardError::Dispatch("response too large".to_string()));
     }
     let len = (bytes.len() as u32).to_be_bytes();
     stream
@@ -892,10 +899,10 @@ async fn dispatch_request(
             shelf,
             request_type,
             payload_b64,
-        } => handle_plugin_request(
-            engine, shelf, request_type, payload_b64,
-        )
-        .await,
+        } => {
+            handle_plugin_request(engine, shelf, request_type, payload_b64)
+                .await
+        }
         ClientRequest::ProjectSubject {
             canonical_id,
             scope,
@@ -956,20 +963,14 @@ async fn run_subscription(
                 let frame = ClientResponse::Happening {
                     happening: happening.into(),
                 };
-                if write_response_frame(&mut stream, &frame)
-                    .await
-                    .is_err()
-                {
+                if write_response_frame(&mut stream, &frame).await.is_err() {
                     // Client disconnected.
                     return Ok(());
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 let frame = ClientResponse::Lagged { lagged: n };
-                if write_response_frame(&mut stream, &frame)
-                    .await
-                    .is_err()
-                {
+                if write_response_frame(&mut stream, &frame).await.is_err() {
                     return Ok(());
                 }
             }
@@ -1050,11 +1051,8 @@ async fn handle_list_active_custodies(
         let guard = engine.lock().await;
         guard.custody_ledger()
     };
-    let active_custodies: Vec<CustodyRecordWire> = ledger
-        .list_active()
-        .into_iter()
-        .map(Into::into)
-        .collect();
+    let active_custodies: Vec<CustodyRecordWire> =
+        ledger.list_active().into_iter().map(Into::into).collect();
     ClientResponse::ActiveCustodies { active_custodies }
 }
 
@@ -1128,7 +1126,9 @@ mod tests {
             } => {
                 assert_eq!(canonical_id, "abc-123");
                 assert_eq!(scope.relation_predicates.len(), 2);
-                assert!(scope.relation_predicates.contains(&"album_of".to_string()));
+                assert!(scope
+                    .relation_predicates
+                    .contains(&"album_of".to_string()));
                 assert!(matches!(scope.direction, WalkDirectionWire::Both));
             }
             other => panic!("expected ProjectSubject, got {other:?}"),
@@ -1334,10 +1334,7 @@ mod tests {
             first["last_state"]["reported_at_ms"].as_u64(),
             Some(1_700_000_000_050)
         );
-        assert_eq!(
-            first["started_at_ms"].as_u64(),
-            Some(1_700_000_000_000)
-        );
+        assert_eq!(first["started_at_ms"].as_u64(), Some(1_700_000_000_000));
         let decoded = B64
             .decode(first["last_state"]["payload_b64"].as_str().unwrap())
             .unwrap();
@@ -1349,8 +1346,7 @@ mod tests {
         let snap = StateSnapshot {
             payload: b"state=x".to_vec(),
             health: HealthStatus::Degraded,
-            reported_at: UNIX_EPOCH
-                + std::time::Duration::from_millis(500),
+            reported_at: UNIX_EPOCH + std::time::Duration::from_millis(500),
         };
         let rec = CustodyRecord {
             plugin: "org.test.warden".into(),
@@ -1358,10 +1354,8 @@ mod tests {
             shelf: Some("example.custody".into()),
             custody_type: Some("playback".into()),
             last_state: Some(snap),
-            started_at: UNIX_EPOCH
-                + std::time::Duration::from_millis(100),
-            last_updated: UNIX_EPOCH
-                + std::time::Duration::from_millis(500),
+            started_at: UNIX_EPOCH + std::time::Duration::from_millis(100),
+            last_updated: UNIX_EPOCH + std::time::Duration::from_millis(500),
         };
         let wire: CustodyRecordWire = rec.into();
         assert_eq!(wire.plugin, "org.test.warden");
@@ -1371,10 +1365,7 @@ mod tests {
         assert_eq!(wire.started_at_ms, 100);
         assert_eq!(wire.last_updated_ms, 500);
         let state = wire.last_state.expect("state");
-        assert_eq!(
-            B64.decode(&state.payload_b64).unwrap(),
-            b"state=x"
-        );
+        assert_eq!(B64.decode(&state.payload_b64).unwrap(), b"state=x");
         assert_eq!(state.health, HealthStatus::Degraded);
         assert_eq!(state.reported_at_ms, 500);
     }
@@ -1389,10 +1380,8 @@ mod tests {
             shelf: None,
             custody_type: None,
             last_state: None,
-            started_at: UNIX_EPOCH
-                + std::time::Duration::from_millis(100),
-            last_updated: UNIX_EPOCH
-                + std::time::Duration::from_millis(100),
+            started_at: UNIX_EPOCH + std::time::Duration::from_millis(100),
+            last_updated: UNIX_EPOCH + std::time::Duration::from_millis(100),
         };
         let wire: CustodyRecordWire = rec.into();
         assert!(wire.shelf.is_none());
@@ -1412,8 +1401,7 @@ mod tests {
         let snap = StateSnapshot {
             payload: b"xyz".to_vec(),
             health: HealthStatus::Unhealthy,
-            reported_at: UNIX_EPOCH
-                + std::time::Duration::from_millis(2_500),
+            reported_at: UNIX_EPOCH + std::time::Duration::from_millis(2_500),
         };
         let wire: StateSnapshotWire = snap.into();
         assert_eq!(B64.decode(&wire.payload_b64).unwrap(), b"xyz");
@@ -1465,30 +1453,12 @@ mod tests {
         };
         let s = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(
-            v["happening"]["type"].as_str(),
-            Some("custody_taken")
-        );
-        assert_eq!(
-            v["happening"]["plugin"].as_str(),
-            Some("org.test.warden")
-        );
-        assert_eq!(
-            v["happening"]["handle_id"].as_str(),
-            Some("c-1")
-        );
-        assert_eq!(
-            v["happening"]["shelf"].as_str(),
-            Some("example.custody")
-        );
-        assert_eq!(
-            v["happening"]["custody_type"].as_str(),
-            Some("playback")
-        );
-        assert_eq!(
-            v["happening"]["at_ms"].as_u64(),
-            Some(1_700_000_000_000)
-        );
+        assert_eq!(v["happening"]["type"].as_str(), Some("custody_taken"));
+        assert_eq!(v["happening"]["plugin"].as_str(), Some("org.test.warden"));
+        assert_eq!(v["happening"]["handle_id"].as_str(), Some("c-1"));
+        assert_eq!(v["happening"]["shelf"].as_str(), Some("example.custody"));
+        assert_eq!(v["happening"]["custody_type"].as_str(), Some("playback"));
+        assert_eq!(v["happening"]["at_ms"].as_u64(), Some(1_700_000_000_000));
         // Distinctive top-level key.
         assert!(!s.contains("\"subscribed\""));
         assert!(!s.contains("\"error\""));

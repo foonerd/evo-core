@@ -150,7 +150,10 @@ mod tests {
     #[test]
     fn retraction_policy_variants_are_distinct() {
         assert_ne!(RetractionPolicy::Dynamic, RetractionPolicy::StartupOnly);
-        assert_ne!(RetractionPolicy::StartupOnly, RetractionPolicy::ShutdownOnly);
+        assert_ne!(
+            RetractionPolicy::StartupOnly,
+            RetractionPolicy::ShutdownOnly
+        );
         assert_ne!(RetractionPolicy::Dynamic, RetractionPolicy::ShutdownOnly);
     }
 }

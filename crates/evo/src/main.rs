@@ -56,10 +56,7 @@ async fn main() -> anyhow::Result<()> {
     // and over config.steward.log_level; see logging::resolve_filter.
     evo::logging::init(&config, args.log_level.as_deref())?;
 
-    tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
-        "evo starting"
-    );
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "evo starting");
 
     // Load the catalogue.
     let catalogue = Catalogue::load(&catalogue_path)?;

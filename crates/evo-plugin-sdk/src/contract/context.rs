@@ -41,7 +41,9 @@ impl CallDeadline {
 
     /// Time remaining before the deadline, or zero if already past.
     pub fn remaining(&self) -> Duration {
-        self.0.checked_duration_since(Instant::now()).unwrap_or_default()
+        self.0
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default()
     }
 
     /// True if the deadline has already passed.
@@ -144,9 +146,7 @@ pub enum ReportError {
 /// Priority hint for state reports.
 ///
 /// Influences how the steward rate-limits and aggregates reports.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReportPriority {
     /// Bypass rate limiting. Use sparingly - state transitions, errors,
@@ -375,8 +375,7 @@ mod tests {
         .unwrap();
         assert!(best.contains(r#"p = "best_effort""#));
 
-        let parsed: Wrap =
-            toml::from_str(r#"p = "best_effort""#).unwrap();
+        let parsed: Wrap = toml::from_str(r#"p = "best_effort""#).unwrap();
         assert_eq!(parsed.p, ReportPriority::BestEffort);
     }
 }

@@ -113,13 +113,15 @@ impl<T: Respondent + 'static> ErasedRespondent for RespondentAdapter<T> {
     fn load<'a>(
         &'a mut self,
         ctx: &'a LoadContext,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
         Box::pin(Plugin::load(&mut self.inner, ctx))
     }
 
     fn unload(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + '_>>
+    {
         Box::pin(Plugin::unload(&mut self.inner))
     }
 
@@ -170,7 +172,9 @@ pub trait ErasedWarden: Send + Sync {
         &'a mut self,
         assignment: Assignment,
     ) -> Pin<
-        Box<dyn Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a>,
+        Box<
+            dyn Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a,
+        >,
     >;
 
     /// Dispatches to `Warden::course_correct`.
@@ -215,13 +219,15 @@ impl<T: Warden + 'static> ErasedWarden for WardenAdapter<T> {
     fn load<'a>(
         &'a mut self,
         ctx: &'a LoadContext,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
         Box::pin(Plugin::load(&mut self.inner, ctx))
     }
 
     fn unload(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + '_>>
+    {
         Box::pin(Plugin::unload(&mut self.inner))
     }
 
@@ -235,7 +241,9 @@ impl<T: Warden + 'static> ErasedWarden for WardenAdapter<T> {
         &'a mut self,
         assignment: Assignment,
     ) -> Pin<
-        Box<dyn Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a>,
+        Box<
+            dyn Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a,
+        >,
     > {
         Box::pin(Warden::take_custody(&mut self.inner, assignment))
     }
@@ -289,10 +297,7 @@ impl AdmittedHandle {
     }
 
     /// Dispatch to the inner plugin's `load`.
-    async fn load(
-        &mut self,
-        ctx: &LoadContext,
-    ) -> Result<(), PluginError> {
+    async fn load(&mut self, ctx: &LoadContext) -> Result<(), PluginError> {
         match self {
             Self::Respondent(r) => r.load(ctx).await,
             Self::Warden(w) => w.load(ctx).await,
@@ -563,12 +568,13 @@ impl AdmissionEngine {
         manifest.validate()?;
 
         let shelf_qualified = manifest.target.shelf.clone();
-        let shelf = catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
-            StewardError::Admission(format!(
-                "{}: target shelf not in catalogue: {}",
-                manifest.plugin.name, shelf_qualified
-            ))
-        })?;
+        let shelf =
+            catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
+                StewardError::Admission(format!(
+                    "{}: target shelf not in catalogue: {}",
+                    manifest.plugin.name, shelf_qualified
+                ))
+            })?;
 
         if shelf.shape != manifest.target.shape {
             return Err(StewardError::Admission(format!(
@@ -678,12 +684,13 @@ impl AdmissionEngine {
         manifest.validate()?;
 
         let shelf_qualified = manifest.target.shelf.clone();
-        let shelf = catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
-            StewardError::Admission(format!(
-                "{}: target shelf not in catalogue: {}",
-                manifest.plugin.name, shelf_qualified
-            ))
-        })?;
+        let shelf =
+            catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
+                StewardError::Admission(format!(
+                    "{}: target shelf not in catalogue: {}",
+                    manifest.plugin.name, shelf_qualified
+                ))
+            })?;
 
         if shelf.shape != manifest.target.shape {
             return Err(StewardError::Admission(format!(
@@ -710,9 +717,8 @@ impl AdmissionEngine {
             )));
         }
 
-        let mut handle = AdmittedHandle::Warden(Box::new(
-            WardenAdapter::new(plugin),
-        ));
+        let mut handle =
+            AdmittedHandle::Warden(Box::new(WardenAdapter::new(plugin)));
 
         let description = handle.describe().await;
         if description.identity.name != manifest.plugin.name {
@@ -808,12 +814,13 @@ impl AdmissionEngine {
         manifest.validate()?;
 
         let shelf_qualified = manifest.target.shelf.clone();
-        let shelf = catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
-            StewardError::Admission(format!(
-                "{}: target shelf not in catalogue: {}",
-                manifest.plugin.name, shelf_qualified
-            ))
-        })?;
+        let shelf =
+            catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
+                StewardError::Admission(format!(
+                    "{}: target shelf not in catalogue: {}",
+                    manifest.plugin.name, shelf_qualified
+                ))
+            })?;
 
         if shelf.shape != manifest.target.shape {
             return Err(StewardError::Admission(format!(
@@ -942,12 +949,13 @@ impl AdmissionEngine {
         manifest.validate()?;
 
         let shelf_qualified = manifest.target.shelf.clone();
-        let shelf = catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
-            StewardError::Admission(format!(
-                "{}: target shelf not in catalogue: {}",
-                manifest.plugin.name, shelf_qualified
-            ))
-        })?;
+        let shelf =
+            catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
+                StewardError::Admission(format!(
+                    "{}: target shelf not in catalogue: {}",
+                    manifest.plugin.name, shelf_qualified
+                ))
+            })?;
 
         if shelf.shape != manifest.target.shape {
             return Err(StewardError::Admission(format!(
@@ -1096,8 +1104,8 @@ impl AdmissionEngine {
     ) -> Result<(), StewardError> {
         // Read and validate the manifest from disk.
         let manifest_path = plugin_dir.join("manifest.toml");
-        let manifest_text = std::fs::read_to_string(&manifest_path)
-            .map_err(|e| {
+        let manifest_text =
+            std::fs::read_to_string(&manifest_path).map_err(|e| {
                 StewardError::io(
                     format!("reading {}", manifest_path.display()),
                     e,
@@ -1158,10 +1166,7 @@ impl AdmissionEngine {
             .spawn()
             .map_err(|e| {
                 StewardError::io(
-                    format!(
-                        "spawning plugin binary {}",
-                        exec_path.display()
-                    ),
+                    format!("spawning plugin binary {}", exec_path.display()),
                     e,
                 )
             })?;
@@ -1176,15 +1181,15 @@ impl AdmissionEngine {
 
         // Wait for the socket to be ready, watching for early child
         // exit. On any failure, kill+reap the child before returning.
-        let stream =
-            match wait_for_socket_ready(&socket_path, &mut child).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    return Err(e);
-                }
-            };
+        let stream = match wait_for_socket_ready(&socket_path, &mut child).await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(e);
+            }
+        };
 
         let (reader, writer) = stream.into_split();
 
@@ -1553,9 +1558,7 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// out-of-process cases.
 ///
 /// See [`AdmissionEngine::shutdown`] for the sequence rationale.
-async fn unload_one_plugin(
-    plugin: AdmittedPlugin,
-) -> Result<(), StewardError> {
+async fn unload_one_plugin(plugin: AdmittedPlugin) -> Result<(), StewardError> {
     let AdmittedPlugin {
         name,
         shelf,
@@ -1802,9 +1805,7 @@ mod tests {
             req: &'a Request,
         ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a
         {
-            async move {
-                Ok(Response::for_request(req, req.payload.clone()))
-            }
+            async move { Ok(Response::for_request(req, req.payload.clone())) }
         }
     }
 
@@ -2086,8 +2087,7 @@ response_budget_ms = 1000
         fn load<'a>(
             &'a mut self,
             ctx: &'a LoadContext,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
             async move {
                 for announcement in &self.announcements {
                     ctx.subject_announcer
@@ -2105,15 +2105,13 @@ response_budget_ms = 1000
 
         fn unload(
             &mut self,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
             async move { Ok(()) }
         }
 
         fn health_check(
             &self,
-        ) -> impl Future<Output = HealthReport> + Send + '_
-        {
+        ) -> impl Future<Output = HealthReport> + Send + '_ {
             async move { HealthReport::healthy() }
         }
     }
@@ -2252,8 +2250,7 @@ response_budget_ms = 1000
         fn load<'a>(
             &'a mut self,
             ctx: &'a LoadContext,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
             use evo_plugin_sdk::contract::{
                 ExternalAddressing, RelationAssertion, SubjectAnnouncement,
             };
@@ -2292,15 +2289,13 @@ response_budget_ms = 1000
 
         fn unload(
             &mut self,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
             async move { Ok(()) }
         }
 
         fn health_check(
             &self,
-        ) -> impl Future<Output = HealthReport> + Send + '_
-        {
+        ) -> impl Future<Output = HealthReport> + Send + '_ {
             async move { HealthReport::healthy() }
         }
     }
@@ -2339,14 +2334,12 @@ response_budget_ms = 1000
 
         let source_id = registry
             .resolve(&evo_plugin_sdk::contract::ExternalAddressing::new(
-                "s",
-                "track-1",
+                "s", "track-1",
             ))
             .unwrap();
         let target_id = registry
             .resolve(&evo_plugin_sdk::contract::ExternalAddressing::new(
-                "s",
-                "album-1",
+                "s", "album-1",
             ))
             .unwrap();
         assert!(graph.exists(&source_id, "album_of", &target_id));
@@ -2430,9 +2423,7 @@ response_budget_ms = 1000
     /// the `example.echo` shelf for convenience (the shelf is
     /// neutral about kind). The caller substitutes the `transport`
     /// block to produce variants.
-    fn example_warden_manifest_with_transport(
-        transport_block: &str,
-    ) -> String {
+    fn example_warden_manifest_with_transport(transport_block: &str) -> String {
         format!(
             r#"
 [plugin]
@@ -2506,11 +2497,8 @@ custody_failure_mode = "abort"
         let manifest_text = example_manifest_with_transport(
             "[transport]\ntype = \"in-process\"\nexec = \"<compiled-in>\"",
         );
-        std::fs::write(
-            plugin_dir.path().join("manifest.toml"),
-            &manifest_text,
-        )
-        .unwrap();
+        std::fs::write(plugin_dir.path().join("manifest.toml"), &manifest_text)
+            .unwrap();
 
         let catalogue = example_catalogue();
         let mut engine = AdmissionEngine::new();
@@ -2542,11 +2530,8 @@ custody_failure_mode = "abort"
         let manifest_text = example_manifest_with_transport(
             "[transport]\ntype = \"out-of-process\"\nexec = \"nonexistent-plugin-binary-xyz\"",
         );
-        std::fs::write(
-            plugin_dir.path().join("manifest.toml"),
-            &manifest_text,
-        )
-        .unwrap();
+        std::fs::write(plugin_dir.path().join("manifest.toml"), &manifest_text)
+            .unwrap();
 
         let catalogue = example_catalogue();
         let mut engine = AdmissionEngine::new();
@@ -2585,11 +2570,8 @@ custody_failure_mode = "abort"
         let manifest_text = example_warden_manifest_with_transport(
             "[transport]\ntype = \"out-of-process\"\nexec = \"nonexistent-warden-binary-xyz\"",
         );
-        std::fs::write(
-            plugin_dir.path().join("manifest.toml"),
-            &manifest_text,
-        )
-        .unwrap();
+        std::fs::write(plugin_dir.path().join("manifest.toml"), &manifest_text)
+            .unwrap();
 
         let catalogue = example_catalogue();
         let mut engine = AdmissionEngine::new();
@@ -2666,15 +2648,13 @@ custody_failure_mode = "abort"
         fn load<'a>(
             &'a mut self,
             _ctx: &'a LoadContext,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
             async move { Ok(()) }
         }
 
         fn unload(
             &mut self,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
             async move { Ok(()) }
         }
 
@@ -2699,16 +2679,14 @@ custody_failure_mode = "abort"
             &'a mut self,
             _handle: &'a CustodyHandle,
             _correction: CourseCorrection,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
             async move { Ok(()) }
         }
 
         fn release_custody<'a>(
             &'a mut self,
             _handle: CustodyHandle,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
             async move { Ok(()) }
         }
     }
@@ -2882,12 +2860,7 @@ custody_failure_mode = "abort"
             .unwrap();
 
         let handle = engine
-            .take_custody(
-                "test.custody",
-                "playback".into(),
-                vec![],
-                None,
-            )
+            .take_custody("test.custody", "playback".into(), vec![], None)
             .await
             .unwrap();
         engine
@@ -2918,15 +2891,13 @@ custody_failure_mode = "abort"
             .unwrap();
 
         let handle = engine
-            .take_custody(
-                "test.custody",
-                "playback".into(),
-                vec![],
-                None,
-            )
+            .take_custody("test.custody", "playback".into(), vec![], None)
             .await
             .unwrap();
-        engine.release_custody("test.custody", handle).await.unwrap();
+        engine
+            .release_custody("test.custody", handle)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -3086,12 +3057,7 @@ custody_failure_mode = "abort"
             .unwrap();
 
         let handle = engine
-            .take_custody(
-                "test.custody",
-                "playback".into(),
-                vec![],
-                None,
-            )
+            .take_custody("test.custody", "playback".into(), vec![], None)
             .await
             .unwrap();
         assert_eq!(engine.custody_ledger().len(), 1);
@@ -3135,12 +3101,7 @@ custody_failure_mode = "abort"
             .unwrap();
 
         let _handle = engine
-            .take_custody(
-                "test.custody",
-                "playback".into(),
-                vec![],
-                None,
-            )
+            .take_custody("test.custody", "playback".into(), vec![], None)
             .await
             .unwrap();
 
@@ -3226,12 +3187,7 @@ custody_failure_mode = "abort"
             .unwrap();
 
         let handle = engine
-            .take_custody(
-                "test.custody",
-                "playback".into(),
-                vec![],
-                None,
-            )
+            .take_custody("test.custody", "playback".into(), vec![], None)
             .await
             .unwrap();
 
@@ -3281,12 +3237,7 @@ custody_failure_mode = "abort"
         let mut rx = engine.happening_bus().subscribe();
 
         let handle = engine
-            .take_custody(
-                "test.custody",
-                "playback".into(),
-                vec![],
-                None,
-            )
+            .take_custody("test.custody", "playback".into(), vec![], None)
             .await
             .unwrap();
         engine
@@ -3317,13 +3268,12 @@ custody_failure_mode = "abort"
         let bus = Arc::new(HappeningBus::new());
 
         let catalogue = test_catalogue();
-        let mut engine =
-            AdmissionEngine::with_registry_graph_ledger_and_bus(
-                Arc::clone(&registry),
-                Arc::clone(&graph),
-                Arc::clone(&ledger),
-                Arc::clone(&bus),
-            );
+        let mut engine = AdmissionEngine::with_registry_graph_ledger_and_bus(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&ledger),
+            Arc::clone(&bus),
+        );
 
         // All four shared handles match the engine's accessors.
         assert!(Arc::ptr_eq(&ledger, &engine.custody_ledger()));
@@ -3345,12 +3295,7 @@ custody_failure_mode = "abort"
             .await
             .unwrap();
         let _handle = engine
-            .take_custody(
-                "test.custody",
-                "playback".into(),
-                vec![],
-                None,
-            )
+            .take_custody("test.custody", "playback".into(), vec![], None)
             .await
             .unwrap();
 

@@ -333,7 +333,8 @@ impl ProjectionEngine {
         degraded: &mut Vec<DegradedReason>,
     ) -> RelatedSubject {
         let target_record = self.registry.describe(target_id);
-        let target_type = target_record.as_ref().map(|r| r.subject_type.clone());
+        let target_type =
+            target_record.as_ref().map(|r| r.subject_type.clone());
 
         if target_type.is_none() {
             degraded.push(DegradedReason {
@@ -347,9 +348,7 @@ impl ProjectionEngine {
         let relation_claimants = self
             .graph
             .describe_relation(source_id, predicate, target_id)
-            .map(|rel| {
-                rel.claims.iter().map(|c| c.claimant.clone()).collect()
-            })
+            .map(|rel| rel.claims.iter().map(|c| c.claimant.clone()).collect())
             .unwrap_or_default();
 
         let nested = self.maybe_nest(
@@ -393,7 +392,8 @@ impl ProjectionEngine {
         degraded: &mut Vec<DegradedReason>,
     ) -> RelatedSubject {
         let source_record = self.registry.describe(source_id);
-        let source_type = source_record.as_ref().map(|r| r.subject_type.clone());
+        let source_type =
+            source_record.as_ref().map(|r| r.subject_type.clone());
 
         if source_type.is_none() {
             degraded.push(DegradedReason {
@@ -407,9 +407,7 @@ impl ProjectionEngine {
         let relation_claimants = self
             .graph
             .describe_relation(source_id, predicate, subject_id)
-            .map(|rel| {
-                rel.claims.iter().map(|c| c.claimant.clone()).collect()
-            })
+            .map(|rel| rel.claims.iter().map(|c| c.claimant.clone()).collect())
             .unwrap_or_default();
 
         let nested = self.maybe_nest(
@@ -455,9 +453,7 @@ impl ProjectionEngine {
         if remaining_depth <= 1 {
             return None;
         }
-        if neighbour_type.is_none() {
-            return None;
-        }
+        neighbour_type?;
         if visited.contains(neighbour_id) {
             return None;
         }
@@ -547,7 +543,10 @@ impl ProjectionScope {
         S: Into<String>,
     {
         Self {
-            relation_predicates: predicates.into_iter().map(Into::into).collect(),
+            relation_predicates: predicates
+                .into_iter()
+                .map(Into::into)
+                .collect(),
             direction: WalkDirection::Forward,
             max_depth: DEFAULT_MAX_DEPTH,
             max_visits: DEFAULT_MAX_VISITS,
@@ -562,7 +561,10 @@ impl ProjectionScope {
         S: Into<String>,
     {
         Self {
-            relation_predicates: predicates.into_iter().map(Into::into).collect(),
+            relation_predicates: predicates
+                .into_iter()
+                .map(Into::into)
+                .collect(),
             direction: WalkDirection::Inverse,
             max_depth: DEFAULT_MAX_DEPTH,
             max_visits: DEFAULT_MAX_VISITS,
@@ -577,7 +579,10 @@ impl ProjectionScope {
         S: Into<String>,
     {
         Self {
-            relation_predicates: predicates.into_iter().map(Into::into).collect(),
+            relation_predicates: predicates
+                .into_iter()
+                .map(Into::into)
+                .collect(),
             direction: WalkDirection::Both,
             max_depth: DEFAULT_MAX_DEPTH,
             max_visits: DEFAULT_MAX_VISITS,
@@ -822,7 +827,8 @@ mod tests {
         let graph = Arc::new(RelationGraph::new());
         let eng = ProjectionEngine::new(Arc::clone(&reg), Arc::clone(&graph));
 
-        let id = announce(&reg, "track", "mpd-path", "/a.flac", "com.example.mpd");
+        let id =
+            announce(&reg, "track", "mpd-path", "/a.flac", "com.example.mpd");
 
         let p = eng.project_subject(&id, &ProjectionScope::none()).unwrap();
         assert_eq!(p.canonical_id, id);
@@ -903,14 +909,17 @@ mod tests {
         let album_id =
             announce(&reg, "album", "s", "a1", "com.example.metadata");
         graph
-            .assert(&track_id, "album_of", &album_id, "com.example.metadata", None)
+            .assert(
+                &track_id,
+                "album_of",
+                &album_id,
+                "com.example.metadata",
+                None,
+            )
             .unwrap();
 
         let p = eng
-            .project_subject(
-                &track_id,
-                &ProjectionScope::forward(["album_of"]),
-            )
+            .project_subject(&track_id, &ProjectionScope::forward(["album_of"]))
             .unwrap();
         assert!(p.claimants.contains(&"com.example.mpd".to_string()));
         assert!(p.claimants.contains(&"com.example.metadata".to_string()));
@@ -924,7 +933,9 @@ mod tests {
 
         let track_id = announce(&reg, "track", "s", "t1", "p");
         let album_id = announce(&reg, "album", "s", "a1", "p");
-        graph.assert(&track_id, "album_of", &album_id, "p", None).unwrap();
+        graph
+            .assert(&track_id, "album_of", &album_id, "p", None)
+            .unwrap();
 
         // Scope has the relation in the graph but no predicates
         // requested: projection has no related entries.
@@ -944,14 +955,17 @@ mod tests {
         let album_id =
             announce(&reg, "album", "s", "a1", "com.example.metadata");
         graph
-            .assert(&track_id, "album_of", &album_id, "com.example.metadata", None)
+            .assert(
+                &track_id,
+                "album_of",
+                &album_id,
+                "com.example.metadata",
+                None,
+            )
             .unwrap();
 
         let p = eng
-            .project_subject(
-                &track_id,
-                &ProjectionScope::forward(["album_of"]),
-            )
+            .project_subject(&track_id, &ProjectionScope::forward(["album_of"]))
             .unwrap();
         assert_eq!(p.related.len(), 1);
         let rel = &p.related[0];
@@ -973,16 +987,15 @@ mod tests {
 
         let track_id = announce(&reg, "track", "s", "t1", "p");
         let album_id = announce(&reg, "album", "s", "a1", "p");
-        graph.assert(&track_id, "album_of", &album_id, "p", None).unwrap();
+        graph
+            .assert(&track_id, "album_of", &album_id, "p", None)
+            .unwrap();
 
         // Project the album. From its perspective, the track points
         // *at* it via album_of: so from the album's viewpoint the
         // track is an inverse neighbour.
         let p = eng
-            .project_subject(
-                &album_id,
-                &ProjectionScope::inverse(["album_of"]),
-            )
+            .project_subject(&album_id, &ProjectionScope::inverse(["album_of"]))
             .unwrap();
         assert_eq!(p.related.len(), 1);
         let rel = &p.related[0];
@@ -1059,10 +1072,7 @@ mod tests {
             .unwrap();
 
         let p = eng
-            .project_subject(
-                &track_id,
-                &ProjectionScope::forward(["album_of"]),
-            )
+            .project_subject(&track_id, &ProjectionScope::forward(["album_of"]))
             .unwrap();
         assert_eq!(p.related.len(), 1);
         assert!(p.related[0].target_type.is_none());
@@ -1129,13 +1139,12 @@ mod tests {
 
         let track_id = announce(&reg, "track", "s", "t1", "p");
         let album_id = announce(&reg, "album", "s", "a1", "p");
-        graph.assert(&track_id, "album_of", &album_id, "p", None).unwrap();
+        graph
+            .assert(&track_id, "album_of", &album_id, "p", None)
+            .unwrap();
 
         let p = eng
-            .project_subject(
-                &track_id,
-                &ProjectionScope::forward(["album_of"]),
-            )
+            .project_subject(&track_id, &ProjectionScope::forward(["album_of"]))
             .unwrap();
         assert_eq!(p.related.len(), 1);
         assert!(p.related[0].nested.is_none());
@@ -1150,7 +1159,9 @@ mod tests {
 
         let track_id = announce(&reg, "track", "s", "t1", "p");
         let album_id = announce(&reg, "album", "s", "a1", "p");
-        graph.assert(&track_id, "album_of", &album_id, "p", None).unwrap();
+        graph
+            .assert(&track_id, "album_of", &album_id, "p", None)
+            .unwrap();
 
         let scope = ProjectionScope::forward(["album_of"]).with_max_depth(0);
         let p = eng.project_subject(&track_id, &scope).unwrap();
@@ -1221,16 +1232,17 @@ mod tests {
         let track_id = announce(&reg, "track", "s", "t1", "p");
         let album_id = announce(&reg, "album", "s", "a1", "p");
         let artist_id = announce(&reg, "artist", "s", "ar1", "p");
-        graph.assert(&track_id, "rel", &album_id, "p", None).unwrap();
-        graph.assert(&album_id, "rel", &artist_id, "p", None).unwrap();
+        graph
+            .assert(&track_id, "rel", &album_id, "p", None)
+            .unwrap();
+        graph
+            .assert(&album_id, "rel", &artist_id, "p", None)
+            .unwrap();
 
         let scope = ProjectionScope::forward(["rel"]).with_max_depth(3);
         let p = eng.project_subject(&track_id, &scope).unwrap();
 
-        let album = p.related[0]
-            .nested
-            .as_ref()
-            .expect("album should nest");
+        let album = p.related[0].nested.as_ref().expect("album should nest");
         let artist = album.related[0]
             .nested
             .as_ref()
@@ -1261,16 +1273,10 @@ mod tests {
         let p = eng.project_subject(&a, &scope).unwrap();
 
         // a -> b (nested)
-        let b_proj = p.related[0]
-            .nested
-            .as_ref()
-            .expect("b should nest");
+        let b_proj = p.related[0].nested.as_ref().expect("b should nest");
         assert_eq!(b_proj.canonical_id, b);
         // b -> c (nested)
-        let c_proj = b_proj.related[0]
-            .nested
-            .as_ref()
-            .expect("c should nest");
+        let c_proj = b_proj.related[0].nested.as_ref().expect("c should nest");
         assert_eq!(c_proj.canonical_id, c);
         // c -> a (cycle guard: nested=None, but the reference is
         // still emitted)
@@ -1298,8 +1304,7 @@ mod tests {
             graph.assert(&hub, "edge", &id, "p", None).unwrap();
             // Give each spoke one further edge so depth-2 would want
             // to expand them.
-            let leaf =
-                announce(&reg, "leaf", "s", &format!("leaf{i}"), "p");
+            let leaf = announce(&reg, "leaf", "s", &format!("leaf{i}"), "p");
             graph.assert(&id, "edge", &leaf, "p", None).unwrap();
             spokes.push(id);
         }

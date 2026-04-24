@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn classification_fatal() {
-        let io_err = io::Error::new(io::ErrorKind::Other, "disk gone");
+        let io_err = io::Error::other("disk gone");
         let e = PluginError::fatal("writing state", io_err);
         assert!(!e.is_transient());
         assert!(!e.is_permanent());
@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn internal_helper_preserves_source_and_context() {
-        let io_err = io::Error::new(io::ErrorKind::Other, "oops");
+        let io_err = io::Error::other("oops");
         let e = PluginError::internal("loading config", io_err);
         assert!(e.is_permanent());
         let s = format!("{e}");

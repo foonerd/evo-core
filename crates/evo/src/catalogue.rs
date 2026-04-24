@@ -69,7 +69,9 @@ pub struct Shelf {
 /// Cardinality constraint on one side of a relation predicate, per
 /// `RELATIONS.md` section 3.2. Cardinality violations emit warnings
 /// rather than rejecting assertions.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Cardinality {
     /// Exactly one subject on this side.
@@ -79,13 +81,8 @@ pub enum Cardinality {
     /// At least one subject on this side; upper bound unconstrained.
     AtLeastOne,
     /// No constraint.
+    #[default]
     Many,
-}
-
-impl Default for Cardinality {
-    fn default() -> Self {
-        Self::Many
-    }
 }
 
 /// A constraint on which subject types may appear on one side of a
@@ -156,14 +153,12 @@ impl Catalogue {
         let content = std::fs::read_to_string(path).map_err(|e| {
             StewardError::io(format!("reading catalogue {}", path.display()), e)
         })?;
-        Self::from_toml(&content)
-            .map_err(|e| match e {
-                StewardError::Toml { source, .. } => StewardError::toml(
-                    format!("{}", path.display()),
-                    source,
-                ),
-                other => other,
-            })
+        Self::from_toml(&content).map_err(|e| match e {
+            StewardError::Toml { source, .. } => {
+                StewardError::toml(format!("{}", path.display()), source)
+            }
+            other => other,
+        })
     }
 
     /// Parse a catalogue from a TOML string.
@@ -442,7 +437,10 @@ target_type = ["folder", "archive"]
         }
         match &p.target_type {
             TypeConstraint::Multiple(ts) => {
-                assert_eq!(ts, &vec!["folder".to_string(), "archive".to_string()]);
+                assert_eq!(
+                    ts,
+                    &vec!["folder".to_string(), "archive".to_string()]
+                );
             }
             _ => panic!("expected Multiple"),
         }

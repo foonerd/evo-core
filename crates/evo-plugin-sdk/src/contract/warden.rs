@@ -186,7 +186,8 @@ mod tests {
 
         let h3 = CustodyHandle {
             id: "same".into(),
-            started_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+            started_at: SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1),
         };
         assert_ne!(h1, h3);
     }

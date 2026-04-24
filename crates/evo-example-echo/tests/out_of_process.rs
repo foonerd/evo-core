@@ -186,8 +186,7 @@ fn make_socket_path(dir: &tempfile::TempDir) -> PathBuf {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn out_of_process_echo_admission_and_request() {
-    let tmp =
-        tempfile::TempDir::new().expect("creating tempdir for socket");
+    let tmp = tempfile::TempDir::new().expect("creating tempdir for socket");
     let socket_path = make_socket_path(&tmp);
 
     let mut child = spawn_echo_wire(&socket_path);
@@ -240,8 +239,7 @@ async fn out_of_process_echo_admission_and_request() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn out_of_process_echo_handles_multiple_requests() {
-    let tmp =
-        tempfile::TempDir::new().expect("creating tempdir for socket");
+    let tmp = tempfile::TempDir::new().expect("creating tempdir for socket");
     let socket_path = make_socket_path(&tmp);
 
     let mut child = spawn_echo_wire(&socket_path);

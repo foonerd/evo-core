@@ -49,7 +49,8 @@ impl StateReporter for LoggingStateReporter {
         &'a self,
         payload: Vec<u8>,
         priority: ReportPriority,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
         let name = self.plugin_name.clone();
         Box::pin(async move {
             tracing::debug!(
@@ -83,7 +84,8 @@ impl InstanceAnnouncer for LoggingInstanceAnnouncer {
     fn announce<'a>(
         &'a self,
         announcement: InstanceAnnouncement,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
         let name = self.plugin_name.clone();
         Box::pin(async move {
             tracing::info!(
@@ -99,7 +101,8 @@ impl InstanceAnnouncer for LoggingInstanceAnnouncer {
     fn retract<'a>(
         &'a self,
         instance_id: InstanceId,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
         let name = self.plugin_name.clone();
         Box::pin(async move {
             tracing::info!(
@@ -136,7 +139,8 @@ impl UserInteractionRequester for LoggingUserInteractionRequester {
     fn request<'a>(
         &'a self,
         interaction: UserInteraction,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
         let name = self.plugin_name.clone();
         Box::pin(async move {
             tracing::warn!(
@@ -172,7 +176,8 @@ impl CustodyStateReporter for LoggingCustodyStateReporter {
         handle: &'a CustodyHandle,
         payload: Vec<u8>,
         health: HealthStatus,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
         let name = self.plugin_name.clone();
         let handle_id = handle.id.clone();
         Box::pin(async move {
@@ -287,22 +292,20 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
         let graph = Arc::clone(&self.graph);
         let plugin_name = self.plugin_name.clone();
         Box::pin(async move {
-            let source_id = registry.resolve(&assertion.source).ok_or_else(
-                || {
+            let source_id =
+                registry.resolve(&assertion.source).ok_or_else(|| {
                     ReportError::Invalid(format!(
                         "assert: source addressing {} is not registered",
                         assertion.source
                     ))
-                },
-            )?;
-            let target_id = registry.resolve(&assertion.target).ok_or_else(
-                || {
+                })?;
+            let target_id =
+                registry.resolve(&assertion.target).ok_or_else(|| {
                     ReportError::Invalid(format!(
                         "assert: target addressing {} is not registered",
                         assertion.target
                     ))
-                },
-            )?;
+                })?;
 
             graph
                 .assert(
@@ -326,22 +329,20 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
         let graph = Arc::clone(&self.graph);
         let plugin_name = self.plugin_name.clone();
         Box::pin(async move {
-            let source_id = registry.resolve(&retraction.source).ok_or_else(
-                || {
+            let source_id =
+                registry.resolve(&retraction.source).ok_or_else(|| {
                     ReportError::Invalid(format!(
                         "retract: source addressing {} is not registered",
                         retraction.source
                     ))
-                },
-            )?;
-            let target_id = registry.resolve(&retraction.target).ok_or_else(
-                || {
+                })?;
+            let target_id =
+                registry.resolve(&retraction.target).ok_or_else(|| {
                     ReportError::Invalid(format!(
                         "retract: target addressing {} is not registered",
                         retraction.target
                     ))
-                },
-            )?;
+                })?;
 
             graph
                 .retract(
@@ -390,9 +391,8 @@ mod tests {
     async fn custody_state_reporter_logs() {
         let r = LoggingCustodyStateReporter::new("org.test.warden");
         let h = CustodyHandle::new("c-1");
-        let result = r
-            .report(&h, b"state".to_vec(), HealthStatus::Healthy)
-            .await;
+        let result =
+            r.report(&h, b"state".to_vec(), HealthStatus::Healthy).await;
         assert!(result.is_ok());
     }
 
@@ -444,14 +444,10 @@ mod tests {
         use evo_plugin_sdk::contract::SubjectAnnouncement;
 
         let registry = Arc::new(SubjectRegistry::new());
-        let announcer_a = RegistrySubjectAnnouncer::new(
-            Arc::clone(&registry),
-            "org.test.a",
-        );
-        let announcer_b = RegistrySubjectAnnouncer::new(
-            Arc::clone(&registry),
-            "org.test.b",
-        );
+        let announcer_a =
+            RegistrySubjectAnnouncer::new(Arc::clone(&registry), "org.test.a");
+        let announcer_b =
+            RegistrySubjectAnnouncer::new(Arc::clone(&registry), "org.test.b");
         announcer_a
             .announce(SubjectAnnouncement::new(
                 "track",

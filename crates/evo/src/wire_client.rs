@@ -54,8 +54,7 @@
 //! [`Warden`]: evo_plugin_sdk::contract::Warden
 
 use crate::context::{
-    LoggingStateReporter, RegistryRelationAnnouncer,
-    RegistrySubjectAnnouncer,
+    LoggingStateReporter, RegistryRelationAnnouncer, RegistrySubjectAnnouncer,
 };
 use crate::custody::{CustodyLedger, LedgerCustodyStateReporter};
 use crate::happenings::HappeningBus;
@@ -177,9 +176,10 @@ impl fmt::Debug for EventSink {
             .field("relation_announcer", &"<Arc<dyn RelationAnnouncer>>")
             .field(
                 "custody_state_reporter",
-                &self.custody_state_reporter.as_ref().map(|_| {
-                    "<Arc<dyn CustodyStateReporter>>"
-                }),
+                &self
+                    .custody_state_reporter
+                    .as_ref()
+                    .map(|_| "<Arc<dyn CustodyStateReporter>>"),
             )
             .finish()
     }
@@ -296,20 +296,16 @@ impl WireClient {
     /// Install callbacks that the reader task will invoke when event
     /// frames arrive. Overwrites any previously installed sink.
     pub fn set_event_sink(&self, sink: EventSink) {
-        let mut guard = self
-            .event_sink
-            .lock()
-            .expect("event sink mutex poisoned");
+        let mut guard =
+            self.event_sink.lock().expect("event sink mutex poisoned");
         *guard = Some(Arc::new(sink));
     }
 
     /// Remove any installed event sink. Subsequent event frames are
     /// logged and dropped.
     pub fn clear_event_sink(&self) {
-        let mut guard = self
-            .event_sink
-            .lock()
-            .expect("event sink mutex poisoned");
+        let mut guard =
+            self.event_sink.lock().expect("event sink mutex poisoned");
         *guard = None;
     }
 
@@ -341,10 +337,8 @@ impl WireClient {
 
         let (resp_tx, resp_rx) = oneshot::channel();
         {
-            let mut pending = self
-                .pending
-                .lock()
-                .expect("pending mutex poisoned");
+            let mut pending =
+                self.pending.lock().expect("pending mutex poisoned");
             // Check liveness while holding the pending lock. If either
             // background task has exited, it set alive=false while also
             // holding this lock, so this check is race-free.
@@ -357,10 +351,8 @@ impl WireClient {
         if self.out_tx.send(frame).await.is_err() {
             // Writer task is gone; remove pending entry and signal
             // disconnection.
-            let mut pending = self
-                .pending
-                .lock()
-                .expect("pending mutex poisoned");
+            let mut pending =
+                self.pending.lock().expect("pending mutex poisoned");
             pending.remove(&cid);
             return Err(WireClientError::Disconnected);
         }
@@ -371,10 +363,8 @@ impl WireClient {
                 // Reader task dropped the sender without sending a
                 // Disconnected result - should not happen with the
                 // current drain logic but handle it defensively.
-                let mut pending = self
-                    .pending
-                    .lock()
-                    .expect("pending mutex poisoned");
+                let mut pending =
+                    self.pending.lock().expect("pending mutex poisoned");
                 pending.remove(&cid);
                 Err(WireClientError::Disconnected)
             }
@@ -382,9 +372,7 @@ impl WireClient {
     }
 
     /// Send the `describe` verb and return the plugin's description.
-    pub async fn describe(
-        &self,
-    ) -> Result<PluginDescription, WireClientError> {
+    pub async fn describe(&self) -> Result<PluginDescription, WireClientError> {
         let cid = self.next_cid();
         let frame = WireFrame::Describe {
             v: PROTOCOL_VERSION,
@@ -454,9 +442,7 @@ impl WireClient {
     }
 
     /// Send the `health_check` verb and return the plugin's report.
-    pub async fn health_check(
-        &self,
-    ) -> Result<HealthReport, WireClientError> {
+    pub async fn health_check(&self) -> Result<HealthReport, WireClientError> {
         let cid = self.next_cid();
         let frame = WireFrame::HealthCheck {
             v: PROTOCOL_VERSION,
@@ -696,8 +682,7 @@ async fn handle_inbound_frame(
         }
     } else if frame.is_event() {
         let sink = {
-            let guard =
-                event_sink.lock().expect("event sink mutex poisoned");
+            let guard = event_sink.lock().expect("event sink mutex poisoned");
             guard.clone()
         };
         match sink {
@@ -729,8 +714,7 @@ async fn forward_event(frame: WireFrame, sink: &EventSink) {
             }
         }
         WireFrame::AnnounceSubject { announcement, .. } => {
-            if let Err(e) =
-                sink.subject_announcer.announce(announcement).await
+            if let Err(e) = sink.subject_announcer.announce(announcement).await
             {
                 tracing::warn!(
                     error = %e,
@@ -759,8 +743,7 @@ async fn forward_event(frame: WireFrame, sink: &EventSink) {
             }
         }
         WireFrame::RetractRelation { retraction, .. } => {
-            if let Err(e) = sink.relation_announcer.retract(retraction).await
-            {
+            if let Err(e) = sink.relation_announcer.retract(retraction).await {
                 tracing::warn!(
                     error = %e,
                     "relation_announcer.retract failed"
@@ -774,8 +757,7 @@ async fn forward_event(frame: WireFrame, sink: &EventSink) {
             ..
         } => match &sink.custody_state_reporter {
             Some(reporter) => {
-                if let Err(e) =
-                    reporter.report(&handle, payload, health).await
+                if let Err(e) = reporter.report(&handle, payload, health).await
                 {
                     tracing::warn!(
                         error = %e,
@@ -997,13 +979,10 @@ impl crate::admission::ErasedRespondent for WireRespondent {
                 })?;
 
             let deadline_ms = ctx.deadline.map(|d| {
-                d.remaining()
-                    .as_millis()
-                    .min(u64::MAX as u128) as u64
+                d.remaining().as_millis().min(u64::MAX as u128) as u64
             });
 
-            let state_dir =
-                ctx.state_dir.to_string_lossy().into_owned();
+            let state_dir = ctx.state_dir.to_string_lossy().into_owned();
             let credentials_dir =
                 ctx.credentials_dir.to_string_lossy().into_owned();
 
@@ -1233,13 +1212,10 @@ impl crate::admission::ErasedWarden for WireWarden {
                 })?;
 
             let deadline_ms = ctx.deadline.map(|d| {
-                d.remaining()
-                    .as_millis()
-                    .min(u64::MAX as u128) as u64
+                d.remaining().as_millis().min(u64::MAX as u128) as u64
             });
 
-            let state_dir =
-                ctx.state_dir.to_string_lossy().into_owned();
+            let state_dir = ctx.state_dir.to_string_lossy().into_owned();
             let credentials_dir =
                 ctx.credentials_dir.to_string_lossy().into_owned();
 
@@ -1295,7 +1271,9 @@ impl crate::admission::ErasedWarden for WireWarden {
         &'a mut self,
         assignment: Assignment,
     ) -> Pin<
-        Box<dyn Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a>,
+        Box<
+            dyn Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a,
+        >,
     > {
         Box::pin(async move {
             // Note: `assignment.custody_state_reporter` is not used on
@@ -1337,10 +1315,9 @@ impl crate::admission::ErasedWarden for WireWarden {
                 .await
             {
                 Ok(()) => Ok(()),
-                Err(e) => Err(wire_error_to_plugin_error(
-                    e,
-                    "wire course_correct",
-                )),
+                Err(e) => {
+                    Err(wire_error_to_plugin_error(e, "wire course_correct"))
+                }
             }
         })
     }
@@ -1359,10 +1336,9 @@ impl crate::admission::ErasedWarden for WireWarden {
             let cid = self.client.next_cid();
             match self.client.release_custody(cid, handle).await {
                 Ok(()) => Ok(()),
-                Err(e) => Err(wire_error_to_plugin_error(
-                    e,
-                    "wire release_custody",
-                )),
+                Err(e) => {
+                    Err(wire_error_to_plugin_error(e, "wire release_custody"))
+                }
             }
         })
     }
@@ -1493,8 +1469,7 @@ mod tests {
     impl Plugin for TestPlugin {
         fn describe(
             &self,
-        ) -> impl Future<Output = PluginDescription> + Send + '_
-        {
+        ) -> impl Future<Output = PluginDescription> + Send + '_ {
             let name = self.name.clone();
             async move {
                 PluginDescription {
@@ -1521,8 +1496,7 @@ mod tests {
         fn load<'a>(
             &'a mut self,
             ctx: &'a LoadContext,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
             async move {
                 if self.fail_load {
                     return Err(PluginError::Permanent(
@@ -1530,40 +1504,20 @@ mod tests {
                     ));
                 }
                 if let Some(a) = &self.announce_on_load {
-                    ctx.subject_announcer
-                        .announce(a.clone())
-                        .await
-                        .map_err(|e| {
-                            PluginError::Permanent(format!(
-                                "announce: {e}"
-                            ))
-                        })?;
+                    ctx.subject_announcer.announce(a.clone()).await.map_err(
+                        |e| PluginError::Permanent(format!("announce: {e}")),
+                    )?;
                 }
                 if let Some((s1, s2, r)) = &self.relation_on_load {
-                    ctx.subject_announcer
-                        .announce(s1.clone())
-                        .await
-                        .map_err(|e| {
-                            PluginError::Permanent(format!(
-                                "announce s1: {e}"
-                            ))
-                        })?;
-                    ctx.subject_announcer
-                        .announce(s2.clone())
-                        .await
-                        .map_err(|e| {
-                            PluginError::Permanent(format!(
-                                "announce s2: {e}"
-                            ))
-                        })?;
-                    ctx.relation_announcer
-                        .assert(r.clone())
-                        .await
-                        .map_err(|e| {
-                            PluginError::Permanent(format!(
-                                "assert: {e}"
-                            ))
-                        })?;
+                    ctx.subject_announcer.announce(s1.clone()).await.map_err(
+                        |e| PluginError::Permanent(format!("announce s1: {e}")),
+                    )?;
+                    ctx.subject_announcer.announce(s2.clone()).await.map_err(
+                        |e| PluginError::Permanent(format!("announce s2: {e}")),
+                    )?;
+                    ctx.relation_announcer.assert(r.clone()).await.map_err(
+                        |e| PluginError::Permanent(format!("assert: {e}")),
+                    )?;
                 }
                 self.loaded.store(true, Ordering::Relaxed);
                 Ok(())
@@ -1572,8 +1526,7 @@ mod tests {
 
         fn unload(
             &mut self,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
             async move {
                 self.unloaded.store(true, Ordering::Relaxed);
                 Ok(())
@@ -1582,8 +1535,7 @@ mod tests {
 
         fn health_check(
             &self,
-        ) -> impl Future<Output = HealthReport> + Send + '_
-        {
+        ) -> impl Future<Output = HealthReport> + Send + '_ {
             async move {
                 if self.loaded.load(Ordering::Relaxed) {
                     HealthReport::healthy()
@@ -1604,10 +1556,7 @@ mod tests {
                 if self.fatal_handle_request {
                     return Err(PluginError::fatal(
                         "echoing",
-                        std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "cannot continue",
-                        ),
+                        std::io::Error::other("cannot continue"),
                     ));
                 }
                 Ok(Response::for_request(req, req.payload.clone()))
@@ -1621,7 +1570,10 @@ mod tests {
     // separate spawned tasks.
     async fn connect_test_pair(
         plugin: TestPlugin,
-    ) -> (WireRespondent, JoinHandle<Result<(), evo_plugin_sdk::host::HostError>>) {
+    ) -> (
+        WireRespondent,
+        JoinHandle<Result<(), evo_plugin_sdk::host::HostError>>,
+    ) {
         let plugin_name = plugin.name.clone();
 
         // One-directional: steward writes, plugin reads.
@@ -1659,10 +1611,7 @@ mod tests {
             ..Default::default()
         };
         let (respondent, host) = connect_test_pair(plugin).await;
-        assert_eq!(
-            respondent.description().identity.name,
-            "org.test.x"
-        );
+        assert_eq!(respondent.description().identity.name, "org.test.x");
         drop(respondent);
         let _ = host.await;
     }
@@ -1903,7 +1852,7 @@ mod tests {
         let mut t = toml::Table::new();
         t.insert("s".into(), toml::Value::String("hello".into()));
         t.insert("i".into(), toml::Value::Integer(42));
-        t.insert("f".into(), toml::Value::Float(3.14));
+        t.insert("f".into(), toml::Value::Float(2.5));
         t.insert("b".into(), toml::Value::Boolean(true));
         let mut nested = toml::Table::new();
         nested.insert("key".into(), toml::Value::String("v".into()));
@@ -1919,7 +1868,7 @@ mod tests {
         let v = toml_table_to_json_value(t).unwrap();
         assert_eq!(v["s"], serde_json::json!("hello"));
         assert_eq!(v["i"], serde_json::json!(42));
-        assert_eq!(v["f"], serde_json::json!(3.14));
+        assert_eq!(v["f"], serde_json::json!(2.5));
         assert_eq!(v["b"], serde_json::json!(true));
         assert_eq!(v["nested"]["key"], serde_json::json!("v"));
         assert_eq!(v["list"], serde_json::json!([1, 2]));
@@ -1928,8 +1877,7 @@ mod tests {
     #[tokio::test]
     async fn toml_datetime_rejected_with_clear_error() {
         let mut t = toml::Table::new();
-        let dt: toml::value::Datetime =
-            "1979-05-27T07:32:00Z".parse().unwrap();
+        let dt: toml::value::Datetime = "1979-05-27T07:32:00Z".parse().unwrap();
         t.insert("stamp".into(), toml::Value::Datetime(dt));
         let err = toml_table_to_json_value(t).unwrap_err();
         assert!(err.contains("TOML datetimes"));
@@ -1958,9 +1906,7 @@ mod tests {
                 plugin_name.to_string(),
             )),
             user_interaction_requester: Arc::new(
-                LoggingUserInteractionRequester::new(
-                    plugin_name.to_string(),
-                ),
+                LoggingUserInteractionRequester::new(plugin_name.to_string()),
             ),
             subject_announcer: Arc::new(RegistrySubjectAnnouncer::new(
                 Arc::clone(&registry),
@@ -2000,8 +1946,7 @@ mod tests {
     impl Plugin for TestWarden {
         fn describe(
             &self,
-        ) -> impl Future<Output = PluginDescription> + Send + '_
-        {
+        ) -> impl Future<Output = PluginDescription> + Send + '_ {
             let name = self.name.clone();
             async move {
                 PluginDescription {
@@ -2028,8 +1973,7 @@ mod tests {
         fn load<'a>(
             &'a mut self,
             _ctx: &'a LoadContext,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
             async move {
                 self.loaded.store(true, Ordering::Relaxed);
                 Ok(())
@@ -2038,8 +1982,7 @@ mod tests {
 
         fn unload(
             &mut self,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
             async move {
                 self.unloaded.store(true, Ordering::Relaxed);
                 Ok(())
@@ -2048,8 +1991,7 @@ mod tests {
 
         fn health_check(
             &self,
-        ) -> impl Future<Output = HealthReport> + Send + '_
-        {
+        ) -> impl Future<Output = HealthReport> + Send + '_ {
             async move {
                 if self.loaded.load(Ordering::Relaxed) {
                     HealthReport::healthy()
@@ -2064,9 +2006,7 @@ mod tests {
         fn take_custody<'a>(
             &'a mut self,
             assignment: Assignment,
-        ) -> impl Future<Output = Result<CustodyHandle, PluginError>>
-               + Send
-               + 'a
+        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a
         {
             async move {
                 if self.fail_take {
@@ -2080,9 +2020,7 @@ mod tests {
                     "custody-{}",
                     assignment.correlation_id
                 ));
-                if let Some(payload) =
-                    self.report_payload_during_take.clone()
-                {
+                if let Some(payload) = self.report_payload_during_take.clone() {
                     assignment
                         .custody_state_reporter
                         .report(&handle, payload, HealthStatus::Healthy)
@@ -2097,27 +2035,30 @@ mod tests {
             &'a mut self,
             _handle: &'a CustodyHandle,
             _correction: CourseCorrection,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
             async move { Ok(()) }
         }
 
         fn release_custody<'a>(
             &'a mut self,
             _handle: CustodyHandle,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
-        {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
             async move { Ok(()) }
         }
     }
+
+    /// Type alias for the capture buffer used by the test-only
+    /// [`CapturingCustodyStateReporter`]. Factored out so both the
+    /// struct field and the test-local `let captured: ...` binding
+    /// can name the same shape without tripping `clippy::type_complexity`.
+    type CapturedReports =
+        Arc<std::sync::Mutex<Vec<(CustodyHandle, Vec<u8>, HealthStatus)>>>;
 
     /// Custody state reporter that records each call into a shared
     /// `Vec`, for test observation of events routed through
     /// [`forward_event`].
     struct CapturingCustodyStateReporter {
-        captured: Arc<
-            std::sync::Mutex<Vec<(CustodyHandle, Vec<u8>, HealthStatus)>>,
-        >,
+        captured: CapturedReports,
     }
 
     impl CustodyStateReporter for CapturingCustodyStateReporter {
@@ -2126,9 +2067,8 @@ mod tests {
             handle: &'a CustodyHandle,
             payload: Vec<u8>,
             health: HealthStatus,
-        ) -> Pin<
-            Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>,
-        > {
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
             let captured = Arc::clone(&self.captured);
             let handle = handle.clone();
             Box::pin(async move {
@@ -2415,9 +2355,8 @@ mod tests {
         // Overwrite the sink with one whose custody reporter
         // captures to a shared Vec. The other announcers stay as
         // loggers since this test does not exercise them.
-        let captured: Arc<
-            std::sync::Mutex<Vec<(CustodyHandle, Vec<u8>, HealthStatus)>>,
-        > = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured: CapturedReports =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
         warden.client().set_event_sink(EventSink {
             state_reporter: Arc::clone(&ctx.state_reporter),
             subject_announcer: Arc::clone(&ctx.subject_announcer),
@@ -2448,13 +2387,14 @@ mod tests {
         let handle = warden.take_custody(assignment).await.unwrap();
         assert_eq!(handle.id, "custody-40");
 
-        let captured = captured.lock().unwrap();
-        assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0].0.id, "custody-40");
-        assert_eq!(captured[0].1, b"state=playing");
-        assert_eq!(captured[0].2, HealthStatus::Healthy);
+        {
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].0.id, "custody-40");
+            assert_eq!(captured[0].1, b"state=playing");
+            assert_eq!(captured[0].2, HealthStatus::Healthy);
+        }
 
-        drop(captured);
         warden.unload().await.unwrap();
         drop(warden);
         let _ = host.await;

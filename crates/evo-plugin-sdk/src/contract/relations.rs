@@ -141,33 +141,21 @@ mod tests {
 
     #[test]
     fn assertion_with_reason() {
-        let a = RelationAssertion::new(
-            addr("s", "v1"),
-            "p",
-            addr("s", "v2"),
-        )
-        .with_reason("scraped from metadata");
+        let a = RelationAssertion::new(addr("s", "v1"), "p", addr("s", "v2"))
+            .with_reason("scraped from metadata");
         assert_eq!(a.reason.as_deref(), Some("scraped from metadata"));
     }
 
     #[test]
     fn retraction_new_no_reason() {
-        let r = RelationRetraction::new(
-            addr("s", "v1"),
-            "p",
-            addr("s", "v2"),
-        );
+        let r = RelationRetraction::new(addr("s", "v1"), "p", addr("s", "v2"));
         assert!(r.reason.is_none());
     }
 
     #[test]
     fn retraction_with_reason() {
-        let r = RelationRetraction::new(
-            addr("s", "v1"),
-            "p",
-            addr("s", "v2"),
-        )
-        .with_reason("file deleted");
+        let r = RelationRetraction::new(addr("s", "v1"), "p", addr("s", "v2"))
+            .with_reason("file deleted");
         assert_eq!(r.reason.as_deref(), Some("file deleted"));
     }
 

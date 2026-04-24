@@ -84,9 +84,7 @@ pub fn init(
             .with(fmt_layer)
             .try_init()
             .map_err(|e| {
-                StewardError::Config(format!(
-                    "tracing subscriber init: {e}"
-                ))
+                StewardError::Config(format!("tracing subscriber init: {e}"))
             })?;
     }
 
@@ -123,8 +121,7 @@ fn resolve_filter(config_level: &str, cli_override: Option<&str>) -> EnvFilter {
         }
     }
 
-    EnvFilter::try_new(config_level)
-        .unwrap_or_else(|_| EnvFilter::new("warn"))
+    EnvFilter::try_new(config_level).unwrap_or_else(|_| EnvFilter::new("warn"))
 }
 
 #[cfg(test)]

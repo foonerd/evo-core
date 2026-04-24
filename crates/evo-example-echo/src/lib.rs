@@ -93,16 +93,15 @@ impl Plugin for EchoPlugin {
         _ctx: &'a LoadContext,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         async move {
-            tracing::info!(
-                plugin = "org.evo.example.echo",
-                "plugin load"
-            );
+            tracing::info!(plugin = "org.evo.example.echo", "plugin load");
             self.loaded = true;
             Ok(())
         }
     }
 
-    fn unload(&mut self) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
+    fn unload(
+        &mut self,
+    ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
         async move {
             tracing::info!(
                 plugin = "org.evo.example.echo",

@@ -193,7 +193,11 @@ impl SubjectRegistry {
 
     /// Current number of canonical subjects in the registry.
     pub fn subject_count(&self) -> usize {
-        self.inner.lock().expect("registry mutex poisoned").subjects.len()
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .subjects
+            .len()
     }
 
     /// Current number of distinct addressings in the registry.
@@ -208,7 +212,11 @@ impl SubjectRegistry {
     /// Current number of recorded claims (equivalent, distinct,
     /// conflict).
     pub fn claim_count(&self) -> usize {
-        self.inner.lock().expect("registry mutex poisoned").claims.len()
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .claims
+            .len()
     }
 
     /// Resolve an addressing to a canonical subject ID if known.
@@ -339,7 +347,9 @@ impl SubjectRegistry {
                         .collect();
 
                     for addr in &unresolved {
-                        inner.addressings.insert(addr.clone(), target_id.clone());
+                        inner
+                            .addressings
+                            .insert(addr.clone(), target_id.clone());
                     }
                     if let Some(record) = inner.subjects.get_mut(&target_id) {
                         for r in records {
@@ -361,10 +371,8 @@ impl SubjectRegistry {
 
             // Multiple distinct IDs: conflict. Record and move on.
             _ => {
-                let ids: Vec<String> = distinct_ids
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
+                let ids: Vec<String> =
+                    distinct_ids.iter().map(|s| s.to_string()).collect();
                 inner.claims.push(ClaimRecord {
                     kind: ClaimKind::MultiSubjectConflict {
                         addressings: announcement.addressings.clone(),
@@ -382,9 +390,7 @@ impl SubjectRegistry {
                     plugin = %claimant,
                     "SubjectConflict: announcement spans multiple subjects; claim recorded, no merge performed"
                 );
-                AnnounceOutcome::Conflict {
-                    canonical_ids: ids,
-                }
+                AnnounceOutcome::Conflict { canonical_ids: ids }
             }
         };
 
@@ -426,10 +432,9 @@ impl SubjectRegistry {
             }
         };
 
-        let own_claim_idx = record
-            .addressings
-            .iter()
-            .position(|r| r.addressing == *addressing && r.claimant == claimant);
+        let own_claim_idx = record.addressings.iter().position(|r| {
+            r.addressing == *addressing && r.claimant == claimant
+        });
 
         let idx = match own_claim_idx {
             Some(i) => i,
@@ -472,7 +477,9 @@ impl SubjectRegistry {
     }
 }
 
-fn claim_to_kind_and_reason(claim: &SubjectClaim) -> (ClaimKind, Option<String>) {
+fn claim_to_kind_and_reason(
+    claim: &SubjectClaim,
+) -> (ClaimKind, Option<String>) {
     match claim {
         SubjectClaim::Equivalent {
             a,
@@ -533,7 +540,10 @@ mod tests {
     #[test]
     fn announce_resolves_existing() {
         let r = SubjectRegistry::new();
-        let a = SubjectAnnouncement::new("track", vec![addr("mpd-path", "/f.flac")]);
+        let a = SubjectAnnouncement::new(
+            "track",
+            vec![addr("mpd-path", "/f.flac")],
+        );
         let first = r.announce(&a, "p1").unwrap();
         let AnnounceOutcome::Created(id) = first else {
             panic!("expected Created outcome");
@@ -548,8 +558,12 @@ mod tests {
     #[test]
     fn announce_adds_addressing_to_existing() {
         let r = SubjectRegistry::new();
-        let a1 = SubjectAnnouncement::new("track", vec![addr("mpd-path", "/f.flac")]);
-        let AnnounceOutcome::Created(id) = r.announce(&a1, "p1").unwrap() else {
+        let a1 = SubjectAnnouncement::new(
+            "track",
+            vec![addr("mpd-path", "/f.flac")],
+        );
+        let AnnounceOutcome::Created(id) = r.announce(&a1, "p1").unwrap()
+        else {
             panic!();
         };
 
@@ -571,12 +585,18 @@ mod tests {
     fn announce_with_only_new_addressings_creates_new_subject() {
         let r = SubjectRegistry::new();
         r.announce(
-            &SubjectAnnouncement::new("track", vec![addr("mpd-path", "/a.flac")]),
+            &SubjectAnnouncement::new(
+                "track",
+                vec![addr("mpd-path", "/a.flac")],
+            ),
             "p1",
         )
         .unwrap();
         r.announce(
-            &SubjectAnnouncement::new("track", vec![addr("mpd-path", "/b.flac")]),
+            &SubjectAnnouncement::new(
+                "track",
+                vec![addr("mpd-path", "/b.flac")],
+            ),
             "p1",
         )
         .unwrap();
@@ -588,12 +608,18 @@ mod tests {
     fn announce_conflict_spanning_two_subjects() {
         let r = SubjectRegistry::new();
         r.announce(
-            &SubjectAnnouncement::new("track", vec![addr("mpd-path", "/a.flac")]),
+            &SubjectAnnouncement::new(
+                "track",
+                vec![addr("mpd-path", "/a.flac")],
+            ),
             "p1",
         )
         .unwrap();
         r.announce(
-            &SubjectAnnouncement::new("track", vec![addr("spotify", "track:X")]),
+            &SubjectAnnouncement::new(
+                "track",
+                vec![addr("spotify", "track:X")],
+            ),
             "p1",
         )
         .unwrap();
@@ -675,8 +701,10 @@ mod tests {
     #[test]
     fn retract_last_addressing_forgets_subject() {
         let r = SubjectRegistry::new();
-        let a =
-            SubjectAnnouncement::new("track", vec![addr("mpd-path", "/f.flac")]);
+        let a = SubjectAnnouncement::new(
+            "track",
+            vec![addr("mpd-path", "/f.flac")],
+        );
         r.announce(&a, "p1").unwrap();
 
         r.retract(&addr("mpd-path", "/f.flac"), "p1", None).unwrap();
@@ -687,8 +715,10 @@ mod tests {
     #[test]
     fn retract_by_wrong_plugin_errors() {
         let r = SubjectRegistry::new();
-        let a =
-            SubjectAnnouncement::new("track", vec![addr("mpd-path", "/f.flac")]);
+        let a = SubjectAnnouncement::new(
+            "track",
+            vec![addr("mpd-path", "/f.flac")],
+        );
         r.announce(&a, "p1").unwrap();
 
         let err = r
@@ -727,7 +757,9 @@ mod tests {
             "album",
             vec![addr("spotify", "album:X"), addr("mbid", "release-abc")],
         );
-        let AnnounceOutcome::Created(id) = r.announce(&a, "com.example.spotify").unwrap() else {
+        let AnnounceOutcome::Created(id) =
+            r.announce(&a, "com.example.spotify").unwrap()
+        else {
             panic!();
         };
 

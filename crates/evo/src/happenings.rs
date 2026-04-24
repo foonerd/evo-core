@@ -331,10 +331,7 @@ mod tests {
 
         match rx.recv().await {
             Err(RecvError::Lagged(n)) => {
-                assert!(
-                    n > 0,
-                    "Lagged count should be positive, got {n}"
-                );
+                assert!(n > 0, "Lagged count should be positive, got {n}");
             }
             other => panic!("expected Lagged, got {other:?}"),
         }
@@ -357,9 +354,7 @@ mod tests {
         };
         let cloned = h.clone();
         match cloned {
-            Happening::CustodyStateReported {
-                plugin, health, ..
-            } => {
+            Happening::CustodyStateReported { plugin, health, .. } => {
                 assert_eq!(plugin, "org.test.warden");
                 assert_eq!(health, HealthStatus::Healthy);
             }
