@@ -204,7 +204,7 @@ Semver. Plugin authors increment:
 
 ### Install digest
 
-At install time, the steward computes SHA-256 over the manifest file concatenated with the artefact file. This digest identifies this specific installation. Revocations target install digests.
+At install time, the steward computes the install digest as `SHA-256(manifest.toml || SHA-256(artefact))`: the SHA-256 of the same byte sequence that is signed (see section 5, Signing). This digest identifies this specific installation. Revocations target install digests.
 
 ## 5. Trust Classes and Signing
 

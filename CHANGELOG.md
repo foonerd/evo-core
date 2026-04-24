@@ -17,6 +17,47 @@ artefacts. Consult the git log for pre-0.1.8 history.
 
 ### Added
 
+- **Phase 2 tightening (post-closure, GAPS [13], [14])**: end-to-end
+  coverage for `evo_trust::verify_out_of_process_bundle` in
+  `crates/evo-trust/tests/verify.rs` (twelve tests: valid signature
+  at declared class, key loaded from `trust_dir_etc`, name-prefix
+  mismatch, class above key max with `degrade_trust = true`
+  degrades and `= false` refuses, unrecognised signature,
+  wrong-length `manifest.sig`, unsigned refused without
+  `allow_unsigned`, unsigned admitted at `Sandbox` with
+  `allow_unsigned`, revoked install digest, missing-revocations-file
+  as empty set, install-digest formula pin). Deterministic signing
+  seeds keep failures reproducible. Four trust-integration tests in
+  `admission.rs` cover `AdmissionEngine::set_plugin_trust` wiring:
+  skip-verification without trust, unsigned-refused, unsigned-accepted
+  at Sandbox, and revocation-refused. `MissingOrBadSignature`
+  thiserror format attribute fixed (the previous form duplicated its
+  text because both `{}` and `{0}` resolved to the same argument).
+  `KeySection`'s three advisory fields now carry `#[allow(dead_code)]`
+  uniformly (only `fingerprint` carried it previously).
+  `DEFAULT_DEGRADE_TRUST` public constant added paralleling
+  `DEFAULT_TRUST_DIR_OPT`, `DEFAULT_TRUST_DIR_ETC`, and
+  `DEFAULT_REVOCATIONS_PATH`. `config.rs` module-level schema snippet
+  refreshed to list all `[plugins]` fields including the four added
+  in Phase 2. `main.rs` redundant `Arc::clone` on the trust state
+  replaced with a move. `STEWARD.md` section 11.1 config table
+  extended with four rows for `trust_dir_opt`, `trust_dir_etc`,
+  `revocations_path`, `degrade_trust`. `PLUGIN_PACKAGING.md` section
+  4 install-digest description reconciled with code: the digest is
+  `SHA-256(manifest || SHA-256(artefact))` i.e. the hash of the
+  signed bytes, not `SHA-256(manifest || artefact)` which the text
+  previously implied. `crates/evo-plugin-tool/` empty scaffold
+  directory removed (no Cargo.toml, not a workspace member; a stray
+  `mkdir` from an aborted start on gap [20]; re-opens cleanly when
+  [20] is scheduled in Phase 5).
+- **Phase 2 (in progress)**: `evo-trust` crate and steward wiring for
+  `PLUGIN_PACKAGING.md` §5: install digest, ed25519 `manifest.sig`
+  verification, PEM + `*.meta.toml` trust roots (`plugins.trust_dir_opt`,
+  `plugins.trust_dir_etc`), digest revocations (`plugins.revocations_path`),
+  `plugins.degrade_trust`, and `AdmissionEngine::set_plugin_trust` (the
+  binary always loads trust; tests skip by default). Remaining Phase 2
+  work: `evo-plugin-tool` (gap [20]), OS trust-class enforcement (gap
+  [12]), manifest resource enforcement (gap [23]).
 - **Phase 1 tightening (post-closure, GAPS [1], [17], [22])**: end-to-end
   coverage for `plugin_discovery::discover_and_admit` in
   `crates/evo-example-echo/tests/discovery.rs` (staged layout, flat

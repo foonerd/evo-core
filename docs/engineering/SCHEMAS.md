@@ -426,6 +426,10 @@ allow_unsigned = <bool>         # optional; default false
 plugin_data_root = "<path>"        # optional; default "/var/lib/evo/plugins"
 runtime_dir = "<path>"             # optional; default "/var/run/evo/plugins"
 search_roots = ["<path>", ...]     # optional; default ["/opt/evo/plugins", "/var/lib/evo/plugins"]
+trust_dir_opt = "<path>"           # optional; default "/opt/evo/trust"
+trust_dir_etc = "<path>"           # optional; default "/etc/evo/trust.d"
+revocations_path = "<path>"        # optional; default "/etc/evo/revocations.toml"
+degrade_trust = <bool>             # optional; default true
 ```
 
 #### 3.3.2 Field Reference
@@ -451,6 +455,10 @@ search_roots = ["<path>", ...]     # optional; default ["/opt/evo/plugins", "/va
 | `plugin_data_root` | string (path) | no | `"/var/lib/evo/plugins"` | Parent for per-plugin `state/` and `credentials/`. |
 | `runtime_dir` | string (path) | no | `"/var/run/evo/plugins"` | Directory for out-of-process plugin socket files `*.sock`. Paralleling the steward's own socket at `/var/run/evo/evo.sock` per FHS. |
 | `search_roots` | array of paths | no | `["/opt/evo/plugins", "/var/lib/evo/plugins"]` | Plugin bundle search order; later entry wins on duplicate `plugin.name`. |
+| `trust_dir_opt` | string (path) | no | `"/opt/evo/trust"` | `*.pem` public keys; each `x.pem` requires `x.meta.toml` (see `PLUGIN_PACKAGING.md` §5). |
+| `trust_dir_etc` | string (path) | no | `"/etc/evo/trust.d"` | Additional operator `*.pem` keys. |
+| `revocations_path` | string (path) | no | `"/etc/evo/revocations.toml"` | Install-digest revocations. Missing file is an empty set. |
+| `degrade_trust` | bool | no | `true` | If a signing key is weaker than the manifest’s declared class, admit at the key’s max instead of refusing. |
 
 #### 3.3.3 File Location and Override Precedence
 
@@ -464,7 +472,7 @@ Per-field overrides (highest precedence first):
 - `log_level`: `--log-level` CLI flag > `RUST_LOG` env var > `config.steward.log_level` > hardcoded `"warn"`.
 - `socket_path`: `--socket` CLI flag > `config.steward.socket_path` > default.
 - `catalogue.path`: `--catalogue` CLI flag > `config.catalogue.path` > default.
-- `allow_unsigned`, `plugin_data_root`, `runtime_dir`, `search_roots`: config file only.
+- `allow_unsigned`, `plugin_data_root`, `runtime_dir`, `search_roots`, `trust_dir_opt`, `trust_dir_etc`, `revocations_path`, `degrade_trust`: config file only.
 
 #### 3.3.4 Example
 

@@ -5,6 +5,7 @@ members = [
     "crates/evo-example-echo",
     "crates/evo-example-warden",
     "crates/evo-plugin-sdk",
+    "crates/evo-trust",
 ]
 
 # Further crates will be added here as they are authored. Engineering-layer

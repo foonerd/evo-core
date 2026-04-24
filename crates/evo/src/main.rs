@@ -26,6 +26,7 @@ use evo::catalogue::Catalogue;
 use evo::cli::Args;
 use evo::config::StewardConfig;
 use evo::plugin_discovery;
+use evo::plugin_trust::load_plugin_trust_arc;
 use evo::projections::ProjectionEngine;
 use evo::server::Server;
 use evo::shutdown::wait_for_signal;
@@ -75,9 +76,11 @@ async fn main() -> anyhow::Result<()> {
     // Construct the admission engine and run plugin discovery
     // (out-of-process singletons only; see `plugin_discovery` and
     // `GAPS.md` phase 1).
+    let trust = load_plugin_trust_arc(&config)?;
     let mut engine = AdmissionEngine::with_plugin_data_root(
         config.plugins.plugin_data_root.clone(),
     );
+    engine.set_plugin_trust(Some(trust));
     plugin_discovery::discover_and_admit(&mut engine, &catalogue, &config)
         .await?;
 

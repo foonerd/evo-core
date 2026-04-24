@@ -99,6 +99,10 @@ allow_unsigned = false
 
 **`search_roots`** is an ordered list of directories to walk for `manifest.toml` in each plugin bundle. Default: `/opt/evo/plugins` first, then `/var/lib/evo/plugins`. If the same `plugin.name` appears under two roots, the later root in the list wins. Layout (staged `evo` / `distribution` / `vendor` vs flat) follows `PLUGIN_PACKAGING.md` and the `plugin_discovery` module.
 
+**`trust_dir_opt`** and **`trust_dir_etc`** are directories of `*.pem` ed25519 public keys, each with a `*.meta.toml` sidecar authorising name prefixes and `max_trust_class` (see `PLUGIN_PACKAGING.md` section 5). Defaults: `/opt/evo/trust` and `/etc/evo/trust.d`. **Signature verification** uses the union of these directories; a missing directory is treated as empty.
+
+**`revocations_path`** is the TOML file of revoked install digests (default `/etc/evo/revocations.toml`); a missing file means no revocations. **`degrade_trust`** (default `true`) allows admission at the signing key’s `max_trust_class` when the manifest asks for a stronger class, instead of refusing.
+
 There is deliberately no field to turn off admission validation entirely, lower trust requirements globally, or disable signature checking for particular plugins. Admission policy is binary: signed plugins with valid trust, or unsigned plugins at `sandbox` if explicitly allowed.
 
 ## 4. Precedence: CLI, Env, Config, Default
@@ -111,7 +115,7 @@ For fields that can be set from multiple sources, the precedence order (highest 
 | `socket_path` | `--socket` CLI | `config.steward.socket_path` | - | default `/var/run/evo/evo.sock` |
 | `catalogue.path` | `--catalogue` CLI | `config.catalogue.path` | - | default `/opt/evo/catalogue/default.toml` |
 | `allow_unsigned` | `config.plugins.allow_unsigned` | - | - | default `false` |
-| `plugins.plugin_data_root`, `runtime_dir`, `search_roots` | `config.plugins.*` | - | - | see `SCHEMAS.md` 3.3 |
+| `plugins.*` (incl. trust and discovery paths) | `config.plugins.*` | - | - | see `SCHEMAS.md` 3.3 |
 
 Notes:
 

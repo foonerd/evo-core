@@ -369,6 +369,10 @@ The effective configuration surfaces (full schema in `SCHEMAS.md` section 3.3, n
 | `plugins.plugin_data_root` | `/var/lib/evo/plugins` | Parent for per-plugin `state/` and `credentials/`. |
 | `plugins.runtime_dir` | `/var/run/evo/plugins` | Directory for out-of-process plugin socket files. |
 | `plugins.search_roots` | `["/opt/evo/plugins", "/var/lib/evo/plugins"]` | Ordered bundle search roots; later entry wins on duplicate `plugin.name`. |
+| `plugins.trust_dir_opt` | `/opt/evo/trust` | Package-shipped `*.pem` public keys; each with a `*.meta.toml` sidecar. |
+| `plugins.trust_dir_etc` | `/etc/evo/trust.d` | Operator-installed `*.pem` public keys (union with `trust_dir_opt`). |
+| `plugins.revocations_path` | `/etc/evo/revocations.toml` | Install-digest revocation list; missing file is an empty set. |
+| `plugins.degrade_trust` | `true` | If a signing key's `max_trust_class` is weaker than the declared class, admit at the key's max instead of refusing. |
 
 ### 11.2 Catalogue
 

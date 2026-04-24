@@ -15,7 +15,9 @@
 //!
 //! [plugins]
 //! allow_unsigned = false
-//! # plugin_data_root, runtime_dir, search_roots: see CONFIG.md / SCHEMAS.md
+//! # plugin_data_root, runtime_dir, search_roots,
+//! # trust_dir_opt, trust_dir_etc, revocations_path, degrade_trust:
+//! # see CONFIG.md section 3 / SCHEMAS.md section 3.3.
 //! ```
 
 use crate::error::StewardError;
@@ -49,6 +51,21 @@ pub const DEFAULT_PLUGIN_RUNTIME_DIR: &str = "/var/run/evo/plugins";
 /// earlier one).
 const DEFAULT_PLUGIN_SEARCH_ROOTS: [&str; 2] =
     ["/opt/evo/plugins", "/var/lib/evo/plugins"];
+
+/// Package-shipped trust directory (`/opt/evo/trust/*.pem`). See
+/// `PLUGIN_PACKAGING.md` section 5.
+pub const DEFAULT_TRUST_DIR_OPT: &str = "/opt/evo/trust";
+
+/// Operator-installed trust drop-in directory (`/etc/evo/trust.d/*.pem`).
+pub const DEFAULT_TRUST_DIR_ETC: &str = "/etc/evo/trust.d";
+
+/// Revocation list path.
+pub const DEFAULT_REVOCATIONS_PATH: &str = "/etc/evo/revocations.toml";
+
+/// Default for [`PluginsSection::degrade_trust`]: admit at the signing
+/// key's `max_trust_class` when the manifest declares a stronger class,
+/// instead of refusing. See `PLUGIN_PACKAGING.md` section 5.
+pub const DEFAULT_DEGRADE_TRUST: bool = true;
 
 /// Root of the steward's configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -197,6 +214,22 @@ pub struct PluginsSection {
     /// then [`DEFAULT_PLUGIN_DATA_ROOT`].
     #[serde(default = "default_plugin_search_roots")]
     pub search_roots: Vec<PathBuf>,
+    /// Directory of `*.pem` public keys (package-shipped; union with
+    /// [`Self::trust_dir_etc`]). See `PLUGIN_PACKAGING.md` section 5.
+    #[serde(default = "default_trust_dir_opt")]
+    pub trust_dir_opt: PathBuf,
+    /// Directory of `*.pem` public keys (operator `trust.d`). Each
+    /// `foo.pem` must have a `foo.meta.toml` sidecar in the same directory.
+    #[serde(default = "default_trust_dir_etc")]
+    pub trust_dir_etc: PathBuf,
+    /// Install-digest revocations (`[[revoke]]` in TOML).
+    #[serde(default = "default_revocations_path")]
+    pub revocations_path: PathBuf,
+    /// If the manifest's trust class is above what the signing key may
+    /// authorise, admit at the key's `max_trust_class` instead of
+    /// refusing. If `false`, that situation is a hard error.
+    #[serde(default = "default_degrade_trust")]
+    pub degrade_trust: bool,
 }
 
 fn default_plugin_data_root_path() -> PathBuf {
@@ -214,6 +247,22 @@ fn default_plugin_search_roots() -> Vec<PathBuf> {
         .collect()
 }
 
+fn default_trust_dir_opt() -> PathBuf {
+    PathBuf::from(DEFAULT_TRUST_DIR_OPT)
+}
+
+fn default_trust_dir_etc() -> PathBuf {
+    PathBuf::from(DEFAULT_TRUST_DIR_ETC)
+}
+
+fn default_revocations_path() -> PathBuf {
+    PathBuf::from(DEFAULT_REVOCATIONS_PATH)
+}
+
+fn default_degrade_trust() -> bool {
+    DEFAULT_DEGRADE_TRUST
+}
+
 impl Default for PluginsSection {
     fn default() -> Self {
         Self {
@@ -221,6 +270,10 @@ impl Default for PluginsSection {
             plugin_data_root: default_plugin_data_root_path(),
             runtime_dir: default_plugin_runtime_dir(),
             search_roots: default_plugin_search_roots(),
+            trust_dir_opt: default_trust_dir_opt(),
+            trust_dir_etc: default_trust_dir_etc(),
+            revocations_path: default_revocations_path(),
+            degrade_trust: default_degrade_trust(),
         }
     }
 }
@@ -245,6 +298,10 @@ mod tests {
             PathBuf::from(DEFAULT_PLUGIN_RUNTIME_DIR)
         );
         assert_eq!(cfg.plugins.search_roots, default_plugin_search_roots());
+        assert_eq!(cfg.plugins.trust_dir_opt, default_trust_dir_opt());
+        assert_eq!(cfg.plugins.trust_dir_etc, default_trust_dir_etc());
+        assert_eq!(cfg.plugins.revocations_path, default_revocations_path());
+        assert!(cfg.plugins.degrade_trust);
     }
 
     #[test]

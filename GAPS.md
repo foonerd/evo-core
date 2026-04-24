@@ -61,12 +61,14 @@ Order inside phase was: [1] then [22] then [17] decision.
 
 ### Phase 2 - Security and supply chain
 
+Status: **partial** — [13] and [14] closed; [12], [20], and [23] open.
+
 One vertical slice: manifest trust becomes real, not text. Includes the sign / verify / pack half of the plugin tool so operators have a single workflow from day one.
 
 Design first: trust model (keys, roots, digest algorithm, canonical signing payload). Then:
 
-- [13] Signature verification. ed25519 over manifest plus artefact digest; trust root loading from `/opt/evo/trust/` and `/etc/evo/trust.d/`.
-- [14] Revocation. Digest-based entries in `/etc/evo/revocations.toml`.
+- [13] Signature verification. **Closed** — `evo-trust` + `AdmissionEngine::set_plugin_trust` + `[plugins]` trust path fields; see gap inventory.
+- [14] Revocation. **Closed** — `RevocationSet` and install-digest check. Default path `/etc/evo/revocations.toml` (configurable).
 - [12] Trust class OS enforcement. Map the trust-class taxonomy to seccomp, namespaces, capabilities, and user separation per PLUGIN_PACKAGING section 5.
 - [23] Manifest resource and prerequisite declarations. Enforce, or explicitly strip the fields that cannot be enforced. Must align with whatever [12] actually provides at the OS level.
 - [20] evo-plugin-tool sign / verify / pack subcommands. Parallel with [13] / [14]. The remaining subcommands (install / uninstall / purge / lint) land in Phase 5.
@@ -313,20 +315,20 @@ These are not numbered gaps in the inventory; they are honest boundaries for int
 ### [13] Plugin Signature Verification
 
 - Promised: PLUGIN_PACKAGING section 5 defines ed25519 signatures over manifest plus artefact digest; trust root at /opt/evo/trust/ and /etc/evo/trust.d/; key authorisation metadata.
-- On disk: nothing. Admission does not look for manifest.sig, does not compute digests, does not load any trust root.
-- Operator hits: a signed plugin request. The signature is ignored; the plugin admits on name match alone.
-- Status: OPEN
-- Decision:
-- Notes:
+- On disk: the `evo-trust` crate implements the signing message, 64-byte `manifest.sig` verification, PEM + `<stem>.meta.toml` loading, name-prefix and `max_trust_class` checks, and `plugins.degrade_trust`. `admit_out_of_process_from_directory` runs verification when the engine was configured with `set_plugin_trust` (the shipped `evo` binary always does). Unsigned out-of-process bundles are refused unless `allow_unsigned` is true (then effective class is `sandbox`).
+- Operator hits: a signed verifiable plugin is required for default configs; or use `allow_unsigned` for local/dev only.
+- Status: RESOLVED — IMPLEMENTED
+- Decision: IMPLEMENT. Policy lives in `StewardConfig` `[plugins]`; trust state is optional on `AdmissionEngine` for harnesses.
+- Notes: `evo-plugin-tool sign` (gap [20]) should call the same `signing_message` and `ed25519` sign path; not duplicated here yet.
 
 ### [14] Plugin Revocation
 
 - Promised: PLUGIN_PACKAGING section 5 documents /etc/evo/revocations.toml with digest-based revocation entries.
-- On disk: nothing.
-- Operator hits: no way to revoke a compromised plugin short of deleting its directory.
-- Status: OPEN
-- Decision:
-- Notes:
+- On disk: `evo_trust::RevocationSet` loads `plugins.revocations_path` (default `/etc/evo/revocations.toml`); missing file is an empty set. `verify_out_of_process_bundle` checks the install digest before signature verification.
+- Operator hits: (closed for install-digest revocation) add a `[[revoke]]` entry; the steward refuses admission. Runtime re-checks on every admission from disk; hot reload / long-lived in-memory revalidation is a future concern tied to the administration rack (gap [15]).
+- Status: RESOLVED — IMPLEMENTED
+- Decision: IMPLEMENT digest list at configured path.
+- Notes: no UI to manage revocations yet; file-level operator workflow only.
 
 ### [15] Plugins Administration Rack
 
@@ -573,3 +575,43 @@ Summary: verification identified six items worth closing before declaring Phase 
 Changes: `crates/evo/src/plugin_discovery.rs` (log promotion), `crates/evo/src/admission.rs` (`with_data_root` + test), `crates/evo/src/config.rs` (`DEFAULT_PLUGIN_RUNTIME_DIR`, new default for `runtime_dir`), `crates/evo-plugin-sdk/src/manifest.rs` (`TransportKind::InProcess` doc), `crates/evo-example-echo/tests/discovery.rs` (new), `docs/engineering/STEWARD.md` (section 11.1 and section 16), `docs/engineering/CONFIG.md` (section 3.3), `docs/engineering/SCHEMAS.md` (section 3.3), `CHANGELOG.md` [Unreleased], this file.
 
 Verification: the standard gate (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --all-targets --locked`, `cargo build --workspace --locked`) must pass, and `discovery.rs` must pass on the host entry of the CI MSRV matrix (where `CARGO_BIN_EXE_echo-wire` is set).
+
+### Phase 2 (partial) — [13] and [14]
+
+Outcome: [13] and [14] RESOLVED — IMPLEMENTED; [12], [20], and [23] remain OPEN in Phase 2.
+
+Summary: New `crates/evo-trust` provides install digest, `manifest.sig` ed25519 verification, PEM + `*.meta.toml` trust roots, name-prefix and `max_trust_class` authorisation with `degrade_trust` policy, and `revocations.toml` digest set. `StewardConfig` `[plugins]` adds `trust_dir_opt`, `trust_dir_etc`, `revocations_path`, and `degrade_trust`. `AdmissionEngine` holds `Option<Arc<PluginTrustState>>` and `set_plugin_trust`; the binary always loads trust. Harnesses that omit `set_plugin_trust` skip crypto (existing tests). Remaining: `evo-plugin-tool` (sign/verify/pack), OS-level trust-class mapping ([12]), manifest resource enforcement ([23]).
+
+Changes: `crates/evo-trust/` (new crate), `Cargo.toml` (workspace members addition), `crates/evo/Cargo.toml` (evo-trust path dependency), `crates/evo/src/admission.rs`, `crates/evo/src/config.rs`, `crates/evo/src/main.rs`, `crates/evo/src/plugin_trust.rs`, `Cargo.lock`, `docs/engineering/SCHEMAS.md` (section 3.3), `docs/engineering/CONFIG.md` (section 3.3), `CHANGELOG.md`, `GAPS.md` (this file), `crates/evo-example-echo/tests/discovery.rs` (`..Default::default()` on `PluginsSection`).
+
+### Phase 2 tightening - empirical closure, hygiene, doc reconciliation
+
+Outcome: IMPLEMENTED. Post-closure cleanup for Phase 2 gaps [13] and [14]. No gap re-opens; this entry records the work that brings the Phase 2 closure from structurally complete to empirically complete and doc-consistent.
+
+Summary: verification identified a set of items worth closing before declaring Phase 2 empirically done on a greenfield industrial-grade codebase:
+
+1. No end-to-end test composed `signing_message`, `verify_out_of_process_bundle`, `RevocationSet`, and `load_trust_root` against real ed25519 keypairs and on-disk bundles. The unit test in `matchers.rs` covered one prefix form; nothing else. `crates/evo-trust/tests/verify.rs` is new and carries twelve integration tests: valid signature at declared class, key loaded from `trust_dir_etc`, name-prefix mismatch, declared class above key max with `degrade_trust = true` (degrades) and `= false` (refuses), unrecognised signature, wrong-length `manifest.sig`, unsigned with `allow_unsigned = false` (refuses) and `= true` (admits at Sandbox), revoked install digest, missing-revocations-file as empty set, and install-digest formula pin. Deterministic signing seeds (`[0xAA; 32]`, `[0xBB; 32]`) keep failures reproducible across CI runs.
+
+2. `AdmissionEngine::set_plugin_trust` and the trust-gated branch inside `admit_out_of_process_from_directory` had no test coverage. Four new tests in `admission.rs`: `admit_from_directory_without_trust_skips_signature_check` (control: no trust state, no sig error in output); `admit_from_directory_with_trust_rejects_unsigned_bundle` (`UnsignedInadmissible` surfaces as `StewardError::Admission`); `admit_from_directory_with_trust_accepts_unsigned_when_allowed` (`allow_unsigned = true` passes trust, fails at spawn on bogus binary); `admit_from_directory_with_trust_rejects_revoked_digest` (revocation check fires before sig-presence check, so `allow_unsigned = true` does not mask it). The trust-verification algorithm itself remains covered in the evo-trust integration tests above; these assert only on the steward integration.
+
+3. `evo_trust::TrustError::MissingOrBadSignature` carried a malformed `#[error]` format attribute that duplicated its text. The expansion produced `"plugin manifest.sig is missing or not 64 bytes: manifest.sig is missing or not 64 bytes"` on Display because both `{}` and `{0}` format placeholders resolved to the same argument. Fixed to plain `"manifest.sig is missing or not 64 bytes"`.
+
+4. `KeySection`'s three advisory fields (`fingerprint`, `purpose`, `issued_by`) had inconsistent `#[allow(dead_code)]` treatment: only `fingerprint` carried the attribute. All three are parsed-but-unused v0 provenance metadata that future tooling (e.g. `evo-plugin-tool verify`) may consult. Unified to all three carrying the attribute, with a struct-level doc comment naming their role.
+
+5. `config.rs` lacked a `DEFAULT_DEGRADE_TRUST` public constant paralleling `DEFAULT_TRUST_DIR_OPT`, `DEFAULT_TRUST_DIR_ETC`, and `DEFAULT_REVOCATIONS_PATH`. Added. The inline `fn default_degrade_trust() -> bool { true }` now references the constant instead of a literal.
+
+6. `config.rs` module-level schema snippet was stale: the `[plugins]` block comment still pointed at three pre-Phase-2 fields. Refreshed to list all seven (plus `allow_unsigned`) and to cross-reference CONFIG.md section 3 and SCHEMAS.md section 3.3.
+
+7. `main.rs` wrote `engine.set_plugin_trust(Some(Arc::clone(&trust)))` where `trust` had no further use. Replaced with a move (`Some(trust)`).
+
+8. `STEWARD.md` section 11.1 config table was extended during Phase 1 tightening to cover `allow_unsigned`, `plugin_data_root`, `runtime_dir`, `search_roots`; Phase 2 added four more fields (`trust_dir_opt`, `trust_dir_etc`, `revocations_path`, `degrade_trust`) without updating the table. Four new rows added.
+
+9. `PLUGIN_PACKAGING.md` section 4 "Install digest" described the digest as "SHA-256 over the manifest file concatenated with the artefact file". Code computes `SHA-256(manifest || SHA-256(art))` i.e. the SHA-256 of the signing message, which is a more efficient and conceptually cleaner formula (ties the install digest to the signed-bytes identity rather than requiring a separate second read of the artefact). Text reconciled to match code; the spec now explicitly names the formula and cross-references section 5 Signing. The new `install_digest_is_hash_of_signing_message` test in `crates/evo-trust/tests/verify.rs` pins the formula so future refactors cannot silently change it.
+
+10. `crates/evo-plugin-tool/` was an empty scaffold directory: no `Cargo.toml`, no source files, not a workspace member. Stray `mkdir` from an aborted start on gap [20]. Removed; the crate opens afresh when [20] is scheduled in Phase 5.
+
+11. The original Phase 2 Resolution Log entry above named only a subset of touched surfaces in its Changes list (`crates/evo-trust/`, four `evo/src/*.rs` files, Cargo.lock, CHANGELOG, GAPS, discovery.rs). Extended to include the workspace `Cargo.toml` members addition, the `crates/evo/Cargo.toml` evo-trust path dependency, `docs/engineering/SCHEMAS.md` section 3.3, and `docs/engineering/CONFIG.md` section 3.3.
+
+Changes: `crates/evo-trust/src/error.rs`, `crates/evo-trust/src/key_meta.rs`, `crates/evo-trust/Cargo.toml` (dev-dependencies), `crates/evo-trust/tests/verify.rs` (new file), `crates/evo/src/admission.rs` (trust tests), `crates/evo/src/config.rs` (DEFAULT_DEGRADE_TRUST const plus module-level schema comment), `crates/evo/src/main.rs` (Arc::clone removed), `crates/evo-plugin-tool/` (removed), `docs/engineering/STEWARD.md` (section 11.1), `docs/engineering/PLUGIN_PACKAGING.md` (section 4), `CHANGELOG.md`, `GAPS.md` (this file: Phase 2 entry Changes list extended above; this entry added).
+
+Verification: the standard gate (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --all-targets --locked`, `cargo build --workspace --locked`) must pass.

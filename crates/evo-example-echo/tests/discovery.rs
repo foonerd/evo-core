@@ -127,6 +127,7 @@ fn build_config(
                 .iter()
                 .map(|p| p.to_path_buf())
                 .collect(),
+            ..Default::default()
         },
         ..Default::default()
     }

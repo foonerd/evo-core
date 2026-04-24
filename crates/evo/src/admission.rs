@@ -32,6 +32,7 @@ use crate::context::{
 use crate::custody::{CustodyLedger, LedgerCustodyStateReporter};
 use crate::error::StewardError;
 use crate::happenings::{Happening, HappeningBus};
+use crate::plugin_trust::PluginTrustState;
 use crate::relations::RelationGraph;
 use crate::subjects::SubjectRegistry;
 use evo_plugin_sdk::contract::{
@@ -399,6 +400,9 @@ pub struct AdmissionEngine {
     /// Root for per-plugin `state/` and `credentials/` (see
     /// `PLUGIN_PACKAGING.md`: `/var/lib/evo/plugins/<name>/...`).
     plugin_data_root: PathBuf,
+    /// Optional: signature and revocation state for disk-bundled
+    /// out-of-process plugins. `None` skips trust checks (harnesses).
+    plugin_trust: Option<Arc<PluginTrustState>>,
 }
 
 fn default_plugin_data_root() -> PathBuf {
@@ -416,6 +420,7 @@ impl Default for AdmissionEngine {
             happening_bus: Arc::new(HappeningBus::new()),
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
             plugin_data_root: default_plugin_data_root(),
+            plugin_trust: None,
         }
     }
 }
@@ -480,6 +485,14 @@ impl AdmissionEngine {
         &self.plugin_data_root
     }
 
+    /// Set plugin signature / revocation state for on-disk
+    /// out-of-process admission. The shipped binary loads this from
+    /// [`StewardConfig`] and [`crate::plugin_trust::PluginTrustState::load`].
+    /// `None` skips `manifest.sig` checks (e.g. integration test harnesses).
+    pub fn set_plugin_trust(&mut self, trust: Option<Arc<PluginTrustState>>) {
+        self.plugin_trust = trust;
+    }
+
     /// Construct an admission engine sharing an existing subject
     /// registry. Useful for tests that want to pre-populate or inspect
     /// the registry from outside. A fresh relation graph is created.
@@ -493,6 +506,7 @@ impl AdmissionEngine {
             happening_bus: Arc::new(HappeningBus::new()),
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
             plugin_data_root: default_plugin_data_root(),
+            plugin_trust: None,
         }
     }
 
@@ -513,6 +527,7 @@ impl AdmissionEngine {
             happening_bus: Arc::new(HappeningBus::new()),
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
             plugin_data_root: default_plugin_data_root(),
+            plugin_trust: None,
         }
     }
 
@@ -539,6 +554,7 @@ impl AdmissionEngine {
             happening_bus: Arc::new(HappeningBus::new()),
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
             plugin_data_root: default_plugin_data_root(),
+            plugin_trust: None,
         }
     }
 
@@ -566,6 +582,7 @@ impl AdmissionEngine {
             happening_bus,
             custody_cid_counter: Arc::new(AtomicU64::new(1)),
             plugin_data_root: default_plugin_data_root(),
+            plugin_trust: None,
         }
     }
 
@@ -1172,7 +1189,7 @@ impl AdmissionEngine {
                     e,
                 )
             })?;
-        let manifest = Manifest::from_toml(&manifest_text)?;
+        let mut manifest = Manifest::from_toml(&manifest_text)?;
 
         // This entry point only handles out-of-process plugins. The
         // in-process path requires a concrete Rust type that cannot be
@@ -1198,6 +1215,33 @@ impl AdmissionEngine {
                 plugin_dir.join(raw)
             }
         };
+
+        if let Some(t) = self.plugin_trust.as_ref() {
+            use evo_trust::{
+                verify_out_of_process_bundle, OutOfProcessBundleRef,
+            };
+            let bundle = OutOfProcessBundleRef {
+                plugin_dir,
+                manifest_path: &manifest_path,
+                exec_path: &exec_path,
+                plugin_name: &manifest.plugin.name,
+                declared_trust: manifest.trust.class,
+            };
+            let o = verify_out_of_process_bundle(
+                &bundle,
+                &t.keys,
+                &t.revocations,
+                t.options,
+            )
+            .map_err(|e| StewardError::Admission(e.to_string()))?;
+            manifest.trust.class = o.effective_trust;
+            if o.was_unsigned {
+                tracing::info!(
+                    plugin = %manifest.plugin.name,
+                    "admitting unsigned out-of-process plugin (sandbox) per allow_unsigned"
+                );
+            }
+        }
 
         // Compute the socket path. Dots in plugin names are valid in
         // filenames on all supported platforms.
@@ -3418,5 +3462,217 @@ custody_failure_mode = "abort"
             got,
             crate::happenings::Happening::CustodyTaken { .. }
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // Trust-gated admission tests (Phase 2 tightening).
+    //
+    // Verify that set_plugin_trust gates
+    // admit_out_of_process_from_directory: without trust state,
+    // admission skips signature checks; with trust state, the same
+    // bundle is checked against keys and revocations BEFORE spawn.
+    // The trust-verification algorithm itself is covered end-to-end
+    // in crates/evo-trust/tests/verify.rs; these tests assert only
+    // on the steward integration (presence/absence of
+    // set_plugin_trust, error propagation into StewardError).
+    // -----------------------------------------------------------------
+
+    fn unsigned_trust_disallowed() -> Arc<crate::plugin_trust::PluginTrustState>
+    {
+        Arc::new(crate::plugin_trust::PluginTrustState {
+            keys: Vec::new(),
+            revocations: evo_trust::RevocationSet::default(),
+            options: evo_trust::TrustOptions {
+                allow_unsigned: false,
+                degrade_trust: true,
+            },
+        })
+    }
+
+    fn unsigned_trust_allowed() -> Arc<crate::plugin_trust::PluginTrustState> {
+        Arc::new(crate::plugin_trust::PluginTrustState {
+            keys: Vec::new(),
+            revocations: evo_trust::RevocationSet::default(),
+            options: evo_trust::TrustOptions {
+                allow_unsigned: true,
+                degrade_trust: true,
+            },
+        })
+    }
+
+    // Writes a valid manifest.toml plus a plugin.bin whose content is
+    // not a real executable. The trust check reads both files to
+    // compute the install digest, then either passes (revocation /
+    // unsigned gates) or fails. Downstream spawn will fail on the
+    // bogus binary; tests that reach the spawn step assert on that
+    // failure as the signal that trust check passed.
+    fn write_unsigned_bundle(plugin_dir: &Path) {
+        let manifest_text = example_manifest_with_transport(
+            "[transport]\ntype = \"out-of-process\"\nexec = \"plugin.bin\"",
+        );
+        std::fs::write(plugin_dir.join("manifest.toml"), &manifest_text)
+            .unwrap();
+        std::fs::write(plugin_dir.join("plugin.bin"), b"not-a-binary").unwrap();
+    }
+
+    #[tokio::test]
+    async fn admit_from_directory_without_trust_skips_signature_check() {
+        // Control test: no set_plugin_trust call. The unsigned bundle
+        // must reach the spawn step, where it fails on the invalid
+        // artefact. Absence of a manifest.sig-related error is the
+        // signal that no signature check ran.
+        let plugin_dir = tempfile::TempDir::new().unwrap();
+        let runtime_dir = tempfile::TempDir::new().unwrap();
+        write_unsigned_bundle(plugin_dir.path());
+
+        let catalogue = example_catalogue();
+        let mut engine = AdmissionEngine::new();
+        // No set_plugin_trust call: trust state is None.
+
+        let r = engine
+            .admit_out_of_process_from_directory(
+                plugin_dir.path(),
+                runtime_dir.path(),
+                &catalogue,
+            )
+            .await;
+
+        assert!(
+            r.is_err(),
+            "bogus artefact should fail admission downstream of trust"
+        );
+        if let Err(StewardError::Admission(msg)) = &r {
+            assert!(
+                !msg.contains("manifest.sig"),
+                "with no trust state, no sig check should run: {msg:?}"
+            );
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admit_from_directory_with_trust_rejects_unsigned_bundle() {
+        let plugin_dir = tempfile::TempDir::new().unwrap();
+        let runtime_dir = tempfile::TempDir::new().unwrap();
+        write_unsigned_bundle(plugin_dir.path());
+
+        let catalogue = example_catalogue();
+        let mut engine = AdmissionEngine::new();
+        engine.set_plugin_trust(Some(unsigned_trust_disallowed()));
+
+        let r = engine
+            .admit_out_of_process_from_directory(
+                plugin_dir.path(),
+                runtime_dir.path(),
+                &catalogue,
+            )
+            .await;
+
+        match r {
+            Err(StewardError::Admission(msg)) => {
+                assert!(
+                    msg.contains("signed bundle required"),
+                    "expected UnsignedInadmissible wording, got {msg:?}"
+                );
+            }
+            other => {
+                panic!("expected Admission error, got {other:?}")
+            }
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admit_from_directory_with_trust_accepts_unsigned_when_allowed() {
+        // allow_unsigned = true passes the trust check at Sandbox.
+        // Admission then proceeds to spawn, which fails on the
+        // invalid binary. The fact that the error is about spawning
+        // (not about signatures) is the signal we reached spawn.
+        let plugin_dir = tempfile::TempDir::new().unwrap();
+        let runtime_dir = tempfile::TempDir::new().unwrap();
+        write_unsigned_bundle(plugin_dir.path());
+
+        let catalogue = example_catalogue();
+        let mut engine = AdmissionEngine::new();
+        engine.set_plugin_trust(Some(unsigned_trust_allowed()));
+
+        let r = engine
+            .admit_out_of_process_from_directory(
+                plugin_dir.path(),
+                runtime_dir.path(),
+                &catalogue,
+            )
+            .await;
+
+        assert!(r.is_err());
+        if let Err(StewardError::Admission(msg)) = &r {
+            assert!(
+                !msg.contains("signed bundle required"),
+                "with allow_unsigned, no sig error should appear: {msg:?}"
+            );
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admit_from_directory_with_trust_rejects_revoked_digest() {
+        let plugin_dir = tempfile::TempDir::new().unwrap();
+        let runtime_dir = tempfile::TempDir::new().unwrap();
+        write_unsigned_bundle(plugin_dir.path());
+
+        // Compute the install digest and put it in a revocations
+        // set. The revocation check fires before the sig-presence
+        // check, so allow_unsigned = true must not mask this.
+        let id = evo_trust::install_digest(
+            &plugin_dir.path().join("manifest.toml"),
+            &plugin_dir.path().join("plugin.bin"),
+        )
+        .unwrap();
+        let revocations_dir = tempfile::TempDir::new().unwrap();
+        let revs_path = revocations_dir.path().join("revocations.toml");
+        let body = format!(
+            "[[revoke]]\ndigest = \"{}\"\nreason = \"test\"\n",
+            evo_trust::format_digest_sha256_hex(&id),
+        );
+        std::fs::write(&revs_path, body).unwrap();
+        let revocations = evo_trust::RevocationSet::load(&revs_path).unwrap();
+
+        let trust = Arc::new(crate::plugin_trust::PluginTrustState {
+            keys: Vec::new(),
+            revocations,
+            options: evo_trust::TrustOptions {
+                allow_unsigned: true,
+                degrade_trust: true,
+            },
+        });
+
+        let catalogue = example_catalogue();
+        let mut engine = AdmissionEngine::new();
+        engine.set_plugin_trust(Some(trust));
+
+        let r = engine
+            .admit_out_of_process_from_directory(
+                plugin_dir.path(),
+                runtime_dir.path(),
+                &catalogue,
+            )
+            .await;
+
+        match r {
+            Err(StewardError::Admission(msg)) => {
+                assert!(
+                    msg.contains("revoked"),
+                    "expected revocation error, got {msg:?}"
+                );
+                assert!(
+                    msg.contains("sha256:"),
+                    "expected sha256 digest in error, got {msg:?}"
+                );
+            }
+            other => {
+                panic!("expected Admission error, got {other:?}")
+            }
+        }
+        assert_eq!(engine.len(), 0);
     }
 }

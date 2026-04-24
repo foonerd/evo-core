@@ -56,6 +56,7 @@ pub mod error;
 pub mod happenings;
 pub mod logging;
 pub mod plugin_discovery;
+pub mod plugin_trust;
 pub mod projections;
 pub mod relations;
 pub mod server;
