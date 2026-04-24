@@ -1,7 +1,15 @@
 # Rust build artefacts
 /target/
 **/target/
-Cargo.lock
+
+# Cargo.lock IS committed.
+#
+# This workspace produces a binary (the evo steward); reproducible builds
+# require the lockfile to be under version control so every developer,
+# every CI run, and every release build resolves to the same dependency
+# graph. Library crates (no binaries) conventionally omit the lockfile;
+# workspaces that ship any binary include it. See:
+#   https://doc.rust-lang.org/cargo/faq.html#why-have-cargolock-in-version-control
 
 # Editor and OS junk
 .DS_Store

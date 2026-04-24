@@ -13,6 +13,13 @@
 # and to the declared MSRV (1.80) for the msrv job. The MSRV job
 # catches accidental dependence on Rust features newer than the
 # declared minimum.
+#
+# Every cargo invocation uses --locked: CI MUST resolve to exactly
+# the committed Cargo.lock, never to a fresh resolution. Without
+# --locked, CI would pick whatever versions happen to satisfy
+# Cargo.toml constraints at build time, which breaks MSRV builds
+# the moment an upstream crate releases a version requiring a newer
+# Rust. The lockfile is the contract; CI enforces it.
 
 name: CI
 
@@ -32,7 +39,7 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust toolchain (stable, rustfmt)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -44,7 +51,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust toolchain (stable, clippy)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -52,39 +59,39 @@ jobs:
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
       - name: cargo clippy -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
       - name: cargo test --workspace
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --locked
       - name: cargo test --workspace --doc
-        run: cargo test --workspace --doc
+        run: cargo test --workspace --doc --locked
 
   build-release:
     name: build (release)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
       - name: cargo build --workspace --release
-        run: cargo build --workspace --release
+        run: cargo build --workspace --release --locked
 
   msrv:
     name: msrv (1.80)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust toolchain (1.80)
         uses: dtolnay/rust-toolchain@1.80
       - name: Cache cargo registry and target
@@ -92,6 +99,6 @@ jobs:
         with:
           prefix-key: msrv
       - name: cargo build --workspace (MSRV)
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --locked
       - name: cargo test --workspace (MSRV)
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --locked
