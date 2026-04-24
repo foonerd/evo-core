@@ -1,0 +1,31 @@
+# Cargo configuration for the evo-core workspace.
+#
+# This file opts the workspace into the MSRV-aware resolver,
+# stabilised in Cargo 1.84 (2025-01-09). The resolver honours each
+# dependency's declared `package.rust-version` field when selecting
+# versions, preferring the newest version whose MSRV is <= our own
+# workspace MSRV (declared in Cargo.toml as `rust-version`).
+#
+# Why this matters: absent this config, cargo's default resolver
+# picks the newest version satisfying semver constraints regardless
+# of MSRV. When an upstream crate bumps its MSRV (or adopts a Cargo
+# feature like `edition2024` that implicitly bumps it), the next
+# `cargo update` pulls in a version our MSRV cannot parse, and the
+# build fails in ways that are difficult to diagnose and impossible
+# to prevent with transitive-dep pinning (see the January 2026 clap
+# incident; git history for the resolution of that).
+#
+# With `fallback`, the resolver automatically selects the newest
+# MSRV-compatible version. Dependencies without a declared
+# rust-version are treated as compatible (the historical default).
+#
+# Compatibility: this key is silently ignored by Cargo < 1.84, so
+# adding it does not affect older toolchains. The MSRV CI job uses
+# `--locked` and consumes whatever lockfile was committed; lockfile
+# generation on a 1.84+ toolchain produces an MSRV-safe lockfile.
+#
+# Reference: https://rust-lang.github.io/rfcs/3537-msrv-resolver.html
+#            https://blog.rust-lang.org/2025/01/09/Rust-1.84.0/
+
+[resolver]
+incompatible-rust-versions = "fallback"

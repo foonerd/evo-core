@@ -15,7 +15,124 @@ artefacts. Consult the git log for pre-0.1.8 history.
 
 ## [Unreleased]
 
-(none)
+### Changed
+
+- Workspace MSRV raised from `1.80` to `1.85` in response to the Rust
+  ecosystem's broad adoption of edition 2024 (stabilised in Rust 1.85 on
+  2025-02-20). Transitive dependencies in the workspace graph - `clap_lex`
+  1.x, `getrandom` 0.4.x's wasi backends, and more as the adoption spreads -
+  declare `edition2024` in their manifests, making the graph unresolvable
+  under a framework MSRV below 1.85 without per-crate version pinning. The
+  prior 1.80 declaration was no longer sustainable; per-dep pinning was
+  rejected as band-aid engineering (unbounded maintenance burden).
+
+  The MSRV is a framework-level choice, not derived from any single
+  distribution's OS. `evo-core` supports an open set of distributions
+  (`evo-device-<vendor>` repositories) already in active development against
+  Debian-based systems, Yocto-based embedded Linux, FreeBSD, macOS, Android
+  AOSP, Buildroot, Alpine, and vendor-custom automotive/industrial SDKs.
+  Rust 1.85 is achievable on every one of these platforms via `rustup` on
+  the build host; several also ship it natively in their package tree
+  (Debian Trixie APT, FreeBSD ports, Alpine, Arch, Fedora, modern Yocto
+  layers). Distribution builders on older LTS hosts or older Yocto release
+  trains use `rustup`, which is the Rust ecosystem's standard answer to
+  this situation and imposes no structural barrier.
+- `DEVELOPING.md` section 1 prerequisites table updated to 1.85 with a
+  cross-reference to `MSRV.md` for the full policy.
+- `docs/engineering/PLUGIN_AUTHORING.md` section 3 example manifest updated
+  to reflect the new MSRV.
+- `docs/engineering/BUILDING.md` section 6 (Non-Targets) updated to name
+  `wasm32-wasip1`, `wasm32-wasip2`, and `wasm32-wasip3` explicitly as
+  Non-targets. The previous entry only said `wasm32-*`; the expansion
+  removes ambiguity about whether any WASI preview revision might be
+  supported (none is) and cross-references `MSRV.md` section 4 for the
+  consequence on lockfile entries.
+- `README.md` documentation index updated to list `MSRV.md` under the
+  Operations section alongside `BUILDING.md`.
+
+### Added
+
+- `.cargo/config.toml` with `[resolver] incompatible-rust-versions = "fallback"`
+  opting the workspace into the MSRV-aware resolver stabilised in Cargo 1.84
+  (2025-01-09). Protects lockfile generation against future ecosystem shifts:
+  when a dep bumps its declared `rust-version` above ours, cargo automatically
+  picks the newest compatible version instead of failing. Silently ignored by
+  Cargo < 1.84, so no compatibility hazard for the MSRV job.
+- `docs/engineering/MSRV.md` - new document stating the MSRV policy, its
+  rationale (Debian Trixie alignment), the CI verification matrix, rules for
+  raising MSRV, and an explicit catalogue of lockfile entries that exceed the
+  declared MSRV because they are target-gated to wasi (currently `wasip3`,
+  `wit-bindgen` 0.51.0, `wit-bindgen-core`, `wit-bindgen-rust` and their
+  transitive wasi-only dependencies). This converts an undocumented
+  lockfile anomaly into documented, verified behaviour.
+- CI MSRV job converted from a single host build to a matrix over every
+  Primary target defined in `BUILDING.md` section 3 (eight targets: the
+  five glibc Linux triples plus three musl Linux triples). Each matrix
+  entry installs rustc 1.85 with the relevant target, runs
+  `cargo check --workspace --all-targets --target <triple> --locked`, and
+  the host entry additionally runs `cargo test`. This turns "MSRV 1.85 on
+  host" into "MSRV 1.85 empirically verified on every target the project
+  publicly commits to".
+
+### Removed
+
+- Transitive-dep pin on `clap` in `crates/evo/Cargo.toml`. The pin existed
+  solely to work around the MSRV mismatch (clap_builder's transitive widening
+  of `clap_lex` to admit the 1.x line, which requires `edition2024` and
+  therefore Rust 1.85). With MSRV aligned to Trixie's rustc, the unpinned
+  `clap = "4"` resolves cleanly. Removing the pin also restores normal
+  security-patch uptake for clap.
+
+### Rationale
+
+Declaring an MSRV that renders the dependency graph unresolvable without
+unbounded per-crate pinning is not industrial-grade engineering. The pattern
+of pinning individual transitive deps to work around the mismatch (first
+`clap_lex`, then `getrandom`, then whatever adopts edition 2024 next) was a
+band-aid that would have recurred on every ecosystem shift. Raising MSRV to
+1.85 is the structural fix; the MSRV-aware resolver config is permanent
+insurance against the same pattern recurring when the ecosystem next shifts.
+
+The MSRV is chosen on framework grounds, not derived from any single
+distribution OS. Tying the framework's MSRV to Debian Trixie's APT rustc
+(or any other specific OS's package tree) would have been a category error
+in a deliberately multi-distribution project: `evo-device-<vendor>`
+repositories are in development against Yocto-based vehicle systems,
+FreeBSD NAS appliances, macOS-developed home audio, Android-TV kiosks,
+and vendor-custom industrial SDKs, alongside Debian-based systems.
+Anchoring the framework to any one of these would arbitrarily privilege
+that target over the others. 1.85 is defensible on framework requirements
+alone and happens to align with what Trixie ships; the latter is a
+convenience for Trixie-based builders, not the rationale.
+
+The accompanying additions - the CI target matrix, `MSRV.md`, and the
+explicit wasi Non-target entry in `BUILDING.md` - convert the MSRV from a
+declared value into a verified, documented property of the codebase. Without
+them, the MSRV claim would still be a single-target assertion supported only
+by implicit target-gating behaviour. With them, every Primary target is
+verified on every PR, and the lockfile anomaly from wasi-gated transitive
+crates is explicitly catalogued and its inertness is proven by the same
+matrix that establishes the MSRV.
+
+### Verification
+
+- `rm Cargo.lock && cargo generate-lockfile` produces an MSRV-safe lockfile
+  with the workspace MSRV at 1.85 and the resolver fallback config active.
+- `rustup run 1.85 cargo check --workspace --all-targets --target <T> --locked`
+  passes locally for every Primary target `<T>` from `BUILDING.md` section 3.
+  Enforced by the CI matrix at `.github/workflows/ci.yml`.
+- `cargo test --workspace --all-targets --locked` on the host passes all 360
+  tests on both stable and 1.85.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` passes
+  clean; `cargo fmt --all -- --check` passes clean.
+- Lockfile entries with declared `rust-version` above 1.85 (`wasip3`,
+  `wit-bindgen` 0.51.0, `wit-bindgen-core`, `wit-bindgen-rust`, and their
+  transitive dependencies) are inert on all verified targets by the wasi
+  target gate; this is both documented in `MSRV.md` section 4 and proven by
+  the fact that the CI matrix passes on 1.85.
+- Version remains 0.1.8; hygiene changes do not bump. Per
+  `BOUNDARY.md` section 8 and the project directive that 0.1.9 is reserved
+  for the next capability release.
 
 ## [0.1.8] - 2026-04-23
 

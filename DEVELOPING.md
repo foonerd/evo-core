@@ -12,7 +12,7 @@ If you are building an `evo-device-<vendor>` distribution, this document is usef
 
 | Requirement | Version | Why |
 |-------------|---------|-----|
-| Rust toolchain | `1.80` or newer (MSRV per `Cargo.toml`) | The workspace uses 2021 edition Rust with `async fn` in traits. |
+| Rust toolchain | `1.85` or newer (MSRV per `Cargo.toml`) | Framework-level requirement driven by the Rust ecosystem's adoption of edition 2024 in transitive dependencies. Achievable via `rustup` on every supported platform; some OSes (Debian Trixie, FreeBSD ports, Alpine, Arch, Fedora, modern Yocto) also ship 1.85 in their package tree. See `docs/engineering/MSRV.md` for the full policy, per-platform availability analysis, verification matrix, and rules for raising it. |
 | cargo | bundled with Rust | Build, test, run. |
 | A Linux host | any modern distribution | The steward uses Unix domain sockets, journald, and POSIX signals. macOS works for building and running most tests; `tracing-journald` logging and a few signal behaviours are Linux-specific. |
 | Optional: `python3` | 3.9+ | Useful for talking to a running steward from a shell (section 6). |

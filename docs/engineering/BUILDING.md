@@ -118,7 +118,8 @@ These are combinations that will not work and will not be made to work without a
 | Non-target | Reason |
 |------------|--------|
 | `*-pc-windows-msvc`, `*-pc-windows-gnu` | No Unix domain sockets. Windows has named pipes (`\\.\pipe\...`), which are a different API with different semantics. Supporting Windows would mean adding a second transport for the client socket and every plugin socket. Not on the roadmap. |
-| `wasm32-*`, `wasm64-*` | No filesystem, no sockets, no signal handling, no child processes. A steward cannot exist in WASM; WASM is a plugin sandbox, not a host. |
+| `wasm32-unknown-unknown`, `wasm64-unknown-unknown` | No filesystem, no sockets, no signal handling, no child processes. A steward cannot exist in WASM under a bare-browser runtime; WASM is a plugin sandbox, not a host. |
+| `wasm32-wasip1`, `wasm32-wasip2`, `wasm32-wasip3` (and any other `wasm32-wasi*`) | WASI preview 1, 2, and 3 each expose only a progressively larger subset of POSIX; none provides `AF_UNIX` domain sockets, `signalfd`-style signal handling, or the process-spawning primitives the steward uses. WASI is a plugin-sandbox target at most; the steward is a host and cannot be compiled into a WASI component. Lockfile entries for wasi-gated transitive crates (`wasip2`, `wasip3`, `wit-bindgen-*`, etc.) are inert on every supported target; see `MSRV.md` section 4. |
 | `*-none-*` (bare-metal) | No `std`. The steward depends on `std::fs`, `std::net`, `std::process`, threads, and signals. |
 | `*-unknown-uefi`, `*-none-efi` | Same as bare-metal. |
 | `*-nintendo-*`, `*-sony-*`, `*-cuda` etc. | Not relevant to appliance deployment. |

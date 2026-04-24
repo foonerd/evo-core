@@ -146,6 +146,7 @@ The doc set is grouped by what you are trying to do.
 | Document | Purpose |
 |----------|---------|
 | [BUILDING.md](docs/engineering/BUILDING.md) | Cross-architecture builds. Eight primary targets, the `cross` tool, release tuning, glibc vs musl, Android notes, testing cross-compiled binaries. |
+| [MSRV.md](docs/engineering/MSRV.md) | Minimum Supported Rust Version policy, verification matrix across Primary targets, lockfile entries that exceed the declared MSRV (target-gated wasi crates), rules for raising MSRV. |
 
 ## Status
 

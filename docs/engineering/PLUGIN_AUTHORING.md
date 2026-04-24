@@ -77,7 +77,7 @@ A plugin is a Rust crate that depends on `evo-plugin-sdk`. Minimal `Cargo.toml`:
 name = "my-plugin"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 
 [lib]
 path = "src/lib.rs"
