@@ -98,9 +98,11 @@ jobs:
   #
   # `cargo check --target` still runs `build.rs` for dependencies; crates
   # with C (e.g. `ring` via `rustls`, `lzma-sys` via `xz2`) need a
-  # matching `CC_*` / linker for the matrix triple. The msrv job installs
-  # Debian cross-GNU toolchains, `musl-tools` for x86_64-musl, and
-  # pre-built musl.cc cross toolchains for aarch64 / armv7 musl. See
+  # matching `CC_*` / linker for the matrix triple AND the target sysroot
+  # headers. The msrv job installs Debian cross-GNU toolchains plus the
+  # matching `libc6-dev-*-cross` sysroot headers, `musl-tools` for
+  # x86_64-musl, and pre-built musl.cc cross toolchains for aarch64 /
+  # armv7 musl (whose tarballs bundle the sysroot). See
   # `.github/scripts/ci-msrv-cargo-env.sh`.
   #
   # The host matrix entry (x86_64-unknown-linux-gnu) additionally runs
@@ -131,11 +133,25 @@ jobs:
       - name: Install C cross toolchains and musl (host)
         run: |
           sudo apt-get update
+          # `libc6-dev-*-cross` are apt-recommended but not required by
+          # the gcc cross packages themselves, so `--no-install-recommends`
+          # skips them by default. They supply the target sysroot headers
+          # (<bits/libc-header-start.h>, <asm/types.h>, etc.) that every C
+          # build.rs for a cross target needs. `ring` (via `rustls` via
+          # `ureq`) and `lzma-sys` (via `xz2`) both hit this path; without
+          # these -dev packages the cross-gcc falls back to the host's
+          # `/usr/include/stdint.h` and fails with "bits/libc-header-start.h:
+          # No such file or directory". Musl targets carry their own
+          # sysroot in the musl.cc tarballs or via `musl-tools` and do not
+          # need an equivalent package.
           sudo apt-get install -y --no-install-recommends \
             build-essential \
             gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
             gcc-arm-linux-gnueabihf \
+            libc6-dev-armhf-cross \
             gcc-i686-linux-gnu \
+            libc6-dev-i386-cross \
             musl-tools
       - name: Install musl.cc cross (aarch64-unknown-linux-musl)
         if: matrix.target == 'aarch64-unknown-linux-musl'
