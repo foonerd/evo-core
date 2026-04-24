@@ -96,6 +96,34 @@ path = "src/bin/my-plugin-wire.rs"
 
 Pin the SDK to a specific evo-core version (see `BOUNDARY.md` section 8). If you are in an `evo-device-<vendor>` distribution repository, the workspace typically pins one evo-core version and every plugin crate inherits the pin via `workspace.package` or a shared dependency declaration.
 
+### 3.1 Workspace Lint Configuration
+
+If you run `cargo clippy --workspace --all-targets -- -D warnings` on a plugin crate that depends on `evo-plugin-sdk`, clippy will reject every trait method on `Plugin`, `Respondent`, `Warden`, and `Factory` with `clippy::manual_async_fn`. The lint suggests rewriting
+
+```rust
+fn foo() -> impl Future<Output = T> + Send + '_
+```
+
+to
+
+```rust
+async fn foo() -> T
+```
+
+On stable Rust, trait-position `async fn` does not carry `Send` bounds on the returned future, which is incompatible with the steward's multi-threaded dispatch. `#[async_trait]` does preserve Send but boxes every call. The SDK's trait contract rejects both alternatives; see the "Async style" section of `evo-plugin-sdk::contract` module documentation for the full rationale.
+
+The lint is a known false positive for this pattern. Add the following to your distribution's workspace `Cargo.toml`:
+
+```toml
+[workspace.lints.clippy]
+# SDK trait methods use RPIT (impl Future + Send + '_) deliberately;
+# see evo-plugin-sdk::contract module docs "Async style". The lint's
+# rewrite suggestion is incompatible with the trait contract.
+manual_async_fn = "allow"
+```
+
+This must live in the **workspace** root `Cargo.toml`, not in individual plugin-crate `Cargo.toml` files. Workspace lints do not propagate across workspaces, so `evo-core` configures it for its own crates and each distribution configures it for its own crates separately. Every crate in your workspace inherits the allow; no per-crate `#![allow(...)]` is needed.
+
 ## 4. The `Plugin` Trait
 
 Every plugin - respondent or warden, in-process or wire - implements `Plugin`. It is the shared set of verbs:
