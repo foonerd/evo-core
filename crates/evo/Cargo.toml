@@ -27,6 +27,16 @@ anyhow = "1"
 # raising the workspace MSRV or verifying the transitive graph again.
 clap = { version = "~4.5", features = ["derive"] }
 
+# clap_lex is a transitive dependency of clap. clap 4.5's internal
+# constraint on clap_lex permits the 1.x line; clap_lex 1.1.0 is the
+# version that hard-requires edition2024. Pinning clap alone is not
+# sufficient because semver constraints do not cascade tree-wide;
+# each crate resolves its own deps within its own constraint. We
+# declare clap_lex as a direct dep here solely to force the resolver
+# onto the 0.7 line, which is MSRV 1.80 compatible. It is not imported
+# by our code; the declaration exists to constrain resolution.
+clap_lex = "~0.7"
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
