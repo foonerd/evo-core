@@ -124,7 +124,8 @@ Every admission validates the plugin's manifest against the catalogue:
 | Plugin `describe` returns an identity matching the manifest | `StewardError::IdentityMismatch` |
 | No plugin is already admitted on this shelf (singletons enforce this) | `StewardError::DuplicateShelf` |
 | `manifest.kind.interaction` matches the admission path (respondent vs warden) | `StewardError::Admission` with a message naming the mismatch |
-| Shelf-shape version is in the slot's supported range | Not yet enforced; see section 12.4 |
+| `manifest.target.shape` equals the shelf's `shape` | `StewardError::Admission` (shape mismatch) |
+| Shelf accepts a **range** of shape values (migration window) | Not implemented; see section 12.4 and `GAPS.md` gap [9] |
 
 A validation failure during out-of-process admission is handled by tearing down the child process cleanly before returning the error (section 5.4).
 
@@ -398,7 +399,9 @@ All steward state lives entirely in memory. Restarting the steward yields empty 
 
 ### 12.4 Shape Version Enforcement
 
-Shelf shapes are versioned. Plugin manifests declare the shape version they satisfy. The catalogue slot declares its supported range. The steward today reads these values and stores them but does not yet refuse a plugin whose declared version is outside the slot's supported range. The enforcement is a small addition; the decision deferred in `CONCEPT.md` section 10 is the version-negotiation semantics (strict equality, SemVer-like range, tolerance window).
+Plugin manifests declare `target.shape` as a `u32`. The catalogue shelf declares a single `shape` `u32` for that slot. At admission, the steward enforces **equality**: the manifest's `target.shape` must match the shelf's `shape` or admission fails. There is no supported-range field on the shelf in the current schema, so "outside the supported range" and "mismatch" are the same case today: not equal, refused.
+
+The **range** model (a shelf that admits plugins declaring shape 1 or 2 during a migration, tolerance windows, SemVer-like rules) and the **catalogue schema** to express it are not implemented; that work is the remainder of shape versioning, tracked in `GAPS.md` gap [9] and the open decision in `CONCEPT.md` section 10.
 
 ### 12.5 Rack-Keyed Projections
 

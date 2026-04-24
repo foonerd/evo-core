@@ -107,7 +107,7 @@ instance_ttl_seconds = <u32>             # required for factories; 0 = no TTL
 | Field | Type | Required | Default | Constraint |
 |-------|------|----------|---------|------------|
 | `shelf` | string | yes | - | Must be a declared shelf in the steward's catalogue. |
-| `shape` | u32 | yes | - | Shelf-shape version. Must fall in the shelf's supported range. |
+| `shape` | u32 | yes | - | Must **equal** the `shape` of the targeted catalogue shelf. (Future range support is gap [9]; the slot is a single integer today.) |
 
 **[kind]**
 
@@ -190,8 +190,8 @@ Enforced by `Manifest::validate`:
 Enforced by the steward at admission time (outside the SDK):
 
 6. `target.shelf` exists in the catalogue.
-7. `target.shape` is in the shelf's supported version range (not yet enforced in v0; `STEWARD.md` section 12.4).
-8. Signing, if required by the declared trust class (`VENDOR_CONTRACT.md`).
+7. `target.shape` **equals** the `shape` field of that shelf (enforced at admission; see `STEWARD.md` section 12.4). A supported **range** on the shelf (multiple admissible shape values) is not in the schema yet; see `GAPS.md` gap [9].
+8. Signing, if required by the declared trust class (`VENDOR_CONTRACT.md`). (Supply-chain signing in admission is not implemented yet; see `GAPS.md` gap [13].)
 
 #### 3.1.4 Example
 
@@ -947,8 +947,8 @@ Different schemas version differently:
 |--------|---------------|-----------|
 | Plugin manifest | `plugin.contract` | Integer. Current: 1. A plugin declaring a version the SDK does not support is rejected at parse time. |
 | Plugin wire protocol | `v` on every frame | Integer (`PROTOCOL_VERSION`). Current: 1. A wire-version mismatch closes the connection. |
-| Catalogue | No top-level version | Individual shelf shapes version via `shape: <u32>`. Shape-version enforcement is deferred. |
-| Shelf shape | `shape` field on each shelf and its targeting plugins | Integer. The steward checks the plugin's declared shape is in the shelf's supported range (not yet enforced). |
+| Catalogue | No top-level version | Each shelf has `shape: <u32>`. The steward enforces **equality** with `manifest.target.shape` at admission. **Range** semantics (multiple admissible shapes per slot) are not implemented; see `GAPS.md` gap [9]. |
+| Shelf shape | `shape` on each shelf and `target.shape` on the manifest | Integer. Must match exactly for admission today. |
 | Steward config | No version | Forward-compatible via default-valued fields. |
 | Client protocol | No version | Response shapes are fixed for the steward's lifetime; a new steward version with incompatible shapes requires coordinated consumer updates. |
 | Happening variants | `#[non_exhaustive]` enum | New variants added without breaking source compatibility; consumers must tolerate unknown `type` values. |

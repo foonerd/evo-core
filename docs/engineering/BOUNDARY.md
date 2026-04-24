@@ -206,7 +206,8 @@ A few boundary-adjacent questions are deliberately not settled today. Each is na
 | Projection subscription protocol | Pending. The `subscribe_happenings` op is the precedent; `PROJECTIONS.md` section 8 and `STEWARD.md` section 16 carry the live design. |
 | Persistence boundary | Pending. `CUSTODY.md` section 11.1, `STEWARD.md` section 12.3, and the subject/relation persistence discussions converge. |
 | Trust-class-to-OS-privilege mapping | Pending. `STEWARD.md` section 10 states what is stored; what it enforces is tracked in `STEWARD.md` section 16. |
-| Shape-version enforcement on admission | Pending. `STEWARD.md` section 12.4. |
+| Shape **equality** on admission (`target.shape` vs shelf `shape`) | Enforced. `STEWARD.md` section 5.2 and 12.4. |
+| Shape **range** / negotiation (multiple admissible shapes per slot) | Pending. `STEWARD.md` section 12.4; `GAPS.md` gap [9]. |
 | Factory-plugin admission | Pending. `STEWARD.md` section 12.7. |
 | Fast-path mechanism | Pending. `FAST_PATH.md`. |
 

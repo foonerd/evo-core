@@ -102,13 +102,11 @@ A plugin's manifest targets `<rack>.<shelf>` as its slot. The shape version lets
 
 ### 4.2 Shelf Shape Versioning
 
-Shape versioning is the hinge that lets a catalogue evolve without breaking old plugins all at once. The workflow:
+Shape versioning is the hinge that lets a catalogue evolve without forking shelf names. The end-state workflow (supported **ranges** on a slot, negotiation windows) is specified in `CONCEPT.md` section 10 and tracked as gap [9] in `GAPS.md`—the **catalogue type today carries a single integer per shelf**, not a range.
 
-1. A shelf starts at shape 1. Plugins target `shape = 1`.
-2. A new version of the shelf contract is declared. The catalogue says `shape = 2`. Old plugins at shape 1 can still run (the steward's shape-version enforcement, when implemented, will check supported ranges).
-3. Over time, all plugins migrate to shape 2. The shelf declares it no longer supports shape 1.
+**What the steward enforces today.** At admission, the steward requires **strict equality**: the plugin manifest's `target.shape` must equal the catalogue shelf's `shape` for the targeted slot. If the catalogue bumps a shelf from `shape = 1` to `shape = 2`, a plugin that still declares `shape = 1` is **refused** until its manifest is updated. There is no silent mismatch and no "old plugin keeps running" during a shape bump on the same shelf name.
 
-This workflow is **not yet enforced** in v0 (see `STEWARD.md` section 12.4). The `shape` field is recorded and can be read, but the steward does not currently reject a plugin whose shape version does not match. Treat it as forward-planning: author your catalogue and plugins with correct shape fields now, and the enforcement will land without requiring a rewrite.
+**What is not implemented yet.** A shelf that accepts **more than one** shape value during a migration (for example "plugins at shape 1 or 2 may admit"), SemVer-style negotiation, and the corresponding catalogue schema—see `STEWARD.md` section 12.4 and gap [9]. Until that lands, shape evolution on a slot is **lockstep**: catalogue and every plugin on that slot move together.
 
 ### 4.3 Choosing Shelf Boundaries
 
@@ -142,7 +140,7 @@ Each predicate declares:
 - **Source cardinality** / **target cardinality**: how many subjects can appear on each side. Defaults to `many`.
 - **Optional inverse**: the name of the reverse predicate. If both directions are in use, they should declare each other as inverses.
 
-Cardinality values are `exactly_one`, `at_most_one`, `at_least_one`, `many`. These are **advisory** in v0: the steward records the declared cardinality but does not reject assertions that violate it. Cardinality violations are logged as warnings.
+Cardinality values are `exactly_one`, `at_most_one`, `at_least_one`, `many`. The steward records the declared cardinality in the catalogue but does **not** yet reject graph assertions that violate it; it also does **not** log warnings for violations today (see `GAPS.md` [DC-2] and gap [10]). Author the catalogue with correct cardinalities; enforcement will tighten later.
 
 ### 5.3 Inverses
 
@@ -211,11 +209,11 @@ A catalogue that fails validation is a development-time bug: the distribution's 
 Several checks are planned but not implemented in v0:
 
 - **Inverse consistency**: a predicate's declared inverse is itself declared, with swapped types.
-- **Shelf shape support ranges**: a plugin's declared shape version falls in the shelf's supported range.
+- **Shelf shape support ranges** (multiple admissible shape values on one slot, migration window): the steward today enforces **only** exact equality of `target.shape` with the shelf's single `shape` field. Range data and logic are `GAPS.md` gap [9]; see section 4.2 above.
 - **Subject-type references**: types named in `source_type` / `target_type` correspond to some declared subject-type registry.
-- **Cardinality enforcement**: the steward records cardinality but does not reject violating assertions.
+- **Cardinality enforcement**: the steward records cardinality but does not reject violating assertions (and does not log warnings as described in the advisory note in section 5.2; see `GAPS.md` [DC-2] and gap [10]).
 
-These are tracked in `STEWARD.md` section 12. Distribution authors should still write the catalogue correctly today; the enforcement will land without needing a rewrite.
+These are tracked in `STEWARD.md` section 12 and `GAPS.md`. Distribution authors should still write the catalogue correctly; missing enforcement is not permission to ship an inconsistent file.
 
 ## 8. Anti-Patterns
 

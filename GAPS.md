@@ -39,15 +39,15 @@ These are not gaps in the inventory sense; they are places where the documentati
 
 ### [DC-1] CATALOGUE.md shape-mismatch claim contradicts admission.rs
 
-- Doc says: CATALOGUE.md section 4.2 describes shape-version enforcement as "not yet enforced" and tells authors the steward does not refuse on shape mismatch.
+- Doc said: CATALOGUE.md section 4.2 described shape-version enforcement as "not yet enforced" and told authors the steward does not reject on shape mismatch. STEWARD.md 12.4 and SCHEMAS.md also described "supported range" and deferred enforcement in ways that did not match the code or the single-integer shelf schema.
 - Code does: admission.rs enforces strict equality (manifest.target.shape == shelf.shape) in admit_singleton_respondent and parallel paths; a mismatch is refused.
-- Resolution: edit CATALOGUE.md to state the truth (strict equality is enforced; range semantics and negotiation are what remains open). Gap [9] then describes the remaining work precisely.
+- **Resolution (landed):** CATALOGUE.md section 4.2 and section 7.1, STEWARD.md section 12.4, and SCHEMAS.md (manifest `target.shape` constraint, rules 3.1.3, and schema versioning table) now state strict equality, distinguish gap [9] (range negotiation), and cross-reference [13] where signing is still aspirational in SCHEMAS. Gap [9] remains the inventory item for the remaining work.
 
 ### [DC-2] Cardinality-warning claim inconsistent across modules
 
-- Doc says: catalogue.rs comments state cardinality violations are logged as warnings.
+- Doc said: CATALOGUE.md section 5.2 stated cardinality violations were logged as warnings; that did not match `relations.rs` behaviour.
 - Code does: relations.rs does not emit such warnings; assertions succeed silently regardless of declared cardinality.
-- Resolution: either the comment or the behaviour changes. Since gap [10] chooses the IMPLEMENT direction (cardinality becomes enforced), the comment is correct in spirit and the behaviour must come up to meet it.
+- **Resolution (partial, docs):** CATALOGUE.md sections 5.2 and 7.1 now state the truth (no warning path today). **Behaviour** remains gap [10]; closing the gap is IMPLEMENT, not a doc fix alone.
 
 ### [DC-3] projections.rs module header claimed wire pull was unimplemented
 
