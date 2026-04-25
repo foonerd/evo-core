@@ -32,11 +32,12 @@ use crate::context::{
     RegistryRelationAnnouncer, RegistrySubjectAdmin, RegistrySubjectAnnouncer,
     RegistrySubjectQuerier,
 };
-use crate::custody::{CustodyLedger, LedgerCustodyStateReporter};
+use crate::custody::CustodyLedger;
 use crate::error::StewardError;
-use crate::happenings::{Happening, HappeningBus};
+use crate::happenings::HappeningBus;
 use crate::plugin_trust::PluginTrustState;
 use crate::relations::RelationGraph;
+use crate::router::{take_child, unload_handle, PluginEntry, PluginRouter};
 use crate::state::StewardState;
 use crate::subjects::SubjectRegistry;
 use evo_plugin_sdk::contract::{
@@ -47,13 +48,11 @@ use evo_plugin_sdk::contract::{
 use evo_plugin_sdk::manifest::{InteractionShape, TransportKind};
 use evo_plugin_sdk::Manifest;
 use evo_trust::ADMIN_MINIMUM_TRUST;
-use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
@@ -295,7 +294,7 @@ pub enum AdmittedHandle {
 
 impl AdmittedHandle {
     /// Dispatch to the inner plugin's `describe`.
-    async fn describe(&self) -> PluginDescription {
+    pub async fn describe(&self) -> PluginDescription {
         match self {
             Self::Respondent(r) => r.describe().await,
             Self::Warden(w) => w.describe().await,
@@ -303,7 +302,7 @@ impl AdmittedHandle {
     }
 
     /// Dispatch to the inner plugin's `load`.
-    async fn load(&mut self, ctx: &LoadContext) -> Result<(), PluginError> {
+    pub async fn load(&mut self, ctx: &LoadContext) -> Result<(), PluginError> {
         match self {
             Self::Respondent(r) => r.load(ctx).await,
             Self::Warden(w) => w.load(ctx).await,
@@ -311,7 +310,7 @@ impl AdmittedHandle {
     }
 
     /// Dispatch to the inner plugin's `unload`.
-    async fn unload(&mut self) -> Result<(), PluginError> {
+    pub async fn unload(&mut self) -> Result<(), PluginError> {
         match self {
             Self::Respondent(r) => r.unload().await,
             Self::Warden(w) => w.unload().await,
@@ -319,7 +318,7 @@ impl AdmittedHandle {
     }
 
     /// Dispatch to the inner plugin's `health_check`.
-    async fn health_check(&self) -> HealthReport {
+    pub async fn health_check(&self) -> HealthReport {
         match self {
             Self::Respondent(r) => r.health_check().await,
             Self::Warden(w) => w.health_check().await,
@@ -327,46 +326,11 @@ impl AdmittedHandle {
     }
 
     /// Human-readable name of the interaction shape for diagnostics.
-    fn kind_name(&self) -> &'static str {
+    pub fn kind_name(&self) -> &'static str {
         match self {
             Self::Respondent(_) => "respondent",
             Self::Warden(_) => "warden",
         }
-    }
-}
-
-/// Internal record of one admitted plugin.
-struct AdmittedPlugin {
-    /// Canonical plugin name, per the manifest.
-    name: String,
-    /// Fully-qualified shelf this plugin occupies (`<rack>.<shelf>`).
-    shelf: String,
-    /// Type-erased handle for lifecycle and dispatch. Exactly one of
-    /// the two variants per admission.
-    handle: AdmittedHandle,
-    /// Child process handle, if this plugin was spawned by the steward
-    /// via [`AdmissionEngine::admit_out_of_process_from_directory`].
-    ///
-    /// The child is owned by the steward for its full lifetime. It is
-    /// waited on (or killed after a timeout) during
-    /// [`AdmissionEngine::shutdown`]. `kill_on_drop(true)` is set so
-    /// even if the engine is dropped without a shutdown call the child
-    /// is guaranteed to be reaped.
-    ///
-    /// `None` for in-process plugins and for out-of-process plugins
-    /// admitted via [`AdmissionEngine::admit_out_of_process_respondent`]
-    /// where the caller owns the child.
-    child: Option<Child>,
-}
-
-impl std::fmt::Debug for AdmittedPlugin {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AdmittedPlugin")
-            .field("name", &self.name)
-            .field("shelf", &self.shelf)
-            .field("kind", &self.handle.kind_name())
-            .field("child", &self.child.as_ref().map(|c| c.id()))
-            .finish()
     }
 }
 
@@ -381,20 +345,23 @@ impl std::fmt::Debug for AdmittedPlugin {
 /// at construction. Plugins receive `SubjectAnnouncer` and
 /// `RelationAnnouncer` handles in their `LoadContext` that write to
 /// those stores tagged with the plugin's name.
+///
+/// The routing table itself lives on a [`PluginRouter`] held behind
+/// an `Arc`. The engine writes to the router during admission and
+/// drain; the dispatch verbs delegate to the router. The server
+/// can take its own `Arc<PluginRouter>` clone (via
+/// [`AdmissionEngine::router`]) to dispatch without acquiring the
+/// engine mutex in a follow-up pass.
 pub struct AdmissionEngine {
-    /// Map of shelf name -> admitted plugin.
-    by_shelf: HashMap<String, AdmittedPlugin>,
-    /// Admission order, for reverse-order shutdown.
-    admission_order: Vec<String>,
+    /// Routing table plus dispatch primitives. Shared with the
+    /// server so dispatch can move off the engine mutex without a
+    /// further refactor.
+    router: Arc<PluginRouter>,
     /// Shared steward stores plus the catalogue. Built once at boot
     /// and shared with the server, projection engine, and any future
     /// admin paths so dispatch does not serialise on the engine
     /// mutex for store reads.
     state: Arc<StewardState>,
-    /// Monotonic counter for correlation IDs on warden custody verbs
-    /// (`take_custody`, `course_correct`). Each call allocates a fresh
-    /// ID. Engine-local, not persistent across restarts.
-    custody_cid_counter: Arc<AtomicU64>,
     /// Root for per-plugin `state/` and `credentials/` (see
     /// `PLUGIN_PACKAGING.md`: `/var/lib/evo/plugins/<name>/...`).
     plugin_data_root: PathBuf,
@@ -410,8 +377,8 @@ pub struct AdmissionEngine {
 impl std::fmt::Debug for AdmissionEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdmissionEngine")
-            .field("plugin_count", &self.by_shelf.len())
-            .field("admission_order", &self.admission_order)
+            .field("plugin_count", &self.router.len())
+            .field("admission_order", &self.router.admission_order())
             .finish()
     }
 }
@@ -437,15 +404,25 @@ impl AdmissionEngine {
         plugin_trust: Option<Arc<PluginTrustState>>,
         plugins_security: PluginsSecurityConfig,
     ) -> Self {
+        let router = Arc::new(PluginRouter::new(Arc::clone(&state)));
         Self {
-            by_shelf: HashMap::new(),
-            admission_order: Vec::new(),
+            router,
             state,
-            custody_cid_counter: Arc::new(AtomicU64::new(1)),
             plugin_data_root,
             plugin_trust,
             plugins_security,
         }
+    }
+
+    /// Borrow the [`PluginRouter`] handle this engine constructed.
+    ///
+    /// The server clones this `Arc` to dispatch requests without
+    /// acquiring the engine mutex once `server.rs` is updated to
+    /// route directly through the router. Until then dispatch still
+    /// goes through the engine's delegation methods so the engine
+    /// mutex's cross-await scope is unchanged.
+    pub fn router(&self) -> &Arc<PluginRouter> {
+        &self.router
     }
 
     /// Borrow the shared [`StewardState`](StewardState) handle this
@@ -498,12 +475,12 @@ impl AdmissionEngine {
 
     /// Number of currently admitted plugins.
     pub fn len(&self) -> usize {
-        self.by_shelf.len()
+        self.router.len()
     }
 
     /// True if no plugins are admitted.
     pub fn is_empty(&self) -> bool {
-        self.by_shelf.is_empty()
+        self.router.is_empty()
     }
 
     /// Admit an in-process singleton respondent.
@@ -554,7 +531,7 @@ impl AdmissionEngine {
             )));
         }
 
-        if self.by_shelf.contains_key(&shelf_qualified) {
+        if self.router.contains_shelf(&shelf_qualified) {
             return Err(StewardError::Admission(format!(
                 "{}: shelf {} already occupied",
                 manifest.plugin.name, shelf_qualified
@@ -613,23 +590,21 @@ impl AdmissionEngine {
             ))
         })?;
 
-        let record = AdmittedPlugin {
-            name: manifest.plugin.name.clone(),
-            shelf: shelf_qualified.clone(),
-            handle,
-            child: None,
-        };
-
+        let kind_name = handle.kind_name();
         tracing::info!(
-            plugin = %record.name,
-            shelf = %record.shelf,
-            kind = %record.handle.kind_name(),
+            plugin = %manifest.plugin.name,
+            shelf = %shelf_qualified,
+            kind = %kind_name,
             trust_class = ?manifest.trust.class,
             "plugin admitted"
         );
 
-        self.by_shelf.insert(shelf_qualified.clone(), record);
-        self.admission_order.push(shelf_qualified);
+        let entry = Arc::new(PluginEntry::new(
+            manifest.plugin.name.clone(),
+            shelf_qualified.clone(),
+            handle,
+        ));
+        self.router.insert(entry)?;
 
         Ok(())
     }
@@ -678,7 +653,7 @@ impl AdmissionEngine {
             )));
         }
 
-        if self.by_shelf.contains_key(&shelf_qualified) {
+        if self.router.contains_shelf(&shelf_qualified) {
             return Err(StewardError::Admission(format!(
                 "{}: shelf {} already occupied",
                 manifest.plugin.name, shelf_qualified
@@ -736,23 +711,21 @@ impl AdmissionEngine {
             ))
         })?;
 
-        let record = AdmittedPlugin {
-            name: manifest.plugin.name.clone(),
-            shelf: shelf_qualified.clone(),
-            handle,
-            child: None,
-        };
-
+        let kind_name = handle.kind_name();
         tracing::info!(
-            plugin = %record.name,
-            shelf = %record.shelf,
-            kind = %record.handle.kind_name(),
+            plugin = %manifest.plugin.name,
+            shelf = %shelf_qualified,
+            kind = %kind_name,
             trust_class = ?manifest.trust.class,
             "plugin admitted"
         );
 
-        self.by_shelf.insert(shelf_qualified.clone(), record);
-        self.admission_order.push(shelf_qualified);
+        let entry = Arc::new(PluginEntry::new(
+            manifest.plugin.name.clone(),
+            shelf_qualified.clone(),
+            handle,
+        ));
+        self.router.insert(entry)?;
 
         Ok(())
     }
@@ -816,7 +789,7 @@ impl AdmissionEngine {
             )));
         }
 
-        if self.by_shelf.contains_key(&shelf_qualified) {
+        if self.router.contains_shelf(&shelf_qualified) {
             return Err(StewardError::Admission(format!(
                 "{}: shelf {} already occupied",
                 manifest.plugin.name, shelf_qualified
@@ -889,24 +862,22 @@ impl AdmissionEngine {
             ))
         })?;
 
-        let record = AdmittedPlugin {
-            name: manifest.plugin.name.clone(),
-            shelf: shelf_qualified.clone(),
-            handle,
-            child: None,
-        };
-
+        let kind_name = handle.kind_name();
         tracing::info!(
-            plugin = %record.name,
-            shelf = %record.shelf,
-            kind = %record.handle.kind_name(),
+            plugin = %manifest.plugin.name,
+            shelf = %shelf_qualified,
+            kind = %kind_name,
             trust_class = ?manifest.trust.class,
             transport = "wire",
             "plugin admitted"
         );
 
-        self.by_shelf.insert(shelf_qualified.clone(), record);
-        self.admission_order.push(shelf_qualified);
+        let entry = Arc::new(PluginEntry::new(
+            manifest.plugin.name.clone(),
+            shelf_qualified.clone(),
+            handle,
+        ));
+        self.router.insert(entry)?;
 
         Ok(())
     }
@@ -959,7 +930,7 @@ impl AdmissionEngine {
             )));
         }
 
-        if self.by_shelf.contains_key(&shelf_qualified) {
+        if self.router.contains_shelf(&shelf_qualified) {
             return Err(StewardError::Admission(format!(
                 "{}: shelf {} already occupied",
                 manifest.plugin.name, shelf_qualified
@@ -1035,24 +1006,22 @@ impl AdmissionEngine {
             ))
         })?;
 
-        let record = AdmittedPlugin {
-            name: manifest.plugin.name.clone(),
-            shelf: shelf_qualified.clone(),
-            handle,
-            child: None,
-        };
-
+        let kind_name = handle.kind_name();
         tracing::info!(
-            plugin = %record.name,
-            shelf = %record.shelf,
-            kind = %record.handle.kind_name(),
+            plugin = %manifest.plugin.name,
+            shelf = %shelf_qualified,
+            kind = %kind_name,
             trust_class = ?manifest.trust.class,
             transport = "wire",
             "plugin admitted"
         );
 
-        self.by_shelf.insert(shelf_qualified.clone(), record);
-        self.admission_order.push(shelf_qualified);
+        let entry = Arc::new(PluginEntry::new(
+            manifest.plugin.name.clone(),
+            shelf_qualified.clone(),
+            handle,
+        ));
+        self.router.insert(entry)?;
 
         Ok(())
     }
@@ -1269,21 +1238,21 @@ impl AdmissionEngine {
         }
 
         // Admission succeeded. Attach the child to the admitted
-        // record so shutdown can reap it.
+        // record on the router so shutdown can reap it.
         let shelf_qualified = manifest.target.shelf.clone();
-        if let Some(record) = self.by_shelf.get_mut(&shelf_qualified) {
-            record.child = Some(child);
-        } else {
+        if !self.router.attach_child(&shelf_qualified, child).await {
             // Should be impossible: admit_out_of_process_respondent
             // just inserted this record. If it is missing, something
-            // is deeply wrong; kill the child and log.
+            // is deeply wrong; the child cannot be reattached so the
+            // router has effectively lost it. Log loudly. The child
+            // would have been moved into attach_child if the entry
+            // existed, so reaching here means the entry vanished
+            // before we could attach.
             tracing::error!(
                 plugin = %manifest.plugin.name,
                 shelf = %shelf_qualified,
                 "admitted record missing after successful admission"
             );
-            let _ = child.kill().await;
-            let _ = child.wait().await;
         }
 
         Ok(())
@@ -1298,23 +1267,17 @@ impl AdmissionEngine {
     ///
     /// Returns the plugin's own error wrapped in
     /// [`StewardError::Plugin`] if the plugin's handler fails.
+    ///
+    /// This is a thin delegation to
+    /// [`PluginRouter::handle_request`](crate::router::PluginRouter::handle_request);
+    /// callers that hold an `Arc<PluginRouter>` directly can avoid
+    /// the engine mutex entirely.
     pub async fn handle_request(
-        &mut self,
+        &self,
         shelf: &str,
         request: Request,
     ) -> Result<Response, StewardError> {
-        let plugin = self.by_shelf.get_mut(shelf).ok_or_else(|| {
-            StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
-        })?;
-        match &mut plugin.handle {
-            AdmittedHandle::Respondent(r) => {
-                r.handle_request(&request).await.map_err(Into::into)
-            }
-            AdmittedHandle::Warden(_) => Err(StewardError::Dispatch(format!(
-                "handle_request on shelf {shelf}: plugin is a warden, \
-                 not a respondent"
-            ))),
-        }
+        self.router.handle_request(shelf, request).await
     }
 
     /// Deliver an assignment to the warden on the given shelf.
@@ -1348,85 +1311,15 @@ impl AdmissionEngine {
     /// assignment. On such failure neither the ledger nor the bus
     /// is written.
     pub async fn take_custody(
-        &mut self,
+        &self,
         shelf: &str,
         custody_type: String,
         payload: Vec<u8>,
         deadline: Option<Instant>,
     ) -> Result<CustodyHandle, StewardError> {
-        // Clone the ledger and bus Arcs up front for use after the
-        // warden call. After this point we hold a mutable borrow of
-        // self.by_shelf through `plugin`, so accessing self.state
-        // directly would conflict.
-        let ledger = Arc::clone(&self.state.custody);
-        let bus = Arc::clone(&self.state.bus);
-
-        let plugin = self.by_shelf.get_mut(shelf).ok_or_else(|| {
-            StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
-        })?;
-        let warden = match &mut plugin.handle {
-            AdmittedHandle::Warden(w) => w,
-            AdmittedHandle::Respondent(_) => {
-                return Err(StewardError::Dispatch(format!(
-                    "take_custody on shelf {shelf}: plugin is a respondent, \
-                     not a warden"
-                )));
-            }
-        };
-
-        // Clone fields we need after the await point. custody_type
-        // is consumed by the Assignment below so clone it first.
-        let plugin_name = plugin.name.clone();
-        let shelf_qualified = plugin.shelf.clone();
-        let custody_type_for_ledger = custody_type.clone();
-
-        let correlation_id =
-            self.custody_cid_counter.fetch_add(1, Ordering::Relaxed);
-        let reporter: Arc<dyn evo_plugin_sdk::contract::CustodyStateReporter> =
-            Arc::new(LedgerCustodyStateReporter::new(
-                Arc::clone(&ledger),
-                Arc::clone(&bus),
-                plugin_name.clone(),
-            ));
-        let assignment = Assignment {
-            custody_type,
-            payload,
-            correlation_id,
-            deadline,
-            custody_state_reporter: reporter,
-        };
-
-        let handle: CustodyHandle = warden
-            .take_custody(assignment)
+        self.router
+            .take_custody(shelf, custody_type, payload, deadline)
             .await
-            .map_err(StewardError::from)?;
-
-        // Record the successful take in the ledger. UPSERT - if an
-        // early state report from within the plugin's take_custody
-        // already created a partial record, this call merges in the
-        // metadata and preserves the earlier started_at and
-        // last_state.
-        ledger.record_custody(
-            &plugin_name,
-            &shelf_qualified,
-            &handle,
-            &custody_type_for_ledger,
-        );
-
-        // Emit the happening AFTER the ledger write so subscribers
-        // that react by re-querying the ledger see the new record.
-        // The owned Strings are moved into the happening since they
-        // are not used again; only handle.id is cloned because
-        // handle is returned to the caller.
-        bus.emit(Happening::CustodyTaken {
-            plugin: plugin_name,
-            handle_id: handle.id.clone(),
-            shelf: shelf_qualified,
-            custody_type: custody_type_for_ledger,
-            at: SystemTime::now(),
-        });
-
-        Ok(handle)
     }
 
     /// Deliver a course correction to an ongoing custody on the given
@@ -1442,37 +1335,15 @@ impl AdmissionEngine {
     /// [`StewardError::Plugin`] on warden-side rejection (unknown
     /// handle, correction-type not accepted, timeout, etc.).
     pub async fn course_correct(
-        &mut self,
+        &self,
         shelf: &str,
         handle: &CustodyHandle,
         correction_type: String,
         payload: Vec<u8>,
     ) -> Result<(), StewardError> {
-        let plugin = self.by_shelf.get_mut(shelf).ok_or_else(|| {
-            StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
-        })?;
-        let warden = match &mut plugin.handle {
-            AdmittedHandle::Warden(w) => w,
-            AdmittedHandle::Respondent(_) => {
-                return Err(StewardError::Dispatch(format!(
-                    "course_correct on shelf {shelf}: plugin is a \
-                     respondent, not a warden"
-                )));
-            }
-        };
-
-        let correlation_id =
-            self.custody_cid_counter.fetch_add(1, Ordering::Relaxed);
-        let correction = CourseCorrection {
-            correction_type,
-            payload,
-            correlation_id,
-        };
-
-        warden
-            .course_correct(handle, correction)
+        self.router
+            .course_correct(shelf, handle, correction_type, payload)
             .await
-            .map_err(Into::into)
     }
 
     /// Gracefully terminate an ongoing custody on the given shelf.
@@ -1488,66 +1359,17 @@ impl AdmissionEngine {
     /// mismatches as [`Self::take_custody`]. Returns
     /// [`StewardError::Plugin`] on warden-side rejection.
     pub async fn release_custody(
-        &mut self,
+        &self,
         shelf: &str,
         handle: CustodyHandle,
     ) -> Result<(), StewardError> {
-        // Clone the ledger and bus Arcs up front for the same
-        // reason as take_custody.
-        let ledger = Arc::clone(&self.state.custody);
-        let bus = Arc::clone(&self.state.bus);
-
-        let plugin = self.by_shelf.get_mut(shelf).ok_or_else(|| {
-            StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
-        })?;
-        let warden = match &mut plugin.handle {
-            AdmittedHandle::Warden(w) => w,
-            AdmittedHandle::Respondent(_) => {
-                return Err(StewardError::Dispatch(format!(
-                    "release_custody on shelf {shelf}: plugin is a \
-                     respondent, not a warden"
-                )));
-            }
-        };
-
-        // Clone before handle is consumed by the warden call.
-        let plugin_name = plugin.name.clone();
-        let handle_id = handle.id.clone();
-
-        warden
-            .release_custody(handle)
-            .await
-            .map_err(StewardError::from)?;
-
-        // Drop the record from the ledger after the warden
-        // acknowledges the release. The removed record is
-        // discarded; a future pass can expose it for archiving.
-        ledger.release_custody(&plugin_name, &handle_id);
-
-        // Emit the released happening after the ledger drop so
-        // subscribers that react by re-querying the ledger see the
-        // record gone. Both owned strings are moved in; neither is
-        // used again.
-        bus.emit(Happening::CustodyReleased {
-            plugin: plugin_name,
-            handle_id,
-            at: SystemTime::now(),
-        });
-
-        Ok(())
+        self.router.release_custody(shelf, handle).await
     }
 
     /// Run a health check against every admitted plugin, returning a
     /// vector of (plugin name, report) pairs.
     pub async fn health_check_all(&self) -> Vec<(String, HealthReport)> {
-        let mut out = Vec::with_capacity(self.by_shelf.len());
-        for shelf in &self.admission_order {
-            if let Some(p) = self.by_shelf.get(shelf) {
-                let r = p.handle.health_check().await;
-                out.push((p.name.clone(), r));
-            }
-        }
-        out
+        self.router.health_check_all().await
     }
 
     /// Gracefully unload every admitted plugin in reverse admission
@@ -1568,15 +1390,14 @@ impl AdmissionEngine {
     /// Step 2 is essential: the child will not exit until its read
     /// side sees EOF, so waiting for the child while still holding
     /// the wire connection would deadlock.
-    pub async fn shutdown(&mut self) -> Result<(), StewardError> {
+    pub async fn shutdown(&self) -> Result<(), StewardError> {
         let mut first_err: Option<StewardError> = None;
 
-        while let Some(shelf) = self.admission_order.pop() {
-            if let Some(plugin) = self.by_shelf.remove(&shelf) {
-                if let Err(e) = unload_one_plugin(plugin).await {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
+        let entries = self.router.drain_in_reverse_admission_order();
+        for entry in entries {
+            if let Err(e) = unload_one_plugin(entry).await {
+                if first_err.is_none() {
+                    first_err = Some(e);
                 }
             }
         }
@@ -1603,22 +1424,30 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// out-of-process cases.
 ///
 /// See [`AdmissionEngine::shutdown`] for the sequence rationale.
-async fn unload_one_plugin(plugin: AdmittedPlugin) -> Result<(), StewardError> {
-    let AdmittedPlugin {
-        name,
-        shelf,
-        mut handle,
-        child,
-    } = plugin;
+///
+/// The entry is the cloned `Arc<PluginEntry>` returned by
+/// [`PluginRouter::drain_in_reverse_admission_order`]; its inner
+/// handle is taken (not borrowed) so the wire client is dropped
+/// before the child is awaited.
+async fn unload_one_plugin(
+    entry: Arc<PluginEntry>,
+) -> Result<(), StewardError> {
+    let name = entry.name.clone();
+    let shelf = entry.shelf.clone();
 
     tracing::info!(
         plugin = %name,
         shelf = %shelf,
-        kind = %handle.kind_name(),
         "plugin unloading"
     );
 
-    let unload_result = handle.unload().await;
+    // Take the handle out of the entry so we can both call
+    // `unload()` on it AND drop it before awaiting the child. For
+    // in-process plugins this drop is a no-op. For wire-backed
+    // plugins the drop closes the WireClient's writer channel,
+    // which causes the child to see EOF on its read side. Waiting
+    // on the child while still holding the writer would deadlock.
+    let unload_result = unload_handle(&entry).await;
 
     match &unload_result {
         Ok(()) => tracing::info!(plugin = %name, "plugin unloaded"),
@@ -1629,15 +1458,7 @@ async fn unload_one_plugin(plugin: AdmittedPlugin) -> Result<(), StewardError> {
         ),
     }
 
-    // Drop the erased handle before waiting on the child. For
-    // in-process plugins this is a no-op. For wire-backed plugins
-    // this drops the WireClient, which closes the writer channel,
-    // which drops the socket's writer half, which causes the child
-    // to see EOF on its read side. Waiting on the child while still
-    // holding the writer would deadlock.
-    drop(handle);
-
-    if let Some(mut child) = child {
+    if let Some(mut child) = take_child(&entry).await {
         wait_or_kill_child(&name, &mut child).await;
     }
 
@@ -2240,7 +2061,7 @@ response_budget_ms = 1000
 
     #[tokio::test]
     async fn handle_request_unknown_shelf_errors() {
-        let mut engine = test_engine();
+        let engine = test_engine();
         let req = Request {
             request_type: "ping".into(),
             payload: vec![],

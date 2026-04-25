@@ -1742,7 +1742,7 @@ async fn handle_plugin_request(
     };
 
     let result = {
-        let mut guard = engine.lock().await;
+        let guard = engine.lock().await;
         guard.handle_request(&shelf, sdk_request).await
     };
 

@@ -16,6 +16,11 @@
 //! - [`admission`]: the admission engine that runs plugin lifecycles.
 //! - [`subjects`]: the subject registry, implementing `SUBJECTS.md`.
 //! - [`relations`]: the relation graph, implementing `RELATIONS.md`.
+//! - [`router`]: the per-request plugin router holding the routing
+//!   table behind a finer-grained synchronisation primitive than
+//!   the engine mutex. Receives admitted entries from
+//!   [`admission`] and dispatches lookups via the
+//!   lookup-clone-drop pattern.
 //! - [`context`]: concrete implementations of the SDK callback traits
 //!   supplied to plugins in their [`LoadContext`].
 //! - [`custody`]: the custody ledger, tracking every custody the
@@ -63,6 +68,7 @@ pub mod plugin_discovery;
 pub mod plugin_trust;
 pub mod projections;
 pub mod relations;
+pub mod router;
 pub mod server;
 pub mod shutdown;
 pub mod state;
