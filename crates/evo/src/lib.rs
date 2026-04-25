@@ -25,6 +25,9 @@
 //!   other) transitions without polling.
 //! - [`server`]: the client-facing Unix socket server.
 //! - [`shutdown`]: graceful shutdown on SIGTERM / SIGINT / Ctrl-C.
+//! - [`state`]: immutable handle bag of shared steward stores
+//!   ([`state::StewardState`]). Built once at boot; consumed by
+//!   future passes that decouple dispatch from the per-engine mutex.
 //! - [`logging`]: tracing subscriber setup per the LOGGING contract.
 //! - [`wire_client`]: steward-side client for out-of-process plugins
 //!   speaking the wire protocol from `PLUGIN_CONTRACT.md` sections 6
@@ -62,7 +65,9 @@ pub mod projections;
 pub mod relations;
 pub mod server;
 pub mod shutdown;
+pub mod state;
 pub mod subjects;
 pub mod wire_client;
 
 pub use error::StewardError;
+pub use state::{StewardState, StewardStateBuildError, StewardStateBuilder};
