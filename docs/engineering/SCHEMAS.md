@@ -549,6 +549,7 @@ Every request carries an `op` discriminator.
 |------|-------|-----------|
 | `"request"` | Sync request/response | No |
 | `"project_subject"` | Sync request/response | No |
+| `"describe_alias"` | Sync request/response | No |
 | `"list_active_custodies"` | Sync request/response | No |
 | `"subscribe_happenings"` | Streaming (ack + stream) | Yes |
 
@@ -581,7 +582,8 @@ Every request carries an `op` discriminator.
     "direction": "forward" | "inverse" | "both",
     "max_depth": <u32>,
     "max_visits": <u32>
-  }
+  },
+  "follow_aliases": <bool>
 }
 ```
 
@@ -593,6 +595,22 @@ Every request carries an `op` discriminator.
 | `scope.direction` | string | no | `"forward"` | `forward`, `inverse`, or `both`. |
 | `scope.max_depth` | u32 | no | `1` | Traversal depth limit. |
 | `scope.max_visits` | u32 | no | `1000` | Total visit cap across the walk. |
+| `follow_aliases` | bool | no | `true` | Auto-follow alias chains for stale canonical IDs. When `false`, a queried ID retired by merge or split returns `subject: null` plus the populated `aliased_from` so the consumer chooses how to follow. |
+
+**`op = "describe_alias"`**:
+
+```json
+{
+  "op": "describe_alias",
+  "subject_id": "<uuid>",
+  "include_chain": <bool>
+}
+```
+
+| Field | Type | Required | Default | Notes |
+|-------|------|----------|---------|-------|
+| `subject_id` | string (UUID) | yes | - | Canonical subject ID to inspect. |
+| `include_chain` | bool | no | `true` | Walk the full alias chain (default). When `false`, only the immediate alias record is returned (single-hop view). |
 
 **`op = "list_active_custodies"`**:
 
@@ -618,7 +636,45 @@ No other fields. Promotes the connection to streaming mode.
 { "payload_b64": "<base64>" }
 ```
 
-**Success response to `op = "project_subject"`**: a full `SubjectProjection` object (see section 5.3).
+**Success response to `op = "project_subject"`**: shape varies with whether the queried ID resolved live or required alias resolution.
+
+Live-subject path — a full `SubjectProjection` object (see section 5.3); the `aliased_from` key is **absent**, not serialised as `null`:
+
+```json
+<SubjectProjection>
+```
+
+Alias-aware path — emitted whenever the queried ID has been merged or split, regardless of whether `follow_aliases` was set:
+
+```json
+{
+  "subject": <SubjectProjection> | null,
+  "aliased_from": <AliasedFrom>
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `subject` | object \| null | The terminal subject's projection when the chain resolved to one live subject AND `follow_aliases` was `true` (the default); `null` otherwise (forked split, depth cap hit, or auto-follow disabled). |
+| `aliased_from` | object | Always present in this branch. See `AliasedFrom` shape in section 5.5. |
+
+Consumers test for the presence of the `aliased_from` key (not its value) to discriminate the two paths. An unknown `canonical_id` returns the existing not-found error shape verbatim with no `aliased_from` field.
+
+**Success response to `op = "describe_alias"`**:
+
+```json
+{
+  "ok": true,
+  "subject_id": "<uuid>",
+  "result": <SubjectQueryResult>
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `ok` | bool | Always `true` on success; the key set `{ ok, subject_id, result }` distinguishes this response from every other shape. |
+| `subject_id` | string (UUID) | Echoes the queried ID so callers correlating pipelined responses match without holding state. |
+| `result` | object | The lookup outcome. `SubjectQueryResult` is internally tagged by `kind` (`"found"`, `"aliased"`, `"not_found"`). See section 5.7. |
 
 **Success response to `op = "list_active_custodies"`**:
 
@@ -687,7 +743,7 @@ The `op` field discriminates between frame types. Frames are internally tagged p
 
 #### 4.2.2 Frame Inventory
 
-Fifteen `op` values across requests (steward-to-plugin), responses (plugin-to-steward), and async events (plugin-to-steward).
+Nineteen `op` values across steward-to-plugin requests, plugin-to-steward responses (to those requests), plugin-to-steward requests (alias-aware queries), steward-to-plugin responses (to those queries), and plugin-to-steward async events.
 
 **Requests (steward-to-plugin)**
 
@@ -714,6 +770,22 @@ Fifteen `op` values across requests (steward-to-plugin), responses (plugin-to-st
 | `take_custody_response` | `take_custody` | `handle` (CustodyHandle) |
 | `course_correct_response` | `course_correct` | - |
 | `release_custody_response` | `release_custody` | - |
+
+**Plugin-initiated requests (plugin-to-steward, carry their own cid)**
+
+These reverse the polarity of the request / response axis: the plugin issues the request, the steward answers with the matching `*_response` frame (or an `error` frame echoing the same cid). Out-of-process plugins use these to invoke the alias-aware `SubjectQuerier` callback over the wire; in-process plugins call the trait directly without serialising a frame.
+
+| `op` | Purpose | Additional fields |
+|------|---------|-------------------|
+| `describe_alias` | Look up the alias record (if any) for a canonical subject ID | `subject_id` (string) |
+| `describe_subject` | Look up the live subject for a canonical subject ID, walking alias chains as far as a single terminal | `subject_id` (string) |
+
+**Steward responses to plugin-initiated requests**
+
+| `op` | Answers | Additional fields |
+|------|---------|-------------------|
+| `describe_alias_response` | `describe_alias` | `record` (AliasRecord \| null) |
+| `describe_subject_response` | `describe_subject` | `result` (SubjectQueryResult) |
 
 **Async events (plugin-to-steward, carry their own cid)**
 
@@ -763,6 +835,72 @@ Opaque bytes are base64-encoded in JSON. Applied fields: `payload` on `handle_re
   "handle": { "id": "custody-42", "started_at": "2024-01-15T10:30:00Z" },
   "payload": "cG9zaXRpb249MTIz",
   "health": "healthy"
+}
+```
+
+`describe_alias` request (plugin-initiated):
+
+```json
+{
+  "op": "describe_alias", "v": 1, "cid": 500, "plugin": "com.example.metadata",
+  "subject_id": "stale-canonical-id"
+}
+```
+
+`describe_alias_response` (steward-to-plugin):
+
+```json
+{
+  "op": "describe_alias_response", "v": 1, "cid": 500, "plugin": "com.example.metadata",
+  "record": {
+    "old_id": "stale-canonical-id",
+    "new_ids": ["new-id-after-merge"],
+    "kind": "merged",
+    "recorded_at_ms": 1700000000000,
+    "admin_plugin": "com.example.admin"
+  }
+}
+```
+
+`describe_subject` request (plugin-initiated):
+
+```json
+{
+  "op": "describe_subject", "v": 1, "cid": 501, "plugin": "com.example.metadata",
+  "subject_id": "stale-canonical-id"
+}
+```
+
+`describe_subject_response` (steward-to-plugin):
+
+```json
+{
+  "op": "describe_subject_response", "v": 1, "cid": 501, "plugin": "com.example.metadata",
+  "result": {
+    "kind": "aliased",
+    "chain": [
+      {
+        "old_id": "stale-canonical-id",
+        "new_ids": ["new-id-after-merge"],
+        "kind": "merged",
+        "recorded_at_ms": 1700000000000,
+        "admin_plugin": "com.example.admin"
+      }
+    ],
+    "terminal": {
+      "id": "new-id-after-merge",
+      "subject_type": "track",
+      "addressings": [
+        {
+          "addressing": { "scheme": "mbid", "value": "abc-def" },
+          "claimant": "com.example.metadata",
+          "added_at_ms": 1700000000200
+        }
+      ],
+      "created_at_ms": 1700000000200,
+      "modified_at_ms": 1700000000600
+    }
+  }
 }
 ```
 
@@ -1244,14 +1382,129 @@ Serialises as a snake_case string.
 | `"merged"` | The old subject was merged into another subject. The alias's `new_ids` has length 1. |
 | `"split"` | The old subject was split into multiple subjects. The alias's `new_ids` has length at least 2. |
 
-### 5.5 SplitRelationStrategy and ExplicitRelationAssignment
+### 5.5 AliasedFrom (project_subject envelope)
+
+**Location**: `crates/evo/src/server.rs` (the `AliasedFromWire` struct).
+**See also**: `CLIENT_API.md` section 4.2.2 (consumer-facing semantics), `SUBJECTS.md` section 10.4.
+
+Attached to a `project_subject` response whenever the queried canonical ID has been merged or split. The envelope mirrors the on-wire shape of the SDK `SubjectQueryResult::Aliased` variant (section 5.7) so consumers can carry the same parser through both surfaces; the only difference is that this struct surfaces the queried ID and the terminal ID directly (instead of a fully-projected terminal `SubjectRecord`) because the corresponding `subject` field on the response already carries the projection.
+
+```json
+{
+  "queried_id": "<uuid>",
+  "chain": [ <AliasRecord>, ... ],
+  "terminal_id": "<uuid>" | null
+}
+```
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `queried_id` | string (UUID) | yes | The canonical ID the consumer originally addressed. |
+| `chain` | array\<AliasRecord\> | yes | The alias chain the steward walked, oldest-first. Length is at least 1 whenever this struct is emitted. |
+| `terminal_id` | string (UUID) \| null | yes | Canonical ID of the terminal subject if the chain resolved to a single live subject; `null` when the chain forks (a split, or a chain that hit the steward's depth cap of 16 hops). |
+
+The maximum chain length the steward will walk is 16 hops (defence-in-depth). Hitting the cap returns the partial chain with `terminal_id: null`; the caller can re-query the last entry's `new_ids` to continue.
+
+### 5.6 SubjectRecord and SubjectAddressingRecord
+
+**Location**: `crates/evo-plugin-sdk/src/contract/subjects.rs` (the `SubjectRecord` and `SubjectAddressingRecord` structs).
+**See also**: `SUBJECTS.md` section 10.4, `PLUGIN_CONTRACT.md` section 5.2 (the `SubjectQuerier` callback that returns these types).
+
+A snapshot of one canonical subject as visible to consumers of the alias-aware describe operations. Mirrors the steward's internal `SubjectRecord` shape but projected onto SDK-visible types: timestamps are stored as milliseconds since the UNIX epoch, addressings carry their per-addressing claimant and recording timestamp.
+
+#### 5.6.1 SubjectRecord
+
+```json
+{
+  "id": "<uuid>",
+  "subject_type": "<string>",
+  "addressings": [ <SubjectAddressingRecord>, ... ],
+  "created_at_ms": <u64>,
+  "modified_at_ms": <u64>
+}
+```
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `id` | string (UUID) | yes | Canonical subject ID. |
+| `subject_type` | string | yes | Subject type, as declared in the catalogue. |
+| `addressings` | array | yes | All addressings currently registered to this subject, with per-addressing provenance. |
+| `created_at_ms` | u64 | yes | When this subject was first registered, milliseconds since the UNIX epoch. |
+| `modified_at_ms` | u64 | yes | When the subject was last modified (addressing added or removed), milliseconds since the UNIX epoch. |
+
+#### 5.6.2 SubjectAddressingRecord
+
+```json
+{
+  "addressing": <ExternalAddressing>,
+  "claimant": "<plugin-name>",
+  "added_at_ms": <u64>
+}
+```
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `addressing` | object | yes | The `(scheme, value)` pair. See section 5.3 for the `ExternalAddressing` shape. |
+| `claimant` | string | yes | Canonical name of the plugin that first asserted this addressing. |
+| `added_at_ms` | u64 | yes | When the claim was recorded, milliseconds since the UNIX epoch. |
+
+Note: the `SubjectRecord`'s `ExternalAddressing` is the SDK shape `{ scheme, value }`. The `SubjectProjection`'s `ExternalAddressing` (section 5.3) flattens the claimant onto the same object as `{ scheme, value, claimant }` because projections aggregate addressings across plugins; here, the claimant lives on the `SubjectAddressingRecord` wrapper instead.
+
+### 5.7 SubjectQueryResult
+
+**Location**: `crates/evo-plugin-sdk/src/contract/subjects.rs` (the `SubjectQueryResult` enum).
+**See also**: `SUBJECTS.md` section 10.4, `PLUGIN_CONTRACT.md` section 5.2.
+
+Returned by `op = "describe_alias"` (as the `result` field), the SDK `SubjectQuerier::describe_subject_with_aliases` callback, and the wire `describe_subject_response` frame. Carries enough information for a consumer holding a stale canonical ID to recover the current identity, including the audit chain of merges / splits that produced it.
+
+Internally tagged by the `kind` field; serialises as snake_case. The enum is `#[non_exhaustive]`: consumers MUST tolerate unknown `kind` values (treat as "ignore" or "log and continue", never crash).
+
+**`kind: "found"`** — the queried ID is current:
+
+```json
+{
+  "kind": "found",
+  "record": <SubjectRecord>
+}
+```
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `record` | object | yes | The current subject record at the queried ID. See section 5.6. |
+
+**`kind: "aliased"`** — the queried ID was retired by a merge or split:
+
+```json
+{
+  "kind": "aliased",
+  "chain": [ <AliasRecord>, ... ],
+  "terminal": <SubjectRecord> | null
+}
+```
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `chain` | array\<AliasRecord\> | yes | The alias chain the steward walked, oldest-first. Length is at least 1. Each entry records one merge or split that touched the path from the queried ID toward the current subject set. |
+| `terminal` | object \| null | yes | The current subject if the chain resolves to one (a single merge target, or a chain of merges ending in a live subject). `null` when the chain forks (a split, or a chain that hit the steward's depth cap of 16 hops). |
+
+**`kind: "not_found"`** — no subject ever existed at the queried ID, and no alias either:
+
+```json
+{ "kind": "not_found" }
+```
+
+No additional fields.
+
+The maximum chain length the steward will walk is 16 hops (defence-in-depth against pathological chains). Hitting the cap returns the partial chain with `terminal: null`; the caller can re-query the last entry's `new_ids` to continue manually.
+
+### 5.8 SplitRelationStrategy and ExplicitRelationAssignment
 
 **Location**: `crates/evo-plugin-sdk/src/contract/subjects.rs` (the `SplitRelationStrategy` enum, the `ExplicitRelationAssignment` struct).
 **See also**: `RELATIONS.md` section 8.2, `SUBJECTS.md` section 10.2.
 
 Used by the SDK's `SubjectAdmin::split` primitive to control how relations on the source subject are distributed to the new subjects.
 
-#### 5.5.1 SplitRelationStrategy
+#### 5.8.1 SplitRelationStrategy
 
 Serialises as a snake_case string.
 
@@ -1261,7 +1514,7 @@ Serialises as a snake_case string.
 | `"to_first"` | Every relation goes to the FIRST new subject in the partition; subsequent new subjects start bare. |
 | `"explicit"` | Each relation is assigned to a specific new subject by operator-supplied `ExplicitRelationAssignment` entries. Relations with no matching assignment fall through to `to_both` and the steward emits one `relation_split_ambiguous` per gap. |
 
-#### 5.5.2 ExplicitRelationAssignment
+#### 5.8.2 ExplicitRelationAssignment
 
 ```json
 {
@@ -1281,7 +1534,7 @@ Serialises as a snake_case string.
 
 The triple `(source, predicate, target)` identifies a single relation in the graph at the time of the split.
 
-### 5.6 AdminLogEntry and AdminLogKind
+### 5.9 AdminLogEntry and AdminLogKind
 
 **Location**: `crates/evo/src/admin.rs` (the `AdminLogEntry` struct, the `AdminLogKind` enum).
 **See also**: `PERSISTENCE.md` (the `admin_log` table this struct is shaped to fit), `BOUNDARY.md` section 6.1.
@@ -1290,7 +1543,7 @@ Every privileged administration action a plugin takes through the `SubjectAdmin`
 
 The admin ledger is not exposed on the client socket today; the entry shape is documented here because (a) it is the canonical home for the audit trail of admin actions and (b) a future client-socket op (or part of the broader happenings expansion) will surface it.
 
-#### 5.6.1 AdminLogEntry
+#### 5.9.1 AdminLogEntry
 
 ```json
 {
@@ -1308,7 +1561,7 @@ The admin ledger is not exposed on the client socket today; the entry shape is d
 
 | Field | Type | Always populated? | Notes |
 |-------|------|-------------------|-------|
-| `kind` | enum | yes | One of the `AdminLogKind` values in section 5.6.2. |
+| `kind` | enum | yes | One of the `AdminLogKind` values in section 5.9.2. |
 | `admin_plugin` | string | yes | Canonical name of the admin plugin that performed the action. |
 | `target_plugin` | string \| null | per kind | Canonical name of the plugin whose claim was modified. `null` for kinds that do not target a specific plugin (`subject_merge`, `subject_split`, `relation_suppress`, `relation_unsuppress`). |
 | `target_subject` | string (UUID) \| null | per kind | Canonical ID of the subject involved. For `subject_merge` this is the NEW canonical ID; for `subject_split` this is the SOURCE (old) canonical ID. |
@@ -1318,7 +1571,7 @@ The admin ledger is not exposed on the client socket today; the entry shape is d
 | `reason` | string \| null | optional | Free-form operator-supplied reason; mirrors the `reason` field on the underlying primitive. |
 | `at_ms` | u64 | yes | When the action was recorded, milliseconds since UNIX epoch. |
 
-#### 5.6.2 AdminLogKind
+#### 5.9.2 AdminLogKind
 
 Serialises as a snake_case string. The enum is `#[non_exhaustive]`; readers must tolerate unknown values.
 

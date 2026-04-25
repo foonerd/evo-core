@@ -10,7 +10,7 @@ STEWARD.md section 6 remains the source of truth on wire grammar. If anything he
 
 ## 1. Purpose
 
-The steward runs on the device and exposes a Unix domain socket. Consumers connect to that socket and exchange length-prefixed JSON frames. The protocol is deliberately simple: four operations, three synchronous and one streaming, each with a stable JSON shape. Any language that can open a Unix socket and encode/decode JSON can be a consumer.
+The steward runs on the device and exposes a Unix domain socket. Consumers connect to that socket and exchange length-prefixed JSON frames. The protocol is deliberately simple: five operations, four synchronous and one streaming, each with a stable JSON shape. Any language that can open a Unix socket and encode/decode JSON can be a consumer.
 
 Consumer examples that commonly exist in a deployed distribution:
 
@@ -56,12 +56,13 @@ A frame carries exactly one JSON object. The object's shape disambiguates whethe
 
 ## 4. Operations Reference
 
-Four operations. Three are synchronous request/response; one is streaming.
+Five operations. Four are synchronous request/response; one is streaming.
 
 | Op | Shape | Purpose |
 |----|-------|---------|
 | `request` | Request / response | Dispatch a plugin request on a specific shelf. |
-| `project_subject` | Request / response | Compose and return a federated subject projection. |
+| `project_subject` | Request / response | Compose and return a federated subject projection. Auto-follows alias chains by default. |
+| `describe_alias` | Request / response | Resolve a canonical subject ID to its alias record, alias chain, or current subject. |
 | `list_active_custodies` | Request / response | Snapshot the custody ledger. |
 | `subscribe_happenings` | Streaming | Stream every happening the bus emits. |
 
@@ -120,7 +121,8 @@ Request:
     "direction": "forward",
     "max_depth": 2,
     "max_visits": 100
-  }
+  },
+  "follow_aliases": true
 }
 ```
 
@@ -133,12 +135,15 @@ Request:
 | `scope.direction` | string, optional | `"forward"`, `"inverse"`, or `"both"`. Default `"forward"`. |
 | `scope.max_depth` | number, optional | Traversal depth limit. Default 1. |
 | `scope.max_visits` | number, optional | Total visit-count limit across the walk. Default 1000. |
+| `follow_aliases` | bool, optional | Auto-follow merge / split chains for stale canonical IDs. Default `true`. See "Alias-aware projection" below. |
 
-Response on success is a full `SubjectProjection`:
+#### 4.2.1 Live-subject response
+
+When `canonical_id` resolves to a live subject (the common case), the response is a full `SubjectProjection`:
 
 ```json
 {
-  "canonical_id": "a1b2c3d4-...",
+  "canonical_id": "a1b2c3d4-e5f6-7890-abcd-ef0123456789",
   "subject_type": "track",
   "addressings": [
     { "scheme": "mpd-path", "value": "/music/x.flac", "claimant": "org.example.mpd" }
@@ -147,7 +152,7 @@ Response on success is a full `SubjectProjection`:
     {
       "predicate": "album_of",
       "direction": "forward",
-      "target_id": "e5f6g7h8-...",
+      "target_id": "e5f6g7h8-1234-5678-9abc-def012345678",
       "target_type": "album",
       "relation_claimants": ["org.example.mpd"],
       "nested": null
@@ -162,9 +167,214 @@ Response on success is a full `SubjectProjection`:
 }
 ```
 
+The `aliased_from` key is **absent** on this happy path, not serialised as `null`. Consumers test for the key's presence with `"aliased_from" in resp` (or the language-equivalent) to distinguish live-subject responses from alias-aware responses below.
+
 See `PROJECTIONS.md` for the full shape.
 
-### 4.3 `op = "list_active_custodies"`
+#### 4.2.2 Alias-aware projection
+
+When `canonical_id` was retired by a merge or split, the registry retains an alias record so consumers holding stale references can recover. The steward walks the alias chain (oldest-first) and shapes the response according to whether the chain resolves to a single live subject and whether the request opted in to auto-follow.
+
+The response always contains a top-level `aliased_from` key in this branch:
+
+```json
+{
+  "queried_id": "<the ID the consumer asked about>",
+  "chain": [ <AliasRecord>, ... ],
+  "terminal_id": "<canonical ID of the live subject>" | null
+}
+```
+
+`chain` is an array of `AliasRecord` entries (`SCHEMAS.md` section 5.4) oldest-first, length at least 1. `terminal_id` is the canonical ID of the live subject if the chain resolved to one (a single merge target, or a chain of merges ending in a live subject). `terminal_id` is `null` when the chain forks (a `split` entry, or a chain that hits the steward's depth cap of 16 hops without resolving).
+
+**Merged ID, auto-follow (default).** When the chain resolves to one live subject and the request did not opt out, the steward projects that subject and returns it under `subject`:
+
+```json
+{
+  "subject": {
+    "canonical_id": "new-id-after-merge",
+    "subject_type": "track",
+    "addressings": [
+      { "scheme": "mbid", "value": "abc-def", "claimant": "org.example.metadata" },
+      { "scheme": "mpd-path", "value": "/music/x.flac", "claimant": "org.example.mpd" }
+    ],
+    "related": [],
+    "composed_at_ms": 1700000000500,
+    "shape_version": 1,
+    "claimants": ["org.example.metadata", "org.example.mpd"],
+    "degraded": false,
+    "degraded_reasons": [],
+    "walk_truncated": false
+  },
+  "aliased_from": {
+    "queried_id": "stale-pre-merge-id",
+    "chain": [
+      {
+        "old_id": "stale-pre-merge-id",
+        "new_ids": ["new-id-after-merge"],
+        "kind": "merged",
+        "recorded_at_ms": 1700000000000,
+        "admin_plugin": "org.example.admin"
+      }
+    ],
+    "terminal_id": "new-id-after-merge"
+  }
+}
+```
+
+The `subject` shape is the same `SubjectProjection` returned on the live-subject path (4.2.1).
+
+**Split or fork.** When the chain forks (a `split`, or a chain that diverges into multiple new IDs), `subject` is `null`; the consumer follows the chain entries themselves to learn which new IDs exist:
+
+```json
+{
+  "subject": null,
+  "aliased_from": {
+    "queried_id": "stale-pre-split-id",
+    "chain": [
+      {
+        "old_id": "stale-pre-split-id",
+        "new_ids": ["new-id-1", "new-id-2"],
+        "kind": "split",
+        "recorded_at_ms": 1700000001000,
+        "admin_plugin": "org.example.admin",
+        "reason": "split for distinct artists"
+      }
+    ],
+    "terminal_id": null
+  }
+}
+```
+
+**`follow_aliases: false` on a merged ID.** With auto-follow disabled the steward emits the alias envelope but does not project the terminal:
+
+```json
+{
+  "subject": null,
+  "aliased_from": {
+    "queried_id": "stale-pre-merge-id",
+    "chain": [
+      {
+        "old_id": "stale-pre-merge-id",
+        "new_ids": ["new-id-after-merge"],
+        "kind": "merged",
+        "recorded_at_ms": 1700000000000,
+        "admin_plugin": "org.example.admin"
+      }
+    ],
+    "terminal_id": "new-id-after-merge"
+  }
+}
+```
+
+The consumer can then issue a second `project_subject` against `terminal_id`, or invoke `describe_alias` (section 4.3) to inspect the chain in more detail.
+
+**Unknown ID.** A `canonical_id` that the registry has never seen returns the existing not-found error shape verbatim, with no `aliased_from` field:
+
+```json
+{ "error": "unknown subject: 00000000-0000-0000-0000-000000000000" }
+```
+
+See `SCHEMAS.md` section 4.1 for the JSON schema covering both live and alias-aware response variants.
+
+### 4.3 `op = "describe_alias"`
+
+Resolve a canonical subject ID to its alias record, alias chain, or current subject. Useful when a consumer holds an ID it knows (or suspects) was retired by a merge or split, or when it wants the alias-chain audit trail without a full projection.
+
+Request:
+
+```json
+{
+  "op": "describe_alias",
+  "subject_id": "stale-canonical-id",
+  "include_chain": true
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `op` | string | Must be `"describe_alias"`. |
+| `subject_id` | string | Canonical subject ID to inspect. |
+| `include_chain` | bool, optional | Walk the full alias chain (default `true`). When `false`, only the immediate alias record is returned (a single-hop view). |
+
+Response on success carries `ok`, the echoed `subject_id`, and a `result` object whose shape is the SDK `SubjectQueryResult` tagged enum (`kind = "found" | "aliased" | "not_found"`; `SCHEMAS.md` section 5.7). The three variants:
+
+**`kind: "found"`** — the queried ID is current; `record` carries the live `SubjectRecord` (`SCHEMAS.md` section 5.6):
+
+```json
+{
+  "ok": true,
+  "subject_id": "live-canonical-id",
+  "result": {
+    "kind": "found",
+    "record": {
+      "id": "live-canonical-id",
+      "subject_type": "track",
+      "addressings": [
+        {
+          "addressing": { "scheme": "mpd-path", "value": "/music/x.flac" },
+          "claimant": "org.example.mpd",
+          "added_at_ms": 1700000000000
+        }
+      ],
+      "created_at_ms": 1700000000000,
+      "modified_at_ms": 1700000000500
+    }
+  }
+}
+```
+
+**`kind: "aliased"`** — the queried ID was retired; `chain` is the oldest-first alias chain the steward walked, `terminal` is the live subject if the chain resolved to one or `null` if the chain forked:
+
+```json
+{
+  "ok": true,
+  "subject_id": "stale-pre-merge-id",
+  "result": {
+    "kind": "aliased",
+    "chain": [
+      {
+        "old_id": "stale-pre-merge-id",
+        "new_ids": ["new-id-after-merge"],
+        "kind": "merged",
+        "recorded_at_ms": 1700000000000,
+        "admin_plugin": "org.example.admin"
+      }
+    ],
+    "terminal": {
+      "id": "new-id-after-merge",
+      "subject_type": "track",
+      "addressings": [
+        {
+          "addressing": { "scheme": "mbid", "value": "abc-def" },
+          "claimant": "org.example.metadata",
+          "added_at_ms": 1700000000200
+        }
+      ],
+      "created_at_ms": 1700000000200,
+      "modified_at_ms": 1700000000600
+    }
+  }
+}
+```
+
+**`kind: "not_found"`** — the queried ID is unknown to the registry (never existed, no alias either):
+
+```json
+{
+  "ok": true,
+  "subject_id": "00000000-0000-0000-0000-000000000000",
+  "result": { "kind": "not_found" }
+}
+```
+
+`include_chain: false` short-circuits the steward's walk: only the immediate alias record (if any) is returned, wrapped in an `aliased` variant with a chain of length 1 and `terminal: null`. Use this when the caller wants only the merge / split metadata for a known-retired ID and not the cost of resolving to a live subject. For an ID that turns out to be current, the response collapses to `kind: "found"`; for a fully unknown ID, `kind: "not_found"` (the contract surface is `Found | Aliased | NotFound`, never a bare `null`).
+
+Maximum chain length the steward will walk is 16 hops (defence-in-depth against a pathological chain). Hitting the cap returns the partial chain with `terminal: null`; the caller can re-query the last entry's `new_ids` to continue.
+
+`SubjectQueryResult` is `#[non_exhaustive]` on the SDK side, so consumers MUST tolerate unknown `kind` values (treat as "ignore" or "log and continue", never crash). See `SCHEMAS.md` sections 5.6 and 5.7 for the SDK type schemas.
+
+### 4.4 `op = "list_active_custodies"`
 
 Snapshot the custody ledger. No arguments.
 
@@ -198,7 +408,7 @@ Response:
 
 Empty ledger returns `{"active_custodies": []}`. See `CUSTODY.md` for the record model.
 
-### 4.4 `op = "subscribe_happenings"`
+### 4.5 `op = "subscribe_happenings"`
 
 Promote the connection to streaming mode. Receive every happening the bus emits for the lifetime of the subscription.
 
@@ -477,6 +687,15 @@ interface ProjectSubjectOp {
         max_depth?: number;
         max_visits?: number;
     };
+    // Auto-follow alias chains for stale canonical IDs. Default true.
+    follow_aliases?: boolean;
+}
+
+interface DescribeAliasOp {
+    op: 'describe_alias';
+    subject_id: string;
+    // Walk the full alias chain. Default true.
+    include_chain?: boolean;
 }
 
 interface ListActiveCustodiesOp {
@@ -487,7 +706,12 @@ interface SubscribeHappeningsOp {
     op: 'subscribe_happenings';
 }
 
-type EvoRequest = RequestOp | ProjectSubjectOp | ListActiveCustodiesOp | SubscribeHappeningsOp;
+type EvoRequest =
+    | RequestOp
+    | ProjectSubjectOp
+    | DescribeAliasOp
+    | ListActiveCustodiesOp
+    | SubscribeHappeningsOp;
 
 interface RequestSuccess { payload_b64: string; }
 interface ErrorResponse { error: string; }
@@ -1008,7 +1232,108 @@ def query_and_subscribe(socket_path):
     threading.Thread(target=reconcile, daemon=True).start()
 ```
 
-### 7.5 Reconnection
+### 7.5 Caching canonical IDs across merges and splits
+
+Consumers that build a local index keyed by canonical subject ID — a frontend cache, a metadata-enrichment pipeline, an external system that mirrors evo state — face an identity-stability problem the moment an admin plugin merges or splits subjects. The pre-merge IDs continue to live in the consumer's index; the registry has retired them. A subscriber-only consumer learns about the change from the `subject_merged` / `subject_split` happening, but a one-shot consumer that wakes up holding only a cached ID needs an explicit lookup path.
+
+The alias-aware surfaces are designed for that path:
+
+- **`project_subject` with `follow_aliases: true`** (the default) lets a consumer feed a possibly-stale ID and receive the live subject's projection, plus the chain it walked. This is the cheapest path when the consumer just wants the current data.
+- **`describe_alias`** answers "is this ID still current, retired, or unknown?" without composing a projection. Use this when the consumer only needs to update its own index keys.
+- **`subscribe_happenings`** delivers `subject_merged` and `subject_split` events live. A subscribed consumer reconciles its cache as the events arrive; an unsubscribed consumer that wakes up later resolves stale IDs lazily through the two ops above.
+
+The canonical pattern combines the subscription with on-demand reconciliation. A TypeScript implementation:
+
+```typescript
+import { call, HappeningSubscription, EvoRequest } from './evo-client';
+
+// Local index keyed by canonical subject ID.
+const cache = new Map<string, SubjectProjection>();
+// Tombstones for IDs that the consumer has learned are retired.
+const aliasOf = new Map<string, string>(); // staleId -> currentId
+
+// Subscribe-and-reconcile: keep the cache live as merges and splits land.
+const sub = new HappeningSubscription('/var/run/evo/evo.sock');
+sub.on('happening', (h: any) => {
+    if (h.type === 'subject_merged') {
+        // h.source_ids: string[]; h.new_id: string
+        for (const stale of h.source_ids) {
+            cache.delete(stale);
+            aliasOf.set(stale, h.new_id);
+        }
+    } else if (h.type === 'subject_split') {
+        // h.source_id: string; h.new_ids: string[]
+        cache.delete(h.source_id);
+        // Splits forks the chain - aliasOf only carries single-hop merges,
+        // so for a split we record the source-as-retired and let the caller
+        // pick which new_id is the right one for its scenario.
+    }
+});
+
+// Lookup helper: opportunistically follow alias chains for IDs the cache
+// has flagged retired. The steward owns the authoritative chain; this
+// helper just keeps the consumer's local map current.
+async function getProjection(
+    id: string,
+    socketPath = '/var/run/evo/evo.sock',
+): Promise<SubjectProjection | null> {
+    const hit = cache.get(id);
+    if (hit) return hit;
+
+    const resp = await call<any>(socketPath, {
+        op: 'project_subject',
+        canonical_id: id,
+        follow_aliases: true,
+    });
+
+    if (resp.error) return null;
+
+    if ('aliased_from' in resp) {
+        // Steward walked a chain. Record the redirect locally so the
+        // next lookup against the stale ID is a cache hit on the live
+        // subject, and cache the projection (when present) under both
+        // the queried ID and the terminal ID.
+        const af = resp.aliased_from;
+        if (af.terminal_id) {
+            aliasOf.set(af.queried_id, af.terminal_id);
+        }
+        if (resp.subject) {
+            cache.set(resp.subject.canonical_id, resp.subject);
+            return resp.subject;
+        }
+        return null; // forked split or follow_aliases:false on the request
+    }
+
+    cache.set(resp.canonical_id, resp);
+    return resp;
+}
+```
+
+A leaner variant for consumers that only need to update index keys (no projection) replaces the `project_subject` round-trip with a single `describe_alias` call:
+
+```typescript
+async function reconcileId(
+    id: string,
+    socketPath = '/var/run/evo/evo.sock',
+): Promise<{ live: string | null; chain: AliasRecord[] }> {
+    const resp = await call<any>(socketPath, {
+        op: 'describe_alias',
+        subject_id: id,
+        include_chain: true,
+    });
+    if (!resp.ok) return { live: null, chain: [] };
+    const r = resp.result;
+    if (r.kind === 'found') return { live: r.record.id, chain: [] };
+    if (r.kind === 'aliased') {
+        return { live: r.terminal ? r.terminal.id : null, chain: r.chain };
+    }
+    return { live: null, chain: [] }; // not_found
+}
+```
+
+The two paths share the same `aliased_from` / `SubjectQueryResult` parser: chains are oldest-first, terminal is `null` when the chain forks at a split, length is bounded at 16 hops. See `SCHEMAS.md` sections 5.4-5.7 for the JSON shapes.
+
+### 7.6 Reconnection
 
 Sockets can be closed: steward restart, OS signal propagation, network administration on a shared device. Consumers should be prepared to reconnect. A simple back-off:
 
@@ -1050,6 +1375,9 @@ If any of these is essential for a consumer scenario, the right fix is a plugin 
 - `HAPPENINGS.md` - happening variant reference and delivery semantics.
 - `CUSTODY.md` - custody record model for the `list_active_custodies` and happening payloads.
 - `PROJECTIONS.md` - `project_subject` response shape.
+- `SCHEMAS.md` sections 4.1, 5.4-5.7 - JSON schemas for the alias-aware request/response shapes (`aliased_from`, `SubjectQueryResult`, `SubjectRecord`).
+- `SUBJECTS.md` section 10.4 - alias records, merge / split semantics, why the framework does not transparently follow aliases on resolve.
+- `PLUGIN_CONTRACT.md` section 5.2 - the in-process / wire `SubjectQuerier` plugin callback that mirrors the `describe_alias` op.
 - `FRONTEND.md` - positioning on where the frontend sits and what technology runs there.
 - `DEVELOPING.md` section 6 - connecting to a locally-running steward during development.
 - `BOUNDARY.md` section 3 - the client socket protocol as one of four contracts crossing the framework/distribution boundary.

@@ -95,6 +95,47 @@ Every admin-callback invocation that succeeds (including the silent `NotFound` o
 
 Reference implementation: `crates/evo-example-admin`. See `PLUGIN_AUTHORING.md` for a walkthrough.
 
+## 5.2 Alias-Aware Subject Lookup (`SubjectQuerier`)
+
+Plugins that retain canonical subject IDs across their own lifecycle — caches, indexers, anything that joins external state to a steward subject by ID — face an identity-stability problem when an admin plugin merges or splits subjects. The pre-merge IDs continue to live in the plugin's local store; the registry has retired them. The framework retains alias records indefinitely so a plugin holding a stale ID can recover the current identity, but the framework does NOT transparently follow aliases on resolve. Chasing the alias is an explicit plugin step, exposed through the `SubjectQuerier` callback on `LoadContext`.
+
+| Callback | Trait | Purpose |
+|----------|-------|---------|
+| `subject_querier` | `SubjectQuerier` | Look up the alias record for a canonical subject ID, or walk the alias chain to the live subject. Read-only. |
+
+`subject_querier` is `Option<Arc<dyn SubjectQuerier>>` on `LoadContext`. Unlike `subject_admin` and `relation_admin`, it is populated (non-None) for every admission regardless of capability or trust class: the surface is read-only, exposes only data the steward already considers public, and emits no happenings or audit entries. In-process plugins receive a registry-backed implementation; out-of-process (wire) plugins receive a wire-backed implementation that round-trips `describe_alias` / `describe_subject` frames over the same connection. Both transports observe the same shape and the same semantics; the wire path adds one round-trip per call.
+
+The trait exposes two methods. The full Rust shape lives in `evo-plugin-sdk`; both methods return boxed futures (the trait is object-safe and Arc-shared across async tasks):
+
+| Method | Returns | When to use |
+|--------|---------|-------------|
+| `describe_alias(subject_id) -> Result<Option<AliasRecord>, ReportError>` | `Some(record)` if the queried ID was retired; `None` if it is current OR unknown to the registry. | When the plugin already knows (or strongly suspects) the queried ID was retired and just wants the merge / split metadata. Single hop only. |
+| `describe_subject_with_aliases(subject_id) -> Result<SubjectQueryResult, ReportError>` | `Found { record }` if current; `Aliased { chain, terminal }` if retired; `NotFound` if unknown. | When the plugin does not yet know whether the ID is current. Walks the chain to a single live terminal where possible. |
+
+`SubjectQueryResult` is internally tagged by `kind` and is `#[non_exhaustive]`: plugins MUST tolerate future variants gracefully. See `SCHEMAS.md` section 5.7 for the JSON shape. `AliasRecord`, `SubjectRecord`, and `SubjectAddressingRecord` are documented in `SCHEMAS.md` sections 5.4 and 5.6.
+
+**Chain-walk semantics.** `describe_subject_with_aliases` walks oldest-first: the steward starts at the queried ID, follows alias records hop by hop along the merge path, and stops when one of the following becomes true:
+
+- The current ID resolves to a live subject. Returns `Found` (no hops walked) or `Aliased { chain, terminal: Some(...) }` (one or more hops, single terminal).
+- The current ID is retired and the alias entry is a `split`, OR a `merged` entry whose `new_ids` has more than one ID. The chain forks; returns `Aliased { chain, terminal: None }`. The plugin follows individual chain entries' `new_ids` itself.
+- The walk hits the framework depth cap of 16 hops without resolving. Returns `Aliased { chain, terminal: None }` with the partial chain. A real registry cannot grow an unbounded merge chain between two queries (each merge takes the alias-index lock and writes a new record), so the cap is purely defence-in-depth against pathological data.
+- The current ID is unknown to the registry (no live subject, no alias). Returns `NotFound` if the cap was never visited; otherwise the partial chain is already in `Aliased`.
+
+`terminal` is therefore `None` when the chain forks (a `split`, or a `merged` record with multiple new IDs) or when the chain hits the depth cap. It is `Some(record)` only when the chain resolved to one live subject. Plugins distinguish "fork" from "depth cap hit" by inspecting `chain` length: a chain whose last entry's `new_ids` has length more than 1 forked; a chain of length 16 hit the cap.
+
+**Error semantics.** `ReportError` is the standard SDK error type for steward-rejected operations. The variants a `SubjectQuerier` caller should expect:
+
+- `ReportError::RateLimited` — the steward is rate-limiting this plugin's reports. Back off and retry later.
+- `ReportError::ShuttingDown` — the steward is shutting down. Treat as terminal for the current `load` cycle.
+- `ReportError::Deregistered` — the plugin is no longer admitted; future calls will continue to fail.
+- `ReportError::Invalid(...)` — wire-side adapter rejected the request (malformed `subject_id`, etc.). Plugins typically do not encounter this on the in-process transport.
+
+The `*Self*Target`, `Merge*`, and `Split*` variants on `ReportError` apply only to the admin surface and never surface here. `ReportError` is `#[non_exhaustive]`; plugins MUST tolerate future variants. An empty `subject_id` is silently treated as `NotFound` / `None`; the steward does not surface a dedicated error variant for that input shape.
+
+**In-process vs wire parity.** Both transports return the same `SubjectQueryResult` and `AliasRecord` types and observe the same chain-walk rules and depth cap. The only observable difference is round-trip cost: in-process callers see the registry directly; wire callers send a `describe_alias` or `describe_subject` frame and await the matching `*_response` (or an `error` frame echoing the same cid) on the same connection. Wire frames are documented in `SCHEMAS.md` section 4.2.2; their JSON envelope is identical to other plugin-initiated requests, with `op` values `describe_alias`, `describe_alias_response`, `describe_subject`, and `describe_subject_response`.
+
+**Consumer-facing surface.** The same alias-aware semantics are also reachable from the client socket (consumers, frontends, diagnostic tools) via two new ops: `op = "describe_alias"` (a direct echo of this trait) and `op = "project_subject"` with `follow_aliases: true` (auto-follows the chain to the terminal subject and returns its projection). The plugin-side and consumer-side surfaces share the same JSON shapes for the chain and the terminal subject, so a parser written for one carries to the other. See `CLIENT_API.md` sections 4.2 and 4.3 for the consumer-side reference.
+
 ## 6. Message Framing
 
 Wire framing is identical across transports. Each message is:
