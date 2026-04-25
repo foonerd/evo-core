@@ -1,0 +1,21 @@
+# Evo v0 skeleton catalogue.
+#
+# Minimal catalogue shipped with the v0 steward skeleton. Declares one
+# rack (`example`) with one shelf (`echo`). The shipped echo plugin
+# (org.evo.example.echo) targets this shelf.
+#
+# Real distributions replace this with their domain's catalogue. For the
+# audio-player distribution (Volumio), that catalogue declares the
+# audio, audio-sources, audio-processing, artwork, metadata, networking,
+# storage, library, and other racks from CONCEPT.md.
+
+[[racks]]
+name = "example"
+family = "domain"
+kinds = ["registrar"]
+charter = "Example rack for the v0 skeleton."
+
+[[racks.shelves]]
+name = "echo"
+shape = 1
+description = "Echoes whatever payload is sent to it."

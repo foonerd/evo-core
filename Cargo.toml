@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/evo",
+    "crates/evo-example-admin",
+    "crates/evo-example-echo",
+    "crates/evo-example-warden",
+    "crates/evo-plugin-sdk",
+    "crates/evo-plugin-tool",
+    "crates/evo-trust",
+]
+
+# Further crates will be added here as they are authored. Engineering-layer
+# documents in docs/ remain the source of truth; every public type in a
+# workspace crate has a corresponding citation in those documents.
+
+[workspace.package]
+version = "0.1.8"
+edition = "2021"
+# MSRV is a framework-level choice, independent of any single
+# distribution's OS. evo-core supports an open set of distributions
+# (evo-device-<vendor> repositories) targeting Debian-based systems,
+# Yocto-based embedded Linux, FreeBSD, macOS, Android AOSP, Buildroot,
+# Alpine, and vendor-custom automotive/industrial SDKs. The MSRV
+# must be defensible on framework requirements alone, not inherited
+# from any one OS's package tree.
+#
+# Rust 1.85 (2025-02-20) stabilised Rust 2024 edition. Transitive
+# deps in our graph (clap_lex 1.x, getrandom 0.4.x's wasi backends,
+# and continuing as ecosystem adoption spreads) declare edition 2024
+# in their manifests; a framework MSRV below 1.85 makes the graph
+# unresolvable without per-crate pinning, which is unbounded
+# maintenance burden.
+#
+# 1.85 is achievable via rustup on every platform evo-core
+# distributions target. Some platforms also ship 1.85 natively
+# (Debian Trixie APT, FreeBSD ports, Alpine, Arch, Fedora, modern
+# Yocto layers); others require rustup on the build host (older
+# Debian/Ubuntu LTS, macOS, Android, older Yocto). The project does
+# not dictate which path a distribution uses; it dictates only that
+# 1.85 is the floor.
+#
+# See docs/engineering/MSRV.md for the full policy: rationale,
+# alternatives considered and rejected, per-platform availability
+# analysis, CI verification matrix across every Primary target,
+# rules for raising MSRV (valid and invalid reasons), the
+# distribution-side MSRV independence contract, and the catalogue
+# of lockfile entries whose declared rust-version exceeds 1.85
+# because they are target-gated to wasi and inert on every
+# supported target.
+#
+# See .cargo/config.toml for the MSRV-aware resolver configuration
+# that protects lockfile generation against future ecosystem shifts.
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/foonerd/evo-core"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# The SDK's trait contract uses
+#   fn foo() -> impl Future<Output = T> + Send + '_
+# rather than `async fn foo() -> T`. On stable Rust, trait-position
+# `async fn` does not carry Send bounds on the returned future, which
+# breaks the steward's tokio multi-threaded dispatch. #[async_trait]
+# boxes per call and the fast path (Plugin/Respondent/Warden/Factory)
+# rejects that allocation. See crates/evo-plugin-sdk/src/contract/mod.rs
+# "Async style" for the full rationale. Clippy's manual_async_fn
+# suggests a rewrite that is incompatible with this contract; we allow
+# it here at the workspace level so every crate inherits the decision.
+#
+# Downstream `evo-device-<vendor>` workspaces that depend on
+# evo-plugin-sdk need the same allow in their own workspace Cargo.toml.
+# Workspace lints do not propagate across workspaces.
+manual_async_fn = "allow"

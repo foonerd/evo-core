@@ -1,0 +1,4662 @@
+//! Steward-side implementations of the SDK callback traits.
+//!
+//! When the steward admits a plugin it calls `Plugin::load` with a
+//! `LoadContext` containing callback handles. This module provides those
+//! callback implementations: [`LoggingStateReporter`],
+//! [`LoggingInstanceAnnouncer`], [`LoggingUserInteractionRequester`],
+//! [`LoggingCustodyStateReporter`].
+//!
+//! v0 implementations are deliberately trivial: they log each callback
+//! invocation via `tracing` and return `Ok(())`. The steward's v0
+//! skeleton does not yet route state reports to consumers, announce
+//! instances into a subject registry, or serve user interactions. Those
+//! are future work.
+
+use evo_plugin_sdk::contract::{
+    CustodyHandle, CustodyStateReporter, ExplicitRelationAssignment,
+    ExternalAddressing, HealthStatus, InstanceAnnouncement, InstanceAnnouncer,
+    InstanceId, RelationAdmin, RelationAnnouncer, RelationAssertion,
+    RelationRetraction, ReportError, ReportPriority, SplitRelationStrategy,
+    StateReporter, SubjectAdmin, SubjectAnnouncement, SubjectAnnouncer,
+    UserInteraction, UserInteractionRequester,
+};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use crate::admin::{AdminLedger, AdminLogEntry, AdminLogKind};
+use crate::catalogue::{Cardinality, Catalogue};
+use crate::happenings::{
+    CardinalityViolationSide, Happening, HappeningBus, RelationForgottenReason,
+};
+use crate::relations::{
+    ForcedRetractClaimOutcome, RelationGraph, RelationKey,
+    ResolvedSplitAssignment, SuppressOutcome, UnsuppressOutcome,
+};
+use crate::subjects::{
+    ForcedRetractAddressingOutcome, SubjectRegistry, SubjectRetractOutcome,
+};
+
+/// A trivial state reporter that logs each report and returns success.
+///
+/// The `plugin_name` field is included in every log event so operators
+/// can filter per-plugin via `journalctl EVO_PLUGIN=<name>`.
+#[derive(Debug)]
+pub struct LoggingStateReporter {
+    plugin_name: String,
+}
+
+impl LoggingStateReporter {
+    /// Construct a reporter tagged with a plugin name.
+    pub fn new(plugin_name: impl Into<String>) -> Self {
+        Self {
+            plugin_name: plugin_name.into(),
+        }
+    }
+}
+
+impl StateReporter for LoggingStateReporter {
+    fn report<'a>(
+        &'a self,
+        payload: Vec<u8>,
+        priority: ReportPriority,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let name = self.plugin_name.clone();
+        Box::pin(async move {
+            tracing::debug!(
+                plugin = %name,
+                bytes = payload.len(),
+                priority = ?priority,
+                "state report"
+            );
+            Ok(())
+        })
+    }
+}
+
+/// A trivial instance announcer that logs each announcement and
+/// retraction and returns success.
+#[derive(Debug)]
+pub struct LoggingInstanceAnnouncer {
+    plugin_name: String,
+}
+
+impl LoggingInstanceAnnouncer {
+    /// Construct an announcer tagged with a plugin name.
+    pub fn new(plugin_name: impl Into<String>) -> Self {
+        Self {
+            plugin_name: plugin_name.into(),
+        }
+    }
+}
+
+impl InstanceAnnouncer for LoggingInstanceAnnouncer {
+    fn announce<'a>(
+        &'a self,
+        announcement: InstanceAnnouncement,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let name = self.plugin_name.clone();
+        Box::pin(async move {
+            tracing::info!(
+                plugin = %name,
+                instance = %announcement.instance_id,
+                bytes = announcement.payload.len(),
+                "instance announced"
+            );
+            Ok(())
+        })
+    }
+
+    fn retract<'a>(
+        &'a self,
+        instance_id: InstanceId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let name = self.plugin_name.clone();
+        Box::pin(async move {
+            tracing::info!(
+                plugin = %name,
+                instance = %instance_id,
+                "instance retracted"
+            );
+            Ok(())
+        })
+    }
+}
+
+/// A trivial user-interaction requester that logs and returns success.
+///
+/// In v0 there is no way to deliver the user's response back to the
+/// plugin; the steward simply acknowledges the request. Plugins should
+/// not rely on getting a response until a future pass implements
+/// consumer routing.
+#[derive(Debug)]
+pub struct LoggingUserInteractionRequester {
+    plugin_name: String,
+}
+
+impl LoggingUserInteractionRequester {
+    /// Construct a requester tagged with a plugin name.
+    pub fn new(plugin_name: impl Into<String>) -> Self {
+        Self {
+            plugin_name: plugin_name.into(),
+        }
+    }
+}
+
+impl UserInteractionRequester for LoggingUserInteractionRequester {
+    fn request<'a>(
+        &'a self,
+        interaction: UserInteraction,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let name = self.plugin_name.clone();
+        Box::pin(async move {
+            tracing::warn!(
+                plugin = %name,
+                interaction_type = %interaction.interaction_type,
+                cid = interaction.correlation_id,
+                "user interaction requested (not routed in v0)"
+            );
+            Ok(())
+        })
+    }
+}
+
+/// A trivial custody state reporter that logs each report and returns
+/// success.
+#[derive(Debug)]
+pub struct LoggingCustodyStateReporter {
+    plugin_name: String,
+}
+
+impl LoggingCustodyStateReporter {
+    /// Construct a reporter tagged with a plugin name.
+    pub fn new(plugin_name: impl Into<String>) -> Self {
+        Self {
+            plugin_name: plugin_name.into(),
+        }
+    }
+}
+
+impl CustodyStateReporter for LoggingCustodyStateReporter {
+    fn report<'a>(
+        &'a self,
+        handle: &'a CustodyHandle,
+        payload: Vec<u8>,
+        health: HealthStatus,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let name = self.plugin_name.clone();
+        let handle_id = handle.id.clone();
+        Box::pin(async move {
+            tracing::debug!(
+                plugin = %name,
+                custody = %handle_id,
+                bytes = payload.len(),
+                health = ?health,
+                "custody state report"
+            );
+            Ok(())
+        })
+    }
+}
+
+/// Subject announcer backed by the subject registry.
+///
+/// Translates plugin announce/retract calls into registry operations,
+/// tagging every claim with the plugin's name. Before each announce
+/// the catalogue is consulted to verify that the announced subject
+/// type is declared; undeclared types are refused with
+/// `ReportError::Invalid` before the registry is touched.
+/// Retraction does not carry a subject type and skips the check.
+///
+/// The announcer also owns the subject-forget cascade surface.
+/// On retract, when the registry's
+/// [`SubjectRetractOutcome`] reports `SubjectForgotten` (the
+/// retracted addressing was the subject's last), the announcer:
+///
+/// 1. Emits
+///    [`Happening::SubjectForgotten`](crate::happenings::Happening::SubjectForgotten).
+/// 2. Calls
+///    [`RelationGraph::forget_all_touching`](crate::relations::RelationGraph::forget_all_touching)
+///    to cascade-remove every edge the forgotten subject
+///    participates in (as source or target), irrespective of
+///    remaining claimants per `RELATIONS.md` section 8.3.
+/// 3. Emits one
+///    [`Happening::RelationForgotten`](crate::happenings::Happening::RelationForgotten)
+///    per cascaded edge with
+///    [`RelationForgottenReason::SubjectCascade`].
+///
+/// The subject happening fires BEFORE the cascade relation
+/// happenings so subscribers that react to a subject-forgotten
+/// event see it before the edge events that name the same subject.
+#[derive(Debug)]
+pub struct RegistrySubjectAnnouncer {
+    registry: Arc<SubjectRegistry>,
+    graph: Arc<RelationGraph>,
+    catalogue: Arc<Catalogue>,
+    bus: Arc<HappeningBus>,
+    plugin_name: String,
+}
+
+impl RegistrySubjectAnnouncer {
+    /// Construct an announcer that writes to the given registry,
+    /// tagging claims with the given plugin name.
+    ///
+    /// The `catalogue` Arc is consulted on every announce to
+    /// validate that the subject type is one the catalogue declared.
+    /// The `graph` and `bus` Arcs are used by the retract path's
+    /// cascade: on subject-forget the announcer cascades the
+    /// removal into the graph via
+    /// [`RelationGraph::forget_all_touching`](crate::relations::RelationGraph::forget_all_touching)
+    /// and emits structured
+    /// [`Happening::SubjectForgotten`](crate::happenings::Happening::SubjectForgotten)
+    /// and
+    /// [`Happening::RelationForgotten`](crate::happenings::Happening::RelationForgotten)
+    /// events on the bus.
+    pub fn new(
+        registry: Arc<SubjectRegistry>,
+        graph: Arc<RelationGraph>,
+        catalogue: Arc<Catalogue>,
+        bus: Arc<HappeningBus>,
+        plugin_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            registry,
+            graph,
+            catalogue,
+            bus,
+            plugin_name: plugin_name.into(),
+        }
+    }
+}
+
+impl SubjectAnnouncer for RegistrySubjectAnnouncer {
+    fn announce<'a>(
+        &'a self,
+        announcement: SubjectAnnouncement,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        let catalogue = Arc::clone(&self.catalogue);
+        let plugin_name = self.plugin_name.clone();
+        Box::pin(async move {
+            // Subject-type existence validation at announcement.
+            // The announced subject type must correspond to a type
+            // the catalogue declared; an undeclared type is refused
+            // before the registry sees it, keeping the registry's
+            // vocabulary bounded to the catalogue's declared set.
+            // Retraction carries no subject type and is not gated
+            // by this check.
+            if catalogue
+                .find_subject_type(&announcement.subject_type)
+                .is_none()
+            {
+                return Err(ReportError::Invalid(format!(
+                    "announce: subject type {:?} is not declared in \
+                     the catalogue",
+                    announcement.subject_type
+                )));
+            }
+            match registry.announce(&announcement, &plugin_name) {
+                Ok(_outcome) => Ok(()),
+                Err(e) => Err(ReportError::Invalid(format!("announce: {e}"))),
+            }
+        })
+    }
+
+    fn retract<'a>(
+        &'a self,
+        addressing: ExternalAddressing,
+        reason: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        let graph = Arc::clone(&self.graph);
+        let bus = Arc::clone(&self.bus);
+        let plugin_name = self.plugin_name.clone();
+        Box::pin(async move {
+            let outcome =
+                match registry.retract(&addressing, &plugin_name, reason) {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        return Err(ReportError::Invalid(format!(
+                            "retract: {e}"
+                        )));
+                    }
+                };
+
+            match outcome {
+                // Subject survives: no cascade, no happenings
+                // at this layer. The addressing-level events
+                // remain tracing-only pending the broader
+                // happenings expansion.
+                SubjectRetractOutcome::AddressingRemoved => Ok(()),
+                // Subject forgotten: fire the subject happening
+                // first, then cascade into the relation graph and
+                // fire one relation happening per removed edge.
+                // Ordering is load-bearing per the
+                // `RegistrySubjectAnnouncer` doc comment: every
+                // subscriber that reacts to
+                // `Happening::SubjectForgotten` by cleaning up
+                // auxiliary state sees that event BEFORE the
+                // cascade `Happening::RelationForgotten` events
+                // that name the same subject as source or target.
+                SubjectRetractOutcome::SubjectForgotten {
+                    canonical_id,
+                    subject_type,
+                } => {
+                    let at = SystemTime::now();
+
+                    // 1. Subject happening.
+                    bus.emit(Happening::SubjectForgotten {
+                        plugin: plugin_name.clone(),
+                        canonical_id: canonical_id.clone(),
+                        subject_type,
+                        at,
+                    });
+
+                    // 2. Storage cascade. The graph returns the
+                    // keys of every removed edge; we iterate them
+                    // to fire the per-edge happenings.
+                    let removed = graph.forget_all_touching(&canonical_id);
+
+                    // 3. One happening per removed edge. Uses the
+                    // same `at` timestamp as the subject happening
+                    // to pin the ordering on the wire (subscribers
+                    // that sort by timestamp see the subject event
+                    // first-or-equal; the emission order on the
+                    // broadcast channel is the authoritative order
+                    // for tie-breaking).
+                    for key in removed {
+                        bus.emit(Happening::RelationForgotten {
+                            plugin: plugin_name.clone(),
+                            source_id: key.source_id,
+                            predicate: key.predicate,
+                            target_id: key.target_id,
+                            reason: RelationForgottenReason::SubjectCascade {
+                                forgotten_subject: canonical_id.clone(),
+                            },
+                            at,
+                        });
+                    }
+
+                    Ok(())
+                }
+            }
+        })
+    }
+}
+
+/// Relation announcer backed by the relation graph and subject
+/// registry.
+///
+/// Resolves the external addressings in an assertion to canonical
+/// subject IDs via the subject registry, then calls the graph's
+/// `assert` or `retract`. Enforces three catalogue-driven rules at
+/// the wiring layer so the storage graph stays a pure data
+/// structure:
+///
+/// 1. Predicate-existence: refuses `Invalid` when the assertion
+///    or retraction names a predicate the catalogue did not
+///    declare.
+/// 2. Type-constraint: refuses `Invalid` when the resolved source
+///    or target subject's declared type is not accepted by the
+///    predicate's `source_type` / `target_type`.
+/// 3. Cardinality warning: after a successful `assert` the
+///    announcer consults the graph's `forward_count` and
+///    `inverse_count` and, if a declared `AtMostOne` or
+///    `ExactlyOne` bound is now exceeded on either side, logs a
+///    warning and emits a
+///    [`Happening::RelationCardinalityViolation`] on the
+///    happenings bus. The assertion is not refused; per
+///    `RELATIONS.md` section 7.1 both the new and any pre-existing
+///    relations are retained and consumers decide how to reconcile.
+///
+/// Retraction runs the predicate-existence check symmetrically
+/// (rationale: a retraction whose matching assert would itself have
+/// been refused is a caller bug against a stale or wrong
+/// catalogue). Type-constraint and cardinality checks do not apply
+/// on retract because retraction only removes a claim on an already
+/// stored relation; it cannot produce a new type or cardinality
+/// violation.
+#[derive(Debug)]
+pub struct RegistryRelationAnnouncer {
+    registry: Arc<SubjectRegistry>,
+    graph: Arc<RelationGraph>,
+    catalogue: Arc<Catalogue>,
+    bus: Arc<HappeningBus>,
+    plugin_name: String,
+}
+
+impl RegistryRelationAnnouncer {
+    /// Construct an announcer that resolves addressings via `registry`
+    /// and writes relations into `graph`, tagging claims with the
+    /// given plugin name. The `catalogue` Arc is consulted on every
+    /// assertion and retraction to validate the predicate and
+    /// type-constraint grammar; the `bus` Arc is used to emit
+    /// cardinality-violation happenings after successful asserts.
+    pub fn new(
+        registry: Arc<SubjectRegistry>,
+        graph: Arc<RelationGraph>,
+        catalogue: Arc<Catalogue>,
+        bus: Arc<HappeningBus>,
+        plugin_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            registry,
+            graph,
+            catalogue,
+            bus,
+            plugin_name: plugin_name.into(),
+        }
+    }
+}
+
+/// Returns `true` if a bound of this [`Cardinality`] value is
+/// *exceeded* when the observed count reaches `count`.
+///
+/// Per `RELATIONS.md` section 7.1 only the upper-bound variants
+/// (`AtMostOne`, `ExactlyOne`) produce a violation on assert: the
+/// violating assert must have pushed the count past one. The
+/// lower-bound variant (`AtLeastOne`) cannot be violated by an
+/// assert (adding a relation can only make the count go up); its
+/// enforcement is a retract-time or startup-time concern outside
+/// this assert-side check. `Many` is never violated.
+fn cardinality_exceeded(bound: Cardinality, count: usize) -> bool {
+    match bound {
+        Cardinality::AtMostOne | Cardinality::ExactlyOne => count > 1,
+        Cardinality::AtLeastOne | Cardinality::Many => false,
+    }
+}
+
+impl RelationAnnouncer for RegistryRelationAnnouncer {
+    fn assert<'a>(
+        &'a self,
+        assertion: RelationAssertion,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        let graph = Arc::clone(&self.graph);
+        let catalogue = Arc::clone(&self.catalogue);
+        let bus = Arc::clone(&self.bus);
+        let plugin_name = self.plugin_name.clone();
+        Box::pin(async move {
+            // Predicate existence validation at assertion. The
+            // predicate name on every assertion must correspond
+            // to a predicate the catalogue declared.
+            let predicate = catalogue
+                .find_predicate(&assertion.predicate)
+                .ok_or_else(|| {
+                    ReportError::Invalid(format!(
+                        "assert: predicate {:?} is not declared in \
+                             the catalogue",
+                        assertion.predicate
+                    ))
+                })?;
+
+            let source_id =
+                registry.resolve(&assertion.source).ok_or_else(|| {
+                    ReportError::Invalid(format!(
+                        "assert: source addressing {} is not registered",
+                        assertion.source
+                    ))
+                })?;
+            let target_id =
+                registry.resolve(&assertion.target).ok_or_else(|| {
+                    ReportError::Invalid(format!(
+                        "assert: target addressing {} is not registered",
+                        assertion.target
+                    ))
+                })?;
+
+            // Type-constraint enforcement. Resolved subjects must
+            // have declared types satisfying the predicate's
+            // source_type and target_type constraints. The subject
+            // registry is the authority for the subjects' types;
+            // the catalogue is the authority for the constraints.
+            let source_record =
+                registry.describe(&source_id).ok_or_else(|| {
+                    ReportError::Invalid(format!(
+                        "assert: source {} resolved but no record found",
+                        source_id
+                    ))
+                })?;
+            let target_record =
+                registry.describe(&target_id).ok_or_else(|| {
+                    ReportError::Invalid(format!(
+                        "assert: target {} resolved but no record found",
+                        target_id
+                    ))
+                })?;
+            if !predicate.source_type.accepts(&source_record.subject_type) {
+                return Err(ReportError::Invalid(format!(
+                    "assert: source subject type {:?} is not accepted by \
+                     predicate {:?} source_type constraint",
+                    source_record.subject_type, assertion.predicate
+                )));
+            }
+            if !predicate.target_type.accepts(&target_record.subject_type) {
+                return Err(ReportError::Invalid(format!(
+                    "assert: target subject type {:?} is not accepted by \
+                     predicate {:?} target_type constraint",
+                    target_record.subject_type, assertion.predicate
+                )));
+            }
+
+            // All gates passed; store the relation.
+            graph
+                .assert(
+                    &source_id,
+                    &assertion.predicate,
+                    &target_id,
+                    &plugin_name,
+                    assertion.reason,
+                )
+                .map_err(|e| ReportError::Invalid(format!("assert: {e}")))?;
+
+            // Cardinality-violation detection. Runs AFTER the
+            // graph accepts the assert so the counts reflect the
+            // new storage state. `RELATIONS.md` section 7.1
+            // specifies storage is permissive: the happening is
+            // the observable signal, not a refusal. Both sides
+            // are checked independently since an assertion can
+            // violate either, both, or neither bound. The
+            // happenings are fire-and-forget; a bus with no
+            // subscribers silently drops the event.
+            let source_count =
+                graph.forward_count(&source_id, &assertion.predicate);
+            if cardinality_exceeded(predicate.source_cardinality, source_count)
+            {
+                tracing::warn!(
+                    plugin = %plugin_name,
+                    predicate = %assertion.predicate,
+                    source = %source_id,
+                    target = %target_id,
+                    declared = ?predicate.source_cardinality,
+                    observed_count = source_count,
+                    "RelationCardinalityViolation on source side"
+                );
+                bus.emit(Happening::RelationCardinalityViolation {
+                    plugin: plugin_name.clone(),
+                    predicate: assertion.predicate.clone(),
+                    source_id: source_id.clone(),
+                    target_id: target_id.clone(),
+                    side: CardinalityViolationSide::Source,
+                    declared: predicate.source_cardinality,
+                    observed_count: source_count,
+                    at: SystemTime::now(),
+                });
+            }
+            let target_count =
+                graph.inverse_count(&target_id, &assertion.predicate);
+            if cardinality_exceeded(predicate.target_cardinality, target_count)
+            {
+                tracing::warn!(
+                    plugin = %plugin_name,
+                    predicate = %assertion.predicate,
+                    source = %source_id,
+                    target = %target_id,
+                    declared = ?predicate.target_cardinality,
+                    observed_count = target_count,
+                    "RelationCardinalityViolation on target side"
+                );
+                bus.emit(Happening::RelationCardinalityViolation {
+                    plugin: plugin_name.clone(),
+                    predicate: assertion.predicate.clone(),
+                    source_id: source_id.clone(),
+                    target_id: target_id.clone(),
+                    side: CardinalityViolationSide::Target,
+                    declared: predicate.target_cardinality,
+                    observed_count: target_count,
+                    at: SystemTime::now(),
+                });
+            }
+
+            Ok(())
+        })
+    }
+
+    fn retract<'a>(
+        &'a self,
+        retraction: RelationRetraction,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        let graph = Arc::clone(&self.graph);
+        let catalogue = Arc::clone(&self.catalogue);
+        let bus = Arc::clone(&self.bus);
+        let plugin_name = self.plugin_name.clone();
+        Box::pin(async move {
+            // Predicate existence validation, applied symmetrically
+            // to retraction. An undeclared predicate on retract is
+            // a caller bug (the matching assert would itself have
+            // been refused); refusing here keeps the check in one
+            // place and the error surface consistent between
+            // assert and retract. Type-constraint and cardinality
+            // checks do not apply on retract: a retract cannot
+            // introduce a new type or push a count over a bound.
+            if catalogue.find_predicate(&retraction.predicate).is_none() {
+                return Err(ReportError::Invalid(format!(
+                    "retract: predicate {:?} is not declared in the catalogue",
+                    retraction.predicate
+                )));
+            }
+
+            let source_id =
+                registry.resolve(&retraction.source).ok_or_else(|| {
+                    ReportError::Invalid(format!(
+                        "retract: source addressing {} is not registered",
+                        retraction.source
+                    ))
+                })?;
+            let target_id =
+                registry.resolve(&retraction.target).ok_or_else(|| {
+                    ReportError::Invalid(format!(
+                        "retract: target addressing {} is not registered",
+                        retraction.target
+                    ))
+                })?;
+
+            let predicate = retraction.predicate.clone();
+            let outcome = graph
+                .retract(
+                    &source_id,
+                    &predicate,
+                    &target_id,
+                    &plugin_name,
+                    retraction.reason,
+                )
+                .map_err(|e| ReportError::Invalid(format!("retract: {e}")))?;
+
+            // Fire RelationForgotten with reason ClaimsRetracted
+            // when the last claimant retracted and the graph
+            // removed the relation. The ClaimRemoved outcome
+            // keeps the relation alive with other claimants; it
+            // emits no happening at this layer (claim-level
+            // events remain tracing-only pending the broader
+            // happenings expansion).
+            if matches!(
+                outcome,
+                crate::relations::RelationRetractOutcome::RelationForgotten
+            ) {
+                bus.emit(Happening::RelationForgotten {
+                    plugin: plugin_name.clone(),
+                    source_id,
+                    predicate,
+                    target_id,
+                    reason: RelationForgottenReason::ClaimsRetracted {
+                        retracting_plugin: plugin_name,
+                    },
+                    at: SystemTime::now(),
+                });
+            }
+
+            Ok(())
+        })
+    }
+}
+
+/// Privileged subject administration announcer.
+///
+/// Handed to admin plugins through
+/// [`LoadContext::subject_admin`](evo_plugin_sdk::contract::LoadContext::subject_admin)
+/// when their manifest declares `capabilities.admin = true` AND
+/// their effective trust class is at or above
+/// [`evo_trust::ADMIN_MINIMUM_TRUST`]. Non-admin plugins see
+/// `None` for that field.
+///
+/// Wiring-layer responsibilities that sit on top of the storage
+/// primitive
+/// ([`SubjectRegistry::forced_retract_addressing`](crate::subjects::SubjectRegistry::forced_retract_addressing)):
+///
+/// 1. Refuse `target_plugin == self admin_plugin` with
+///    [`ReportError::Invalid`] to preserve provenance integrity.
+/// 2. On [`ForcedRetractAddressingOutcome::AddressingRemoved`]:
+///    emit [`Happening::SubjectAddressingForcedRetract`] and
+///    record an [`AdminLedger`] entry.
+/// 3. On [`ForcedRetractAddressingOutcome::SubjectForgotten`]:
+///    emit `Happening::SubjectAddressingForcedRetract` FIRST,
+///    then [`Happening::SubjectForgotten`], then cascade into the
+///    relation graph and emit one
+///    [`Happening::RelationForgotten`] per removed edge with
+///    reason
+///    [`RelationForgottenReason::SubjectCascade`]. Record the
+///    audit-log entry after the cascade.
+/// 4. On [`ForcedRetractAddressingOutcome::NotFound`]: return
+///    `Ok(())` silently and do not log to the ledger. Admin tooling
+///    can sweep without error noise for entries already cleaned.
+#[derive(Debug)]
+pub struct RegistrySubjectAdmin {
+    registry: Arc<SubjectRegistry>,
+    graph: Arc<RelationGraph>,
+    catalogue: Arc<Catalogue>,
+    bus: Arc<HappeningBus>,
+    ledger: Arc<AdminLedger>,
+    admin_plugin: String,
+}
+
+impl RegistrySubjectAdmin {
+    /// Construct a subject-admin announcer bound to the shared
+    /// registry, graph, catalogue, happenings bus, and admin
+    /// ledger, tagged with the admin plugin's canonical name.
+    ///
+    /// The `catalogue` Arc is held today for symmetry with the
+    /// existing [`RegistrySubjectAnnouncer`] surface; future SDK
+    /// extensions use it for the split primitive's subject-type
+    /// invariants, so carrying it now avoids a follow-up signature
+    /// change.
+    pub fn new(
+        registry: Arc<SubjectRegistry>,
+        graph: Arc<RelationGraph>,
+        catalogue: Arc<Catalogue>,
+        bus: Arc<HappeningBus>,
+        ledger: Arc<AdminLedger>,
+        admin_plugin: impl Into<String>,
+    ) -> Self {
+        Self {
+            registry,
+            graph,
+            catalogue,
+            bus,
+            ledger,
+            admin_plugin: admin_plugin.into(),
+        }
+    }
+}
+
+impl SubjectAdmin for RegistrySubjectAdmin {
+    fn forced_retract_addressing<'a>(
+        &'a self,
+        target_plugin: String,
+        addressing: ExternalAddressing,
+        reason: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        let graph = Arc::clone(&self.graph);
+        let bus = Arc::clone(&self.bus);
+        let ledger = Arc::clone(&self.ledger);
+        let admin_plugin = self.admin_plugin.clone();
+        // Carry a catalogue Arc clone for parity with the
+        // announcer pattern; unused on the retract path today
+        // but reserved for the future split path. The reference
+        // is dropped when the future resolves; no runtime cost
+        // beyond one Arc clone.
+        let _catalogue = Arc::clone(&self.catalogue);
+        Box::pin(async move {
+            // Provenance invariant: admin cannot retract its own
+            // claims via this path. A self-targeted forced retract
+            // would record in the audit ledger that the admin
+            // retracted another plugin's claim when in fact it
+            // retracted its own, corrupting provenance.
+            if target_plugin == admin_plugin {
+                return Err(ReportError::Invalid(format!(
+                    "forced_retract_addressing: admin plugin {admin_plugin} \
+                     may not target its own claims via the admin path"
+                )));
+            }
+
+            let outcome = registry
+                .forced_retract_addressing(
+                    &addressing,
+                    &target_plugin,
+                    &admin_plugin,
+                    reason.clone(),
+                )
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "forced_retract_addressing: {e}"
+                    ))
+                })?;
+
+            match outcome {
+                // Silent no-op: addressing was absent or claimed
+                // by a different plugin. No happening, no audit
+                // entry.
+                ForcedRetractAddressingOutcome::NotFound => Ok(()),
+
+                // Addressing removed, subject survives. Emit the
+                // admin happening; record the audit entry. The
+                // canonical_id in the outcome identifies the
+                // surviving subject so subscribers can correlate
+                // the happening with the subject that still
+                // exists.
+                ForcedRetractAddressingOutcome::AddressingRemoved {
+                    canonical_id,
+                } => {
+                    let at = SystemTime::now();
+
+                    bus.emit(Happening::SubjectAddressingForcedRetract {
+                        admin_plugin: admin_plugin.clone(),
+                        target_plugin: target_plugin.clone(),
+                        canonical_id: canonical_id.clone(),
+                        scheme: addressing.scheme.clone(),
+                        value: addressing.value.clone(),
+                        reason: reason.clone(),
+                        at,
+                    });
+
+                    ledger.record(AdminLogEntry {
+                        kind: AdminLogKind::SubjectAddressingForcedRetract,
+                        admin_plugin: admin_plugin.clone(),
+                        target_plugin: Some(target_plugin),
+                        target_subject: Some(canonical_id),
+                        target_addressing: Some(addressing),
+                        target_relation: None,
+                        additional_subjects: Vec::new(),
+                        reason,
+                        at,
+                    });
+                    Ok(())
+                }
+
+                // Subject forgotten: cascade discipline. Ordering
+                // is load-bearing per the struct-level doc: the
+                // admin happening fires FIRST, then the subject
+                // happening, then the per-edge cascade events.
+                ForcedRetractAddressingOutcome::SubjectForgotten {
+                    canonical_id,
+                    subject_type,
+                } => {
+                    let at = SystemTime::now();
+
+                    // 1. Admin happening with the forgotten
+                    //    subject's canonical ID.
+                    bus.emit(Happening::SubjectAddressingForcedRetract {
+                        admin_plugin: admin_plugin.clone(),
+                        target_plugin: target_plugin.clone(),
+                        canonical_id: canonical_id.clone(),
+                        scheme: addressing.scheme.clone(),
+                        value: addressing.value.clone(),
+                        reason: reason.clone(),
+                        at,
+                    });
+
+                    // 2. Subject forgotten. The `plugin` field on
+                    //    the subject happening names the admin
+                    //    plugin (not the target) because the
+                    //    admin's action caused the forget.
+                    bus.emit(Happening::SubjectForgotten {
+                        plugin: admin_plugin.clone(),
+                        canonical_id: canonical_id.clone(),
+                        subject_type,
+                        at,
+                    });
+
+                    // 3. Cascade into the relation graph and fire
+                    //    one RelationForgotten per removed edge.
+                    let removed = graph.forget_all_touching(&canonical_id);
+                    for key in removed {
+                        bus.emit(Happening::RelationForgotten {
+                            plugin: admin_plugin.clone(),
+                            source_id: key.source_id,
+                            predicate: key.predicate,
+                            target_id: key.target_id,
+                            reason: RelationForgottenReason::SubjectCascade {
+                                forgotten_subject: canonical_id.clone(),
+                            },
+                            at,
+                        });
+                    }
+
+                    // 4. Audit ledger entry records the admin
+                    //    action, with the forgotten subject's
+                    //    canonical ID for cross-reference.
+                    ledger.record(AdminLogEntry {
+                        kind: AdminLogKind::SubjectAddressingForcedRetract,
+                        admin_plugin: admin_plugin.clone(),
+                        target_plugin: Some(target_plugin),
+                        target_subject: Some(canonical_id),
+                        target_addressing: Some(addressing),
+                        target_relation: None,
+                        additional_subjects: Vec::new(),
+                        reason,
+                        at,
+                    });
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    /// Merge two canonical subjects into one.
+    ///
+    /// Wiring discipline:
+    ///
+    /// 1. Resolve `target_a` and `target_b` to canonical IDs via
+    ///    the registry. Unresolvable addressings are refused with
+    ///    [`ReportError::Invalid`]: merge is a deliberate operator
+    ///    action, not a sweep, so a silent no-op would mask
+    ///    typos.
+    /// 2. Call
+    ///    [`SubjectRegistry::merge_aliases`](crate::subjects::SubjectRegistry::merge_aliases)
+    ///    to retire both source IDs, install alias records, and
+    ///    obtain the new canonical ID.
+    /// 3. Per ADR-0004, emit
+    ///    [`Happening::SubjectMerged`] BEFORE the relation-graph
+    ///    rewrite so subscribers see the identity transition
+    ///    before any post-rewrite cardinality violations.
+    /// 4. Call
+    ///    [`RelationGraph::rewrite_subject_to`](crate::relations::RelationGraph::rewrite_subject_to)
+    ///    once per source ID, relabelling every edge mentioning
+    ///    the old IDs to mention the new one. Duplicate triples
+    ///    collapse with claim-set union per `RELATIONS.md`
+    ///    section 8.1.
+    /// 5. Record an [`AdminLedger`] entry with `kind =
+    ///    SubjectMerge`, `target_subject = new_id`,
+    ///    `additional_subjects = [source_a_id, source_b_id]`.
+    fn merge<'a>(
+        &'a self,
+        target_a: ExternalAddressing,
+        target_b: ExternalAddressing,
+        reason: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        let graph = Arc::clone(&self.graph);
+        let bus = Arc::clone(&self.bus);
+        let ledger = Arc::clone(&self.ledger);
+        let admin_plugin = self.admin_plugin.clone();
+        let _catalogue = Arc::clone(&self.catalogue);
+        Box::pin(async move {
+            let source_a_id = registry.resolve(&target_a).ok_or_else(|| {
+                ReportError::Invalid(format!(
+                    "merge: target_a addressing {target_a} is not registered"
+                ))
+            })?;
+            let source_b_id = registry.resolve(&target_b).ok_or_else(|| {
+                ReportError::Invalid(format!(
+                    "merge: target_b addressing {target_b} is not registered"
+                ))
+            })?;
+
+            // Storage primitive: produces a new canonical ID and
+            // installs alias records. Cross-type and self-merge
+            // refusals come back as Dispatch errors from the
+            // primitive; surface them as Invalid here.
+            let new_id = registry
+                .merge_aliases(
+                    &source_a_id,
+                    &source_b_id,
+                    &admin_plugin,
+                    reason.clone(),
+                )
+                .map_err(|e| ReportError::Invalid(format!("merge: {e}")))?;
+
+            // Per ADR-0004, admin happening fires BEFORE the
+            // structural cascade. Emit SubjectMerged before the
+            // graph rewrite so subscribers see the identity
+            // transition before any cardinality-violation
+            // happenings the rewrite triggers.
+            let at = SystemTime::now();
+            bus.emit(Happening::SubjectMerged {
+                admin_plugin: admin_plugin.clone(),
+                source_ids: vec![source_a_id.clone(), source_b_id.clone()],
+                new_id: new_id.clone(),
+                reason: reason.clone(),
+                at,
+            });
+
+            // Rewrite the graph: every edge mentioning either
+            // source ID is relabelled to new_id. The two calls
+            // are independent; the second sees the post-first
+            // state and may collapse further if the rewritten
+            // edges from source_a coincide with edges already
+            // touched by source_b.
+            graph
+                .rewrite_subject_to(&source_a_id, &new_id)
+                .map_err(|e| {
+                    ReportError::Invalid(format!("merge graph: {e}"))
+                })?;
+            graph
+                .rewrite_subject_to(&source_b_id, &new_id)
+                .map_err(|e| {
+                    ReportError::Invalid(format!("merge graph: {e}"))
+                })?;
+
+            ledger.record(AdminLogEntry {
+                kind: AdminLogKind::SubjectMerge,
+                admin_plugin: admin_plugin.clone(),
+                target_plugin: None,
+                target_subject: Some(new_id),
+                target_addressing: None,
+                target_relation: None,
+                additional_subjects: vec![source_a_id, source_b_id],
+                reason,
+                at,
+            });
+
+            Ok(())
+        })
+    }
+
+    /// Split one canonical subject into two or more.
+    ///
+    /// Wiring discipline:
+    ///
+    /// 1. Resolve `source` to its canonical ID; refuse with
+    ///    [`ReportError::Invalid`] when unresolvable.
+    /// 2. Resolve every [`ExplicitRelationAssignment`]'s source
+    ///    and target addressings to canonical IDs BEFORE the
+    ///    registry split runs: after the split, the source's
+    ///    addressings are re-pointed to the new IDs and resolution
+    ///    would yield post-split IDs, breaking the match against
+    ///    the graph's pre-split triples. Assignments whose
+    ///    addressings do not resolve are silently dropped — they
+    ///    cannot match a real relation and the storage primitive's
+    ///    ambiguous-edge reporting still surfaces any unmatched
+    ///    relations.
+    /// 3. Call
+    ///    [`SubjectRegistry::split_subject`](crate::subjects::SubjectRegistry::split_subject)
+    ///    to retire the source ID and produce N new canonical
+    ///    IDs.
+    /// 4. Per ADR-0004, emit [`Happening::SubjectSplit`] BEFORE
+    ///    the per-edge graph rewrite.
+    /// 5. Call
+    ///    [`RelationGraph::split_relations`](crate::relations::RelationGraph::split_relations)
+    ///    to distribute every relation involving the source
+    ///    across the new IDs per `strategy`. Surface each
+    ///    [`AmbiguousEdge`](crate::relations::AmbiguousEdge) as
+    ///    a [`Happening::RelationSplitAmbiguous`] event AFTER the
+    ///    `SubjectSplit` event.
+    /// 6. Record an [`AdminLedger`] entry with `kind =
+    ///    SubjectSplit`, `target_subject = source_id` (the OLD
+    ///    ID, for cross-reference), `additional_subjects =
+    ///    new_ids`.
+    fn split<'a>(
+        &'a self,
+        source: ExternalAddressing,
+        partition: Vec<Vec<ExternalAddressing>>,
+        strategy: SplitRelationStrategy,
+        explicit_assignments: Vec<ExplicitRelationAssignment>,
+        reason: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        let graph = Arc::clone(&self.graph);
+        let bus = Arc::clone(&self.bus);
+        let ledger = Arc::clone(&self.ledger);
+        let admin_plugin = self.admin_plugin.clone();
+        let _catalogue = Arc::clone(&self.catalogue);
+        Box::pin(async move {
+            let source_id = registry.resolve(&source).ok_or_else(|| {
+                ReportError::Invalid(format!(
+                    "split: source addressing {source} is not registered"
+                ))
+            })?;
+
+            // Resolve assignments BEFORE the registry split. After
+            // the split, the addressings re-point to new IDs, so
+            // resolving them then would not match the pre-split
+            // triples in the graph. Filter-mapped silently:
+            // unresolvable assignment addressings cannot match any
+            // real graph triple anyway, and the storage
+            // primitive's ambiguous-edge reporting will surface
+            // any unmatched relations as RelationSplitAmbiguous
+            // events.
+            let resolved_assignments: Vec<ResolvedSplitAssignment> =
+                explicit_assignments
+                    .into_iter()
+                    .filter_map(|a| {
+                        let s = registry.resolve(&a.source)?;
+                        let t = registry.resolve(&a.target)?;
+                        Some(ResolvedSplitAssignment {
+                            source_id: s,
+                            predicate: a.predicate,
+                            target_id: t,
+                            target_new_id: a.target_new_id.as_str().to_string(),
+                        })
+                    })
+                    .collect();
+
+            // Storage primitive: registers N new subjects and
+            // retires the source ID with an alias record carrying
+            // every new ID.
+            let new_ids = registry
+                .split_subject(
+                    &source_id,
+                    partition,
+                    &admin_plugin,
+                    reason.clone(),
+                )
+                .map_err(|e| ReportError::Invalid(format!("split: {e}")))?;
+
+            // Per ADR-0004, admin happening before structural
+            // cascade. SubjectSplit fires before per-edge
+            // distribution and before any RelationSplitAmbiguous
+            // events that follow.
+            let at = SystemTime::now();
+            bus.emit(Happening::SubjectSplit {
+                admin_plugin: admin_plugin.clone(),
+                source_id: source_id.clone(),
+                new_ids: new_ids.clone(),
+                strategy,
+                reason: reason.clone(),
+                at,
+            });
+
+            // Distribute relations across the new IDs.
+            let outcome = graph
+                .split_relations(
+                    &source_id,
+                    &new_ids,
+                    strategy,
+                    &resolved_assignments,
+                )
+                .map_err(|e| {
+                    ReportError::Invalid(format!("split graph: {e}"))
+                })?;
+
+            // One RelationSplitAmbiguous per Explicit-strategy
+            // gap. Same `at` timestamp pins ordering on the wire.
+            for edge in outcome.ambiguous {
+                bus.emit(Happening::RelationSplitAmbiguous {
+                    admin_plugin: admin_plugin.clone(),
+                    source_subject: edge.source_subject,
+                    predicate: edge.predicate,
+                    other_endpoint_id: edge.other_endpoint_id,
+                    candidate_new_ids: edge.candidate_new_ids,
+                    at,
+                });
+            }
+
+            ledger.record(AdminLogEntry {
+                kind: AdminLogKind::SubjectSplit,
+                admin_plugin: admin_plugin.clone(),
+                target_plugin: None,
+                target_subject: Some(source_id),
+                target_addressing: None,
+                target_relation: None,
+                additional_subjects: new_ids,
+                reason,
+                at,
+            });
+
+            Ok(())
+        })
+    }
+}
+
+/// Privileged relation administration announcer.
+///
+/// Parallel to [`RegistrySubjectAdmin`] for relation claims.
+/// Handed to admin plugins through
+/// [`LoadContext::relation_admin`](evo_plugin_sdk::contract::LoadContext::relation_admin)
+/// on the same gating rules.
+///
+/// Wiring-layer responsibilities on top of
+/// [`RelationGraph::forced_retract_claim`](crate::relations::RelationGraph::forced_retract_claim):
+///
+/// 1. Refuse `target_plugin == self admin_plugin` with
+///    [`ReportError::Invalid`].
+/// 2. Resolve `source` and `target` addressings via the registry.
+///    Unresolvable addressings are a silent no-op (NotFound
+///    discipline).
+/// 3. On [`ForcedRetractClaimOutcome::ClaimRemoved`]: emit
+///    [`Happening::RelationClaimForcedRetract`] and record an
+///    [`AdminLedger`] entry.
+/// 4. On [`ForcedRetractClaimOutcome::RelationForgotten`]: emit
+///    `Happening::RelationClaimForcedRetract` FIRST, then
+///    [`Happening::RelationForgotten`] with
+///    [`RelationForgottenReason::ClaimsRetracted`] naming the
+///    ADMIN plugin as `retracting_plugin`. Record the audit
+///    entry.
+/// 5. On [`ForcedRetractClaimOutcome::NotFound`]: return
+///    `Ok(())` silently.
+#[derive(Debug)]
+pub struct RegistryRelationAdmin {
+    registry: Arc<SubjectRegistry>,
+    graph: Arc<RelationGraph>,
+    catalogue: Arc<Catalogue>,
+    bus: Arc<HappeningBus>,
+    ledger: Arc<AdminLedger>,
+    admin_plugin: String,
+}
+
+impl RegistryRelationAdmin {
+    /// Construct a relation-admin announcer bound to the shared
+    /// registry, graph, catalogue, happenings bus, and admin
+    /// ledger, tagged with the admin plugin's canonical name.
+    pub fn new(
+        registry: Arc<SubjectRegistry>,
+        graph: Arc<RelationGraph>,
+        catalogue: Arc<Catalogue>,
+        bus: Arc<HappeningBus>,
+        ledger: Arc<AdminLedger>,
+        admin_plugin: impl Into<String>,
+    ) -> Self {
+        Self {
+            registry,
+            graph,
+            catalogue,
+            bus,
+            ledger,
+            admin_plugin: admin_plugin.into(),
+        }
+    }
+}
+
+impl RelationAdmin for RegistryRelationAdmin {
+    fn forced_retract_claim<'a>(
+        &'a self,
+        target_plugin: String,
+        source: ExternalAddressing,
+        predicate: String,
+        target: ExternalAddressing,
+        reason: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        let graph = Arc::clone(&self.graph);
+        let bus = Arc::clone(&self.bus);
+        let ledger = Arc::clone(&self.ledger);
+        let admin_plugin = self.admin_plugin.clone();
+        let _catalogue = Arc::clone(&self.catalogue);
+        Box::pin(async move {
+            if target_plugin == admin_plugin {
+                return Err(ReportError::Invalid(format!(
+                    "forced_retract_claim: admin plugin {admin_plugin} \
+                     may not target its own claims via the admin path"
+                )));
+            }
+
+            // Resolve addressings. Unresolvable is a silent
+            // no-op matching the NotFound discipline of the
+            // underlying primitive.
+            let source_id = match registry.resolve(&source) {
+                Some(id) => id,
+                None => return Ok(()),
+            };
+            let target_id = match registry.resolve(&target) {
+                Some(id) => id,
+                None => return Ok(()),
+            };
+
+            let outcome = graph
+                .forced_retract_claim(
+                    &source_id,
+                    &predicate,
+                    &target_id,
+                    &target_plugin,
+                    &admin_plugin,
+                    reason.clone(),
+                )
+                .map_err(|e| {
+                    ReportError::Invalid(format!("forced_retract_claim: {e}"))
+                })?;
+
+            match outcome {
+                ForcedRetractClaimOutcome::NotFound => Ok(()),
+
+                ForcedRetractClaimOutcome::ClaimRemoved => {
+                    let at = SystemTime::now();
+                    bus.emit(Happening::RelationClaimForcedRetract {
+                        admin_plugin: admin_plugin.clone(),
+                        target_plugin: target_plugin.clone(),
+                        source_id: source_id.clone(),
+                        predicate: predicate.clone(),
+                        target_id: target_id.clone(),
+                        reason: reason.clone(),
+                        at,
+                    });
+                    ledger.record(AdminLogEntry {
+                        kind: AdminLogKind::RelationClaimForcedRetract,
+                        admin_plugin: admin_plugin.clone(),
+                        target_plugin: Some(target_plugin),
+                        target_subject: None,
+                        target_addressing: None,
+                        target_relation: Some(RelationKey::new(
+                            source_id, predicate, target_id,
+                        )),
+                        additional_subjects: Vec::new(),
+                        reason,
+                        at,
+                    });
+                    Ok(())
+                }
+
+                ForcedRetractClaimOutcome::RelationForgotten => {
+                    let at = SystemTime::now();
+
+                    // 1. Admin happening FIRST.
+                    bus.emit(Happening::RelationClaimForcedRetract {
+                        admin_plugin: admin_plugin.clone(),
+                        target_plugin: target_plugin.clone(),
+                        source_id: source_id.clone(),
+                        predicate: predicate.clone(),
+                        target_id: target_id.clone(),
+                        reason: reason.clone(),
+                        at,
+                    });
+
+                    // 2. Relation forgotten, with the admin plugin
+                    //    named as retracting_plugin: the admin's
+                    //    action caused the retract.
+                    bus.emit(Happening::RelationForgotten {
+                        plugin: admin_plugin.clone(),
+                        source_id: source_id.clone(),
+                        predicate: predicate.clone(),
+                        target_id: target_id.clone(),
+                        reason: RelationForgottenReason::ClaimsRetracted {
+                            retracting_plugin: admin_plugin.clone(),
+                        },
+                        at,
+                    });
+
+                    ledger.record(AdminLogEntry {
+                        kind: AdminLogKind::RelationClaimForcedRetract,
+                        admin_plugin: admin_plugin.clone(),
+                        target_plugin: Some(target_plugin),
+                        target_subject: None,
+                        target_addressing: None,
+                        target_relation: Some(RelationKey::new(
+                            source_id, predicate, target_id,
+                        )),
+                        additional_subjects: Vec::new(),
+                        reason,
+                        at,
+                    });
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    /// Suppress a relation: hide it from neighbour queries,
+    /// walks, and cardinality counts while preserving its claims
+    /// for audit.
+    ///
+    /// Wiring discipline mirrors the
+    /// [`Self::forced_retract_claim`] path:
+    ///
+    /// 1. Resolve `source` and `target` addressings.
+    ///    Unresolvable is a silent no-op (NotFound discipline).
+    /// 2. Call
+    ///    [`RelationGraph::suppress`](crate::relations::RelationGraph::suppress).
+    /// 3. On [`SuppressOutcome::NewlySuppressed`]: emit
+    ///    [`Happening::RelationSuppressed`] and record an
+    ///    [`AdminLedger`] entry with `kind = RelationSuppress`.
+    /// 4. On [`SuppressOutcome::AlreadySuppressed`] or
+    ///    [`SuppressOutcome::NotFound`]: silent no-op (no
+    ///    happening, no ledger entry). Re-suppressing is
+    ///    idempotent; the existing suppression record is
+    ///    preserved untouched by the storage primitive.
+    fn suppress<'a>(
+        &'a self,
+        source: ExternalAddressing,
+        predicate: String,
+        target: ExternalAddressing,
+        reason: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        let graph = Arc::clone(&self.graph);
+        let bus = Arc::clone(&self.bus);
+        let ledger = Arc::clone(&self.ledger);
+        let admin_plugin = self.admin_plugin.clone();
+        let _catalogue = Arc::clone(&self.catalogue);
+        Box::pin(async move {
+            let source_id = match registry.resolve(&source) {
+                Some(id) => id,
+                None => return Ok(()),
+            };
+            let target_id = match registry.resolve(&target) {
+                Some(id) => id,
+                None => return Ok(()),
+            };
+
+            let outcome = graph
+                .suppress(
+                    &source_id,
+                    &predicate,
+                    &target_id,
+                    &admin_plugin,
+                    reason.clone(),
+                )
+                .map_err(|e| ReportError::Invalid(format!("suppress: {e}")))?;
+
+            match outcome {
+                SuppressOutcome::AlreadySuppressed
+                | SuppressOutcome::NotFound => Ok(()),
+
+                SuppressOutcome::NewlySuppressed => {
+                    let at = SystemTime::now();
+                    bus.emit(Happening::RelationSuppressed {
+                        admin_plugin: admin_plugin.clone(),
+                        source_id: source_id.clone(),
+                        predicate: predicate.clone(),
+                        target_id: target_id.clone(),
+                        reason: reason.clone(),
+                        at,
+                    });
+                    ledger.record(AdminLogEntry {
+                        kind: AdminLogKind::RelationSuppress,
+                        admin_plugin,
+                        target_plugin: None,
+                        target_subject: None,
+                        target_addressing: None,
+                        target_relation: Some(RelationKey::new(
+                            source_id, predicate, target_id,
+                        )),
+                        additional_subjects: Vec::new(),
+                        reason,
+                        at,
+                    });
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    /// Unsuppress a relation: restore it to neighbour queries,
+    /// walks, and cardinality counts.
+    ///
+    /// Wiring discipline:
+    ///
+    /// 1. Resolve addressings (silent no-op on unresolvable).
+    /// 2. Call
+    ///    [`RelationGraph::unsuppress`](crate::relations::RelationGraph::unsuppress).
+    /// 3. On [`UnsuppressOutcome::Unsuppressed`]: emit
+    ///    [`Happening::RelationUnsuppressed`] and record an
+    ///    [`AdminLedger`] entry with `kind = RelationUnsuppress`.
+    /// 4. On [`UnsuppressOutcome::NotSuppressed`] or
+    ///    [`UnsuppressOutcome::NotFound`]: silent no-op. The
+    ///    SDK trait does not carry a `reason` parameter on
+    ///    unsuppress; the audit entry's `reason` is `None`.
+    fn unsuppress<'a>(
+        &'a self,
+        source: ExternalAddressing,
+        predicate: String,
+        target: ExternalAddressing,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        let graph = Arc::clone(&self.graph);
+        let bus = Arc::clone(&self.bus);
+        let ledger = Arc::clone(&self.ledger);
+        let admin_plugin = self.admin_plugin.clone();
+        let _catalogue = Arc::clone(&self.catalogue);
+        Box::pin(async move {
+            let source_id = match registry.resolve(&source) {
+                Some(id) => id,
+                None => return Ok(()),
+            };
+            let target_id = match registry.resolve(&target) {
+                Some(id) => id,
+                None => return Ok(()),
+            };
+
+            let outcome = graph
+                .unsuppress(&source_id, &predicate, &target_id)
+                .map_err(|e| {
+                    ReportError::Invalid(format!("unsuppress: {e}"))
+                })?;
+
+            match outcome {
+                UnsuppressOutcome::NotSuppressed
+                | UnsuppressOutcome::NotFound => Ok(()),
+
+                UnsuppressOutcome::Unsuppressed => {
+                    let at = SystemTime::now();
+                    bus.emit(Happening::RelationUnsuppressed {
+                        admin_plugin: admin_plugin.clone(),
+                        source_id: source_id.clone(),
+                        predicate: predicate.clone(),
+                        target_id: target_id.clone(),
+                        at,
+                    });
+                    ledger.record(AdminLogEntry {
+                        kind: AdminLogKind::RelationUnsuppress,
+                        admin_plugin,
+                        target_plugin: None,
+                        target_subject: None,
+                        target_addressing: None,
+                        target_relation: Some(RelationKey::new(
+                            source_id, predicate, target_id,
+                        )),
+                        additional_subjects: Vec::new(),
+                        reason: None,
+                        at,
+                    });
+                    Ok(())
+                }
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    #[tokio::test]
+    async fn state_reporter_logs_and_succeeds() {
+        let r = LoggingStateReporter::new("org.test.plugin");
+        let result = r.report(b"hello".to_vec(), ReportPriority::Normal).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn instance_announcer_announces_and_retracts() {
+        let a = LoggingInstanceAnnouncer::new("org.test.factory");
+        let announcement = InstanceAnnouncement::new("i1", b"data".to_vec());
+        assert!(a.announce(announcement).await.is_ok());
+        assert!(a.retract(InstanceId::new("i1")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn user_interaction_requester_logs() {
+        let r = LoggingUserInteractionRequester::new("org.test.auth");
+        let ui = UserInteraction {
+            interaction_type: "confirm".into(),
+            payload: vec![],
+            correlation_id: 1,
+        };
+        assert!(r.request(ui).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn custody_state_reporter_logs() {
+        let r = LoggingCustodyStateReporter::new("org.test.warden");
+        let h = CustodyHandle::new("c-1");
+        let result =
+            r.report(&h, b"state".to_vec(), HealthStatus::Healthy).await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // Test fixtures
+    //
+    // Shared helpers used by subject- and relation-announcer tests.
+    // The catalogues declare:
+    //
+    // - `track` and `album` subject types (required so the
+    //   predicates below pass catalogue-load cross-reference
+    //   validation).
+    // - `album_of` (track -> album, at_most_one album per track),
+    //   used to exercise source-side cardinality checks.
+    // - `tracks_of` (album -> track, at_most_one source per album),
+    //   used to exercise target-side cardinality checks, with its
+    //   inverse symmetrically declared back to `album_of`.
+    // - `contained_in` (*, *), used to exercise the wildcard
+    //   acceptance path without tripping type-constraint
+    //   enforcement.
+    // -----------------------------------------------------------------
+
+    /// Minimal catalogue declaring only subject types. Used by
+    /// subject-announcer tests that need the `track` type
+    /// available but have no need for predicates.
+    fn subjects_only_catalogue() -> crate::catalogue::Catalogue {
+        crate::catalogue::Catalogue::from_toml(
+            r#"
+[[subjects]]
+name = "track"
+
+[[subjects]]
+name = "album"
+"#,
+        )
+        .expect("subjects-only catalogue must parse")
+    }
+
+    /// Catalogue declaring `track` and `album` subjects plus three
+    /// predicates: `album_of`, `tracks_of` (its declared inverse),
+    /// and `contained_in` (wildcard on both sides). Any predicate
+    /// name OUTSIDE this set is refused by the announcer; any
+    /// source/target type that does not satisfy the declared
+    /// constraint is refused as well.
+    fn test_catalogue_with_predicates() -> crate::catalogue::Catalogue {
+        crate::catalogue::Catalogue::from_toml(
+            r#"
+[[subjects]]
+name = "track"
+
+[[subjects]]
+name = "album"
+
+[[relation]]
+predicate = "album_of"
+source_type = "track"
+target_type = "album"
+source_cardinality = "at_most_one"
+target_cardinality = "many"
+inverse = "tracks_of"
+
+[[relation]]
+predicate = "tracks_of"
+source_type = "album"
+target_type = "track"
+source_cardinality = "many"
+target_cardinality = "at_most_one"
+inverse = "album_of"
+
+[[relation]]
+predicate = "contained_in"
+source_type = "*"
+target_type = "*"
+"#,
+        )
+        .expect("test catalogue with predicates must parse")
+    }
+
+    // -----------------------------------------------------------------
+    // RegistrySubjectAnnouncer
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn registry_subject_announcer_announces() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.announcer",
+        );
+        let announcement = SubjectAnnouncement::new(
+            "track",
+            vec![ExternalAddressing::new("test-scheme", "test-value")],
+        );
+        assert!(announcer.announce(announcement).await.is_ok());
+        assert_eq!(registry.subject_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_retracts() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.announcer",
+        );
+        let announcement = SubjectAnnouncement::new(
+            "track",
+            vec![ExternalAddressing::new("test-scheme", "test-value")],
+        );
+        announcer.announce(announcement).await.unwrap();
+        assert_eq!(registry.subject_count(), 1);
+
+        let result = announcer
+            .retract(
+                ExternalAddressing::new("test-scheme", "test-value"),
+                Some("test cleanup".into()),
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(registry.subject_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_rejects_wrong_plugin_retract() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let announcer_a = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+        let announcer_b = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.b",
+        );
+        announcer_a
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("s", "v")],
+            ))
+            .await
+            .unwrap();
+        let result = announcer_b
+            .retract(ExternalAddressing::new("s", "v"), None)
+            .await;
+        assert!(matches!(result, Err(ReportError::Invalid(_))));
+    }
+
+    // -----------------------------------------------------------------
+    // Gap [26]: subject-type existence at announcement.
+    //
+    // RegistrySubjectAnnouncer refuses announcements whose
+    // subject_type is not declared in the catalogue. Retraction
+    // carries no subject type and is not gated by this check; that
+    // is asserted by the positive retract test above.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn registry_subject_announcer_rejects_undeclared_type() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        // `podcast_episode` is not declared in the catalogue.
+        let announcement = SubjectAnnouncement::new(
+            "podcast_episode",
+            vec![ExternalAddressing::new("s", "v")],
+        );
+        let result = announcer.announce(announcement).await;
+        match result {
+            Err(ReportError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("podcast_episode"),
+                    "expected error to name the type, got {msg:?}"
+                );
+                assert!(
+                    msg.contains("not declared"),
+                    "expected error to reference the catalogue, got {msg:?}"
+                );
+            }
+            other => panic!("expected Invalid error, got {other:?}"),
+        }
+        // Registry is untouched: the gate runs BEFORE the registry
+        // sees the announcement, so undeclared types leave no
+        // trace in the registry's claim log or addressing index.
+        assert_eq!(registry.subject_count(), 0);
+        assert_eq!(registry.claim_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_accepts_declared_type() {
+        // Positive control for the refusal test above. If this
+        // test breaks while the refusal test still passes, the
+        // announcer has become a blanket-deny gate. Covered
+        // implicitly by `registry_subject_announcer_announces` but
+        // kept separate so a regression in either test does not
+        // mask the other.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "album",
+                vec![ExternalAddressing::new("s", "v")],
+            ))
+            .await
+            .expect("declared type must admit");
+        assert_eq!(registry.subject_count(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // RegistryRelationAnnouncer
+    // -----------------------------------------------------------------
+
+    /// Pre-populate a registry with a `track` addressed at `/a.flac`
+    /// and an `album` addressed at `album-x`. Used by relation-
+    /// announcer tests that need both endpoints registered before
+    /// asserting or retracting.
+    fn seed_track_and_album(registry: &Arc<SubjectRegistry>, claimant: &str) {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                claimant,
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                claimant,
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn registry_relation_announcer_asserts() {
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        seed_track_and_album(&registry, "org.test.a");
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        let assertion = RelationAssertion::new(
+            ExternalAddressing::new("mpd-path", "/a.flac"),
+            "album_of",
+            ExternalAddressing::new("mbid", "album-x"),
+        );
+        assert!(announcer.assert(assertion).await.is_ok());
+        assert_eq!(graph.relation_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_relation_announcer_rejects_unknown_source() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        // Only announce the target.
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        let assertion = RelationAssertion::new(
+            ExternalAddressing::new("mpd-path", "/unknown.flac"),
+            "album_of",
+            ExternalAddressing::new("mbid", "album-x"),
+        );
+        let result = announcer.assert(assertion).await;
+        assert!(matches!(result, Err(ReportError::Invalid(_))));
+        assert_eq!(graph.relation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_relation_announcer_retracts() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("s", "a")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("s", "b")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("s", "a"),
+                "album_of",
+                ExternalAddressing::new("s", "b"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(graph.relation_count(), 1);
+
+        announcer
+            .retract(RelationRetraction::new(
+                ExternalAddressing::new("s", "a"),
+                "album_of",
+                ExternalAddressing::new("s", "b"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(graph.relation_count(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Gap [25]: predicate existence validation at assertion.
+    //
+    // RegistryRelationAnnouncer rejects assertions and retractions
+    // whose predicate name is not declared in the catalogue. The
+    // symmetric behaviour on retraction is pinned so a future
+    // refactor cannot accidentally make retract permissive.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn registry_relation_announcer_rejects_undeclared_predicate() {
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        seed_track_and_album(&registry, "org.test.a");
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        let result = announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "bogus_predicate",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await;
+
+        match result {
+            Err(ReportError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("bogus_predicate"),
+                    "expected error to name the predicate, got {msg:?}"
+                );
+                assert!(
+                    msg.contains("not declared"),
+                    "expected error to mention catalogue, got {msg:?}"
+                );
+            }
+            other => {
+                panic!("expected Invalid error, got {other:?}")
+            }
+        }
+        // Graph is untouched: the check runs BEFORE subject
+        // resolution and BEFORE the graph call, so undeclared
+        // predicates leave no trace.
+        assert_eq!(graph.relation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_relation_announcer_accepts_declared_predicate() {
+        // Positive control: the same announcer accepts a predicate
+        // that IS declared (proving the check is not a blanket
+        // refusal). This is a tighter variant of
+        // `registry_relation_announcer_asserts` above; kept separate
+        // so a regression in either test does not mask the other.
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        seed_track_and_album(&registry, "org.test.a");
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .expect("declared predicate must admit");
+        assert_eq!(graph.relation_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_relation_announcer_retract_rejects_undeclared_predicate()
+    {
+        // An undeclared predicate on retract is refused at the same
+        // error surface as on assert. A test-only catalogue would
+        // never contain `bogus_predicate`, so the retract cannot
+        // reach a real relation and the graph stays empty in any
+        // correctness scenario. This test pins the symmetry so a
+        // future refactor that makes retract permissive to
+        // undeclared predicates (e.g. for "garbage collection is
+        // always OK") does not land silently.
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        seed_track_and_album(&registry, "org.test.a");
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        let result = announcer
+            .retract(RelationRetraction::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "bogus_predicate",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await;
+
+        match result {
+            Err(ReportError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("bogus_predicate"),
+                    "expected error to name the predicate, got {msg:?}"
+                );
+                assert!(
+                    msg.contains("not declared"),
+                    "expected error to mention catalogue, got {msg:?}"
+                );
+            }
+            other => {
+                panic!("expected Invalid error, got {other:?}")
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Gap [26] (deferred-from-[25] half): type-constraint
+    // enforcement at assertion.
+    //
+    // The predicate declares source_type = "track", target_type =
+    // "album". Asserting with a source subject typed as "album"
+    // (swapped role) or a target subject typed as "track" (swapped
+    // role) must be refused. Wildcard (`contained_in`) must admit
+    // any pair of declared subjects without type-constraint
+    // refusal.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn registry_relation_announcer_rejects_mismatched_source_type() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        // Announce TWO `album`-typed subjects. `album_of` requires
+        // source_type = "track"; a source subject typed as `album`
+        // must be refused.
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("s", "x")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("s", "y")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        let result = announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("s", "x"),
+                "album_of",
+                ExternalAddressing::new("s", "y"),
+            ))
+            .await;
+        match result {
+            Err(ReportError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("source subject type"),
+                    "expected source-side message, got {msg:?}"
+                );
+                assert!(
+                    msg.contains("album"),
+                    "expected observed type in message, got {msg:?}"
+                );
+            }
+            other => panic!("expected Invalid error, got {other:?}"),
+        }
+        // Graph is untouched: type-constraint check runs BEFORE
+        // the graph assert.
+        assert_eq!(graph.relation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_relation_announcer_rejects_mismatched_target_type() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        // Announce TWO `track`-typed subjects. `album_of` requires
+        // target_type = "album"; a target subject typed as `track`
+        // must be refused.
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("s", "x")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("s", "y")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        let result = announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("s", "x"),
+                "album_of",
+                ExternalAddressing::new("s", "y"),
+            ))
+            .await;
+        match result {
+            Err(ReportError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("target subject type"),
+                    "expected target-side message, got {msg:?}"
+                );
+                assert!(
+                    msg.contains("track"),
+                    "expected observed type in message, got {msg:?}"
+                );
+            }
+            other => panic!("expected Invalid error, got {other:?}"),
+        }
+        assert_eq!(graph.relation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_relation_announcer_accepts_wildcard_type_constraints() {
+        // `contained_in` declares source_type = "*", target_type =
+        // "*": any pair of declared-type subjects admits, including
+        // the symmetrical mismatch case the specific `album_of`
+        // predicate would reject.
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        seed_track_and_album(&registry, "org.test.a");
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        // album -> track under a wildcard predicate: the specific
+        // `album_of` predicate would reject this (types swapped
+        // from its declaration), but `contained_in` accepts.
+        announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mbid", "album-x"),
+                "contained_in",
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+            ))
+            .await
+            .expect("wildcard predicate must admit any pair");
+        assert_eq!(graph.relation_count(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Gap [10]: cardinality violation warning.
+    //
+    // RELATIONS.md section 7.1: violating asserts succeed (the
+    // graph stores both the new and the pre-existing relation),
+    // and the violation is surfaced as a warn log plus a
+    // RelationCardinalityViolation happening. These tests subscribe
+    // to the bus BEFORE emitting so the late-subscriber rule in
+    // happenings.rs does not drop the event.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cardinality_exceeded_semantics() {
+        // AtMostOne / ExactlyOne fire once count exceeds 1.
+        assert!(!cardinality_exceeded(Cardinality::AtMostOne, 1));
+        assert!(cardinality_exceeded(Cardinality::AtMostOne, 2));
+        assert!(cardinality_exceeded(Cardinality::AtMostOne, 10));
+        assert!(!cardinality_exceeded(Cardinality::ExactlyOne, 1));
+        assert!(cardinality_exceeded(Cardinality::ExactlyOne, 2));
+        // Lower-bound and unconstrained never fire on assert (the
+        // assert path can only increase counts; AtLeastOne violation
+        // surfaces elsewhere).
+        assert!(!cardinality_exceeded(Cardinality::AtLeastOne, 0));
+        assert!(!cardinality_exceeded(Cardinality::AtLeastOne, 1));
+        assert!(!cardinality_exceeded(Cardinality::AtLeastOne, 99));
+        assert!(!cardinality_exceeded(Cardinality::Many, 0));
+        assert!(!cardinality_exceeded(Cardinality::Many, 1_000_000));
+    }
+
+    #[tokio::test]
+    async fn registry_relation_announcer_emits_source_cardinality_happening() {
+        // `album_of` has source_cardinality = at_most_one: a single
+        // track may have at most one album. Asserting a second
+        // (track, album_of, album) for the same track succeeds
+        // (storage is permissive) but fires the source-side
+        // cardinality happening.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        // One track, two albums.
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-1")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-2")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        // Subscribe BEFORE emitting so the happening is retained.
+        let mut rx = bus.subscribe();
+
+        // First assert: at count 1, no violation.
+        announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-1"),
+            ))
+            .await
+            .unwrap();
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => {}
+            other => panic!(
+                "expected no happening after first assert, got {other:?}"
+            ),
+        }
+
+        // Second assert: track now points at two albums; source
+        // cardinality (at_most_one) is exceeded, happening fires.
+        announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-2"),
+            ))
+            .await
+            .expect("assert must succeed; storage is permissive");
+
+        // Both relations are stored.
+        assert_eq!(graph.relation_count(), 2);
+
+        let h = rx.recv().await.expect("cardinality happening must arrive");
+        match h {
+            Happening::RelationCardinalityViolation {
+                plugin,
+                predicate,
+                side,
+                declared,
+                observed_count,
+                ..
+            } => {
+                assert_eq!(plugin, "org.test.a");
+                assert_eq!(predicate, "album_of");
+                assert_eq!(side, CardinalityViolationSide::Source);
+                assert_eq!(declared, Cardinality::AtMostOne);
+                assert_eq!(observed_count, 2);
+            }
+            other => panic!("unexpected happening: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_relation_announcer_emits_target_cardinality_happening() {
+        // `tracks_of` has target_cardinality = at_most_one: an
+        // album target may be pointed at by at most one source via
+        // this predicate. Asserting a second (album, tracks_of, X)
+        // for the same target X fires the target-side happening.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        // Two albums, one track. Both albums point at the track.
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-1")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-2")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        let mut rx = bus.subscribe();
+
+        announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mbid", "album-1"),
+                "tracks_of",
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+            ))
+            .await
+            .unwrap();
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => {}
+            other => panic!(
+                "expected no happening after first assert, got {other:?}"
+            ),
+        }
+
+        announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mbid", "album-2"),
+                "tracks_of",
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+            ))
+            .await
+            .expect("assert must succeed; storage is permissive");
+        assert_eq!(graph.relation_count(), 2);
+
+        let h = rx.recv().await.expect("cardinality happening must arrive");
+        match h {
+            Happening::RelationCardinalityViolation {
+                predicate,
+                side,
+                declared,
+                observed_count,
+                ..
+            } => {
+                assert_eq!(predicate, "tracks_of");
+                assert_eq!(side, CardinalityViolationSide::Target);
+                assert_eq!(declared, Cardinality::AtMostOne);
+                assert_eq!(observed_count, 2);
+            }
+            other => panic!("unexpected happening: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_relation_announcer_no_cardinality_happening_on_many() {
+        // `contained_in` has no declared cardinalities, so they
+        // default to Many on both sides. Any number of asserts on
+        // the same source or target must NOT produce cardinality
+        // happenings.
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        seed_track_and_album(&registry, "org.test.a");
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        let mut rx = bus.subscribe();
+
+        announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "contained_in",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+        announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mbid", "album-x"),
+                "contained_in",
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+            ))
+            .await
+            .unwrap();
+
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => {}
+            other => panic!(
+                "cardinality Many must never fire a happening, got {other:?}"
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Gap [27]: dangling relation GC cascade and structured
+    // RelationForgotten happenings.
+    //
+    // These tests exercise the wiring layer's side of the contract:
+    //
+    // - RegistrySubjectAnnouncer::retract cascades into the
+    //   relation graph on subject-forget and emits ordered
+    //   structured happenings (SubjectForgotten first, then one
+    //   RelationForgotten per cascaded edge with reason
+    //   SubjectCascade).
+    // - RegistryRelationAnnouncer::retract emits RelationForgotten
+    //   with reason ClaimsRetracted when the last claimant
+    //   retracts; emits nothing when other claimants remain.
+    //
+    // The storage primitives themselves are covered in
+    // subjects::tests and relations::tests; the wire-serialisation
+    // shapes are covered in server::tests.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn registry_subject_announcer_addressing_retract_does_not_cascade() {
+        // Positive control: retracting one of several addressings
+        // leaves the subject alive, emits no SubjectForgotten and
+        // no cascade RelationForgotten, and leaves the graph
+        // untouched. If this test fires the cascade, the
+        // AddressingRemoved arm has regressed.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![
+                        ExternalAddressing::new("mpd-path", "/a.flac"),
+                        ExternalAddressing::new("mbid", "track-mbid"),
+                    ],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+
+        // Assert a relation so a faulty cascade would be observable.
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(graph.relation_count(), 1);
+
+        let subj_announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        let mut rx = bus.subscribe();
+
+        // Retract ONE of the track's two addressings. Subject
+        // survives; no cascade fires.
+        subj_announcer
+            .retract(ExternalAddressing::new("mbid", "track-mbid"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(registry.subject_count(), 2);
+        assert_eq!(graph.relation_count(), 1);
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => {}
+            other => panic!(
+                "AddressingRemoved outcome must not emit a happening, \
+                 got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_forget_triggers_graph_cascade() {
+        // When the retracted addressing is the subject's last, the
+        // announcer cascades into the graph. The relation that
+        // names the forgotten subject is removed even though the
+        // relation's claimant (a different plugin) did not
+        // retract. Pins the cascade-overrides-multi-claimant
+        // contract at the wiring layer.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.subjects",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.subjects",
+            )
+            .unwrap();
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.relations",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(graph.relation_count(), 1);
+
+        let subj_announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.subjects",
+        );
+
+        subj_announcer
+            .retract(ExternalAddressing::new("mpd-path", "/a.flac"), None)
+            .await
+            .unwrap();
+
+        // Track subject is forgotten; album survives.
+        assert_eq!(registry.subject_count(), 1);
+        // Cascade removed the edge even though claimant
+        // `org.test.relations` never retracted.
+        assert_eq!(graph.relation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_emits_subject_forgotten_happening() {
+        // On subject-forget the announcer emits
+        // Happening::SubjectForgotten with the canonical ID,
+        // subject_type, and retracting plugin name.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        let outcome = registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        let expected_id = match outcome {
+            crate::subjects::AnnounceOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        let mut rx = bus.subscribe();
+
+        announcer
+            .retract(ExternalAddressing::new("mbid", "album-x"), None)
+            .await
+            .unwrap();
+
+        let h = rx.recv().await.expect("subject_forgotten must arrive");
+        match h {
+            Happening::SubjectForgotten {
+                plugin,
+                canonical_id,
+                subject_type,
+                ..
+            } => {
+                assert_eq!(plugin, "org.test.a");
+                assert_eq!(canonical_id, expected_id);
+                assert_eq!(subject_type, "album");
+            }
+            other => panic!("unexpected happening: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_emits_relation_forgotten_per_removed_edge(
+    ) {
+        // The announcer emits one Happening::RelationForgotten
+        // per edge the cascade removed, each with reason
+        // SubjectCascade carrying the forgotten subject's
+        // canonical ID.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        // One track that will be forgotten, plus two album
+        // targets. The track will have two outbound edges under
+        // `album_of`. The cascade must remove both and emit two
+        // RelationForgotten happenings.
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.subjects",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-1")],
+                ),
+                "org.test.subjects",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-2")],
+                ),
+                "org.test.subjects",
+            )
+            .unwrap();
+
+        let track_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.relations",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-1"),
+            ))
+            .await
+            .unwrap();
+        // Second album assert overruns at_most_one on the source;
+        // storage is permissive and the cascade test cares about
+        // the stored edges, not the cardinality happening. A
+        // fresh subscriber below sees only the cascade events.
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-2"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(graph.relation_count(), 2);
+
+        let subj_announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.subjects",
+        );
+
+        // Subscribe AFTER the asserts so the prior
+        // cardinality-violation happenings do not land in this
+        // receiver.
+        let mut rx = bus.subscribe();
+
+        subj_announcer
+            .retract(ExternalAddressing::new("mpd-path", "/a.flac"), None)
+            .await
+            .unwrap();
+
+        // Expect: SubjectForgotten, then two RelationForgotten.
+        let first = rx.recv().await.expect("first happening");
+        assert!(
+            matches!(first, Happening::SubjectForgotten { .. }),
+            "expected SubjectForgotten first, got {first:?}"
+        );
+
+        let mut cascade_count = 0;
+        for _ in 0..2 {
+            let h = rx.recv().await.expect("cascade happening");
+            match h {
+                Happening::RelationForgotten {
+                    plugin,
+                    source_id,
+                    predicate,
+                    reason,
+                    ..
+                } => {
+                    assert_eq!(
+                        plugin, "org.test.subjects",
+                        "cascade plugin is the subject retractor, \
+                         not the relation claimant"
+                    );
+                    assert_eq!(source_id, track_id);
+                    assert_eq!(predicate, "album_of");
+                    match reason {
+                        RelationForgottenReason::SubjectCascade {
+                            forgotten_subject,
+                        } => {
+                            assert_eq!(forgotten_subject, track_id);
+                        }
+                        other => panic!(
+                            "expected SubjectCascade reason, got {other:?}"
+                        ),
+                    }
+                    cascade_count += 1;
+                }
+                other => panic!(
+                    "expected RelationForgotten after subject event, \
+                     got {other:?}"
+                ),
+            }
+        }
+        assert_eq!(cascade_count, 2);
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_emits_subject_forgotten_before_cascade_relations(
+    ) {
+        // Ordering pin: the SubjectForgotten event is always
+        // emitted BEFORE the cascade RelationForgotten events.
+        // Subscribers that react to subject-forget by cleaning up
+        // auxiliary state rely on this ordering.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let subj_announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        let mut rx = bus.subscribe();
+
+        subj_announcer
+            .retract(ExternalAddressing::new("mpd-path", "/a.flac"), None)
+            .await
+            .unwrap();
+
+        let first = rx.recv().await.expect("first happening");
+        let second = rx.recv().await.expect("second happening");
+        assert!(
+            matches!(first, Happening::SubjectForgotten { .. }),
+            "first must be SubjectForgotten, got {first:?}"
+        );
+        assert!(
+            matches!(second, Happening::RelationForgotten { .. }),
+            "second must be RelationForgotten, got {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_forget_cascades_both_endpoint_roles() {
+        // A forgotten subject that is both source of some edges
+        // and target of others must have every touching edge
+        // cascaded, regardless of role. Pins the
+        // forget_all_touching contract end-to-end through the
+        // wiring layer.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        // `pivot` is an album: target of album_of (from a track)
+        // and source of tracks_of (to a different track).
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("s", "track-a")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("s", "pivot")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("s", "track-b")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+        // track-a -> pivot via album_of (pivot is target).
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("s", "track-a"),
+                "album_of",
+                ExternalAddressing::new("s", "pivot"),
+            ))
+            .await
+            .unwrap();
+        // pivot -> track-b via tracks_of (pivot is source).
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("s", "pivot"),
+                "tracks_of",
+                ExternalAddressing::new("s", "track-b"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(graph.relation_count(), 2);
+
+        let subj_announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        subj_announcer
+            .retract(ExternalAddressing::new("s", "pivot"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(graph.relation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_relation_announcer_emits_relation_forgotten_on_last_claimant(
+    ) {
+        // RegistryRelationAnnouncer::retract emits
+        // Happening::RelationForgotten with reason
+        // ClaimsRetracted when the graph reports
+        // RelationRetractOutcome::RelationForgotten (last
+        // claimant gone).
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("s", "track-1")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("s", "album-1")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+
+        let source_id = registry
+            .resolve(&ExternalAddressing::new("s", "track-1"))
+            .unwrap();
+        let target_id = registry
+            .resolve(&ExternalAddressing::new("s", "album-1"))
+            .unwrap();
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+
+        announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("s", "track-1"),
+                "album_of",
+                ExternalAddressing::new("s", "album-1"),
+            ))
+            .await
+            .unwrap();
+
+        // Subscribe after the assert to skip any assert-time
+        // happenings and isolate the retract happening.
+        let mut rx = bus.subscribe();
+
+        announcer
+            .retract(RelationRetraction::new(
+                ExternalAddressing::new("s", "track-1"),
+                "album_of",
+                ExternalAddressing::new("s", "album-1"),
+            ))
+            .await
+            .unwrap();
+
+        let h = rx.recv().await.expect("relation_forgotten must arrive");
+        match h {
+            Happening::RelationForgotten {
+                plugin,
+                source_id: got_source,
+                predicate,
+                target_id: got_target,
+                reason,
+                ..
+            } => {
+                assert_eq!(plugin, "org.test.a");
+                assert_eq!(got_source, source_id);
+                assert_eq!(predicate, "album_of");
+                assert_eq!(got_target, target_id);
+                match reason {
+                    RelationForgottenReason::ClaimsRetracted {
+                        retracting_plugin,
+                    } => {
+                        assert_eq!(retracting_plugin, "org.test.a");
+                    }
+                    other => {
+                        panic!("expected ClaimsRetracted reason, got {other:?}")
+                    }
+                }
+            }
+            other => panic!("unexpected happening: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_relation_announcer_emits_no_happening_when_claims_remain()
+    {
+        // Positive control: when the retract only removes one
+        // claim out of several, no happening fires. The graph's
+        // RelationRetractOutcome::ClaimRemoved variant keeps the
+        // relation alive; claim-level events remain tracing-only
+        // for now.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("s", "track-1")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("s", "album-1")],
+                ),
+                "org.test.a",
+            )
+            .unwrap();
+
+        // Two announcers for two distinct claimants on the same
+        // relation.
+        let announcer_a = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.a",
+        );
+        let announcer_b = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.b",
+        );
+
+        announcer_a
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("s", "track-1"),
+                "album_of",
+                ExternalAddressing::new("s", "album-1"),
+            ))
+            .await
+            .unwrap();
+        announcer_b
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("s", "track-1"),
+                "album_of",
+                ExternalAddressing::new("s", "album-1"),
+            ))
+            .await
+            .unwrap();
+
+        let mut rx = bus.subscribe();
+
+        announcer_a
+            .retract(RelationRetraction::new(
+                ExternalAddressing::new("s", "track-1"),
+                "album_of",
+                ExternalAddressing::new("s", "album-1"),
+            ))
+            .await
+            .unwrap();
+
+        // Relation still exists with org.test.b's claim.
+        assert_eq!(graph.relation_count(), 1);
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => {}
+            other => {
+                panic!("ClaimRemoved must not emit a happening, got {other:?}")
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Admin announcer wiring tests: RegistrySubjectAdmin and
+    // RegistryRelationAdmin.
+    //
+    // The admin wiring builds on the storage-primitive outcomes
+    // exercised in subjects::tests and relations::tests. These
+    // tests cover:
+    //
+    // - Happy-path removal emits the admin happening and records
+    //   an audit-ledger entry.
+    // - Cascade path emits the admin happening BEFORE the cascade
+    //   happenings (ordering is load-bearing).
+    // - Self-plugin targeting is refused with Invalid to preserve
+    //   provenance integrity.
+    // - NotFound outcomes are silent no-ops.
+    // -----------------------------------------------------------------
+
+    fn build_subject_admin(
+        registry: &Arc<SubjectRegistry>,
+        graph: &Arc<RelationGraph>,
+        catalogue: &Arc<crate::catalogue::Catalogue>,
+        bus: &Arc<HappeningBus>,
+        ledger: &Arc<AdminLedger>,
+        admin_plugin: &str,
+    ) -> RegistrySubjectAdmin {
+        RegistrySubjectAdmin::new(
+            Arc::clone(registry),
+            Arc::clone(graph),
+            Arc::clone(catalogue),
+            Arc::clone(bus),
+            Arc::clone(ledger),
+            admin_plugin,
+        )
+    }
+
+    fn build_relation_admin(
+        registry: &Arc<SubjectRegistry>,
+        graph: &Arc<RelationGraph>,
+        catalogue: &Arc<crate::catalogue::Catalogue>,
+        bus: &Arc<HappeningBus>,
+        ledger: &Arc<AdminLedger>,
+        admin_plugin: &str,
+    ) -> RegistryRelationAdmin {
+        RegistryRelationAdmin::new(
+            Arc::clone(registry),
+            Arc::clone(graph),
+            Arc::clone(catalogue),
+            Arc::clone(bus),
+            Arc::clone(ledger),
+            admin_plugin,
+        )
+    }
+
+    #[tokio::test]
+    async fn forced_retract_addressing_removes_target_plugin_addressing() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![
+                        ExternalAddressing::new("mpd-path", "/a.flac"),
+                        ExternalAddressing::new("mbid", "abc"),
+                    ],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        assert_eq!(registry.addressing_count(), 2);
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        admin
+            .forced_retract_addressing(
+                "org.test.p1".into(),
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                Some("stale".into()),
+            )
+            .await
+            .expect("forced retract must succeed");
+
+        assert_eq!(registry.addressing_count(), 1);
+        assert_eq!(registry.subject_count(), 1);
+        assert_eq!(ledger.count(), 1);
+        let entries = ledger.entries();
+        assert_eq!(entries[0].admin_plugin, "admin.plugin");
+        assert_eq!(entries[0].target_plugin.as_deref(), Some("org.test.p1"));
+        assert_eq!(
+            entries[0].kind,
+            AdminLogKind::SubjectAddressingForcedRetract
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_retract_addressing_emits_happening_with_admin_identity() {
+        // Happening names both admin and target plugins so a
+        // subscriber can tell "who did the retract" from "whose
+        // claim was removed".
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![
+                        ExternalAddressing::new("mpd-path", "/a.flac"),
+                        ExternalAddressing::new("mbid", "abc"),
+                    ],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        let expected_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .forced_retract_addressing(
+                "org.test.p1".into(),
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                Some("test".into()),
+            )
+            .await
+            .unwrap();
+
+        let h = rx.recv().await.expect("admin happening must arrive");
+        match h {
+            Happening::SubjectAddressingForcedRetract {
+                admin_plugin,
+                target_plugin,
+                canonical_id,
+                scheme,
+                value,
+                reason,
+                ..
+            } => {
+                assert_eq!(admin_plugin, "admin.plugin");
+                assert_eq!(target_plugin, "org.test.p1");
+                assert_eq!(canonical_id, expected_id);
+                assert_eq!(scheme, "mpd-path");
+                assert_eq!(value, "/a.flac");
+                assert_eq!(reason.as_deref(), Some("test"));
+            }
+            other => panic!("unexpected happening: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_retract_addressing_cascades_subject_forgotten_on_last_addressing(
+    ) {
+        // Admin removes subject's last addressing: cascade fires.
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        seed_track_and_album(&registry, "org.test.p1");
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.relations",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(graph.relation_count(), 1);
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        admin
+            .forced_retract_addressing(
+                "org.test.p1".into(),
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Track forgotten, album survives, cascaded edge gone.
+        assert_eq!(registry.subject_count(), 1);
+        assert_eq!(graph.relation_count(), 0);
+        assert_eq!(ledger.count(), 1);
+        assert!(ledger.entries()[0].target_subject.is_some());
+    }
+
+    #[tokio::test]
+    async fn forced_retract_addressing_ordering_admin_happening_before_cascade()
+    {
+        // Ordering pin: admin happening FIRST, then subject
+        // forgotten, then per-edge cascade.
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        seed_track_and_album(&registry, "org.test.p1");
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.relations",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .forced_retract_addressing(
+                "org.test.p1".into(),
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let first = rx.recv().await.expect("first happening");
+        let second = rx.recv().await.expect("second happening");
+        let third = rx.recv().await.expect("third happening");
+
+        assert!(
+            matches!(first, Happening::SubjectAddressingForcedRetract { .. }),
+            "first must be SubjectAddressingForcedRetract, got {first:?}"
+        );
+        assert!(
+            matches!(second, Happening::SubjectForgotten { .. }),
+            "second must be SubjectForgotten, got {second:?}"
+        );
+        assert!(
+            matches!(third, Happening::RelationForgotten { .. }),
+            "third must be RelationForgotten, got {third:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_retract_addressing_refuses_self_plugin() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("s", "v")],
+                ),
+                "admin.plugin",
+            )
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let result = admin
+            .forced_retract_addressing(
+                "admin.plugin".into(),
+                ExternalAddressing::new("s", "v"),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ReportError::Invalid(_))),
+            "self-target must return Invalid, got {result:?}"
+        );
+        assert_eq!(registry.addressing_count(), 1);
+        assert_eq!(ledger.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn forced_retract_addressing_not_found_is_silent_noop() {
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .forced_retract_addressing(
+                "org.test.p1".into(),
+                ExternalAddressing::new("ghost", "never"),
+                None,
+            )
+            .await
+            .expect("NotFound is not an error");
+
+        assert_eq!(ledger.count(), 0);
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => {}
+            other => {
+                panic!("NotFound must not emit a happening, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_retract_claim_removes_target_plugin_claim() {
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        seed_track_and_album(&registry, "org.test.p1");
+
+        let announcer_1 = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        let announcer_2 = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p2",
+        );
+        announcer_1
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+        announcer_2
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(graph.claim_count(), 2);
+
+        let admin = build_relation_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .forced_retract_claim(
+                "org.test.p1".into(),
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+                Some("stale".into()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(graph.claim_count(), 1);
+        assert_eq!(ledger.count(), 1);
+
+        let h = rx.recv().await.expect("happening must arrive");
+        match h {
+            Happening::RelationClaimForcedRetract {
+                admin_plugin,
+                target_plugin,
+                predicate,
+                ..
+            } => {
+                assert_eq!(admin_plugin, "admin.plugin");
+                assert_eq!(target_plugin, "org.test.p1");
+                assert_eq!(predicate, "album_of");
+            }
+            other => panic!("unexpected happening: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_retract_claim_cascades_relation_forgotten_with_admin_as_retractor(
+    ) {
+        // Admin retracts last claim: RelationForgotten fires with
+        // retracting_plugin set to the ADMIN (load-bearing).
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        seed_track_and_album(&registry, "org.test.p1");
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let admin = build_relation_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .forced_retract_claim(
+                "org.test.p1".into(),
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(graph.relation_count(), 0);
+
+        let first = rx.recv().await.expect("first happening");
+        let second = rx.recv().await.expect("second happening");
+
+        assert!(
+            matches!(first, Happening::RelationClaimForcedRetract { .. }),
+            "first must be RelationClaimForcedRetract, got {first:?}"
+        );
+        match second {
+            Happening::RelationForgotten { plugin, reason, .. } => {
+                assert_eq!(plugin, "admin.plugin");
+                match reason {
+                    RelationForgottenReason::ClaimsRetracted {
+                        retracting_plugin,
+                    } => {
+                        assert_eq!(
+                            retracting_plugin, "admin.plugin",
+                            "admin plugin must appear as retracting_plugin \
+                             on admin-caused forget"
+                        );
+                    }
+                    other => {
+                        panic!("expected ClaimsRetracted reason, got {other:?}")
+                    }
+                }
+            }
+            other => {
+                panic!("second must be RelationForgotten, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_retract_claim_refuses_self_plugin() {
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        seed_track_and_album(&registry, "admin.plugin");
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "admin.plugin",
+        );
+        announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let admin = build_relation_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let result = admin
+            .forced_retract_claim(
+                "admin.plugin".into(),
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ReportError::Invalid(_))),
+            "self-target must return Invalid, got {result:?}"
+        );
+        assert_eq!(graph.claim_count(), 1);
+        assert_eq!(ledger.count(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Subject merge / split wiring.
+    //
+    // Per ADR-0004 the admin happening fires BEFORE the
+    // structural cascade. Tests subscribe to the bus and verify
+    // ordering plus payload, the post-state of the registry and
+    // graph, and the audit-ledger entries.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn admin_merge_succeeds_emits_happening_and_records_ledger() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mbid", "track-mbid")],
+                ),
+                "org.test.p2",
+            )
+            .unwrap();
+
+        let source_a_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+        let source_b_id = registry
+            .resolve(&ExternalAddressing::new("mbid", "track-mbid"))
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "track-mbid"),
+                Some("operator confirmed".into()),
+            )
+            .await
+            .expect("merge must succeed");
+
+        // Two source subjects collapsed into one.
+        assert_eq!(registry.subject_count(), 1);
+
+        let h = rx.recv().await.expect("SubjectMerged must arrive");
+        let new_id = match h {
+            Happening::SubjectMerged {
+                admin_plugin,
+                source_ids,
+                new_id,
+                reason,
+                ..
+            } => {
+                assert_eq!(admin_plugin, "admin.plugin");
+                assert_eq!(
+                    source_ids,
+                    vec![source_a_id.clone(), source_b_id.clone()]
+                );
+                assert_ne!(new_id, source_a_id);
+                assert_ne!(new_id, source_b_id);
+                assert_eq!(reason.as_deref(), Some("operator confirmed"));
+                new_id
+            }
+            other => panic!("unexpected happening: {other:?}"),
+        };
+
+        // Old addressings now resolve to the new ID.
+        assert_eq!(
+            registry.resolve(&ExternalAddressing::new("mpd-path", "/a.flac")),
+            Some(new_id.clone())
+        );
+        assert_eq!(
+            registry.resolve(&ExternalAddressing::new("mbid", "track-mbid")),
+            Some(new_id),
+        );
+
+        // Ledger entry recorded with both old IDs.
+        assert_eq!(ledger.count(), 1);
+        let entries = ledger.entries();
+        assert_eq!(entries[0].kind, AdminLogKind::SubjectMerge);
+        assert_eq!(entries[0].admin_plugin, "admin.plugin");
+        assert_eq!(
+            entries[0].additional_subjects,
+            vec![source_a_id, source_b_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_merge_unresolvable_target_a_returns_invalid() {
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let result = admin
+            .merge(
+                ExternalAddressing::new("ghost", "a"),
+                ExternalAddressing::new("ghost", "b"),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ReportError::Invalid(_))),
+            "unresolvable merge target must return Invalid, got {result:?}"
+        );
+        assert_eq!(ledger.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn admin_merge_rewrites_relation_graph() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mbid", "track-mbid")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+
+        let track_a_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+        let track_b_id = registry
+            .resolve(&ExternalAddressing::new("mbid", "track-mbid"))
+            .unwrap();
+        let album_id = registry
+            .resolve(&ExternalAddressing::new("mbid", "album-x"))
+            .unwrap();
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mbid", "track-mbid"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(graph.relation_count(), 2);
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "track-mbid"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Old IDs no longer have the outbound edge.
+        assert!(!graph.exists(&track_a_id, "album_of", &album_id));
+        assert!(!graph.exists(&track_b_id, "album_of", &album_id));
+
+        // Both rewritten edges collapsed into a single record at
+        // (new_id, album_of, album_id).
+        assert_eq!(graph.relation_count(), 1);
+        let new_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+        assert!(graph.exists(&new_id, "album_of", &album_id));
+    }
+
+    #[tokio::test]
+    async fn admin_split_succeeds_emits_happening_and_records_ledger() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![
+                        ExternalAddressing::new("mpd-path", "/a.flac"),
+                        ExternalAddressing::new("mbid", "abc"),
+                    ],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        let source_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .split(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                vec![
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                    vec![ExternalAddressing::new("mbid", "abc")],
+                ],
+                SplitRelationStrategy::ToBoth,
+                vec![],
+                Some("not the same track".into()),
+            )
+            .await
+            .expect("split must succeed");
+
+        assert_eq!(registry.subject_count(), 2);
+
+        let h = rx.recv().await.expect("SubjectSplit must arrive");
+        match h {
+            Happening::SubjectSplit {
+                admin_plugin,
+                source_id: got_source,
+                new_ids,
+                strategy,
+                reason,
+                ..
+            } => {
+                assert_eq!(admin_plugin, "admin.plugin");
+                assert_eq!(got_source, source_id);
+                assert_eq!(new_ids.len(), 2);
+                assert_eq!(strategy, SplitRelationStrategy::ToBoth);
+                assert_eq!(reason.as_deref(), Some("not the same track"));
+            }
+            other => panic!("unexpected happening: {other:?}"),
+        }
+
+        assert_eq!(ledger.count(), 1);
+        let entries = ledger.entries();
+        assert_eq!(entries[0].kind, AdminLogKind::SubjectSplit);
+        assert_eq!(
+            entries[0].target_subject.as_deref(),
+            Some(source_id.as_str())
+        );
+        assert_eq!(entries[0].additional_subjects.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn admin_split_with_explicit_unmatched_emits_relation_split_ambiguous(
+    ) {
+        // Operator chose Explicit but supplied no assignment for
+        // the existing album_of edge. The split's storage
+        // primitive falls through to ToBoth and surfaces the gap;
+        // the wiring layer emits one RelationSplitAmbiguous
+        // happening AFTER the SubjectSplit event.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![
+                        ExternalAddressing::new("mpd-path", "/a.flac"),
+                        ExternalAddressing::new("mbid", "abc"),
+                    ],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        // Subscribe AFTER the assert so cardinality / forgotten
+        // events from earlier setup do not pollute the channel.
+        let mut rx = bus.subscribe();
+
+        admin
+            .split(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                vec![
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                    vec![ExternalAddressing::new("mbid", "abc")],
+                ],
+                SplitRelationStrategy::Explicit,
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let first = rx.recv().await.expect("SubjectSplit");
+        assert!(
+            matches!(first, Happening::SubjectSplit { .. }),
+            "first must be SubjectSplit, got {first:?}"
+        );
+        let second = rx.recv().await.expect("RelationSplitAmbiguous");
+        match second {
+            Happening::RelationSplitAmbiguous {
+                admin_plugin,
+                predicate,
+                candidate_new_ids,
+                ..
+            } => {
+                assert_eq!(admin_plugin, "admin.plugin");
+                assert_eq!(predicate, "album_of");
+                assert_eq!(candidate_new_ids.len(), 2);
+            }
+            other => panic!("unexpected happening: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_split_unresolvable_source_returns_invalid() {
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let result = admin
+            .split(
+                ExternalAddressing::new("ghost", "x"),
+                vec![
+                    vec![ExternalAddressing::new("ghost", "a")],
+                    vec![ExternalAddressing::new("ghost", "b")],
+                ],
+                SplitRelationStrategy::ToBoth,
+                vec![],
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ReportError::Invalid(_))),
+            "unresolvable split source must return Invalid, got {result:?}"
+        );
+        assert_eq!(ledger.count(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Relation suppress / unsuppress wiring.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn admin_suppress_succeeds_emits_happening_and_records_ledger() {
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        seed_track_and_album(&registry, "org.test.p1");
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let source_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+        let target_id = registry
+            .resolve(&ExternalAddressing::new("mbid", "album-x"))
+            .unwrap();
+
+        let admin = build_relation_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .suppress(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+                Some("disputed".into()),
+            )
+            .await
+            .unwrap();
+
+        assert!(graph.is_suppressed(&source_id, "album_of", &target_id));
+
+        let h = rx.recv().await.expect("RelationSuppressed must arrive");
+        match h {
+            Happening::RelationSuppressed {
+                admin_plugin,
+                source_id: got_source,
+                predicate,
+                target_id: got_target,
+                reason,
+                ..
+            } => {
+                assert_eq!(admin_plugin, "admin.plugin");
+                assert_eq!(got_source, source_id);
+                assert_eq!(predicate, "album_of");
+                assert_eq!(got_target, target_id);
+                assert_eq!(reason.as_deref(), Some("disputed"));
+            }
+            other => panic!("unexpected happening: {other:?}"),
+        }
+
+        assert_eq!(ledger.count(), 1);
+        let entry = &ledger.entries()[0];
+        assert_eq!(entry.kind, AdminLogKind::RelationSuppress);
+        assert!(entry.target_relation.is_some());
+        assert_eq!(entry.reason.as_deref(), Some("disputed"));
+    }
+
+    #[tokio::test]
+    async fn admin_suppress_idempotent_is_silent_noop() {
+        // Re-suppressing an already-suppressed relation is a
+        // silent no-op: no happening, no new ledger entry.
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        seed_track_and_album(&registry, "org.test.p1");
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let admin = build_relation_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        admin
+            .suppress(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+                Some("first".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ledger.count(), 1);
+
+        // Subscribe AFTER the first suppress so the first
+        // happening is not in the receiver's queue.
+        let mut rx = bus.subscribe();
+
+        admin
+            .suppress(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+                Some("second".into()),
+            )
+            .await
+            .unwrap();
+
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => {}
+            other => panic!(
+                "idempotent suppress must not emit a happening, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            ledger.count(),
+            1,
+            "idempotent suppress must not record a second ledger entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_unsuppress_succeeds_emits_happening_and_records_ledger() {
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        seed_track_and_album(&registry, "org.test.p1");
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let source_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+        let target_id = registry
+            .resolve(&ExternalAddressing::new("mbid", "album-x"))
+            .unwrap();
+
+        let admin = build_relation_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        admin
+            .suppress(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(graph.is_suppressed(&source_id, "album_of", &target_id));
+        assert_eq!(ledger.count(), 1);
+
+        // Subscribe AFTER suppress so the unsuppress happening is
+        // first in the receiver's queue.
+        let mut rx = bus.subscribe();
+
+        admin
+            .unsuppress(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+            )
+            .await
+            .unwrap();
+
+        assert!(!graph.is_suppressed(&source_id, "album_of", &target_id));
+
+        let h = rx.recv().await.expect("RelationUnsuppressed must arrive");
+        match h {
+            Happening::RelationUnsuppressed {
+                admin_plugin,
+                source_id: got_source,
+                predicate,
+                target_id: got_target,
+                ..
+            } => {
+                assert_eq!(admin_plugin, "admin.plugin");
+                assert_eq!(got_source, source_id);
+                assert_eq!(predicate, "album_of");
+                assert_eq!(got_target, target_id);
+            }
+            other => panic!("unexpected happening: {other:?}"),
+        }
+
+        // Two ledger entries: suppress, then unsuppress.
+        assert_eq!(ledger.count(), 2);
+        let entry = &ledger.entries()[1];
+        assert_eq!(entry.kind, AdminLogKind::RelationUnsuppress);
+        // The unsuppress trait carries no reason parameter.
+        assert!(entry.reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_unsuppress_not_suppressed_is_silent_noop() {
+        // Unsuppressing a relation that was never suppressed is a
+        // silent no-op: no happening, no ledger entry.
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        seed_track_and_album(&registry, "org.test.p1");
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let admin = build_relation_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .unsuppress(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+            )
+            .await
+            .unwrap();
+
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => {}
+            other => {
+                panic!("non-suppressed unsuppress must not emit, got {other:?}")
+            }
+        }
+        assert_eq!(ledger.count(), 0);
+    }
+}

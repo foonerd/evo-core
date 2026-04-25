@@ -1,0 +1,121 @@
+# evo.service.example - reference systemd unit (TEMPLATE, not for direct install)
+#
+# This file is reference material shipped by evo-core. Per BOUNDARY.md
+# section 6 (what a distribution contains) and section 9 (filesystem
+# ownership table - the row "Journald unit `evo.service` | Distribution"),
+# packaging is a distribution concern: an `evo-device-<vendor>` repository
+# ships the actual service unit on the target image. evo-core has no
+# package that drops a unit into /lib/systemd/system/.
+#
+# Read this with:
+#   docs/engineering/BOUNDARY.md            section 6 (packaging is
+#                                           distribution-owned),
+#                                           section 9 (filesystem
+#                                           ownership table)
+#   docs/engineering/PERSISTENCE.md         section 6.2 (state-dir
+#                                           ownership; framework
+#                                           observes effective UID,
+#                                           never the user name)
+#   docs/engineering/PLUGIN_PACKAGING.md    section 5 (install-time
+#                                           service user, trust class
+#                                           `standard`)
+#
+# What this file IS: a tested baseline of the unit shape evo-core
+# expects. RuntimeDirectory=, StateDirectory=, ConfigurationDirectory=,
+# the hardening directives, the ExecStart path - these are framework-
+# shaped and a distribution should preserve them unless it has a
+# specific reason to deviate.
+#
+# What this file IS NOT: a runnable unit. The User= and Group= lines
+# are not set; without a distribution-side choice the steward would run
+# as root (permitted by the docs in development and certain embedded
+# scenarios but never the right answer for a packaged appliance).
+#
+# To use: copy this file into your distribution's packaging tree
+# (renaming to `evo.service`), set the distribution-owned choices
+# marked below, and ship the result on the target image.
+
+[Unit]
+Description=Evo steward
+Documentation=https://github.com/foonerd/evo-core
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/evo/bin/evo
+Restart=on-failure
+RestartSec=5s
+
+# ----------------------------------------------------------------------
+# DISTRIBUTION-OWNED CHOICE: service identity
+#
+# Per PERSISTENCE.md section 6.2, the framework observes only the
+# effective UID at runtime; it has no opinion on the name. Pick ONE of
+# the strategies below in your distribution's packaging. The framework
+# does not default to any of them; the as-shipped template runs as root
+# until the distribution makes the choice explicit.
+#
+# Strategy A - named system user (typical packaged appliance):
+#   Distribution packaging creates the account at install time
+#   (Debian postinst, OTA layer, image-build recipe, Yocto recipe).
+#   Common picks: a brand account (`volumio`, `audiokit`, `kioskos`)
+#   or the conventional `evo`. Replace the placeholders below and
+#   uncomment.
+#
+#     User=<service-user>
+#     Group=<service-group>
+#
+# Strategy B - systemd DynamicUser:
+#   Zero-config; systemd assigns a transient UID. Combined with
+#   StateDirectory= below, ownership of /var/lib/evo persists across
+#   restarts. Caveat: switching from DynamicUser=yes to a named user
+#   later requires a `chown -R` of /var/lib/evo/ because the transient
+#   UID and the later named UID will not match.
+#
+#     DynamicUser=yes
+#
+# Strategy C - root (development / certain embedded scenarios only):
+#   Leave this section commented out. The steward runs as root.
+#   Permitted by the docs but the threat model deserves review before
+#   shipping a production unit this way.
+# ----------------------------------------------------------------------
+
+# Runtime directory for the Unix socket the steward binds at
+# /run/evo/evo.sock. systemd creates /run/evo/ owned by the service
+# identity chosen above.
+RuntimeDirectory=evo
+RuntimeDirectoryMode=0755
+
+# Persistent state directory for subjects, relations, custody ledger,
+# and per-plugin state. The directory itself is 0700 inside per
+# PERSISTENCE.md section 6.2; the unit-level mode here is a starting
+# floor systemd applies to the directory it creates.
+StateDirectory=evo
+StateDirectoryMode=0750
+
+# Read-only configuration. The steward writes nothing under /etc/evo.
+ConfigurationDirectory=evo
+ConfigurationDirectoryMode=0755
+
+# Hardening. evo-core's tested baseline. A distribution may add more
+# (CapabilityBoundingSet=, SystemCallFilter=, cgroup limits, seccomp
+# profile, dedicated SELinux domain) per PLUGIN_PACKAGING.md section 5
+# but should not silently drop these protections.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+
+# Per LOGGING.md: default log level is warn. Operators override by
+# editing /etc/evo/evo.toml or by uncommenting the Environment line
+# below.
+# Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

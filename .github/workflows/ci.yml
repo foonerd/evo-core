@@ -1,0 +1,187 @@
+# CI workflow for evo-core.
+#
+# Matches the "Check everything CI checks" command documented in
+# DEVELOPING.md section 11, plus a release build smoke test and an
+# MSRV verification job. Every PR and every push to main runs this
+# matrix; a red pipeline blocks merges.
+#
+# Jobs are independent and run in parallel. Each installs its own
+# toolchain components and caches the target directory via
+# Swatinem/rust-cache so repeated CI runs are fast.
+#
+# The CI toolchain is pinned to `stable` for fmt/clippy/test/build
+# and to the declared MSRV (1.85) for the msrv job. The MSRV is
+# set to match Debian Trixie's shipped rustc; see workspace
+# Cargo.toml rust-version for the full rationale. The MSRV job
+# catches accidental dependence on Rust features newer than the
+# declared minimum.
+#
+# Every cargo invocation uses --locked: CI MUST resolve to exactly
+# the committed Cargo.lock, never to a fresh resolution. Without
+# --locked, CI would pick whatever versions happen to satisfy
+# Cargo.toml constraints at build time, which breaks MSRV builds
+# the moment an upstream crate releases a version requiring a newer
+# Rust. The lockfile is the contract; CI enforces it.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: short
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust toolchain (stable, rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust toolchain (stable, clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+      - name: cargo test --workspace
+        run: cargo test --workspace --all-targets --locked
+      - name: cargo test --workspace --doc
+        run: cargo test --workspace --doc --locked
+
+  build-release:
+    name: build (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+      - name: cargo build --workspace --release
+        run: cargo build --workspace --release --locked
+
+  # The MSRV job verifies that the workspace compiles on the declared
+  # MSRV (1.85) across every target listed as Primary in
+  # docs/engineering/BUILDING.md section 3. This turns the MSRV claim
+  # from a declaration into an empirical guarantee across the full
+  # matrix of targets evo-core commits to shipping release artefacts
+  # for.
+  #
+  # `cargo check --target` still runs `build.rs` for dependencies; crates
+  # with C (e.g. `ring` via `rustls`, `lzma-sys` via `xz2`) need a
+  # matching `CC_*` / linker for the matrix triple AND the target sysroot
+  # headers. The msrv job installs Debian cross-GNU toolchains plus the
+  # matching `libc6-dev-*-cross` sysroot headers, `musl-tools` for
+  # x86_64-musl, and pre-built musl.cc cross toolchains for aarch64 /
+  # armv7 musl (whose tarballs bundle the sysroot). See
+  # `.github/scripts/ci-msrv-cargo-env.sh`.
+  #
+  # The host matrix entry (x86_64-unknown-linux-gnu) additionally runs
+  # the full `cargo test` suite on 1.85 to catch any runtime-visible
+  # MSRV divergence from stable. Non-host entries are compile-check
+  # only; runtime testing on ARM / i686 / musl is done at release cut
+  # on reference hardware per BUILDING.md section 12.2.
+  #
+  # `fail-fast: false` ensures all matrix entries report, so a failure
+  # on one target doesn't mask failures on others.
+  msrv:
+    name: msrv (1.85) ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - arm-unknown-linux-gnueabihf
+          - i686-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install C cross toolchains and musl (host)
+        run: |
+          sudo apt-get update
+          # `libc6-dev-*-cross` are apt-recommended but not required by
+          # the gcc cross packages themselves, so `--no-install-recommends`
+          # skips them by default. They supply the target sysroot headers
+          # (<bits/libc-header-start.h>, <asm/types.h>, etc.) that every C
+          # build.rs for a cross target needs. `ring` (via `rustls` via
+          # `ureq`) and `lzma-sys` (via `xz2`) both hit this path; without
+          # these -dev packages the cross-gcc falls back to the host's
+          # `/usr/include/stdint.h` and fails with "bits/libc-header-start.h:
+          # No such file or directory". Musl targets carry their own
+          # sysroot in the musl.cc tarballs or via `musl-tools` and do not
+          # need an equivalent package.
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+            gcc-arm-linux-gnueabihf \
+            libc6-dev-armhf-cross \
+            gcc-i686-linux-gnu \
+            libc6-dev-i386-cross \
+            musl-tools
+      - name: Install musl.cc cross (aarch64-unknown-linux-musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: bash .github/scripts/ci-install-musl-cc-tarball.sh aarch64-linux-musl-cross
+      - name: Install musl.cc cross (armv7-unknown-linux-musleabihf)
+        if: matrix.target == 'armv7-unknown-linux-musleabihf'
+        run: bash .github/scripts/ci-install-musl-cc-tarball.sh armv7l-linux-musleabihf-cross
+      - name: Install Rust 1.85 with target ${{ matrix.target }}
+        uses: dtolnay/rust-toolchain@1.85
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: msrv-${{ matrix.target }}
+      - name: cargo check (MSRV, target ${{ matrix.target }})
+        run: |
+          # Cross targets: clear workflow RUSTFLAGS=-D warnings so upstream crates
+          # (e.g. target-gated code in rustls/ring) are not failed as errors. The
+          # clippy job still enforces -D warnings for the default host build.
+          if [ "$TARGET" != "x86_64-unknown-linux-gnu" ]; then
+            export RUSTFLAGS=""
+          fi
+          set -a
+          # shellcheck source=/dev/null
+          source .github/scripts/ci-msrv-cargo-env.sh
+          set +a
+          cargo check --workspace --all-targets --target "$TARGET" --locked
+        env:
+          TARGET: ${{ matrix.target }}
+      - name: cargo test (MSRV, host only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test --workspace --all-targets --target ${{ matrix.target }} --locked
