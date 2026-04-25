@@ -303,9 +303,28 @@ pub enum SuppressOutcome {
     /// Indices were cleaned; future neighbour queries, walks, and
     /// cardinality counts skip it.
     NewlySuppressed,
-    /// The relation was already suppressed; no change. The
-    /// existing [`SuppressionRecord`] is preserved untouched.
+    /// The relation was already suppressed AND the new reason
+    /// matches the existing one; no change. The existing
+    /// [`SuppressionRecord`] is preserved untouched.
     AlreadySuppressed,
+    /// The relation was already suppressed but the caller supplied
+    /// a different reason. The existing [`SuppressionRecord`]'s
+    /// `reason` field has been updated in place; `admin_plugin` and
+    /// `suppressed_at` are preserved (the suppression itself was
+    /// already valid; only the rationale evolved). The wiring layer
+    /// emits a `RelationSuppressionReasonUpdated` happening and
+    /// records an `AdminLedger` entry on this outcome. The same
+    /// rule applies whether the reason transitions from
+    /// `Some(_)` to a different `Some(_)`, from `Some(_)` to `None`,
+    /// or from `None` to `Some(_)`.
+    ReasonUpdated {
+        /// The reason carried on the existing suppression record
+        /// before the update.
+        old_reason: Option<String>,
+        /// The reason the caller supplied; now stored on the
+        /// suppression record.
+        new_reason: Option<String>,
+    },
     /// The relation does not exist in the graph.
     NotFound,
 }
@@ -1131,8 +1150,21 @@ impl RelationGraph {
     /// - [`SuppressOutcome::NewlySuppressed`] when the relation
     ///   transitioned from visible to suppressed.
     /// - [`SuppressOutcome::AlreadySuppressed`] when a
-    ///   suppression record was already present; the existing
-    ///   record is preserved untouched.
+    ///   suppression record was already present and the supplied
+    ///   `reason` matches the existing record's reason; the
+    ///   existing record is preserved untouched. This is the
+    ///   silent-no-op path.
+    /// - [`SuppressOutcome::ReasonUpdated`] when a suppression
+    ///   record was already present but the supplied `reason`
+    ///   differs from the existing record's reason. The record's
+    ///   `reason` field is mutated in place; `admin_plugin` and
+    ///   `suppressed_at` are preserved (the suppression itself
+    ///   was already valid; only the rationale evolves). The
+    ///   transition `Some(_) -> None`, `None -> Some(_)`, and
+    ///   `Some(a) -> Some(b)` (where `a != b`) all count as
+    ///   different and trigger this outcome. The wiring layer
+    ///   emits `Happening::RelationSuppressionReasonUpdated` and
+    ///   writes an `AdminLedger` entry on this outcome.
     /// - [`SuppressOutcome::NotFound`] when the relation does
     ///   not exist in the graph. The wiring layer treats this as
     ///   a silent no-op consistent with the forced-retract
@@ -1140,8 +1172,8 @@ impl RelationGraph {
     ///
     /// This method does not emit happenings; the wiring layer
     /// owns that surface. A `tracing::info!` record is written
-    /// on the visible-to-suppressed transition as a debug
-    /// utility.
+    /// on the visible-to-suppressed transition and on the
+    /// reason-update transition as a debug utility.
     pub fn suppress(
         &self,
         source_id: &str,
@@ -1158,8 +1190,38 @@ impl RelationGraph {
             None => return Ok(SuppressOutcome::NotFound),
         };
 
-        if record.suppression.is_some() {
-            return Ok(SuppressOutcome::AlreadySuppressed);
+        if let Some(existing) = record.suppression.as_mut() {
+            // Already suppressed. Compare the existing reason
+            // with the newly-supplied reason; same-reason
+            // re-suppress is a silent no-op (correct: it is
+            // literally a noop). Different-reason re-suppress is
+            // operator-corrective work and must be audible: the
+            // record's reason is mutated in place, leaving
+            // `admin_plugin` and `suppressed_at` untouched, and
+            // the wiring layer fires the
+            // `RelationSuppressionReasonUpdated` happening. The
+            // transitions `Some -> None`, `None -> Some`, and
+            // `Some(a) -> Some(b)` (where `a != b`) all count as
+            // different.
+            if existing.reason == reason {
+                return Ok(SuppressOutcome::AlreadySuppressed);
+            }
+            let old_reason = existing.reason.clone();
+            existing.reason = reason.clone();
+            record.modified_at = SystemTime::now();
+            tracing::info!(
+                source = %source_id,
+                predicate = %predicate,
+                target = %target_id,
+                admin_plugin = %admin_plugin,
+                old_reason = ?old_reason,
+                new_reason = ?reason,
+                "RelationSuppressionReasonUpdated: suppression rationale evolved"
+            );
+            return Ok(SuppressOutcome::ReasonUpdated {
+                old_reason,
+                new_reason: reason,
+            });
         }
 
         let now = SystemTime::now();
@@ -2416,10 +2478,15 @@ mod tests {
     }
 
     #[test]
-    fn suppress_idempotent_returns_already_suppressed() {
+    fn suppress_idempotent_same_reason_returns_already_suppressed() {
+        // Same-reason re-suppress is the silent no-op path: the
+        // record is preserved untouched and the outcome is
+        // `AlreadySuppressed`. Pin both the outcome and the
+        // record-preservation invariant.
         let g = RelationGraph::new();
         g.assert("s1", "p", "t1", "p1", None).unwrap();
-        g.suppress("s1", "p", "t1", "admin.plugin", None).unwrap();
+        g.suppress("s1", "p", "t1", "admin.plugin", Some("contested".into()))
+            .unwrap();
         // Capture the original suppression timestamp by record
         // clone so we can verify the idempotent call did not
         // overwrite it.
@@ -2429,19 +2496,20 @@ mod tests {
             .suppression
             .unwrap();
 
-        // Second suppress: no-op.
+        // Second suppress with the SAME reason: no-op.
         let outcome = g
             .suppress(
                 "s1",
                 "p",
                 "t1",
                 "different.admin",
-                Some("second try".into()),
+                Some("contested".into()),
             )
             .unwrap();
         assert_eq!(outcome, SuppressOutcome::AlreadySuppressed);
 
-        // The original suppression record is preserved untouched.
+        // The original suppression record is preserved untouched
+        // (admin_plugin, reason, suppressed_at all unchanged).
         let after = g
             .describe_relation("s1", "p", "t1")
             .unwrap()
@@ -2450,6 +2518,133 @@ mod tests {
         assert_eq!(after.admin_plugin, original.admin_plugin);
         assert_eq!(after.reason, original.reason);
         assert_eq!(after.suppressed_at, original.suppressed_at);
+    }
+
+    #[test]
+    fn suppress_different_reason_returns_reason_updated() {
+        // Different-reason re-suppress is the operator-corrective
+        // path: the outcome is `ReasonUpdated { old_reason,
+        // new_reason }`, the record's `reason` is mutated in
+        // place, and `admin_plugin` and `suppressed_at` are
+        // preserved (the suppression itself was already valid;
+        // only the rationale evolved).
+        let g = RelationGraph::new();
+        g.assert("s1", "p", "t1", "p1", None).unwrap();
+        g.suppress(
+            "s1",
+            "p",
+            "t1",
+            "admin.plugin",
+            Some("spurious metadata claim".into()),
+        )
+        .unwrap();
+        let original = g
+            .describe_relation("s1", "p", "t1")
+            .unwrap()
+            .suppression
+            .unwrap();
+
+        let outcome = g
+            .suppress(
+                "s1",
+                "p",
+                "t1",
+                "different.admin",
+                Some("incorrect provenance per investigation".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            SuppressOutcome::ReasonUpdated {
+                old_reason: Some("spurious metadata claim".into()),
+                new_reason: Some(
+                    "incorrect provenance per investigation".into()
+                ),
+            }
+        );
+
+        let after = g
+            .describe_relation("s1", "p", "t1")
+            .unwrap()
+            .suppression
+            .unwrap();
+        // Reason updated; admin_plugin and suppressed_at preserved.
+        assert_eq!(
+            after.reason.as_deref(),
+            Some("incorrect provenance per investigation")
+        );
+        assert_eq!(after.admin_plugin, original.admin_plugin);
+        assert_eq!(after.suppressed_at, original.suppressed_at);
+    }
+
+    #[test]
+    fn suppress_some_to_none_is_reason_updated() {
+        // `Some(_) -> None` counts as "different reason": the
+        // record's reason transitions from a value to absent. Pins
+        // the policy that None is not a special "no change" sentinel.
+        let g = RelationGraph::new();
+        g.assert("s1", "p", "t1", "p1", None).unwrap();
+        g.suppress("s1", "p", "t1", "admin.plugin", Some("foo".into()))
+            .unwrap();
+
+        let outcome =
+            g.suppress("s1", "p", "t1", "admin.plugin", None).unwrap();
+        assert_eq!(
+            outcome,
+            SuppressOutcome::ReasonUpdated {
+                old_reason: Some("foo".into()),
+                new_reason: None,
+            }
+        );
+
+        let after = g
+            .describe_relation("s1", "p", "t1")
+            .unwrap()
+            .suppression
+            .unwrap();
+        assert!(after.reason.is_none());
+    }
+
+    #[test]
+    fn suppress_none_to_some_is_reason_updated() {
+        // `None -> Some(_)` counts as "different reason": the
+        // record's reason transitions from absent to a value.
+        let g = RelationGraph::new();
+        g.assert("s1", "p", "t1", "p1", None).unwrap();
+        g.suppress("s1", "p", "t1", "admin.plugin", None).unwrap();
+
+        let outcome = g
+            .suppress("s1", "p", "t1", "admin.plugin", Some("bar".into()))
+            .unwrap();
+        assert_eq!(
+            outcome,
+            SuppressOutcome::ReasonUpdated {
+                old_reason: None,
+                new_reason: Some("bar".into()),
+            }
+        );
+
+        let after = g
+            .describe_relation("s1", "p", "t1")
+            .unwrap()
+            .suppression
+            .unwrap();
+        assert_eq!(after.reason.as_deref(), Some("bar"));
+    }
+
+    #[test]
+    fn suppress_idempotent_none_to_none_returns_already_suppressed() {
+        // `None -> None` counts as same-reason: silent no-op.
+        // Symmetric to the `Some(a) -> Some(a)` case but pinned
+        // separately because None equality is easy to bungle.
+        let g = RelationGraph::new();
+        g.assert("s1", "p", "t1", "p1", None).unwrap();
+        g.suppress("s1", "p", "t1", "admin.plugin", None).unwrap();
+
+        let outcome = g
+            .suppress("s1", "p", "t1", "different.admin", None)
+            .unwrap();
+        assert_eq!(outcome, SuppressOutcome::AlreadySuppressed);
     }
 
     #[test]

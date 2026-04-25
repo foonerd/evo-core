@@ -35,6 +35,7 @@ pub enum Happening {
     RelationCardinalityViolation { plugin, predicate, source_id, target_id, side, declared, observed_count, at },
     RelationForgotten { plugin, source_id, predicate, target_id, reason, at },
     RelationSuppressed { admin_plugin, source_id, predicate, target_id, reason, at },
+    RelationSuppressionReasonUpdated { admin_plugin, source_id, predicate, target_id, old_reason, new_reason, at },
     RelationUnsuppressed { admin_plugin, source_id, predicate, target_id, at },
     // Subject registry
     SubjectForgotten { plugin, canonical_id, subject_type, at },
@@ -57,7 +58,7 @@ pub enum Happening {
 
 ### 3.1 Current Variants
 
-Sixteen variants ship today across five categories. All variants carry an `at: SystemTime` field (the steward's clock when the happening was emitted) - omitted from the per-variant tables below to keep them readable. JSON shapes are in `SCHEMAS.md` section 5.1.
+Seventeen variants ship today across five categories. All variants carry an `at: SystemTime` field (the steward's clock when the happening was emitted) - omitted from the per-variant tables below to keep them readable. JSON shapes are in `SCHEMAS.md` section 5.1.
 
 **Custody transitions**
 
@@ -73,7 +74,8 @@ Sixteen variants ship today across five categories. All variants carry an `at: S
 |---------|---------|------------------------|
 | `RelationCardinalityViolation` | An assertion stored in the graph causes the source-side or target-side count for the predicate to exceed its declared bound. The assertion is not refused; the violation is surfaced for consumer policy (`RELATIONS.md` 7.1). | `plugin`, `predicate`, `source_id`, `target_id`, `side`, `declared`, `observed_count` |
 | `RelationForgotten` | The last claimant retracts (`reason.kind = "claims_retracted"`), or a touched subject is forgotten and the cascade removes the edge (`reason.kind = "subject_cascade"`). Both paths emit the same variant; consumers branch on `reason.kind`. | `plugin`, `source_id`, `predicate`, `target_id`, `reason` |
-| `RelationSuppressed` | First-time successful suppression of a relation by an admin. Re-suppressing an already-suppressed relation is a silent no-op. | `admin_plugin`, `source_id`, `predicate`, `target_id`, `reason` |
+| `RelationSuppressed` | First-time successful suppression of a relation by an admin. Re-suppressing an already-suppressed relation with the same reason is a silent no-op; a re-suppress with a different reason emits `RelationSuppressionReasonUpdated` instead. | `admin_plugin`, `source_id`, `predicate`, `target_id`, `reason` |
+| `RelationSuppressionReasonUpdated` | An admin re-suppressed an already-suppressed relation with a DIFFERENT reason. The suppression record's `reason` field is mutated in place; `admin_plugin` and `suppressed_at` on the record are preserved. The transitions `Some -> None`, `None -> Some`, and `Some(a) -> Some(b)` (where `a != b`) all count as "different reason" and emit this happening. Same-reason re-suppress is a silent no-op. | `admin_plugin`, `source_id`, `predicate`, `target_id`, `old_reason`, `new_reason` |
 | `RelationUnsuppressed` | Successful transition from suppressed to visible. Unsuppressing a non-suppressed or unknown relation is a silent no-op. | `admin_plugin`, `source_id`, `predicate`, `target_id` |
 
 **Subject registry**
@@ -207,6 +209,7 @@ Every happening is emitted after the authoritative store write it describes comp
 | `RelationForgotten` (claims_retracted) | `RelationGraph::retract` (last claimant gone) |
 | `RelationForgotten` (subject_cascade) | `RelationGraph::forget_all_touching` (cascade) |
 | `RelationSuppressed` | `RelationGraph::suppress` |
+| `RelationSuppressionReasonUpdated` | `RelationGraph::suppress` (when re-suppress with different reason mutates the existing record's `reason` in place) + `AdminLedger::record` |
 | `RelationUnsuppressed` | `RelationGraph::unsuppress` |
 | `SubjectForgotten` | `SubjectRegistry::forget` |
 | `SubjectAddressingForcedRetract` | `SubjectRegistry::forced_retract_addressing` + `AdminLedger::record` |
@@ -243,6 +246,7 @@ This ordering is the basis for the "consistent view" property in section 1. A su
 - After `RelationCardinalityViolation`: the violating relation has been stored; both the new and the pre-existing relation are visible to neighbour queries.
 - After `RelationForgotten`: the relation is gone from the graph.
 - After `RelationSuppressed`: the relation is hidden from neighbour queries and walks; `describe_relation` still surfaces it with its `SuppressionRecord`.
+- After `RelationSuppressionReasonUpdated`: the existing `SuppressionRecord` carries the new reason; `admin_plugin` and `suppressed_at` on the record are unchanged. The relation remains hidden from neighbour queries and walks.
 - After `RelationUnsuppressed`: the relation is visible again to neighbour queries and walks.
 - After `SubjectForgotten`: the canonical ID no longer resolves in the registry.
 - After `SubjectAddressingForcedRetract`: the addressing is gone; if it was the subject's last addressing, a `SubjectForgotten` follows.
@@ -308,7 +312,7 @@ The bus has the following production emission sites today:
 - `RegistrySubjectAnnouncer`: emits `SubjectForgotten` when a retract removes a subject's last addressing. Cascade `RelationForgotten` events with `reason.kind = "subject_cascade"` follow per edge `RelationGraph::forget_all_touching` removed.
 - `RegistryRelationAnnouncer`: emits `RelationCardinalityViolation` after the assertion has been stored, and `RelationForgotten` with `reason.kind = "claims_retracted"` when the last claimant retracts.
 - `RegistrySubjectAdmin`: emits `SubjectAddressingForcedRetract`, `SubjectMerged`, and `SubjectSplit` after the registry primitive succeeds. `SubjectMerged` and `SubjectSplit` emit BEFORE the relation-graph rewrite they trigger; cascade `RelationCardinalityViolation` and `RelationSplitAmbiguous` events fire afterwards.
-- `RegistryRelationAdmin`: emits `RelationClaimForcedRetract`, `RelationSuppressed`, and `RelationUnsuppressed` after the graph primitive succeeds.
+- `RegistryRelationAdmin`: emits `RelationClaimForcedRetract`, `RelationSuppressed`, `RelationSuppressionReasonUpdated`, and `RelationUnsuppressed` after the graph primitive succeeds.
 
 A separate site exists on the client-socket surface: when a client sends `subscribe_happenings`, the server subscribes on its behalf and forwards every happening as a frame. See section 9.2.
 

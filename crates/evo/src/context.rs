@@ -946,6 +946,7 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                         target_relation: None,
                         additional_subjects: Vec::new(),
                         reason,
+                        prior_reason: None,
                         at,
                     });
                     Ok(())
@@ -1012,6 +1013,7 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                         target_relation: None,
                         additional_subjects: Vec::new(),
                         reason,
+                        prior_reason: None,
                         at,
                     });
                     Ok(())
@@ -1302,6 +1304,7 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 target_relation: None,
                 additional_subjects: vec![source_a_id, source_b_id],
                 reason,
+                prior_reason: None,
                 at,
             });
 
@@ -1588,6 +1591,7 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 target_relation: None,
                 additional_subjects: new_ids,
                 reason,
+                prior_reason: None,
                 at,
             });
 
@@ -1729,6 +1733,7 @@ impl RelationAdmin for RegistryRelationAdmin {
                         )),
                         additional_subjects: Vec::new(),
                         reason,
+                        prior_reason: None,
                         at,
                     });
                     Ok(())
@@ -1773,6 +1778,7 @@ impl RelationAdmin for RegistryRelationAdmin {
                         )),
                         additional_subjects: Vec::new(),
                         reason,
+                        prior_reason: None,
                         at,
                     });
                     Ok(())
@@ -1795,9 +1801,19 @@ impl RelationAdmin for RegistryRelationAdmin {
     /// 3. On [`SuppressOutcome::NewlySuppressed`]: emit
     ///    [`Happening::RelationSuppressed`] and record an
     ///    [`AdminLedger`] entry with `kind = RelationSuppress`.
-    /// 4. On [`SuppressOutcome::AlreadySuppressed`] or
+    /// 4. On [`SuppressOutcome::ReasonUpdated`]: emit
+    ///    [`Happening::RelationSuppressionReasonUpdated`]
+    ///    carrying the old and new reasons, and record an
+    ///    [`AdminLedger`] entry with
+    ///    `kind = RelationSuppressionReasonUpdated`. The audit
+    ///    entry's `reason` is the new reason and `prior_reason`
+    ///    is the reason on the suppression record before the
+    ///    update. Operator-corrective work (typing a corrected
+    ///    justification onto an existing suppression) is now
+    ///    audible rather than silently discarded.
+    /// 5. On [`SuppressOutcome::AlreadySuppressed`] or
     ///    [`SuppressOutcome::NotFound`]: silent no-op (no
-    ///    happening, no ledger entry). Re-suppressing is
+    ///    happening, no ledger entry). Same-reason re-suppress is
     ///    idempotent; the existing suppression record is
     ///    preserved untouched by the storage primitive.
     fn suppress<'a>(
@@ -1859,6 +1875,38 @@ impl RelationAdmin for RegistryRelationAdmin {
                         )),
                         additional_subjects: Vec::new(),
                         reason,
+                        prior_reason: None,
+                        at,
+                    });
+                    Ok(())
+                }
+
+                SuppressOutcome::ReasonUpdated {
+                    old_reason,
+                    new_reason,
+                } => {
+                    let at = SystemTime::now();
+                    bus.emit(Happening::RelationSuppressionReasonUpdated {
+                        admin_plugin: admin_plugin.clone(),
+                        source_id: source_id.clone(),
+                        predicate: predicate.clone(),
+                        target_id: target_id.clone(),
+                        old_reason: old_reason.clone(),
+                        new_reason: new_reason.clone(),
+                        at,
+                    });
+                    ledger.record(AdminLogEntry {
+                        kind: AdminLogKind::RelationSuppressionReasonUpdated,
+                        admin_plugin,
+                        target_plugin: None,
+                        target_subject: None,
+                        target_addressing: None,
+                        target_relation: Some(RelationKey::new(
+                            source_id, predicate, target_id,
+                        )),
+                        additional_subjects: Vec::new(),
+                        reason: new_reason,
+                        prior_reason: old_reason,
                         at,
                     });
                     Ok(())
@@ -1935,6 +1983,7 @@ impl RelationAdmin for RegistryRelationAdmin {
                         )),
                         additional_subjects: Vec::new(),
                         reason: None,
+                        prior_reason: None,
                         at,
                     });
                     Ok(())
@@ -5277,9 +5326,12 @@ target_type = "*"
     }
 
     #[tokio::test]
-    async fn admin_suppress_idempotent_is_silent_noop() {
-        // Re-suppressing an already-suppressed relation is a
-        // silent no-op: no happening, no new ledger entry.
+    async fn admin_suppress_same_reason_is_silent_noop() {
+        // Re-suppressing an already-suppressed relation with the
+        // SAME reason is a silent no-op: no happening, no new
+        // ledger entry. The transitions `Some(x) -> Some(x)` and
+        // `None -> None` both qualify as same-reason and take this
+        // path.
         let registry = Arc::new(SubjectRegistry::new());
         let graph = Arc::new(RelationGraph::new());
         let catalogue = Arc::new(test_catalogue_with_predicates());
@@ -5333,7 +5385,7 @@ target_type = "*"
                 ExternalAddressing::new("mpd-path", "/a.flac"),
                 "album_of".into(),
                 ExternalAddressing::new("mbid", "album-x"),
-                Some("second".into()),
+                Some("first".into()),
             )
             .await
             .unwrap();
@@ -5341,14 +5393,314 @@ target_type = "*"
         match rx.try_recv() {
             Err(TryRecvError::Empty) => {}
             other => panic!(
-                "idempotent suppress must not emit a happening, got {other:?}"
+                "same-reason re-suppress must not emit a happening, got {other:?}"
             ),
         }
         assert_eq!(
             ledger.count(),
             1,
-            "idempotent suppress must not record a second ledger entry"
+            "same-reason re-suppress must not record a second ledger entry"
         );
+    }
+
+    #[tokio::test]
+    async fn admin_suppress_different_reason_emits_reason_updated_and_records_ledger(
+    ) {
+        // Re-suppressing an already-suppressed relation with a
+        // DIFFERENT reason is operator-corrective work. The wiring
+        // layer must emit exactly one
+        // `RelationSuppressionReasonUpdated` happening carrying
+        // the old and new reasons, and append exactly one
+        // `AdminLedger` entry with kind
+        // `RelationSuppressionReasonUpdated`, `reason` = new
+        // reason, `prior_reason` = old reason.
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        seed_track_and_album(&registry, "org.test.p1");
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let source_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+        let target_id = registry
+            .resolve(&ExternalAddressing::new("mbid", "album-x"))
+            .unwrap();
+
+        let admin = build_relation_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        admin
+            .suppress(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+                Some("spurious metadata claim".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ledger.count(), 1);
+
+        // Subscribe AFTER the first suppress so its happening is
+        // not in the receiver's queue.
+        let mut rx = bus.subscribe();
+
+        admin
+            .suppress(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+                Some("incorrect provenance per investigation".into()),
+            )
+            .await
+            .unwrap();
+
+        let h = rx.recv().await.expect(
+            "RelationSuppressionReasonUpdated must arrive on different-reason re-suppress",
+        );
+        match h {
+            Happening::RelationSuppressionReasonUpdated {
+                admin_plugin,
+                source_id: got_source,
+                predicate,
+                target_id: got_target,
+                old_reason,
+                new_reason,
+                ..
+            } => {
+                assert_eq!(admin_plugin, "admin.plugin");
+                assert_eq!(got_source, source_id);
+                assert_eq!(predicate, "album_of");
+                assert_eq!(got_target, target_id);
+                assert_eq!(
+                    old_reason.as_deref(),
+                    Some("spurious metadata claim")
+                );
+                assert_eq!(
+                    new_reason.as_deref(),
+                    Some("incorrect provenance per investigation")
+                );
+            }
+            other => panic!("unexpected happening: {other:?}"),
+        }
+
+        // No further happening (exactly one).
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => {}
+            other => panic!(
+                "different-reason re-suppress must emit exactly one happening, got {other:?}"
+            ),
+        }
+
+        assert_eq!(
+            ledger.count(),
+            2,
+            "different-reason re-suppress must append a second ledger entry"
+        );
+        let entry = &ledger.entries()[1];
+        assert_eq!(entry.kind, AdminLogKind::RelationSuppressionReasonUpdated);
+        assert!(entry.target_relation.is_some());
+        assert_eq!(
+            entry.reason.as_deref(),
+            Some("incorrect provenance per investigation")
+        );
+        assert_eq!(
+            entry.prior_reason.as_deref(),
+            Some("spurious metadata claim")
+        );
+        assert!(entry.target_plugin.is_none());
+
+        // The graph's record reflects the new reason; the
+        // suppression itself remains in place.
+        assert!(graph.is_suppressed(&source_id, "album_of", &target_id));
+        let rec = graph
+            .describe_relation(&source_id, "album_of", &target_id)
+            .unwrap();
+        assert_eq!(
+            rec.suppression.unwrap().reason.as_deref(),
+            Some("incorrect provenance per investigation")
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_suppress_some_to_none_emits_reason_updated() {
+        // Edge case: `Some(_) -> None` counts as "different
+        // reason". One happening, one ledger entry; `prior_reason`
+        // populated, `reason` is None.
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        seed_track_and_album(&registry, "org.test.p1");
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let admin = build_relation_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        admin
+            .suppress(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+                Some("foo".into()),
+            )
+            .await
+            .unwrap();
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .suppress(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let h = rx.recv().await.expect("reason-updated must arrive");
+        match h {
+            Happening::RelationSuppressionReasonUpdated {
+                old_reason,
+                new_reason,
+                ..
+            } => {
+                assert_eq!(old_reason.as_deref(), Some("foo"));
+                assert!(new_reason.is_none());
+            }
+            other => panic!("unexpected happening: {other:?}"),
+        }
+
+        let entry = &ledger.entries()[1];
+        assert_eq!(entry.kind, AdminLogKind::RelationSuppressionReasonUpdated);
+        assert!(entry.reason.is_none());
+        assert_eq!(entry.prior_reason.as_deref(), Some("foo"));
+    }
+
+    #[tokio::test]
+    async fn admin_suppress_none_to_some_emits_reason_updated() {
+        // Edge case: `None -> Some(_)` counts as "different
+        // reason". Symmetric to the some-to-none case.
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        seed_track_and_album(&registry, "org.test.p1");
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let admin = build_relation_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        admin
+            .suppress(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .suppress(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+                Some("bar".into()),
+            )
+            .await
+            .unwrap();
+
+        let h = rx.recv().await.expect("reason-updated must arrive");
+        match h {
+            Happening::RelationSuppressionReasonUpdated {
+                old_reason,
+                new_reason,
+                ..
+            } => {
+                assert!(old_reason.is_none());
+                assert_eq!(new_reason.as_deref(), Some("bar"));
+            }
+            other => panic!("unexpected happening: {other:?}"),
+        }
+
+        let entry = &ledger.entries()[1];
+        assert_eq!(entry.kind, AdminLogKind::RelationSuppressionReasonUpdated);
+        assert_eq!(entry.reason.as_deref(), Some("bar"));
+        assert!(entry.prior_reason.is_none());
     }
 
     #[tokio::test]

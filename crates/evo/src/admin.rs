@@ -17,6 +17,7 @@
 //! - [`AdminLogKind::SubjectMerge`]
 //! - [`AdminLogKind::SubjectSplit`]
 //! - [`AdminLogKind::RelationSuppress`]
+//! - [`AdminLogKind::RelationSuppressionReasonUpdated`]
 //! - [`AdminLogKind::RelationUnsuppress`]
 //!
 //! The enum is `#[non_exhaustive]` so further SDK extensions can
@@ -92,6 +93,15 @@ pub enum AdminLogKind {
     /// suppression hides the relation regardless of which
     /// plugins claim it.
     RelationSuppress,
+    /// The admin re-suppressed an already-suppressed relation
+    /// with a DIFFERENT reason. The entry's `target_relation`
+    /// carries the relation key; `target_plugin` is `None`. The
+    /// entry's `reason` field carries the NEW reason and the
+    /// optional [`AdminLogEntry::prior_reason`] field carries the
+    /// reason that was on the suppression record before the
+    /// update. Same-reason re-suppress is a silent no-op and
+    /// produces no entry.
+    RelationSuppressionReasonUpdated,
     /// The admin unsuppressed a previously-suppressed relation
     /// via
     /// [`RelationAdmin::unsuppress`](evo_plugin_sdk::contract::RelationAdmin::unsuppress).
@@ -140,8 +150,24 @@ pub struct AdminLogEntry {
     /// constructs entries with `Vec::new()` in those cases.
     pub additional_subjects: Vec<String>,
     /// Free-form operator-supplied reason. Mirrors the `reason`
-    /// field on the underlying retract/suppress primitive.
+    /// field on the underlying retract/suppress primitive. For
+    /// [`AdminLogKind::RelationSuppressionReasonUpdated`] this is
+    /// the NEW reason; the prior reason that was overwritten is
+    /// carried separately on [`Self::prior_reason`].
     pub reason: Option<String>,
+    /// Reason that was on the relevant record before the action
+    /// overwrote it. Populated only for
+    /// [`AdminLogKind::RelationSuppressionReasonUpdated`]; `None`
+    /// for every other kind today (the other kinds either install
+    /// or remove a record entirely, so there is no prior-reason
+    /// to capture). The `Option<Option<String>>` shape would
+    /// distinguish "no prior-reason concept" from "prior reason
+    /// was None"; we use a flat `Option<String>` and rely on the
+    /// `kind` discriminant: readers consult `prior_reason` only
+    /// when `kind == RelationSuppressionReasonUpdated`, and within
+    /// that kind a `None` here means the prior reason was
+    /// literally `None` on the record.
+    pub prior_reason: Option<String>,
     /// When the action was recorded (after the storage primitive
     /// succeeded, before the ledger write returned).
     pub at: SystemTime,
@@ -255,6 +281,7 @@ mod tests {
             target_relation: None,
             additional_subjects: Vec::new(),
             reason: Some("test entry".to_string()),
+            prior_reason: None,
             at: SystemTime::now(),
         }
     }
@@ -434,6 +461,7 @@ mod tests {
             target_relation: None,
             additional_subjects: vec!["old-a".into(), "old-b".into()],
             reason: Some("operator confirmed identity".into()),
+            prior_reason: None,
             at: SystemTime::now(),
         });
         let entries = l.entries();
@@ -467,6 +495,7 @@ mod tests {
                 "new-3".into(),
             ],
             reason: None,
+            prior_reason: None,
             at: SystemTime::now(),
         });
         let entries = l.entries();
@@ -497,6 +526,7 @@ mod tests {
             target_relation: Some(key.clone()),
             additional_subjects: Vec::new(),
             reason: Some("disputed claim".into()),
+            prior_reason: None,
             at: SystemTime::now(),
         });
         let entries = l.entries();
@@ -526,6 +556,7 @@ mod tests {
             target_relation: Some(key.clone()),
             additional_subjects: Vec::new(),
             reason: None,
+            prior_reason: None,
             at: SystemTime::now(),
         });
         let entries = l.entries();

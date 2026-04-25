@@ -855,6 +855,24 @@ enum HappeningWire {
         /// When the happening was recorded, ms since UNIX epoch.
         at_ms: u64,
     },
+    /// Wire form of [`Happening::RelationSuppressionReasonUpdated`].
+    RelationSuppressionReasonUpdated {
+        /// Canonical name of the admin plugin that performed the
+        /// re-suppress with the new reason.
+        admin_plugin: String,
+        /// Canonical ID of the source subject.
+        source_id: String,
+        /// Predicate of the relation.
+        predicate: String,
+        /// Canonical ID of the target subject.
+        target_id: String,
+        /// The reason on the suppression record before the update.
+        old_reason: Option<String>,
+        /// The reason now stored on the suppression record.
+        new_reason: Option<String>,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
     /// Wire form of [`Happening::RelationUnsuppressed`].
     RelationUnsuppressed {
         /// Canonical name of the admin plugin that performed the
@@ -1182,6 +1200,23 @@ impl From<Happening> for HappeningWire {
                 predicate,
                 target_id,
                 reason,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::RelationSuppressionReasonUpdated {
+                admin_plugin,
+                source_id,
+                predicate,
+                target_id,
+                old_reason,
+                new_reason,
+                at,
+            } => HappeningWire::RelationSuppressionReasonUpdated {
+                admin_plugin,
+                source_id,
+                predicate,
+                target_id,
+                old_reason,
+                new_reason,
                 at_ms: system_time_to_ms(at),
             },
             Happening::RelationUnsuppressed {

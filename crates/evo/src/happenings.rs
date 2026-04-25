@@ -83,8 +83,13 @@
 //! - [`RegistryRelationAdmin`](crate::context::RegistryRelationAdmin)
 //!   emits [`Happening::RelationSuppressed`] on a successful
 //!   first-time suppression of a relation. Re-suppressing an
-//!   already-suppressed relation is a silent no-op and emits no
-//!   happening.
+//!   already-suppressed relation with the SAME reason is a silent
+//!   no-op and emits no happening.
+//! - [`RegistryRelationAdmin`](crate::context::RegistryRelationAdmin)
+//!   emits [`Happening::RelationSuppressionReasonUpdated`] when an
+//!   admin re-suppresses an already-suppressed relation with a
+//!   DIFFERENT reason. The suppression record's reason is mutated
+//!   in place; `admin_plugin` and `suppressed_at` are preserved.
 //! - [`RegistryRelationAdmin`](crate::context::RegistryRelationAdmin)
 //!   emits [`Happening::RelationUnsuppressed`] on a successful
 //!   transition from suppressed to visible. Unsuppressing a
@@ -541,8 +546,10 @@ pub enum Happening {
     /// An admin plugin suppressed a relation. Emitted by
     /// [`RegistryRelationAdmin`](crate::context::RegistryRelationAdmin)
     /// on a successful first-time suppression. Re-suppressing an
-    /// already-suppressed relation is a silent no-op (no
-    /// happening).
+    /// already-suppressed relation with the SAME reason is a
+    /// silent no-op (no happening); a re-suppress with a
+    /// DIFFERENT reason emits
+    /// [`Happening::RelationSuppressionReasonUpdated`] instead.
     ///
     /// The relation remains in the graph and visible to
     /// `describe_relation` (with its `SuppressionRecord`
@@ -562,6 +569,41 @@ pub enum Happening {
         target_id: String,
         /// Operator-supplied reason, if any.
         reason: Option<String>,
+        /// When the happening was recorded.
+        at: SystemTime,
+    },
+    /// An admin plugin re-suppressed an already-suppressed
+    /// relation with a DIFFERENT reason. Emitted by
+    /// [`RegistryRelationAdmin`](crate::context::RegistryRelationAdmin)
+    /// after the storage primitive has mutated the existing
+    /// [`SuppressionRecord`]'s `reason` field in place. Same-reason
+    /// re-suppress is a silent no-op and does not emit this
+    /// variant. The transitions `Some(_) -> None`,
+    /// `None -> Some(_)`, and `Some(a) -> Some(b)` (where
+    /// `a != b`) all count as "different reason" and trigger this
+    /// happening.
+    ///
+    /// `admin_plugin` is the plugin performing the new
+    /// re-suppress (which may differ from the plugin that
+    /// installed the original suppression — in that case the
+    /// stored `admin_plugin` on the suppression record is
+    /// preserved untouched; only the rationale evolves).
+    RelationSuppressionReasonUpdated {
+        /// Canonical name of the admin plugin that performed the
+        /// re-suppress with the new reason.
+        admin_plugin: String,
+        /// Canonical ID of the source subject on the relation.
+        source_id: String,
+        /// Predicate of the relation.
+        predicate: String,
+        /// Canonical ID of the target subject on the relation.
+        target_id: String,
+        /// The reason carried on the existing suppression record
+        /// before the update.
+        old_reason: Option<String>,
+        /// The reason the caller supplied; now stored on the
+        /// suppression record.
+        new_reason: Option<String>,
         /// When the happening was recorded.
         at: SystemTime,
     },

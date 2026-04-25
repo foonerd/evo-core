@@ -1038,7 +1038,24 @@ For `claims_retracted`, `plugin` and `reason.retracting_plugin` are the same can
 }
 ```
 
-Re-suppressing an already-suppressed relation is a silent no-op and emits no happening.
+Re-suppressing an already-suppressed relation with the same reason is a silent no-op and emits no happening. A re-suppress with a DIFFERENT reason emits `relation_suppression_reason_updated` (next entry).
+
+**`type = "relation_suppression_reason_updated"`**:
+
+```json
+{
+  "type": "relation_suppression_reason_updated",
+  "admin_plugin": "<string>",
+  "source_id": "<uuid>",
+  "predicate": "<string>",
+  "target_id": "<uuid>",
+  "old_reason": "<string>" | null,
+  "new_reason": "<string>" | null,
+  "at_ms": <u64>
+}
+```
+
+Emitted when an admin re-suppresses an already-suppressed relation with a DIFFERENT reason. The suppression record's `reason` field is mutated in place; the record's `admin_plugin` and `suppressed_at` are preserved (the suppression itself was already valid; only the rationale evolved). The transitions `Some -> None`, `None -> Some`, and `Some(a) -> Some(b)` (where `a != b`) all count as "different reason" and emit this happening. Same-reason re-suppress is a silent no-op.
 
 **`type = "relation_unsuppressed"`**:
 
@@ -1555,6 +1572,7 @@ The admin ledger is not exposed on the client socket today; the entry shape is d
   "target_relation": <RelationKey> | null,
   "additional_subjects": ["<uuid>", ...],
   "reason": "<string>" | null,
+  "prior_reason": "<string>" | null,
   "at_ms": <u64>
 }
 ```
@@ -1563,12 +1581,13 @@ The admin ledger is not exposed on the client socket today; the entry shape is d
 |-------|------|-------------------|-------|
 | `kind` | enum | yes | One of the `AdminLogKind` values in section 5.9.2. |
 | `admin_plugin` | string | yes | Canonical name of the admin plugin that performed the action. |
-| `target_plugin` | string \| null | per kind | Canonical name of the plugin whose claim was modified. `null` for kinds that do not target a specific plugin (`subject_merge`, `subject_split`, `relation_suppress`, `relation_unsuppress`). |
+| `target_plugin` | string \| null | per kind | Canonical name of the plugin whose claim was modified. `null` for kinds that do not target a specific plugin (`subject_merge`, `subject_split`, `relation_suppress`, `relation_suppression_reason_updated`, `relation_unsuppress`). |
 | `target_subject` | string (UUID) \| null | per kind | Canonical ID of the subject involved. For `subject_merge` this is the NEW canonical ID; for `subject_split` this is the SOURCE (old) canonical ID. |
 | `target_addressing` | object \| null | per kind | Addressing targeted, populated for `subject_addressing_forced_retract`. |
 | `target_relation` | object \| null | per kind | Relation key targeted, populated for relation operations. |
 | `additional_subjects` | array\<string\> | sometimes | Extra canonical subject IDs. Populated for `subject_merge` (the source IDs, length 2) and `subject_split` (the new IDs, length at least 2). Empty array otherwise. |
-| `reason` | string \| null | optional | Free-form operator-supplied reason; mirrors the `reason` field on the underlying primitive. |
+| `reason` | string \| null | optional | Free-form operator-supplied reason; mirrors the `reason` field on the underlying primitive. For `relation_suppression_reason_updated` this is the NEW reason; the prior reason is carried separately on `prior_reason`. |
+| `prior_reason` | string \| null | per kind | Reason on the relevant record before the action overwrote it. Populated only for `relation_suppression_reason_updated`. `null` for every other kind. Within `relation_suppression_reason_updated`, a `null` here means the prior reason was literally null on the suppression record. |
 | `at_ms` | u64 | yes | When the action was recorded, milliseconds since UNIX epoch. |
 
 #### 5.9.2 AdminLogKind
@@ -1582,6 +1601,7 @@ Serialises as a snake_case string. The enum is `#[non_exhaustive]`; readers must
 | `"subject_merge"` | An admin merged two canonical subjects into one. `target_subject` carries the NEW ID; `additional_subjects` carries the source IDs. `target_plugin` is `null`. | `subject_merged` |
 | `"subject_split"` | An admin split one canonical subject into two or more. `target_subject` carries the SOURCE (old) ID; `additional_subjects` carries the new IDs. `target_plugin` is `null`. | `subject_split` |
 | `"relation_suppress"` | An admin suppressed a relation. `target_relation` carries the relation key. `target_plugin` is `null`. | `relation_suppressed` |
+| `"relation_suppression_reason_updated"` | An admin re-suppressed an already-suppressed relation with a DIFFERENT reason. `target_relation` carries the relation key. `target_plugin` is `null`. `reason` is the NEW reason; `prior_reason` is the reason on the suppression record before the update. Same-reason re-suppress is a silent no-op and produces no entry. | `relation_suppression_reason_updated` |
 | `"relation_unsuppress"` | An admin unsuppressed a previously-suppressed relation. `target_relation` carries the relation key. `target_plugin` is `null`. | `relation_unsuppressed` |
 
 `AdminLogKind` and the corresponding `Happening` variant are paired but not identical: `AdminLogKind` is the persisted audit kind (snake_case singular verb form: `subject_merge`); the happening's `type` is the streamed event tag (snake_case past tense: `subject_merged`). The wire representations are intentionally distinct so a future audit-log reader and a happenings subscriber need not multiplex on the same string.
