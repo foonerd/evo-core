@@ -39,13 +39,14 @@
 //! - `admin.subject.split`: JSON payload of shape
 //!   [`AdminSplitRequest`]. Dispatches to
 //!   [`SubjectAdmin::split`](evo_plugin_sdk::contract::SubjectAdmin::split).
-//!   The [`SplitStrategyPayload::Explicit`] strategy needs the
-//!   operator to supply the canonical IDs of the new subjects in
-//!   each [`ExplicitRelationAssignmentPayload::target_new_id`]; the
-//!   storage primitive generates those IDs and they cannot be
-//!   predicted from the partition. In practice today, JSON clients
-//!   use `to_both` or `to_first`; a planning API for `Explicit`
-//!   will close this gap in a future pass.
+//!   The [`SplitStrategyPayload::Explicit`] strategy specifies
+//!   per-relation routing using
+//!   [`ExplicitRelationAssignmentPayload::target_new_id_index`], a
+//!   zero-based index into the request's `partition` array. The
+//!   operator works in indices they own; the framework maps each
+//!   index to the corresponding freshly-minted canonical ID after
+//!   the storage primitive commits, so JSON clients can drive
+//!   `Explicit` end-to-end without out-of-band UUID coordination.
 //!
 //! - `admin.relation.suppress`: JSON payload of shape
 //!   [`AdminSuppressRequest`]. Dispatches to
@@ -65,10 +66,10 @@
 #![warn(missing_docs)]
 
 use evo_plugin_sdk::contract::{
-    BuildInfo, CanonicalSubjectId, ExplicitRelationAssignment,
-    ExternalAddressing, HealthReport, LoadContext, Plugin, PluginDescription,
-    PluginError, PluginIdentity, RelationAdmin, Request, Respondent, Response,
-    RuntimeCapabilities, SplitRelationStrategy, SubjectAdmin,
+    BuildInfo, ExplicitRelationAssignment, ExternalAddressing, HealthReport,
+    LoadContext, Plugin, PluginDescription, PluginError, PluginIdentity,
+    RelationAdmin, Request, Respondent, Response, RuntimeCapabilities,
+    SplitRelationStrategy, SubjectAdmin,
 };
 use evo_plugin_sdk::Manifest;
 use serde::{Deserialize, Serialize};
@@ -221,12 +222,12 @@ impl From<SplitStrategyPayload> for SplitRelationStrategy {
 
 /// Wire form of [`ExplicitRelationAssignment`].
 ///
-/// `target_new_id` is a canonical subject ID string the storage
-/// primitive produced from a prior split or that the operator
-/// otherwise knows out of band. The framework today has no
-/// planning API to surface those IDs ahead of time; JSON clients
-/// driving the `Explicit` strategy must therefore obtain the IDs
-/// through some other channel.
+/// `target_new_id_index` is a zero-based index into the
+/// surrounding [`AdminSplitRequest::partition`] array. The
+/// framework maps the index to the freshly-minted canonical ID
+/// after the storage primitive commits, so JSON clients can
+/// author `Explicit` splits using only information they already
+/// own (the partition cells they themselves authored).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExplicitRelationAssignmentPayload {
     /// Source addressing of the relation.
@@ -235,9 +236,11 @@ pub struct ExplicitRelationAssignmentPayload {
     pub predicate: String,
     /// Target addressing of the relation.
     pub target: AddressingPayload,
-    /// Canonical ID of the new subject the relation is assigned
-    /// to. Must be one of the IDs the split produced.
-    pub target_new_id: String,
+    /// Zero-based partition index naming the new subject the
+    /// relation is assigned to. Must be strictly less than
+    /// `partition.len()`; the framework refuses out-of-bounds
+    /// indices BEFORE any registry mint.
+    pub target_new_id_index: usize,
 }
 
 impl From<ExplicitRelationAssignmentPayload> for ExplicitRelationAssignment {
@@ -246,7 +249,7 @@ impl From<ExplicitRelationAssignmentPayload> for ExplicitRelationAssignment {
             source: p.source.into(),
             predicate: p.predicate,
             target: p.target.into(),
-            target_new_id: CanonicalSubjectId::new(p.target_new_id),
+            target_new_id_index: p.target_new_id_index,
         }
     }
 }
@@ -779,7 +782,7 @@ mod tests {
                     scheme: "mbid".into(),
                     value: "album-x".into(),
                 },
-                target_new_id: "new-id-1".into(),
+                target_new_id_index: 1,
             }],
             reason: None,
         };
@@ -787,7 +790,7 @@ mod tests {
         let back: AdminSplitRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.partition.len(), 2);
         assert_eq!(back.explicit_assignments.len(), 1);
-        assert_eq!(back.explicit_assignments[0].target_new_id, "new-id-1");
+        assert_eq!(back.explicit_assignments[0].target_new_id_index, 1);
         // Empty assignments are omitted on serialisation when
         // strategy != Explicit; here the field is present but the
         // payload still survives the trip.

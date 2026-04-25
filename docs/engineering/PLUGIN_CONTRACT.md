@@ -77,10 +77,10 @@ An administration plugin is a regular plugin (singleton or factory, respondent o
 
 | Callback | Trait | Purpose |
 |----------|-------|---------|
-| `subject_admin` | `SubjectAdmin` | Force-retract an addressing claim owned by another plugin. Cascades to `SubjectForgotten` when the last addressing on a subject is removed. |
-| `relation_admin` | `RelationAdmin` | Force-retract a relation claim owned by another plugin. Cascades to `RelationForgotten` when the last claimant on a relation is removed. |
+| `subject_admin` | `SubjectAdmin` | Force-retract an addressing claim owned by another plugin (cascades to `SubjectForgotten` when the last addressing on a subject is removed); merge two subjects into one; split one subject into two or more. |
+| `relation_admin` | `RelationAdmin` | Force-retract a relation claim owned by another plugin (cascades to `RelationForgotten` when the last claimant on a relation is removed); suppress and unsuppress individual relations. |
 
-These retract primitives are available today. Future SDK extensions will add merge, split, suppress, and unsuppress primitives to both traits.
+These primitives are available today. The `SubjectAdmin::split` callback takes a `partitions: Vec<Vec<ExternalAddressing>>` directive and a `SplitRelationStrategy`; under `SplitRelationStrategy::Explicit` the operator supplies per-edge `ExplicitRelationAssignment` entries whose `target_new_id_index` references the partition cell the relation should follow (zero-based). The framework validates indices BEFORE the registry mints new IDs and refuses out-of-bounds indices with the structured `SplitTargetNewIdIndexOutOfBounds` error, leaving the registry untouched; valid indices are mapped to the corresponding freshly-minted canonical ID after the split commits.
 
 Both callbacks are `Option<Arc<dyn Trait>>` in `LoadContext`. They are populated (non-None) for an admission if and only if (a) the manifest declares `capabilities.admin = true`, AND (b) the effective trust class is at or above `evo_trust::ADMIN_MINIMUM_TRUST` (currently `Privileged`). The admission-time gate refuses non-qualifying admin manifests with `StewardError::AdminTrustTooLow` before the plugin ever sees its `load` call; an admin plugin that nevertheless encounters `None` in `load` (for example, because it was constructed via a test harness that bypassed admission) should surface the misconfiguration as a `Permanent` error rather than silently no-oping subsequent requests.
 

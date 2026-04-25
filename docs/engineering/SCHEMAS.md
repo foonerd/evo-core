@@ -1538,7 +1538,7 @@ Serialises as a snake_case string.
   "source": <ExternalAddressing>,
   "predicate": "<string>",
   "target": <ExternalAddressing>,
-  "target_new_id": "<uuid>"
+  "target_new_id_index": <integer>
 }
 ```
 
@@ -1547,7 +1547,7 @@ Serialises as a snake_case string.
 | `source` | object | yes | `ExternalAddressing` of the relation's source endpoint. See section 5.3 for the shape. |
 | `predicate` | string | yes | Predicate of the relation. |
 | `target` | object | yes | `ExternalAddressing` of the relation's target endpoint. |
-| `target_new_id` | string (UUID) | yes | Canonical ID of the new subject the relation is assigned to. Must be one of the IDs the split produced; the steward refuses assignments referencing other IDs. |
+| `target_new_id_index` | integer (>= 0) | yes | Zero-based index into the operator's `partitions` directive on the surrounding split request. Must be strictly less than `partitions.len()`. The framework maps the index to the freshly-minted canonical ID after the split commits, so operators never need to know UUIDs the framework has not yet generated. Validation runs BEFORE any registry mint; out-of-bounds indices are refused with `SplitTargetNewIdIndexOutOfBounds` and the registry remains untouched. |
 
 The triple `(source, predicate, target)` identifies a single relation in the graph at the time of the split.
 

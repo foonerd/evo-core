@@ -297,16 +297,22 @@ pub enum ReportError {
         detail: String,
     },
     /// Split refused: an explicit relation assignment named a
-    /// `target_new_id` that was not produced by the split. The
-    /// steward refuses rather than silently rewriting a relation to
-    /// a phantom subject.
+    /// `target_new_id_index` outside the bounds of the operator's
+    /// `partitions` directive. Validated BEFORE the registry mints
+    /// any new IDs, so the registry remains untouched on this
+    /// error and no orphan subjects are produced.
     #[error(
-        "split refused: explicit assignment names target_new_id \
-         {target_new_id} which was not produced by the split"
+        "split refused: explicit assignment names target_new_id_index \
+         {index} but the partitions directive has only {partition_count} \
+         entries"
     )]
-    SplitTargetNewIdUnknown {
-        /// The bogus `target_new_id` from the assignment.
-        target_new_id: String,
+    SplitTargetNewIdIndexOutOfBounds {
+        /// The out-of-bounds `target_new_id_index` from the
+        /// assignment.
+        index: usize,
+        /// Number of partition cells the operator supplied; valid
+        /// indices are `0..partition_count`.
+        partition_count: usize,
     },
 }
 

@@ -345,10 +345,18 @@ pub enum UnsuppressOutcome {
 /// Resolved (canonical-ID) form of a single explicit assignment
 /// for [`RelationGraph::split_relations`].
 ///
-/// Mirrors
-/// [`evo_plugin_sdk::contract::ExplicitRelationAssignment`] but
-/// with addressings already resolved to canonical IDs by the
-/// wiring layer. Used only when the split's strategy is
+/// The post-canonicalisation mirror of
+/// [`evo_plugin_sdk::contract::ExplicitRelationAssignment`]. The
+/// wiring layer constructs one of these AFTER the registry has
+/// minted the new canonical IDs: addressings are resolved to
+/// canonical IDs, and the operator-supplied
+/// `target_new_id_index` is mapped to the corresponding minted
+/// `target_new_id`. The public input shape uses an index because
+/// operators cannot know UUIDs the framework has not yet minted;
+/// this internal resolved shape uses the ID because by the time
+/// it exists, the new IDs have been minted.
+///
+/// Used only when the split's strategy is
 /// [`SplitRelationStrategy::Explicit`]; ignored otherwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSplitAssignment {
@@ -363,7 +371,10 @@ pub struct ResolvedSplitAssignment {
     pub target_id: String,
     /// Canonical ID of the new subject the relation should be
     /// assigned to. Must be one of the new IDs produced by the
-    /// split.
+    /// split. Resolved by the wiring layer from the
+    /// `target_new_id_index` the operator supplied on the
+    /// public-facing
+    /// [`evo_plugin_sdk::contract::ExplicitRelationAssignment`].
     pub target_new_id: String,
 }
 

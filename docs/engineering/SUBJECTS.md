@@ -381,6 +381,8 @@ Split reverses a mistaken merge. It takes a canonical ID and a partition specify
 
 A `SubjectSplit` happening is emitted carrying the old ID and all new IDs.
 
+The split directive carries a relation-distribution strategy (`to_both`, `to_first`, `explicit`). Under `explicit`, the operator supplies per-edge assignments naming the destination as a zero-based index into their own `partitions` directive (`target_new_id_index`); the framework maps the index to the freshly-minted canonical ID after the split commits. Index validation runs BEFORE any registry mint, so an out-of-bounds index is refused with the registry untouched and produces no orphan subjects. See `RELATIONS.md` section 8.2 for the full cascade.
+
 ### 10.3 Why New IDs
 
 Merge and split produce NEW canonical IDs rather than reusing old ones so that any consumer holding a stale reference receives a clear signal (the old ID resolves to an alias, emitting a happening) rather than silently observing a subject whose meaning has changed.

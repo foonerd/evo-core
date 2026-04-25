@@ -364,11 +364,22 @@ pub enum SplitRelationStrategy {
 /// [`SplitRelationStrategy::Explicit`].
 ///
 /// The triple `(source, predicate, target)` identifies a single
-/// relation in the graph. `target_new_id` names which of the new
-/// subject IDs (from the split's partition) the relation should
-/// be assigned to. The named ID must be one of the IDs the split
-/// produced; the steward refuses assignments referencing other
-/// IDs.
+/// relation in the graph. `target_new_id_index` names the
+/// partition position the relation should be rewritten to. It is
+/// a zero-based index into the operator's `partitions` directive
+/// (the `Vec<Vec<ExternalAddressing>>` passed to
+/// [`SubjectAdmin::split`](crate::contract::SubjectAdmin::split)).
+/// Working in indices rather than canonical IDs makes the
+/// `Explicit` strategy callable end-to-end: the framework mints
+/// new canonical IDs at split time in partition order and maps
+/// each operator-supplied index to the corresponding minted ID
+/// after the split commits, so the operator never has to know a
+/// UUID it cannot predict.
+///
+/// The framework refuses assignments whose
+/// `target_new_id_index >= partitions.len()` BEFORE any registry
+/// state is changed, so an out-of-bounds index never produces
+/// orphan subjects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplicitRelationAssignment {
     /// Source addressing of the relation.
@@ -377,9 +388,15 @@ pub struct ExplicitRelationAssignment {
     pub predicate: String,
     /// Target addressing of the relation.
     pub target: ExternalAddressing,
-    /// Canonical ID of the new subject the relation is assigned
-    /// to. Must be one of the IDs produced by the split.
-    pub target_new_id: CanonicalSubjectId,
+    /// Zero-based partition index naming the new subject the
+    /// relation is assigned to. References the position in the
+    /// operator's `partitions` directive supplied to
+    /// [`SubjectAdmin::split`](crate::contract::SubjectAdmin::split);
+    /// the framework maps the index to the freshly-minted
+    /// canonical ID after the split commits. Must be strictly less
+    /// than `partitions.len()`; the framework validates this
+    /// pre-mint and refuses out-of-bounds indices.
+    pub target_new_id_index: usize,
 }
 
 #[cfg(test)]
@@ -587,7 +604,7 @@ mod tests {
             source: ExternalAddressing::new("mpd-path", "/a.flac"),
             predicate: "album_of".into(),
             target: ExternalAddressing::new("mbid", "album-x"),
-            target_new_id: CanonicalSubjectId::new("new-id-1"),
+            target_new_id_index: 1,
         };
         let s = toml::to_string(&e).expect("assignment serialises");
         let back: ExplicitRelationAssignment =

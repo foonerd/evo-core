@@ -357,13 +357,15 @@ The operator's split directive specifies a relation-partition strategy:
 |----------|-----------|
 | `to_both` | Every relation involving A is replicated: one copy with B, one copy with C. Default. |
 | `to_first` | Every relation goes to B. C is bare. |
-| `explicit` | Operator specifies per-relation which new subject it belongs to. |
+| `explicit` | Operator specifies per-relation which new subject it belongs to, by zero-based index into the `partitions` directive. |
 
 Default is `to_both` because it is conservative: no information is lost. Consumers observe a possible cardinality violation and emit happenings accordingly.
 
+Under `explicit`, the operator authors per-edge `ExplicitRelationAssignment` entries whose `target_new_id_index` references the partition cell the relation should follow. The framework maps each index to the corresponding freshly-minted canonical ID after the storage primitive commits, so operators do not have to know UUIDs the framework has not yet generated. Index validation runs BEFORE any registry mint: if any assignment names an out-of-bounds index the wiring refuses with the structured `SplitTargetNewIdIndexOutOfBounds` error, leaves the registry untouched, and emits no `SubjectSplit`. Two assignments may legitimately carry the same index — they route both relations to the same minted subject.
+
 If the operator chose `explicit`, any relation not explicitly assigned goes to both with a `RelationSplitAmbiguous` happening.
 
-**Status: implemented.** The cascade is realised by `RelationGraph::split_relations`, called by the `RegistrySubjectAdmin::split` wiring layer. The strategy parameter is the SDK's `SplitRelationStrategy::ToBoth`, `ToFirst`, or `Explicit`. For `Explicit`, the operator's per-relation assignments are resolved to canonical IDs BEFORE the registry split runs (after the split, addressings re-point to the new IDs and would not match the pre-split graph triples). Unmatched relations under `Explicit` fall through to `ToBoth` and surface as ambiguous. Suppression markers transfer to the new records.
+**Status: implemented.** The cascade is realised by `RelationGraph::split_relations`, called by the `RegistrySubjectAdmin::split` wiring layer. The strategy parameter is the SDK's `SplitRelationStrategy::ToBoth`, `ToFirst`, or `Explicit`. For `Explicit`, the operator's per-relation assignments carry a `target_new_id_index` into the `partitions` directive; the wiring layer validates indices BEFORE the registry mints any new IDs (so out-of-bounds indices do not orphan subjects), resolves source/target addressings to canonical IDs BEFORE the registry split runs (after the split, addressings re-point to the new IDs and would not match the pre-split graph triples), then maps each index to the freshly-minted canonical ID after the storage primitive commits. Unmatched relations under `Explicit` fall through to `ToBoth` and surface as ambiguous. Suppression markers transfer to the new records.
 
 The wiring emits cascade happenings in a fixed order, pinned by tests:
 

@@ -1318,7 +1318,14 @@ impl SubjectAdmin for RegistrySubjectAdmin {
     ///
     /// 1. Resolve `source` to its canonical ID; refuse with
     ///    [`ReportError::Invalid`] when unresolvable.
-    /// 2. Resolve every [`ExplicitRelationAssignment`]'s source
+    /// 2. Pre-mint validation: every
+    ///    [`ExplicitRelationAssignment`]'s `target_new_id_index`
+    ///    must be strictly less than `partition.len()`. Out-of-
+    ///    bounds indices are refused with
+    ///    [`ReportError::SplitTargetNewIdIndexOutOfBounds`] BEFORE
+    ///    any registry mint, so the registry is untouched and no
+    ///    orphan subjects are produced on this error.
+    /// 3. Resolve every [`ExplicitRelationAssignment`]'s source
     ///    and target addressings to canonical IDs BEFORE the
     ///    registry split runs: after the split, the source's
     ///    addressings are re-pointed to the new IDs and resolution
@@ -1328,20 +1335,24 @@ impl SubjectAdmin for RegistrySubjectAdmin {
     ///    cannot match a real relation and the storage primitive's
     ///    ambiguous-edge reporting still surfaces any unmatched
     ///    relations.
-    /// 3. Call
+    /// 4. Call
     ///    [`SubjectRegistry::split_subject`](crate::subjects::SubjectRegistry::split_subject)
     ///    to retire the source ID and produce N new canonical
-    ///    IDs.
-    /// 4. Emit [`Happening::SubjectSplit`] BEFORE the per-edge
+    ///    IDs in partition order.
+    /// 5. Map each operator-supplied `target_new_id_index` to the
+    ///    corresponding minted canonical ID, producing one
+    ///    [`ResolvedSplitAssignment`] per surviving operator
+    ///    assignment.
+    /// 6. Emit [`Happening::SubjectSplit`] BEFORE the per-edge
     ///    graph rewrite.
-    /// 5. Call
+    /// 7. Call
     ///    [`RelationGraph::split_relations`](crate::relations::RelationGraph::split_relations)
     ///    to distribute every relation involving the source
     ///    across the new IDs per `strategy`. Surface each
     ///    [`AmbiguousEdge`](crate::relations::AmbiguousEdge) as
     ///    a [`Happening::RelationSplitAmbiguous`] event AFTER the
     ///    `SubjectSplit` event.
-    /// 6. Record an [`AdminLedger`] entry with `kind =
+    /// 8. Record an [`AdminLedger`] entry with `kind =
     ///    SubjectSplit`, `target_subject = source_id` (the OLD
     ///    ID, for cross-reference), `additional_subjects =
     ///    new_ids`.
@@ -1367,27 +1378,57 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 ))
             })?;
 
+            // Pre-mint validation. Every operator-supplied
+            // assignment's `target_new_id_index` must be strictly
+            // less than the operator's partition cell count.
+            // Validating BEFORE the registry mints any new
+            // subjects guarantees the registry is untouched on
+            // this error path: a bogus index never produces orphan
+            // subjects. The storage primitive itself enforces
+            // partition.len() >= 2 and refuses empty cells, so a
+            // valid call by definition has at least two valid
+            // indices (0 and 1).
+            let partition_count = partition.len();
+            if let Some(bogus) = explicit_assignments
+                .iter()
+                .find(|a| a.target_new_id_index >= partition_count)
+            {
+                return Err(ReportError::SplitTargetNewIdIndexOutOfBounds {
+                    index: bogus.target_new_id_index,
+                    partition_count,
+                });
+            }
+
             // Resolve assignments BEFORE the registry split. After
             // the split, the addressings re-point to new IDs, so
             // resolving them then would not match the pre-split
-            // triples in the graph. Filter-mapped silently:
-            // unresolvable assignment addressings cannot match any
-            // real graph triple anyway, and the storage
-            // primitive's ambiguous-edge reporting will surface
-            // any unmatched relations as RelationSplitAmbiguous
-            // events.
-            let resolved_assignments: Vec<ResolvedSplitAssignment> =
+            // triples in the graph. The target_new_id field is
+            // left as a placeholder index here; we cannot resolve
+            // it to a canonical ID until the registry mints. The
+            // operator-supplied source/target addressings are
+            // resolved now; assignments whose addressings cannot
+            // be resolved are silently dropped (they cannot match
+            // a real graph triple, and the storage primitive's
+            // ambiguous-edge reporting still surfaces any
+            // unmatched relations).
+            let pre_resolved: Vec<(usize, ResolvedSplitAssignment)> =
                 explicit_assignments
                     .into_iter()
                     .filter_map(|a| {
                         let s = registry.resolve(&a.source)?;
                         let t = registry.resolve(&a.target)?;
-                        Some(ResolvedSplitAssignment {
-                            source_id: s,
-                            predicate: a.predicate,
-                            target_id: t,
-                            target_new_id: a.target_new_id.as_str().to_string(),
-                        })
+                        Some((
+                            a.target_new_id_index,
+                            ResolvedSplitAssignment {
+                                source_id: s,
+                                predicate: a.predicate,
+                                target_id: t,
+                                // Placeholder, replaced after mint
+                                // by mapping the index to the
+                                // freshly-minted canonical ID.
+                                target_new_id: String::new(),
+                            },
+                        ))
                     })
                     .collect();
 
@@ -1395,6 +1436,8 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             // retires the source ID with an alias record carrying
             // every new ID. The addressing-transfer records drive
             // the per-addressing ClaimReassigned cascade below.
+            // `new_ids` is returned in partition order, which is
+            // load-bearing for the index -> ID mapping below.
             let crate::subjects::SplitSubjectOutcome {
                 new_ids,
                 addressing_transfers,
@@ -1407,26 +1450,21 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 )
                 .map_err(|e| ReportError::Invalid(format!("split: {e}")))?;
 
-            // Validate every resolved assignment's target_new_id is
-            // one of the IDs the split produced. Per the wiring
-            // discipline and the SDK doc on
-            // `ExplicitRelationAssignment::target_new_id`, the
-            // steward refuses assignments referencing other IDs:
-            // an operator-supplied bogus UUID would otherwise
-            // silently rewrite a relation to a non-existent
-            // subject. This check sits AFTER the registry split
-            // (the new IDs are minted there) but BEFORE the
-            // SubjectSplit happening is emitted and BEFORE
-            // graph.split_relations runs, so no observable graph
-            // corruption can result from a bogus target_new_id.
-            if let Some(bogus) = resolved_assignments
-                .iter()
-                .find(|a| !new_ids.iter().any(|nid| nid == &a.target_new_id))
-            {
-                return Err(ReportError::SplitTargetNewIdUnknown {
-                    target_new_id: bogus.target_new_id.clone(),
-                });
-            }
+            // Map each operator-supplied target_new_id_index to
+            // the corresponding minted canonical ID. Pre-mint
+            // validation above guarantees every retained index is
+            // < new_ids.len(), so the lookup is total. Two
+            // assignments may carry the same index — they
+            // legitimately route both relations to the same minted
+            // subject.
+            let resolved_assignments: Vec<ResolvedSplitAssignment> =
+                pre_resolved
+                    .into_iter()
+                    .map(|(idx, mut r)| {
+                        r.target_new_id = new_ids[idx].clone();
+                        r
+                    })
+                    .collect();
 
             // Admin happening before structural cascade.
             // SubjectSplit fires before per-edge distribution and
@@ -5025,17 +5063,16 @@ target_type = "*"
     }
 
     #[tokio::test]
-    async fn admin_split_explicit_with_bogus_target_new_id_is_refused() {
-        // B3: Operator passes an ExplicitRelationAssignment whose
-        // `target_new_id` is not one of the IDs minted by the
-        // split. Without validation this would silently rewrite a
-        // relation to a non-existent subject. The wiring layer
-        // must refuse with the structured
-        // `SplitTargetNewIdUnknown` variant before the graph is
-        // touched.
-        use evo_plugin_sdk::contract::{
-            CanonicalSubjectId, SubjectAnnouncement,
-        };
+    async fn admin_split_explicit_with_out_of_bounds_index_is_refused_pre_mint()
+    {
+        // Operator passes an ExplicitRelationAssignment whose
+        // `target_new_id_index` is outside the bounds of their
+        // own `partitions` directive. The wiring layer must
+        // refuse with the structured
+        // `SplitTargetNewIdIndexOutOfBounds` variant BEFORE any
+        // registry mint, leaving the registry untouched and the
+        // ledger empty.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
 
         let registry = Arc::new(SubjectRegistry::new());
         let graph = Arc::new(RelationGraph::new());
@@ -5090,12 +5127,9 @@ target_type = "*"
             "admin.plugin",
         );
 
-        // Use a UUID-shaped string that cannot collide with the
-        // (UUIDv4) IDs minted by split_subject. The literal does
-        // not need to be a valid v4; it just needs to be absent
-        // from the new_ids the split returns.
-        let bogus =
-            CanonicalSubjectId::new("00000000-0000-0000-0000-000000000000");
+        // The partitions directive has two cells (valid indices
+        // are 0 and 1). Index 2 is out of bounds.
+        let bogus_index: usize = 2;
 
         let result = admin
             .split(
@@ -5109,25 +5143,258 @@ target_type = "*"
                     source: ExternalAddressing::new("mpd-path", "/a.flac"),
                     predicate: "album_of".into(),
                     target: ExternalAddressing::new("mbid", "album-x"),
-                    target_new_id: bogus.clone(),
+                    target_new_id_index: bogus_index,
                 }],
                 None,
             )
             .await;
 
         match result {
-            Err(ReportError::SplitTargetNewIdUnknown { target_new_id }) => {
-                assert_eq!(target_new_id, bogus.as_str());
+            Err(ReportError::SplitTargetNewIdIndexOutOfBounds {
+                index,
+                partition_count,
+            }) => {
+                assert_eq!(index, bogus_index);
+                assert_eq!(partition_count, 2);
             }
             other => panic!(
-                "bogus target_new_id must be refused with \
-                 SplitTargetNewIdUnknown, got {other:?}"
+                "out-of-bounds target_new_id_index must be refused with \
+                 SplitTargetNewIdIndexOutOfBounds, got {other:?}"
             ),
         }
 
         // Ledger must NOT record the split: the operation aborted
         // before the audit-log entry was written.
         assert_eq!(ledger.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn admin_split_explicit_with_out_of_bounds_index_does_not_mint_new_ids(
+    ) {
+        // Pre-mint validation invariant: when validation refuses
+        // an out-of-bounds index, the registry must be entirely
+        // untouched. The original source canonical ID still
+        // resolves (no alias entry was written, no new IDs were
+        // minted, no addressings were transferred). This pins the
+        // "no orphan subjects" guarantee that motivated moving
+        // validation in front of the mint.
+        use evo_plugin_sdk::contract::{
+            SubjectAnnouncement, SubjectQueryResult,
+        };
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![
+                        ExternalAddressing::new("mpd-path", "/a.flac"),
+                        ExternalAddressing::new("mbid", "abc"),
+                    ],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+
+        let source_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .expect("source id resolves before split");
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let result = admin
+            .split(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                vec![
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                    vec![ExternalAddressing::new("mbid", "abc")],
+                ],
+                SplitRelationStrategy::Explicit,
+                vec![ExplicitRelationAssignment {
+                    source: ExternalAddressing::new("mpd-path", "/a.flac"),
+                    predicate: "album_of".into(),
+                    target: ExternalAddressing::new("mbid", "album-x"),
+                    target_new_id_index: 5,
+                }],
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ReportError::SplitTargetNewIdIndexOutOfBounds { .. })
+            ),
+            "expected pre-mint refusal, got {result:?}"
+        );
+
+        // Source ID still resolves (no alias was written).
+        let still_there =
+            registry.resolve(&ExternalAddressing::new("mpd-path", "/a.flac"));
+        assert_eq!(still_there.as_deref(), Some(source_id.as_str()));
+
+        // describe_alias on the source ID returns None: the
+        // registry never recorded a Split alias because the mint
+        // never ran.
+        assert!(
+            registry.describe_alias(&source_id).is_none(),
+            "registry must not record a Split alias when pre-mint \
+             validation refuses",
+        );
+
+        // Ledger empty.
+        assert_eq!(ledger.count(), 0);
+
+        // describe(source_id) still finds the live subject.
+        let querier = RegistrySubjectQuerier::new(Arc::clone(&registry));
+        let q = querier
+            .describe_subject_with_aliases(source_id.clone())
+            .await
+            .expect("describe must succeed");
+        match q {
+            SubjectQueryResult::Found { record } => {
+                assert_eq!(record.id.as_str(), source_id);
+            }
+            other => panic!(
+                "source must remain Found post-validation-refusal, got \
+                 {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_split_explicit_with_indices_routes_relation_to_named_partition(
+    ) {
+        // End-to-end happy path for the index-based Explicit
+        // strategy. Operator splits a track into two cells and
+        // names index 1 (the second partition cell, identified
+        // by the `mbid` addressing) as the destination for the
+        // album_of relation. Asserts the RelationRewritten event
+        // points the rewritten endpoint at the new ID minted for
+        // partition[1].
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![
+                        ExternalAddressing::new("mpd-path", "/a.flac"),
+                        ExternalAddressing::new("mbid", "track-mbid"),
+                    ],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .split(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                vec![
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                    vec![ExternalAddressing::new("mbid", "track-mbid")],
+                ],
+                SplitRelationStrategy::Explicit,
+                vec![ExplicitRelationAssignment {
+                    source: ExternalAddressing::new("mpd-path", "/a.flac"),
+                    predicate: "album_of".into(),
+                    target: ExternalAddressing::new("mbid", "album-x"),
+                    target_new_id_index: 1,
+                }],
+                None,
+            )
+            .await
+            .expect("Explicit split with valid index must succeed");
+
+        // After the split the `mbid:track-mbid` addressing
+        // resolves to the canonical ID minted for partition[1].
+        let partition_one_id = registry
+            .resolve(&ExternalAddressing::new("mbid", "track-mbid"))
+            .expect("partition[1] addressing resolves to its minted id");
+
+        // 1. SubjectSplit envelope.
+        let h = rx.recv().await.expect("SubjectSplit");
+        assert!(matches!(h, Happening::SubjectSplit { .. }));
+
+        // 2. Exactly one RelationRewritten (the assignment named
+        //    a single destination, no ToBoth fallback). The new
+        //    subject ID must equal the partition[1] minted ID.
+        let h = rx.recv().await.expect("RelationRewritten");
+        match h {
+            Happening::RelationRewritten {
+                predicate,
+                new_subject_id,
+                ..
+            } => {
+                assert_eq!(predicate, "album_of");
+                assert_eq!(new_subject_id, partition_one_id);
+            }
+            other => {
+                panic!("expected RelationRewritten, got {other:?}")
+            }
+        }
+
+        // 3. No RelationSplitAmbiguous (assignment matched the
+        //    edge). Drain remaining cascade events without
+        //    panicking on shape; only the routing assertion
+        //    above is load-bearing for this test.
+        while !rx.is_empty() {
+            let _ = rx.recv().await.unwrap();
+        }
     }
 
     #[tokio::test]
