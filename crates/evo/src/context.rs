@@ -930,15 +930,20 @@ impl SubjectAdmin for RegistrySubjectAdmin {
     ///
     /// 1. Resolve `target_a` and `target_b` to canonical IDs via
     ///    the registry. Unresolvable addressings are refused with
-    ///    [`ReportError::Invalid`]: merge is a deliberate operator
-    ///    action, not a sweep, so a silent no-op would mask
-    ///    typos.
-    /// 2. Call
+    ///    [`ReportError::MergeSourceUnknown`]: merge is a
+    ///    deliberate operator action, not a sweep, so a silent
+    ///    no-op would mask typos.
+    /// 2. Pre-validate self-merge ([`ReportError::MergeSelfTarget`])
+    ///    and cross-type merge ([`ReportError::MergeCrossType`])
+    ///    before touching the registry. Every merge refusal
+    ///    carries a structured variant; storage-primitive failures
+    ///    the wiring layer cannot pre-classify surface as
+    ///    [`ReportError::MergeInternal`].
+    /// 3. Call
     ///    [`SubjectRegistry::merge_aliases`](crate::subjects::SubjectRegistry::merge_aliases)
     ///    to retire both source IDs, install alias records, and
     ///    obtain the new canonical ID.
-    /// 3. Per ADR-0004, emit
-    ///    [`Happening::SubjectMerged`] BEFORE the relation-graph
+    /// 3. Emit [`Happening::SubjectMerged`] BEFORE the relation-graph
     ///    rewrite so subscribers see the identity transition
     ///    before any post-rewrite cardinality violations.
     /// 4. Call
@@ -965,20 +970,40 @@ impl SubjectAdmin for RegistrySubjectAdmin {
         let _catalogue = Arc::clone(&self.catalogue);
         Box::pin(async move {
             let source_a_id = registry.resolve(&target_a).ok_or_else(|| {
-                ReportError::Invalid(format!(
-                    "merge: target_a addressing {target_a} is not registered"
-                ))
+                ReportError::MergeSourceUnknown {
+                    addressing: target_a.to_string(),
+                }
             })?;
             let source_b_id = registry.resolve(&target_b).ok_or_else(|| {
-                ReportError::Invalid(format!(
-                    "merge: target_b addressing {target_b} is not registered"
-                ))
+                ReportError::MergeSourceUnknown {
+                    addressing: target_b.to_string(),
+                }
             })?;
 
+            // Pre-validate so we can surface structured variants
+            // distinguishable without scraping a stringly-typed
+            // error. The storage primitive enforces the same
+            // invariants but only carries StewardError::Dispatch.
+            if source_a_id == source_b_id {
+                return Err(ReportError::MergeSelfTarget);
+            }
+            if let (Some(rec_a), Some(rec_b)) = (
+                registry.describe(&source_a_id),
+                registry.describe(&source_b_id),
+            ) {
+                if rec_a.subject_type != rec_b.subject_type {
+                    return Err(ReportError::MergeCrossType {
+                        a_type: rec_a.subject_type,
+                        b_type: rec_b.subject_type,
+                    });
+                }
+            }
+
             // Storage primitive: produces a new canonical ID and
-            // installs alias records. Cross-type and self-merge
-            // refusals come back as Dispatch errors from the
-            // primitive; surface them as Invalid here.
+            // installs alias records. Pre-validation above covers
+            // self-merge and cross-type; anything else returned by
+            // the primitive is genuinely unforeseen and surfaces as
+            // MergeInternal.
             let new_id = registry
                 .merge_aliases(
                     &source_a_id,
@@ -986,13 +1011,15 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                     &admin_plugin,
                     reason.clone(),
                 )
-                .map_err(|e| ReportError::Invalid(format!("merge: {e}")))?;
+                .map_err(|e| ReportError::MergeInternal {
+                    detail: e.to_string(),
+                })?;
 
-            // Per ADR-0004, admin happening fires BEFORE the
-            // structural cascade. Emit SubjectMerged before the
-            // graph rewrite so subscribers see the identity
-            // transition before any cardinality-violation
-            // happenings the rewrite triggers.
+            // Admin happening fires BEFORE the structural cascade.
+            // Emit SubjectMerged before the graph rewrite so
+            // subscribers see the identity transition before any
+            // cardinality-violation happenings the rewrite
+            // triggers.
             let at = SystemTime::now();
             bus.emit(Happening::SubjectMerged {
                 admin_plugin: admin_plugin.clone(),
@@ -1010,13 +1037,13 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             // touched by source_b.
             graph
                 .rewrite_subject_to(&source_a_id, &new_id)
-                .map_err(|e| {
-                    ReportError::Invalid(format!("merge graph: {e}"))
+                .map_err(|e| ReportError::MergeInternal {
+                    detail: format!("graph rewrite (source_a): {e}"),
                 })?;
             graph
                 .rewrite_subject_to(&source_b_id, &new_id)
-                .map_err(|e| {
-                    ReportError::Invalid(format!("merge graph: {e}"))
+                .map_err(|e| ReportError::MergeInternal {
+                    detail: format!("graph rewrite (source_b): {e}"),
                 })?;
 
             ledger.record(AdminLogEntry {
@@ -1055,8 +1082,8 @@ impl SubjectAdmin for RegistrySubjectAdmin {
     ///    [`SubjectRegistry::split_subject`](crate::subjects::SubjectRegistry::split_subject)
     ///    to retire the source ID and produce N new canonical
     ///    IDs.
-    /// 4. Per ADR-0004, emit [`Happening::SubjectSplit`] BEFORE
-    ///    the per-edge graph rewrite.
+    /// 4. Emit [`Happening::SubjectSplit`] BEFORE the per-edge
+    ///    graph rewrite.
     /// 5. Call
     ///    [`RelationGraph::split_relations`](crate::relations::RelationGraph::split_relations)
     ///    to distribute every relation involving the source
@@ -1126,10 +1153,30 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 )
                 .map_err(|e| ReportError::Invalid(format!("split: {e}")))?;
 
-            // Per ADR-0004, admin happening before structural
-            // cascade. SubjectSplit fires before per-edge
-            // distribution and before any RelationSplitAmbiguous
-            // events that follow.
+            // Validate every resolved assignment's target_new_id is
+            // one of the IDs the split produced. Per the wiring
+            // discipline and the SDK doc on
+            // `ExplicitRelationAssignment::target_new_id`, the
+            // steward refuses assignments referencing other IDs:
+            // an operator-supplied bogus UUID would otherwise
+            // silently rewrite a relation to a non-existent
+            // subject. This check sits AFTER the registry split
+            // (the new IDs are minted there) but BEFORE the
+            // SubjectSplit happening is emitted and BEFORE
+            // graph.split_relations runs, so no observable graph
+            // corruption can result from a bogus target_new_id.
+            if let Some(bogus) = resolved_assignments.iter().find(|a| {
+                !new_ids.iter().any(|nid| nid == &a.target_new_id)
+            }) {
+                return Err(ReportError::SplitTargetNewIdUnknown {
+                    target_new_id: bogus.target_new_id.clone(),
+                });
+            }
+
+            // Admin happening before structural cascade.
+            // SubjectSplit fires before per-edge distribution and
+            // before any RelationSplitAmbiguous events that
+            // follow.
             let at = SystemTime::now();
             bus.emit(Happening::SubjectSplit {
                 admin_plugin: admin_plugin.clone(),
@@ -3885,8 +3932,8 @@ target_type = "*"
     // -----------------------------------------------------------------
     // Subject merge / split wiring.
     //
-    // Per ADR-0004 the admin happening fires BEFORE the
-    // structural cascade. Tests subscribe to the bus and verify
+    // The admin happening fires BEFORE the structural cascade.
+    // Tests subscribe to the bus and verify
     // ordering plus payload, the post-state of the registry and
     // graph, and the audit-ledger entries.
     // -----------------------------------------------------------------
@@ -4017,10 +4064,18 @@ target_type = "*"
                 None,
             )
             .await;
-        assert!(
-            matches!(result, Err(ReportError::Invalid(_))),
-            "unresolvable merge target must return Invalid, got {result:?}"
-        );
+        match result {
+            Err(ReportError::MergeSourceUnknown { ref addressing }) => {
+                assert!(
+                    addressing.contains("ghost"),
+                    "structured variant must carry the bogus addressing: {addressing}"
+                );
+            }
+            other => panic!(
+                "unresolvable merge target_a must return \
+                 MergeSourceUnknown, got {other:?}"
+            ),
+        }
         assert_eq!(ledger.count(), 0);
     }
 
@@ -4345,6 +4400,221 @@ target_type = "*"
             matches!(result, Err(ReportError::Invalid(_))),
             "unresolvable split source must return Invalid, got {result:?}"
         );
+        assert_eq!(ledger.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn admin_split_explicit_with_bogus_target_new_id_is_refused() {
+        // B3: Operator passes an ExplicitRelationAssignment whose
+        // `target_new_id` is not one of the IDs minted by the
+        // split. Without validation this would silently rewrite a
+        // relation to a non-existent subject. The wiring layer
+        // must refuse with the structured
+        // `SplitTargetNewIdUnknown` variant before the graph is
+        // touched.
+        use evo_plugin_sdk::contract::{
+            CanonicalSubjectId, SubjectAnnouncement,
+        };
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![
+                        ExternalAddressing::new("mpd-path", "/a.flac"),
+                        ExternalAddressing::new("mbid", "abc"),
+                    ],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        // Use a UUID-shaped string that cannot collide with the
+        // (UUIDv4) IDs minted by split_subject. The literal does
+        // not need to be a valid v4; it just needs to be absent
+        // from the new_ids the split returns.
+        let bogus =
+            CanonicalSubjectId::new("00000000-0000-0000-0000-000000000000");
+
+        let result = admin
+            .split(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                vec![
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                    vec![ExternalAddressing::new("mbid", "abc")],
+                ],
+                SplitRelationStrategy::Explicit,
+                vec![ExplicitRelationAssignment {
+                    source: ExternalAddressing::new("mpd-path", "/a.flac"),
+                    predicate: "album_of".into(),
+                    target: ExternalAddressing::new("mbid", "album-x"),
+                    target_new_id: bogus.clone(),
+                }],
+                None,
+            )
+            .await;
+
+        match result {
+            Err(ReportError::SplitTargetNewIdUnknown { target_new_id }) => {
+                assert_eq!(target_new_id, bogus.as_str());
+            }
+            other => panic!(
+                "bogus target_new_id must be refused with \
+                 SplitTargetNewIdUnknown, got {other:?}"
+            ),
+        }
+
+        // Ledger must NOT record the split: the operation aborted
+        // before the audit-log entry was written.
+        assert_eq!(ledger.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn admin_merge_self_target_returns_structured_variant() {
+        // M2: merging a subject with itself returns the structured
+        // MergeSelfTarget variant, not a stringly-typed Invalid.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![
+                        ExternalAddressing::new("mpd-path", "/a.flac"),
+                        ExternalAddressing::new("mbid", "abc"),
+                    ],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let result = admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "abc"),
+                None,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ReportError::MergeSelfTarget)),
+            "self-merge must return MergeSelfTarget, got {result:?}"
+        );
+        assert_eq!(ledger.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn admin_merge_cross_type_returns_structured_variant() {
+        // M2: merging across subject types returns the structured
+        // MergeCrossType variant carrying both type names.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let result = admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "album-x"),
+                None,
+            )
+            .await;
+
+        match result {
+            Err(ReportError::MergeCrossType { a_type, b_type }) => {
+                assert_eq!(a_type, "track");
+                assert_eq!(b_type, "album");
+            }
+            other => panic!(
+                "cross-type merge must return MergeCrossType, got {other:?}"
+            ),
+        }
         assert_eq!(ledger.count(), 0);
     }
 
