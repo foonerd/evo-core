@@ -13,18 +13,21 @@
 //! are future work.
 
 use evo_plugin_sdk::contract::{
-    CustodyHandle, CustodyStateReporter, ExplicitRelationAssignment,
-    ExternalAddressing, HealthStatus, InstanceAnnouncement, InstanceAnnouncer,
-    InstanceId, RelationAdmin, RelationAnnouncer, RelationAssertion,
-    RelationRetraction, ReportError, ReportPriority, SplitRelationStrategy,
-    StateReporter, SubjectAdmin, SubjectAnnouncement, SubjectAnnouncer,
-    UserInteraction, UserInteractionRequester,
+    AliasKind, AliasRecord, CanonicalSubjectId, CustodyHandle,
+    CustodyStateReporter, ExplicitRelationAssignment, ExternalAddressing,
+    HealthStatus, InstanceAnnouncement, InstanceAnnouncer, InstanceId,
+    RelationAdmin, RelationAnnouncer, RelationAssertion, RelationRetraction,
+    ReportError, ReportPriority, SplitRelationStrategy, StateReporter,
+    SubjectAddressingRecord, SubjectAdmin, SubjectAnnouncement,
+    SubjectAnnouncer, SubjectQuerier, SubjectQueryResult,
+    SubjectRecord as SdkSubjectRecord, UserInteraction,
+    UserInteractionRequester,
 };
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::admin::{AdminLedger, AdminLogEntry, AdminLogKind};
 use crate::catalogue::{Cardinality, Catalogue};
@@ -1933,6 +1936,198 @@ impl RelationAdmin for RegistryRelationAdmin {
                     });
                     Ok(())
                 }
+            }
+        })
+    }
+}
+
+/// Maximum number of merge hops the alias-aware describe operation
+/// will follow before giving up. Defence-in-depth: a real registry
+/// cannot grow an unbounded chain of merges between two queries
+/// (each merge takes the alias-index lock and writes a new record),
+/// so this cap is purely a protection against pathological data
+/// (e.g. an alias index inconsistency or a future bug). Hitting the
+/// cap returns the partial chain with `terminal = None`; the caller
+/// can then re-query the last visited entry's `new_ids` directly.
+const MAX_ALIAS_CHAIN_DEPTH: usize = 16;
+
+/// Convert a `SystemTime` to milliseconds since the UNIX epoch.
+///
+/// Times before the epoch (which a `SystemTime` could in principle
+/// represent on a clock that has been wound back) collapse to zero;
+/// the SDK on-wire shape is unsigned and the steward never produces
+/// pre-epoch timestamps in practice.
+fn system_time_to_ms(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Project a steward-internal subject record onto the SDK shape
+/// returned to consumers of the alias-aware describe operation.
+///
+/// The two record shapes diverged because the SDK type is part of
+/// the wire contract (so it stores timestamps as `u64` ms-since-epoch
+/// for stable on-wire form), while the steward's internal record
+/// stores `SystemTime` for arithmetic convenience inside the
+/// registry.
+fn project_subject_record(record: crate::subjects::SubjectRecord) -> SdkSubjectRecord {
+    SdkSubjectRecord {
+        id: CanonicalSubjectId::new(record.id),
+        subject_type: record.subject_type,
+        addressings: record
+            .addressings
+            .into_iter()
+            .map(|a| SubjectAddressingRecord {
+                addressing: a.addressing,
+                claimant: a.claimant,
+                added_at_ms: system_time_to_ms(a.added_at),
+            })
+            .collect(),
+        created_at_ms: system_time_to_ms(record.created_at),
+        modified_at_ms: system_time_to_ms(record.modified_at),
+    }
+}
+
+/// A registry-backed implementation of [`SubjectQuerier`].
+///
+/// The querier exposes the alias-aware describe operations to
+/// in-process plugins so a consumer holding a stale canonical ID
+/// can recover the alias chain and the current subject. The
+/// framework retains alias records indefinitely; this struct just
+/// reads them out and projects the steward's internal shapes onto
+/// the SDK contract.
+///
+/// Querying is read-only: no happenings are emitted, no audit
+/// entries are recorded. Consequently the querier is populated for
+/// every in-process plugin regardless of capability or trust class
+/// (cf. [`RegistrySubjectAdmin`], which is gated on
+/// `capabilities.admin`).
+#[derive(Debug)]
+pub struct RegistrySubjectQuerier {
+    registry: Arc<SubjectRegistry>,
+}
+
+impl RegistrySubjectQuerier {
+    /// Construct a querier bound to the shared subject registry.
+    pub fn new(registry: Arc<SubjectRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+impl SubjectQuerier for RegistrySubjectQuerier {
+    fn describe_alias<'a>(
+        &'a self,
+        subject_id: String,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<AliasRecord>, ReportError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let registry = Arc::clone(&self.registry);
+        Box::pin(async move {
+            // Empty IDs are a silent NotFound. The SDK contract
+            // models "current or unknown" both as `Ok(None)` for
+            // describe_alias; treating empty the same way avoids
+            // a special-case error variant for an input the
+            // registry would never produce.
+            if subject_id.is_empty() {
+                return Ok(None);
+            }
+            Ok(registry.describe_alias(&subject_id))
+        })
+    }
+
+    fn describe_subject_with_aliases<'a>(
+        &'a self,
+        subject_id: String,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<SubjectQueryResult, ReportError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let registry = Arc::clone(&self.registry);
+        Box::pin(async move {
+            if subject_id.is_empty() {
+                return Ok(SubjectQueryResult::NotFound);
+            }
+
+            let mut current_id = subject_id;
+            let mut chain: Vec<AliasRecord> = Vec::new();
+            let mut depth: usize = 0;
+
+            loop {
+                // 1. If the current ID resolves to a live subject,
+                //    we have either a direct hit (depth == 0) or
+                //    the terminal of a merge chain.
+                if let Some(record) = registry.describe(&current_id) {
+                    let projected = project_subject_record(record);
+                    if chain.is_empty() {
+                        return Ok(SubjectQueryResult::Found {
+                            record: projected,
+                        });
+                    }
+                    return Ok(SubjectQueryResult::Aliased {
+                        chain,
+                        terminal: Some(projected),
+                    });
+                }
+
+                // 2. Otherwise look for an alias record. Append it
+                //    to the chain and decide whether to follow.
+                if let Some(alias_record) =
+                    registry.describe_alias(&current_id)
+                {
+                    let kind = alias_record.kind;
+                    let new_ids = alias_record.new_ids.clone();
+                    chain.push(alias_record);
+
+                    // Chain forks: a Split, or a Merged record
+                    // whose new_ids has more than one entry
+                    // (structurally indistinguishable from a fork
+                    // for our purposes — a single terminal cannot
+                    // be returned). The contract surface treats
+                    // these uniformly: caller follows individual
+                    // chain entries' new_ids by re-querying.
+                    if matches!(kind, AliasKind::Split) || new_ids.len() != 1
+                    {
+                        return Ok(SubjectQueryResult::Aliased {
+                            chain,
+                            terminal: None,
+                        });
+                    }
+
+                    // Merge chain step. Follow the single new_id.
+                    depth += 1;
+                    if depth >= MAX_ALIAS_CHAIN_DEPTH {
+                        // Defence-in-depth cap. Return the partial
+                        // chain with no terminal so the caller can
+                        // continue manually if needed.
+                        return Ok(SubjectQueryResult::Aliased {
+                            chain,
+                            terminal: None,
+                        });
+                    }
+                    current_id = new_ids[0].as_str().to_string();
+                    continue;
+                }
+
+                // 3. Neither a live subject nor an alias. If we
+                //    have walked some chain already, that means
+                //    the chain dead-ends at an unknown ID — surface
+                //    the partial chain with no terminal. Otherwise
+                //    the queried ID is genuinely unknown.
+                if chain.is_empty() {
+                    return Ok(SubjectQueryResult::NotFound);
+                }
+                return Ok(SubjectQueryResult::Aliased {
+                    chain,
+                    terminal: None,
+                });
             }
         })
     }
@@ -6074,5 +6269,426 @@ target_type = "*"
         }
         assert_eq!(relation_reassigned, 2);
         assert_eq!(addressing_reassigned, 2);
+    }
+
+    // -----------------------------------------------------------------
+    // RegistrySubjectQuerier
+    //
+    // Exercises the read-only alias-aware describe surface. The
+    // querier walks the same alias index merge / split write through
+    // the storage primitive, so these tests focus on:
+    //
+    // - Direct describe_alias hits and misses (silent-NotFound for
+    //   empty / unknown IDs).
+    // - The three describe_subject_with_aliases outcomes:
+    //   `Found` for a live subject, `Aliased { terminal: Some(..) }`
+    //   for a chain that resolves to a single terminal, and
+    //   `Aliased { terminal: None }` for a fork.
+    // - Multi-hop merge chains: the walk follows AliasKind::Merged
+    //   records of length 1 across multiple steps before reporting
+    //   the terminal.
+    // -----------------------------------------------------------------
+    //
+    // The querier is constructed directly from a SubjectRegistry and
+    // does not depend on the catalogue or the happenings bus, so the
+    // fixtures below stay narrow.
+
+    #[tokio::test]
+    async fn subject_querier_describe_alias_returns_record_for_merged_id() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mbid", "track-mbid")],
+                ),
+                "org.test.p2",
+            )
+            .unwrap();
+
+        let source_a_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+        admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "track-mbid"),
+                Some("dedup".into()),
+            )
+            .await
+            .expect("merge must succeed");
+
+        let querier = RegistrySubjectQuerier::new(Arc::clone(&registry));
+        let alias = querier
+            .describe_alias(source_a_id.clone())
+            .await
+            .expect("describe_alias call must succeed");
+        let record = alias.expect("merged source must have an alias record");
+        assert_eq!(record.old_id.as_str(), source_a_id);
+        assert_eq!(record.kind, AliasKind::Merged);
+        assert_eq!(record.new_ids.len(), 1);
+        assert_eq!(record.admin_plugin, "admin.plugin");
+        assert_eq!(record.reason.as_deref(), Some("dedup"));
+    }
+
+    #[tokio::test]
+    async fn subject_querier_describe_alias_returns_none_for_unknown_id() {
+        let registry = Arc::new(SubjectRegistry::new());
+        let querier = RegistrySubjectQuerier::new(registry);
+
+        // Unknown ID: silent None.
+        let result = querier
+            .describe_alias("does-not-exist".into())
+            .await
+            .expect("describe_alias must succeed");
+        assert!(result.is_none());
+
+        // Empty ID: silent None per the documented convention.
+        let result = querier
+            .describe_alias(String::new())
+            .await
+            .expect("describe_alias must succeed");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn subject_querier_describe_subject_with_aliases_returns_found_for_live_subject(
+    ) {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        let id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+
+        let querier = RegistrySubjectQuerier::new(Arc::clone(&registry));
+        let result = querier
+            .describe_subject_with_aliases(id.clone())
+            .await
+            .expect("describe_subject_with_aliases must succeed");
+
+        match result {
+            SubjectQueryResult::Found { record } => {
+                assert_eq!(record.id.as_str(), id);
+                assert_eq!(record.subject_type, "track");
+                assert_eq!(record.addressings.len(), 1);
+                assert_eq!(
+                    record.addressings[0].addressing,
+                    ExternalAddressing::new("mpd-path", "/a.flac")
+                );
+                assert_eq!(record.addressings[0].claimant, "org.test.p1");
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subject_querier_describe_subject_with_aliases_returns_aliased_with_terminal(
+    ) {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mbid", "track-mbid")],
+                ),
+                "org.test.p2",
+            )
+            .unwrap();
+
+        let source_a_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+        admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "track-mbid"),
+                None,
+            )
+            .await
+            .expect("merge must succeed");
+
+        // The merged-into subject's canonical ID is whatever
+        // the source addressings now resolve to.
+        let new_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+
+        let querier = RegistrySubjectQuerier::new(Arc::clone(&registry));
+        let result = querier
+            .describe_subject_with_aliases(source_a_id.clone())
+            .await
+            .expect("describe_subject_with_aliases must succeed");
+
+        match result {
+            SubjectQueryResult::Aliased { chain, terminal } => {
+                assert_eq!(chain.len(), 1, "chain must have one hop");
+                assert_eq!(chain[0].old_id.as_str(), source_a_id);
+                assert_eq!(chain[0].kind, AliasKind::Merged);
+                assert_eq!(chain[0].new_ids.len(), 1);
+                assert_eq!(chain[0].new_ids[0].as_str(), new_id);
+                let terminal =
+                    terminal.expect("merge chain must have a terminal");
+                assert_eq!(terminal.id.as_str(), new_id);
+                assert_eq!(terminal.subject_type, "track");
+            }
+            other => panic!("expected Aliased, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subject_querier_describe_subject_with_aliases_returns_aliased_no_terminal_on_split(
+    ) {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![
+                        ExternalAddressing::new("mpd-path", "/a.flac"),
+                        ExternalAddressing::new("mbid", "abc"),
+                    ],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        let source_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+        admin
+            .split(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                vec![
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                    vec![ExternalAddressing::new("mbid", "abc")],
+                ],
+                SplitRelationStrategy::ToBoth,
+                vec![],
+                None,
+            )
+            .await
+            .expect("split must succeed");
+
+        let querier = RegistrySubjectQuerier::new(Arc::clone(&registry));
+        let result = querier
+            .describe_subject_with_aliases(source_id.clone())
+            .await
+            .expect("describe_subject_with_aliases must succeed");
+
+        match result {
+            SubjectQueryResult::Aliased { chain, terminal } => {
+                assert_eq!(chain.len(), 1);
+                assert_eq!(chain[0].old_id.as_str(), source_id);
+                assert_eq!(chain[0].kind, AliasKind::Split);
+                assert!(chain[0].new_ids.len() >= 2);
+                assert!(
+                    terminal.is_none(),
+                    "split chain must have no terminal"
+                );
+            }
+            other => panic!("expected Aliased, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subject_querier_describe_subject_with_aliases_walks_multi_hop_merge_chain(
+    ) {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        // Build three subjects, then merge A into (A,B) -> X, then
+        // merge X into (X,C) -> Y. Querying A's original ID should
+        // produce a two-hop chain ending at Y.
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mbid", "b-mbid")],
+                ),
+                "org.test.p2",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mbid", "c-mbid")],
+                ),
+                "org.test.p3",
+            )
+            .unwrap();
+
+        let original_a_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "b-mbid"),
+                None,
+            )
+            .await
+            .expect("first merge must succeed");
+
+        let intermediate_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+        assert_ne!(intermediate_id, original_a_id);
+
+        admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "c-mbid"),
+                None,
+            )
+            .await
+            .expect("second merge must succeed");
+
+        let final_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+        assert_ne!(final_id, intermediate_id);
+
+        let querier = RegistrySubjectQuerier::new(Arc::clone(&registry));
+        let result = querier
+            .describe_subject_with_aliases(original_a_id.clone())
+            .await
+            .expect("describe_subject_with_aliases must succeed");
+
+        match result {
+            SubjectQueryResult::Aliased { chain, terminal } => {
+                assert_eq!(chain.len(), 2, "must walk both hops");
+                assert_eq!(chain[0].old_id.as_str(), original_a_id);
+                assert_eq!(chain[0].new_ids[0].as_str(), intermediate_id);
+                assert_eq!(chain[0].kind, AliasKind::Merged);
+                assert_eq!(chain[1].old_id.as_str(), intermediate_id);
+                assert_eq!(chain[1].new_ids[0].as_str(), final_id);
+                assert_eq!(chain[1].kind, AliasKind::Merged);
+                let terminal = terminal
+                    .expect("multi-hop merge must have a terminal");
+                assert_eq!(terminal.id.as_str(), final_id);
+            }
+            other => panic!("expected Aliased, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subject_querier_describe_subject_with_aliases_returns_not_found_for_unknown_id(
+    ) {
+        let registry = Arc::new(SubjectRegistry::new());
+        let querier = RegistrySubjectQuerier::new(registry);
+
+        let result = querier
+            .describe_subject_with_aliases("does-not-exist".into())
+            .await
+            .expect("describe_subject_with_aliases must succeed");
+        assert!(matches!(result, SubjectQueryResult::NotFound));
+
+        // Empty ID also collapses to NotFound (silent
+        // NotFound convention).
+        let result = querier
+            .describe_subject_with_aliases(String::new())
+            .await
+            .expect("describe_subject_with_aliases must succeed");
+        assert!(matches!(result, SubjectQueryResult::NotFound));
     }
 }

@@ -30,6 +30,7 @@ use crate::context::{
     LoggingInstanceAnnouncer, LoggingStateReporter,
     LoggingUserInteractionRequester, RegistryRelationAdmin,
     RegistryRelationAnnouncer, RegistrySubjectAdmin, RegistrySubjectAnnouncer,
+    RegistrySubjectQuerier,
 };
 use crate::custody::{CustodyLedger, LedgerCustodyStateReporter};
 use crate::error::StewardError;
@@ -2031,15 +2032,18 @@ fn build_load_context(
             manifest.plugin.name.clone(),
         )),
         relation_announcer: Arc::new(RegistryRelationAnnouncer::new(
-            registry,
+            Arc::clone(&registry),
             graph,
             catalogue,
             bus,
             manifest.plugin.name.clone(),
         )),
-        // Subject-querier wiring is dormant in this phase; later
-        // phases populate it with a registry-backed implementation.
-        subject_querier: None,
+        // Subject querying is read-only and emits no happenings or
+        // audit entries; populate the querier for every in-process
+        // plugin regardless of capability or trust class. The
+        // out-of-process wire-side dispatch wires its own adapter
+        // separately.
+        subject_querier: Some(Arc::new(RegistrySubjectQuerier::new(registry))),
         subject_admin,
         relation_admin,
     }
