@@ -36,6 +36,7 @@ tracing-journald = "0.3"
 [dev-dependencies]
 evo-example-echo = { path = "../evo-example-echo" }
 tempfile = "3"
+proptest = "1"
 
 [lints]
 workspace = true
