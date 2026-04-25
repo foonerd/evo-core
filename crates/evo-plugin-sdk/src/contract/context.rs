@@ -59,10 +59,50 @@ impl CallDeadline {
 ///
 /// Carries:
 ///
-/// - Plugin configuration (merged from operator overrides).
+/// - Plugin configuration (merged for this plugin from operator overrides).
 /// - Per-plugin filesystem paths.
 /// - Callback handles for asynchronous plugin-to-steward messages.
 /// - An optional deadline for the `load` call itself.
+///
+/// # Steward sole authority
+///
+/// Plugins MUST NOT be able to enumerate one another. The SDK exposes no
+/// API by which a plugin may list, count, look up, or otherwise
+/// observe other plugins through its [`LoadContext`]; the steward is
+/// the sole authority for plugin-set knowledge. The doctests below pin
+/// the absence of every plausible enumeration helper a future
+/// contributor might be tempted to add. If any of them ever compiles,
+/// the steward-sole-authority invariant has been violated and the test
+/// in this docblock will start passing where it previously failed,
+/// surfacing the regression at `cargo test --doc`.
+///
+/// ```compile_fail
+/// use evo_plugin_sdk::LoadContext;
+/// fn must_not_compile(ctx: &LoadContext) {
+///     let _plugins = ctx.list_plugins();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use evo_plugin_sdk::LoadContext;
+/// fn must_not_compile(ctx: &LoadContext) {
+///     let _plugins = ctx.plugins();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use evo_plugin_sdk::LoadContext;
+/// fn must_not_compile(ctx: &LoadContext) {
+///     let _plugins = ctx.enumerate_plugins();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use evo_plugin_sdk::LoadContext;
+/// fn must_not_compile(ctx: &LoadContext) {
+///     let _plugins = ctx.peer_plugins();
+/// }
+/// ```
 pub struct LoadContext {
     /// Operator configuration for this plugin, merged from
     /// `/etc/evo/plugins.d/<name>.toml` if present. Empty table if
@@ -199,6 +239,57 @@ pub enum ReportError {
     /// retract, malformed payload, etc.).
     #[error("invalid report: {0}")]
     Invalid(String),
+    /// Merge refused: the two operator-supplied addressings resolve
+    /// to the same canonical subject. Self-merge is a deliberate
+    /// operator mistake; the dedicated variant lets callers
+    /// distinguish it from any other merge refusal without scraping
+    /// a free-form string.
+    #[error("merge refused: cannot merge subject with itself")]
+    MergeSelfTarget,
+    /// Merge refused: at least one operator-supplied addressing did
+    /// not resolve to a registered subject. The carried addressing
+    /// is the bogus one, suitable for surfacing to operators.
+    #[error(
+        "merge refused: source addressing {addressing} is not registered"
+    )]
+    MergeSourceUnknown {
+        /// The unresolvable operator-supplied addressing, rendered
+        /// as `scheme:value`.
+        addressing: String,
+    },
+    /// Merge refused: the two sources have differing subject types.
+    /// Cross-type merge would require redefining identity semantics
+    /// across catalogue types; the steward refuses.
+    #[error(
+        "merge refused: cross-type merge ({a_type} != {b_type})"
+    )]
+    MergeCrossType {
+        /// Subject type of the first source.
+        a_type: String,
+        /// Subject type of the second source.
+        b_type: String,
+    },
+    /// Merge refused for an internal reason that does not match the
+    /// other merge variants (e.g. graph-rewrite primitive failure).
+    /// The carried `detail` is for operator diagnostics only and
+    /// MUST NOT be parsed.
+    #[error("merge refused (internal): {detail}")]
+    MergeInternal {
+        /// Free-form detail string for operator diagnostics.
+        detail: String,
+    },
+    /// Split refused: an explicit relation assignment named a
+    /// `target_new_id` that was not produced by the split. The
+    /// steward refuses rather than silently rewriting a relation to
+    /// a phantom subject.
+    #[error(
+        "split refused: explicit assignment names target_new_id \
+         {target_new_id} which was not produced by the split"
+    )]
+    SplitTargetNewIdUnknown {
+        /// The bogus `target_new_id` from the assignment.
+        target_new_id: String,
+    },
 }
 
 /// Priority hint for state reports.
@@ -405,9 +496,9 @@ pub trait RelationAnnouncer: Send + Sync {
 /// - [`forced_retract_addressing`](Self::forced_retract_addressing):
 ///   force-retract an addressing claimed by another plugin.
 /// - [`merge`](Self::merge): collapse two canonical subjects into
-///   one, producing a new canonical ID per ADR-0008.
+///   one, producing a new canonical ID.
 /// - [`split`](Self::split): partition one canonical subject into
-///   two or more, each with a new canonical ID per ADR-0008.
+///   two or more, each with a new canonical ID.
 pub trait SubjectAdmin: Send + Sync {
     /// Force-retract an addressing claimed by another plugin.
     ///
@@ -436,8 +527,8 @@ pub trait SubjectAdmin: Send + Sync {
     /// itself is refused with `ReportError::Invalid`) and must
     /// have the same subject type (cross-type merge is refused).
     ///
-    /// Per `SUBJECTS.md` section 10.1 and ADR-0008, the merge
-    /// produces a NEW canonical ID. Both source IDs are retained
+    /// Per `SUBJECTS.md` section 10.1, the merge produces a NEW
+    /// canonical ID. Both source IDs are retained
     /// in the registry as alias records (`AliasKind::Merged`) so
     /// consumers holding stale references can discover the new
     /// identity via `describe_alias`. The new subject's
@@ -473,8 +564,8 @@ pub trait SubjectAdmin: Send + Sync {
     /// partition group; addressings not on the source are refused
     /// with `ReportError::Invalid`.
     ///
-    /// Per `SUBJECTS.md` section 10.2 and ADR-0008, the split
-    /// produces N NEW canonical IDs (one per partition group).
+    /// Per `SUBJECTS.md` section 10.2, the split produces N NEW
+    /// canonical IDs (one per partition group).
     /// The source ID is retained in the registry as an alias
     /// record (`AliasKind::Split`) carrying all new IDs.
     ///
