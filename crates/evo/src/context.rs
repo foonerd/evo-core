@@ -20,6 +20,7 @@ use evo_plugin_sdk::contract::{
     StateReporter, SubjectAdmin, SubjectAnnouncement, SubjectAnnouncer,
     UserInteraction, UserInteractionRequester,
 };
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -28,7 +29,8 @@ use std::time::SystemTime;
 use crate::admin::{AdminLedger, AdminLogEntry, AdminLogKind};
 use crate::catalogue::{Cardinality, Catalogue};
 use crate::happenings::{
-    CardinalityViolationSide, Happening, HappeningBus, RelationForgottenReason,
+    CardinalityViolationSide, Happening, HappeningBus, ReassignedClaimKind,
+    RelationForgottenReason,
 };
 use crate::relations::{
     ForcedRetractClaimOutcome, RelationGraph, RelationKey,
@@ -471,6 +473,93 @@ fn cardinality_exceeded(bound: Cardinality, count: usize) -> bool {
     match bound {
         Cardinality::AtMostOne | Cardinality::ExactlyOne => count > 1,
         Cardinality::AtLeastOne | Cardinality::Many => false,
+    }
+}
+
+/// Re-evaluate cardinality bounds for every `(subject, predicate)`
+/// pair touched by a merge or split rewrite and emit one
+/// [`Happening::RelationCardinalityViolatedPostRewrite`] per
+/// offending side.
+///
+/// Cardinality is only checked on assert today: the merge and split
+/// paths can consolidate two valid claim sets into a violating one
+/// that no individual assertion would have produced. This helper
+/// closes that gap by inspecting the post-rewrite forward and
+/// inverse counts for every subject the rewrite touched, against
+/// every predicate the catalogue declares.
+///
+/// Symmetric to the assert-time cardinality probe in
+/// [`RegistryRelationAnnouncer`]: the predicate's
+/// `source_cardinality` constrains the source side
+/// (`forward_count`), and `target_cardinality` constrains the target
+/// side (`inverse_count`). Only `AtMostOne` / `ExactlyOne` bounds
+/// can be violated by a rewrite-driven count growth; other bounds
+/// emit nothing.
+fn emit_post_rewrite_cardinality_violations(
+    graph: &RelationGraph,
+    catalogue: &Catalogue,
+    affected_subjects: &HashSet<String>,
+    admin_plugin: &str,
+    bus: &HappeningBus,
+) {
+    let at = SystemTime::now();
+    // Stable iteration order for the bus: sort the affected
+    // subjects so the violations appear in deterministic order
+    // across runs. Predicate iteration follows catalogue
+    // declaration order which is itself stable.
+    let mut subjects: Vec<&String> = affected_subjects.iter().collect();
+    subjects.sort();
+    for subject_id in subjects {
+        for predicate_rule in &catalogue.relations {
+            // Target side: predicate.target_cardinality bounds how
+            // many sources may point at one target via this
+            // predicate. Probed via inverse_count on the subject.
+            if matches!(
+                predicate_rule.target_cardinality,
+                Cardinality::AtMostOne | Cardinality::ExactlyOne
+            ) {
+                let count = graph
+                    .inverse_count(subject_id, &predicate_rule.predicate);
+                if cardinality_exceeded(
+                    predicate_rule.target_cardinality,
+                    count,
+                ) {
+                    bus.emit(Happening::RelationCardinalityViolatedPostRewrite {
+                        admin_plugin: admin_plugin.to_string(),
+                        subject_id: subject_id.clone(),
+                        predicate: predicate_rule.predicate.clone(),
+                        side: CardinalityViolationSide::Target,
+                        declared: predicate_rule.target_cardinality,
+                        observed_count: count,
+                        at,
+                    });
+                }
+            }
+            // Source side: predicate.source_cardinality bounds how
+            // many targets a single source may have via this
+            // predicate. Probed via forward_count on the subject.
+            if matches!(
+                predicate_rule.source_cardinality,
+                Cardinality::AtMostOne | Cardinality::ExactlyOne
+            ) {
+                let count = graph
+                    .forward_count(subject_id, &predicate_rule.predicate);
+                if cardinality_exceeded(
+                    predicate_rule.source_cardinality,
+                    count,
+                ) {
+                    bus.emit(Happening::RelationCardinalityViolatedPostRewrite {
+                        admin_plugin: admin_plugin.to_string(),
+                        subject_id: subject_id.clone(),
+                        predicate: predicate_rule.predicate.clone(),
+                        side: CardinalityViolationSide::Source,
+                        declared: predicate_rule.source_cardinality,
+                        observed_count: count,
+                        at,
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -967,7 +1056,7 @@ impl SubjectAdmin for RegistrySubjectAdmin {
         let bus = Arc::clone(&self.bus);
         let ledger = Arc::clone(&self.ledger);
         let admin_plugin = self.admin_plugin.clone();
-        let _catalogue = Arc::clone(&self.catalogue);
+        let catalogue = Arc::clone(&self.catalogue);
         Box::pin(async move {
             let source_a_id = registry.resolve(&target_a).ok_or_else(|| {
                 ReportError::MergeSourceUnknown {
@@ -1003,12 +1092,11 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             // installs alias records. Pre-validation above covers
             // self-merge and cross-type; anything else returned by
             // the primitive is genuinely unforeseen and surfaces as
-            // MergeInternal. The per-addressing transfer records on
-            // the outcome are ignored here; the cascade-emission
-            // wiring consumes them.
+            // MergeInternal. The addressing-transfer records drive
+            // the per-addressing ClaimReassigned cascade below.
             let crate::subjects::MergeAliasesOutcome {
                 new_id,
-                addressing_transfers: _,
+                addressing_transfers,
             } = registry
                 .merge_aliases(
                     &source_a_id,
@@ -1039,19 +1127,166 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             // are independent; the second sees the post-first
             // state and may collapse further if the rewritten
             // edges from source_a coincide with edges already
-            // touched by source_b. The per-edge outcome records
-            // are ignored here; the cascade-emission wiring
-            // consumes them.
-            let _rewrite_a = graph
+            // touched by source_b. The structured outcomes drive
+            // the per-edge cascade emission that follows.
+            let rewrite_a = graph
                 .rewrite_subject_to(&source_a_id, &new_id)
                 .map_err(|e| ReportError::MergeInternal {
                     detail: format!("graph rewrite (source_a): {e}"),
                 })?;
-            let _rewrite_b = graph
+            let rewrite_b = graph
                 .rewrite_subject_to(&source_b_id, &new_id)
                 .map_err(|e| ReportError::MergeInternal {
                     detail: format!("graph rewrite (source_b): {e}"),
                 })?;
+
+            // Cascade emission. Ordering is load-bearing and pinned
+            // by tests:
+            //
+            // 1. RelationRewritten per edge (source_a outcome
+            //    first, then source_b).
+            // 2. RelationCardinalityViolatedPostRewrite per
+            //    `(subject, predicate, side)` whose count exceeds
+            //    its declared bound after the rewrite settled.
+            // 3. RelationClaimSuppressionCollapsed per demoted
+            //    claimant on each suppression-collapsed edge.
+            // 4. ClaimReassigned per relation-claim moved by an
+            //    EdgeRewrite.
+            // 5. ClaimReassigned per addressing-claim moved by the
+            //    registry.
+            //
+            // The "unchanged endpoint" of an EdgeRewrite is
+            // whichever side of the new key is NOT the merge
+            // target (`new_id`). When the source side was
+            // rewritten the unchanged endpoint is the target id;
+            // when the target side was rewritten it is the source
+            // id. The match against the OLD key disambiguates
+            // which side moved (a self-edge rewrite has both old
+            // ends equal to source_id).
+            let mut affected_subjects: HashSet<String> = HashSet::new();
+            affected_subjects.insert(new_id.clone());
+
+            // Step 1: RelationRewritten in source_a then source_b
+            // outcome order.
+            for (source_id, outcome) in [
+                (&source_a_id, &rewrite_a),
+                (&source_b_id, &rewrite_b),
+            ] {
+                for edge in &outcome.rewrites {
+                    let unchanged_endpoint =
+                        if edge.old_key.source_id == *source_id {
+                            edge.new_key.target_id.clone()
+                        } else {
+                            edge.new_key.source_id.clone()
+                        };
+                    affected_subjects.insert(unchanged_endpoint.clone());
+                    bus.emit(Happening::RelationRewritten {
+                        admin_plugin: admin_plugin.clone(),
+                        predicate: edge.new_key.predicate.clone(),
+                        old_subject_id: source_id.clone(),
+                        new_subject_id: new_id.clone(),
+                        target_id: unchanged_endpoint,
+                        at,
+                    });
+                }
+            }
+
+            // Step 2: post-rewrite cardinality re-evaluation across
+            // every endpoint touched by either rewrite plus the
+            // merge target itself.
+            emit_post_rewrite_cardinality_violations(
+                &graph,
+                &catalogue,
+                &affected_subjects,
+                &admin_plugin,
+                &bus,
+            );
+
+            // Step 3: RelationClaimSuppressionCollapsed per demoted
+            // claimant per collapse, source_a first then source_b.
+            for outcome in [&rewrite_a, &rewrite_b] {
+                for collapse in &outcome.suppression_collapses {
+                    for demoted in &collapse.demoted_claimants {
+                        bus.emit(
+                            Happening::RelationClaimSuppressionCollapsed {
+                                admin_plugin: admin_plugin.clone(),
+                                subject_id: collapse
+                                    .surviving_key
+                                    .source_id
+                                    .clone(),
+                                predicate: collapse
+                                    .surviving_key
+                                    .predicate
+                                    .clone(),
+                                target_id: collapse
+                                    .surviving_key
+                                    .target_id
+                                    .clone(),
+                                demoted_claimant: demoted.claimant.clone(),
+                                surviving_suppression_record: collapse
+                                    .surviving_suppression
+                                    .clone(),
+                                at,
+                            },
+                        );
+                    }
+                }
+            }
+
+            // Step 4: ClaimReassigned per relation-claim, one per
+            // claim per EdgeRewrite, source_a first then source_b.
+            // An EdgeRewrite carries a snapshot of the dying
+            // record's claim list at the moment of rewrite; every
+            // claim on that list has been moved onto `new_id` so
+            // every claim earns its own ClaimReassigned event.
+            // Multiple claims by the same claimant on the same
+            // edge are unusual (the storage primitive deduplicates
+            // claimants) but not forbidden by the snapshot; this
+            // wiring fires once per claim entry rather than once
+            // per claimant, mirroring the snapshot's granularity.
+            for (source_id, outcome) in [
+                (&source_a_id, &rewrite_a),
+                (&source_b_id, &rewrite_b),
+            ] {
+                for edge in &outcome.rewrites {
+                    let unchanged_endpoint =
+                        if edge.old_key.source_id == *source_id {
+                            edge.new_key.target_id.clone()
+                        } else {
+                            edge.new_key.source_id.clone()
+                        };
+                    for claim in &edge.claims {
+                        bus.emit(Happening::ClaimReassigned {
+                            admin_plugin: admin_plugin.clone(),
+                            plugin: claim.claimant.clone(),
+                            kind: ReassignedClaimKind::Relation,
+                            old_subject_id: source_id.clone(),
+                            new_subject_id: new_id.clone(),
+                            scheme: None,
+                            value: None,
+                            predicate: Some(edge.new_key.predicate.clone()),
+                            target_id: Some(unchanged_endpoint.clone()),
+                            at,
+                        });
+                    }
+                }
+            }
+
+            // Step 5: ClaimReassigned per addressing-claim.
+            for transfer in &addressing_transfers {
+                bus.emit(Happening::ClaimReassigned {
+                    admin_plugin: admin_plugin.clone(),
+                    plugin: transfer.claimant.clone(),
+                    kind: ReassignedClaimKind::Addressing,
+                    old_subject_id: transfer.old_subject_id.clone(),
+                    new_subject_id: transfer.new_subject_id.clone(),
+                    scheme: Some(transfer.addressing.scheme.clone()),
+                    value: Some(transfer.addressing.value.clone()),
+                    predicate: None,
+                    target_id: None,
+                    at,
+                });
+            }
 
             ledger.record(AdminLogEntry {
                 kind: AdminLogKind::SubjectMerge,
@@ -1116,7 +1351,7 @@ impl SubjectAdmin for RegistrySubjectAdmin {
         let bus = Arc::clone(&self.bus);
         let ledger = Arc::clone(&self.ledger);
         let admin_plugin = self.admin_plugin.clone();
-        let _catalogue = Arc::clone(&self.catalogue);
+        let catalogue = Arc::clone(&self.catalogue);
         Box::pin(async move {
             let source_id = registry.resolve(&source).ok_or_else(|| {
                 ReportError::Invalid(format!(
@@ -1150,12 +1385,11 @@ impl SubjectAdmin for RegistrySubjectAdmin {
 
             // Storage primitive: registers N new subjects and
             // retires the source ID with an alias record carrying
-            // every new ID. The per-addressing transfer records
-            // on the outcome are ignored here; the cascade-emission
-            // wiring consumes them.
+            // every new ID. The addressing-transfer records drive
+            // the per-addressing ClaimReassigned cascade below.
             let crate::subjects::SplitSubjectOutcome {
                 new_ids,
-                addressing_transfers: _,
+                addressing_transfers,
             } = registry
                 .split_subject(
                     &source_id,
@@ -1200,7 +1434,7 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             });
 
             // Distribute relations across the new IDs.
-            let outcome = graph
+            let split_outcome = graph
                 .split_relations(
                     &source_id,
                     &new_ids,
@@ -1211,15 +1445,130 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                     ReportError::Invalid(format!("split graph: {e}"))
                 })?;
 
-            // One RelationSplitAmbiguous per Explicit-strategy
+            // Cascade emission. Ordering is load-bearing and pinned
+            // by tests:
+            //
+            // 1. RelationRewritten per edge in
+            //    split_outcome.rewrites.
+            // 2. RelationSplitAmbiguous per Explicit-strategy gap.
+            // 3. RelationCardinalityViolatedPostRewrite per
+            //    `(subject, predicate, side)` whose count exceeds
+            //    its declared bound after the cascade settled.
+            // 4. ClaimReassigned per relation-claim moved by an
+            //    EdgeRewrite.
+            // 5. ClaimReassigned per addressing-claim moved by the
+            //    registry.
+            //
+            // The "rewritten endpoint" of an EdgeRewrite is
+            // whichever side of the new key is one of the
+            // freshly-minted IDs. Compared to merge, split's
+            // EdgeRewrite carries one new-id per output edge: the
+            // OLD key has the source-id on whichever side it
+            // occupied, and the NEW key replaces that side with
+            // one of the new ids. The opposite side is unchanged.
+            let mut affected_subjects: HashSet<String> = HashSet::new();
+            for nid in &new_ids {
+                affected_subjects.insert(nid.clone());
+            }
+
+            // Step 1: RelationRewritten per edge.
+            for edge in &split_outcome.rewrites {
+                let (rewritten_endpoint, unchanged_endpoint) =
+                    if edge.old_key.source_id == source_id {
+                        (
+                            edge.new_key.source_id.clone(),
+                            edge.new_key.target_id.clone(),
+                        )
+                    } else {
+                        (
+                            edge.new_key.target_id.clone(),
+                            edge.new_key.source_id.clone(),
+                        )
+                    };
+                affected_subjects.insert(unchanged_endpoint.clone());
+                bus.emit(Happening::RelationRewritten {
+                    admin_plugin: admin_plugin.clone(),
+                    predicate: edge.new_key.predicate.clone(),
+                    old_subject_id: source_id.clone(),
+                    new_subject_id: rewritten_endpoint,
+                    target_id: unchanged_endpoint,
+                    at,
+                });
+            }
+
+            // Step 2: RelationSplitAmbiguous per Explicit-strategy
             // gap. Same `at` timestamp pins ordering on the wire.
-            for edge in outcome.ambiguous {
+            for edge in &split_outcome.ambiguous {
                 bus.emit(Happening::RelationSplitAmbiguous {
                     admin_plugin: admin_plugin.clone(),
-                    source_subject: edge.source_subject,
-                    predicate: edge.predicate,
-                    other_endpoint_id: edge.other_endpoint_id,
-                    candidate_new_ids: edge.candidate_new_ids,
+                    source_subject: edge.source_subject.clone(),
+                    predicate: edge.predicate.clone(),
+                    other_endpoint_id: edge.other_endpoint_id.clone(),
+                    candidate_new_ids: edge.candidate_new_ids.clone(),
+                    at,
+                });
+            }
+
+            // Step 3: post-rewrite cardinality re-evaluation across
+            // every endpoint touched by the split plus all the
+            // freshly-minted ids.
+            emit_post_rewrite_cardinality_violations(
+                &graph,
+                &catalogue,
+                &affected_subjects,
+                &admin_plugin,
+                &bus,
+            );
+
+            // Step 4: ClaimReassigned per relation-claim. Old
+            // subject is `source_id`; new subject is whichever new
+            // id occupies the rewritten endpoint of the new key.
+            // Multiple claims by the same claimant on the same
+            // edge fire one event per claim entry, mirroring the
+            // EdgeRewrite snapshot's granularity (the storage
+            // primitive deduplicates claimants, so this is a
+            // conservative fan-out).
+            for edge in &split_outcome.rewrites {
+                let rewritten_endpoint =
+                    if edge.old_key.source_id == source_id {
+                        edge.new_key.source_id.clone()
+                    } else {
+                        edge.new_key.target_id.clone()
+                    };
+                let unchanged_endpoint =
+                    if edge.old_key.source_id == source_id {
+                        edge.new_key.target_id.clone()
+                    } else {
+                        edge.new_key.source_id.clone()
+                    };
+                for claim in &edge.claims {
+                    bus.emit(Happening::ClaimReassigned {
+                        admin_plugin: admin_plugin.clone(),
+                        plugin: claim.claimant.clone(),
+                        kind: ReassignedClaimKind::Relation,
+                        old_subject_id: source_id.clone(),
+                        new_subject_id: rewritten_endpoint.clone(),
+                        scheme: None,
+                        value: None,
+                        predicate: Some(edge.new_key.predicate.clone()),
+                        target_id: Some(unchanged_endpoint.clone()),
+                        at,
+                    });
+                }
+            }
+
+            // Step 5: ClaimReassigned per addressing-claim.
+            for transfer in &addressing_transfers {
+                bus.emit(Happening::ClaimReassigned {
+                    admin_plugin: admin_plugin.clone(),
+                    plugin: transfer.claimant.clone(),
+                    kind: ReassignedClaimKind::Addressing,
+                    old_subject_id: transfer.old_subject_id.clone(),
+                    new_subject_id: transfer.new_subject_id.clone(),
+                    scheme: Some(transfer.addressing.scheme.clone()),
+                    value: Some(transfer.addressing.value.clone()),
+                    predicate: None,
+                    target_id: None,
                     at,
                 });
             }
@@ -4363,19 +4712,32 @@ target_type = "*"
             matches!(first, Happening::SubjectSplit { .. }),
             "first must be SubjectSplit, got {first:?}"
         );
-        let second = rx.recv().await.expect("RelationSplitAmbiguous");
-        match second {
-            Happening::RelationSplitAmbiguous {
-                admin_plugin,
-                predicate,
-                candidate_new_ids,
-                ..
-            } => {
-                assert_eq!(admin_plugin, "admin.plugin");
-                assert_eq!(predicate, "album_of");
-                assert_eq!(candidate_new_ids.len(), 2);
+        // RelationRewritten events (one per output edge from the
+        // ToBoth fallback) precede the RelationSplitAmbiguous
+        // event in the cascade ordering. Walk past them and pin
+        // the ambiguous event's payload.
+        loop {
+            let h = rx.recv().await.expect("more cascade events");
+            match h {
+                Happening::RelationRewritten { .. } => continue,
+                Happening::RelationSplitAmbiguous {
+                    admin_plugin,
+                    predicate,
+                    candidate_new_ids,
+                    ..
+                } => {
+                    assert_eq!(admin_plugin, "admin.plugin");
+                    assert_eq!(predicate, "album_of");
+                    assert_eq!(candidate_new_ids.len(), 2);
+                    break;
+                }
+                other => {
+                    panic!(
+                        "unexpected happening before RelationSplitAmbiguous: \
+                         {other:?}"
+                    )
+                }
             }
-            other => panic!("unexpected happening: {other:?}"),
         }
     }
 
@@ -4940,5 +5302,777 @@ target_type = "*"
             }
         }
         assert_eq!(ledger.count(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Cascade-emission ordering tests for merge and split.
+    //
+    // The admin merge and split paths emit a documented sequence of
+    // happenings whose order is load-bearing: subscribers indexing
+    // on (source_id, predicate, target_id) triples consume the
+    // RelationRewritten events to keep their indices coherent;
+    // ClaimReassigned tells affected plugins to reconcile cached
+    // canonical-ID state; RelationCardinalityViolatedPostRewrite
+    // and RelationClaimSuppressionCollapsed surface the structural
+    // side-effects rewrites can introduce that no individual
+    // assert/retract would have. Tests below pin the order via
+    // sequential `bus.recv()` calls, mirroring the discipline of
+    // `forced_retract_addressing_ordering_admin_happening_before_cascade`.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn admin_merge_emits_cascade_in_documented_order() {
+        // Two tracks, each with its own outbound edge to the SAME
+        // album. The merge collapses both edges into one at the
+        // new id (source_a's rewrite creates the surviving edge;
+        // source_b's rewrite unions a claim into it). Expected
+        // bus order:
+        //   SubjectMerged
+        //   RelationRewritten (source_a)
+        //   RelationRewritten (source_b)
+        //   ClaimReassigned (relation, p1)
+        //   ClaimReassigned (relation, p2)
+        //   ClaimReassigned (addressing, ...)+
+        // No cardinality violation: the surviving edge has a
+        // single forward target.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mbid", "track-b")],
+                ),
+                "org.test.p2",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+
+        let p1_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        let p2_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p2",
+        );
+        p1_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+        p2_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mbid", "track-b"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        // Subscribe AFTER setup so prior asserts do not pollute
+        // the channel. Cascade order is what we pin here.
+        let mut rx = bus.subscribe();
+
+        admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "track-b"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 1. SubjectMerged.
+        let h = rx.recv().await.expect("SubjectMerged");
+        assert!(
+            matches!(h, Happening::SubjectMerged { .. }),
+            "first must be SubjectMerged, got {h:?}"
+        );
+
+        // 2. RelationRewritten x2 (one per source).
+        for i in 0..2 {
+            let h = rx.recv().await.expect("RelationRewritten");
+            assert!(
+                matches!(h, Happening::RelationRewritten { .. }),
+                "event {i} must be RelationRewritten, got {h:?}"
+            );
+        }
+
+        // 3. No RelationCardinalityViolatedPostRewrite (single
+        //    target on `album_of` source side, within bounds).
+        // 4. No RelationClaimSuppressionCollapsed (no suppression
+        //    in this scenario).
+        // 5. ClaimReassigned per relation-claim (one per claim,
+        //    per source's EdgeRewrite). Each EdgeRewrite carries
+        //    one claim; two rewrites yield two events.
+        let mut relation_reassigned = 0usize;
+        let mut addressing_reassigned = 0usize;
+        let mut next: Option<Happening> = None;
+        loop {
+            let h = match next.take() {
+                Some(h) => h,
+                None => match rx.recv().await {
+                    Ok(h) => h,
+                    Err(_) => break,
+                },
+            };
+            match h {
+                Happening::ClaimReassigned { kind, .. } => match kind {
+                    ReassignedClaimKind::Relation => {
+                        relation_reassigned += 1;
+                    }
+                    ReassignedClaimKind::Addressing => {
+                        addressing_reassigned += 1;
+                    }
+                },
+                other => panic!(
+                    "unexpected happening in cascade tail: {other:?}"
+                ),
+            }
+            if rx.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            relation_reassigned, 2,
+            "expected one ClaimReassigned per relation claim per source"
+        );
+        assert!(
+            addressing_reassigned >= 1,
+            "expected at least one ClaimReassigned for addressing transfer, \
+             got {addressing_reassigned}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_merge_with_cardinality_violation_fires_violation_after_rewrites(
+    ) {
+        // Two tracks each with their OWN album_of edge to a
+        // distinct album. After the merge the new id has TWO
+        // outbound album_of edges, violating
+        // `source_cardinality = at_most_one` declared on
+        // `album_of` in the test catalogue. Expected bus order:
+        //   SubjectMerged
+        //   RelationRewritten (x2)
+        //   RelationCardinalityViolatedPostRewrite (x1)
+        //   ClaimReassigned (relation x2, addressing 1+)
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mbid", "track-b")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-y")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mbid", "track-b"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-y"),
+            ))
+            .await
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "track-b"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 1. SubjectMerged.
+        let h = rx.recv().await.expect("SubjectMerged");
+        assert!(matches!(h, Happening::SubjectMerged { .. }));
+
+        // 2. RelationRewritten x2.
+        for _ in 0..2 {
+            let h = rx.recv().await.expect("RelationRewritten");
+            assert!(
+                matches!(h, Happening::RelationRewritten { .. }),
+                "expected RelationRewritten, got {h:?}"
+            );
+        }
+
+        // 3. RelationCardinalityViolatedPostRewrite (Source side,
+        //    declared = AtMostOne, observed = 2).
+        let h = rx.recv().await.expect("violation");
+        match h {
+            Happening::RelationCardinalityViolatedPostRewrite {
+                admin_plugin,
+                predicate,
+                side,
+                declared,
+                observed_count,
+                ..
+            } => {
+                assert_eq!(admin_plugin, "admin.plugin");
+                assert_eq!(predicate, "album_of");
+                assert_eq!(side, CardinalityViolationSide::Source);
+                assert_eq!(declared, Cardinality::AtMostOne);
+                assert_eq!(observed_count, 2);
+            }
+            other => panic!(
+                "expected RelationCardinalityViolatedPostRewrite \
+                 after RelationRewritten, got {other:?}"
+            ),
+        }
+
+        // 4. ClaimReassigned tail: at least 2 relation claims
+        //    plus addressing transfers.
+        let mut relation_reassigned = 0usize;
+        let mut addressing_reassigned = 0usize;
+        while !rx.is_empty() {
+            match rx.recv().await.unwrap() {
+                Happening::ClaimReassigned { kind, .. } => match kind {
+                    ReassignedClaimKind::Relation => {
+                        relation_reassigned += 1
+                    }
+                    ReassignedClaimKind::Addressing => {
+                        addressing_reassigned += 1
+                    }
+                },
+                other => panic!(
+                    "expected ClaimReassigned tail, got {other:?}"
+                ),
+            }
+        }
+        assert_eq!(relation_reassigned, 2);
+        assert!(addressing_reassigned >= 1);
+    }
+
+    #[tokio::test]
+    async fn admin_merge_with_suppression_collapse_fires_collapse_event() {
+        // Setup a suppression collapse during merge:
+        //   - source_a (track at /a.flac) has edge album_of->album-x
+        //     SUPPRESSED by admin.
+        //   - source_b (track at mbid:track-b) has edge
+        //     album_of->album-x VISIBLE.
+        // Merge rewrites source_a's edge first to (new, album_of,
+        // album-x) carrying the suppression marker; then
+        // source_b's rewrite collides, finds the surviving edge
+        // suppressed, and demotes its claim. Expected bus order:
+        //   SubjectMerged
+        //   RelationRewritten (x2)
+        //   RelationClaimSuppressionCollapsed (x1)
+        //   ClaimReassigned (relation x2, addressing 1+)
+        // No cardinality violation: the suppressed edge is
+        // invisible to forward/inverse counts.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mbid", "track-b")],
+                ),
+                "org.test.p2",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+
+        let p1_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        let p2_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p2",
+        );
+        p1_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+        p2_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mbid", "track-b"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        // Suppress source_a's edge.
+        let track_a_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+        let album_id = registry
+            .resolve(&ExternalAddressing::new("mbid", "album-x"))
+            .unwrap();
+        graph
+            .suppress(
+                &track_a_id,
+                "album_of",
+                &album_id,
+                "admin.plugin",
+                Some("dispute".into()),
+            )
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "track-b"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 1. SubjectMerged.
+        let h = rx.recv().await.expect("SubjectMerged");
+        assert!(matches!(h, Happening::SubjectMerged { .. }));
+
+        // 2. RelationRewritten x2.
+        for _ in 0..2 {
+            let h = rx.recv().await.expect("RelationRewritten");
+            assert!(
+                matches!(h, Happening::RelationRewritten { .. }),
+                "expected RelationRewritten, got {h:?}"
+            );
+        }
+
+        // 3. RelationClaimSuppressionCollapsed.
+        let h = rx.recv().await.expect("collapse");
+        match h {
+            Happening::RelationClaimSuppressionCollapsed {
+                admin_plugin,
+                predicate,
+                demoted_claimant,
+                ..
+            } => {
+                assert_eq!(admin_plugin, "admin.plugin");
+                assert_eq!(predicate, "album_of");
+                assert_eq!(demoted_claimant, "org.test.p2");
+            }
+            other => panic!(
+                "expected RelationClaimSuppressionCollapsed, got {other:?}"
+            ),
+        }
+
+        // 4. ClaimReassigned tail.
+        let mut relation_reassigned = 0usize;
+        let mut addressing_reassigned = 0usize;
+        while !rx.is_empty() {
+            match rx.recv().await.unwrap() {
+                Happening::ClaimReassigned { kind, .. } => match kind {
+                    ReassignedClaimKind::Relation => {
+                        relation_reassigned += 1
+                    }
+                    ReassignedClaimKind::Addressing => {
+                        addressing_reassigned += 1
+                    }
+                },
+                other => panic!(
+                    "expected ClaimReassigned tail, got {other:?}"
+                ),
+            }
+        }
+        assert_eq!(relation_reassigned, 2);
+        assert!(addressing_reassigned >= 1);
+    }
+
+    #[tokio::test]
+    async fn admin_split_emits_cascade_in_documented_order() {
+        // Single track with two addressings and one outbound edge
+        // album_of->album-x. Split partitions the addressings
+        // across two new ids using the ToBoth strategy: the edge
+        // is replicated to both new ids. Expected bus order:
+        //   SubjectSplit
+        //   RelationRewritten (x2, one per output edge)
+        //   ClaimReassigned (relation x2, addressing 2)
+        // No ambiguous edges (ToBoth has no fall-through).
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![
+                        ExternalAddressing::new("mpd-path", "/a.flac"),
+                        ExternalAddressing::new("mbid", "track-mbid"),
+                    ],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .split(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                vec![
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                    vec![ExternalAddressing::new("mbid", "track-mbid")],
+                ],
+                SplitRelationStrategy::ToBoth,
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 1. SubjectSplit.
+        let h = rx.recv().await.expect("SubjectSplit");
+        assert!(matches!(h, Happening::SubjectSplit { .. }));
+
+        // 2. RelationRewritten x2 (one per output edge from
+        //    ToBoth replication).
+        for _ in 0..2 {
+            let h = rx.recv().await.expect("RelationRewritten");
+            assert!(
+                matches!(h, Happening::RelationRewritten { .. }),
+                "expected RelationRewritten, got {h:?}"
+            );
+        }
+
+        // 3. No RelationSplitAmbiguous (ToBoth has no
+        //    fall-through). No cardinality violation either:
+        //    each new id has at most one album_of target.
+        // 4. ClaimReassigned tail: 2 relation + 2 addressing.
+        let mut relation_reassigned = 0usize;
+        let mut addressing_reassigned = 0usize;
+        while !rx.is_empty() {
+            match rx.recv().await.unwrap() {
+                Happening::ClaimReassigned { kind, .. } => match kind {
+                    ReassignedClaimKind::Relation => {
+                        relation_reassigned += 1
+                    }
+                    ReassignedClaimKind::Addressing => {
+                        addressing_reassigned += 1
+                    }
+                },
+                other => panic!(
+                    "expected ClaimReassigned tail, got {other:?}"
+                ),
+            }
+        }
+        assert_eq!(relation_reassigned, 2);
+        assert_eq!(addressing_reassigned, 2);
+    }
+
+    #[tokio::test]
+    async fn admin_split_with_ambiguous_edge_orders_ambiguous_after_rewrites() {
+        // Explicit-strategy split with no assignment for the
+        // existing album_of edge: storage primitive falls through
+        // to ToBoth and reports the gap as an AmbiguousEdge.
+        // Expected bus order:
+        //   SubjectSplit
+        //   RelationRewritten (x2, from ToBoth fall-through)
+        //   RelationSplitAmbiguous (x1)
+        //   ClaimReassigned (relation x2, addressing 2)
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![
+                        ExternalAddressing::new("mpd-path", "/a.flac"),
+                        ExternalAddressing::new("mbid", "track-mbid"),
+                    ],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        admin
+            .split(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                vec![
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                    vec![ExternalAddressing::new("mbid", "track-mbid")],
+                ],
+                SplitRelationStrategy::Explicit,
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 1. SubjectSplit.
+        let h = rx.recv().await.expect("SubjectSplit");
+        assert!(matches!(h, Happening::SubjectSplit { .. }));
+
+        // 2. RelationRewritten x2 (ToBoth fall-through).
+        for _ in 0..2 {
+            let h = rx.recv().await.expect("RelationRewritten");
+            assert!(
+                matches!(h, Happening::RelationRewritten { .. }),
+                "expected RelationRewritten, got {h:?}"
+            );
+        }
+
+        // 3. RelationSplitAmbiguous AFTER the rewrites.
+        let h = rx.recv().await.expect("RelationSplitAmbiguous");
+        match h {
+            Happening::RelationSplitAmbiguous {
+                admin_plugin,
+                predicate,
+                candidate_new_ids,
+                ..
+            } => {
+                assert_eq!(admin_plugin, "admin.plugin");
+                assert_eq!(predicate, "album_of");
+                assert_eq!(candidate_new_ids.len(), 2);
+            }
+            other => panic!(
+                "expected RelationSplitAmbiguous after rewrites, got \
+                 {other:?}"
+            ),
+        }
+
+        // 4. ClaimReassigned tail.
+        let mut relation_reassigned = 0usize;
+        let mut addressing_reassigned = 0usize;
+        while !rx.is_empty() {
+            match rx.recv().await.unwrap() {
+                Happening::ClaimReassigned { kind, .. } => match kind {
+                    ReassignedClaimKind::Relation => {
+                        relation_reassigned += 1
+                    }
+                    ReassignedClaimKind::Addressing => {
+                        addressing_reassigned += 1
+                    }
+                },
+                other => panic!(
+                    "expected ClaimReassigned tail, got {other:?}"
+                ),
+            }
+        }
+        assert_eq!(relation_reassigned, 2);
+        assert_eq!(addressing_reassigned, 2);
     }
 }
