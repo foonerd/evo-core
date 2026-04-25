@@ -241,6 +241,96 @@ pub enum AliasKind {
     Split,
 }
 
+/// One addressing currently registered to a subject, with the
+/// provenance the steward retained when the addressing was claimed.
+///
+/// Mirrors the steward's internal `AddressingRecord` shape but
+/// projected onto SDK-visible types: `claimant` is the canonical
+/// plugin name that first asserted the addressing, `added_at` is
+/// stored as milliseconds since the UNIX epoch for the same
+/// stable on-wire form rationale as [`AliasRecord::recorded_at_ms`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubjectAddressingRecord {
+    /// The addressing itself.
+    pub addressing: ExternalAddressing,
+    /// Canonical name of the plugin that first asserted this
+    /// addressing.
+    pub claimant: String,
+    /// When the claim was recorded, milliseconds since the UNIX
+    /// epoch.
+    pub added_at_ms: u64,
+}
+
+/// A snapshot of one canonical subject as visible to consumers.
+///
+/// Carries the canonical ID, the subject type, and the addressings
+/// currently registered to the subject (with their per-addressing
+/// provenance). Returned by alias-aware describe operations so
+/// callers holding only a stale canonical ID can recover the
+/// current subject when the steward resolves a chain to a single
+/// terminal.
+///
+/// Timestamps are stored as milliseconds since the UNIX epoch,
+/// matching the on-wire convention of [`AliasRecord::recorded_at_ms`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubjectRecord {
+    /// Canonical subject ID.
+    pub id: CanonicalSubjectId,
+    /// Subject type, as declared in the catalogue.
+    pub subject_type: String,
+    /// All addressings currently registered to this subject, with
+    /// per-addressing provenance.
+    pub addressings: Vec<SubjectAddressingRecord>,
+    /// When this subject was first registered, milliseconds since
+    /// the UNIX epoch.
+    pub created_at_ms: u64,
+    /// When the subject was last modified (addressing added or
+    /// removed), milliseconds since the UNIX epoch.
+    pub modified_at_ms: u64,
+}
+
+/// Result of an alias-aware subject lookup.
+///
+/// Returned by the steward's alias-aware describe operation when a
+/// consumer queries a canonical ID that may have been merged or
+/// split. The framework does NOT transparently follow aliases; the
+/// caller inspects this enum and decides how to chase the chain.
+///
+/// Per `SUBJECTS.md` section 10.4. The variant carries enough
+/// information for a consumer holding a stale canonical ID to
+/// recover the current identity, including the audit chain of
+/// merges / splits that produced it.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubjectQueryResult {
+    /// The subject exists at the queried ID.
+    Found {
+        /// The current subject record at the queried ID.
+        record: SubjectRecord,
+    },
+    /// The queried ID was merged or split into other subjects.
+    ///
+    /// `chain` is the alias chain the steward walked, oldest-first;
+    /// each entry records one merge or split that touched the
+    /// path from the queried ID toward the current subject set.
+    /// `terminal` is the current subject if the chain resolves to
+    /// one (a single merge target, or a chain of merges ending in
+    /// a live subject), or `None` when the chain forks (a split —
+    /// the caller follows individual `chain` entries to learn the
+    /// new IDs).
+    Aliased {
+        /// The alias chain, oldest-first.
+        chain: Vec<AliasRecord>,
+        /// The terminal subject if the chain resolves to one;
+        /// `None` if the chain forks.
+        terminal: Option<SubjectRecord>,
+    },
+    /// No subject ever existed at the queried ID, and no alias
+    /// either. The ID is unknown to the registry.
+    NotFound,
+}
+
 /// Strategy for distributing relations across new subject IDs
 /// when a subject is split.
 ///
@@ -503,5 +593,135 @@ mod tests {
         let back: ExplicitRelationAssignment =
             toml::from_str(&s).expect("assignment round-trips");
         assert_eq!(back, e);
+    }
+
+    fn sample_subject_record() -> SubjectRecord {
+        SubjectRecord {
+            id: CanonicalSubjectId::new("subj-1"),
+            subject_type: "track".into(),
+            addressings: vec![SubjectAddressingRecord {
+                addressing: ExternalAddressing::new(
+                    "mpd-path",
+                    "/music/a.flac",
+                ),
+                claimant: "org.evo.example.mpd".into(),
+                added_at_ms: 1_700_000_000_000,
+            }],
+            created_at_ms: 1_700_000_000_000,
+            modified_at_ms: 1_700_000_000_500,
+        }
+    }
+
+    #[test]
+    fn subject_record_roundtrips() {
+        let r = sample_subject_record();
+        let s = toml::to_string(&r).expect("subject record serialises");
+        let back: SubjectRecord =
+            toml::from_str(&s).expect("subject record round-trips");
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn subject_query_result_found_roundtrips() {
+        // Wrapper to satisfy toml's "root must be a table" rule for
+        // bare enum variants; mirrors the AliasKind / ReportPriority
+        // test pattern elsewhere in the contract module.
+        #[derive(Serialize, Deserialize)]
+        struct Wrap {
+            r: SubjectQueryResult,
+        }
+        let q = Wrap {
+            r: SubjectQueryResult::Found {
+                record: sample_subject_record(),
+            },
+        };
+        let s = toml::to_string(&q).expect("query result Found serialises");
+        assert!(
+            s.contains(r#"kind = "found""#),
+            "expected snake_case kind tag, got {s}"
+        );
+        let back: Wrap =
+            toml::from_str(&s).expect("query result Found round-trips");
+        assert_eq!(back.r, q.r);
+    }
+
+    #[test]
+    fn subject_query_result_aliased_roundtrips_with_terminal() {
+        #[derive(Serialize, Deserialize)]
+        struct Wrap {
+            r: SubjectQueryResult,
+        }
+        let q = Wrap {
+            r: SubjectQueryResult::Aliased {
+                chain: vec![AliasRecord {
+                    old_id: CanonicalSubjectId::new("aaaa-1111"),
+                    new_ids: vec![CanonicalSubjectId::new("subj-1")],
+                    kind: AliasKind::Merged,
+                    recorded_at_ms: 1_700_000_000_000,
+                    admin_plugin: "org.evo.example.admin".into(),
+                    reason: None,
+                }],
+                terminal: Some(sample_subject_record()),
+            },
+        };
+        let s = toml::to_string(&q)
+            .expect("query result Aliased serialises");
+        assert!(
+            s.contains(r#"kind = "aliased""#),
+            "expected snake_case kind tag, got {s}"
+        );
+        let back: Wrap =
+            toml::from_str(&s).expect("query result Aliased round-trips");
+        assert_eq!(back.r, q.r);
+    }
+
+    #[test]
+    fn subject_query_result_aliased_roundtrips_without_terminal() {
+        // Split case: chain forks, terminal is None.
+        #[derive(Serialize, Deserialize)]
+        struct Wrap {
+            r: SubjectQueryResult,
+        }
+        let q = Wrap {
+            r: SubjectQueryResult::Aliased {
+                chain: vec![AliasRecord {
+                    old_id: CanonicalSubjectId::new("aaaa-1111"),
+                    new_ids: vec![
+                        CanonicalSubjectId::new("bbbb-2222"),
+                        CanonicalSubjectId::new("cccc-3333"),
+                    ],
+                    kind: AliasKind::Split,
+                    recorded_at_ms: 1_700_000_000_000,
+                    admin_plugin: "org.evo.example.admin".into(),
+                    reason: Some("split for distinct artists".into()),
+                }],
+                terminal: None,
+            },
+        };
+        let s = toml::to_string(&q)
+            .expect("query result Aliased (split) serialises");
+        let back: Wrap = toml::from_str(&s)
+            .expect("query result Aliased (split) round-trips");
+        assert_eq!(back.r, q.r);
+    }
+
+    #[test]
+    fn subject_query_result_not_found_roundtrips() {
+        #[derive(Serialize, Deserialize)]
+        struct Wrap {
+            r: SubjectQueryResult,
+        }
+        let q = Wrap {
+            r: SubjectQueryResult::NotFound,
+        };
+        let s = toml::to_string(&q)
+            .expect("query result NotFound serialises");
+        assert!(
+            s.contains(r#"kind = "not_found""#),
+            "expected snake_case kind tag, got {s}"
+        );
+        let back: Wrap =
+            toml::from_str(&s).expect("query result NotFound round-trips");
+        assert_eq!(back.r, q.r);
     }
 }

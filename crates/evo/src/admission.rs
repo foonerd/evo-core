@@ -2037,6 +2037,9 @@ fn build_load_context(
             bus,
             manifest.plugin.name.clone(),
         )),
+        // Subject-querier wiring is dormant in this phase; later
+        // phases populate it with a registry-backed implementation.
+        subject_querier: None,
         subject_admin,
         relation_admin,
     }

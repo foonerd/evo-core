@@ -80,8 +80,8 @@ pub mod warden;
 pub use context::{
     CallDeadline, CustodyStateReporter, InstanceAnnouncer, LoadContext,
     RelationAdmin, RelationAnnouncer, ReportError, ReportPriority,
-    StateReporter, SubjectAdmin, SubjectAnnouncer, UserInteraction,
-    UserInteractionRequester,
+    StateReporter, SubjectAdmin, SubjectAnnouncer, SubjectQuerier,
+    UserInteraction, UserInteractionRequester,
 };
 pub use error::PluginError;
 pub use factory::{
@@ -96,6 +96,7 @@ pub use respondent::{Request, Respondent, Response};
 pub use subjects::{
     AliasKind, AliasRecord, CanonicalSubjectId, ClaimConfidence,
     ExplicitRelationAssignment, ExternalAddressing, SplitRelationStrategy,
-    SubjectAnnouncement, SubjectClaim,
+    SubjectAddressingRecord, SubjectAnnouncement, SubjectClaim,
+    SubjectQueryResult, SubjectRecord,
 };
 pub use warden::{Assignment, CourseCorrection, CustodyHandle, Warden};

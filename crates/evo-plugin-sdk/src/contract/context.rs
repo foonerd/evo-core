@@ -16,8 +16,8 @@ use crate::contract::factory::{InstanceAnnouncement, InstanceId};
 use crate::contract::plugin::HealthStatus;
 use crate::contract::relations::{RelationAssertion, RelationRetraction};
 use crate::contract::subjects::{
-    ExplicitRelationAssignment, ExternalAddressing, SplitRelationStrategy,
-    SubjectAnnouncement,
+    AliasRecord, ExplicitRelationAssignment, ExternalAddressing,
+    SplitRelationStrategy, SubjectAnnouncement, SubjectQueryResult,
 };
 use crate::contract::warden::CustodyHandle;
 use serde::{Deserialize, Serialize};
@@ -145,6 +145,20 @@ pub struct LoadContext {
     /// steward maintains the relation graph per `RELATIONS.md`.
     pub relation_announcer: Arc<dyn RelationAnnouncer>,
 
+    /// Handle for alias-aware subject lookups.
+    ///
+    /// Populated by the steward when the in-process plugin host
+    /// builds the load context. Allows plugins holding a canonical
+    /// subject ID that may have been merged or split to recover the
+    /// alias chain and current identity. The framework does NOT
+    /// transparently follow aliases on resolve; chasing an alias is
+    /// an explicit consumer step.
+    ///
+    /// Stays `None` while the steward-side wiring is dormant; later
+    /// phases populate it with a registry-backed implementation
+    /// (in-process) and a wire-transport adapter (out-of-process).
+    pub subject_querier: Option<Arc<dyn SubjectQuerier>>,
+
     /// Handle for privileged cross-plugin subject administration.
     ///
     /// Populated as `Some` only when the plugin's manifest declares
@@ -200,6 +214,14 @@ impl std::fmt::Debug for LoadContext {
             )
             .field("subject_announcer", &"<Arc<dyn SubjectAnnouncer>>")
             .field("relation_announcer", &"<Arc<dyn RelationAnnouncer>>")
+            .field(
+                "subject_querier",
+                &self
+                    .subject_querier
+                    .as_ref()
+                    .map(|_| "<Arc<dyn SubjectQuerier>>")
+                    .unwrap_or("None"),
+            )
             .field(
                 "subject_admin",
                 &self
@@ -426,6 +448,68 @@ pub trait SubjectAnnouncer: Send + Sync {
         addressing: ExternalAddressing,
         reason: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
+}
+
+/// Callback trait: alias-aware subject lookup.
+///
+/// Per `SUBJECTS.md` section 10.4. A consumer holding a canonical
+/// subject ID that may since have been merged or split queries
+/// through this trait to discover the alias chain and the current
+/// subject. The framework retains alias records indefinitely so
+/// stale references can resolve; this trait is the consumer's
+/// resolution path. The framework does NOT transparently follow
+/// aliases on resolve.
+///
+/// Two methods cover the common access patterns:
+///
+/// - [`describe_alias`](Self::describe_alias) returns the single
+///   alias record (if any) recorded against the queried ID. Useful
+///   when the caller knows the queried ID was retired and just
+///   wants the merge / split metadata.
+/// - [`describe_subject_with_aliases`](Self::describe_subject_with_aliases)
+///   returns a [`SubjectQueryResult`]: the live subject if the ID
+///   is current, the alias chain plus an optional terminal subject
+///   if the ID was retired, or `NotFound` if the ID is unknown.
+///   Useful when the caller does not yet know whether the ID is
+///   current.
+///
+/// Implementations are Arc-shared across async tasks; the trait is
+/// object-safe and uses the boxed-future return form for the same
+/// rationale as [`SubjectAnnouncer`] and [`SubjectAdmin`].
+pub trait SubjectQuerier: Send + Sync {
+    /// Look up the alias record (if any) for `subject_id`.
+    ///
+    /// Returns `Ok(Some(record))` if the queried ID was retired by a
+    /// merge or split (the record carries the new IDs and the audit
+    /// metadata); `Ok(None)` if the ID is current or unknown to the
+    /// registry. Callers that need to distinguish "current" from
+    /// "unknown" use
+    /// [`describe_subject_with_aliases`](Self::describe_subject_with_aliases).
+    fn describe_alias<'a>(
+        &'a self,
+        subject_id: String,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<AliasRecord>, ReportError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Look up the subject for `subject_id`, following alias records
+    /// as far as the chain resolves to a single terminal.
+    ///
+    /// See [`SubjectQueryResult`] for the variants and their meaning.
+    fn describe_subject_with_aliases<'a>(
+        &'a self,
+        subject_id: String,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<SubjectQueryResult, ReportError>>
+                + Send
+                + 'a,
+        >,
+    >;
 }
 
 /// Callback trait: plugin asserts and retracts relations between

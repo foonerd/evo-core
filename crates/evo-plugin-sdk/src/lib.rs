@@ -100,7 +100,8 @@ pub use contract::{
     PluginError, PluginIdentity, RelationAnnouncer, RelationAssertion,
     RelationRetraction, ReportError, ReportPriority, Request, Respondent,
     Response, RetractionPolicy, RuntimeCapabilities, StateReporter,
-    SubjectAnnouncement, SubjectAnnouncer, SubjectClaim, UserInteraction,
+    SubjectAnnouncement, SubjectAnnouncer, SubjectClaim, SubjectQuerier,
+    SubjectQueryResult, SubjectRecord, UserInteraction,
     UserInteractionRequester, Warden,
 };
 

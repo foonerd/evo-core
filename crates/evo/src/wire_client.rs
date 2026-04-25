@@ -825,6 +825,12 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::AssertRelation { .. } => "assert_relation",
         WireFrame::RetractRelation { .. } => "retract_relation",
         WireFrame::ReportCustodyState { .. } => "report_custody_state",
+        WireFrame::DescribeAlias { .. } => "describe_alias",
+        WireFrame::DescribeAliasResponse { .. } => "describe_alias_response",
+        WireFrame::DescribeSubject { .. } => "describe_subject",
+        WireFrame::DescribeSubjectResponse { .. } => {
+            "describe_subject_response"
+        }
         WireFrame::Error { .. } => "error",
     }
 }
@@ -1920,6 +1926,9 @@ target_type = "album"
                 bus,
                 plugin_name.to_string(),
             )),
+            // Subject querier is not wired in this phase; later
+            // phases populate it for the in-process steward.
+            subject_querier: None,
             // Test harness constructs non-admin LoadContexts, so
             // both admin Arcs are None. Admin-path tests live in
             // context.rs and admission.rs where capabilities.admin

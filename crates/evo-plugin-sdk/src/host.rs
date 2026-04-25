@@ -447,6 +447,12 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::AssertRelation { .. } => "assert_relation",
         WireFrame::RetractRelation { .. } => "retract_relation",
         WireFrame::ReportCustodyState { .. } => "report_custody_state",
+        WireFrame::DescribeAlias { .. } => "describe_alias",
+        WireFrame::DescribeAliasResponse { .. } => "describe_alias_response",
+        WireFrame::DescribeSubject { .. } => "describe_subject",
+        WireFrame::DescribeSubjectResponse { .. } => {
+            "describe_subject_response"
+        }
         WireFrame::Error { .. } => "error",
     }
 }
@@ -502,6 +508,11 @@ fn build_load_context(
         user_interaction_requester,
         subject_announcer,
         relation_announcer,
+        // Alias-aware subject querier is not wired through the
+        // wire transport yet; later phases populate it. Wire
+        // plugins see None for now, matching the dormant
+        // in-process discipline.
+        subject_querier: None,
         // Admin surface is not wired through the wire transport
         // (the transport-admin story is a future pass). Non-admin
         // wire plugins see None, which matches the in-process

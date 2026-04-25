@@ -57,9 +57,9 @@
 //! `HandleRequest`.
 
 use crate::contract::{
-    CustodyHandle, ExternalAddressing, HealthReport, HealthStatus,
+    AliasRecord, CustodyHandle, ExternalAddressing, HealthReport, HealthStatus,
     PluginDescription, RelationAssertion, RelationRetraction, ReportPriority,
-    SubjectAnnouncement,
+    SubjectAnnouncement, SubjectQueryResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -400,6 +400,71 @@ pub enum WireFrame {
     },
 
     // ---------------------------------------------------------------
+    // Plugin -> Steward: alias-aware subject queries (SUBJECTS.md
+    // section 10.4). The plugin holds a canonical subject ID that
+    // may have been merged or split and asks the steward to
+    // describe the alias chain or the current subject. The steward
+    // answers with the matching `*_response` frame; on failure, an
+    // `Error` frame echoing the request's `cid` is returned in
+    // place of the response. These frames are dormant in this
+    // phase: only the type definitions land. Later phases wire the
+    // plugin-side emitter and the steward-side handler.
+    // ---------------------------------------------------------------
+    /// `describe_alias` request. Asks the steward for the single
+    /// alias record (if any) recorded against `subject_id`.
+    DescribeAlias {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Canonical subject ID being queried.
+        subject_id: String,
+    },
+
+    /// `describe_alias` response. `record` is `Some` if the queried
+    /// ID was retired by a merge or split; `None` if the ID is
+    /// current or unknown to the registry.
+    DescribeAliasResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The alias record, if any.
+        record: Option<AliasRecord>,
+    },
+
+    /// `describe_subject` request. Asks the steward for the live
+    /// subject at `subject_id`, following alias records as far as
+    /// the chain resolves to a single terminal.
+    DescribeSubject {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Canonical subject ID being queried.
+        subject_id: String,
+    },
+
+    /// `describe_subject` response. Carries the alias-aware lookup
+    /// outcome.
+    DescribeSubjectResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Lookup outcome.
+        result: SubjectQueryResult,
+    },
+
+    // ---------------------------------------------------------------
     // Error frames (bidirectional). When returned in response to a
     // request, `cid` matches the request; when returned in response
     // to an event, `cid` matches the event.
@@ -447,11 +512,19 @@ impl WireFrame {
             | Self::AssertRelation { v, cid, plugin, .. }
             | Self::RetractRelation { v, cid, plugin, .. }
             | Self::ReportCustodyState { v, cid, plugin, .. }
+            | Self::DescribeAlias { v, cid, plugin, .. }
+            | Self::DescribeAliasResponse { v, cid, plugin, .. }
+            | Self::DescribeSubject { v, cid, plugin, .. }
+            | Self::DescribeSubjectResponse { v, cid, plugin, .. }
             | Self::Error { v, cid, plugin, .. } => (*v, *cid, plugin.as_str()),
         }
     }
 
     /// True if this frame is a request initiated by the steward.
+    ///
+    /// Plugin-originated request frames (e.g. the alias-aware
+    /// describe queries) are NOT counted here; they go through
+    /// [`is_plugin_request`](Self::is_plugin_request).
     pub fn is_request(&self) -> bool {
         matches!(
             self,
@@ -466,7 +539,21 @@ impl WireFrame {
         )
     }
 
-    /// True if this frame is a response to a prior request.
+    /// True if this frame is a request initiated by the plugin
+    /// (steward answers with the matching `*_response` frame).
+    ///
+    /// Distinct from [`is_request`](Self::is_request), which covers
+    /// steward-initiated requests. The two directions sit on the
+    /// same wire but follow opposite request / response polarity.
+    pub fn is_plugin_request(&self) -> bool {
+        matches!(
+            self,
+            Self::DescribeAlias { .. } | Self::DescribeSubject { .. }
+        )
+    }
+
+    /// True if this frame is a response to a prior request,
+    /// regardless of which side originated the request.
     pub fn is_response(&self) -> bool {
         matches!(
             self,
@@ -478,6 +565,8 @@ impl WireFrame {
                 | Self::TakeCustodyResponse { .. }
                 | Self::CourseCorrectResponse { .. }
                 | Self::ReleaseCustodyResponse { .. }
+                | Self::DescribeAliasResponse { .. }
+                | Self::DescribeSubjectResponse { .. }
         )
     }
 
@@ -1022,6 +1111,150 @@ mod tests {
             fatal: false,
         };
         assert!(err.is_error());
+    }
+
+    #[test]
+    fn describe_alias_round_trip() {
+        let orig = WireFrame::DescribeAlias {
+            v: PROTOCOL_VERSION,
+            cid: 500,
+            plugin: sample_plugin(),
+            subject_id: "subj-aaaa-1111".into(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"describe_alias""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_plugin_request());
+        assert!(!orig.is_request());
+    }
+
+    #[test]
+    fn describe_alias_response_round_trip_some() {
+        use crate::contract::{AliasKind, AliasRecord, CanonicalSubjectId};
+        let record = AliasRecord {
+            old_id: CanonicalSubjectId::new("subj-aaaa-1111"),
+            new_ids: vec![CanonicalSubjectId::new("subj-cccc-3333")],
+            kind: AliasKind::Merged,
+            recorded_at_ms: 1_700_000_000_000,
+            admin_plugin: "org.evo.example.admin".into(),
+            reason: Some("operator confirmed identity".into()),
+        };
+        let orig = WireFrame::DescribeAliasResponse {
+            v: PROTOCOL_VERSION,
+            cid: 500,
+            plugin: sample_plugin(),
+            record: Some(record),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"describe_alias_response""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_response());
+    }
+
+    #[test]
+    fn describe_alias_response_round_trip_none() {
+        let orig = WireFrame::DescribeAliasResponse {
+            v: PROTOCOL_VERSION,
+            cid: 501,
+            plugin: sample_plugin(),
+            record: None,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn describe_subject_round_trip() {
+        let orig = WireFrame::DescribeSubject {
+            v: PROTOCOL_VERSION,
+            cid: 600,
+            plugin: sample_plugin(),
+            subject_id: "subj-aaaa-1111".into(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"describe_subject""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_plugin_request());
+    }
+
+    #[test]
+    fn describe_subject_response_round_trip_found() {
+        use crate::contract::{
+            CanonicalSubjectId, SubjectAddressingRecord, SubjectQueryResult,
+            SubjectRecord,
+        };
+        let result = SubjectQueryResult::Found {
+            record: SubjectRecord {
+                id: CanonicalSubjectId::new("subj-1"),
+                subject_type: "track".into(),
+                addressings: vec![SubjectAddressingRecord {
+                    addressing: sample_addressing(),
+                    claimant: "org.evo.example.mpd".into(),
+                    added_at_ms: 1_700_000_000_000,
+                }],
+                created_at_ms: 1_700_000_000_000,
+                modified_at_ms: 1_700_000_000_500,
+            },
+        };
+        let orig = WireFrame::DescribeSubjectResponse {
+            v: PROTOCOL_VERSION,
+            cid: 600,
+            plugin: sample_plugin(),
+            result,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"describe_subject_response""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_response());
+    }
+
+    #[test]
+    fn describe_subject_response_round_trip_aliased_split() {
+        use crate::contract::{
+            AliasKind, AliasRecord, CanonicalSubjectId, SubjectQueryResult,
+        };
+        let result = SubjectQueryResult::Aliased {
+            chain: vec![AliasRecord {
+                old_id: CanonicalSubjectId::new("aaaa-1111"),
+                new_ids: vec![
+                    CanonicalSubjectId::new("bbbb-2222"),
+                    CanonicalSubjectId::new("cccc-3333"),
+                ],
+                kind: AliasKind::Split,
+                recorded_at_ms: 1_700_000_000_000,
+                admin_plugin: "org.evo.example.admin".into(),
+                reason: None,
+            }],
+            terminal: None,
+        };
+        let orig = WireFrame::DescribeSubjectResponse {
+            v: PROTOCOL_VERSION,
+            cid: 601,
+            plugin: sample_plugin(),
+            result,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn describe_subject_response_round_trip_not_found() {
+        use crate::contract::SubjectQueryResult;
+        let orig = WireFrame::DescribeSubjectResponse {
+            v: PROTOCOL_VERSION,
+            cid: 602,
+            plugin: sample_plugin(),
+            result: SubjectQueryResult::NotFound,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
     }
 
     #[test]
