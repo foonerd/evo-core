@@ -21,15 +21,21 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::sync::Mutex;
 
+use evo::admin::AdminLedger;
 use evo::admission::AdmissionEngine;
 use evo::catalogue::Catalogue;
 use evo::cli::Args;
 use evo::config::StewardConfig;
+use evo::custody::CustodyLedger;
+use evo::happenings::HappeningBus;
 use evo::plugin_discovery;
 use evo::plugin_trust::load_plugin_trust_arc;
 use evo::projections::ProjectionEngine;
+use evo::relations::RelationGraph;
 use evo::server::Server;
 use evo::shutdown::wait_for_signal;
+use evo::state::StewardState;
+use evo::subjects::SubjectRegistry;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -76,33 +82,49 @@ async fn main() -> anyhow::Result<()> {
         "catalogue loaded"
     );
 
+    // Build the shared steward state once: catalogue plus
+    // freshly-allocated stores. The same `Arc<StewardState>` is
+    // handed to the admission engine and the server so dispatch
+    // does not have to lock the engine to read shared stores.
+    let state = StewardState::builder()
+        .catalogue(Arc::clone(&catalogue))
+        .subjects(Arc::new(SubjectRegistry::new()))
+        .relations(Arc::new(RelationGraph::new()))
+        .custody(Arc::new(CustodyLedger::new()))
+        .bus(Arc::new(HappeningBus::new()))
+        .admin(Arc::new(AdminLedger::new()))
+        .build()?;
+
     // Construct the admission engine and run plugin discovery
     // (out-of-process singletons only; see `plugin_discovery`).
     let trust = load_plugin_trust_arc(&config)?;
-    let mut engine = AdmissionEngine::with_plugin_data_root(
+    let mut engine = AdmissionEngine::new(
+        Arc::clone(&state),
         config.plugins.plugin_data_root.clone(),
+        Some(trust),
+        config.plugins.security.clone(),
     );
-    engine.set_plugin_trust(Some(trust));
-    engine.set_plugins_security(config.plugins.security.clone());
-    plugin_discovery::discover_and_admit(&mut engine, &catalogue, &config)
-        .await?;
+    plugin_discovery::discover_and_admit(&mut engine, &config).await?;
 
-    // Construct a projection engine sharing the admission engine's
-    // subject registry and relation graph. Plugins announce into the
-    // same stores the projection engine reads from.
+    // Construct a projection engine sharing the steward's subject
+    // registry and relation graph. Plugins announce into the same
+    // stores the projection engine reads from.
     let projections = Arc::new(ProjectionEngine::new(
-        engine.registry(),
-        engine.relation_graph(),
+        Arc::clone(&state.subjects),
+        Arc::clone(&state.relations),
     ));
 
     // Wrap engine for shared access between the server and the final
     // drain.
     let engine = Arc::new(Mutex::new(engine));
 
-    // Start the server.
+    // Start the server. The server clones the state Arc directly so
+    // it can serve bus subscriptions and ledger snapshots without
+    // taking the engine mutex.
     let server = Server::new(
         socket_path.clone(),
         Arc::clone(&engine),
+        Arc::clone(&state),
         Arc::clone(&projections),
     );
 

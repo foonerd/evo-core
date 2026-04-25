@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use evo_plugin_sdk::manifest::{InstanceShape, TransportKind};
 use evo_plugin_sdk::Manifest;
@@ -20,14 +19,14 @@ use crate::error::StewardError;
 /// non-out-of-process transports are skipped with a warning.
 pub async fn discover_and_admit(
     engine: &mut AdmissionEngine,
-    catalogue: &Arc<Catalogue>,
     config: &StewardConfig,
 ) -> Result<(), StewardError> {
+    let catalogue = engine.catalogue();
     if config.plugins.search_roots.is_empty() {
         tracing::warn!(
             "plugins.search_roots is empty; skipping plugin discovery"
         );
-        log_admission_outcome(engine, catalogue);
+        log_admission_outcome(engine, &catalogue);
         return Ok(());
     }
 
@@ -103,12 +102,11 @@ pub async fn discover_and_admit(
             .admit_out_of_process_from_directory(
                 dir.as_path(),
                 &config.plugins.runtime_dir,
-                catalogue,
             )
             .await?;
     }
 
-    log_admission_outcome(engine, catalogue);
+    log_admission_outcome(engine, &catalogue);
     Ok(())
 }
 

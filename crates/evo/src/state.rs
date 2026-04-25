@@ -164,6 +164,34 @@ impl StewardStateBuilder {
     }
 }
 
+#[cfg(test)]
+impl StewardState {
+    /// Build a `StewardState` populated with default-constructed
+    /// stores and an empty catalogue, for tests that do not exercise
+    /// catalogue-grammar specifics.
+    ///
+    /// Tests that need a specific catalogue use
+    /// [`StewardState::for_tests_with_catalogue`] or the builder
+    /// directly via [`StewardState::builder`].
+    pub fn for_tests() -> Arc<Self> {
+        Self::for_tests_with_catalogue(Arc::new(Catalogue::default()))
+    }
+
+    /// Like [`StewardState::for_tests`] but with a caller-supplied
+    /// catalogue. Used by tests that exercise shelf-lookup,
+    /// subject-type, or relation-predicate validation.
+    pub fn for_tests_with_catalogue(catalogue: Arc<Catalogue>) -> Arc<Self> {
+        Arc::new(Self {
+            catalogue,
+            subjects: Arc::new(SubjectRegistry::new()),
+            relations: Arc::new(RelationGraph::new()),
+            custody: Arc::new(CustodyLedger::new()),
+            bus: Arc::new(HappeningBus::new()),
+            admin: Arc::new(AdminLedger::new()),
+        })
+    }
+}
+
 /// Errors returned by [`StewardStateBuilder::build`].
 ///
 /// One variant per required field. Each variant names the missing

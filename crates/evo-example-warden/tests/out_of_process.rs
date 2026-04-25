@@ -30,8 +30,15 @@
 //!   on every take_custody; the steward must consume those frames
 //!   cleanly for shutdown to succeed).
 
+use evo::admin::AdminLedger;
 use evo::admission::AdmissionEngine;
 use evo::catalogue::Catalogue;
+use evo::config::PluginsSecurityConfig;
+use evo::custody::CustodyLedger;
+use evo::happenings::HappeningBus;
+use evo::relations::RelationGraph;
+use evo::state::StewardState;
+use evo::subjects::SubjectRegistry;
 use evo_plugin_sdk::Manifest;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -39,6 +46,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
+
+/// Build an `AdmissionEngine` over a fresh `StewardState` carrying
+/// the supplied catalogue and default-constructed stores.
+fn engine_with_catalogue(catalogue: Arc<Catalogue>) -> AdmissionEngine {
+    let state = StewardState::builder()
+        .catalogue(catalogue)
+        .subjects(Arc::new(SubjectRegistry::new()))
+        .relations(Arc::new(RelationGraph::new()))
+        .custody(Arc::new(CustodyLedger::new()))
+        .bus(Arc::new(HappeningBus::new()))
+        .admin(Arc::new(AdminLedger::new()))
+        .build()
+        .expect("steward state must build");
+    AdmissionEngine::new(
+        state,
+        PathBuf::from("/tmp/evo-warden-out-of-process-test-data-root"),
+        None,
+        PluginsSecurityConfig::default(),
+    )
+}
 
 /// Path to the `warden-wire` binary as built by Cargo for this test
 /// run.
@@ -193,9 +220,9 @@ async fn out_of_process_warden_admission_and_custody_lifecycle() {
     let catalogue = test_catalogue();
     let manifest = test_manifest();
 
-    let mut engine = AdmissionEngine::new();
+    let mut engine = engine_with_catalogue(catalogue);
     engine
-        .admit_out_of_process_warden(manifest, &catalogue, reader, writer)
+        .admit_out_of_process_warden(manifest, reader, writer)
         .await
         .expect("admitting warden-wire");
     assert_eq!(engine.len(), 1);
@@ -270,9 +297,9 @@ async fn out_of_process_warden_handles_multiple_custodies() {
 
     let catalogue = test_catalogue();
     let manifest = test_manifest();
-    let mut engine = AdmissionEngine::new();
+    let mut engine = engine_with_catalogue(catalogue);
     engine
-        .admit_out_of_process_warden(manifest, &catalogue, reader, writer)
+        .admit_out_of_process_warden(manifest, reader, writer)
         .await
         .expect("admitting warden-wire");
 

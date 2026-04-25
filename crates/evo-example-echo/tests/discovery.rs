@@ -19,12 +19,19 @@
 //! composed end-to-end with those paths and the shipped binary's
 //! startup flow.
 
+use evo::admin::AdminLedger;
 use evo::admission::AdmissionEngine;
 use evo::catalogue::Catalogue;
+use evo::config::PluginsSecurityConfig;
 use evo::config::{PluginsSection, StewardConfig};
+use evo::custody::CustodyLedger;
+use evo::happenings::HappeningBus;
 use evo::plugin_discovery;
+use evo::relations::RelationGraph;
+use evo::state::StewardState;
+use evo::subjects::SubjectRegistry;
 use evo_plugin_sdk::contract::Request;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,9 +42,34 @@ const ECHO_WIRE_BIN: &str = env!("CARGO_BIN_EXE_echo-wire");
 /// Timeout for a single request round-trip.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Build an `AdmissionEngine` over a fresh `StewardState` carrying the
+/// supplied catalogue and a per-test `plugin_data_root`. Mirrors the
+/// boot path's construction shape; `discover_and_admit` reads the
+/// catalogue back from the engine via `engine.catalogue()`.
+fn engine_with_catalogue_and_data_root(
+    catalogue: Arc<Catalogue>,
+    plugin_data_root: PathBuf,
+) -> AdmissionEngine {
+    let state = StewardState::builder()
+        .catalogue(catalogue)
+        .subjects(Arc::new(SubjectRegistry::new()))
+        .relations(Arc::new(RelationGraph::new()))
+        .custody(Arc::new(CustodyLedger::new()))
+        .bus(Arc::new(HappeningBus::new()))
+        .admin(Arc::new(AdminLedger::new()))
+        .build()
+        .expect("steward state must build");
+    AdmissionEngine::new(
+        state,
+        plugin_data_root,
+        None,
+        PluginsSecurityConfig::default(),
+    )
+}
+
 /// Catalogue containing the `example.echo` shelf that the echo bundle
 /// targets. Wrapped in `Arc` so each test can share the handle with
-/// admission engine calls that take `&Arc<Catalogue>`.
+/// the steward state bag.
 fn test_catalogue() -> Arc<Catalogue> {
     Arc::new(
         Catalogue::from_toml(
@@ -158,10 +190,11 @@ async fn discover_and_admit_staged_layout() {
         runtime_dir.path(),
     );
 
-    let mut engine = AdmissionEngine::with_plugin_data_root(
+    let mut engine = engine_with_catalogue_and_data_root(
+        Arc::clone(&catalogue),
         plugin_data_root.path().to_path_buf(),
     );
-    plugin_discovery::discover_and_admit(&mut engine, &catalogue, &config)
+    plugin_discovery::discover_and_admit(&mut engine, &config)
         .await
         .expect("discover_and_admit (staged layout)");
     assert_eq!(engine.len(), 1, "one plugin admitted from staged bundle");
@@ -250,10 +283,11 @@ async fn discover_and_admit_flat_layout() {
         runtime_dir.path(),
     );
 
-    let mut engine = AdmissionEngine::with_plugin_data_root(
+    let mut engine = engine_with_catalogue_and_data_root(
+        Arc::clone(&catalogue),
         plugin_data_root.path().to_path_buf(),
     );
-    plugin_discovery::discover_and_admit(&mut engine, &catalogue, &config)
+    plugin_discovery::discover_and_admit(&mut engine, &config)
         .await
         .expect("discover_and_admit (flat layout)");
     assert_eq!(engine.len(), 1, "one plugin admitted from flat bundle");
@@ -311,10 +345,11 @@ async fn discover_and_admit_deduplicates_across_roots() {
         runtime_dir.path(),
     );
 
-    let mut engine = AdmissionEngine::with_plugin_data_root(
+    let mut engine = engine_with_catalogue_and_data_root(
+        Arc::clone(&catalogue),
         plugin_data_root.path().to_path_buf(),
     );
-    plugin_discovery::discover_and_admit(&mut engine, &catalogue, &config)
+    plugin_discovery::discover_and_admit(&mut engine, &config)
         .await
         .expect(
             "discover_and_admit must collapse duplicate plugin.name before \
@@ -344,10 +379,11 @@ async fn discover_and_admit_empty_search_roots_is_noop() {
     let catalogue = test_catalogue();
     let config = build_config(&[], plugin_data_root.path(), runtime_dir.path());
 
-    let mut engine = AdmissionEngine::with_plugin_data_root(
+    let mut engine = engine_with_catalogue_and_data_root(
+        Arc::clone(&catalogue),
         plugin_data_root.path().to_path_buf(),
     );
-    plugin_discovery::discover_and_admit(&mut engine, &catalogue, &config)
+    plugin_discovery::discover_and_admit(&mut engine, &config)
         .await
         .expect("empty search_roots must not error");
     assert_eq!(engine.len(), 0);
@@ -379,10 +415,11 @@ async fn discover_and_admit_missing_search_root_is_skipped() {
     );
 
     let catalogue = test_catalogue();
-    let mut engine = AdmissionEngine::with_plugin_data_root(
+    let mut engine = engine_with_catalogue_and_data_root(
+        Arc::clone(&catalogue),
         plugin_data_root.path().to_path_buf(),
     );
-    plugin_discovery::discover_and_admit(&mut engine, &catalogue, &config)
+    plugin_discovery::discover_and_admit(&mut engine, &config)
         .await
         .expect("missing search_root must be skipped, not errored");
     assert_eq!(

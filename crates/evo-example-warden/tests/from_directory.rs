@@ -39,10 +39,39 @@
 //! should use relative paths and ship the binary alongside the
 //! manifest.
 
+use evo::admin::AdminLedger;
 use evo::admission::AdmissionEngine;
 use evo::catalogue::Catalogue;
+use evo::config::PluginsSecurityConfig;
+use evo::custody::CustodyLedger;
+use evo::happenings::HappeningBus;
+use evo::relations::RelationGraph;
+use evo::state::StewardState;
+use evo::subjects::SubjectRegistry;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Build an `AdmissionEngine` over a fresh `StewardState` with the
+/// supplied catalogue and default-constructed stores. Mirrors the
+/// echo crate's helper for warden tests.
+fn engine_with_catalogue(catalogue: Arc<Catalogue>) -> AdmissionEngine {
+    let state = StewardState::builder()
+        .catalogue(catalogue)
+        .subjects(Arc::new(SubjectRegistry::new()))
+        .relations(Arc::new(RelationGraph::new()))
+        .custody(Arc::new(CustodyLedger::new()))
+        .bus(Arc::new(HappeningBus::new()))
+        .admin(Arc::new(AdminLedger::new()))
+        .build()
+        .expect("steward state must build");
+    AdmissionEngine::new(
+        state,
+        PathBuf::from("/tmp/evo-warden-from-directory-test-data-root"),
+        None,
+        PluginsSecurityConfig::default(),
+    )
+}
 
 /// Path to the `warden-wire` binary, set by Cargo for integration
 /// tests in the same crate as the binary target.
@@ -136,7 +165,7 @@ async fn admit_from_directory_warden_full_lifecycle() {
     write_manifest(plugin_dir.path());
 
     let catalogue = test_catalogue();
-    let mut engine = AdmissionEngine::new();
+    let mut engine = engine_with_catalogue(Arc::clone(&catalogue));
 
     // Hand off everything to the steward. This goes through the
     // interaction-kind dispatch branch: manifest.kind.interaction
@@ -145,7 +174,6 @@ async fn admit_from_directory_warden_full_lifecycle() {
         .admit_out_of_process_from_directory(
             plugin_dir.path(),
             runtime_dir.path(),
-            &catalogue,
         )
         .await
         .expect("admit_out_of_process_from_directory");
@@ -219,13 +247,12 @@ async fn admit_from_directory_warden_rejects_shelf_already_occupied() {
     write_manifest(plugin_dir.path());
 
     let catalogue = test_catalogue();
-    let mut engine = AdmissionEngine::new();
+    let mut engine = engine_with_catalogue(Arc::clone(&catalogue));
 
     engine
         .admit_out_of_process_from_directory(
             plugin_dir.path(),
             runtime_dir.path(),
-            &catalogue,
         )
         .await
         .expect("first admission");
@@ -239,7 +266,6 @@ async fn admit_from_directory_warden_rejects_shelf_already_occupied() {
         .admit_out_of_process_from_directory(
             plugin_dir.path(),
             runtime_dir.path(),
-            &catalogue,
         )
         .await;
 

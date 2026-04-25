@@ -155,6 +155,7 @@ use crate::projections::{
     ProjectionScope, RelatedSubject, RelationDirection, SubjectProjection,
 };
 use crate::relations::WalkDirection;
+use crate::state::StewardState;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use evo_plugin_sdk::contract::{
@@ -1332,22 +1333,27 @@ impl From<Happening> for HappeningWire {
 pub struct Server {
     socket_path: PathBuf,
     engine: Arc<Mutex<AdmissionEngine>>,
+    state: Arc<StewardState>,
     projections: Arc<ProjectionEngine>,
 }
 
 impl Server {
     /// Construct a server bound to a socket path and sharing an
-    /// admission engine and a projection engine. The socket is not
-    /// created until [`run`] is called.
+    /// admission engine, the steward's shared state bag, and a
+    /// projection engine. The socket is not created until [`run`] is
+    /// called.
     ///
-    /// The [`ProjectionEngine`] must read from the same subject
-    /// registry and relation graph as the admission engine; typically
-    /// constructed as:
+    /// `state` carries the same shared store handles the admission
+    /// engine was built over. Subscription and ledger-snapshot ops
+    /// read from `state` directly so they do not have to lock the
+    /// engine. The [`ProjectionEngine`] must read from the same
+    /// subject registry and relation graph as the admission engine;
+    /// typically constructed as:
     ///
     /// ```ignore
     /// let projections = Arc::new(ProjectionEngine::new(
-    ///     admission.registry(),
-    ///     admission.relation_graph(),
+    ///     Arc::clone(&state.subjects),
+    ///     Arc::clone(&state.relations),
     /// ));
     /// ```
     ///
@@ -1355,11 +1361,13 @@ impl Server {
     pub fn new(
         socket_path: PathBuf,
         engine: Arc<Mutex<AdmissionEngine>>,
+        state: Arc<StewardState>,
         projections: Arc<ProjectionEngine>,
     ) -> Self {
         Self {
             socket_path,
             engine,
+            state,
             projections,
         }
     }
@@ -1433,10 +1441,11 @@ impl Server {
                     match accept_result {
                         Ok((stream, _addr)) => {
                             let engine = Arc::clone(&self.engine);
+                            let state = Arc::clone(&self.state);
                             let projections = Arc::clone(&self.projections);
                             tokio::spawn(async move {
                                 if let Err(e) = handle_connection(
-                                    stream, engine, projections
+                                    stream, engine, state, projections
                                 ).await {
                                     tracing::warn!(
                                         error = %e,
@@ -1489,6 +1498,7 @@ impl Server {
 async fn handle_connection(
     mut stream: UnixStream,
     engine: Arc<Mutex<AdmissionEngine>>,
+    state: Arc<StewardState>,
     projections: Arc<ProjectionEngine>,
 ) -> Result<(), StewardError> {
     loop {
@@ -1512,18 +1522,15 @@ async fn handle_connection(
         };
 
         if matches!(req, ClientRequest::SubscribeHappenings) {
-            // Promote the connection to streaming mode. Acquire the
-            // bus Arc under a brief engine lock, then release it so
-            // the streaming loop does not hold the engine lock across
-            // await points.
-            let bus = {
-                let guard = engine.lock().await;
-                guard.happening_bus()
-            };
+            // Promote the connection to streaming mode. The bus
+            // handle is read directly from the steward state bag;
+            // no engine lock is taken here.
+            let bus = Arc::clone(&state.bus);
             return run_subscription(stream, bus).await;
         }
 
-        let response = dispatch_request(req, &engine, &projections).await;
+        let response =
+            dispatch_request(req, &engine, &state, &projections).await;
         write_response_frame(&mut stream, &response).await?;
     }
 }
@@ -1602,6 +1609,7 @@ async fn write_response_frame(
 async fn dispatch_request(
     req: ClientRequest,
     engine: &Arc<Mutex<AdmissionEngine>>,
+    state: &Arc<StewardState>,
     projections: &Arc<ProjectionEngine>,
 ) -> ClientResponse {
     match req {
@@ -1633,7 +1641,7 @@ async fn dispatch_request(
             handle_describe_alias(projections, subject_id, include_chain).await
         }
         ClientRequest::ListActiveCustodies => {
-            handle_list_active_custodies(engine).await
+            handle_list_active_custodies(state).await
         }
         ClientRequest::SubscribeHappenings => {
             // Intercepted in handle_connection; should not reach here.
@@ -1949,19 +1957,18 @@ async fn handle_describe_alias(
 
 /// Snapshot the custody ledger (`op = "list_active_custodies"`).
 ///
-/// Briefly locks the admission engine to clone the ledger Arc, then
-/// queries the ledger without holding the engine lock. The ledger
-/// has its own RwLock; contention with in-flight custody ops is
-/// limited to that.
+/// Reads the ledger handle from the shared steward state and queries
+/// it without taking any engine lock. The ledger has its own RwLock;
+/// contention with in-flight custody ops is limited to that.
 async fn handle_list_active_custodies(
-    engine: &Arc<Mutex<AdmissionEngine>>,
+    state: &Arc<StewardState>,
 ) -> ClientResponse {
-    let ledger = {
-        let guard = engine.lock().await;
-        guard.custody_ledger()
-    };
-    let active_custodies: Vec<CustodyRecordWire> =
-        ledger.list_active().into_iter().map(Into::into).collect();
+    let active_custodies: Vec<CustodyRecordWire> = state
+        .custody
+        .list_active()
+        .into_iter()
+        .map(Into::into)
+        .collect();
     ClientResponse::ActiveCustodies { active_custodies }
 }
 

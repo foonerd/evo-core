@@ -25,8 +25,15 @@
 //! * Subject or relation announcements from within the echo plugin
 //!   (the echo plugin does not announce anything during load).
 
+use evo::admin::AdminLedger;
 use evo::admission::AdmissionEngine;
 use evo::catalogue::Catalogue;
+use evo::config::PluginsSecurityConfig;
+use evo::custody::CustodyLedger;
+use evo::happenings::HappeningBus;
+use evo::relations::RelationGraph;
+use evo::state::StewardState;
+use evo::subjects::SubjectRegistry;
 use evo_plugin_sdk::contract::Request;
 use evo_plugin_sdk::Manifest;
 use std::path::{Path, PathBuf};
@@ -35,6 +42,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
+
+/// Build an `AdmissionEngine` over a fresh `StewardState` carrying
+/// the supplied catalogue and default-constructed stores.
+fn engine_with_catalogue(catalogue: Arc<Catalogue>) -> AdmissionEngine {
+    let state = StewardState::builder()
+        .catalogue(catalogue)
+        .subjects(Arc::new(SubjectRegistry::new()))
+        .relations(Arc::new(RelationGraph::new()))
+        .custody(Arc::new(CustodyLedger::new()))
+        .bus(Arc::new(HappeningBus::new()))
+        .admin(Arc::new(AdminLedger::new()))
+        .build()
+        .expect("steward state must build");
+    AdmissionEngine::new(
+        state,
+        PathBuf::from("/tmp/evo-echo-out-of-process-test-data-root"),
+        None,
+        PluginsSecurityConfig::default(),
+    )
+}
 
 /// Path to the `echo-wire` binary as built by Cargo for this test run.
 ///
@@ -201,9 +228,9 @@ async fn out_of_process_echo_admission_and_request() {
     let catalogue = test_catalogue();
     let manifest = test_manifest();
 
-    let mut engine = AdmissionEngine::new();
+    let mut engine = engine_with_catalogue(catalogue);
     engine
-        .admit_out_of_process_respondent(manifest, &catalogue, reader, writer)
+        .admit_out_of_process_respondent(manifest, reader, writer)
         .await
         .expect("admitting echo-wire");
     assert_eq!(engine.len(), 1);
@@ -252,9 +279,9 @@ async fn out_of_process_echo_handles_multiple_requests() {
 
     let catalogue = test_catalogue();
     let manifest = test_manifest();
-    let mut engine = AdmissionEngine::new();
+    let mut engine = engine_with_catalogue(catalogue);
     engine
-        .admit_out_of_process_respondent(manifest, &catalogue, reader, writer)
+        .admit_out_of_process_respondent(manifest, reader, writer)
         .await
         .expect("admitting echo-wire");
 

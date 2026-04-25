@@ -1,5 +1,6 @@
-//! Load trust keys, revocations, and options from [`StewardConfig`] for
-//! [`crate::admission::AdmissionEngine::set_plugin_trust`].
+//! Load trust keys, revocations, and options from [`StewardConfig`]
+//! for the `plugin_trust` argument of
+//! [`crate::admission::AdmissionEngine::new`].
 
 use std::sync::Arc;
 
@@ -41,8 +42,9 @@ impl PluginTrustState {
     }
 }
 
-/// Loads trust with [`PluginTrustState::load`], for use as
-/// `Some(Arc::new(...))` in [`crate::admission::AdmissionEngine::set_plugin_trust`].
+/// Loads trust with [`PluginTrustState::load`], for use as the
+/// `plugin_trust` argument to
+/// [`crate::admission::AdmissionEngine::new`].
 pub fn load_plugin_trust_arc(
     config: &StewardConfig,
 ) -> Result<Arc<PluginTrustState>, StewardError> {

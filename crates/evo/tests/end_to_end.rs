@@ -14,11 +14,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
+use evo::admin::AdminLedger;
 use evo::admission::AdmissionEngine;
 use evo::catalogue::Catalogue;
+use evo::config::PluginsSecurityConfig;
+use evo::custody::CustodyLedger;
 use evo::happenings::{Happening, HappeningBus};
 use evo::projections::ProjectionEngine;
+use evo::relations::RelationGraph;
 use evo::server::Server;
+use evo::state::StewardState;
+use evo::subjects::SubjectRegistry;
 use evo_plugin_sdk::contract::{
     CustodyHandle, ExternalAddressing, HealthStatus, SubjectAnnouncement,
 };
@@ -47,28 +53,45 @@ async fn build_harness(
     let tmp_parent = socket_path.parent().unwrap().to_path_buf();
     let catalogue_path = tmp_parent.join("catalogue.toml");
     std::fs::write(&catalogue_path, catalogue_toml).expect("write catalogue");
-    // Wrap in Arc: admit_* entry points take `&Arc<Catalogue>` so
-    // the steward can share one catalogue handle across every
-    // admitted plugin's RegistryRelationAnnouncer without cloning
-    // the catalogue body.
+    // Wrap in Arc: the catalogue is held by the steward state bag and
+    // by every admitted plugin's RegistryRelationAnnouncer.
     let catalogue =
         Arc::new(Catalogue::load(&catalogue_path).expect("catalogue"));
 
-    let mut engine = AdmissionEngine::new();
+    let state = StewardState::builder()
+        .catalogue(catalogue)
+        .subjects(Arc::new(SubjectRegistry::new()))
+        .relations(Arc::new(RelationGraph::new()))
+        .custody(Arc::new(CustodyLedger::new()))
+        .bus(Arc::new(HappeningBus::new()))
+        .admin(Arc::new(AdminLedger::new()))
+        .build()
+        .expect("steward state must build");
+
+    let mut engine = AdmissionEngine::new(
+        Arc::clone(&state),
+        std::path::PathBuf::from("/tmp/evo-end-to-end-tests-data-root"),
+        None,
+        PluginsSecurityConfig::default(),
+    );
     let echo_plugin = evo_example_echo::EchoPlugin::new();
     let echo_manifest = evo_example_echo::manifest();
     engine
-        .admit_singleton_respondent(echo_plugin, echo_manifest, &catalogue)
+        .admit_singleton_respondent(echo_plugin, echo_manifest)
         .await
         .expect("admit echo plugin");
 
     let projections = Arc::new(ProjectionEngine::new(
-        engine.registry(),
-        engine.relation_graph(),
+        Arc::clone(&state.subjects),
+        Arc::clone(&state.relations),
     ));
     let engine = Arc::new(Mutex::new(engine));
-    let server =
-        Server::new(socket_path, Arc::clone(&engine), Arc::clone(&projections));
+    let server = Server::new(
+        socket_path,
+        Arc::clone(&engine),
+        Arc::clone(&state),
+        Arc::clone(&projections),
+    );
 
     (engine, projections, server)
 }

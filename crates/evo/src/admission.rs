@@ -37,6 +37,7 @@ use crate::error::StewardError;
 use crate::happenings::{Happening, HappeningBus};
 use crate::plugin_trust::PluginTrustState;
 use crate::relations::RelationGraph;
+use crate::state::StewardState;
 use crate::subjects::SubjectRegistry;
 use evo_plugin_sdk::contract::{
     Assignment, CourseCorrection, CustodyHandle, HealthReport, LoadContext,
@@ -374,37 +375,22 @@ impl std::fmt::Debug for AdmittedPlugin {
 /// Holds admitted plugins keyed by fully-qualified shelf name. v0 permits
 /// one plugin per shelf; additional admissions on the same shelf fail.
 ///
-/// Owns the shared subject registry and relation graph used by admitted
-/// plugins. Plugins receive `SubjectAnnouncer` and `RelationAnnouncer`
-/// handles in their `LoadContext` that write to these stores tagged
-/// with the plugin's name.
+/// Acquires every shared store handle (subject registry, relation graph,
+/// custody ledger, happenings bus, admin audit ledger) plus the
+/// catalogue from a single [`Arc<StewardState>`](StewardState) supplied
+/// at construction. Plugins receive `SubjectAnnouncer` and
+/// `RelationAnnouncer` handles in their `LoadContext` that write to
+/// those stores tagged with the plugin's name.
 pub struct AdmissionEngine {
     /// Map of shelf name -> admitted plugin.
     by_shelf: HashMap<String, AdmittedPlugin>,
     /// Admission order, for reverse-order shutdown.
     admission_order: Vec<String>,
-    /// Subject registry shared with all admitted plugins.
-    registry: Arc<SubjectRegistry>,
-    /// Relation graph shared with all admitted plugins.
-    relation_graph: Arc<RelationGraph>,
-    /// Custody ledger shared with the wire-warden adapter. Tracks
-    /// every custody handed out by [`Self::take_custody`] and every
-    /// state report emitted by the holding warden.
-    custody_ledger: Arc<CustodyLedger>,
-    /// Happenings bus. Receives [`Happening::CustodyTaken`] and
-    /// [`Happening::CustodyReleased`] from this engine's custody
-    /// verbs; receives [`Happening::CustodyStateReported`] from a
-    /// future pass that routes the ledger-backed custody state
-    /// reporter through the bus.
-    happening_bus: Arc<HappeningBus>,
-    /// Admin audit ledger. Records every
-    /// privileged administration action an admitted admin plugin
-    /// performs via the [`SubjectAdmin`](evo_plugin_sdk::contract::SubjectAdmin)
-    /// or [`RelationAdmin`](evo_plugin_sdk::contract::RelationAdmin)
-    /// callbacks. Shared with each admitted admin plugin's
-    /// [`RegistrySubjectAdmin`] / [`RegistryRelationAdmin`] via
-    /// [`build_load_context`].
-    admin_ledger: Arc<AdminLedger>,
+    /// Shared steward stores plus the catalogue. Built once at boot
+    /// and shared with the server, projection engine, and any future
+    /// admin paths so dispatch does not serialise on the engine
+    /// mutex for store reads.
+    state: Arc<StewardState>,
     /// Monotonic counter for correlation IDs on warden custody verbs
     /// (`take_custody`, `course_correct`). Each call allocates a fresh
     /// ID. Engine-local, not persistent across restarts.
@@ -421,28 +407,6 @@ pub struct AdmissionEngine {
     plugins_security: PluginsSecurityConfig,
 }
 
-fn default_plugin_data_root() -> PathBuf {
-    PathBuf::from(crate::config::DEFAULT_PLUGIN_DATA_ROOT)
-}
-
-impl Default for AdmissionEngine {
-    fn default() -> Self {
-        Self {
-            by_shelf: HashMap::new(),
-            admission_order: Vec::new(),
-            registry: Arc::new(SubjectRegistry::new()),
-            relation_graph: Arc::new(RelationGraph::new()),
-            custody_ledger: Arc::new(CustodyLedger::new()),
-            happening_bus: Arc::new(HappeningBus::new()),
-            admin_ledger: Arc::new(AdminLedger::new()),
-            custody_cid_counter: Arc::new(AtomicU64::new(1)),
-            plugin_data_root: default_plugin_data_root(),
-            plugin_trust: None,
-            plugins_security: PluginsSecurityConfig::default(),
-        }
-    }
-}
-
 impl std::fmt::Debug for AdmissionEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdmissionEngine")
@@ -453,48 +417,44 @@ impl std::fmt::Debug for AdmissionEngine {
 }
 
 impl AdmissionEngine {
-    /// Construct an empty admission engine with a fresh subject registry.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Like [`Self::new`], with a custom per-plugin data root (state and
-    /// credentials directories). The shipped binary takes this from
-    /// `StewardConfig`.
-    pub fn with_plugin_data_root(data_root: PathBuf) -> Self {
+    /// Construct an admission engine over a shared
+    /// [`StewardState`](StewardState).
+    ///
+    /// `state` is the bag of shared store handles plus the catalogue
+    /// the steward administers; the engine clones the `Arc` and
+    /// reaches into it for every store-touching path. `plugin_data_root`
+    /// is the root under which per-plugin `state/` and `credentials/`
+    /// paths are built (`/var/lib/evo/plugins/<name>/...` in
+    /// production; a tempdir in tests). `plugin_trust` is optional
+    /// signature and revocation state for on-disk out-of-process
+    /// admission; passing `None` skips signature checks (test
+    /// harnesses). `plugins_security` carries optional per-trust-class
+    /// Unix UID/GID for out-of-process spawns; the default is the
+    /// no-op (every plugin process runs as the steward user).
+    pub fn new(
+        state: Arc<StewardState>,
+        plugin_data_root: PathBuf,
+        plugin_trust: Option<Arc<PluginTrustState>>,
+        plugins_security: PluginsSecurityConfig,
+    ) -> Self {
         Self {
-            plugin_data_root: data_root,
-            ..Self::default()
+            by_shelf: HashMap::new(),
+            admission_order: Vec::new(),
+            state,
+            custody_cid_counter: Arc::new(AtomicU64::new(1)),
+            plugin_data_root,
+            plugin_trust,
+            plugins_security,
         }
     }
 
-    /// Builder-style setter for the plugin data root on an existing
-    /// engine. Chainable with any of the `with_registry*` constructors
-    /// when the caller wants to share preexisting registries, graphs,
-    /// ledgers, or buses *and* customise the per-plugin data root
-    /// (typically a tempdir in integration tests).
+    /// Borrow the shared [`StewardState`](StewardState) handle this
+    /// engine was constructed over.
     ///
-    /// [`Self::with_plugin_data_root`] is the normal path for
-    /// production callers that only need the data root customised. Use
-    /// this method when composing shared-store constructors with a
-    /// non-default data root so the load path does not silently bind
-    /// to the production `/var/lib/evo/plugins` location.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use std::sync::Arc;
-    /// use evo::admission::AdmissionEngine;
-    /// use evo::subjects::SubjectRegistry;
-    ///
-    /// let shared = Arc::new(SubjectRegistry::new());
-    /// let tmp = tempfile::tempdir().unwrap();
-    /// let engine = AdmissionEngine::with_registry(shared)
-    ///     .with_data_root(tmp.path().to_path_buf());
-    /// ```
-    pub fn with_data_root(mut self, data_root: PathBuf) -> Self {
-        self.plugin_data_root = data_root;
-        self
+    /// Used by tests and by the server / projection layer to reach the
+    /// individual stores without going through engine accessors.
+    pub fn state(&self) -> &Arc<StewardState> {
+        &self.state
     }
 
     /// Root under which per-plugin `state/` and `credentials/` paths are
@@ -503,149 +463,37 @@ impl AdmissionEngine {
         &self.plugin_data_root
     }
 
-    /// Set plugin signature / revocation state for on-disk
-    /// out-of-process admission. The shipped binary loads this from
-    /// [`StewardConfig`] and [`crate::plugin_trust::PluginTrustState::load`].
-    /// `None` skips `manifest.sig` checks (e.g. integration test harnesses).
-    pub fn set_plugin_trust(&mut self, trust: Option<Arc<PluginTrustState>>) {
-        self.plugin_trust = trust;
-    }
-
-    /// Set optional per-trust-class OS identity for out-of-process plugin
-    /// spawns. The shipped `evo` binary passes
-    /// [`StewardConfig::plugins`](crate::config::StewardConfig) `.security`
-    /// here. `Default` is the no-op: every plugin process runs as the
-    /// steward user.
-    pub fn set_plugins_security(&mut self, security: PluginsSecurityConfig) {
-        self.plugins_security = security;
-    }
-
-    /// Construct an admission engine sharing an existing subject
-    /// registry. Useful for tests that want to pre-populate or inspect
-    /// the registry from outside. A fresh relation graph is created.
-    pub fn with_registry(registry: Arc<SubjectRegistry>) -> Self {
-        Self {
-            by_shelf: HashMap::new(),
-            admission_order: Vec::new(),
-            registry,
-            relation_graph: Arc::new(RelationGraph::new()),
-            custody_ledger: Arc::new(CustodyLedger::new()),
-            happening_bus: Arc::new(HappeningBus::new()),
-            admin_ledger: Arc::new(AdminLedger::new()),
-            custody_cid_counter: Arc::new(AtomicU64::new(1)),
-            plugin_data_root: default_plugin_data_root(),
-            plugin_trust: None,
-            plugins_security: PluginsSecurityConfig::default(),
-        }
-    }
-
-    /// Construct an admission engine sharing existing subject registry
-    /// and relation graph handles. Useful for tests that exercise both
-    /// stores together, or for future dependency injection when the
-    /// steward carries persisted state across restarts.
-    pub fn with_registry_and_graph(
-        registry: Arc<SubjectRegistry>,
-        relation_graph: Arc<RelationGraph>,
-    ) -> Self {
-        Self {
-            by_shelf: HashMap::new(),
-            admission_order: Vec::new(),
-            registry,
-            relation_graph,
-            custody_ledger: Arc::new(CustodyLedger::new()),
-            happening_bus: Arc::new(HappeningBus::new()),
-            admin_ledger: Arc::new(AdminLedger::new()),
-            custody_cid_counter: Arc::new(AtomicU64::new(1)),
-            plugin_data_root: default_plugin_data_root(),
-            plugin_trust: None,
-            plugins_security: PluginsSecurityConfig::default(),
-        }
-    }
-
-    /// Construct an admission engine sharing existing subject
-    /// registry, relation graph, and custody ledger handles.
-    ///
-    /// Parallel to [`Self::with_registry_and_graph`] for the case
-    /// where the caller also wants to share a preexisting ledger.
-    /// Useful for tests that assert on both engine dispatch and
-    /// ledger state from outside the engine, and for future
-    /// dependency injection when the steward carries persisted
-    /// ledger state across restarts.
-    pub fn with_registry_graph_and_ledger(
-        registry: Arc<SubjectRegistry>,
-        relation_graph: Arc<RelationGraph>,
-        custody_ledger: Arc<CustodyLedger>,
-    ) -> Self {
-        Self {
-            by_shelf: HashMap::new(),
-            admission_order: Vec::new(),
-            registry,
-            relation_graph,
-            custody_ledger,
-            happening_bus: Arc::new(HappeningBus::new()),
-            admin_ledger: Arc::new(AdminLedger::new()),
-            custody_cid_counter: Arc::new(AtomicU64::new(1)),
-            plugin_data_root: default_plugin_data_root(),
-            plugin_trust: None,
-            plugins_security: PluginsSecurityConfig::default(),
-        }
-    }
-
-    /// Construct an admission engine sharing existing subject
-    /// registry, relation graph, custody ledger, and happenings bus
-    /// handles.
-    ///
-    /// Parallel to [`Self::with_registry_graph_and_ledger`] for the
-    /// case where the caller also wants to share a preexisting bus.
-    /// Tests that assert on happenings emitted from the engine's
-    /// custody verbs use this constructor so the bus is reachable
-    /// both from the engine and from a subscriber held by the test.
-    pub fn with_registry_graph_ledger_and_bus(
-        registry: Arc<SubjectRegistry>,
-        relation_graph: Arc<RelationGraph>,
-        custody_ledger: Arc<CustodyLedger>,
-        happening_bus: Arc<HappeningBus>,
-    ) -> Self {
-        Self {
-            by_shelf: HashMap::new(),
-            admission_order: Vec::new(),
-            registry,
-            relation_graph,
-            custody_ledger,
-            happening_bus,
-            admin_ledger: Arc::new(AdminLedger::new()),
-            custody_cid_counter: Arc::new(AtomicU64::new(1)),
-            plugin_data_root: default_plugin_data_root(),
-            plugin_trust: None,
-            plugins_security: PluginsSecurityConfig::default(),
-        }
-    }
-
     /// Borrow a handle to the subject registry used by this engine.
     pub fn registry(&self) -> Arc<SubjectRegistry> {
-        Arc::clone(&self.registry)
+        Arc::clone(&self.state.subjects)
     }
 
     /// Borrow a handle to the relation graph used by this engine.
     pub fn relation_graph(&self) -> Arc<RelationGraph> {
-        Arc::clone(&self.relation_graph)
+        Arc::clone(&self.state.relations)
     }
 
     /// Borrow a handle to the custody ledger used by this engine.
     pub fn custody_ledger(&self) -> Arc<CustodyLedger> {
-        Arc::clone(&self.custody_ledger)
+        Arc::clone(&self.state.custody)
     }
 
     /// Borrow a handle to the happenings bus used by this engine.
     pub fn happening_bus(&self) -> Arc<HappeningBus> {
-        Arc::clone(&self.happening_bus)
+        Arc::clone(&self.state.bus)
     }
 
     /// Borrow a handle to the admin audit ledger used by this
     /// engine. Tests and the future admin-audit client op use
     /// this to read the recorded entries.
     pub fn admin_ledger(&self) -> Arc<AdminLedger> {
-        Arc::clone(&self.admin_ledger)
+        Arc::clone(&self.state.admin)
+    }
+
+    /// Borrow a handle to the catalogue this engine validates
+    /// admissions against.
+    pub fn catalogue(&self) -> Arc<Catalogue> {
+        Arc::clone(&self.state.catalogue)
     }
 
     /// Number of currently admitted plugins.
@@ -676,7 +524,6 @@ impl AdmissionEngine {
         &mut self,
         plugin: T,
         manifest: Manifest,
-        catalogue: &Arc<Catalogue>,
     ) -> Result<(), StewardError>
     where
         T: Respondent + 'static,
@@ -686,8 +533,11 @@ impl AdmissionEngine {
         check_admin_trust(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
-        let shelf =
-            catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
+        let shelf = self
+            .state
+            .catalogue
+            .find_shelf(&shelf_qualified)
+            .ok_or_else(|| {
                 StewardError::Admission(format!(
                     "{}: target shelf not in catalogue: {}",
                     manifest.plugin.name, shelf_qualified
@@ -750,11 +600,11 @@ impl AdmissionEngine {
         let ctx = build_load_context(
             &self.plugin_data_root,
             &manifest,
-            Arc::clone(&self.registry),
-            Arc::clone(&self.relation_graph),
-            Arc::clone(catalogue),
-            Arc::clone(&self.happening_bus),
-            Arc::clone(&self.admin_ledger),
+            Arc::clone(&self.state.subjects),
+            Arc::clone(&self.state.relations),
+            Arc::clone(&self.state.catalogue),
+            Arc::clone(&self.state.bus),
+            Arc::clone(&self.state.admin),
         );
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -798,7 +648,6 @@ impl AdmissionEngine {
         &mut self,
         plugin: T,
         manifest: Manifest,
-        catalogue: &Arc<Catalogue>,
     ) -> Result<(), StewardError>
     where
         T: Warden + 'static,
@@ -808,8 +657,11 @@ impl AdmissionEngine {
         check_admin_trust(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
-        let shelf =
-            catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
+        let shelf = self
+            .state
+            .catalogue
+            .find_shelf(&shelf_qualified)
+            .ok_or_else(|| {
                 StewardError::Admission(format!(
                     "{}: target shelf not in catalogue: {}",
                     manifest.plugin.name, shelf_qualified
@@ -871,11 +723,11 @@ impl AdmissionEngine {
         let ctx = build_load_context(
             &self.plugin_data_root,
             &manifest,
-            Arc::clone(&self.registry),
-            Arc::clone(&self.relation_graph),
-            Arc::clone(catalogue),
-            Arc::clone(&self.happening_bus),
-            Arc::clone(&self.admin_ledger),
+            Arc::clone(&self.state.subjects),
+            Arc::clone(&self.state.relations),
+            Arc::clone(&self.state.catalogue),
+            Arc::clone(&self.state.bus),
+            Arc::clone(&self.state.admin),
         );
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -931,7 +783,6 @@ impl AdmissionEngine {
     pub async fn admit_out_of_process_respondent<R, W>(
         &mut self,
         manifest: Manifest,
-        catalogue: &Arc<Catalogue>,
         reader: R,
         writer: W,
     ) -> Result<(), StewardError>
@@ -944,8 +795,11 @@ impl AdmissionEngine {
         check_admin_trust(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
-        let shelf =
-            catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
+        let shelf = self
+            .state
+            .catalogue
+            .find_shelf(&shelf_qualified)
+            .ok_or_else(|| {
                 StewardError::Admission(format!(
                     "{}: target shelf not in catalogue: {}",
                     manifest.plugin.name, shelf_qualified
@@ -1022,11 +876,11 @@ impl AdmissionEngine {
         let ctx = build_load_context(
             &self.plugin_data_root,
             &manifest,
-            Arc::clone(&self.registry),
-            Arc::clone(&self.relation_graph),
-            Arc::clone(catalogue),
-            Arc::clone(&self.happening_bus),
-            Arc::clone(&self.admin_ledger),
+            Arc::clone(&self.state.subjects),
+            Arc::clone(&self.state.relations),
+            Arc::clone(&self.state.catalogue),
+            Arc::clone(&self.state.bus),
+            Arc::clone(&self.state.admin),
         );
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -1072,7 +926,6 @@ impl AdmissionEngine {
     pub async fn admit_out_of_process_warden<R, W>(
         &mut self,
         manifest: Manifest,
-        catalogue: &Arc<Catalogue>,
         reader: R,
         writer: W,
     ) -> Result<(), StewardError>
@@ -1085,8 +938,11 @@ impl AdmissionEngine {
         check_admin_trust(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
-        let shelf =
-            catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
+        let shelf = self
+            .state
+            .catalogue
+            .find_shelf(&shelf_qualified)
+            .ok_or_else(|| {
                 StewardError::Admission(format!(
                     "{}: target shelf not in catalogue: {}",
                     manifest.plugin.name, shelf_qualified
@@ -1126,8 +982,8 @@ impl AdmissionEngine {
             reader,
             writer,
             manifest.plugin.name.clone(),
-            Arc::clone(&self.custody_ledger),
-            Arc::clone(&self.happening_bus),
+            Arc::clone(&self.state.custody),
+            Arc::clone(&self.state.bus),
         )
         .await
         .map_err(|e| {
@@ -1166,11 +1022,11 @@ impl AdmissionEngine {
         let ctx = build_load_context(
             &self.plugin_data_root,
             &manifest,
-            Arc::clone(&self.registry),
-            Arc::clone(&self.relation_graph),
-            Arc::clone(catalogue),
-            Arc::clone(&self.happening_bus),
-            Arc::clone(&self.admin_ledger),
+            Arc::clone(&self.state.subjects),
+            Arc::clone(&self.state.relations),
+            Arc::clone(&self.state.catalogue),
+            Arc::clone(&self.state.bus),
+            Arc::clone(&self.state.admin),
         );
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -1217,7 +1073,8 @@ impl AdmissionEngine {
     /// 5. Spawns the plugin binary with that socket path as argv[1].
     ///    The child is spawned with `kill_on_drop(true)` so it cannot
     ///    outlive this engine even if shutdown is never called. On Unix,
-    ///    if [`Self::set_plugins_security`] was used and
+    ///    if the engine was constructed with a non-default
+    ///    [`PluginsSecurityConfig`] and
     ///    [`PluginsSecurityConfig::uid_gid_for_class`](crate::config::PluginsSecurityConfig::uid_gid_for_class)
     ///    returns an identity for the effective trust class, the child
     ///    is launched under that `setuid` / `setgid` identity; otherwise
@@ -1245,7 +1102,6 @@ impl AdmissionEngine {
         &mut self,
         plugin_dir: &Path,
         runtime_dir: &Path,
-        catalogue: &Arc<Catalogue>,
     ) -> Result<(), StewardError> {
         // Read and validate the manifest from disk.
         let manifest_path = plugin_dir.join("manifest.toml");
@@ -1392,7 +1248,6 @@ impl AdmissionEngine {
             InteractionShape::Respondent => {
                 self.admit_out_of_process_respondent(
                     manifest.clone(),
-                    catalogue,
                     reader,
                     writer,
                 )
@@ -1401,7 +1256,6 @@ impl AdmissionEngine {
             InteractionShape::Warden => {
                 self.admit_out_of_process_warden(
                     manifest.clone(),
-                    catalogue,
                     reader,
                     writer,
                 )
@@ -1502,11 +1356,10 @@ impl AdmissionEngine {
     ) -> Result<CustodyHandle, StewardError> {
         // Clone the ledger and bus Arcs up front for use after the
         // warden call. After this point we hold a mutable borrow of
-        // self.by_shelf through `plugin`, so accessing
-        // self.custody_ledger or self.happening_bus directly would
-        // conflict.
-        let ledger = Arc::clone(&self.custody_ledger);
-        let bus = Arc::clone(&self.happening_bus);
+        // self.by_shelf through `plugin`, so accessing self.state
+        // directly would conflict.
+        let ledger = Arc::clone(&self.state.custody);
+        let bus = Arc::clone(&self.state.bus);
 
         let plugin = self.by_shelf.get_mut(shelf).ok_or_else(|| {
             StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
@@ -1641,8 +1494,8 @@ impl AdmissionEngine {
     ) -> Result<(), StewardError> {
         // Clone the ledger and bus Arcs up front for the same
         // reason as take_custody.
-        let ledger = Arc::clone(&self.custody_ledger);
-        let bus = Arc::clone(&self.happening_bus);
+        let ledger = Arc::clone(&self.state.custody);
+        let bus = Arc::clone(&self.state.bus);
 
         let plugin = self.by_shelf.get_mut(shelf).ok_or_else(|| {
             StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
@@ -2161,6 +2014,58 @@ target_type = "album"
         )
     }
 
+    /// Construct an `AdmissionEngine` over a fresh `StewardState`
+    /// populated with the supplied catalogue and default-constructed
+    /// stores. The default plugin data root and security policy
+    /// match the engine's old `new()` defaults so existing test
+    /// behaviour is preserved.
+    fn test_engine_from_catalogue(
+        catalogue: Arc<Catalogue>,
+    ) -> AdmissionEngine {
+        let state = StewardState::for_tests_with_catalogue(catalogue);
+        AdmissionEngine::new(
+            state,
+            PathBuf::from(crate::config::DEFAULT_PLUGIN_DATA_ROOT),
+            None,
+            PluginsSecurityConfig::default(),
+        )
+    }
+
+    /// Construct an `AdmissionEngine` over the standard test
+    /// catalogue (`test_catalogue`) and a fresh state bag. The
+    /// catalogue is the most common pre-condition for engine tests
+    /// in this module.
+    fn test_engine() -> AdmissionEngine {
+        test_engine_from_catalogue(test_catalogue())
+    }
+
+    /// Construct an `AdmissionEngine` over the supplied
+    /// `StewardState`. Used by tests that need to assert on shared
+    /// store handles outside the engine.
+    fn engine_with_state(state: Arc<StewardState>) -> AdmissionEngine {
+        AdmissionEngine::new(
+            state,
+            PathBuf::from(crate::config::DEFAULT_PLUGIN_DATA_ROOT),
+            None,
+            PluginsSecurityConfig::default(),
+        )
+    }
+
+    /// Construct an `AdmissionEngine` over the supplied catalogue and
+    /// caller-provided plugin trust state. Used by trust-gating tests.
+    fn test_engine_with_trust(
+        catalogue: Arc<Catalogue>,
+        trust: Arc<crate::plugin_trust::PluginTrustState>,
+    ) -> AdmissionEngine {
+        let state = StewardState::for_tests_with_catalogue(catalogue);
+        AdmissionEngine::new(
+            state,
+            PathBuf::from(crate::config::DEFAULT_PLUGIN_DATA_ROOT),
+            Some(trust),
+            PluginsSecurityConfig::default(),
+        )
+    }
+
     fn test_manifest(name: &str) -> Manifest {
         let toml = format!(
             r#"
@@ -2206,14 +2111,14 @@ response_budget_ms = 1000
     #[tokio::test]
     async fn admits_valid_plugin() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
         };
         let manifest = test_manifest("org.test.ping");
         engine
-            .admit_singleton_respondent(plugin, manifest, &catalogue)
+            .admit_singleton_respondent(plugin, manifest)
             .await
             .unwrap();
         assert_eq!(engine.len(), 1);
@@ -2222,7 +2127,7 @@ response_budget_ms = 1000
     #[tokio::test]
     async fn rejects_plugin_with_identity_mismatch() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             // describe() will return this name
             name: "org.test.actual".into(),
@@ -2230,9 +2135,7 @@ response_budget_ms = 1000
         };
         // But manifest says a different name
         let manifest = test_manifest("org.test.claimed");
-        let r = engine
-            .admit_singleton_respondent(plugin, manifest, &catalogue)
-            .await;
+        let r = engine.admit_singleton_respondent(plugin, manifest).await;
         assert!(matches!(r, Err(StewardError::Admission(_))));
         assert_eq!(engine.len(), 0);
     }
@@ -2240,7 +2143,7 @@ response_budget_ms = 1000
     #[tokio::test]
     async fn rejects_plugin_targeting_missing_shelf() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
@@ -2283,27 +2186,21 @@ request_types = ["ping"]
 response_budget_ms = 1000
 "#;
         let manifest = Manifest::from_toml(toml).unwrap();
-        let r = engine
-            .admit_singleton_respondent(plugin, manifest, &catalogue)
-            .await;
+        let r = engine.admit_singleton_respondent(plugin, manifest).await;
         assert!(matches!(r, Err(StewardError::Admission(_))));
     }
 
     #[tokio::test]
     async fn rejects_duplicate_shelf_admission() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
 
         let p1 = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
         };
         engine
-            .admit_singleton_respondent(
-                p1,
-                test_manifest("org.test.ping"),
-                &catalogue,
-            )
+            .admit_singleton_respondent(p1, test_manifest("org.test.ping"))
             .await
             .unwrap();
 
@@ -2312,11 +2209,7 @@ response_budget_ms = 1000
             ..Default::default()
         };
         let r = engine
-            .admit_singleton_respondent(
-                p2,
-                test_manifest("org.test.ping"),
-                &catalogue,
-            )
+            .admit_singleton_respondent(p2, test_manifest("org.test.ping"))
             .await;
         assert!(matches!(r, Err(StewardError::Admission(_))));
         assert_eq!(engine.len(), 1);
@@ -2325,17 +2218,13 @@ response_budget_ms = 1000
     #[tokio::test]
     async fn handle_request_dispatches() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
         };
         engine
-            .admit_singleton_respondent(
-                plugin,
-                test_manifest("org.test.ping"),
-                &catalogue,
-            )
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
             .await
             .unwrap();
 
@@ -2351,7 +2240,7 @@ response_budget_ms = 1000
 
     #[tokio::test]
     async fn handle_request_unknown_shelf_errors() {
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine();
         let req = Request {
             request_type: "ping".into(),
             payload: vec![],
@@ -2365,17 +2254,13 @@ response_budget_ms = 1000
     #[tokio::test]
     async fn shutdown_unloads_everything() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
         };
         engine
-            .admit_singleton_respondent(
-                plugin,
-                test_manifest("org.test.ping"),
-                &catalogue,
-            )
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
             .await
             .unwrap();
         assert_eq!(engine.len(), 1);
@@ -2465,7 +2350,7 @@ response_budget_ms = 1000
         };
 
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
 
         let announcements = vec![
             SubjectAnnouncement::new(
@@ -2483,11 +2368,7 @@ response_budget_ms = 1000
             announcements,
         };
         engine
-            .admit_singleton_respondent(
-                plugin,
-                test_manifest("org.test.ping"),
-                &catalogue,
-            )
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
             .await
             .unwrap();
 
@@ -2509,7 +2390,7 @@ response_budget_ms = 1000
     }
 
     #[tokio::test]
-    async fn with_registry_shares_registry_across_engines() {
+    async fn shared_registry_in_state_is_visible_to_admission() {
         use evo_plugin_sdk::contract::{
             ExternalAddressing, SubjectAnnouncement,
         };
@@ -2527,17 +2408,22 @@ response_budget_ms = 1000
             .unwrap();
 
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::with_registry(Arc::clone(&shared));
+        let state = StewardState::builder()
+            .catalogue(catalogue)
+            .subjects(Arc::clone(&shared))
+            .relations(Arc::new(RelationGraph::new()))
+            .custody(Arc::new(CustodyLedger::new()))
+            .bus(Arc::new(HappeningBus::new()))
+            .admin(Arc::new(AdminLedger::new()))
+            .build()
+            .expect("state must build with all handles");
+        let mut engine = engine_with_state(state);
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
         };
         engine
-            .admit_singleton_respondent(
-                plugin,
-                test_manifest("org.test.ping"),
-                &catalogue,
-            )
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
             .await
             .unwrap();
 
@@ -2645,17 +2531,13 @@ response_budget_ms = 1000
     #[tokio::test]
     async fn plugin_relation_assertions_reach_the_graph() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
 
         let plugin = RelatingRespondent {
             name: "org.test.ping".into(),
         };
         engine
-            .admit_singleton_respondent(
-                plugin,
-                test_manifest("org.test.ping"),
-                &catalogue,
-            )
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
             .await
             .unwrap();
 
@@ -2805,12 +2687,11 @@ custody_failure_mode = "abort"
         let runtime_dir = tempfile::TempDir::new().unwrap();
         let catalogue = example_catalogue();
 
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let r = engine
             .admit_out_of_process_from_directory(
                 plugin_dir.path(),
                 runtime_dir.path(),
-                &catalogue,
             )
             .await;
 
@@ -2837,12 +2718,11 @@ custody_failure_mode = "abort"
             .unwrap();
 
         let catalogue = example_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let r = engine
             .admit_out_of_process_from_directory(
                 plugin_dir.path(),
                 runtime_dir.path(),
-                &catalogue,
             )
             .await;
 
@@ -2870,12 +2750,11 @@ custody_failure_mode = "abort"
             .unwrap();
 
         let catalogue = example_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let r = engine
             .admit_out_of_process_from_directory(
                 plugin_dir.path(),
                 runtime_dir.path(),
-                &catalogue,
             )
             .await;
 
@@ -2910,12 +2789,11 @@ custody_failure_mode = "abort"
             .unwrap();
 
         let catalogue = example_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let r = engine
             .admit_out_of_process_from_directory(
                 plugin_dir.path(),
                 runtime_dir.path(),
-                &catalogue,
             )
             .await;
 
@@ -3076,7 +2954,7 @@ custody_failure_mode = "abort"
     #[tokio::test]
     async fn admits_valid_warden() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let warden = TestWarden {
             name: "org.test.custody".into(),
         };
@@ -3084,7 +2962,6 @@ custody_failure_mode = "abort"
             .admit_singleton_warden(
                 warden,
                 test_warden_manifest("org.test.custody"),
-                &catalogue,
             )
             .await
             .unwrap();
@@ -3094,7 +2971,7 @@ custody_failure_mode = "abort"
     #[tokio::test]
     async fn admit_singleton_warden_rejects_respondent_manifest() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         // The warden here is a Warden-implementing Rust type, but the
         // manifest says interaction = respondent. The kind check must
         // catch this mismatch.
@@ -3107,7 +2984,6 @@ custody_failure_mode = "abort"
                 // test_manifest targets test.ping with
                 // interaction=respondent.
                 test_manifest("org.test.custody"),
-                &catalogue,
             )
             .await;
         match r {
@@ -3125,7 +3001,7 @@ custody_failure_mode = "abort"
     #[tokio::test]
     async fn admit_singleton_respondent_rejects_warden_manifest() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         // TestRespondent passed to admit_singleton_respondent with a
         // warden manifest. The kind check must catch this.
         let plugin = TestRespondent {
@@ -3136,7 +3012,6 @@ custody_failure_mode = "abort"
             .admit_singleton_respondent(
                 plugin,
                 test_warden_manifest("org.test.custody"),
-                &catalogue,
             )
             .await;
         match r {
@@ -3154,7 +3029,7 @@ custody_failure_mode = "abort"
     #[tokio::test]
     async fn take_custody_dispatches_to_warden() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let warden = TestWarden {
             name: "org.test.custody".into(),
         };
@@ -3162,7 +3037,6 @@ custody_failure_mode = "abort"
             .admit_singleton_warden(
                 warden,
                 test_warden_manifest("org.test.custody"),
-                &catalogue,
             )
             .await
             .unwrap();
@@ -3183,7 +3057,7 @@ custody_failure_mode = "abort"
     #[tokio::test]
     async fn course_correct_dispatches_to_warden() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let warden = TestWarden {
             name: "org.test.custody".into(),
         };
@@ -3191,7 +3065,6 @@ custody_failure_mode = "abort"
             .admit_singleton_warden(
                 warden,
                 test_warden_manifest("org.test.custody"),
-                &catalogue,
             )
             .await
             .unwrap();
@@ -3214,7 +3087,7 @@ custody_failure_mode = "abort"
     #[tokio::test]
     async fn release_custody_dispatches_to_warden() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let warden = TestWarden {
             name: "org.test.custody".into(),
         };
@@ -3222,7 +3095,6 @@ custody_failure_mode = "abort"
             .admit_singleton_warden(
                 warden,
                 test_warden_manifest("org.test.custody"),
-                &catalogue,
             )
             .await
             .unwrap();
@@ -3240,7 +3112,7 @@ custody_failure_mode = "abort"
     #[tokio::test]
     async fn handle_request_on_warden_shelf_errors() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let warden = TestWarden {
             name: "org.test.custody".into(),
         };
@@ -3248,7 +3120,6 @@ custody_failure_mode = "abort"
             .admit_singleton_warden(
                 warden,
                 test_warden_manifest("org.test.custody"),
-                &catalogue,
             )
             .await
             .unwrap();
@@ -3274,17 +3145,13 @@ custody_failure_mode = "abort"
     #[tokio::test]
     async fn take_custody_on_respondent_shelf_errors() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
         };
         engine
-            .admit_singleton_respondent(
-                plugin,
-                test_manifest("org.test.ping"),
-                &catalogue,
-            )
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
             .await
             .unwrap();
 
@@ -3305,7 +3172,7 @@ custody_failure_mode = "abort"
     #[tokio::test]
     async fn warden_shutdown_unloads() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let warden = TestWarden {
             name: "org.test.custody".into(),
         };
@@ -3313,7 +3180,6 @@ custody_failure_mode = "abort"
             .admit_singleton_warden(
                 warden,
                 test_warden_manifest("org.test.custody"),
-                &catalogue,
             )
             .await
             .unwrap();
@@ -3337,7 +3203,7 @@ custody_failure_mode = "abort"
     #[tokio::test]
     async fn take_custody_records_in_ledger() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let warden = TestWarden {
             name: "org.test.custody".into(),
         };
@@ -3345,7 +3211,6 @@ custody_failure_mode = "abort"
             .admit_singleton_warden(
                 warden,
                 test_warden_manifest("org.test.custody"),
-                &catalogue,
             )
             .await
             .unwrap();
@@ -3380,7 +3245,7 @@ custody_failure_mode = "abort"
     #[tokio::test]
     async fn release_custody_removes_from_ledger() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let warden = TestWarden {
             name: "org.test.custody".into(),
         };
@@ -3388,7 +3253,6 @@ custody_failure_mode = "abort"
             .admit_singleton_warden(
                 warden,
                 test_warden_manifest("org.test.custody"),
-                &catalogue,
             )
             .await
             .unwrap();
@@ -3407,7 +3271,7 @@ custody_failure_mode = "abort"
     }
 
     #[tokio::test]
-    async fn with_registry_graph_and_ledger_shares_ledger() {
+    async fn shared_ledger_in_state_is_visible_to_admission() {
         use crate::custody::CustodyLedger;
 
         let registry = Arc::new(SubjectRegistry::new());
@@ -3415,11 +3279,16 @@ custody_failure_mode = "abort"
         let ledger = Arc::new(CustodyLedger::new());
 
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::with_registry_graph_and_ledger(
-            Arc::clone(&registry),
-            Arc::clone(&graph),
-            Arc::clone(&ledger),
-        );
+        let state = StewardState::builder()
+            .catalogue(catalogue)
+            .subjects(Arc::clone(&registry))
+            .relations(Arc::clone(&graph))
+            .custody(Arc::clone(&ledger))
+            .bus(Arc::new(HappeningBus::new()))
+            .admin(Arc::new(AdminLedger::new()))
+            .build()
+            .expect("state must build with all handles");
+        let mut engine = engine_with_state(state);
 
         // Both handles (the externally-held one and the engine's
         // accessor) point at the same underlying ledger.
@@ -3432,7 +3301,6 @@ custody_failure_mode = "abort"
             .admit_singleton_warden(
                 warden,
                 test_warden_manifest("org.test.custody"),
-                &catalogue,
             )
             .await
             .unwrap();
@@ -3461,7 +3329,7 @@ custody_failure_mode = "abort"
         use crate::happenings::Happening;
 
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let warden = TestWarden {
             name: "org.test.custody".into(),
         };
@@ -3469,7 +3337,6 @@ custody_failure_mode = "abort"
             .admit_singleton_warden(
                 warden,
                 test_warden_manifest("org.test.custody"),
-                &catalogue,
             )
             .await
             .unwrap();
@@ -3510,7 +3377,7 @@ custody_failure_mode = "abort"
         use crate::happenings::Happening;
 
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let warden = TestWarden {
             name: "org.test.custody".into(),
         };
@@ -3518,7 +3385,6 @@ custody_failure_mode = "abort"
             .admit_singleton_warden(
                 warden,
                 test_warden_manifest("org.test.custody"),
-                &catalogue,
             )
             .await
             .unwrap();
@@ -3558,7 +3424,7 @@ custody_failure_mode = "abort"
         use crate::happenings::Happening;
 
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let warden = TestWarden {
             name: "org.test.custody".into(),
         };
@@ -3566,7 +3432,6 @@ custody_failure_mode = "abort"
             .admit_singleton_warden(
                 warden,
                 test_warden_manifest("org.test.custody"),
-                &catalogue,
             )
             .await
             .unwrap();
@@ -3595,61 +3460,25 @@ custody_failure_mode = "abort"
     }
 
     #[tokio::test]
-    async fn with_data_root_overrides_default_on_shared_store_constructors() {
-        // The four `with_registry*` constructors set the plugin data
-        // root to the compile-time default. Tests that want shared
-        // stores and a scratch data root compose them via
-        // `with_data_root`. This test verifies the builder wiring on
-        // all four constructors so the footgun does not re-emerge.
-        use crate::custody::CustodyLedger;
-        use crate::happenings::HappeningBus;
-
+    async fn engine_built_over_custom_data_root_uses_it_for_load_paths() {
+        // The new() constructor takes the per-plugin data root as a
+        // dedicated argument. Construct an engine over a tempdir and
+        // verify the accessor reflects it.
         let tmp = tempfile::tempdir().expect("tempdir");
         let custom = tmp.path().to_path_buf();
 
-        let reg = Arc::new(SubjectRegistry::new());
-        let graph = Arc::new(RelationGraph::new());
-        let ledger = Arc::new(CustodyLedger::new());
-        let bus = Arc::new(HappeningBus::new());
-
-        let e1 = AdmissionEngine::with_registry(Arc::clone(&reg))
-            .with_data_root(custom.clone());
-        assert_eq!(e1.plugin_data_root(), custom.as_path());
-
-        let e2 = AdmissionEngine::with_registry_and_graph(
-            Arc::clone(&reg),
-            Arc::clone(&graph),
-        )
-        .with_data_root(custom.clone());
-        assert_eq!(e2.plugin_data_root(), custom.as_path());
-
-        let e3 = AdmissionEngine::with_registry_graph_and_ledger(
-            Arc::clone(&reg),
-            Arc::clone(&graph),
-            Arc::clone(&ledger),
-        )
-        .with_data_root(custom.clone());
-        assert_eq!(e3.plugin_data_root(), custom.as_path());
-
-        let e4 = AdmissionEngine::with_registry_graph_ledger_and_bus(
-            Arc::clone(&reg),
-            Arc::clone(&graph),
-            Arc::clone(&ledger),
-            Arc::clone(&bus),
-        )
-        .with_data_root(custom.clone());
-        assert_eq!(e4.plugin_data_root(), custom.as_path());
-
-        // And that the shared handles are still shared after the
-        // builder hop, not replaced by the data-root setter.
-        assert!(Arc::ptr_eq(&reg, &e4.registry()));
-        assert!(Arc::ptr_eq(&graph, &e4.relation_graph()));
-        assert!(Arc::ptr_eq(&ledger, &e4.custody_ledger()));
-        assert!(Arc::ptr_eq(&bus, &e4.happening_bus()));
+        let state = StewardState::for_tests();
+        let engine = AdmissionEngine::new(
+            state,
+            custom.clone(),
+            None,
+            PluginsSecurityConfig::default(),
+        );
+        assert_eq!(engine.plugin_data_root(), custom.as_path());
     }
 
     #[tokio::test]
-    async fn with_registry_graph_ledger_and_bus_shares_bus() {
+    async fn shared_bus_in_state_is_visible_to_admission() {
         use crate::custody::CustodyLedger;
         use crate::happenings::HappeningBus;
 
@@ -3659,12 +3488,16 @@ custody_failure_mode = "abort"
         let bus = Arc::new(HappeningBus::new());
 
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::with_registry_graph_ledger_and_bus(
-            Arc::clone(&registry),
-            Arc::clone(&graph),
-            Arc::clone(&ledger),
-            Arc::clone(&bus),
-        );
+        let state = StewardState::builder()
+            .catalogue(catalogue)
+            .subjects(Arc::clone(&registry))
+            .relations(Arc::clone(&graph))
+            .custody(Arc::clone(&ledger))
+            .bus(Arc::clone(&bus))
+            .admin(Arc::new(AdminLedger::new()))
+            .build()
+            .expect("state must build with all handles");
+        let mut engine = engine_with_state(state);
 
         // All four shared handles match the engine's accessors.
         assert!(Arc::ptr_eq(&ledger, &engine.custody_ledger()));
@@ -3681,7 +3514,6 @@ custody_failure_mode = "abort"
             .admit_singleton_warden(
                 warden,
                 test_warden_manifest("org.test.custody"),
-                &catalogue,
             )
             .await
             .unwrap();
@@ -3700,14 +3532,14 @@ custody_failure_mode = "abort"
     // -----------------------------------------------------------------
     // Trust-gated admission tests.
     //
-    // Verify that set_plugin_trust gates
-    // admit_out_of_process_from_directory: without trust state,
+    // Verify that the plugin trust state passed to AdmissionEngine::new
+    // gates admit_out_of_process_from_directory: without trust state,
     // admission skips signature checks; with trust state, the same
     // bundle is checked against keys and revocations BEFORE spawn.
     // The trust-verification algorithm itself is covered end-to-end
     // in crates/evo-trust/tests/verify.rs; these tests assert only
-    // on the steward integration (presence/absence of
-    // set_plugin_trust, error propagation into StewardError).
+    // on the steward integration (presence/absence of trust state,
+    // error propagation into StewardError).
     // -----------------------------------------------------------------
 
     fn unsigned_trust_disallowed() -> Arc<crate::plugin_trust::PluginTrustState>
@@ -3750,23 +3582,22 @@ custody_failure_mode = "abort"
 
     #[tokio::test]
     async fn admit_from_directory_without_trust_skips_signature_check() {
-        // Control test: no set_plugin_trust call. The unsigned bundle
-        // must reach the spawn step, where it fails on the invalid
-        // artefact. Absence of a manifest.sig-related error is the
-        // signal that no signature check ran.
+        // Control test: engine constructed with trust=None. The
+        // unsigned bundle must reach the spawn step, where it fails
+        // on the invalid artefact. Absence of a manifest.sig-related
+        // error is the signal that no signature check ran.
         let plugin_dir = tempfile::TempDir::new().unwrap();
         let runtime_dir = tempfile::TempDir::new().unwrap();
         write_unsigned_bundle(plugin_dir.path());
 
         let catalogue = example_catalogue();
-        let mut engine = AdmissionEngine::new();
-        // No set_plugin_trust call: trust state is None.
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        // Engine constructed with trust=None: no signature check runs.
 
         let r = engine
             .admit_out_of_process_from_directory(
                 plugin_dir.path(),
                 runtime_dir.path(),
-                &catalogue,
             )
             .await;
 
@@ -3790,14 +3621,15 @@ custody_failure_mode = "abort"
         write_unsigned_bundle(plugin_dir.path());
 
         let catalogue = example_catalogue();
-        let mut engine = AdmissionEngine::new();
-        engine.set_plugin_trust(Some(unsigned_trust_disallowed()));
+        let mut engine = test_engine_with_trust(
+            Arc::clone(&catalogue),
+            unsigned_trust_disallowed(),
+        );
 
         let r = engine
             .admit_out_of_process_from_directory(
                 plugin_dir.path(),
                 runtime_dir.path(),
-                &catalogue,
             )
             .await;
 
@@ -3826,14 +3658,15 @@ custody_failure_mode = "abort"
         write_unsigned_bundle(plugin_dir.path());
 
         let catalogue = example_catalogue();
-        let mut engine = AdmissionEngine::new();
-        engine.set_plugin_trust(Some(unsigned_trust_allowed()));
+        let mut engine = test_engine_with_trust(
+            Arc::clone(&catalogue),
+            unsigned_trust_allowed(),
+        );
 
         let r = engine
             .admit_out_of_process_from_directory(
                 plugin_dir.path(),
                 runtime_dir.path(),
-                &catalogue,
             )
             .await;
 
@@ -3880,14 +3713,12 @@ custody_failure_mode = "abort"
         });
 
         let catalogue = example_catalogue();
-        let mut engine = AdmissionEngine::new();
-        engine.set_plugin_trust(Some(trust));
+        let mut engine = test_engine_with_trust(Arc::clone(&catalogue), trust);
 
         let r = engine
             .admit_out_of_process_from_directory(
                 plugin_dir.path(),
                 runtime_dir.path(),
-                &catalogue,
             )
             .await;
 
@@ -3923,7 +3754,7 @@ custody_failure_mode = "abort"
     #[tokio::test]
     async fn admit_refuses_manifest_requiring_future_evo_version() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
@@ -3931,9 +3762,7 @@ custody_failure_mode = "abort"
         // 99.0.0 exceeds any realistic steward version.
         let mut manifest = test_manifest("org.test.ping");
         manifest.prerequisites.evo_min_version = semver::Version::new(99, 0, 0);
-        let r = engine
-            .admit_singleton_respondent(plugin, manifest, &catalogue)
-            .await;
+        let r = engine.admit_singleton_respondent(plugin, manifest).await;
         match r {
             Err(StewardError::Manifest(
                 evo_plugin_sdk::ManifestError::EvoVersionTooLow {
@@ -3953,7 +3782,7 @@ custody_failure_mode = "abort"
         // Setting evo_min_version to the steward's own version must
         // admit: the check is strict >, not >=.
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
@@ -3962,7 +3791,7 @@ custody_failure_mode = "abort"
         manifest.prerequisites.evo_min_version =
             semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
         engine
-            .admit_singleton_respondent(plugin, manifest, &catalogue)
+            .admit_singleton_respondent(plugin, manifest)
             .await
             .expect("equal version must admit");
         assert_eq!(engine.len(), 1);
@@ -3971,7 +3800,7 @@ custody_failure_mode = "abort"
     #[tokio::test]
     async fn admit_refuses_manifest_with_mismatched_os_family() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
@@ -3979,9 +3808,7 @@ custody_failure_mode = "abort"
         // An OS string that matches no supported host.
         let mut manifest = test_manifest("org.test.ping");
         manifest.prerequisites.os_family = "plan9".to_string();
-        let r = engine
-            .admit_singleton_respondent(plugin, manifest, &catalogue)
-            .await;
+        let r = engine.admit_singleton_respondent(plugin, manifest).await;
         match r {
             Err(StewardError::Manifest(
                 evo_plugin_sdk::ManifestError::OsFamilyMismatch {
@@ -4003,7 +3830,7 @@ custody_failure_mode = "abort"
         // explicitly so a future refactor that narrows "any" is
         // caught.
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
@@ -4011,7 +3838,7 @@ custody_failure_mode = "abort"
         let mut manifest = test_manifest("org.test.ping");
         manifest.prerequisites.os_family = "any".to_string();
         engine
-            .admit_singleton_respondent(plugin, manifest, &catalogue)
+            .admit_singleton_respondent(plugin, manifest)
             .await
             .expect("os_family = any must always admit");
         assert_eq!(engine.len(), 1);
@@ -4022,7 +3849,7 @@ custody_failure_mode = "abort"
         // Use std::env::consts::OS as the declared os_family. On
         // Linux this is "linux", on macOS "macos", etc.
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
@@ -4030,7 +3857,7 @@ custody_failure_mode = "abort"
         let mut manifest = test_manifest("org.test.ping");
         manifest.prerequisites.os_family = std::env::consts::OS.to_string();
         engine
-            .admit_singleton_respondent(plugin, manifest, &catalogue)
+            .admit_singleton_respondent(plugin, manifest)
             .await
             .expect("os_family matching host must admit");
         assert_eq!(engine.len(), 1);
@@ -4110,14 +3937,14 @@ response_budget_ms = 1000
     #[tokio::test]
     async fn admission_accepts_admin_plugin_at_platform_class() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
         };
         let manifest = test_admin_manifest("org.test.ping", "platform", true);
         engine
-            .admit_singleton_respondent(plugin, manifest, &catalogue)
+            .admit_singleton_respondent(plugin, manifest)
             .await
             .expect("platform trust must admit an admin plugin");
         assert_eq!(engine.len(), 1);
@@ -4126,14 +3953,14 @@ response_budget_ms = 1000
     #[tokio::test]
     async fn admission_accepts_admin_plugin_at_privileged_class() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
         };
         let manifest = test_admin_manifest("org.test.ping", "privileged", true);
         engine
-            .admit_singleton_respondent(plugin, manifest, &catalogue)
+            .admit_singleton_respondent(plugin, manifest)
             .await
             .expect("privileged trust must admit an admin plugin");
         assert_eq!(engine.len(), 1);
@@ -4142,15 +3969,13 @@ response_budget_ms = 1000
     #[tokio::test]
     async fn admission_refuses_admin_plugin_at_standard_class() {
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
         };
         let manifest = test_admin_manifest("org.test.ping", "standard", true);
-        let r = engine
-            .admit_singleton_respondent(plugin, manifest, &catalogue)
-            .await;
+        let r = engine.admit_singleton_respondent(plugin, manifest).await;
         match r {
             Err(StewardError::AdminTrustTooLow {
                 plugin_name,
@@ -4177,15 +4002,13 @@ response_budget_ms = 1000
         // Sandbox is the lowest trust class. Admission must refuse
         // any admin plugin at this class.
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
         };
         let manifest = test_admin_manifest("org.test.ping", "sandbox", true);
-        let r = engine
-            .admit_singleton_respondent(plugin, manifest, &catalogue)
-            .await;
+        let r = engine.admit_singleton_respondent(plugin, manifest).await;
         assert!(
             matches!(r, Err(StewardError::AdminTrustTooLow { .. })),
             "sandbox admin must be refused, got {r:?}"
@@ -4199,14 +4022,14 @@ response_budget_ms = 1000
         // normally. The admin gate bypasses entirely when
         // capabilities.admin = false.
         let catalogue = test_catalogue();
-        let mut engine = AdmissionEngine::new();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
             name: "org.test.ping".into(),
             ..Default::default()
         };
         let manifest = test_admin_manifest("org.test.ping", "sandbox", false);
         engine
-            .admit_singleton_respondent(plugin, manifest, &catalogue)
+            .admit_singleton_respondent(plugin, manifest)
             .await
             .expect("non-admin plugin at sandbox must admit");
         assert_eq!(engine.len(), 1);

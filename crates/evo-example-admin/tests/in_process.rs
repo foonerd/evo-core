@@ -13,11 +13,19 @@
 //! tests module so they exercise the public admission + SDK surface
 //! the same way a third-party admin plugin would.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use evo::admin::AdminLedger;
 use evo::admission::AdmissionEngine;
 use evo::catalogue::Catalogue;
+use evo::config::PluginsSecurityConfig;
+use evo::custody::CustodyLedger;
 use evo::error::StewardError;
+use evo::happenings::HappeningBus;
+use evo::relations::RelationGraph;
+use evo::state::StewardState;
+use evo::subjects::SubjectRegistry;
 use evo_example_admin::{
     manifest as admin_manifest, AddressingPayload, AdminExamplePlugin,
     AdminMergeRequest, AdminRetractAddressingRequest, AdminRetractClaimRequest,
@@ -39,6 +47,26 @@ use evo_plugin_sdk::Manifest;
 // an example rack plus the `album_of` predicate so a victim plugin
 // can assert relations between tracks and albums.
 // ---------------------------------------------------------------------
+
+/// Build an `AdmissionEngine` over a fresh `StewardState` carrying
+/// the supplied catalogue and default-constructed stores.
+fn engine_with_catalogue(catalogue: Arc<Catalogue>) -> AdmissionEngine {
+    let state = StewardState::builder()
+        .catalogue(catalogue)
+        .subjects(Arc::new(SubjectRegistry::new()))
+        .relations(Arc::new(RelationGraph::new()))
+        .custody(Arc::new(CustodyLedger::new()))
+        .bus(Arc::new(HappeningBus::new()))
+        .admin(Arc::new(AdminLedger::new()))
+        .build()
+        .expect("steward state must build");
+    AdmissionEngine::new(
+        state,
+        PathBuf::from("/tmp/evo-admin-in-process-test-data-root"),
+        None,
+        PluginsSecurityConfig::default(),
+    )
+}
 
 fn test_catalogue() -> Arc<Catalogue> {
     Arc::new(
@@ -236,7 +264,7 @@ response_budget_ms = 1000
 #[tokio::test]
 async fn admin_forced_retract_addressing_removes_stale_entry() {
     let catalogue = test_catalogue();
-    let mut engine = AdmissionEngine::new();
+    let mut engine = engine_with_catalogue(Arc::clone(&catalogue));
 
     // Victim claims a track with two addressings, on shelf
     // example.victim.
@@ -247,7 +275,6 @@ async fn admin_forced_retract_addressing_removes_stale_entry() {
                 loaded: false,
             },
             victim_manifest("org.test.victim"),
-            &catalogue,
         )
         .await
         .expect("victim must admit");
@@ -262,11 +289,7 @@ async fn admin_forced_retract_addressing_removes_stale_entry() {
     // admission accepts it and populates subject_admin /
     // relation_admin in its LoadContext.
     engine
-        .admit_singleton_respondent(
-            AdminExamplePlugin::new(),
-            admin_manifest(),
-            &catalogue,
-        )
+        .admit_singleton_respondent(AdminExamplePlugin::new(), admin_manifest())
         .await
         .expect("admin must admit");
 
@@ -303,7 +326,7 @@ async fn admin_forced_retract_addressing_removes_stale_entry() {
 #[tokio::test]
 async fn admin_forced_retract_claim_removes_other_plugin_claim() {
     let catalogue = test_catalogue();
-    let mut engine = AdmissionEngine::new();
+    let mut engine = engine_with_catalogue(Arc::clone(&catalogue));
 
     engine
         .admit_singleton_respondent(
@@ -312,16 +335,11 @@ async fn admin_forced_retract_claim_removes_other_plugin_claim() {
                 loaded: false,
             },
             victim_manifest("org.test.victim"),
-            &catalogue,
         )
         .await
         .unwrap();
     engine
-        .admit_singleton_respondent(
-            AdminExamplePlugin::new(),
-            admin_manifest(),
-            &catalogue,
-        )
+        .admit_singleton_respondent(AdminExamplePlugin::new(), admin_manifest())
         .await
         .unwrap();
     assert_eq!(engine.relation_graph().claim_count(), 1);
@@ -363,7 +381,7 @@ async fn admin_refused_without_admin_capability_manifest() {
     // manifests leave those fields None. Surface: admission fails
     // with StewardError::Admission ("load failed: ...").
     let catalogue = test_catalogue();
-    let mut engine = AdmissionEngine::new();
+    let mut engine = engine_with_catalogue(Arc::clone(&catalogue));
 
     // Build a manifest matching evo-example-admin's identity but
     // without the admin flag.
@@ -410,11 +428,7 @@ response_budget_ms = 1000
     );
 
     let r = engine
-        .admit_singleton_respondent(
-            AdminExamplePlugin::new(),
-            manifest,
-            &catalogue,
-        )
+        .admit_singleton_respondent(AdminExamplePlugin::new(), manifest)
         .await;
     match r {
         Err(StewardError::Admission(msg)) => {
@@ -438,17 +452,13 @@ async fn admin_admitted_at_platform_trust() {
     // embedded manifest's trust class and confirms admission still
     // succeeds.
     let catalogue = test_catalogue();
-    let mut engine = AdmissionEngine::new();
+    let mut engine = engine_with_catalogue(Arc::clone(&catalogue));
 
     let mut manifest = admin_manifest();
     manifest.trust.class = evo_plugin_sdk::manifest::TrustClass::Platform;
 
     engine
-        .admit_singleton_respondent(
-            AdminExamplePlugin::new(),
-            manifest,
-            &catalogue,
-        )
+        .admit_singleton_respondent(AdminExamplePlugin::new(), manifest)
         .await
         .expect("platform-class admin plugin must admit");
     assert_eq!(engine.len(), 1);
@@ -460,17 +470,13 @@ async fn admin_refused_at_standard_trust() {
     // the admin-trust gate must refuse the plugin. StewardError's
     // AdminTrustTooLow variant is the signal.
     let catalogue = test_catalogue();
-    let mut engine = AdmissionEngine::new();
+    let mut engine = engine_with_catalogue(Arc::clone(&catalogue));
 
     let mut manifest = admin_manifest();
     manifest.trust.class = evo_plugin_sdk::manifest::TrustClass::Standard;
 
     let r = engine
-        .admit_singleton_respondent(
-            AdminExamplePlugin::new(),
-            manifest,
-            &catalogue,
-        )
+        .admit_singleton_respondent(AdminExamplePlugin::new(), manifest)
         .await;
     match r {
         Err(StewardError::AdminTrustTooLow {
@@ -511,7 +517,7 @@ async fn admin_refused_at_standard_trust() {
 #[tokio::test]
 async fn admin_merge_collapses_two_tracks() {
     let catalogue = test_catalogue();
-    let mut engine = AdmissionEngine::new();
+    let mut engine = engine_with_catalogue(Arc::clone(&catalogue));
 
     engine
         .admit_singleton_respondent(
@@ -520,16 +526,11 @@ async fn admin_merge_collapses_two_tracks() {
                 loaded: false,
             },
             victim_manifest("org.test.victim"),
-            &catalogue,
         )
         .await
         .unwrap();
     engine
-        .admit_singleton_respondent(
-            AdminExamplePlugin::new(),
-            admin_manifest(),
-            &catalogue,
-        )
+        .admit_singleton_respondent(AdminExamplePlugin::new(), admin_manifest())
         .await
         .unwrap();
 
@@ -591,7 +592,7 @@ async fn admin_merge_collapses_two_tracks() {
 #[tokio::test]
 async fn admin_split_creates_new_subjects() {
     let catalogue = test_catalogue();
-    let mut engine = AdmissionEngine::new();
+    let mut engine = engine_with_catalogue(Arc::clone(&catalogue));
 
     engine
         .admit_singleton_respondent(
@@ -600,16 +601,11 @@ async fn admin_split_creates_new_subjects() {
                 loaded: false,
             },
             victim_manifest("org.test.victim"),
-            &catalogue,
         )
         .await
         .unwrap();
     engine
-        .admit_singleton_respondent(
-            AdminExamplePlugin::new(),
-            admin_manifest(),
-            &catalogue,
-        )
+        .admit_singleton_respondent(AdminExamplePlugin::new(), admin_manifest())
         .await
         .unwrap();
 
@@ -654,7 +650,7 @@ async fn admin_split_creates_new_subjects() {
 #[tokio::test]
 async fn admin_suppress_hides_relation() {
     let catalogue = test_catalogue();
-    let mut engine = AdmissionEngine::new();
+    let mut engine = engine_with_catalogue(Arc::clone(&catalogue));
 
     engine
         .admit_singleton_respondent(
@@ -663,16 +659,11 @@ async fn admin_suppress_hides_relation() {
                 loaded: false,
             },
             victim_manifest("org.test.victim"),
-            &catalogue,
         )
         .await
         .unwrap();
     engine
-        .admit_singleton_respondent(
-            AdminExamplePlugin::new(),
-            admin_manifest(),
-            &catalogue,
-        )
+        .admit_singleton_respondent(AdminExamplePlugin::new(), admin_manifest())
         .await
         .unwrap();
 
@@ -721,7 +712,7 @@ async fn admin_suppress_hides_relation() {
 #[tokio::test]
 async fn admin_unsuppress_restores_relation() {
     let catalogue = test_catalogue();
-    let mut engine = AdmissionEngine::new();
+    let mut engine = engine_with_catalogue(Arc::clone(&catalogue));
 
     engine
         .admit_singleton_respondent(
@@ -730,16 +721,11 @@ async fn admin_unsuppress_restores_relation() {
                 loaded: false,
             },
             victim_manifest("org.test.victim"),
-            &catalogue,
         )
         .await
         .unwrap();
     engine
-        .admit_singleton_respondent(
-            AdminExamplePlugin::new(),
-            admin_manifest(),
-            &catalogue,
-        )
+        .admit_singleton_respondent(AdminExamplePlugin::new(), admin_manifest())
         .await
         .unwrap();
 
