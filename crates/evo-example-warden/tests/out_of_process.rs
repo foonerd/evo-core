@@ -232,7 +232,7 @@ async fn out_of_process_warden_admission_and_custody_lifecycle() {
     // that frame internally via its LoggingCustodyStateReporter.
     let handle = tokio::time::timeout(
         VERB_TIMEOUT,
-        engine.take_custody(
+        engine.router().take_custody(
             "example.custody",
             "playback".into(),
             b"track-1".to_vec(),
@@ -250,7 +250,7 @@ async fn out_of_process_warden_admission_and_custody_lifecycle() {
     // Course correct the in-flight custody.
     tokio::time::timeout(
         VERB_TIMEOUT,
-        engine.course_correct(
+        engine.router().course_correct(
             "example.custody",
             &handle,
             "seek".into(),
@@ -264,7 +264,7 @@ async fn out_of_process_warden_admission_and_custody_lifecycle() {
     // Release the custody.
     tokio::time::timeout(
         VERB_TIMEOUT,
-        engine.release_custody("example.custody", handle),
+        engine.router().release_custody("example.custody", handle),
     )
     .await
     .expect("release_custody should complete within timeout")
@@ -315,7 +315,7 @@ async fn out_of_process_warden_handles_multiple_custodies() {
     for expected_cid in 1..=3u64 {
         let handle = tokio::time::timeout(
             VERB_TIMEOUT,
-            engine.take_custody(
+            engine.router().take_custody(
                 "example.custody",
                 "playback".into(),
                 format!("track-{expected_cid}").into_bytes(),
@@ -329,7 +329,7 @@ async fn out_of_process_warden_handles_multiple_custodies() {
 
         tokio::time::timeout(
             VERB_TIMEOUT,
-            engine.release_custody("example.custody", handle),
+            engine.router().release_custody("example.custody", handle),
         )
         .await
         .expect("release_custody should complete within timeout")

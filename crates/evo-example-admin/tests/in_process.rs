@@ -308,6 +308,7 @@ async fn admin_forced_retract_addressing_removes_stale_entry() {
         deadline: None,
     };
     let resp = engine
+        .router()
         .handle_request("administration.subjects", req)
         .await
         .expect("admin request must succeed");
@@ -364,6 +365,7 @@ async fn admin_forced_retract_claim_removes_other_plugin_claim() {
         deadline: None,
     };
     engine
+        .router()
         .handle_request("administration.subjects", req)
         .await
         .expect("admin relation retract must succeed");
@@ -569,6 +571,7 @@ async fn admin_merge_collapses_two_tracks() {
         deadline: None,
     };
     engine
+        .router()
         .handle_request("administration.subjects", req)
         .await
         .expect("admin merge must succeed");
@@ -638,6 +641,7 @@ async fn admin_split_creates_new_subjects() {
         deadline: None,
     };
     engine
+        .router()
         .handle_request("administration.subjects", req)
         .await
         .expect("admin split must succeed");
@@ -688,6 +692,7 @@ async fn admin_suppress_hides_relation() {
         deadline: None,
     };
     engine
+        .router()
         .handle_request("administration.subjects", req)
         .await
         .expect("admin suppress must succeed");
@@ -742,6 +747,7 @@ async fn admin_unsuppress_restores_relation() {
         reason: None,
     };
     engine
+        .router()
         .handle_request(
             "administration.subjects",
             Request {
@@ -778,6 +784,7 @@ async fn admin_unsuppress_restores_relation() {
         },
     };
     engine
+        .router()
         .handle_request(
             "administration.subjects",
             Request {

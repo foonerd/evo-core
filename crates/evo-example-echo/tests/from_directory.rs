@@ -197,7 +197,7 @@ async fn admit_from_directory_full_lifecycle() {
     };
     let resp = tokio::time::timeout(
         REQUEST_TIMEOUT,
-        engine.handle_request("example.echo", req),
+        engine.router().handle_request("example.echo", req),
     )
     .await
     .expect("request should complete within timeout")

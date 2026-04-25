@@ -141,7 +141,6 @@
 //!
 //! [`SubjectProjection`]: crate::projections::SubjectProjection
 
-use crate::admission::AdmissionEngine;
 use crate::catalogue::Cardinality;
 use crate::context::RegistrySubjectQuerier;
 use crate::custody::{CustodyRecord, StateSnapshot};
@@ -155,6 +154,7 @@ use crate::projections::{
     ProjectionScope, RelatedSubject, RelationDirection, SubjectProjection,
 };
 use crate::relations::WalkDirection;
+use crate::router::PluginRouter;
 use crate::state::StewardState;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -170,7 +170,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 
 /// Maximum size of a single JSON frame. Prevents malicious or malformed
 /// clients from forcing the steward to allocate unbounded memory.
@@ -1332,23 +1332,27 @@ impl From<Happening> for HappeningWire {
 /// The Unix socket server.
 pub struct Server {
     socket_path: PathBuf,
-    engine: Arc<Mutex<AdmissionEngine>>,
+    router: Arc<PluginRouter>,
     state: Arc<StewardState>,
     projections: Arc<ProjectionEngine>,
 }
 
 impl Server {
-    /// Construct a server bound to a socket path and sharing an
-    /// admission engine, the steward's shared state bag, and a
-    /// projection engine. The socket is not created until [`run`] is
-    /// called.
+    /// Construct a server bound to a socket path and sharing a plugin
+    /// router, the steward's shared state bag, and a projection
+    /// engine. The socket is not created until [`run`] is called.
+    ///
+    /// `router` is cloned from the admission engine via
+    /// [`AdmissionEngine::router`](crate::admission::AdmissionEngine::router):
+    /// dispatch to admitted plugins flows through the router directly,
+    /// without acquiring the admission-engine mutex, so concurrent
+    /// client requests to different plugins run truly in parallel.
     ///
     /// `state` carries the same shared store handles the admission
     /// engine was built over. Subscription and ledger-snapshot ops
-    /// read from `state` directly so they do not have to lock the
-    /// engine. The [`ProjectionEngine`] must read from the same
-    /// subject registry and relation graph as the admission engine;
-    /// typically constructed as:
+    /// read from `state` directly. The [`ProjectionEngine`] must read
+    /// from the same subject registry and relation graph as the
+    /// admission engine; typically constructed as:
     ///
     /// ```ignore
     /// let projections = Arc::new(ProjectionEngine::new(
@@ -1360,13 +1364,13 @@ impl Server {
     /// [`run`]: Self::run
     pub fn new(
         socket_path: PathBuf,
-        engine: Arc<Mutex<AdmissionEngine>>,
+        router: Arc<PluginRouter>,
         state: Arc<StewardState>,
         projections: Arc<ProjectionEngine>,
     ) -> Self {
         Self {
             socket_path,
-            engine,
+            router,
             state,
             projections,
         }
@@ -1440,12 +1444,12 @@ impl Server {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, _addr)) => {
-                            let engine = Arc::clone(&self.engine);
+                            let router = Arc::clone(&self.router);
                             let state = Arc::clone(&self.state);
                             let projections = Arc::clone(&self.projections);
                             tokio::spawn(async move {
                                 if let Err(e) = handle_connection(
-                                    stream, engine, state, projections
+                                    stream, router, state, projections
                                 ).await {
                                     tracing::warn!(
                                         error = %e,
@@ -1497,7 +1501,7 @@ impl Server {
 /// Errors handling one frame close the connection.
 async fn handle_connection(
     mut stream: UnixStream,
-    engine: Arc<Mutex<AdmissionEngine>>,
+    router: Arc<PluginRouter>,
     state: Arc<StewardState>,
     projections: Arc<ProjectionEngine>,
 ) -> Result<(), StewardError> {
@@ -1530,7 +1534,7 @@ async fn handle_connection(
         }
 
         let response =
-            dispatch_request(req, &engine, &state, &projections).await;
+            dispatch_request(req, &router, &state, &projections).await;
         write_response_frame(&mut stream, &response).await?;
     }
 }
@@ -1608,7 +1612,7 @@ async fn write_response_frame(
 /// rather than bubbling up to close the connection.
 async fn dispatch_request(
     req: ClientRequest,
-    engine: &Arc<Mutex<AdmissionEngine>>,
+    router: &Arc<PluginRouter>,
     state: &Arc<StewardState>,
     projections: &Arc<ProjectionEngine>,
 ) -> ClientResponse {
@@ -1618,7 +1622,7 @@ async fn dispatch_request(
             request_type,
             payload_b64,
         } => {
-            handle_plugin_request(engine, shelf, request_type, payload_b64)
+            handle_plugin_request(router, shelf, request_type, payload_b64)
                 .await
         }
         ClientRequest::ProjectSubject {
@@ -1718,8 +1722,13 @@ async fn run_subscription(
 }
 
 /// Dispatch a plugin request (`op = "request"`).
+///
+/// Routes through the [`PluginRouter`] directly: no admission-engine
+/// mutex is acquired, so concurrent client requests addressed at
+/// different shelves run truly in parallel rather than serialising on
+/// the engine lock.
 async fn handle_plugin_request(
-    engine: &Arc<Mutex<AdmissionEngine>>,
+    router: &Arc<PluginRouter>,
     shelf: String,
     request_type: String,
     payload_b64: String,
@@ -1741,10 +1750,7 @@ async fn handle_plugin_request(
         deadline: None,
     };
 
-    let result = {
-        let guard = engine.lock().await;
-        guard.handle_request(&shelf, sdk_request).await
-    };
+    let result = router.handle_request(&shelf, sdk_request).await;
 
     match result {
         Ok(resp) => ClientResponse::Success {

@@ -85,10 +85,11 @@ async fn build_harness(
         Arc::clone(&state.subjects),
         Arc::clone(&state.relations),
     ));
+    let router = Arc::clone(engine.router());
     let engine = Arc::new(Mutex::new(engine));
     let server = Server::new(
         socket_path,
-        Arc::clone(&engine),
+        router,
         Arc::clone(&state),
         Arc::clone(&projections),
     );

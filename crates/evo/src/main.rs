@@ -114,16 +114,23 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&state.relations),
     ));
 
-    // Wrap engine for shared access between the server and the final
-    // drain.
+    // Clone an Arc to the router so the server can dispatch directly
+    // through it without acquiring the admission-engine mutex. The
+    // engine still owns the router; the server only borrows it.
+    let router = Arc::clone(engine.router());
+
+    // Wrap engine for shared access between any future admission-side
+    // mutations and the final drain. The server no longer needs the
+    // engine handle: it routes through the router and reads the bus /
+    // ledger directly off the steward state bag.
     let engine = Arc::new(Mutex::new(engine));
 
     // Start the server. The server clones the state Arc directly so
     // it can serve bus subscriptions and ledger snapshots without
-    // taking the engine mutex.
+    // taking the engine mutex; dispatch flows through the router.
     let server = Server::new(
         socket_path.clone(),
-        Arc::clone(&engine),
+        router,
         Arc::clone(&state),
         Arc::clone(&projections),
     );

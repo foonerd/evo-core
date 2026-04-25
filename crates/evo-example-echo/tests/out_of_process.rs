@@ -245,7 +245,7 @@ async fn out_of_process_echo_admission_and_request() {
     };
     let resp = tokio::time::timeout(
         REQUEST_TIMEOUT,
-        engine.handle_request("example.echo", req),
+        engine.router().handle_request("example.echo", req),
     )
     .await
     .expect("request round-trip should complete within timeout")
@@ -296,7 +296,7 @@ async fn out_of_process_echo_handles_multiple_requests() {
         };
         let resp = tokio::time::timeout(
             REQUEST_TIMEOUT,
-            engine.handle_request("example.echo", req),
+            engine.router().handle_request("example.echo", req),
         )
         .await
         .expect("request should complete within timeout")

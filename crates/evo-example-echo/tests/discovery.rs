@@ -252,7 +252,7 @@ async fn discover_and_admit_staged_layout() {
     };
     let resp = tokio::time::timeout(
         REQUEST_TIMEOUT,
-        engine.handle_request("example.echo", req),
+        engine.router().handle_request("example.echo", req),
     )
     .await
     .expect("request within timeout")
@@ -302,7 +302,7 @@ async fn discover_and_admit_flat_layout() {
     };
     let resp = tokio::time::timeout(
         REQUEST_TIMEOUT,
-        engine.handle_request("example.echo", req),
+        engine.router().handle_request("example.echo", req),
     )
     .await
     .expect("request within timeout")

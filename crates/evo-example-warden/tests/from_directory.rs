@@ -196,7 +196,7 @@ async fn admit_from_directory_warden_full_lifecycle() {
     // admit_out_of_process_warden.
     let handle = tokio::time::timeout(
         VERB_TIMEOUT,
-        engine.take_custody(
+        engine.router().take_custody(
             "example.custody",
             "playback".into(),
             b"track-directory".to_vec(),
@@ -210,7 +210,7 @@ async fn admit_from_directory_warden_full_lifecycle() {
 
     tokio::time::timeout(
         VERB_TIMEOUT,
-        engine.course_correct(
+        engine.router().course_correct(
             "example.custody",
             &handle,
             "seek".into(),
@@ -223,7 +223,7 @@ async fn admit_from_directory_warden_full_lifecycle() {
 
     tokio::time::timeout(
         VERB_TIMEOUT,
-        engine.release_custody("example.custody", handle),
+        engine.router().release_custody("example.custody", handle),
     )
     .await
     .expect("release_custody should complete within timeout")

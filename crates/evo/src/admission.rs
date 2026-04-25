@@ -417,10 +417,9 @@ impl AdmissionEngine {
     /// Borrow the [`PluginRouter`] handle this engine constructed.
     ///
     /// The server clones this `Arc` to dispatch requests without
-    /// acquiring the engine mutex once `server.rs` is updated to
-    /// route directly through the router. Until then dispatch still
-    /// goes through the engine's delegation methods so the engine
-    /// mutex's cross-await scope is unchanged.
+    /// acquiring the engine mutex: concurrent client requests to
+    /// different plugins run truly in parallel rather than serialising
+    /// on the admission lock.
     pub fn router(&self) -> &Arc<PluginRouter> {
         &self.router
     }
@@ -1258,114 +1257,6 @@ impl AdmissionEngine {
         Ok(())
     }
 
-    /// Route a request to the plugin admitted on the given shelf.
-    ///
-    /// Returns [`StewardError::Dispatch`] if no plugin is admitted on
-    /// that shelf, or if the plugin on that shelf is a warden (whose
-    /// verbs are [`Self::take_custody`], [`Self::course_correct`],
-    /// [`Self::release_custody`] - not `handle_request`).
-    ///
-    /// Returns the plugin's own error wrapped in
-    /// [`StewardError::Plugin`] if the plugin's handler fails.
-    ///
-    /// This is a thin delegation to
-    /// [`PluginRouter::handle_request`](crate::router::PluginRouter::handle_request);
-    /// callers that hold an `Arc<PluginRouter>` directly can avoid
-    /// the engine mutex entirely.
-    pub async fn handle_request(
-        &self,
-        shelf: &str,
-        request: Request,
-    ) -> Result<Response, StewardError> {
-        self.router.handle_request(shelf, request).await
-    }
-
-    /// Deliver an assignment to the warden on the given shelf.
-    ///
-    /// Allocates a fresh correlation ID, constructs an [`Assignment`]
-    /// carrying a [`LedgerCustodyStateReporter`] tagged with the
-    /// warden's plugin name, and dispatches to the warden's
-    /// `take_custody`. On success, records the custody in the
-    /// engine's [`CustodyLedger`] keyed by `(plugin_name, handle.id)`
-    /// with the full metadata (shelf, custody_type, handle), then
-    /// emits a [`Happening::CustodyTaken`] on the engine's
-    /// [`HappeningBus`].
-    ///
-    /// The happening is emitted AFTER the ledger write so any
-    /// subscriber that reacts to the happening by querying the
-    /// ledger will see the new record.
-    ///
-    /// If the warden emits an initial `ReportCustodyState` from
-    /// within its own `take_custody` (typical for wire wardens),
-    /// that state report may reach the ledger before this method
-    /// records the custody metadata. The ledger's UPSERT semantics
-    /// merge the two events into one record regardless of arrival
-    /// order.
-    ///
-    /// Returns [`StewardError::Dispatch`] if no plugin is admitted
-    /// on that shelf, or if the plugin there is a respondent (whose
-    /// verb is [`Self::handle_request`] - not `take_custody`).
-    ///
-    /// Returns the plugin's own error wrapped in
-    /// [`StewardError::Plugin`] if the warden rejects the
-    /// assignment. On such failure neither the ledger nor the bus
-    /// is written.
-    pub async fn take_custody(
-        &self,
-        shelf: &str,
-        custody_type: String,
-        payload: Vec<u8>,
-        deadline: Option<Instant>,
-    ) -> Result<CustodyHandle, StewardError> {
-        self.router
-            .take_custody(shelf, custody_type, payload, deadline)
-            .await
-    }
-
-    /// Deliver a course correction to an ongoing custody on the given
-    /// shelf.
-    ///
-    /// Allocates a fresh correlation ID and constructs a
-    /// [`CourseCorrection`] the warden receives. The caller is
-    /// responsible for holding the [`CustodyHandle`] returned from
-    /// the prior [`Self::take_custody`] and passing it back verbatim.
-    ///
-    /// Returns [`StewardError::Dispatch`] for the same shelf-kind
-    /// mismatches as [`Self::take_custody`]. Returns
-    /// [`StewardError::Plugin`] on warden-side rejection (unknown
-    /// handle, correction-type not accepted, timeout, etc.).
-    pub async fn course_correct(
-        &self,
-        shelf: &str,
-        handle: &CustodyHandle,
-        correction_type: String,
-        payload: Vec<u8>,
-    ) -> Result<(), StewardError> {
-        self.router
-            .course_correct(shelf, handle, correction_type, payload)
-            .await
-    }
-
-    /// Gracefully terminate an ongoing custody on the given shelf.
-    ///
-    /// The warden is expected to wind down the work identified by
-    /// `handle`, emit a final state report, and return. After this
-    /// future resolves successfully the handle is consumed; passing
-    /// it to [`Self::course_correct`] or [`Self::release_custody`]
-    /// again is a caller bug and the warden's response is
-    /// implementation-defined.
-    ///
-    /// Returns [`StewardError::Dispatch`] for the same shelf-kind
-    /// mismatches as [`Self::take_custody`]. Returns
-    /// [`StewardError::Plugin`] on warden-side rejection.
-    pub async fn release_custody(
-        &self,
-        shelf: &str,
-        handle: CustodyHandle,
-    ) -> Result<(), StewardError> {
-        self.router.release_custody(shelf, handle).await
-    }
-
     /// Run a health check against every admitted plugin, returning a
     /// vector of (plugin name, report) pairs.
     pub async fn health_check_all(&self) -> Vec<(String, HealthReport)> {
@@ -2055,7 +1946,11 @@ response_budget_ms = 1000
             correlation_id: 1,
             deadline: None,
         };
-        let resp = engine.handle_request("test.ping", req).await.unwrap();
+        let resp = engine
+            .router()
+            .handle_request("test.ping", req)
+            .await
+            .unwrap();
         assert_eq!(resp.payload, b"hello");
     }
 
@@ -2068,7 +1963,7 @@ response_budget_ms = 1000
             correlation_id: 1,
             deadline: None,
         };
-        let r = engine.handle_request("missing.shelf", req).await;
+        let r = engine.router().handle_request("missing.shelf", req).await;
         assert!(matches!(r, Err(StewardError::Dispatch(_))));
     }
 
@@ -2863,6 +2758,7 @@ custody_failure_mode = "abort"
             .unwrap();
 
         let handle = engine
+            .router()
             .take_custody(
                 "test.custody",
                 "playback".into(),
@@ -2891,10 +2787,12 @@ custody_failure_mode = "abort"
             .unwrap();
 
         let handle = engine
+            .router()
             .take_custody("test.custody", "playback".into(), vec![], None)
             .await
             .unwrap();
         engine
+            .router()
             .course_correct(
                 "test.custody",
                 &handle,
@@ -2921,10 +2819,12 @@ custody_failure_mode = "abort"
             .unwrap();
 
         let handle = engine
+            .router()
             .take_custody("test.custody", "playback".into(), vec![], None)
             .await
             .unwrap();
         engine
+            .router()
             .release_custody("test.custody", handle)
             .await
             .unwrap();
@@ -2951,7 +2851,7 @@ custody_failure_mode = "abort"
             correlation_id: 1,
             deadline: None,
         };
-        let r = engine.handle_request("test.custody", req).await;
+        let r = engine.router().handle_request("test.custody", req).await;
         match r {
             Err(StewardError::Dispatch(msg)) => {
                 assert!(
@@ -2977,6 +2877,7 @@ custody_failure_mode = "abort"
             .unwrap();
 
         let r = engine
+            .router()
             .take_custody("test.ping", "playback".into(), vec![], None)
             .await;
         match r {
@@ -3038,6 +2939,7 @@ custody_failure_mode = "abort"
         assert_eq!(engine.custody_ledger().len(), 0);
 
         let handle = engine
+            .router()
             .take_custody(
                 "test.custody",
                 "playback".into(),
@@ -3079,12 +2981,14 @@ custody_failure_mode = "abort"
             .unwrap();
 
         let handle = engine
+            .router()
             .take_custody("test.custody", "playback".into(), vec![], None)
             .await
             .unwrap();
         assert_eq!(engine.custody_ledger().len(), 1);
 
         engine
+            .router()
             .release_custody("test.custody", handle)
             .await
             .unwrap();
@@ -3127,6 +3031,7 @@ custody_failure_mode = "abort"
             .unwrap();
 
         let _handle = engine
+            .router()
             .take_custody("test.custody", "playback".into(), vec![], None)
             .await
             .unwrap();
@@ -3166,6 +3071,7 @@ custody_failure_mode = "abort"
         let mut rx = engine.happening_bus().subscribe();
 
         let handle = engine
+            .router()
             .take_custody(
                 "test.custody",
                 "playback".into(),
@@ -3211,6 +3117,7 @@ custody_failure_mode = "abort"
             .unwrap();
 
         let handle = engine
+            .router()
             .take_custody("test.custody", "playback".into(), vec![], None)
             .await
             .unwrap();
@@ -3222,6 +3129,7 @@ custody_failure_mode = "abort"
         let handle_id = handle.id.clone();
 
         engine
+            .router()
             .release_custody("test.custody", handle)
             .await
             .unwrap();
@@ -3260,10 +3168,12 @@ custody_failure_mode = "abort"
         let mut rx = engine.happening_bus().subscribe();
 
         let handle = engine
+            .router()
             .take_custody("test.custody", "playback".into(), vec![], None)
             .await
             .unwrap();
         engine
+            .router()
             .release_custody("test.custody", handle)
             .await
             .unwrap();
@@ -3339,6 +3249,7 @@ custody_failure_mode = "abort"
             .await
             .unwrap();
         let _handle = engine
+            .router()
             .take_custody("test.custody", "playback".into(), vec![], None)
             .await
             .unwrap();
