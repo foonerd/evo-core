@@ -7,11 +7,9 @@
 //!
 //! The router is split out from
 //! [`AdmissionEngine`](crate::admission::AdmissionEngine) so dispatch
-//! does not have to lock the engine. Today the engine still wraps
-//! the router in its own mutex (see
-//! `server.rs::handle_plugin_request`); a follow-up pass changes the
-//! server to call the router directly and take advantage of the
-//! lookup-clone-drop pattern below.
+//! does not have to lock the engine. The server dispatches through
+//! the router directly; the engine only holds its own mutex during
+//! the shutdown drain.
 //!
 //! ## Lookup-clone-drop pattern
 //!
@@ -30,6 +28,67 @@
 //! deliberately different primitives: the outer lock is held only
 //! for table reads (no await), and the inner per-entry lock is the
 //! one held across a plugin's async work.
+//!
+//! ## Lock-discipline invariants
+//!
+//! These invariants hold for every dispatch site in this module and
+//! must continue to hold under any future refactor. They are pinned
+//! by tests (see "Verification" below) but are also stated here as a
+//! source-of-truth for reviewers.
+//!
+//! 1. **The outer `RwLock` guard is held only across the table
+//!    lookup. It is never held across an `await`.** Holding it across
+//!    an await would either make the future `!Send` (and so refuse to
+//!    schedule on the multi-threaded runtime) or, if the guard type
+//!    becomes `Send`, deadlock under a writer waiting on the lock.
+//!    Every method below acquires the guard, performs at most a
+//!    `HashMap::get` plus an `Arc::clone`, then drops the guard before
+//!    the first `.await`.
+//!
+//! 2. **Per-entry async mutex serialises calls to one plugin's
+//!    handle but does not block other plugins.** Two requests on the
+//!    same shelf serialise on that entry's `handle: AsyncMutex`, but
+//!    two requests on different shelves never share a lock. The
+//!    overlap test in `tests/concurrency.rs` pins this: two slow
+//!    handlers on different shelves must be observed running
+//!    concurrently.
+//!
+//! 3. **Cloning `Arc<PluginEntry>` out of the read guard is the
+//!    discipline; the `Arc` lives independent of the router's
+//!    lifetime.** Dispatch obtains its `Arc` via [`Self::lookup`] (or
+//!    a public helper that calls it), drops the read guard inside
+//!    that call, and proceeds with the cloned `Arc`. The cloned `Arc`
+//!    keeps the entry alive even if the router is concurrently
+//!    drained or dropped.
+//!
+//! ## Verification
+//!
+//! Two test surfaces pin the discipline. Both run as part of the
+//! test gate, with one of them gated behind `--cfg loom`:
+//!
+//! - **Property tests** (`tests/router_proptest.rs`): exercise the
+//!   actual [`PluginRouter`] across randomised insert/lookup/drain
+//!   sequences and assert the table-state invariants directly. Run
+//!   under the standard `cargo test` invocation.
+//!
+//! - **Loom model-checking** (`crates/evo-loom/tests/loom_router.rs`):
+//!   pins invariant (1) at the synchronisation-shape layer using the
+//!   [`loom`](https://crates.io/crates/loom) permutation-testing
+//!   model checker. The loom test re-implements the
+//!   `RwLock<HashMap<_, Arc<_>>>` shape locally on top of
+//!   `loom::sync::*` (mirroring [`crate::sync::RouterTable`] one to
+//!   one) so the model checker can permute every interleaving. Loom
+//!   tests are gated out of the default build and live in the
+//!   stand-alone `evo-loom` crate (not a workspace member, so
+//!   `cargo test --workspace` does not touch them); run them with
+//!   `RUSTFLAGS="--cfg loom" cargo test --manifest-path
+//!   crates/evo-loom/Cargo.toml --test loom_router --release`.
+//!
+//! The per-entry `tokio::sync::Mutex` is intentionally not
+//! loom-tested: tokio's async primitives are not loom-instrumented.
+//! Invariant (2) is therefore pinned by the property tests'
+//! `Arc::ptr_eq` assertions plus the integration-level overlap test
+//! in `tests/concurrency.rs`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

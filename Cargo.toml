@@ -9,6 +9,16 @@ members = [
     "crates/evo-plugin-tool",
     "crates/evo-trust",
 ]
+# `crates/evo-loom` is intentionally NOT a workspace member. It hosts
+# loom model-checking tests for the router's lookup-clone-drop
+# discipline; running those tests requires `RUSTFLAGS="--cfg loom"`,
+# which is a global rustc flag. tokio's source has internal
+# `cfg(loom)` gates that disable its real-I/O surface (`tokio::fs`,
+# `tokio::process`) under loom, and the evo library uses both. Keeping
+# `evo-loom` excluded means `cargo test --workspace` does not touch
+# it and the loom invocation only recompiles `evo-loom` plus loom
+# itself. See `crates/evo-loom/Cargo.toml` for the run command.
+exclude = ["crates/evo-loom"]
 
 # Further crates will be added here as they are authored. Engineering-layer
 # documents in docs/ remain the source of truth; every public type in a

@@ -38,5 +38,20 @@ evo-example-echo = { path = "../evo-example-echo" }
 tempfile = "3"
 proptest = "1"
 
+# Loom model-checking tests for the router's lookup-clone-drop
+# discipline live in the stand-alone `crates/evo-loom` crate, NOT in
+# this crate's `tests/` directory. The reason: `RUSTFLAGS="--cfg loom"`
+# is a global rustc flag, and tokio's source has internal `cfg(loom)`
+# gates that disable its real-I/O surface (`tokio::fs`,
+# `tokio::process`) under loom. The evo library uses both, so the
+# library cannot itself be built under `--cfg loom`. Hosting the loom
+# tests in a separate non-workspace-member crate keeps the loom
+# invocation scoped to that crate plus loom itself.
+#
+# Run loom tests with:
+#   RUSTFLAGS="--cfg loom" cargo test \
+#       --manifest-path crates/evo-loom/Cargo.toml \
+#       --test loom_router --release
+
 [lints]
 workspace = true

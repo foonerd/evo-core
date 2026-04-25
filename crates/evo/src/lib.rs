@@ -33,6 +33,11 @@
 //! - [`state`]: immutable handle bag of shared steward stores
 //!   ([`state::StewardState`]). Built once at boot; consumed by
 //!   future passes that decouple dispatch from the per-engine mutex.
+//! - [`sync`]: shape model of the router's table-of-`Arc`s
+//!   synchronisation core. Hosts the [`sync::RouterTable`] type used
+//!   by the property tests in `tests/router_proptest.rs`. Mirrored
+//!   one-to-one (against loom's instrumented primitives) by the
+//!   stand-alone `evo-loom` crate's loom model-checking test.
 //! - [`logging`]: tracing subscriber setup per the LOGGING contract.
 //! - [`wire_client`]: steward-side client for out-of-process plugins
 //!   speaking the wire protocol from `PLUGIN_CONTRACT.md` sections 6
@@ -73,6 +78,7 @@ pub mod server;
 pub mod shutdown;
 pub mod state;
 pub mod subjects;
+pub mod sync;
 pub mod wire_client;
 
 pub use error::StewardError;
