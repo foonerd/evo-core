@@ -39,6 +39,7 @@ use crate::relations::{
     ForcedRetractClaimOutcome, RelationGraph, RelationKey,
     ResolvedSplitAssignment, SuppressOutcome, UnsuppressOutcome,
 };
+use crate::router::PluginRouter;
 use crate::subjects::{
     ForcedRetractAddressingOutcome, SubjectRegistry, SubjectRetractOutcome,
 };
@@ -810,12 +811,16 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
 /// primitive
 /// ([`SubjectRegistry::forced_retract_addressing`](crate::subjects::SubjectRegistry::forced_retract_addressing)):
 ///
-/// 1. Refuse `target_plugin == self admin_plugin` with
+/// 1. Refuse a `target_plugin` not currently admitted on any shelf
+///    with [`ReportError::TargetPluginUnknown`]. This guards against
+///    operator typos that would otherwise pass through to the
+///    storage layer and silently no-op.
+/// 2. Refuse `target_plugin == self admin_plugin` with
 ///    [`ReportError::Invalid`] to preserve provenance integrity.
-/// 2. On [`ForcedRetractAddressingOutcome::AddressingRemoved`]:
+/// 3. On [`ForcedRetractAddressingOutcome::AddressingRemoved`]:
 ///    emit [`Happening::SubjectAddressingForcedRetract`] and
 ///    record an [`AdminLedger`] entry.
-/// 3. On [`ForcedRetractAddressingOutcome::SubjectForgotten`]:
+/// 4. On [`ForcedRetractAddressingOutcome::SubjectForgotten`]:
 ///    emit `Happening::SubjectAddressingForcedRetract` FIRST,
 ///    then [`Happening::SubjectForgotten`], then cascade into the
 ///    relation graph and emit one
@@ -823,9 +828,11 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
 ///    reason
 ///    [`RelationForgottenReason::SubjectCascade`]. Record the
 ///    audit-log entry after the cascade.
-/// 4. On [`ForcedRetractAddressingOutcome::NotFound`]: return
+/// 5. On [`ForcedRetractAddressingOutcome::NotFound`]: return
 ///    `Ok(())` silently and do not log to the ledger. Admin tooling
-///    can sweep without error noise for entries already cleaned.
+///    can sweep without error noise for entries already cleaned on
+///    a real plugin (the existence check in step 1 already filtered
+///    typoed plugin names).
 #[derive(Debug)]
 pub struct RegistrySubjectAdmin {
     registry: Arc<SubjectRegistry>,
@@ -833,25 +840,33 @@ pub struct RegistrySubjectAdmin {
     catalogue: Arc<Catalogue>,
     bus: Arc<HappeningBus>,
     ledger: Arc<AdminLedger>,
+    router: Arc<PluginRouter>,
     admin_plugin: String,
 }
 
 impl RegistrySubjectAdmin {
     /// Construct a subject-admin announcer bound to the shared
-    /// registry, graph, catalogue, happenings bus, and admin
-    /// ledger, tagged with the admin plugin's canonical name.
+    /// registry, graph, catalogue, happenings bus, admin ledger,
+    /// and plugin router, tagged with the admin plugin's canonical
+    /// name.
     ///
     /// The `catalogue` Arc is held today for symmetry with the
     /// existing [`RegistrySubjectAnnouncer`] surface; future SDK
     /// extensions use it for the split primitive's subject-type
     /// invariants, so carrying it now avoids a follow-up signature
     /// change.
+    ///
+    /// The `router` Arc is consulted on every forced-retract call
+    /// to refuse `target_plugin` arguments that do not name a
+    /// currently-admitted plugin (typo guard); see
+    /// [`PluginRouter::contains_plugin`].
     pub fn new(
         registry: Arc<SubjectRegistry>,
         graph: Arc<RelationGraph>,
         catalogue: Arc<Catalogue>,
         bus: Arc<HappeningBus>,
         ledger: Arc<AdminLedger>,
+        router: Arc<PluginRouter>,
         admin_plugin: impl Into<String>,
     ) -> Self {
         Self {
@@ -860,6 +875,7 @@ impl RegistrySubjectAdmin {
             catalogue,
             bus,
             ledger,
+            router,
             admin_plugin: admin_plugin.into(),
         }
     }
@@ -877,6 +893,7 @@ impl SubjectAdmin for RegistrySubjectAdmin {
         let graph = Arc::clone(&self.graph);
         let bus = Arc::clone(&self.bus);
         let ledger = Arc::clone(&self.ledger);
+        let router = Arc::clone(&self.router);
         let admin_plugin = self.admin_plugin.clone();
         // Carry a catalogue Arc clone for parity with the
         // announcer pattern; unused on the retract path today
@@ -885,6 +902,24 @@ impl SubjectAdmin for RegistrySubjectAdmin {
         // beyond one Arc clone.
         let _catalogue = Arc::clone(&self.catalogue);
         Box::pin(async move {
+            // Existence guard: refuse a target_plugin that is not
+            // currently admitted. Without this check a typoed
+            // plugin name (e.g. "org.foo.adminn" for "org.foo.admin")
+            // would slip past the structural self-check below and
+            // reach the storage primitive, which would silently
+            // no-op because no addressing on any subject carries a
+            // claim from a non-existent plugin. The operator would
+            // see Ok(()), the audit ledger would record nothing,
+            // and the intended retract would never have happened.
+            // The existence check runs FIRST so a typoed self-name
+            // surfaces as TargetPluginUnknown rather than passing
+            // the structural self-check.
+            if !router.contains_plugin(&target_plugin) {
+                return Err(ReportError::TargetPluginUnknown {
+                    plugin: target_plugin,
+                });
+            }
+
             // Provenance invariant: admin cannot retract its own
             // claims via this path. A self-targeted forced retract
             // would record in the audit ledger that the admin
@@ -1648,21 +1683,26 @@ impl SubjectAdmin for RegistrySubjectAdmin {
 /// Wiring-layer responsibilities on top of
 /// [`RelationGraph::forced_retract_claim`](crate::relations::RelationGraph::forced_retract_claim):
 ///
-/// 1. Refuse `target_plugin == self admin_plugin` with
+/// 1. Refuse a `target_plugin` not currently admitted on any shelf
+///    with [`ReportError::TargetPluginUnknown`]. Typo guard: a
+///    misspelled plugin name would otherwise slip past the
+///    structural self-check below and silently no-op at the
+///    storage layer.
+/// 2. Refuse `target_plugin == self admin_plugin` with
 ///    [`ReportError::Invalid`].
-/// 2. Resolve `source` and `target` addressings via the registry.
+/// 3. Resolve `source` and `target` addressings via the registry.
 ///    Unresolvable addressings are a silent no-op (NotFound
 ///    discipline).
-/// 3. On [`ForcedRetractClaimOutcome::ClaimRemoved`]: emit
+/// 4. On [`ForcedRetractClaimOutcome::ClaimRemoved`]: emit
 ///    [`Happening::RelationClaimForcedRetract`] and record an
 ///    [`AdminLedger`] entry.
-/// 4. On [`ForcedRetractClaimOutcome::RelationForgotten`]: emit
+/// 5. On [`ForcedRetractClaimOutcome::RelationForgotten`]: emit
 ///    `Happening::RelationClaimForcedRetract` FIRST, then
 ///    [`Happening::RelationForgotten`] with
 ///    [`RelationForgottenReason::ClaimsRetracted`] naming the
 ///    ADMIN plugin as `retracting_plugin`. Record the audit
 ///    entry.
-/// 5. On [`ForcedRetractClaimOutcome::NotFound`]: return
+/// 6. On [`ForcedRetractClaimOutcome::NotFound`]: return
 ///    `Ok(())` silently.
 #[derive(Debug)]
 pub struct RegistryRelationAdmin {
@@ -1671,19 +1711,27 @@ pub struct RegistryRelationAdmin {
     catalogue: Arc<Catalogue>,
     bus: Arc<HappeningBus>,
     ledger: Arc<AdminLedger>,
+    router: Arc<PluginRouter>,
     admin_plugin: String,
 }
 
 impl RegistryRelationAdmin {
     /// Construct a relation-admin announcer bound to the shared
-    /// registry, graph, catalogue, happenings bus, and admin
-    /// ledger, tagged with the admin plugin's canonical name.
+    /// registry, graph, catalogue, happenings bus, admin ledger,
+    /// and plugin router, tagged with the admin plugin's canonical
+    /// name.
+    ///
+    /// The `router` Arc is consulted on every forced-retract call
+    /// to refuse `target_plugin` arguments that do not name a
+    /// currently-admitted plugin (typo guard); see
+    /// [`PluginRouter::contains_plugin`].
     pub fn new(
         registry: Arc<SubjectRegistry>,
         graph: Arc<RelationGraph>,
         catalogue: Arc<Catalogue>,
         bus: Arc<HappeningBus>,
         ledger: Arc<AdminLedger>,
+        router: Arc<PluginRouter>,
         admin_plugin: impl Into<String>,
     ) -> Self {
         Self {
@@ -1692,6 +1740,7 @@ impl RegistryRelationAdmin {
             catalogue,
             bus,
             ledger,
+            router,
             admin_plugin: admin_plugin.into(),
         }
     }
@@ -1711,9 +1760,23 @@ impl RelationAdmin for RegistryRelationAdmin {
         let graph = Arc::clone(&self.graph);
         let bus = Arc::clone(&self.bus);
         let ledger = Arc::clone(&self.ledger);
+        let router = Arc::clone(&self.router);
         let admin_plugin = self.admin_plugin.clone();
         let _catalogue = Arc::clone(&self.catalogue);
         Box::pin(async move {
+            // Existence guard: refuse a target_plugin that is not
+            // currently admitted. Without this check a typoed
+            // plugin name would slip past the structural self-check
+            // below and reach the storage primitive, which would
+            // silently no-op because no claim on any relation is
+            // owned by a non-existent plugin. Runs FIRST so a
+            // typoed self-name surfaces as TargetPluginUnknown.
+            if !router.contains_plugin(&target_plugin) {
+                return Err(ReportError::TargetPluginUnknown {
+                    plugin: target_plugin,
+                });
+            }
+
             if target_plugin == admin_plugin {
                 return Err(ReportError::Invalid(format!(
                     "forced_retract_claim: admin plugin {admin_plugin} \
@@ -3995,6 +4058,133 @@ target_type = "*"
     // - NotFound outcomes are silent no-ops.
     // -----------------------------------------------------------------
 
+    /// Build a router with a set of admitted plugin names so the
+    /// admin-wiring existence guard accepts those names as
+    /// targets. The shelf qualifier per entry is synthesised
+    /// (`test.<plugin_name>`) and is not load-bearing for these
+    /// tests, which never dispatch through the router. The
+    /// per-entry handle is a no-op `EchoRespondent` parallel to
+    /// the router-test fixture.
+    fn router_with_plugins(plugin_names: &[&str]) -> Arc<PluginRouter> {
+        use crate::admission::{
+            AdmittedHandle, ErasedRespondent, RespondentAdapter,
+        };
+        use crate::router::PluginEntry;
+
+        let router = Arc::new(PluginRouter::new(
+            crate::state::StewardState::for_tests(),
+        ));
+        for (i, name) in plugin_names.iter().enumerate() {
+            let r: Box<dyn ErasedRespondent> =
+                Box::new(RespondentAdapter::new(AdminTestRespondent {
+                    name: (*name).to_string(),
+                }));
+            let handle = AdmittedHandle::Respondent(r);
+            // Synthetic shelf per entry: shelves are unique within
+            // a router but are otherwise irrelevant to admin-wiring
+            // tests, which look up plugins by name.
+            let shelf = format!("test.shelf{i}");
+            let entry =
+                Arc::new(PluginEntry::new((*name).to_string(), shelf, handle));
+            router.insert(entry).expect("router insert");
+        }
+        router
+    }
+
+    /// Inert respondent used only to populate the router with
+    /// admitted plugin names for the admin-wiring tests. Never
+    /// actually dispatched to.
+    struct AdminTestRespondent {
+        name: String,
+    }
+
+    impl evo_plugin_sdk::contract::Plugin for AdminTestRespondent {
+        fn describe(
+            &self,
+        ) -> impl Future<Output = evo_plugin_sdk::contract::PluginDescription>
+               + Send
+               + '_ {
+            async move {
+                evo_plugin_sdk::contract::PluginDescription {
+                    identity: evo_plugin_sdk::contract::PluginIdentity {
+                        name: self.name.clone(),
+                        version: semver::Version::new(0, 1, 0),
+                        contract: 1,
+                    },
+                    runtime_capabilities:
+                        evo_plugin_sdk::contract::RuntimeCapabilities {
+                            request_types: vec![],
+                            accepts_custody: false,
+                            flags: Default::default(),
+                        },
+                    build_info: evo_plugin_sdk::contract::BuildInfo {
+                        plugin_build: "test".into(),
+                        sdk_version: "0.1.0".into(),
+                        rustc_version: None,
+                        built_at: None,
+                    },
+                }
+            }
+        }
+
+        fn load<'a>(
+            &'a mut self,
+            _ctx: &'a evo_plugin_sdk::contract::LoadContext,
+        ) -> impl Future<
+            Output = Result<(), evo_plugin_sdk::contract::PluginError>,
+        > + Send
+               + 'a {
+            async move { Ok(()) }
+        }
+
+        fn unload(
+            &mut self,
+        ) -> impl Future<
+            Output = Result<(), evo_plugin_sdk::contract::PluginError>,
+        > + Send
+               + '_ {
+            async move { Ok(()) }
+        }
+
+        fn health_check(
+            &self,
+        ) -> impl Future<Output = evo_plugin_sdk::contract::HealthReport> + Send + '_
+        {
+            async move { evo_plugin_sdk::contract::HealthReport::healthy() }
+        }
+    }
+
+    impl evo_plugin_sdk::contract::Respondent for AdminTestRespondent {
+        fn handle_request<'a>(
+            &'a mut self,
+            req: &'a evo_plugin_sdk::contract::Request,
+        ) -> impl Future<
+            Output = Result<
+                evo_plugin_sdk::contract::Response,
+                evo_plugin_sdk::contract::PluginError,
+            >,
+        > + Send
+               + 'a {
+            async move {
+                Ok(evo_plugin_sdk::contract::Response::for_request(
+                    req,
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    /// Set of canonical plugin names automatically admitted into
+    /// the test router by [`build_subject_admin`] /
+    /// [`build_relation_admin`]. Existing admin-wiring tests target
+    /// plugins by these names; admitting them by default keeps
+    /// the per-test harness terse and lets tests that need to
+    /// verify the wiring's existence guard (typo / unknown plugin)
+    /// either pass an explicit router via the `_with_router`
+    /// variant or pick a name not in this set.
+    const ADMIN_TEST_ADMITTED_PLUGINS: &[&str] =
+        &["admin.plugin", "org.test.p1", "org.test.p2", "org.test.p3"];
+
     fn build_subject_admin(
         registry: &Arc<SubjectRegistry>,
         graph: &Arc<RelationGraph>,
@@ -4003,12 +4193,34 @@ target_type = "*"
         ledger: &Arc<AdminLedger>,
         admin_plugin: &str,
     ) -> RegistrySubjectAdmin {
+        let router = router_with_plugins(ADMIN_TEST_ADMITTED_PLUGINS);
+        build_subject_admin_with_router(
+            registry,
+            graph,
+            catalogue,
+            bus,
+            ledger,
+            &router,
+            admin_plugin,
+        )
+    }
+
+    fn build_subject_admin_with_router(
+        registry: &Arc<SubjectRegistry>,
+        graph: &Arc<RelationGraph>,
+        catalogue: &Arc<crate::catalogue::Catalogue>,
+        bus: &Arc<HappeningBus>,
+        ledger: &Arc<AdminLedger>,
+        router: &Arc<PluginRouter>,
+        admin_plugin: &str,
+    ) -> RegistrySubjectAdmin {
         RegistrySubjectAdmin::new(
             Arc::clone(registry),
             Arc::clone(graph),
             Arc::clone(catalogue),
             Arc::clone(bus),
             Arc::clone(ledger),
+            Arc::clone(router),
             admin_plugin,
         )
     }
@@ -4021,12 +4233,34 @@ target_type = "*"
         ledger: &Arc<AdminLedger>,
         admin_plugin: &str,
     ) -> RegistryRelationAdmin {
+        let router = router_with_plugins(ADMIN_TEST_ADMITTED_PLUGINS);
+        build_relation_admin_with_router(
+            registry,
+            graph,
+            catalogue,
+            bus,
+            ledger,
+            &router,
+            admin_plugin,
+        )
+    }
+
+    fn build_relation_admin_with_router(
+        registry: &Arc<SubjectRegistry>,
+        graph: &Arc<RelationGraph>,
+        catalogue: &Arc<crate::catalogue::Catalogue>,
+        bus: &Arc<HappeningBus>,
+        ledger: &Arc<AdminLedger>,
+        router: &Arc<PluginRouter>,
+        admin_plugin: &str,
+    ) -> RegistryRelationAdmin {
         RegistryRelationAdmin::new(
             Arc::clone(registry),
             Arc::clone(graph),
             Arc::clone(catalogue),
             Arc::clone(bus),
             Arc::clone(ledger),
+            Arc::clone(router),
             admin_plugin,
         )
     }
@@ -4572,6 +4806,220 @@ target_type = "*"
             "self-target must return Invalid, got {result:?}"
         );
         assert_eq!(graph.claim_count(), 1);
+        assert_eq!(ledger.count(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Existence guard: positive plugin-existence check at the
+    // wiring layer. A target_plugin not currently admitted on any
+    // shelf surfaces TargetPluginUnknown rather than reaching the
+    // storage primitive, where it would silently no-op and erase
+    // the operator's signal.
+    //
+    // The check runs BEFORE the structural self-refusal so a
+    // typoed self-name (e.g. "admin.pluginn" for "admin.plugin")
+    // surfaces the existence error rather than slipping past the
+    // self-check on string-equality grounds.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn forced_retract_addressing_with_unknown_target_plugin_returns_typed_error(
+    ) {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        // Two real plugins on the router: "a" (admin) and "b".
+        // "c" is never admitted; the admin call below names "c"
+        // as the target.
+        let router = router_with_plugins(&["a", "b"]);
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "b",
+            )
+            .unwrap();
+        let addr_count_before = registry.addressing_count();
+
+        let admin = build_subject_admin_with_router(
+            &registry, &graph, &catalogue, &bus, &ledger, &router, "a",
+        );
+
+        let mut rx = bus.subscribe();
+
+        let result = admin
+            .forced_retract_addressing(
+                "c".into(),
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                Some("typo".into()),
+            )
+            .await;
+
+        match result {
+            Err(ReportError::TargetPluginUnknown { plugin }) => {
+                assert_eq!(plugin, "c");
+            }
+            other => panic!(
+                "unknown target plugin must surface \
+                 TargetPluginUnknown, got {other:?}"
+            ),
+        }
+
+        // Registry untouched.
+        assert_eq!(registry.addressing_count(), addr_count_before);
+        // Audit ledger untouched.
+        assert_eq!(ledger.count(), 0);
+        // No happening emitted.
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => {}
+            other => panic!(
+                "TargetPluginUnknown must not emit a happening, got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_retract_claim_with_unknown_target_plugin_returns_typed_error(
+    ) {
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        let router = router_with_plugins(&["a", "b"]);
+
+        seed_track_and_album(&registry, "b");
+
+        let announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "b",
+        );
+        announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+        let claim_count_before = graph.claim_count();
+
+        let admin = build_relation_admin_with_router(
+            &registry, &graph, &catalogue, &bus, &ledger, &router, "a",
+        );
+
+        let mut rx = bus.subscribe();
+
+        let result = admin
+            .forced_retract_claim(
+                "c".into(),
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of".into(),
+                ExternalAddressing::new("mbid", "album-x"),
+                Some("typo".into()),
+            )
+            .await;
+
+        match result {
+            Err(ReportError::TargetPluginUnknown { plugin }) => {
+                assert_eq!(plugin, "c");
+            }
+            other => panic!(
+                "unknown target plugin must surface \
+                 TargetPluginUnknown, got {other:?}"
+            ),
+        }
+
+        // Graph untouched.
+        assert_eq!(graph.claim_count(), claim_count_before);
+        // Audit ledger untouched.
+        assert_eq!(ledger.count(), 0);
+        // No happening emitted.
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => {}
+            other => panic!(
+                "TargetPluginUnknown must not emit a happening, got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_retract_addressing_with_typoed_self_target_plugin_returns_typed_error(
+    ) {
+        // Admin plugin's canonical name is "org.foo.admin"; the
+        // operator typos the target as "org.foo.adminn" (extra
+        // "n"). Without the existence guard the structural
+        // self-check (equality with "org.foo.admin") would PASS
+        // for the typo and the call would reach the storage
+        // primitive, which would silently no-op because
+        // "org.foo.adminn" is not a real plugin. The existence
+        // guard runs FIRST so the typo surfaces as
+        // TargetPluginUnknown.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        // The admin plugin itself is admitted; the typo is not.
+        let router = router_with_plugins(&["org.foo.admin", "org.test.p1"]);
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        let addr_count_before = registry.addressing_count();
+
+        let admin = build_subject_admin_with_router(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            &router,
+            "org.foo.admin",
+        );
+
+        let result = admin
+            .forced_retract_addressing(
+                "org.foo.adminn".into(),
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                None,
+            )
+            .await;
+
+        match result {
+            Err(ReportError::TargetPluginUnknown { plugin }) => {
+                assert_eq!(plugin, "org.foo.adminn");
+            }
+            other => panic!(
+                "typoed self target plugin must surface \
+                 TargetPluginUnknown (existence check fires \
+                 before the structural self-check), got {other:?}"
+            ),
+        }
+
+        // Registry and audit ledger untouched.
+        assert_eq!(registry.addressing_count(), addr_count_before);
         assert_eq!(ledger.count(), 0);
     }
 

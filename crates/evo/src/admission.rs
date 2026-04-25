@@ -581,6 +581,7 @@ impl AdmissionEngine {
             Arc::clone(&self.state.catalogue),
             Arc::clone(&self.state.bus),
             Arc::clone(&self.state.admin),
+            Arc::clone(&self.router),
         );
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -702,6 +703,7 @@ impl AdmissionEngine {
             Arc::clone(&self.state.catalogue),
             Arc::clone(&self.state.bus),
             Arc::clone(&self.state.admin),
+            Arc::clone(&self.router),
         );
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -853,6 +855,7 @@ impl AdmissionEngine {
             Arc::clone(&self.state.catalogue),
             Arc::clone(&self.state.bus),
             Arc::clone(&self.state.admin),
+            Arc::clone(&self.router),
         );
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -997,6 +1000,7 @@ impl AdmissionEngine {
             Arc::clone(&self.state.catalogue),
             Arc::clone(&self.state.bus),
             Arc::clone(&self.state.admin),
+            Arc::clone(&self.router),
         );
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -1899,6 +1903,12 @@ fn check_admin_trust(manifest: &Manifest) -> Result<(), StewardError> {
 /// is handed to the relation announcer so it can emit
 /// [`Happening::RelationCardinalityViolation`] after successful
 /// asserts that exceed the declared cardinality bound on either side.
+// `build_load_context` deliberately takes one Arc per shared
+// service (registry, graph, catalogue, bus, admin ledger, router)
+// to keep each call site a flat list of named handles. Bundling
+// them into a struct would just push the same set of clones one
+// indirection deeper without removing the parameter count.
+#[allow(clippy::too_many_arguments)]
 fn build_load_context(
     plugin_data_root: &Path,
     manifest: &Manifest,
@@ -1907,6 +1917,7 @@ fn build_load_context(
     catalogue: Arc<Catalogue>,
     bus: Arc<HappeningBus>,
     admin_ledger: Arc<AdminLedger>,
+    router: Arc<PluginRouter>,
 ) -> LoadContext {
     let state_dir = plugin_data_root.join(&manifest.plugin.name).join("state");
     let credentials_dir = plugin_data_root
@@ -1920,6 +1931,11 @@ fn build_load_context(
     // check_admin_trust, so by the time we reach here an admin
     // plugin is already known to qualify). Non-admin plugins see
     // None for both fields.
+    //
+    // Both admin announcers carry an `Arc<PluginRouter>` so the
+    // wiring layer can refuse `target_plugin` arguments that do
+    // not name a currently-admitted plugin (typo guard) before
+    // any storage-primitive call.
     let (subject_admin, relation_admin) = if manifest.capabilities.admin {
         let subject_admin: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> =
             Arc::new(RegistrySubjectAdmin::new(
@@ -1928,6 +1944,7 @@ fn build_load_context(
                 Arc::clone(&catalogue),
                 Arc::clone(&bus),
                 Arc::clone(&admin_ledger),
+                Arc::clone(&router),
                 manifest.plugin.name.clone(),
             ));
         let relation_admin: Arc<dyn evo_plugin_sdk::contract::RelationAdmin> =
@@ -1937,6 +1954,7 @@ fn build_load_context(
                 Arc::clone(&catalogue),
                 Arc::clone(&bus),
                 admin_ledger,
+                router,
                 manifest.plugin.name.clone(),
             ));
         (Some(subject_admin), Some(relation_admin))
@@ -4146,6 +4164,7 @@ response_budget_ms = 1000
         let graph = Arc::new(RelationGraph::new());
         let bus = Arc::new(HappeningBus::new());
         let ledger = Arc::new(AdminLedger::new());
+        let router = Arc::new(PluginRouter::new(StewardState::for_tests()));
         let data_root = std::path::PathBuf::from("/tmp");
 
         let ctx = build_load_context(
@@ -4156,6 +4175,7 @@ response_budget_ms = 1000
             Arc::clone(&catalogue),
             bus,
             ledger,
+            router,
         );
         assert!(
             ctx.subject_admin.is_some(),
@@ -4179,6 +4199,7 @@ response_budget_ms = 1000
         let graph = Arc::new(RelationGraph::new());
         let bus = Arc::new(HappeningBus::new());
         let ledger = Arc::new(AdminLedger::new());
+        let router = Arc::new(PluginRouter::new(StewardState::for_tests()));
         let data_root = std::path::PathBuf::from("/tmp");
 
         let ctx = build_load_context(
@@ -4189,6 +4210,7 @@ response_budget_ms = 1000
             Arc::clone(&catalogue),
             bus,
             ledger,
+            router,
         );
         assert!(
             ctx.subject_admin.is_none(),

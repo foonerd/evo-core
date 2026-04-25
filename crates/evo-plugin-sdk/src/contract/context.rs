@@ -261,6 +261,22 @@ pub enum ReportError {
     /// retract, malformed payload, etc.).
     #[error("invalid report: {0}")]
     Invalid(String),
+    /// The wiring rejected the call because the named target plugin
+    /// is not currently admitted. Distinct from a silent storage
+    /// no-op so operators can distinguish a typo from a non-existent
+    /// addressing on a real plugin.
+    ///
+    /// Surfaced today by the privileged admin forced-retract calls
+    /// ([`SubjectAdmin::forced_retract_addressing`] and
+    /// [`RelationAdmin::forced_retract_claim`]) when the
+    /// `target_plugin` argument does not name a plugin that is
+    /// currently admitted on any shelf.
+    #[error("target plugin not admitted: {plugin}")]
+    TargetPluginUnknown {
+        /// The (unknown) plugin name the caller named as the
+        /// retract target.
+        plugin: String,
+    },
     /// Merge refused: the two operator-supplied addressings resolve
     /// to the same canonical subject. Self-merge is a deliberate
     /// operator mistake; the dedicated variant lets callers

@@ -252,6 +252,29 @@ impl PluginRouter {
             .contains_key(shelf)
     }
 
+    /// Returns `true` iff the named plugin is currently admitted on
+    /// any shelf.
+    ///
+    /// The check takes a brief read lock on the router table and
+    /// scans entries for the canonical plugin name. The scan is O(N)
+    /// in the number of admitted plugins; for typical appliance
+    /// scales (tens of plugins) this is negligible. The lock is
+    /// never held across an `await`, so the predicate is safe to
+    /// call from any wiring callback's hot path.
+    ///
+    /// Used by the privileged admin wiring layer to refuse
+    /// forced-retract calls naming a plugin that is not currently
+    /// admitted (typo guard), distinct from the silent no-op the
+    /// storage layer performs when the addressing or claim
+    /// genuinely does not exist on a real plugin.
+    pub fn contains_plugin(&self, plugin_name: &str) -> bool {
+        let inner = self.inner.read().expect("router inner poisoned");
+        inner
+            .by_shelf
+            .values()
+            .any(|entry| entry.name == plugin_name)
+    }
+
     /// Insert a freshly-admitted plugin into the routing table.
     ///
     /// The caller (the admission engine) is responsible for
@@ -783,6 +806,41 @@ mod tests {
         assert!(r.is_empty());
         assert!(!r.contains_shelf("test.ping"));
         assert!(r.lookup("test.ping").is_none());
+    }
+
+    #[tokio::test]
+    async fn contains_plugin_returns_true_only_for_admitted_names() {
+        // Pin the predicate behaviour the admin-wiring existence
+        // check depends on: contains_plugin is true for canonical
+        // plugin names that have been admitted on some shelf, and
+        // false for any other input (typos, never-admitted names,
+        // shelf names mistakenly passed in).
+        let r = fresh_router();
+
+        assert!(!r.contains_plugin("p"));
+        assert!(!r.contains_plugin(""));
+        assert!(!r.contains_plugin("test.ping"));
+
+        r.insert(respondent_entry("p", "test.ping", "p"))
+            .expect("insert should succeed");
+        r.insert(warden_entry("w", "test.custody", "w"))
+            .expect("insert should succeed");
+
+        assert!(r.contains_plugin("p"));
+        assert!(r.contains_plugin("w"));
+        // Shelf qualifier is not a plugin name.
+        assert!(!r.contains_plugin("test.ping"));
+        // Typo of an admitted name is not admitted.
+        assert!(!r.contains_plugin("pp"));
+        assert!(!r.contains_plugin("P"));
+        // Empty string and never-admitted names are not admitted.
+        assert!(!r.contains_plugin(""));
+        assert!(!r.contains_plugin("nobody"));
+
+        // After draining, no admitted names remain.
+        let _ = r.drain_in_reverse_admission_order();
+        assert!(!r.contains_plugin("p"));
+        assert!(!r.contains_plugin("w"));
     }
 
     #[tokio::test]

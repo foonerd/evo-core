@@ -2838,6 +2838,8 @@ name = "album"
         use crate::admin::AdminLedger;
         use crate::admission::ErasedRespondent;
         use crate::context::RegistrySubjectAdmin;
+        use crate::router::PluginRouter;
+        use crate::state::StewardState;
         use evo_plugin_sdk::contract::{
             AliasKind, SubjectAdmin, SubjectAnnouncement,
         };
@@ -2855,6 +2857,9 @@ name = "track"
         );
         let bus = Arc::new(HappeningBus::new());
         let ledger = Arc::new(AdminLedger::new());
+        // Merge does not consult the existence guard (it has no
+        // `target_plugin` argument), so an empty router suffices.
+        let router = Arc::new(PluginRouter::new(StewardState::for_tests()));
 
         registry
             .announce(
@@ -2885,6 +2890,7 @@ name = "track"
             Arc::clone(&catalogue),
             Arc::clone(&bus),
             Arc::clone(&ledger),
+            router,
             "admin.plugin",
         );
         admin
@@ -3006,6 +3012,8 @@ name = "track"
         use crate::admin::AdminLedger;
         use crate::admission::ErasedRespondent;
         use crate::context::RegistrySubjectAdmin;
+        use crate::router::PluginRouter;
+        use crate::state::StewardState;
         use evo_plugin_sdk::contract::{
             AliasKind, SubjectAdmin, SubjectAnnouncement,
         };
@@ -3023,6 +3031,9 @@ name = "track"
         );
         let bus = Arc::new(HappeningBus::new());
         let ledger = Arc::new(AdminLedger::new());
+        // Merge does not consult the existence guard (it has no
+        // `target_plugin` argument), so an empty router suffices.
+        let router = Arc::new(PluginRouter::new(StewardState::for_tests()));
 
         registry
             .announce(
@@ -3062,6 +3073,7 @@ name = "track"
             Arc::clone(&catalogue),
             Arc::clone(&bus),
             Arc::clone(&ledger),
+            router,
             "admin.plugin",
         );
 
