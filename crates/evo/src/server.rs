@@ -143,6 +143,7 @@
 
 use crate::admission::AdmissionEngine;
 use crate::catalogue::Cardinality;
+use crate::context::RegistrySubjectQuerier;
 use crate::custody::{CustodyRecord, StateSnapshot};
 use crate::error::StewardError;
 use crate::happenings::{
@@ -156,7 +157,10 @@ use crate::projections::{
 use crate::relations::WalkDirection;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use evo_plugin_sdk::contract::{HealthStatus, Request, SplitRelationStrategy};
+use evo_plugin_sdk::contract::{
+    AliasRecord, HealthStatus, Request, SplitRelationStrategy, SubjectQuerier,
+    SubjectQueryResult,
+};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -203,6 +207,25 @@ enum ClientRequest {
         /// traversal.
         #[serde(default)]
         scope: ProjectionScopeWire,
+        /// Whether the steward should auto-follow alias chains for
+        /// the given canonical ID. Defaults to `true`. When `false`,
+        /// a queried ID that has been merged or split returns
+        /// `subject: null` plus the populated `aliased_from` so the
+        /// consumer can choose how (or whether) to follow the chain.
+        #[serde(default = "default_follow_aliases")]
+        follow_aliases: bool,
+    },
+    /// Look up alias metadata for a canonical subject ID. See the
+    /// `op = "describe_alias"` section in the module docs for the
+    /// shape and semantics.
+    DescribeAlias {
+        /// Canonical subject ID to inspect.
+        subject_id: String,
+        /// Whether to walk the full alias chain (default `true`).
+        /// When `false`, only the immediate alias record is
+        /// returned (a chain of length 1 with no terminal).
+        #[serde(default = "default_include_chain")]
+        include_chain: bool,
     },
     /// Snapshot the custody ledger - every currently-held custody the
     /// steward has recorded. No fields; v0 returns everything.
@@ -211,6 +234,21 @@ enum ClientRequest {
     /// the connection to streaming mode; see module-level docs for
     /// the sequence of frames the server emits.
     SubscribeHappenings,
+}
+
+/// Default for [`ClientRequest::ProjectSubject::follow_aliases`].
+/// Auto-follow is the consumer-friendly default: callers holding a
+/// stale canonical ID get the terminal subject without a second
+/// round-trip.
+fn default_follow_aliases() -> bool {
+    true
+}
+
+/// Default for [`ClientRequest::DescribeAlias::include_chain`]. Full-
+/// chain walking is the consumer-friendly default; callers wanting
+/// only the immediate hop opt out explicitly.
+fn default_include_chain() -> bool {
+    true
 }
 
 /// Wire form of [`ProjectionScope`]. See module-level docs for JSON
@@ -283,8 +321,10 @@ impl From<ProjectionScopeWire> for ProjectionScope {
 /// A response as it appears on the wire. Untagged: the variant is
 /// disambiguated by the distinct top-level fields of each shape
 /// (`payload_b64` for plugin success, `canonical_id`+`subject_type`
-/// for projections, `active_custodies` for the ledger snapshot,
-/// `error` for failures).
+/// for projections, `subject`+`aliased_from` for alias-aware
+/// projections, `result`+`subject_id` for `describe_alias`,
+/// `active_custodies` for the ledger snapshot, `error` for
+/// failures).
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum ClientResponse {
@@ -295,6 +335,40 @@ enum ClientResponse {
     },
     /// Projection success.
     Projection(SubjectProjectionWire),
+    /// Alias-aware projection envelope. Returned by
+    /// `op = "project_subject"` whenever the queried canonical ID
+    /// resolves through one or more alias records, regardless of
+    /// whether a terminal subject was reached. Distinguished from
+    /// the live-subject [`ClientResponse::Projection`] variant by
+    /// the top-level `aliased_from` key (always present here).
+    ///
+    /// `subject` is populated when the chain resolves to a single
+    /// terminal AND the request did not opt out via
+    /// `follow_aliases: false`; otherwise it serialises as JSON
+    /// `null` so consumers see a predictable
+    /// `{ subject, aliased_from }` shape.
+    ProjectionAliased {
+        /// The terminal subject's projection, or `null` when no
+        /// terminal exists or auto-follow was disabled.
+        subject: Option<Box<SubjectProjectionWire>>,
+        /// Alias-chain metadata for the queried ID.
+        aliased_from: AliasedFromWire,
+    },
+    /// Successful `describe_alias` response. Carries the SDK
+    /// `SubjectQueryResult` (`Found` / `Aliased` / `NotFound`) so
+    /// callers can inspect the chain and any terminal subject.
+    DescribeAliasResponse {
+        /// Always `true` on success; present so the key set
+        /// `{ ok, subject_id, result }` distinguishes this variant
+        /// from every other untagged shape.
+        ok: bool,
+        /// Echoes the queried `subject_id` so callers correlating
+        /// pipelined responses can match without holding state.
+        subject_id: String,
+        /// The lookup outcome, serialised in the SDK's internally-
+        /// tagged form (`kind = "found" | "aliased" | "not_found"`).
+        result: SubjectQueryResult,
+    },
     /// Active custodies snapshot. Shape:
     /// `{ "active_custodies": [ <CustodyRecordWire>, ... ] }`.
     ActiveCustodies {
@@ -383,6 +457,32 @@ struct DegradedReasonWire {
     /// `"dangling_relation"`, etc.
     kind: &'static str,
     detail: Option<String>,
+}
+
+/// Alias-chain metadata attached to a `project_subject` response when
+/// the queried ID has been merged or split. Mirrors the consumer
+/// contract: the queried ID, the chain of [`AliasRecord`] entries
+/// (oldest-first) the steward walked, and the canonical ID of the
+/// terminal subject if the chain resolves to one (`None` when the
+/// chain forks at a split).
+///
+/// `chain` is serialised as the SDK [`AliasRecord`] type's native
+/// JSON form, so the on-wire shape matches the dedicated
+/// `op = "describe_alias"` response and the in-process
+/// [`SubjectQuerier`] callback. Keeping the shape consistent across
+/// surfaces is the point of this Phase: consumers can carry the
+/// same parser through every alias-aware path.
+#[derive(Debug, Serialize)]
+struct AliasedFromWire {
+    /// The canonical ID the consumer originally addressed.
+    queried_id: String,
+    /// The alias chain the steward walked, oldest-first. Length
+    /// is at least 1 whenever this struct is emitted.
+    chain: Vec<AliasRecord>,
+    /// Canonical ID of the terminal subject if the chain resolves
+    /// to a single live subject; `null` if the chain forks (a
+    /// split, or a merge-chain that never reached a live subject).
+    terminal_id: Option<String>,
 }
 
 impl From<SubjectProjection> for SubjectProjectionWire {
@@ -1481,7 +1581,22 @@ async fn dispatch_request(
         ClientRequest::ProjectSubject {
             canonical_id,
             scope,
-        } => handle_project_subject(projections, canonical_id, scope),
+            follow_aliases,
+        } => {
+            handle_project_subject(
+                projections,
+                canonical_id,
+                scope,
+                follow_aliases,
+            )
+            .await
+        }
+        ClientRequest::DescribeAlias {
+            subject_id,
+            include_chain,
+        } => {
+            handle_describe_alias(projections, subject_id, include_chain).await
+        }
         ClientRequest::ListActiveCustodies => {
             handle_list_active_custodies(engine).await
         }
@@ -1599,17 +1714,201 @@ async fn handle_plugin_request(
 }
 
 /// Compose and emit a subject projection (`op = "project_subject"`).
-fn handle_project_subject(
+///
+/// Behaviour:
+///
+/// - If the addressed `canonical_id` resolves to a live subject the
+///   existing [`ClientResponse::Projection`] shape is returned; no
+///   `aliased_from` field is emitted (the live-subject happy path
+///   omits the key entirely rather than serialising it as `null`).
+/// - If the ID has been merged (chain resolves to a single live
+///   terminal) and `follow_aliases == true`, the steward projects
+///   the terminal subject and wraps it in
+///   [`ClientResponse::ProjectionAliased`] so the response carries
+///   both the projection and the chain the consumer's stale ID
+///   walked.
+/// - If the ID has an alias chain but `follow_aliases == false`, or
+///   the chain forks at a split, `subject` serialises as `null` and
+///   the consumer follows the chain entries themselves.
+/// - If the ID is unknown to the registry the existing
+///   `ClientResponse::Error` "unknown subject" shape is preserved
+///   (no `aliased_from`).
+async fn handle_project_subject(
     projections: &Arc<ProjectionEngine>,
     canonical_id: String,
     scope: ProjectionScopeWire,
+    follow_aliases: bool,
 ) -> ClientResponse {
     let scope: ProjectionScope = scope.into();
-    match projections.project_subject(&canonical_id, &scope) {
-        Ok(p) => ClientResponse::Projection(p.into()),
-        Err(ProjectionError::UnknownSubject(id)) => ClientResponse::Error {
-            error: format!("unknown subject: {id}"),
+
+    // The querier reads from the same registry as the projection
+    // engine; constructing it inline keeps the server free of an
+    // extra long-lived field for what is otherwise a stateless
+    // adapter over the registry handle.
+    let querier = RegistrySubjectQuerier::new(projections.registry());
+    let lookup = match querier
+        .describe_subject_with_aliases(canonical_id.clone())
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: format!("describe_subject_with_aliases: {e}"),
+            };
+        }
+    };
+
+    match lookup {
+        SubjectQueryResult::Found { .. } => {
+            // Live-subject path: identical to the pre-Phase-4
+            // behaviour; no `aliased_from` is emitted.
+            match projections.project_subject(&canonical_id, &scope) {
+                Ok(p) => ClientResponse::Projection(p.into()),
+                Err(ProjectionError::UnknownSubject(id)) => {
+                    ClientResponse::Error {
+                        error: format!("unknown subject: {id}"),
+                    }
+                }
+            }
+        }
+        SubjectQueryResult::Aliased { chain, terminal } => {
+            // Mirror the SDK shape on the wire: AliasRecord is
+            // already Serialize, so passing the chain through as-is
+            // matches `op = "describe_alias"` byte-for-byte.
+            let terminal_id =
+                terminal.as_ref().map(|t| t.id.as_str().to_string());
+            let aliased_from = AliasedFromWire {
+                queried_id: canonical_id,
+                chain,
+                terminal_id: terminal_id.clone(),
+            };
+
+            // Auto-follow only when the request opted in (the
+            // default) AND the chain actually resolved to a single
+            // terminal. Forked chains return `subject: null` even
+            // with the auto-follow default.
+            let projected = if follow_aliases {
+                if let Some(t) = terminal_id {
+                    match projections.project_subject(&t, &scope) {
+                        Ok(p) => Some(Box::new(SubjectProjectionWire::from(p))),
+                        // The terminal was reported live by the
+                        // querier; if the projection engine cannot
+                        // find it the registry was mutated under us.
+                        // Surface as an error rather than silently
+                        // returning subject:null.
+                        Err(ProjectionError::UnknownSubject(id)) => {
+                            return ClientResponse::Error {
+                                error: format!(
+                                    "alias terminal vanished during \
+                                     projection: {id}"
+                                ),
+                            };
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            ClientResponse::ProjectionAliased {
+                subject: projected,
+                aliased_from,
+            }
+        }
+        SubjectQueryResult::NotFound => {
+            // Preserve the existing not-found shape verbatim: no
+            // `aliased_from` field, identical error text.
+            ClientResponse::Error {
+                error: format!("unknown subject: {canonical_id}"),
+            }
+        }
+        // `SubjectQueryResult` is `#[non_exhaustive]` per the SDK
+        // contract: future variants must surface as a structured
+        // error on this old client API rather than panicking.
+        _ => ClientResponse::Error {
+            error: "unsupported SubjectQueryResult variant".to_string(),
         },
+    }
+}
+
+/// Look up alias metadata for a canonical subject ID
+/// (`op = "describe_alias"`).
+///
+/// `include_chain == true` (the default) walks the full chain via
+/// [`SubjectQuerier::describe_subject_with_aliases`] and surfaces
+/// the SDK [`SubjectQueryResult`] verbatim. `include_chain == false`
+/// short-circuits to [`SubjectQuerier::describe_alias`] and returns
+/// the immediate hop only — the resulting `Aliased` carries a chain
+/// of length 1 and `terminal: None`, regardless of whether the new
+/// ID is itself live.
+async fn handle_describe_alias(
+    projections: &Arc<ProjectionEngine>,
+    subject_id: String,
+    include_chain: bool,
+) -> ClientResponse {
+    let querier = RegistrySubjectQuerier::new(projections.registry());
+
+    if include_chain {
+        match querier
+            .describe_subject_with_aliases(subject_id.clone())
+            .await
+        {
+            Ok(result) => ClientResponse::DescribeAliasResponse {
+                ok: true,
+                subject_id,
+                result,
+            },
+            Err(e) => ClientResponse::Error {
+                error: format!("describe_subject_with_aliases: {e}"),
+            },
+        }
+    } else {
+        match querier.describe_alias(subject_id.clone()).await {
+            Ok(Some(record)) => {
+                // Single-hop view: caller asked for one record only,
+                // so we wrap it in an `Aliased` with `terminal: None`
+                // even when the `new_ids[0]` happens to be live.
+                let result = SubjectQueryResult::Aliased {
+                    chain: vec![record],
+                    terminal: None,
+                };
+                ClientResponse::DescribeAliasResponse {
+                    ok: true,
+                    subject_id,
+                    result,
+                }
+            }
+            Ok(None) => {
+                // Distinguish "current" from "unknown" the same way
+                // describe_subject_with_aliases does: project the
+                // live subject (if any) into the Found variant; fall
+                // through to NotFound otherwise. The single-hop
+                // contract is `Aliased | Found | NotFound`, never a
+                // bare `None`.
+                match querier
+                    .describe_subject_with_aliases(subject_id.clone())
+                    .await
+                {
+                    Ok(SubjectQueryResult::Found { record }) => {
+                        ClientResponse::DescribeAliasResponse {
+                            ok: true,
+                            subject_id,
+                            result: SubjectQueryResult::Found { record },
+                        }
+                    }
+                    Ok(_) | Err(_) => ClientResponse::DescribeAliasResponse {
+                        ok: true,
+                        subject_id,
+                        result: SubjectQueryResult::NotFound,
+                    },
+                }
+            }
+            Err(e) => ClientResponse::Error {
+                error: format!("describe_alias: {e}"),
+            },
+        }
     }
 }
 
@@ -1674,10 +1973,16 @@ mod tests {
             ClientRequest::ProjectSubject {
                 canonical_id,
                 scope,
+                follow_aliases,
             } => {
                 assert_eq!(canonical_id, "abc-123");
                 assert!(scope.relation_predicates.is_empty());
                 assert!(matches!(scope.direction, WalkDirectionWire::Forward));
+                assert!(
+                    follow_aliases,
+                    "follow_aliases must default to true for the \
+                     auto-follow happy path"
+                );
             }
             other => panic!("expected ProjectSubject, got {other:?}"),
         }
@@ -1698,6 +2003,7 @@ mod tests {
             ClientRequest::ProjectSubject {
                 canonical_id,
                 scope,
+                follow_aliases,
             } => {
                 assert_eq!(canonical_id, "abc-123");
                 assert_eq!(scope.relation_predicates.len(), 2);
@@ -1705,6 +2011,7 @@ mod tests {
                     .relation_predicates
                     .contains(&"album_of".to_string()));
                 assert!(matches!(scope.direction, WalkDirectionWire::Both));
+                assert!(follow_aliases);
             }
             other => panic!("expected ProjectSubject, got {other:?}"),
         }
@@ -1834,6 +2141,143 @@ mod tests {
             }
             other => panic!("expected ProjectSubject, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // describe_alias parse and serialise unit tests. End-to-end
+    // exercise lives in tests/end_to_end.rs.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn client_request_parses_describe_alias_minimal() {
+        let json = r#"{"op":"describe_alias","subject_id":"abc-123"}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::DescribeAlias {
+                subject_id,
+                include_chain,
+            } => {
+                assert_eq!(subject_id, "abc-123");
+                assert!(
+                    include_chain,
+                    "include_chain must default to true to match the \
+                     consumer-friendly default behaviour"
+                );
+            }
+            other => panic!("expected DescribeAlias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_request_parses_describe_alias_include_chain_false() {
+        let json = r#"{
+            "op":"describe_alias",
+            "subject_id":"abc-123",
+            "include_chain":false
+        }"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::DescribeAlias {
+                subject_id,
+                include_chain,
+            } => {
+                assert_eq!(subject_id, "abc-123");
+                assert!(!include_chain);
+            }
+            other => panic!("expected DescribeAlias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_request_parses_project_subject_follow_aliases_false() {
+        let json = r#"{
+            "op":"project_subject",
+            "canonical_id":"abc-123",
+            "follow_aliases":false
+        }"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::ProjectSubject { follow_aliases, .. } => {
+                assert!(
+                    !follow_aliases,
+                    "explicit follow_aliases:false must reach the \
+                     handler so the auto-follow opt-out works"
+                );
+            }
+            other => panic!("expected ProjectSubject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_response_projection_aliased_with_subject_serialises() {
+        // Auto-follow happy path: a merged ID returns the terminal
+        // projection plus aliased_from in the same envelope.
+        let projection = SubjectProjectionWire {
+            canonical_id: "terminal".into(),
+            subject_type: "track".into(),
+            addressings: vec![],
+            related: vec![],
+            composed_at_ms: 0,
+            shape_version: 1,
+            claimants: vec![],
+            degraded: false,
+            degraded_reasons: vec![],
+            walk_truncated: false,
+        };
+        let r = ClientResponse::ProjectionAliased {
+            subject: Some(Box::new(projection)),
+            aliased_from: AliasedFromWire {
+                queried_id: "old-id".into(),
+                chain: vec![],
+                terminal_id: Some("terminal".into()),
+            },
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        // Both keys present: subject populated, aliased_from
+        // distinguishes from the live-subject Projection variant.
+        assert!(!v["subject"].is_null());
+        assert_eq!(v["subject"]["canonical_id"].as_str(), Some("terminal"));
+        assert_eq!(v["aliased_from"]["queried_id"].as_str(), Some("old-id"));
+        assert_eq!(v["aliased_from"]["terminal_id"].as_str(), Some("terminal"));
+        assert!(v["aliased_from"]["chain"].is_array());
+    }
+
+    #[test]
+    fn client_response_projection_aliased_subject_null_serialises() {
+        // follow_aliases:false or split-fork case: subject is JSON
+        // null but the aliased_from envelope is still populated.
+        let r = ClientResponse::ProjectionAliased {
+            subject: None,
+            aliased_from: AliasedFromWire {
+                queried_id: "old-id".into(),
+                chain: vec![],
+                terminal_id: None,
+            },
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(
+            v["subject"].is_null(),
+            "subject must serialise as JSON null when no terminal \
+             is available, not be omitted"
+        );
+        assert!(v["aliased_from"]["terminal_id"].is_null());
+        assert_eq!(v["aliased_from"]["queried_id"].as_str(), Some("old-id"));
+    }
+
+    #[test]
+    fn client_response_describe_alias_response_serialises() {
+        let r = ClientResponse::DescribeAliasResponse {
+            ok: true,
+            subject_id: "abc".into(),
+            result: SubjectQueryResult::NotFound,
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["ok"].as_bool(), Some(true));
+        assert_eq!(v["subject_id"].as_str(), Some("abc"));
+        assert_eq!(v["result"]["kind"].as_str(), Some("not_found"));
     }
 
     #[test]

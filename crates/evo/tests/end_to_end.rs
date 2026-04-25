@@ -729,6 +729,362 @@ async fn subscribe_happenings_delivers_ack_and_events() {
 }
 
 // ---------------------------------------------------------------------
+// project_subject + describe_alias: alias-aware client API surface.
+//
+// Each test below builds a fresh harness, mutates the registry to
+// produce a known alias topology (merge or split), and exercises the
+// client-socket op surface end-to-end. The shared
+// `setup_alias_harness` helper owns the boilerplate around server
+// startup, socket connection, and shutdown so each test reads as a
+// linear story of "produce alias state -> hit op -> assert shape".
+// ---------------------------------------------------------------------
+
+/// Common setup for alias-aware client-API tests. Returns a harness
+/// the test mutates (registry, optional graph) plus a connected
+/// client stream and shutdown plumbing. Caller arranges alias state
+/// via the returned engine, then issues ops over the stream.
+async fn setup_alias_harness() -> (
+    Arc<Mutex<AdmissionEngine>>,
+    UnixStream,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+) {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let stream = UnixStream::connect(&socket_path).await.expect("connect");
+
+    (engine, stream, shutdown_tx, server_task, tmp)
+}
+
+/// Announce two subjects of the same type and merge them via the
+/// registry's `merge_aliases` storage primitive. Returns the two
+/// retired source IDs and the new terminal ID. The engine lock is
+/// released before running merge_aliases so the registry's internal
+/// mutex stays uncontended with the server task.
+async fn merge_two_subjects(
+    engine: &Arc<Mutex<AdmissionEngine>>,
+) -> (String, String, String) {
+    let registry = {
+        let guard = engine.lock().await;
+        guard.registry()
+    };
+
+    let a = SubjectAnnouncement::new(
+        "track",
+        vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+    );
+    let b = SubjectAnnouncement::new(
+        "track",
+        vec![ExternalAddressing::new("mpd-path", "/b.flac")],
+    );
+    let id_a = match registry.announce(&a, "com.test.fixture").unwrap() {
+        evo::subjects::AnnounceOutcome::Created(id) => id,
+        other => panic!("expected Created for a, got {other:?}"),
+    };
+    let id_b = match registry.announce(&b, "com.test.fixture").unwrap() {
+        evo::subjects::AnnounceOutcome::Created(id) => id,
+        other => panic!("expected Created for b, got {other:?}"),
+    };
+
+    let outcome = registry
+        .merge_aliases(&id_a, &id_b, "admin.plugin", Some("dedup".into()))
+        .expect("merge_aliases");
+    let new_id = outcome.new_id;
+
+    (id_a, id_b, new_id)
+}
+
+/// Announce one subject with two addressings and split it across
+/// the partition. Returns the retired source ID and the two new
+/// canonical IDs.
+async fn split_one_subject(
+    engine: &Arc<Mutex<AdmissionEngine>>,
+) -> (String, Vec<String>) {
+    let registry = {
+        let guard = engine.lock().await;
+        guard.registry()
+    };
+
+    let subj = SubjectAnnouncement::new(
+        "track",
+        vec![
+            ExternalAddressing::new("mpd-path", "/x.flac"),
+            ExternalAddressing::new("mpd-path", "/y.flac"),
+        ],
+    );
+    let source_id = match registry.announce(&subj, "com.test.fixture").unwrap()
+    {
+        evo::subjects::AnnounceOutcome::Created(id) => id,
+        other => panic!("expected Created for split source, got {other:?}"),
+    };
+
+    let outcome = registry
+        .split_subject(
+            &source_id,
+            vec![
+                vec![ExternalAddressing::new("mpd-path", "/x.flac")],
+                vec![ExternalAddressing::new("mpd-path", "/y.flac")],
+            ],
+            "admin.plugin",
+            Some("audit".into()),
+        )
+        .expect("split_subject");
+
+    (source_id, outcome.new_ids)
+}
+
+#[tokio::test]
+async fn project_subject_with_aliased_from_when_id_was_merged() {
+    let (engine, mut stream, shutdown_tx, server_task, _tmp) =
+        setup_alias_harness().await;
+    let (id_a, _id_b, new_id) = merge_two_subjects(&engine).await;
+
+    // Query the merged-away ID. Default follow_aliases:true means
+    // the steward auto-follows to the terminal and projects it.
+    let req = format!(r#"{{"op":"project_subject","canonical_id":"{id_a}"}}"#);
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    // subject is populated and is the terminal projection.
+    assert!(
+        !v["subject"].is_null(),
+        "subject must be populated, got: {v}"
+    );
+    assert_eq!(v["subject"]["canonical_id"].as_str(), Some(new_id.as_str()));
+    assert_eq!(v["subject"]["subject_type"].as_str(), Some("track"));
+
+    // aliased_from carries the chain (length 1: single merge hop)
+    // and the terminal_id.
+    let af = &v["aliased_from"];
+    assert_eq!(af["queried_id"].as_str(), Some(id_a.as_str()));
+    assert_eq!(af["terminal_id"].as_str(), Some(new_id.as_str()));
+    let chain = af["chain"].as_array().expect("chain array");
+    assert_eq!(chain.len(), 1, "chain should be length 1, got: {chain:?}");
+    assert_eq!(chain[0]["kind"].as_str(), Some("merged"));
+    assert_eq!(chain[0]["old_id"].as_str(), Some(id_a.as_str()));
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn project_subject_with_aliased_from_when_id_was_split() {
+    let (engine, mut stream, shutdown_tx, server_task, _tmp) =
+        setup_alias_harness().await;
+    let (source_id, new_ids) = split_one_subject(&engine).await;
+
+    let req =
+        format!(r#"{{"op":"project_subject","canonical_id":"{source_id}"}}"#);
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    // subject is null because the chain forked.
+    assert!(
+        v["subject"].is_null(),
+        "subject must be null on split fork, got: {v}"
+    );
+
+    // aliased_from has the split record with terminal_id null.
+    let af = &v["aliased_from"];
+    assert_eq!(af["queried_id"].as_str(), Some(source_id.as_str()));
+    assert!(
+        af["terminal_id"].is_null(),
+        "terminal_id must be null on a split fork, got: {af}"
+    );
+    let chain = af["chain"].as_array().expect("chain array");
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0]["kind"].as_str(), Some("split"));
+    let chain_new_ids: Vec<&str> = chain[0]["new_ids"]
+        .as_array()
+        .expect("new_ids array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    for new_id in &new_ids {
+        assert!(
+            chain_new_ids.contains(&new_id.as_str()),
+            "new_id {new_id} should appear in chain[0].new_ids"
+        );
+    }
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn project_subject_returns_not_found_for_unknown_id_no_alias() {
+    let (engine, mut stream, shutdown_tx, server_task, _tmp) =
+        setup_alias_harness().await;
+
+    let req = r#"{"op":"project_subject","canonical_id":"never-existed"}"#;
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    // Existing NotFound shape: error string, no aliased_from key.
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unknown subject"),
+        "expected unknown subject error, got: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        v.get("aliased_from").is_none(),
+        "aliased_from must be absent when the queried ID is genuinely \
+         unknown, got: {v}"
+    );
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn project_subject_with_follow_aliases_false_does_not_auto_follow() {
+    let (engine, mut stream, shutdown_tx, server_task, _tmp) =
+        setup_alias_harness().await;
+    let (id_a, _id_b, new_id) = merge_two_subjects(&engine).await;
+
+    // Same merge as the auto-follow test, but the request opts out.
+    let req = format!(
+        r#"{{"op":"project_subject","canonical_id":"{id_a}","follow_aliases":false}}"#
+    );
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    assert!(
+        v["subject"].is_null(),
+        "subject must be null when follow_aliases is false, got: {v}"
+    );
+    let af = &v["aliased_from"];
+    assert_eq!(af["queried_id"].as_str(), Some(id_a.as_str()));
+    // terminal_id is still populated: opting out of auto-follow does
+    // not erase the steward's knowledge of where the chain ends, so
+    // the consumer can issue a follow-up project against new_id if
+    // they choose.
+    assert_eq!(af["terminal_id"].as_str(), Some(new_id.as_str()));
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn describe_alias_returns_full_chain_with_include_chain_true_default() {
+    let (engine, mut stream, shutdown_tx, server_task, _tmp) =
+        setup_alias_harness().await;
+    let (id_a, _id_b, new_id) = merge_two_subjects(&engine).await;
+
+    // No include_chain field: default-true walks the chain.
+    let req = format!(r#"{{"op":"describe_alias","subject_id":"{id_a}"}}"#);
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    assert_eq!(v["ok"].as_bool(), Some(true));
+    assert_eq!(v["subject_id"].as_str(), Some(id_a.as_str()));
+    assert_eq!(v["result"]["kind"].as_str(), Some("aliased"));
+    let chain = v["result"]["chain"].as_array().expect("chain");
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0]["kind"].as_str(), Some("merged"));
+    // Terminal is populated because the chain resolves to a live
+    // subject.
+    assert!(!v["result"]["terminal"].is_null());
+    assert_eq!(
+        v["result"]["terminal"]["id"].as_str(),
+        Some(new_id.as_str())
+    );
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn describe_alias_returns_immediate_record_with_include_chain_false() {
+    let (engine, mut stream, shutdown_tx, server_task, _tmp) =
+        setup_alias_harness().await;
+    let (id_a, _id_b, _new_id) = merge_two_subjects(&engine).await;
+
+    let req = format!(
+        r#"{{"op":"describe_alias","subject_id":"{id_a}","include_chain":false}}"#
+    );
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    assert_eq!(v["ok"].as_bool(), Some(true));
+    assert_eq!(v["result"]["kind"].as_str(), Some("aliased"));
+    let chain = v["result"]["chain"].as_array().expect("chain");
+    assert_eq!(
+        chain.len(),
+        1,
+        "single-hop view must carry exactly one record, got: {chain:?}"
+    );
+    // Single-hop view never carries a terminal; the caller decides
+    // whether to chase the new_ids themselves.
+    assert!(
+        v["result"]["terminal"].is_null(),
+        "single-hop must not project a terminal, got: {v}"
+    );
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn describe_alias_returns_not_found_for_unknown_id() {
+    let (engine, mut stream, shutdown_tx, server_task, _tmp) =
+        setup_alias_harness().await;
+
+    let req = r#"{"op":"describe_alias","subject_id":"never-existed"}"#;
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    assert_eq!(v["ok"].as_bool(), Some(true));
+    assert_eq!(v["result"]["kind"].as_str(), Some("not_found"));
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+// ---------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------
 
