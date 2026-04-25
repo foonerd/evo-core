@@ -20,6 +20,7 @@ use evo::catalogue::Catalogue;
 use evo::config::PluginsSecurityConfig;
 use evo::custody::CustodyLedger;
 use evo::happenings::{Happening, HappeningBus};
+use evo::persistence::MemoryPersistenceStore;
 use evo::projections::ProjectionEngine;
 use evo::relations::RelationGraph;
 use evo::server::Server;
@@ -65,6 +66,7 @@ async fn build_harness(
         .custody(Arc::new(CustodyLedger::new()))
         .bus(Arc::new(HappeningBus::new()))
         .admin(Arc::new(AdminLedger::new()))
+        .persistence(Arc::new(MemoryPersistenceStore::new()))
         .build()
         .expect("steward state must build");
 

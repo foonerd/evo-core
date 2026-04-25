@@ -2518,6 +2518,9 @@ response_budget_ms = 1000
             .custody(Arc::new(CustodyLedger::new()))
             .bus(Arc::new(HappeningBus::new()))
             .admin(Arc::new(AdminLedger::new()))
+            .persistence(Arc::new(
+                crate::persistence::MemoryPersistenceStore::new(),
+            ))
             .build()
             .expect("state must build with all handles");
         let mut engine = engine_with_state(state);
@@ -3398,6 +3401,9 @@ custody_failure_mode = "abort"
             .custody(Arc::clone(&ledger))
             .bus(Arc::new(HappeningBus::new()))
             .admin(Arc::new(AdminLedger::new()))
+            .persistence(Arc::new(
+                crate::persistence::MemoryPersistenceStore::new(),
+            ))
             .build()
             .expect("state must build with all handles");
         let mut engine = engine_with_state(state);
@@ -3613,6 +3619,9 @@ custody_failure_mode = "abort"
             .custody(Arc::clone(&ledger))
             .bus(Arc::clone(&bus))
             .admin(Arc::new(AdminLedger::new()))
+            .persistence(Arc::new(
+                crate::persistence::MemoryPersistenceStore::new(),
+            ))
             .build()
             .expect("state must build with all handles");
         let mut engine = engine_with_state(state);

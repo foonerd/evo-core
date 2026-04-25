@@ -23,6 +23,7 @@ use evo::config::PluginsSecurityConfig;
 use evo::custody::CustodyLedger;
 use evo::error::StewardError;
 use evo::happenings::HappeningBus;
+use evo::persistence::MemoryPersistenceStore;
 use evo::relations::RelationGraph;
 use evo::state::StewardState;
 use evo::subjects::SubjectRegistry;
@@ -58,6 +59,7 @@ fn engine_with_catalogue(catalogue: Arc<Catalogue>) -> AdmissionEngine {
         .custody(Arc::new(CustodyLedger::new()))
         .bus(Arc::new(HappeningBus::new()))
         .admin(Arc::new(AdminLedger::new()))
+        .persistence(Arc::new(MemoryPersistenceStore::new()))
         .build()
         .expect("steward state must build");
     AdmissionEngine::new(

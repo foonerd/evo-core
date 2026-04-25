@@ -30,6 +30,17 @@ base64 = "0.22"
 semver = { version = "1", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 
+# Persistence: SQLite via the synchronous rusqlite API.
+# `bundled` compiles SQLite from vendored C source so every target
+# behaves identically regardless of host packaging; `blob` and
+# `serde_json` enable BLOB/JSON column ergonomics the schema relies on.
+rusqlite = { version = "0.31", features = ["bundled", "blob", "serde_json"] }
+# Async wrapper around the synchronous rusqlite API. Each pool
+# connection runs its blocking work on a dedicated thread; the steward
+# `.await`s the join handle so multi-threaded tokio dispatch is not
+# blocked.
+deadpool-sqlite = "0.8"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 tracing-journald = "0.3"
 

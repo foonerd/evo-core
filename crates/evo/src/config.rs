@@ -36,6 +36,12 @@ pub const DEFAULT_CATALOGUE_PATH: &str = "/opt/evo/catalogue/default.toml";
 /// Default location of the steward's client-facing socket.
 pub const DEFAULT_SOCKET_PATH: &str = "/var/run/evo/evo.sock";
 
+/// Default path of the steward's durable state database. The
+/// persistence layer treats this as the canonical SQLite file;
+/// WAL and SHM sidecars live alongside it under the same
+/// directory.
+pub const DEFAULT_PERSISTENCE_PATH: &str = "/var/lib/evo/state/evo.db";
+
 /// Default per-plugin data root: `<this>/<plugin_name>/state` and
 /// `credentials/` (see `PLUGIN_PACKAGING.md`).
 pub const DEFAULT_PLUGIN_DATA_ROOT: &str = "/var/lib/evo/plugins";
@@ -82,6 +88,10 @@ pub struct StewardConfig {
     /// Plugin admission policy.
     #[serde(default)]
     pub plugins: PluginsSection,
+    /// Durable-state persistence. Tunes where the steward's SQLite
+    /// database lives.
+    #[serde(default)]
+    pub persistence: PersistenceSection,
 }
 
 impl StewardConfig {
@@ -167,6 +177,31 @@ fn default_log_level() -> String {
 
 fn default_socket_path() -> PathBuf {
     PathBuf::from(DEFAULT_SOCKET_PATH)
+}
+
+/// `[persistence]` section.
+///
+/// Distributions override `path` to relocate the steward's state
+/// directory. The default suits FHS systems; embedded targets
+/// pointing at a writeable partition supply their own path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistenceSection {
+    /// Path to the SQLite database file. Defaults to
+    /// [`DEFAULT_PERSISTENCE_PATH`].
+    #[serde(default = "default_persistence_path")]
+    pub path: PathBuf,
+}
+
+impl Default for PersistenceSection {
+    fn default() -> Self {
+        Self {
+            path: default_persistence_path(),
+        }
+    }
+}
+
+fn default_persistence_path() -> PathBuf {
+    PathBuf::from(DEFAULT_PERSISTENCE_PATH)
 }
 
 /// `[catalogue]` section.
@@ -340,6 +375,10 @@ mod tests {
         assert_eq!(cfg.steward.log_level, "warn");
         assert_eq!(cfg.steward.socket_path, PathBuf::from(DEFAULT_SOCKET_PATH));
         assert_eq!(cfg.catalogue.path, PathBuf::from(DEFAULT_CATALOGUE_PATH));
+        assert_eq!(
+            cfg.persistence.path,
+            PathBuf::from(DEFAULT_PERSISTENCE_PATH)
+        );
         assert!(!cfg.plugins.allow_unsigned);
         assert_eq!(
             cfg.plugins.plugin_data_root,
@@ -400,6 +439,18 @@ allow_unsigned = true
             PathBuf::from("/etc/evo/catalogue.toml")
         );
         assert!(cfg.plugins.allow_unsigned);
+    }
+
+    #[test]
+    fn persistence_section_overrides_default_path() {
+        let cfg = StewardConfig::from_toml(
+            r#"
+[persistence]
+path = "/tmp/state/evo.db"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.persistence.path, PathBuf::from("/tmp/state/evo.db"));
     }
 
     #[test]

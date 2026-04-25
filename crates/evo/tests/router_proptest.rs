@@ -31,6 +31,7 @@ use evo::admission::{AdmittedHandle, ErasedRespondent, RespondentAdapter};
 use evo::catalogue::Catalogue;
 use evo::custody::CustodyLedger;
 use evo::happenings::HappeningBus;
+use evo::persistence::MemoryPersistenceStore;
 use evo::relations::RelationGraph;
 use evo::router::{PluginEntry, PluginRouter};
 use evo::state::StewardState;
@@ -49,6 +50,7 @@ fn fresh_state() -> Arc<StewardState> {
         .custody(Arc::new(CustodyLedger::new()))
         .bus(Arc::new(HappeningBus::new()))
         .admin(Arc::new(AdminLedger::new()))
+        .persistence(Arc::new(MemoryPersistenceStore::new()))
         .build()
         .expect("steward state must build")
 }

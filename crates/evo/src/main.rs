@@ -28,6 +28,7 @@ use evo::cli::Args;
 use evo::config::StewardConfig;
 use evo::custody::CustodyLedger;
 use evo::happenings::HappeningBus;
+use evo::persistence::{PersistenceStore, SqlitePersistenceStore};
 use evo::plugin_discovery;
 use evo::plugin_trust::load_plugin_trust_arc;
 use evo::projections::ProjectionEngine;
@@ -82,6 +83,28 @@ async fn main() -> anyhow::Result<()> {
         "catalogue loaded"
     );
 
+    // Open the durable persistence store. The file is created if
+    // absent; pragmas (synchronous = FULL, journal_mode = WAL,
+    // foreign_keys = ON, etc.) are applied to every pooled
+    // connection; pending migrations are run before the handle is
+    // returned. The store is unintegrated in Phase 1; Phase 2
+    // wires the subject-registry write path through it.
+    let persistence_path = config.persistence.path.clone();
+    let persistence: Arc<dyn PersistenceStore> = Arc::new(
+        SqlitePersistenceStore::open(persistence_path.clone()).map_err(
+            |e| {
+                anyhow::anyhow!(
+                    "opening persistence store at {}: {e}",
+                    persistence_path.display()
+                )
+            },
+        )?,
+    );
+    tracing::info!(
+        path = %persistence_path.display(),
+        "persistence store opened"
+    );
+
     // Build the shared steward state once: catalogue plus
     // freshly-allocated stores. The same `Arc<StewardState>` is
     // handed to the admission engine and the server so dispatch
@@ -93,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
         .custody(Arc::new(CustodyLedger::new()))
         .bus(Arc::new(HappeningBus::new()))
         .admin(Arc::new(AdminLedger::new()))
+        .persistence(Arc::clone(&persistence))
         .build()?;
 
     // Construct the admission engine and run plugin discovery

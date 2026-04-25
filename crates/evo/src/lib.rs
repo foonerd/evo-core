@@ -38,6 +38,13 @@
 //!   by the property tests in `tests/router_proptest.rs`. Mirrored
 //!   one-to-one (against loom's instrumented primitives) by the
 //!   stand-alone `evo-loom` crate's loom model-checking test.
+//! - [`persistence`]: durable storage for the subject-identity slice
+//!   of the steward's fabric. Defines the schema-aware
+//!   [`persistence::PersistenceStore`] trait and ships an
+//!   SQLite-backed implementation alongside an in-memory mock for
+//!   tests. The trait is unintegrated in Phase 1; subsequent phases
+//!   wire it into the subject registry write path and the boot-time
+//!   replay.
 //! - [`logging`]: tracing subscriber setup per the LOGGING contract.
 //! - [`wire_client`]: steward-side client for out-of-process plugins
 //!   speaking the wire protocol from `PLUGIN_CONTRACT.md` sections 6
@@ -69,6 +76,7 @@ pub mod custody;
 pub mod error;
 pub mod happenings;
 pub mod logging;
+pub mod persistence;
 pub mod plugin_discovery;
 pub mod plugin_trust;
 pub mod projections;

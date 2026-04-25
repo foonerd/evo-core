@@ -1245,3 +1245,19 @@ Named explicitly so future engineering layers know where the open questions live
 | Read replica connections (for projection-heavy workloads) | Performance question; SQLite WAL supports concurrent readers, and the pool already gives concurrent connections; no replica architecture needed until a benchmark disproves this. |
 
 These are not implementation gaps. They are choices deferred to a later layer because the v1 persistence design does not constrain them and each is large enough to merit its own document when picked up.
+
+## 20. Implementation Status
+
+Phased landing plan, tracked here so a reader of this document knows which sections are live in the current build and which describe the eventual destination.
+
+| Phase | Surface | Status |
+| ----- | ------- | ------ |
+| 1 | `PersistenceStore` trait and SQLite-backed `SqlitePersistenceStore` covering the subject-identity slice of section 7's schema (`subjects`, `subject_addressings`, `aliases`, `claim_log`). Trait carried on `StewardState`; `SqlitePersistenceStore` opened from `StewardConfig::persistence.path` (default `/var/lib/evo/state/evo.db`) by the steward binary. Migrations runner shipped at v1 with reserved version slots for later phases. | Landed (unintegrated). |
+| 2 | Subject-registry write path routed through `PersistenceStore`. Every announce / retract / forget operation lands in SQLite before the in-memory registry returns success. | Pending. |
+| 3 | Boot-time replay. The steward rehydrates the subject registry from `load_all_subjects` on startup; alias chains rejoin via `load_aliases_for`. | Pending. |
+| 4 | Relation graph migration (schema v2), relation-store write path through `PersistenceStore`, on-disk relation cardinality re-validation per section 13.4. | Pending. |
+| 5 | Custody ledger migration (schema v3), custody write path, last-state snapshot persistence. | Pending. |
+| 6 | Admin ledger migration (schema v4), admin operations land in `admin_log`, reversibility primitives walk the persisted log per section 14.5. | Pending. |
+| 7 | Trust re-verification on startup per section 12.1; `plugin_trust_snapshot` table; `trust_quarantine` admin-log entries. | Pending. |
+
+Phase 1 ships the trait, the SQLite implementation, the in-memory mock used by every steward-internal test, and a migrations directory whose initial file (`crates/evo/migrations/001_initial.sql`) creates the four subject-identity tables plus the schema-version metadata. The trait's method shape is schema-aware: each fabric operation maps to one transaction touching every affected table atomically, satisfying the multi-table durability promise from section 4.3 even before any caller is wired through. Subsequent phases append migrations rather than renumber: schema versions 2, 3, and 4 are reserved for the relation graph, custody ledger, and admin ledger respectively.

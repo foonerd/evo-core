@@ -26,6 +26,7 @@ use crate::admin::AdminLedger;
 use crate::catalogue::Catalogue;
 use crate::custody::CustodyLedger;
 use crate::happenings::HappeningBus;
+use crate::persistence::PersistenceStore;
 use crate::relations::RelationGraph;
 use crate::subjects::SubjectRegistry;
 
@@ -71,6 +72,12 @@ pub struct StewardState {
     /// administration action an admitted admin plugin performs via
     /// the `SubjectAdmin` / `RelationAdmin` callbacks.
     pub admin: Arc<AdminLedger>,
+    /// Durable backing store for the subject-identity slice of the
+    /// fabric. Phase 1 attaches the handle without integrating it;
+    /// subsequent phases route the subject registry write path and
+    /// the boot-time replay through it. The trait is held as a
+    /// `dyn` reference so tests can substitute the in-memory mock.
+    pub persistence: Arc<dyn PersistenceStore>,
 }
 
 impl StewardState {
@@ -100,6 +107,7 @@ pub struct StewardStateBuilder {
     custody: Option<Arc<CustodyLedger>>,
     bus: Option<Arc<HappeningBus>>,
     admin: Option<Arc<AdminLedger>>,
+    persistence: Option<Arc<dyn PersistenceStore>>,
 }
 
 impl StewardStateBuilder {
@@ -139,6 +147,15 @@ impl StewardStateBuilder {
         self
     }
 
+    /// Provide the persistence-store handle.
+    pub fn persistence(
+        mut self,
+        persistence: Arc<dyn PersistenceStore>,
+    ) -> Self {
+        self.persistence = Some(persistence);
+        self
+    }
+
     /// Finalise the builder.
     ///
     /// Returns `Arc<StewardState>` on success. Returns
@@ -160,6 +177,9 @@ impl StewardStateBuilder {
                 .ok_or(StewardStateBuildError::MissingCustody)?,
             bus: self.bus.ok_or(StewardStateBuildError::MissingBus)?,
             admin: self.admin.ok_or(StewardStateBuildError::MissingAdmin)?,
+            persistence: self
+                .persistence
+                .ok_or(StewardStateBuildError::MissingPersistence)?,
         }))
     }
 }
@@ -188,6 +208,9 @@ impl StewardState {
             custody: Arc::new(CustodyLedger::new()),
             bus: Arc::new(HappeningBus::new()),
             admin: Arc::new(AdminLedger::new()),
+            persistence: Arc::new(
+                crate::persistence::MemoryPersistenceStore::new(),
+            ),
         })
     }
 }
@@ -218,11 +241,19 @@ pub enum StewardStateBuildError {
     /// Builder was finalised without an admin-ledger handle.
     #[error("StewardState builder is missing the admin-ledger handle")]
     MissingAdmin,
+    /// Builder was finalised without a persistence-store handle.
+    #[error("StewardState builder is missing the persistence-store handle")]
+    MissingPersistence,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::MemoryPersistenceStore;
+
+    fn memory_persistence() -> Arc<dyn PersistenceStore> {
+        Arc::new(MemoryPersistenceStore::new())
+    }
 
     fn full_builder() -> StewardStateBuilder {
         StewardState::builder()
@@ -232,6 +263,7 @@ mod tests {
             .custody(Arc::new(CustodyLedger::new()))
             .bus(Arc::new(HappeningBus::new()))
             .admin(Arc::new(AdminLedger::new()))
+            .persistence(memory_persistence())
     }
 
     #[test]
@@ -247,6 +279,7 @@ mod tests {
         let _ = Arc::clone(&state.custody);
         let _ = Arc::clone(&state.bus);
         let _ = Arc::clone(&state.admin);
+        let _ = Arc::clone(&state.persistence);
     }
 
     #[test]
@@ -257,6 +290,7 @@ mod tests {
             .custody(Arc::new(CustodyLedger::new()))
             .bus(Arc::new(HappeningBus::new()))
             .admin(Arc::new(AdminLedger::new()))
+            .persistence(memory_persistence())
             .build()
             .expect_err("build without catalogue should fail");
         assert!(matches!(err, StewardStateBuildError::MissingCatalogue));
@@ -270,6 +304,7 @@ mod tests {
             .custody(Arc::new(CustodyLedger::new()))
             .bus(Arc::new(HappeningBus::new()))
             .admin(Arc::new(AdminLedger::new()))
+            .persistence(memory_persistence())
             .build()
             .expect_err("build without subjects should fail");
         assert!(matches!(err, StewardStateBuildError::MissingSubjects));
@@ -283,6 +318,7 @@ mod tests {
             .custody(Arc::new(CustodyLedger::new()))
             .bus(Arc::new(HappeningBus::new()))
             .admin(Arc::new(AdminLedger::new()))
+            .persistence(memory_persistence())
             .build()
             .expect_err("build without relations should fail");
         assert!(matches!(err, StewardStateBuildError::MissingRelations));
@@ -296,6 +332,7 @@ mod tests {
             .relations(Arc::new(RelationGraph::new()))
             .bus(Arc::new(HappeningBus::new()))
             .admin(Arc::new(AdminLedger::new()))
+            .persistence(memory_persistence())
             .build()
             .expect_err("build without custody should fail");
         assert!(matches!(err, StewardStateBuildError::MissingCustody));
@@ -309,6 +346,7 @@ mod tests {
             .relations(Arc::new(RelationGraph::new()))
             .custody(Arc::new(CustodyLedger::new()))
             .admin(Arc::new(AdminLedger::new()))
+            .persistence(memory_persistence())
             .build()
             .expect_err("build without bus should fail");
         assert!(matches!(err, StewardStateBuildError::MissingBus));
@@ -322,9 +360,24 @@ mod tests {
             .relations(Arc::new(RelationGraph::new()))
             .custody(Arc::new(CustodyLedger::new()))
             .bus(Arc::new(HappeningBus::new()))
+            .persistence(memory_persistence())
             .build()
             .expect_err("build without admin should fail");
         assert!(matches!(err, StewardStateBuildError::MissingAdmin));
+    }
+
+    #[test]
+    fn builder_missing_persistence_returns_error() {
+        let err = StewardState::builder()
+            .catalogue(Arc::new(Catalogue::default()))
+            .subjects(Arc::new(SubjectRegistry::new()))
+            .relations(Arc::new(RelationGraph::new()))
+            .custody(Arc::new(CustodyLedger::new()))
+            .bus(Arc::new(HappeningBus::new()))
+            .admin(Arc::new(AdminLedger::new()))
+            .build()
+            .expect_err("build without persistence should fail");
+        assert!(matches!(err, StewardStateBuildError::MissingPersistence));
     }
 
     #[test]
@@ -345,6 +398,7 @@ mod tests {
             let _custody = Arc::clone(&cloned.custody);
             let _bus = Arc::clone(&cloned.bus);
             let _admin = Arc::clone(&cloned.admin);
+            let _persistence = Arc::clone(&cloned.persistence);
             assert!(Arc::strong_count(&cat) >= 2);
         });
         handle.join().expect("spawned thread should complete");

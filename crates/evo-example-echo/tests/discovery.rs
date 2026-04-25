@@ -26,6 +26,7 @@ use evo::config::PluginsSecurityConfig;
 use evo::config::{PluginsSection, StewardConfig};
 use evo::custody::CustodyLedger;
 use evo::happenings::HappeningBus;
+use evo::persistence::MemoryPersistenceStore;
 use evo::plugin_discovery;
 use evo::relations::RelationGraph;
 use evo::state::StewardState;
@@ -57,6 +58,7 @@ fn engine_with_catalogue_and_data_root(
         .custody(Arc::new(CustodyLedger::new()))
         .bus(Arc::new(HappeningBus::new()))
         .admin(Arc::new(AdminLedger::new()))
+        .persistence(Arc::new(MemoryPersistenceStore::new()))
         .build()
         .expect("steward state must build");
     AdmissionEngine::new(
