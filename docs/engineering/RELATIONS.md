@@ -337,7 +337,15 @@ When subjects A and B merge into new subject C (per `SUBJECTS.md` section 10.1):
 
 The merge is atomic: consumers either see the pre-merge graph or the post-merge graph, never a mix.
 
-**Status: implemented.** The cascade is realised by `RelationGraph::rewrite_subject_to`, called twice by the `RegistrySubjectAdmin::merge` wiring layer (once per source ID). Duplicate triples produced by the rewrite collapse with claim-set union: the surviving record's provenance set absorbs the disappearing record's claims. Suppression markers on collapsed records are preserved on the survivor; the disappearing record's marker is dropped. The `Happening::SubjectMerged` event fires BEFORE the cascade so subscribers see the identity transition before any post-rewrite cardinality-violation happenings the rewrite triggers.
+**Status: implemented.** The cascade is realised by `RelationGraph::rewrite_subject_to`, called twice by the `RegistrySubjectAdmin::merge` wiring layer (once per source ID). Duplicate triples produced by the rewrite collapse with claim-set union: the surviving record's provenance set absorbs the disappearing record's claims. Suppression markers on collapsed records are preserved on the survivor; the disappearing record's marker is dropped.
+
+The wiring emits cascade happenings in a fixed order, pinned by tests:
+
+1. `Happening::SubjectMerged` (parent envelope) — fires first so subscribers see the identity transition before any cascade.
+2. `Happening::RelationRewritten` — one per affected edge, source_a's edges then source_b's. Carries `(predicate, old_subject_id, new_subject_id, target_id)` so subscribers indexing on `(source_id, predicate, target_id)` can update locally without re-querying.
+3. `Happening::RelationCardinalityViolatedPostRewrite` — one per `(subject_id, predicate, side)` whose claim count exceeds the catalogue cardinality after the rewrite. Cardinality is otherwise checked only at assert time; the merge's claim-set union can consolidate two valid claim sets into a violating one. Observational, not corrective: administration plugins decide resolution.
+4. `Happening::RelationClaimSuppressionCollapsed` — one per demoted claimant when a rewrite collides onto a suppressed surviving edge. Without this signal the demotion would be invisible to the affected plugin.
+5. `Happening::ClaimReassigned` — one per relation claim per affected edge (kind `Relation`) and one per addressing transferred at the registry layer (kind `Addressing`). Lets each affected plugin discover that its cached canonical-ID state is stale.
 
 ### 8.2 Split
 
@@ -355,7 +363,17 @@ Default is `to_both` because it is conservative: no information is lost. Consume
 
 If the operator chose `explicit`, any relation not explicitly assigned goes to both with a `RelationSplitAmbiguous` happening.
 
-**Status: implemented.** The cascade is realised by `RelationGraph::split_relations`, called by the `RegistrySubjectAdmin::split` wiring layer. The strategy parameter is the SDK's `SplitRelationStrategy::ToBoth`, `ToFirst`, or `Explicit`. For `Explicit`, the operator's per-relation assignments are resolved to canonical IDs BEFORE the registry split runs (after the split, addressings re-point to the new IDs and would not match the pre-split graph triples). Unmatched relations under `Explicit` fall through to `ToBoth` and surface as `Happening::RelationSplitAmbiguous` events, one per gap. Suppression markers transfer to the new records. Cardinality violations introduced by the distribution surface as `Happening::RelationCardinalityViolation` events. The `Happening::SubjectSplit` event fires BEFORE the per-edge distribution; any `RelationSplitAmbiguous` events follow it.
+**Status: implemented.** The cascade is realised by `RelationGraph::split_relations`, called by the `RegistrySubjectAdmin::split` wiring layer. The strategy parameter is the SDK's `SplitRelationStrategy::ToBoth`, `ToFirst`, or `Explicit`. For `Explicit`, the operator's per-relation assignments are resolved to canonical IDs BEFORE the registry split runs (after the split, addressings re-point to the new IDs and would not match the pre-split graph triples). Unmatched relations under `Explicit` fall through to `ToBoth` and surface as ambiguous. Suppression markers transfer to the new records.
+
+The wiring emits cascade happenings in a fixed order, pinned by tests:
+
+1. `Happening::SubjectSplit` (parent envelope).
+2. `Happening::RelationRewritten` — one per affected edge. The rewritten endpoint is one of the freshly-minted subject IDs; the unchanged endpoint is reported as `target_id`.
+3. `Happening::RelationSplitAmbiguous` — one per edge whose `Explicit` assignment was missing (the edge was distributed via the `ToBoth` fallback).
+4. `Happening::RelationCardinalityViolatedPostRewrite` — one per `(subject_id, predicate, side)` whose claim count exceeds the catalogue cardinality after the distribution.
+5. `Happening::ClaimReassigned` — one per relation claim per affected edge (kind `Relation`) and one per addressing transferred at the registry layer (kind `Addressing`).
+
+Suppression-collapse does not arise in split (split distributes outward; there is no collision with an existing suppressed edge to drop a claimant onto).
 
 ### 8.3 Forget
 
