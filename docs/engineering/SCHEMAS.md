@@ -794,11 +794,15 @@ Every variant carries:
 | Field | Type | Notes |
 |-------|------|-------|
 | `type` | string | Variant discriminator. Snake-case. |
-| `plugin` | string | Canonical plugin name. |
-| `handle_id` | string | Warden-assigned custody handle ID. |
 | `at_ms` | u64 | Steward's clock at emission, milliseconds since Unix epoch. |
 
+Custody variants additionally carry `plugin` and `handle_id`. Subject and relation variants carry the canonical IDs and (where applicable) the predicate. Admin variants carry `admin_plugin` and (where the action targeted a specific claim) `target_plugin`. Field reference per variant is below.
+
 #### 5.1.2 Variant Reference
+
+Twelve variants ship today. The `Happening` enum is `#[non_exhaustive]`; consumers MUST tolerate unknown `type` values and treat them as ignorable. Variants are grouped here by category for navigation; on the wire they are one flat tagged union.
+
+**Custody**
 
 **`type = "custody_taken"`**:
 
@@ -813,8 +817,6 @@ Every variant carries:
 }
 ```
 
-Additional fields: `shelf`, `custody_type`.
-
 **`type = "custody_released"`**:
 
 ```json
@@ -825,8 +827,6 @@ Additional fields: `shelf`, `custody_type`.
   "at_ms": <u64>
 }
 ```
-
-No additional fields.
 
 **`type = "custody_state_reported"`**:
 
@@ -840,7 +840,181 @@ No additional fields.
 }
 ```
 
-Additional field: `health`.
+**Relation graph**
+
+**`type = "relation_cardinality_violation"`**:
+
+```json
+{
+  "type": "relation_cardinality_violation",
+  "plugin": "<string>",
+  "predicate": "<string>",
+  "source_id": "<uuid>",
+  "target_id": "<uuid>",
+  "side": "source" | "target",
+  "declared": "exactly_one" | "at_most_one" | "at_least_one" | "many",
+  "observed_count": <usize>,
+  "at_ms": <u64>
+}
+```
+
+`side` indicates which side's bound was exceeded; `declared` echoes the predicate's bound on that side; `observed_count` is the count after the assertion was stored. Only `exactly_one` and `at_most_one` bounds emit this variant in practice (other bounds cannot be exceeded by a single assertion).
+
+**`type = "relation_forgotten"`**:
+
+```json
+{
+  "type": "relation_forgotten",
+  "plugin": "<string>",
+  "source_id": "<uuid>",
+  "predicate": "<string>",
+  "target_id": "<uuid>",
+  "reason": <RelationForgottenReason>,
+  "at_ms": <u64>
+}
+```
+
+`reason` is internally tagged by `kind`:
+
+```json
+{ "kind": "claims_retracted", "retracting_plugin": "<string>" }
+```
+
+```json
+{ "kind": "subject_cascade", "forgotten_subject": "<uuid>" }
+```
+
+For `claims_retracted`, `plugin` and `reason.retracting_plugin` are the same canonical name (the plugin that retracted the last claim) - except on cascade-from-admin paths, where `reason.retracting_plugin` is the admin plugin (see `RelationClaimForcedRetract`). For `subject_cascade`, `plugin` is the plugin whose retract triggered the parent `SubjectForgotten`; `reason.forgotten_subject` is the canonical ID of the subject the cascade removed and may equal `source_id` or `target_id`.
+
+**`type = "relation_suppressed"`**:
+
+```json
+{
+  "type": "relation_suppressed",
+  "admin_plugin": "<string>",
+  "source_id": "<uuid>",
+  "predicate": "<string>",
+  "target_id": "<uuid>",
+  "reason": "<string>" | null,
+  "at_ms": <u64>
+}
+```
+
+Re-suppressing an already-suppressed relation is a silent no-op and emits no happening.
+
+**`type = "relation_unsuppressed"`**:
+
+```json
+{
+  "type": "relation_unsuppressed",
+  "admin_plugin": "<string>",
+  "source_id": "<uuid>",
+  "predicate": "<string>",
+  "target_id": "<uuid>",
+  "at_ms": <u64>
+}
+```
+
+No `reason` field on the unsuppress variant. Unsuppressing a non-suppressed or unknown relation is a silent no-op.
+
+**Subject registry**
+
+**`type = "subject_forgotten"`**:
+
+```json
+{
+  "type": "subject_forgotten",
+  "plugin": "<string>",
+  "canonical_id": "<uuid>",
+  "subject_type": "<string>",
+  "at_ms": <u64>
+}
+```
+
+`subject_type` is captured from the registry record before removal. Emitted BEFORE any cascade `relation_forgotten` events for the same forget.
+
+**Admin (privileged) operations**
+
+**`type = "subject_addressing_forced_retract"`**:
+
+```json
+{
+  "type": "subject_addressing_forced_retract",
+  "admin_plugin": "<string>",
+  "target_plugin": "<string>",
+  "canonical_id": "<uuid>",
+  "scheme": "<string>",
+  "value": "<string>",
+  "reason": "<string>" | null,
+  "at_ms": <u64>
+}
+```
+
+`scheme` and `value` are the components of the retracted `ExternalAddressing`, carried flat so the wire form does not nest. Fires BEFORE any cascade `subject_forgotten` and `relation_forgotten` events.
+
+**`type = "relation_claim_forced_retract"`**:
+
+```json
+{
+  "type": "relation_claim_forced_retract",
+  "admin_plugin": "<string>",
+  "target_plugin": "<string>",
+  "source_id": "<uuid>",
+  "predicate": "<string>",
+  "target_id": "<uuid>",
+  "reason": "<string>" | null,
+  "at_ms": <u64>
+}
+```
+
+Fires BEFORE any cascade `relation_forgotten` event. The cascade event's `reason.retracting_plugin` is the ADMIN plugin (not `target_plugin`), because the admin's action caused the retract.
+
+**`type = "subject_merged"`**:
+
+```json
+{
+  "type": "subject_merged",
+  "admin_plugin": "<string>",
+  "source_ids": ["<uuid>", "<uuid>"],
+  "new_id": "<uuid>",
+  "reason": "<string>" | null,
+  "at_ms": <u64>
+}
+```
+
+`source_ids` has length 2 today; modelled as an array for forward compatibility with multi-way merge. The two source IDs survive in the registry as `Merged` aliases. Fires BEFORE the relation-graph rewrite; cascading `relation_cardinality_violation` events fire afterwards.
+
+**`type = "subject_split"`**:
+
+```json
+{
+  "type": "subject_split",
+  "admin_plugin": "<string>",
+  "source_id": "<uuid>",
+  "new_ids": ["<uuid>", "<uuid>", ...],
+  "strategy": "to_both" | "to_first" | "explicit",
+  "reason": "<string>" | null,
+  "at_ms": <u64>
+}
+```
+
+`new_ids` has length at least 2. The source ID survives in the registry as a single `Split` alias carrying every new ID. `strategy` records the relation-distribution policy the operator chose; under `explicit`, gap relations produce trailing `relation_split_ambiguous` happenings. Fires BEFORE per-edge relation-graph rewrites.
+
+**`type = "relation_split_ambiguous"`**:
+
+```json
+{
+  "type": "relation_split_ambiguous",
+  "admin_plugin": "<string>",
+  "source_subject": "<uuid>",
+  "predicate": "<string>",
+  "other_endpoint_id": "<uuid>",
+  "candidate_new_ids": ["<uuid>", "<uuid>", ...],
+  "at_ms": <u64>
+}
+```
+
+`source_subject` is the OLD canonical ID (no longer resolves directly after the parent `subject_split`); `other_endpoint_id` is the relation's other endpoint (may be on either side). `candidate_new_ids` lists every new ID the relation was replicated to under fall-through `to_both` semantics. One emission per gap relation; multiple emissions per split are possible. Fires AFTER the parent `subject_split`.
 
 ### 5.2 CustodyRecord and StateSnapshot
 
@@ -944,6 +1118,133 @@ Returned by `op = "project_subject"`.
 ```
 
 `nested` is populated when the scope's `max_depth` permits further recursion.
+
+### 5.4 AliasRecord and AliasKind
+
+**Location**: `crates/evo-plugin-sdk/src/contract/subjects.rs` (the `AliasRecord` struct, the `AliasKind` enum).
+**See also**: `SUBJECTS.md` section 10.4.
+
+When an admin plugin merges or splits a canonical subject, the OLD canonical IDs survive in the registry as alias records so consumers holding stale references can resolve them via the steward's `describe_alias` operation. The framework does NOT transparently follow aliases on resolve; chasing the alias is an explicit consumer step.
+
+#### 5.4.1 AliasRecord
+
+```json
+{
+  "old_id": "<uuid>",
+  "new_ids": ["<uuid>", ...],
+  "kind": "merged" | "split",
+  "recorded_at_ms": <u64>,
+  "admin_plugin": "<string>",
+  "reason": "<string>"
+}
+```
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `old_id` | string (UUID) | yes | The canonical ID that no longer addresses a live subject. |
+| `new_ids` | array\<string\> | yes | The new canonical IDs. Length 1 for merge, length at least 2 for split. Distinguish by inspecting `kind` rather than by counting `new_ids`. |
+| `kind` | enum | yes | `merged` or `split`. See section 5.4.2. |
+| `recorded_at_ms` | u64 | yes | When the alias was recorded, milliseconds since UNIX epoch. |
+| `admin_plugin` | string | yes | Canonical name of the administration plugin that performed the operation. |
+| `reason` | string \| omitted | no | Operator-supplied reason. Omitted on serialise when `None`. |
+
+#### 5.4.2 AliasKind
+
+Serialises as a snake_case string.
+
+| Value | Meaning |
+|-------|---------|
+| `"merged"` | The old subject was merged into another subject. The alias's `new_ids` has length 1. |
+| `"split"` | The old subject was split into multiple subjects. The alias's `new_ids` has length at least 2. |
+
+### 5.5 SplitRelationStrategy and ExplicitRelationAssignment
+
+**Location**: `crates/evo-plugin-sdk/src/contract/subjects.rs` (the `SplitRelationStrategy` enum, the `ExplicitRelationAssignment` struct).
+**See also**: `RELATIONS.md` section 8.2, `SUBJECTS.md` section 10.2.
+
+Used by the SDK's `SubjectAdmin::split` primitive to control how relations on the source subject are distributed to the new subjects.
+
+#### 5.5.1 SplitRelationStrategy
+
+Serialises as a snake_case string.
+
+| Value | Meaning |
+|-------|---------|
+| `"to_both"` | Every relation involving the source subject is replicated once per new subject. No information is lost; cardinality violations may surface as `relation_cardinality_violation` happenings. The conservative default. |
+| `"to_first"` | Every relation goes to the FIRST new subject in the partition; subsequent new subjects start bare. |
+| `"explicit"` | Each relation is assigned to a specific new subject by operator-supplied `ExplicitRelationAssignment` entries. Relations with no matching assignment fall through to `to_both` and the steward emits one `relation_split_ambiguous` per gap. |
+
+#### 5.5.2 ExplicitRelationAssignment
+
+```json
+{
+  "source": <ExternalAddressing>,
+  "predicate": "<string>",
+  "target": <ExternalAddressing>,
+  "target_new_id": "<uuid>"
+}
+```
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `source` | object | yes | `ExternalAddressing` of the relation's source endpoint. See section 5.3 for the shape. |
+| `predicate` | string | yes | Predicate of the relation. |
+| `target` | object | yes | `ExternalAddressing` of the relation's target endpoint. |
+| `target_new_id` | string (UUID) | yes | Canonical ID of the new subject the relation is assigned to. Must be one of the IDs the split produced; the steward refuses assignments referencing other IDs. |
+
+The triple `(source, predicate, target)` identifies a single relation in the graph at the time of the split.
+
+### 5.6 AdminLogEntry and AdminLogKind
+
+**Location**: `crates/evo/src/admin.rs` (the `AdminLogEntry` struct, the `AdminLogKind` enum).
+**See also**: `PERSISTENCE.md` (the `admin_log` table this struct is shaped to fit), `BOUNDARY.md` section 6.1.
+
+Every privileged administration action a plugin takes through the `SubjectAdmin` or `RelationAdmin` callbacks is recorded in the steward's in-memory admin ledger. The shape parallels `CustodyLedger`'s record model and is shaped to align with the persistence story documented in `PERSISTENCE.md`.
+
+The admin ledger is not exposed on the client socket today; the entry shape is documented here because (a) it is the canonical home for the audit trail of admin actions and (b) a future client-socket op (or part of the broader happenings expansion) will surface it.
+
+#### 5.6.1 AdminLogEntry
+
+```json
+{
+  "kind": <AdminLogKind>,
+  "admin_plugin": "<string>",
+  "target_plugin": "<string>" | null,
+  "target_subject": "<uuid>" | null,
+  "target_addressing": <ExternalAddressing> | null,
+  "target_relation": <RelationKey> | null,
+  "additional_subjects": ["<uuid>", ...],
+  "reason": "<string>" | null,
+  "at_ms": <u64>
+}
+```
+
+| Field | Type | Always populated? | Notes |
+|-------|------|-------------------|-------|
+| `kind` | enum | yes | One of the `AdminLogKind` values in section 5.6.2. |
+| `admin_plugin` | string | yes | Canonical name of the admin plugin that performed the action. |
+| `target_plugin` | string \| null | per kind | Canonical name of the plugin whose claim was modified. `null` for kinds that do not target a specific plugin (`subject_merge`, `subject_split`, `relation_suppress`, `relation_unsuppress`). |
+| `target_subject` | string (UUID) \| null | per kind | Canonical ID of the subject involved. For `subject_merge` this is the NEW canonical ID; for `subject_split` this is the SOURCE (old) canonical ID. |
+| `target_addressing` | object \| null | per kind | Addressing targeted, populated for `subject_addressing_forced_retract`. |
+| `target_relation` | object \| null | per kind | Relation key targeted, populated for relation operations. |
+| `additional_subjects` | array\<string\> | sometimes | Extra canonical subject IDs. Populated for `subject_merge` (the source IDs, length 2) and `subject_split` (the new IDs, length at least 2). Empty array otherwise. |
+| `reason` | string \| null | optional | Free-form operator-supplied reason; mirrors the `reason` field on the underlying primitive. |
+| `at_ms` | u64 | yes | When the action was recorded, milliseconds since UNIX epoch. |
+
+#### 5.6.2 AdminLogKind
+
+Serialises as a snake_case string. The enum is `#[non_exhaustive]`; readers must tolerate unknown values.
+
+| Value | Meaning | Paired happening |
+|-------|---------|------------------|
+| `"subject_addressing_forced_retract"` | An admin force-retracted an addressing claimed by another plugin. | `subject_addressing_forced_retract` |
+| `"relation_claim_forced_retract"` | An admin force-retracted a relation claim made by another plugin. | `relation_claim_forced_retract` |
+| `"subject_merge"` | An admin merged two canonical subjects into one. `target_subject` carries the NEW ID; `additional_subjects` carries the source IDs. `target_plugin` is `null`. | `subject_merged` |
+| `"subject_split"` | An admin split one canonical subject into two or more. `target_subject` carries the SOURCE (old) ID; `additional_subjects` carries the new IDs. `target_plugin` is `null`. | `subject_split` |
+| `"relation_suppress"` | An admin suppressed a relation. `target_relation` carries the relation key. `target_plugin` is `null`. | `relation_suppressed` |
+| `"relation_unsuppress"` | An admin unsuppressed a previously-suppressed relation. `target_relation` carries the relation key. `target_plugin` is `null`. | `relation_unsuppressed` |
+
+`AdminLogKind` and the corresponding `Happening` variant are paired but not identical: `AdminLogKind` is the persisted audit kind (snake_case singular verb form: `subject_merge`); the happening's `type` is the streamed event tag (snake_case past tense: `subject_merged`). The wire representations are intentionally distinct so a future audit-log reader and a happenings subscriber need not multiplex on the same string.
 
 ## 6. Naming Conventions
 

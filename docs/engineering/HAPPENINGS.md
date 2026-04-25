@@ -6,7 +6,7 @@ Vocabulary: per `docs/CONCEPT.md`. Cross-references: `STEWARD.md`, `CUSTODY.md`,
 
 The fabric has two notification shapes: pull and push. Consumers ask for the current state (a projection, a ledger snapshot) or they subscribe to transitions (a happening). This document describes the push side: the happenings bus, the `Happening` enum, the delivery semantics, and the boundary between "a happening was emitted" and "a subscriber saw it".
 
-Current variant set is custody-focused, because custody is where sustained warden-held work lives and where external consumers most want live updates. The variant set is open: new transition categories (subject announcements, admission events, factory instance lifecycle) land as new variants under the same enum.
+The variant set spans custody transitions, the relation graph, the subject registry, and admin (privileged) operations. The variant set is open: new transition categories (admission events, factory instance lifecycle) land as new variants under the same enum.
 
 ## 1. Purpose
 
@@ -27,10 +27,24 @@ Projections answer questions. Happenings broadcast transitions. Together they ar
 ```rust
 #[non_exhaustive]
 pub enum Happening {
+    // Custody
     CustodyTaken { plugin, handle_id, shelf, custody_type, at },
     CustodyReleased { plugin, handle_id, at },
     CustodyStateReported { plugin, handle_id, health, at },
-    // ... future variants
+    // Relation graph
+    RelationCardinalityViolation { plugin, predicate, source_id, target_id, side, declared, observed_count, at },
+    RelationForgotten { plugin, source_id, predicate, target_id, reason, at },
+    RelationSuppressed { admin_plugin, source_id, predicate, target_id, reason, at },
+    RelationUnsuppressed { admin_plugin, source_id, predicate, target_id, at },
+    // Subject registry
+    SubjectForgotten { plugin, canonical_id, subject_type, at },
+    // Admin (privileged) operations
+    SubjectAddressingForcedRetract { admin_plugin, target_plugin, canonical_id, scheme, value, reason, at },
+    RelationClaimForcedRetract { admin_plugin, target_plugin, source_id, predicate, target_id, reason, at },
+    SubjectMerged { admin_plugin, source_ids, new_id, reason, at },
+    SubjectSplit { admin_plugin, source_id, new_ids, strategy, reason, at },
+    RelationSplitAmbiguous { admin_plugin, source_subject, predicate, other_endpoint_id, candidate_new_ids, at },
+    // ... further variants may be added under #[non_exhaustive]
 }
 ```
 
@@ -38,23 +52,64 @@ pub enum Happening {
 
 ### 3.1 Current Variants
 
-| Variant | Emitted from | Carries |
-|---------|--------------|---------|
-| `CustodyTaken` | `AdmissionEngine::take_custody` (after ledger write) | `plugin`, `handle_id`, `shelf`, `custody_type`, `at` |
-| `CustodyReleased` | `AdmissionEngine::release_custody` (after ledger drop) | `plugin`, `handle_id`, `at` |
-| `CustodyStateReported` | `LedgerCustodyStateReporter::report` (after ledger write) | `plugin`, `handle_id`, `health`, `at` |
+Twelve variants ship today across four categories. All variants carry an `at: SystemTime` field (the steward's clock when the happening was emitted) - omitted from the per-variant tables below to keep them readable. JSON shapes are in `SCHEMAS.md` section 5.1.
 
-All variants carry `plugin` and `handle_id` so subscribers can correlate happenings with ledger records. `at` is `SystemTime`: the steward's clock when the happening was emitted.
+**Custody transitions**
 
-### 3.2 Future Variants
+| Variant | Emitted from | Carries (besides `at`) |
+|---------|--------------|------------------------|
+| `CustodyTaken` | `AdmissionEngine::take_custody` (after ledger write) | `plugin`, `handle_id`, `shelf`, `custody_type` |
+| `CustodyReleased` | `AdmissionEngine::release_custody` (after ledger drop) | `plugin`, `handle_id` |
+| `CustodyStateReported` | `LedgerCustodyStateReporter::report` (after ledger write) | `plugin`, `handle_id`, `health` |
 
-The variant set is open. Categories identified but not yet modelled:
+**Relation graph**
 
-- Subject announcements / retractions (`SubjectAnnounced`, `SubjectRetracted`).
-- Relation assertions / retractions (`RelationAsserted`, `RelationRetracted`).
+| Variant | Trigger | Carries (besides `at`) |
+|---------|---------|------------------------|
+| `RelationCardinalityViolation` | An assertion stored in the graph causes the source-side or target-side count for the predicate to exceed its declared bound. The assertion is not refused; the violation is surfaced for consumer policy (`RELATIONS.md` 7.1). | `plugin`, `predicate`, `source_id`, `target_id`, `side`, `declared`, `observed_count` |
+| `RelationForgotten` | The last claimant retracts (`reason.kind = "claims_retracted"`), or a touched subject is forgotten and the cascade removes the edge (`reason.kind = "subject_cascade"`). Both paths emit the same variant; consumers branch on `reason.kind`. | `plugin`, `source_id`, `predicate`, `target_id`, `reason` |
+| `RelationSuppressed` | First-time successful suppression of a relation by an admin. Re-suppressing an already-suppressed relation is a silent no-op. | `admin_plugin`, `source_id`, `predicate`, `target_id`, `reason` |
+| `RelationUnsuppressed` | Successful transition from suppressed to visible. Unsuppressing a non-suppressed or unknown relation is a silent no-op. | `admin_plugin`, `source_id`, `predicate`, `target_id` |
+
+**Subject registry**
+
+| Variant | Trigger | Carries (besides `at`) |
+|---------|---------|------------------------|
+| `SubjectForgotten` | A subject's last addressing was retracted and the registry record was removed. Emitted BEFORE any cascade `RelationForgotten` events for the same forget. | `plugin`, `canonical_id`, `subject_type` |
+
+**Admin (privileged) operations**
+
+| Variant | Trigger | Carries (besides `at`) |
+|---------|---------|------------------------|
+| `SubjectAddressingForcedRetract` | An admin plugin force-retracted another plugin's addressing claim. Fires BEFORE any cascade `SubjectForgotten` / `RelationForgotten` events. | `admin_plugin`, `target_plugin`, `canonical_id`, `scheme`, `value`, `reason` |
+| `RelationClaimForcedRetract` | An admin plugin force-retracted another plugin's relation claim. Fires BEFORE any cascade `RelationForgotten` event. | `admin_plugin`, `target_plugin`, `source_id`, `predicate`, `target_id`, `reason` |
+| `SubjectMerged` | Two canonical subjects were merged into one new canonical ID. Fires BEFORE the relation-graph rewrite; any `RelationCardinalityViolation` events the rewrite triggers fire afterwards with the new canonical ID. | `admin_plugin`, `source_ids`, `new_id`, `reason` |
+| `SubjectSplit` | One canonical subject was split into N new canonical IDs (length at least 2). Fires BEFORE per-edge structural rewrites. | `admin_plugin`, `source_id`, `new_ids`, `strategy`, `reason` |
+| `RelationSplitAmbiguous` | A `SplitRelationStrategy::Explicit` split encountered a relation with no matching `ExplicitRelationAssignment`; the steward fell through to `ToBoth` for that relation and surfaces the gap. One emission per gap. Fires AFTER the parent `SubjectSplit`. | `admin_plugin`, `source_subject`, `predicate`, `other_endpoint_id`, `candidate_new_ids` |
+
+Every variant carries identifying fields so subscribers can correlate happenings with ledger records (custody) or with the registry / graph (subject and relation). `admin_plugin` distinguishes the privileged actor from the `target_plugin` whose claim was modified.
+
+### 3.2 Ordering Across Cascade Sequences
+
+Several admin and retract paths produce a sequence of related happenings. The ordering is observable and load-bearing:
+
+- A retract that removes a subject's last addressing fires `SubjectForgotten` BEFORE the per-edge `RelationForgotten` events the cascade triggers (`reason.kind = "subject_cascade"`).
+- `SubjectAddressingForcedRetract` fires BEFORE any cascade `SubjectForgotten` and `RelationForgotten` events the same forced retract triggers.
+- `RelationClaimForcedRetract` fires BEFORE the cascade `RelationForgotten` (with `reason.kind = "claims_retracted"` and `retracting_plugin` set to the ADMIN, not the target).
+- `SubjectMerged` fires BEFORE the relation-graph rewrite; any `RelationCardinalityViolation` events from the rewrite fire afterwards.
+- `SubjectSplit` fires BEFORE per-edge rewrites; one `RelationSplitAmbiguous` is emitted per gap relation under `Explicit` strategy AFTER the `SubjectSplit`.
+
+Subscribers that maintain auxiliary state can rely on these orderings to clean up parent records before their children land.
+
+### 3.3 Future Variants
+
+The variant set is open. Categories identified but not yet modelled (aligned with `STEWARD.md` section 12.2):
+
+- Subject announcement (`SubjectAnnounced`) on first registry insertion (today subscribers infer "new subject" by observing the first projection).
 - Admission events (`PluginAdmitted`, `PluginUnloaded`, `PluginFailed`).
-- Factory instance lifecycle (when factories land).
+- Factory instance lifecycle (when factories land; see `STEWARD.md` 12.7).
 - Projection invalidations (when push-style projections land).
+- Fast-path transitions (when the fast path lands; see `STEWARD.md` 12.6 and `FAST_PATH.md`).
 
 Adding a variant requires updating the enum and the relevant emission site; no other source change is required of consumers (thanks to `#[non_exhaustive]`).
 
@@ -124,15 +179,26 @@ Loss is allowed by design. The ledger is the source of truth for current state; 
 
 Within the bus's capacity, every subscriber independently sees every happening emitted after it subscribed. Subscribers do not compete for happenings; each has its own view of the stream. This matches `tokio::sync::broadcast`'s semantics verbatim.
 
-## 6. Ordering Relative to Ledger Writes
+## 6. Ordering Relative to Authoritative Writes
 
-Every custody happening is emitted after the ledger operation it describes completes:
+Every happening is emitted after the authoritative store write it describes completes. The authoritative store is the custody ledger for custody variants, the relation graph for relation variants, the subject registry for subject variants, and the admin ledger paired with the relevant graph or registry for admin variants:
 
 | Happening | Preceded by |
 |-----------|-------------|
 | `CustodyTaken` | `CustodyLedger::record_custody` |
 | `CustodyReleased` | `CustodyLedger::release_custody` |
 | `CustodyStateReported` | `CustodyLedger::record_state` |
+| `RelationCardinalityViolation` | `RelationGraph::assert` |
+| `RelationForgotten` (claims_retracted) | `RelationGraph::retract` (last claimant gone) |
+| `RelationForgotten` (subject_cascade) | `RelationGraph::forget_all_touching` (cascade) |
+| `RelationSuppressed` | `RelationGraph::suppress` |
+| `RelationUnsuppressed` | `RelationGraph::unsuppress` |
+| `SubjectForgotten` | `SubjectRegistry::forget` |
+| `SubjectAddressingForcedRetract` | `SubjectRegistry::forced_retract_addressing` + `AdminLedger::record` |
+| `RelationClaimForcedRetract` | `RelationGraph::forced_retract_claim` + `AdminLedger::record` |
+| `SubjectMerged` | `SubjectRegistry::merge` + `AdminLedger::record` |
+| `SubjectSplit` | `SubjectRegistry::split` + `AdminLedger::record` |
+| `RelationSplitAmbiguous` | per-edge rewrite during a `SubjectSplit` whose `Explicit` strategy left the edge unassigned |
 
 ```mermaid
 sequenceDiagram
@@ -154,11 +220,21 @@ sequenceDiagram
     L-->>S: state consistent with happening
 ```
 
-This ordering is the basis for the "consistent view" property in section 1. A subscriber that reacts to any of these happenings by querying the ledger sees a state consistent with the happening's semantics:
+This ordering is the basis for the "consistent view" property in section 1. A subscriber that reacts to any of these happenings by querying the authoritative store sees a state consistent with the happening's semantics:
 
 - After `CustodyTaken`: the record exists, `shelf` and `custody_type` populated.
 - After `CustodyReleased`: the record is gone.
 - After `CustodyStateReported`: the record's `last_state` reflects the just-reported snapshot.
+- After `RelationCardinalityViolation`: the violating relation has been stored; both the new and the pre-existing relation are visible to neighbour queries.
+- After `RelationForgotten`: the relation is gone from the graph.
+- After `RelationSuppressed`: the relation is hidden from neighbour queries and walks; `describe_relation` still surfaces it with its `SuppressionRecord`.
+- After `RelationUnsuppressed`: the relation is visible again to neighbour queries and walks.
+- After `SubjectForgotten`: the canonical ID no longer resolves in the registry.
+- After `SubjectAddressingForcedRetract`: the addressing is gone; if it was the subject's last addressing, a `SubjectForgotten` follows.
+- After `RelationClaimForcedRetract`: the claim is gone; if it was the relation's last claim, a `RelationForgotten` (claims_retracted, with `retracting_plugin = admin`) follows.
+- After `SubjectMerged`: the new canonical ID resolves to the merged subject and the two source IDs survive in the registry as `Merged` aliases.
+- After `SubjectSplit`: the new canonical IDs resolve and the source ID survives as a single `Split` alias carrying every new ID.
+- After `RelationSplitAmbiguous`: the relation has been replicated under `ToBoth` semantics across the new IDs; the operator can audit and follow up via per-edge forced retracts.
 
 The ordering is enforced by the emission sites, not by the bus itself. The bus will emit any `Happening` given to it in any order; it is the responsibility of the steward's emission sites (and of any future non-steward emitters) to write state before emitting.
 
@@ -209,13 +285,17 @@ A consumer that needs "did happening X fire in the last hour" cannot answer it f
 
 ### 9.1 Inside the Steward
 
-The bus has three production emission sites today:
+The bus has the following production emission sites today:
 
 - `AdmissionEngine::take_custody`: emits `CustodyTaken` after `record_custody`.
 - `AdmissionEngine::release_custody`: emits `CustodyReleased` after `release_custody`.
 - `LedgerCustodyStateReporter::report`: emits `CustodyStateReported` after `record_state`. Installed in every admitted warden (in-process and wire), so every state report from any warden ends with an emission.
+- `RegistrySubjectAnnouncer`: emits `SubjectForgotten` when a retract removes a subject's last addressing. Cascade `RelationForgotten` events with `reason.kind = "subject_cascade"` follow per edge `RelationGraph::forget_all_touching` removed.
+- `RegistryRelationAnnouncer`: emits `RelationCardinalityViolation` after the assertion has been stored, and `RelationForgotten` with `reason.kind = "claims_retracted"` when the last claimant retracts.
+- `RegistrySubjectAdmin`: emits `SubjectAddressingForcedRetract`, `SubjectMerged`, and `SubjectSplit` after the registry primitive succeeds. `SubjectMerged` and `SubjectSplit` emit BEFORE the relation-graph rewrite they trigger; cascade `RelationCardinalityViolation` and `RelationSplitAmbiguous` events fire afterwards.
+- `RegistryRelationAdmin`: emits `RelationClaimForcedRetract`, `RelationSuppressed`, and `RelationUnsuppressed` after the graph primitive succeeds.
 
-A fourth site exists on the client-socket surface: when a client sends `subscribe_happenings`, the server subscribes on its behalf and forwards every happening as a frame. See section 9.2.
+A separate site exists on the client-socket surface: when a client sends `subscribe_happenings`, the server subscribes on its behalf and forwards every happening as a frame. See section 9.2.
 
 ### 9.2 External Subscribers (client socket)
 
@@ -249,7 +329,7 @@ A future design decision may allow plugins to contribute to a constrained set of
 
 ### 11.1 Additional Variants
 
-Categories identified for future work (see 3.2). The pattern is mechanically simple: add a variant, add an emission site, add tests. The design work is deciding what belongs on each variant; consumer needs drive that.
+Categories identified for future work (see 3.3). The pattern is mechanically simple: add a variant, add an emission site, add tests. The design work is deciding what belongs on each variant; consumer needs drive that.
 
 ### 11.2 Per-rack or Per-subject Filtering
 

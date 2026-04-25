@@ -231,7 +231,16 @@ The server writes three kinds of frames after accepting the subscription:
 }
 ```
 
-Variants: `custody_taken`, `custody_released`, `custody_state_reported`. See `HAPPENINGS.md` section 3.1 for the full field reference per variant.
+The `happening` object is internally tagged by `type`. Twelve variants ship today across four categories:
+
+| Category | `type` values |
+|----------|---------------|
+| Custody | `custody_taken`, `custody_released`, `custody_state_reported` |
+| Relation graph | `relation_cardinality_violation`, `relation_forgotten`, `relation_suppressed`, `relation_unsuppressed` |
+| Subject registry | `subject_forgotten` |
+| Admin (privileged) | `subject_addressing_forced_retract`, `relation_claim_forced_retract`, `subject_merged`, `subject_split`, `relation_split_ambiguous` |
+
+The `Happening` enum is `#[non_exhaustive]`; consumers MUST tolerate unknown `type` values (treat as "ignore" or "log and continue", never crash). See `HAPPENINGS.md` section 3.1 for the per-variant trigger semantics and `SCHEMAS.md` section 5.1 for full JSON shapes per variant.
 
 **Lagged** (streamed when the subscriber has fallen behind the bus's buffer):
 
@@ -484,10 +493,25 @@ interface ErrorResponse { error: string; }
 interface SubscribedAck { subscribed: true; }
 interface LaggedFrame { lagged: number; }
 
+// Common discriminator on every happening: `type`. The enum is
+// non-exhaustive on the steward side; consumers should retain a
+// catch-all branch (e.g. a default `type: string` arm) for forward
+// compatibility. See SCHEMAS.md section 5.1 for the canonical JSON
+// shape of every variant.
 type HappeningVariant =
     | { type: 'custody_taken'; plugin: string; handle_id: string; shelf: string; custody_type: string; at_ms: number }
     | { type: 'custody_released'; plugin: string; handle_id: string; at_ms: number }
-    | { type: 'custody_state_reported'; plugin: string; handle_id: string; health: 'healthy' | 'degraded' | 'unhealthy'; at_ms: number };
+    | { type: 'custody_state_reported'; plugin: string; handle_id: string; health: 'healthy' | 'degraded' | 'unhealthy'; at_ms: number }
+    | { type: 'relation_cardinality_violation'; plugin: string; predicate: string; source_id: string; target_id: string; side: 'source' | 'target'; declared: 'exactly_one' | 'at_most_one' | 'at_least_one' | 'many'; observed_count: number; at_ms: number }
+    | { type: 'relation_forgotten'; plugin: string; source_id: string; predicate: string; target_id: string; reason: { kind: 'claims_retracted'; retracting_plugin: string } | { kind: 'subject_cascade'; forgotten_subject: string }; at_ms: number }
+    | { type: 'relation_suppressed'; admin_plugin: string; source_id: string; predicate: string; target_id: string; reason: string | null; at_ms: number }
+    | { type: 'relation_unsuppressed'; admin_plugin: string; source_id: string; predicate: string; target_id: string; at_ms: number }
+    | { type: 'subject_forgotten'; plugin: string; canonical_id: string; subject_type: string; at_ms: number }
+    | { type: 'subject_addressing_forced_retract'; admin_plugin: string; target_plugin: string; canonical_id: string; scheme: string; value: string; reason: string | null; at_ms: number }
+    | { type: 'relation_claim_forced_retract'; admin_plugin: string; target_plugin: string; source_id: string; predicate: string; target_id: string; reason: string | null; at_ms: number }
+    | { type: 'subject_merged'; admin_plugin: string; source_ids: string[]; new_id: string; reason: string | null; at_ms: number }
+    | { type: 'subject_split'; admin_plugin: string; source_id: string; new_ids: string[]; strategy: 'to_both' | 'to_first' | 'explicit'; reason: string | null; at_ms: number }
+    | { type: 'relation_split_ambiguous'; admin_plugin: string; source_subject: string; predicate: string; other_endpoint_id: string; candidate_new_ids: string[]; at_ms: number };
 
 interface HappeningFrame { happening: HappeningVariant; }
 
@@ -731,6 +755,12 @@ pub async fn call(
     Ok(serde_json::from_slice(&body)?)
 }
 
+// Twelve variants ship today. Consumers should treat the set as
+// open: future steward versions may add variants under
+// `#[non_exhaustive]`. Match arms below cover the custody triple;
+// for the rest, treat as `serde_json::Value` and inspect `type`,
+// or extend this enum with the variants you care about. See
+// SCHEMAS.md section 5.1 for the full set.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Happening {
@@ -744,6 +774,15 @@ pub enum Happening {
         plugin: String, handle_id: String,
         health: String, at_ms: u64,
     },
+    // Other variants - relation_cardinality_violation,
+    // relation_forgotten, relation_suppressed,
+    // relation_unsuppressed, subject_forgotten,
+    // subject_addressing_forced_retract,
+    // relation_claim_forced_retract, subject_merged,
+    // subject_split, relation_split_ambiguous - intentionally not
+    // listed here. Add them as needed for the consumer scenario.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Deserialize)]

@@ -132,21 +132,24 @@ Something must be able to correct this state.
 
 An override channel in the steward creates a second source of truth parallel to plugin claims with different trust, reload, and audit semantics. That complexity is warranted only when specific distribution use cases justify it and must be earned by the distribution, not imposed by the framework.
 
-**In scope for the framework.** A set of SDK-exposed, trust-class-gated primitives that a distribution-authored administration plugin can compose into complete operator-facing correction tooling. Without these primitives, the administration-plugin pattern below is partial: some correction cases work today, others are unreachable from within the plugin API the framework provides. The primitives are:
+**In scope for the framework.** A set of SDK-exposed, trust-class-gated primitives that a distribution-authored administration plugin can compose into complete operator-facing correction tooling. Most of these have landed; the remaining pieces are noted below. The primitives are:
 
-- **Privileged cross-plugin retraction.** Today `SUBJECTS.md` section 7.5 and `RELATIONS.md` section 4.3 scope retraction to the claiming plugin. An elevated-trust administration plugin needs the capability to retract another plugin's claims when the owning plugin cannot or will not (stale addressings from a crashed plugin, corrections a non-admin plugin cannot perform on itself). Provenance captures the retracting administration plugin's identity so audit remains intact.
-- **Plugin-exposed subject merge and split.** `SUBJECTS.md` section 10 describes merge and split as "operator operations". Today the framework exposes no plugin-callable API for them. An SDK extension exposes both, trust-gated, so an administration plugin can drive them on operator request.
-- **Relation suppression.** Relations are multi-claimant (`RELATIONS.md` 4.2); counter-claims add, they do not subtract. An administration plugin needs a framework-level way to mark a relation as suppressed that the walk and projection layers honour. The mechanism is a suppressed-flag claim kind, a new `RelationSuppressed` happening, and walk/projection filtering.
-- **Standard administration-rack vocabulary in CATALOGUE.md.** Catalogues that take operator correction seriously declare an `administration` rack with standard shelves. Declaring the rack is how a distribution says "I take this responsibility". Consumers (admin panels, diagnostic tools) target the standard vocabulary instead of per-distribution shapes.
-- **Reference administration plugin.** `crates/evo-example-admin` (new), parallel to `evo-example-echo` and `evo-example-warden`. Reads the reference override-file shape below, drives the framework primitives above end-to-end. Distributions fork, extend, or use verbatim.
+- **Privileged cross-plugin retraction.** **Landed.** Exposed by `SubjectAdmin::forced_retract_addressing` and `RelationAdmin::forced_retract_claim` in the SDK; the wiring layer's `RegistrySubjectAdmin` and `RegistryRelationAdmin` route to the registry/graph primitives, write `AdminLogEntry` records, and emit `SubjectAddressingForcedRetract` / `RelationClaimForcedRetract` happenings. The cascade discipline (forced-retract event before any `SubjectForgotten` / `RelationForgotten` it triggers) is enforced by the announcer.
+- **Plugin-exposed subject merge and split.** **Landed.** Exposed by `SubjectAdmin::merge` and `SubjectAdmin::split` in the SDK. The registry produces an `AliasRecord` on either path so consumers holding stale references resolve via `describe_alias`. Split takes a `SplitRelationStrategy` (`to_both` / `to_first` / `explicit`) plus optional `ExplicitRelationAssignment` entries; gap relations under `explicit` surface as `RelationSplitAmbiguous` happenings.
+- **Relation suppression.** **Landed.** Exposed by `RelationAdmin::suppress` and `RelationAdmin::unsuppress` in the SDK. Suppressed relations are hidden from neighbour queries and walks but remain visible to `describe_relation` (with a `SuppressionRecord`) and to direct lookup. `RelationSuppressed` and `RelationUnsuppressed` happenings track transitions.
+- **Standard administration-rack vocabulary in CATALOGUE.md.** Pending. Catalogues that take operator correction seriously declare an `administration` rack with standard shelves. Declaring the rack is how a distribution says "I take this responsibility". Consumers (admin panels, diagnostic tools) target the standard vocabulary instead of per-distribution shapes.
+- **Reference administration plugin.** Pending. `crates/evo-example-admin` (new), parallel to `evo-example-echo` and `evo-example-warden`. Reads the reference override-file shape below, drives the framework primitives above end-to-end. Distributions fork, extend, or use verbatim.
 
-**What works today, ahead of the privileged primitives.** Distributions that want to begin shipping correction tooling have a meaningful but incomplete surface:
+**What works today, with the privileged primitives in place.** A distribution shipping correction tooling now has a substantively complete surface:
 
 - **Same-plugin retract + re-announce.** A plugin that made a wrong claim can retract its own addressings (`SUBJECTS.md` 7.5) or relation claims (`RELATIONS.md` 4.3) and issue corrected ones. This is the correct path when the plugin is still running, cooperative, and fixable from within.
 - **Counter-claims for subject equivalence and distinctness.** An administration plugin that sees a wrong reconciliation can assert an equivalence or distinctness claim at `asserted` confidence; `SUBJECTS.md` section 9.2 gives the higher-confidence claim precedence, and the administration plugin's correction becomes the reconciliation outcome.
-- **Additive relation claims.** An administration plugin can assert a correct relation that coexists with any contrary plugin claims. Consumers see both; the graph does not suppress until the relation-suppression primitive lands.
+- **Additive relation claims.** An administration plugin can assert a correct relation that coexists with any contrary plugin claims. Consumers see both; the graph does not subtract one claim because of another.
+- **Cross-plugin forced retraction.** An administration plugin (admitted at an elevated trust class) can force-retract another plugin's addressings and relation claims via `SubjectAdmin` and `RelationAdmin`. Provenance captures the admin plugin's identity in the `AdminLogEntry` and on the paired happening.
+- **Subject merge and split.** An administration plugin can merge two canonical subjects into one or split one into many through `SubjectAdmin`; alias records preserve resolvability of the old IDs.
+- **Relation suppression.** An administration plugin can suppress (and later unsuppress) a relation so it stops appearing in walks and projections without being removed from the graph.
 
-What does NOT work today: cross-plugin retraction, type correction of subjects the administration plugin did not claim, merge, split, and relation suppression. These require the forthcoming privileged primitives.
+What does NOT work today: type correction of subjects the administration plugin did not claim. The merge primitive can effectively achieve type correction in the special case where the corrected type is also represented as a separate canonical subject the operator wants to consolidate to; outside that case the type-correction primitive is still pending.
 
 **What a distribution builds.** Any combination of the following, shaped to the product:
 
@@ -193,8 +196,11 @@ type = "album"
 reason = "Incorrectly registered as track by legacy plugin."
 
 # Remove an addressing whose owning plugin will not retract.
-# Requires the privileged cross-plugin retract primitive.
-# Status: requires forthcoming primitives.
+# Drives `SubjectAdmin::forced_retract_addressing`. Provenance
+# captures the administration plugin's identity in the
+# `AdminLogEntry` and on the `SubjectAddressingForcedRetract`
+# happening.
+# Status: implementable today.
 [[forget_addressing]]
 scheme = "mpd-path"
 value = "/music/orphan.flac"
@@ -206,21 +212,21 @@ Relation overrides:
 ```toml
 # Force a relation to exist. Administration plugin asserts the
 # relation as its own claim. The relation coexists with any
-# contrary plugin claims today (relations are multi-claimant;
-# consumers see all claims).
-# Status: implementable today, with caveat: cannot remove
-# contrary claims until the relation-suppression primitive
-# lands.
+# contrary plugin claims (relations are multi-claimant;
+# consumers see all claims). Pair with `[[forbid]]` below if
+# the operator wants the contrary claims hidden.
+# Status: implementable today.
 [[assert]]
 source    = { id = "a1b2c3d4-..." }
 predicate = "album_of"
 target    = { id = "e5f6a7b8-..." }
 reason    = "Manual correction: plugins disagree."
 
-# Suppress a relation. No equivalent exists in the as-shipped
-# framework; counter-claims add to the graph, they do not
-# subtract. Requires the relation-suppression primitive.
-# Status: requires forthcoming primitives.
+# Suppress a relation. Drives `RelationAdmin::suppress`; the
+# relation remains in the graph and visible to
+# `describe_relation` (with its `SuppressionRecord`) but is
+# hidden from neighbour queries and walks until unsuppressed.
+# Status: implementable today.
 [[forbid]]
 source    = { id = "..." }
 predicate = "performed_by"
@@ -230,17 +236,20 @@ reason    = "Incorrect match despite fuzzy metadata."
 
 **Key points for the distribution implementer.**
 
-- Plan for a staged rollout. Ship the administration plugin with what works today (counter-claims for subject equivalence/distinctness; additive relation claims that coexist with contrary plugin claims; same-plugin retractions). Close the remaining cases (cross-plugin retract, type correction, merge, split, relation suppression) when the privileged primitives ship.
-- Every correction that lands in the registry or graph does so as a plugin claim (the administration plugin's claim, or eventually a privileged retraction attributed to the administration plugin). The single-source-of-truth invariant is preserved; audit flows through the normal provenance surface.
+- Most of the privileged primitives have landed (cross-plugin forced retract, merge, split, relation suppression). Type correction is the remaining gap; merge covers the common case in which the operator is consolidating to an already-existing better-typed subject.
+- Every correction that lands in the registry or graph does so as a plugin claim (the administration plugin's claim) or as a privileged retraction / merge / split / suppression attributed to the administration plugin in both the `AdminLogEntry` and the paired happening. The single-source-of-truth invariant is preserved; audit flows through the normal provenance surface plus the dedicated admin ledger.
 - Reload semantics (SIGHUP, file-watch, polling) are the administration plugin's concern, not the steward's.
-- Audit of operator actions is stored in whatever surface the administration plugin chooses (its own log, journald, a distribution-specific database). Plugin-claim provenance in the subject registry and relation graph already captures the audit of the resulting data changes.
+- Audit of operator actions is captured by the steward's `AdminLedger` (in-memory today; persistence aligned with `PERSISTENCE.md`'s `admin_log` table). The plugin may additionally maintain its own log surface (journald, a distribution-specific database) for operator-facing presentation. Plugin-claim provenance in the subject registry and relation graph captures the audit of the resulting data changes.
 - Trust of the administration plugin is a distribution and operator concern. `VENDOR_CONTRACT.md` position 5 (operator sovereignty over trust) applies: the operator decides what administration plugin runs on their device. Trust-class gating for the privileged primitives makes this sovereignty enforceable.
 
 **Cross-references.**
 
-- `SUBJECTS.md` section 7.5 (plugin retract contract for subject addressings; same-plugin only today).
-- `RELATIONS.md` section 4.3 (plugin retract contract for relation claims; same-plugin only today).
-- `SUBJECTS.md` section 10 (merge and split semantics; plugin-callable API forthcoming).
+- `SUBJECTS.md` section 7.5 (plugin retract contract for subject addressings).
+- `RELATIONS.md` section 4.3 (plugin retract contract for relation claims).
+- `SUBJECTS.md` section 10 (merge and split semantics; plugin-callable API exposed via `SubjectAdmin`).
+- `RELATIONS.md` sections 7.1, 8.2, 8.3 (cardinality violations, split-relation distribution strategies, cascade discipline).
+- `HAPPENINGS.md` section 3.1 (admin happenings: forced-retract, merge, split, suppression, ambiguous-split).
+- `SCHEMAS.md` sections 5.1, 5.4-5.6 (wire shapes for the admin happenings, `AliasRecord`, `SplitRelationStrategy`, `ExplicitRelationAssignment`, `AdminLogEntry`, `AdminLogKind`).
 - `PLUGIN_PACKAGING.md` (manifest, trust class, signing for the administration plugin).
 - `VENDOR_CONTRACT.md` (trust and key authorisation for distribution-shipped administration tooling).
 
