@@ -67,29 +67,36 @@
 
 use crate::codec::{read_frame_json, write_frame_json, WireError};
 use crate::contract::{
-    Assignment, CallDeadline, CourseCorrection, CustodyHandle,
+    AliasRecord, Assignment, CallDeadline, CourseCorrection, CustodyHandle,
     CustodyStateReporter, ExternalAddressing, HealthStatus,
     InstanceAnnouncement, InstanceAnnouncer, InstanceId, LoadContext, Plugin,
     PluginError, RelationAnnouncer, RelationAssertion, RelationRetraction,
     ReportError, ReportPriority, Request, Respondent, StateReporter,
-    SubjectAnnouncement, SubjectAnnouncer, UserInteraction,
-    UserInteractionRequester, Warden,
+    SubjectAnnouncement, SubjectAnnouncer, SubjectQuerier, SubjectQueryResult,
+    UserInteraction, UserInteractionRequester, Warden,
 };
 use crate::wire::{WireFrame, PROTOCOL_VERSION};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Default event channel capacity. Events beyond this are backpressured;
 /// a plugin that floods the channel will see its callback futures
 /// pend until the writer task drains.
 pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// Pending map for plugin-initiated requests (e.g. the alias-aware
+/// describe queries). Keyed by correlation ID; the dispatch loop
+/// removes the matching entry when the steward's response frame
+/// arrives and forwards the frame on the oneshot.
+type PendingMap = HashMap<u64, oneshot::Sender<WireFrame>>;
 
 /// Errors raised by the host.
 ///
@@ -175,18 +182,24 @@ impl HostConfig {
 pub async fn serve<P, R, W>(
     plugin: P,
     config: HostConfig,
-    mut reader: R,
+    reader: R,
     writer: W,
 ) -> Result<(), HostError>
 where
     P: Plugin + Respondent + 'static,
-    R: AsyncRead + Send + Unpin,
+    R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
     let (tx, rx) = mpsc::channel::<WireFrame>(config.event_channel_capacity);
     let writer_task = tokio::spawn(writer_loop(writer, rx));
+    let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
 
-    let result = dispatch_loop(plugin, &config, &mut reader, tx).await;
+    let result =
+        dispatch_loop(plugin, &config, reader, tx, Arc::clone(&pending)).await;
+
+    // Drain any pending plugin-initiated requests still awaiting a
+    // response from the steward; they cannot complete now.
+    drain_pending(&pending);
 
     // Whatever happened, wait for the writer task so we don't leak it.
     // If our dispatch errored, the tx sender is already dropped (the
@@ -231,61 +244,196 @@ where
     Ok(())
 }
 
+/// Item the reader task hands to the dispatch task.
+///
+/// `Request` boxes the frame so the enum size stays small even
+/// though `WireFrame` itself is several hundred bytes; `Err` is
+/// the cheaper variant to keep on the channel.
+enum ReaderItem {
+    /// A steward-initiated request frame the dispatch task should
+    /// process.
+    Request(Box<WireFrame>),
+    /// The reader hit a fatal error; the dispatch task should
+    /// surface it and tear down.
+    Err(HostError),
+}
+
 async fn dispatch_loop<P, R>(
     mut plugin: P,
     config: &HostConfig,
-    reader: &mut R,
+    reader: R,
     tx: mpsc::Sender<WireFrame>,
+    pending: Arc<Mutex<PendingMap>>,
 ) -> Result<(), HostError>
 where
     P: Plugin + Respondent + 'static,
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Send + Unpin + 'static,
 {
     let event_cid = Arc::new(AtomicU64::new(1));
 
-    loop {
-        let frame = match read_frame_json(reader).await {
-            Ok(f) => f,
-            Err(WireError::PeerClosed) => {
-                // Clean EOF from the peer. Drop our sender so the
-                // writer task can drain any pending events and exit.
-                drop(tx);
-                return Ok(());
+    // Spawn a reader task. It pulls frames off the wire, routes
+    // responses through the pending map directly, and forwards
+    // request frames to this dispatch task via `req_rx`. This
+    // indirection is what makes plugin-initiated callbacks safe:
+    // a request handler can await a response while the reader
+    // task continues draining and routing frames.
+    let (req_tx, mut req_rx) = mpsc::channel::<ReaderItem>(1);
+    let reader_task = tokio::spawn(reader_loop_serve(
+        reader,
+        Arc::clone(&pending),
+        config.plugin_name.clone(),
+        req_tx,
+    ));
+
+    let result = loop {
+        let item = match req_rx.recv().await {
+            Some(item) => item,
+            None => break Ok(()),
+        };
+        match item {
+            ReaderItem::Request(frame) => {
+                let response = handle_frame(
+                    &mut plugin,
+                    *frame,
+                    config,
+                    &tx,
+                    &event_cid,
+                    &pending,
+                )
+                .await;
+                if tx.send(response).await.is_err() {
+                    break Err(HostError::Protocol(
+                        "writer task closed before response could be sent"
+                            .into(),
+                    ));
+                }
             }
-            Err(e) => return Err(e.into()),
+            ReaderItem::Err(e) => break Err(e),
+        }
+    };
+
+    // Drop our outbound sender so the writer drains and exits.
+    drop(tx);
+    // The reader task may still be parked inside `read_frame_json`
+    // waiting for more bytes; aborting is the only way to drop
+    // ownership of `reader` without requiring the steward to close
+    // the wire first. Aborting is safe because the dispatch is
+    // tearing down; the reader task holds no shared state we
+    // couldn't lose.
+    reader_task.abort();
+    let _ = reader_task.await;
+    result
+}
+
+/// Reader task for the respondent dispatch loop. Reads frames in a
+/// loop, routing responses/errors through the pending map and
+/// forwarding requests to the dispatch task.
+async fn reader_loop_serve<R>(
+    mut reader: R,
+    pending: Arc<Mutex<PendingMap>>,
+    expected_plugin: String,
+    req_tx: mpsc::Sender<ReaderItem>,
+) where
+    R: AsyncRead + Send + Unpin + 'static,
+{
+    loop {
+        let frame = match read_frame_json(&mut reader).await {
+            Ok(f) => f,
+            Err(WireError::PeerClosed) => return,
+            Err(e) => {
+                let _ = req_tx.send(ReaderItem::Err(e.into())).await;
+                return;
+            }
         };
 
         let (v, _cid, peer_plugin) = frame.envelope();
         if v != PROTOCOL_VERSION {
-            return Err(HostError::VersionMismatch {
-                expected: PROTOCOL_VERSION,
-                actual: v,
-            });
+            let _ = req_tx
+                .send(ReaderItem::Err(HostError::VersionMismatch {
+                    expected: PROTOCOL_VERSION,
+                    actual: v,
+                }))
+                .await;
+            return;
         }
-        if peer_plugin != config.plugin_name {
-            return Err(HostError::PluginMismatch {
-                expected: config.plugin_name.clone(),
-                actual: peer_plugin.to_string(),
-            });
+        if peer_plugin != expected_plugin {
+            let _ = req_tx
+                .send(ReaderItem::Err(HostError::PluginMismatch {
+                    expected: expected_plugin,
+                    actual: peer_plugin.to_string(),
+                }))
+                .await;
+            return;
         }
 
+        if frame.is_response() {
+            if !route_pending_response(&pending, frame) {
+                let _ = req_tx
+                    .send(ReaderItem::Err(HostError::Protocol(
+                        "response frame with no matching pending request"
+                            .into(),
+                    )))
+                    .await;
+                return;
+            }
+            continue;
+        }
+        if frame.is_error() {
+            if !route_pending_response(&pending, frame) {
+                tracing::warn!(
+                    "error frame from steward with no matching pending \
+                     request; dropping"
+                );
+            }
+            continue;
+        }
         if !frame.is_request() {
-            return Err(HostError::Protocol(format!(
-                "expected request frame, got {}",
-                variant_name(&frame)
-            )));
+            let _ = req_tx
+                .send(ReaderItem::Err(HostError::Protocol(format!(
+                    "expected request frame, got {}",
+                    variant_name(&frame)
+                ))))
+                .await;
+            return;
         }
-
-        let response =
-            handle_frame(&mut plugin, frame, config, &tx, &event_cid).await;
-
-        if tx.send(response).await.is_err() {
-            // Writer task closed - nothing we can do but return.
-            return Err(HostError::Protocol(
-                "writer task closed before response could be sent".into(),
-            ));
+        if req_tx
+            .send(ReaderItem::Request(Box::new(frame)))
+            .await
+            .is_err()
+        {
+            // Dispatch task is gone.
+            return;
         }
     }
+}
+
+/// Try to route a response frame (or `Error` frame) to a waiting
+/// plugin-initiated request. Returns true if a pending entry was
+/// matched.
+fn route_pending_response(
+    pending: &Arc<Mutex<PendingMap>>,
+    frame: WireFrame,
+) -> bool {
+    let (_v, cid, _plugin) = frame.envelope();
+    let entry = {
+        let mut p = pending.lock().expect("pending mutex poisoned");
+        p.remove(&cid)
+    };
+    match entry {
+        Some(sender) => {
+            let _ = sender.send(frame);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Drain pending plugin-initiated requests, dropping their oneshot
+/// senders. Awaiting callers see a closed channel and return
+/// `ReportError::ShuttingDown`.
+fn drain_pending(pending: &Arc<Mutex<PendingMap>>) {
+    let mut p = pending.lock().expect("pending mutex poisoned");
+    p.clear();
 }
 
 async fn handle_frame<P>(
@@ -294,6 +442,7 @@ async fn handle_frame<P>(
     config: &HostConfig,
     tx: &mpsc::Sender<WireFrame>,
     event_cid: &Arc<AtomicU64>,
+    pending: &Arc<Mutex<PendingMap>>,
 ) -> WireFrame
 where
     P: Plugin + Respondent + 'static,
@@ -318,15 +467,16 @@ where
             credentials_dir,
             deadline_ms,
         } => {
-            let ctx = match build_load_context(
-                cfg,
+            let ctx = match build_load_context(LoadContextBuildArgs {
+                config: cfg,
                 state_dir,
                 credentials_dir,
                 deadline_ms,
-                tx.clone(),
-                event_cid.clone(),
-                &p,
-            ) {
+                tx: tx.clone(),
+                event_cid: event_cid.clone(),
+                pending: Arc::clone(pending),
+                plugin_name: &p,
+            }) {
                 Ok(ctx) => ctx,
                 Err(e) => {
                     return error_frame(v, cid, &p, e, true);
@@ -461,15 +611,38 @@ fn variant_name(frame: &WireFrame) -> &'static str {
 // Config conversion
 // ---------------------------------------------------------------------
 
-fn build_load_context(
+/// Inputs to [`build_load_context`].
+///
+/// Bundled into one struct so the function signature stays small
+/// and call sites are explicit about which value flows where. The
+/// transport plumbing (`tx`, `event_cid`, `pending`) is shared
+/// across every wire-backed callback inside the constructed
+/// `LoadContext`; the rest mirrors fields the steward sent on the
+/// `Load` frame.
+struct LoadContextBuildArgs<'a> {
     config: serde_json::Value,
     state_dir: String,
     credentials_dir: String,
     deadline_ms: Option<u64>,
     tx: mpsc::Sender<WireFrame>,
     event_cid: Arc<AtomicU64>,
-    plugin_name: &str,
+    pending: Arc<Mutex<PendingMap>>,
+    plugin_name: &'a str,
+}
+
+fn build_load_context(
+    args: LoadContextBuildArgs<'_>,
 ) -> Result<LoadContext, String> {
+    let LoadContextBuildArgs {
+        config,
+        state_dir,
+        credentials_dir,
+        deadline_ms,
+        tx,
+        event_cid,
+        pending,
+        plugin_name,
+    } = args;
     let config = json_value_to_toml_table(config)
         .map_err(|e| format!("invalid config: {e}"))?;
 
@@ -490,8 +663,20 @@ fn build_load_context(
         });
     let relation_announcer: Arc<dyn RelationAnnouncer> =
         Arc::new(WireRelationAnnouncer {
+            tx: tx.clone(),
+            event_cid: event_cid.clone(),
+            plugin_name: plugin_name.to_string(),
+        });
+    // Wire-backed alias-aware subject querier. Mints a fresh cid,
+    // registers a pending entry, sends the request frame, and awaits
+    // the steward's response on the oneshot. The dispatch loop
+    // routes incoming `*_response` and `Error` frames whose cid
+    // matches a pending entry through the same map.
+    let subject_querier: Arc<dyn SubjectQuerier> =
+        Arc::new(WireSubjectQuerier {
             tx,
             event_cid,
+            pending,
             plugin_name: plugin_name.to_string(),
         });
 
@@ -508,11 +693,10 @@ fn build_load_context(
         user_interaction_requester,
         subject_announcer,
         relation_announcer,
-        // Alias-aware subject querier is not wired through the
-        // wire transport yet; later phases populate it. Wire
-        // plugins see None for now, matching the dormant
-        // in-process discipline.
-        subject_querier: None,
+        // Wire plugins receive a wire-backed querier that round-trips
+        // alias-aware describe queries to the steward over the same
+        // connection.
+        subject_querier: Some(subject_querier),
         // Admin surface is not wired through the wire transport
         // (the transport-admin story is a future pass). Non-admin
         // wire plugins see None, which matches the in-process
@@ -731,6 +915,131 @@ impl RelationAnnouncer for WireRelationAnnouncer {
     }
 }
 
+/// Subject querier that round-trips alias-aware describe queries to
+/// the steward over the wire connection.
+///
+/// Mints a fresh correlation ID for each query (sharing the same
+/// `event_cid` counter the announcers use - one monotonic id space
+/// per plugin connection avoids collisions across plugin-initiated
+/// frames). Registers a oneshot in the pending map keyed by that
+/// cid, then sends the request frame on the outbound channel and
+/// awaits the response. The dispatch loop matches the steward's
+/// `*_response` (or `Error`) frame back to the pending entry.
+#[derive(Debug)]
+struct WireSubjectQuerier {
+    tx: mpsc::Sender<WireFrame>,
+    event_cid: Arc<AtomicU64>,
+    pending: Arc<Mutex<PendingMap>>,
+    plugin_name: String,
+}
+
+impl SubjectQuerier for WireSubjectQuerier {
+    fn describe_alias<'a>(
+        &'a self,
+        subject_id: String,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<AliasRecord>, ReportError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let tx = self.tx.clone();
+        let plugin = self.plugin_name.clone();
+        let pending = Arc::clone(&self.pending);
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let rx = register_pending(&pending, cid);
+            let frame = WireFrame::DescribeAlias {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                subject_id,
+            };
+            if tx.send(frame).await.is_err() {
+                remove_pending(&pending, cid);
+                return Err(ReportError::ShuttingDown);
+            }
+            match rx.await {
+                Ok(WireFrame::DescribeAliasResponse { record, .. }) => {
+                    Ok(record)
+                }
+                Ok(WireFrame::Error { message, .. }) => {
+                    Err(ReportError::Invalid(message))
+                }
+                Ok(other) => Err(ReportError::Invalid(format!(
+                    "unexpected response frame: {}",
+                    variant_name(&other)
+                ))),
+                Err(_) => Err(ReportError::ShuttingDown),
+            }
+        })
+    }
+
+    fn describe_subject_with_aliases<'a>(
+        &'a self,
+        subject_id: String,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<SubjectQueryResult, ReportError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let tx = self.tx.clone();
+        let plugin = self.plugin_name.clone();
+        let pending = Arc::clone(&self.pending);
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let rx = register_pending(&pending, cid);
+            let frame = WireFrame::DescribeSubject {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                subject_id,
+            };
+            if tx.send(frame).await.is_err() {
+                remove_pending(&pending, cid);
+                return Err(ReportError::ShuttingDown);
+            }
+            match rx.await {
+                Ok(WireFrame::DescribeSubjectResponse { result, .. }) => {
+                    Ok(result)
+                }
+                Ok(WireFrame::Error { message, .. }) => {
+                    Err(ReportError::Invalid(message))
+                }
+                Ok(other) => Err(ReportError::Invalid(format!(
+                    "unexpected response frame: {}",
+                    variant_name(&other)
+                ))),
+                Err(_) => Err(ReportError::ShuttingDown),
+            }
+        })
+    }
+}
+
+/// Register a oneshot for `cid` in the pending map and return the
+/// receiver half. The dispatch loop's [`route_pending_response`]
+/// looks up `cid` and forwards the response frame on the matching
+/// sender.
+fn register_pending(
+    pending: &Arc<Mutex<PendingMap>>,
+    cid: u64,
+) -> oneshot::Receiver<WireFrame> {
+    let (tx, rx) = oneshot::channel();
+    let mut p = pending.lock().expect("pending mutex poisoned");
+    p.insert(cid, tx);
+    rx
+}
+
+/// Remove a pending entry without notifying the receiver. Used when
+/// the outbound channel is gone before we ever sent the request.
+fn remove_pending(pending: &Arc<Mutex<PendingMap>>, cid: u64) {
+    let mut p = pending.lock().expect("pending mutex poisoned");
+    p.remove(&cid);
+}
+
 /// Placeholder instance announcer. Factory-on-wire is not yet
 /// implemented; this stub returns `ReportError::Invalid` so plugins
 /// that try to use factory semantics on a wire transport get a clear
@@ -811,18 +1120,23 @@ impl UserInteractionRequester for WireUserInteractionRequester {
 pub async fn serve_warden<P, R, W>(
     plugin: P,
     config: HostConfig,
-    mut reader: R,
+    reader: R,
     writer: W,
 ) -> Result<(), HostError>
 where
     P: Plugin + Warden + 'static,
-    R: AsyncRead + Send + Unpin,
+    R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
     let (tx, rx) = mpsc::channel::<WireFrame>(config.event_channel_capacity);
     let writer_task = tokio::spawn(writer_loop(writer, rx));
+    let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
 
-    let result = dispatch_loop_warden(plugin, &config, &mut reader, tx).await;
+    let result =
+        dispatch_loop_warden(plugin, &config, reader, tx, Arc::clone(&pending))
+            .await;
+
+    drain_pending(&pending);
 
     match writer_task.await {
         Ok(Ok(())) => {}
@@ -854,56 +1168,55 @@ where
 async fn dispatch_loop_warden<P, R>(
     mut plugin: P,
     config: &HostConfig,
-    reader: &mut R,
+    reader: R,
     tx: mpsc::Sender<WireFrame>,
+    pending: Arc<Mutex<PendingMap>>,
 ) -> Result<(), HostError>
 where
     P: Plugin + Warden + 'static,
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Send + Unpin + 'static,
 {
     let event_cid = Arc::new(AtomicU64::new(1));
 
-    loop {
-        let frame = match read_frame_json(reader).await {
-            Ok(f) => f,
-            Err(WireError::PeerClosed) => {
-                drop(tx);
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
+    let (req_tx, mut req_rx) = mpsc::channel::<ReaderItem>(1);
+    let reader_task = tokio::spawn(reader_loop_serve(
+        reader,
+        Arc::clone(&pending),
+        config.plugin_name.clone(),
+        req_tx,
+    ));
+
+    let result = loop {
+        let item = match req_rx.recv().await {
+            Some(item) => item,
+            None => break Ok(()),
         };
-
-        let (v, _cid, peer_plugin) = frame.envelope();
-        if v != PROTOCOL_VERSION {
-            return Err(HostError::VersionMismatch {
-                expected: PROTOCOL_VERSION,
-                actual: v,
-            });
-        }
-        if peer_plugin != config.plugin_name {
-            return Err(HostError::PluginMismatch {
-                expected: config.plugin_name.clone(),
-                actual: peer_plugin.to_string(),
-            });
-        }
-
-        if !frame.is_request() {
-            return Err(HostError::Protocol(format!(
-                "expected request frame, got {}",
-                variant_name(&frame)
-            )));
-        }
-
-        let response =
-            handle_warden_frame(&mut plugin, frame, config, &tx, &event_cid)
+        match item {
+            ReaderItem::Request(frame) => {
+                let response = handle_warden_frame(
+                    &mut plugin,
+                    *frame,
+                    config,
+                    &tx,
+                    &event_cid,
+                    &pending,
+                )
                 .await;
-
-        if tx.send(response).await.is_err() {
-            return Err(HostError::Protocol(
-                "writer task closed before response could be sent".into(),
-            ));
+                if tx.send(response).await.is_err() {
+                    break Err(HostError::Protocol(
+                        "writer task closed before response could be sent"
+                            .into(),
+                    ));
+                }
+            }
+            ReaderItem::Err(e) => break Err(e),
         }
-    }
+    };
+
+    drop(tx);
+    reader_task.abort();
+    let _ = reader_task.await;
+    result
 }
 
 async fn handle_warden_frame<P>(
@@ -912,6 +1225,7 @@ async fn handle_warden_frame<P>(
     config: &HostConfig,
     tx: &mpsc::Sender<WireFrame>,
     event_cid: &Arc<AtomicU64>,
+    pending: &Arc<Mutex<PendingMap>>,
 ) -> WireFrame
 where
     P: Plugin + Warden + 'static,
@@ -936,15 +1250,16 @@ where
             credentials_dir,
             deadline_ms,
         } => {
-            let ctx = match build_load_context(
-                cfg,
+            let ctx = match build_load_context(LoadContextBuildArgs {
+                config: cfg,
                 state_dir,
                 credentials_dir,
                 deadline_ms,
-                tx.clone(),
-                event_cid.clone(),
-                &p,
-            ) {
+                tx: tx.clone(),
+                event_cid: event_cid.clone(),
+                pending: Arc::clone(pending),
+                plugin_name: &p,
+            }) {
                 Ok(ctx) => ctx,
                 Err(e) => {
                     return error_frame(v, cid, &p, e, true);

@@ -68,6 +68,7 @@ use evo_plugin_sdk::contract::{
     Assignment, CourseCorrection, CustodyHandle, CustodyStateReporter,
     HealthReport, LoadContext, PluginDescription, PluginError,
     RelationAnnouncer, Request, Response, StateReporter, SubjectAnnouncer,
+    SubjectQuerier,
 };
 use evo_plugin_sdk::wire::{WireFrame, PROTOCOL_VERSION};
 use std::collections::HashMap;
@@ -169,6 +170,10 @@ pub struct EventSink {
     /// Where to route `report_custody_state` frames. `None` for
     /// respondent-backed sinks.
     pub custody_state_reporter: Option<Arc<dyn CustodyStateReporter>>,
+    /// Where to route plugin-initiated `describe_alias` /
+    /// `describe_subject` requests. The reader task answers each with
+    /// the matching `*_response` frame on the same connection.
+    pub subject_querier: Arc<dyn SubjectQuerier>,
 }
 
 impl fmt::Debug for EventSink {
@@ -184,6 +189,7 @@ impl fmt::Debug for EventSink {
                     .as_ref()
                     .map(|_| "<Arc<dyn CustodyStateReporter>>"),
             )
+            .field("subject_querier", &"<Arc<dyn SubjectQuerier>>")
             .finish()
     }
 }
@@ -241,6 +247,22 @@ impl fmt::Debug for WireClient {
     }
 }
 
+impl Drop for WireClient {
+    /// Abort the spawned reader and writer tasks on drop.
+    ///
+    /// Necessary because the reader task holds a clone of the
+    /// outbound sender (so it can answer plugin-initiated requests
+    /// like the alias-aware describe queries). That clone keeps the
+    /// writer's mpsc receiver alive even after the WireClient's own
+    /// `out_tx` drops, which would otherwise leave the writer task
+    /// holding the connection open until the peer closes its end.
+    /// Aborting both tasks releases the I/O halves promptly.
+    fn drop(&mut self) {
+        self._reader_task.abort();
+        self._writer_task.abort();
+    }
+}
+
 impl WireClient {
     /// Spawn a wire client against the given reader and writer halves.
     ///
@@ -266,6 +288,7 @@ impl WireClient {
             Arc::clone(&event_sink),
             plugin_name.clone(),
             Arc::clone(&alive),
+            out_tx.clone(),
         ));
         let writer_task = tokio::spawn(writer_loop(
             writer,
@@ -617,6 +640,7 @@ async fn reader_loop<R>(
     event_sink: Arc<Mutex<Option<Arc<EventSink>>>>,
     expected_plugin: String,
     alive: Arc<std::sync::atomic::AtomicBool>,
+    out_tx: mpsc::Sender<WireFrame>,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -628,6 +652,7 @@ async fn reader_loop<R>(
                     &pending,
                     &event_sink,
                     &expected_plugin,
+                    &out_tx,
                 )
                 .await;
             }
@@ -649,6 +674,7 @@ async fn handle_inbound_frame(
     pending: &Arc<Mutex<PendingMap>>,
     event_sink: &Arc<Mutex<Option<Arc<EventSink>>>>,
     expected_plugin: &str,
+    out_tx: &mpsc::Sender<WireFrame>,
 ) {
     let (v, cid, peer_plugin) = frame.envelope();
 
@@ -696,13 +722,168 @@ async fn handle_inbound_frame(
                 );
             }
         }
+    } else if frame.is_plugin_request() {
+        // Plugin-initiated request (alias-aware describe queries).
+        // Dispatch through the event sink's subject querier and
+        // emit the matching `*_response` (or `Error`) frame on the
+        // outbound channel.
+        let sink = {
+            let guard = event_sink.lock().expect("event sink mutex poisoned");
+            guard.clone()
+        };
+        match sink {
+            Some(sink) => {
+                forward_plugin_request(frame, &sink, out_tx).await;
+            }
+            None => {
+                tracing::warn!(
+                    cid = cid,
+                    frame = variant_name(&frame),
+                    "plugin-initiated request arrived with no event sink \
+                     installed; replying with error"
+                );
+                let plugin = peer_plugin.to_string();
+                let _ = out_tx
+                    .send(WireFrame::Error {
+                        v: PROTOCOL_VERSION,
+                        cid,
+                        plugin,
+                        message:
+                            "subject querier unavailable: plugin not loaded"
+                                .into(),
+                        fatal: false,
+                    })
+                    .await;
+            }
+        }
     } else {
-        // Request from peer is a protocol violation; log and drop.
+        // Steward-initiated request from a plugin is a protocol
+        // violation; log and drop.
         tracing::warn!(
             cid = cid,
             frame = variant_name(&frame),
             "request frame arrived from peer; plugin side should not send requests"
         );
+    }
+}
+
+/// Dispatch a plugin-initiated request (describe_alias /
+/// describe_subject) through the event sink's subject querier and
+/// emit the matching response (or `Error`) frame on the outbound
+/// channel. The reader task owns no awaitable in-flight state for
+/// these dispatches: each call constructs the response frame and
+/// hands it to the writer task via `out_tx`.
+async fn forward_plugin_request(
+    frame: WireFrame,
+    sink: &EventSink,
+    out_tx: &mpsc::Sender<WireFrame>,
+) {
+    let response = match frame {
+        WireFrame::DescribeAlias {
+            v,
+            cid,
+            plugin,
+            subject_id,
+        } => match sink.subject_querier.describe_alias(subject_id).await {
+            Ok(record) => WireFrame::DescribeAliasResponse {
+                v,
+                cid,
+                plugin,
+                record,
+            },
+            Err(e) => WireFrame::Error {
+                v,
+                cid,
+                plugin,
+                message: format!("describe_alias: {e}"),
+                fatal: false,
+            },
+        },
+        WireFrame::DescribeSubject {
+            v,
+            cid,
+            plugin,
+            subject_id,
+        } => match sink
+            .subject_querier
+            .describe_subject_with_aliases(subject_id)
+            .await
+        {
+            Ok(result) => WireFrame::DescribeSubjectResponse {
+                v,
+                cid,
+                plugin,
+                result,
+            },
+            Err(e) => WireFrame::Error {
+                v,
+                cid,
+                plugin,
+                message: format!("describe_subject: {e}"),
+                fatal: false,
+            },
+        },
+        other => {
+            // Should never happen: caller guards on
+            // is_plugin_request() before calling.
+            tracing::warn!(
+                frame = variant_name(&other),
+                "forward_plugin_request called with non plugin request frame"
+            );
+            return;
+        }
+    };
+    if out_tx.send(response).await.is_err() {
+        tracing::warn!(
+            "writer task closed before plugin-request response could be sent"
+        );
+    }
+}
+
+/// Stub querier installed when a wire-backed `LoadContext` carries
+/// no querier (typical for test harnesses that do not populate the
+/// field). Returns `NotFound` / `None` for every query so the wire
+/// dispatch path remains structurally identical to production while
+/// preserving existing test behaviour where querier-less plugins
+/// simply do not benefit from alias resolution.
+#[derive(Debug, Default)]
+struct NotFoundSubjectQuerier;
+
+impl SubjectQuerier for NotFoundSubjectQuerier {
+    fn describe_alias<'a>(
+        &'a self,
+        _subject_id: String,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Option<evo_plugin_sdk::contract::AliasRecord>,
+                        evo_plugin_sdk::contract::ReportError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn describe_subject_with_aliases<'a>(
+        &'a self,
+        _subject_id: String,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        evo_plugin_sdk::contract::SubjectQueryResult,
+                        evo_plugin_sdk::contract::ReportError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Ok(evo_plugin_sdk::contract::SubjectQueryResult::NotFound)
+        })
     }
 }
 
@@ -972,12 +1153,22 @@ impl crate::admission::ErasedRespondent for WireRespondent {
             // Install event sink BEFORE sending the load frame so that
             // any events emitted during load() reach the registries.
             // Respondents never emit ReportCustodyState so the
-            // custody_state_reporter slot is None.
+            // custody_state_reporter slot is None. The subject_querier
+            // is taken from the LoadContext when present (admission
+            // populates it with a registry-backed querier for every
+            // wire plugin); test harnesses that leave the field None
+            // get the default stub which returns NotFound for every
+            // query.
+            let subject_querier: Arc<dyn SubjectQuerier> = ctx
+                .subject_querier
+                .clone()
+                .unwrap_or_else(|| Arc::new(NotFoundSubjectQuerier));
             self.client.set_event_sink(EventSink {
                 state_reporter: Arc::clone(&ctx.state_reporter),
                 subject_announcer: Arc::clone(&ctx.subject_announcer),
                 relation_announcer: Arc::clone(&ctx.relation_announcer),
                 custody_state_reporter: None,
+                subject_querier,
             });
 
             let config_json = toml_table_to_json_value(ctx.config.clone())
@@ -1206,11 +1397,19 @@ impl crate::admission::ErasedWarden for WireWarden {
                     Arc::clone(&self.bus),
                     self.client.plugin_name().to_string(),
                 ));
+            // Same fallback rationale as WireRespondent::load: the
+            // querier comes from the LoadContext when present, else
+            // a stub that returns NotFound for every query.
+            let subject_querier: Arc<dyn SubjectQuerier> = ctx
+                .subject_querier
+                .clone()
+                .unwrap_or_else(|| Arc::new(NotFoundSubjectQuerier));
             self.client.set_event_sink(EventSink {
                 state_reporter: Arc::clone(&ctx.state_reporter),
                 subject_announcer: Arc::clone(&ctx.subject_announcer),
                 relation_announcer: Arc::clone(&ctx.relation_announcer),
                 custody_state_reporter: Some(custody_reporter),
+                subject_querier,
             });
 
             let config_json = toml_table_to_json_value(ctx.config.clone())
@@ -1412,10 +1611,10 @@ fn toml_value_to_json_value(
 mod tests {
     use super::*;
     use evo_plugin_sdk::contract::{
-        BuildInfo, ExternalAddressing, HealthReport, HealthStatus, Plugin,
-        PluginDescription, PluginError, PluginIdentity, RelationAssertion,
-        ReportError, Request, Respondent, Response, RuntimeCapabilities,
-        SubjectAnnouncement, Warden,
+        AliasRecord, BuildInfo, ExternalAddressing, HealthReport, HealthStatus,
+        Plugin, PluginDescription, PluginError, PluginIdentity,
+        RelationAssertion, ReportError, Request, Respondent, Response,
+        RuntimeCapabilities, SubjectAnnouncement, SubjectQueryResult, Warden,
     };
     use evo_plugin_sdk::host::{serve, serve_warden, HostConfig};
     use std::sync::atomic::AtomicBool;
@@ -1424,6 +1623,22 @@ mod tests {
     // -----------------------------------------------------------------
     // Test plugin that can be driven through the SDK's serve()
     // -----------------------------------------------------------------
+
+    /// Captured outcome of a wire-backed `subject_querier` call made
+    /// from inside `TestPlugin::load`. The test reads the contents
+    /// after `load()` returns to assert what the steward replied.
+    type CapturedAlias = Arc<
+        std::sync::Mutex<
+            Option<Result<Option<AliasRecord>, ReportErrorString>>,
+        >,
+    >;
+    type CapturedSubjectQuery = Arc<
+        std::sync::Mutex<Option<Result<SubjectQueryResult, ReportErrorString>>>,
+    >;
+
+    /// Stringified `ReportError` so it can travel through `Mutex`
+    /// boundaries without lifetime-laden `Box<dyn Error>` plumbing.
+    type ReportErrorString = String;
 
     #[derive(Default)]
     struct TestPlugin {
@@ -1438,6 +1653,15 @@ mod tests {
         )>,
         fail_load: bool,
         fatal_handle_request: bool,
+        /// If Some, call `ctx.subject_querier.describe_alias` with
+        /// this id during load and stash the outcome.
+        describe_alias_id: Option<String>,
+        capture_alias: Option<CapturedAlias>,
+        /// If Some, call
+        /// `ctx.subject_querier.describe_subject_with_aliases` with
+        /// this id during load and stash the outcome.
+        describe_subject_id: Option<String>,
+        capture_subject_query: Option<CapturedSubjectQuery>,
     }
 
     impl Plugin for TestPlugin {
@@ -1492,6 +1716,30 @@ mod tests {
                     ctx.relation_announcer.assert(r.clone()).await.map_err(
                         |e| PluginError::Permanent(format!("assert: {e}")),
                     )?;
+                }
+                if let Some(id) = self.describe_alias_id.as_ref() {
+                    let querier = ctx.subject_querier.as_ref().expect(
+                        "test asks for describe_alias but ctx has no querier",
+                    );
+                    let outcome = querier
+                        .describe_alias(id.clone())
+                        .await
+                        .map_err(|e| format!("{e}"));
+                    if let Some(slot) = self.capture_alias.as_ref() {
+                        *slot.lock().unwrap() = Some(outcome);
+                    }
+                }
+                if let Some(id) = self.describe_subject_id.as_ref() {
+                    let querier = ctx.subject_querier.as_ref().expect(
+                        "test asks for describe_subject but ctx has no querier",
+                    );
+                    let outcome = querier
+                        .describe_subject_with_aliases(id.clone())
+                        .await
+                        .map_err(|e| format!("{e}"));
+                    if let Some(slot) = self.capture_subject_query.as_ref() {
+                        *slot.lock().unwrap() = Some(outcome);
+                    }
                 }
                 self.loaded.store(true, Ordering::Relaxed);
                 Ok(())
@@ -2384,6 +2632,7 @@ target_type = "album"
                     captured: Arc::clone(&captured),
                 },
             )),
+            subject_querier: Arc::new(NotFoundSubjectQuerier),
         });
 
         // Take custody. The plugin emits the state report BEFORE
@@ -2501,6 +2750,385 @@ target_type = "album"
 
         warden.unload().await.unwrap();
         drop(warden);
+        let _ = host.await;
+    }
+
+    // -----------------------------------------------------------------
+    // Wire SubjectQuerier round-trip tests.
+    //
+    // These exercise the plugin-initiated request path end-to-end:
+    // the plugin calls `ctx.subject_querier.<query>` from inside its
+    // `load()` method. The SDK's wire-backed querier mints a cid,
+    // sends a `DescribeAlias` / `DescribeSubject` frame, and awaits
+    // the response. The steward's reader task receives the request,
+    // dispatches through the EventSink's `subject_querier` (which we
+    // populate from a `RegistrySubjectQuerier` over a real
+    // `SubjectRegistry`), and emits the matching response frame.
+    // The plugin's await resolves and the captured outcome should
+    // mirror what an in-process plugin would see.
+    // -----------------------------------------------------------------
+
+    /// Build a `LoadContext` shaped like the production wire path:
+    /// `subject_querier` populated with a `RegistrySubjectQuerier`
+    /// over the supplied registry, other announcers kept as the
+    /// minimal logging stubs the existing wire tests use.
+    fn test_load_context_with_querier(
+        plugin_name: &str,
+        registry: Arc<SubjectRegistry>,
+        graph: Arc<RelationGraph>,
+    ) -> LoadContext {
+        use crate::context::{
+            LoggingInstanceAnnouncer, LoggingStateReporter,
+            LoggingUserInteractionRequester, RegistrySubjectQuerier,
+        };
+        let catalogue = Arc::new(
+            Catalogue::from_toml(
+                r#"
+[[subjects]]
+name = "track"
+
+[[subjects]]
+name = "album"
+"#,
+            )
+            .expect("test catalogue must parse"),
+        );
+        let bus = Arc::new(HappeningBus::new());
+        LoadContext {
+            config: toml::Table::new(),
+            state_dir: "/tmp/state".into(),
+            credentials_dir: "/tmp/creds".into(),
+            deadline: None,
+            state_reporter: Arc::new(LoggingStateReporter::new(
+                plugin_name.to_string(),
+            )),
+            instance_announcer: Arc::new(LoggingInstanceAnnouncer::new(
+                plugin_name.to_string(),
+            )),
+            user_interaction_requester: Arc::new(
+                LoggingUserInteractionRequester::new(plugin_name.to_string()),
+            ),
+            subject_announcer: Arc::new(RegistrySubjectAnnouncer::new(
+                Arc::clone(&registry),
+                Arc::clone(&graph),
+                Arc::clone(&catalogue),
+                Arc::clone(&bus),
+                plugin_name.to_string(),
+            )),
+            relation_announcer: Arc::new(RegistryRelationAnnouncer::new(
+                Arc::clone(&registry),
+                graph,
+                catalogue,
+                bus,
+                plugin_name.to_string(),
+            )),
+            subject_querier: Some(Arc::new(RegistrySubjectQuerier::new(
+                Arc::clone(&registry),
+            ))),
+            subject_admin: None,
+            relation_admin: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wire_subject_querier_describe_alias_round_trips() {
+        // Arrange: registry with two subjects merged via the admin
+        // surface. The merged source ID will resolve to an
+        // AliasRecord describing the merge.
+        use crate::admin::AdminLedger;
+        use crate::admission::ErasedRespondent;
+        use crate::context::RegistrySubjectAdmin;
+        use evo_plugin_sdk::contract::{
+            AliasKind, SubjectAdmin, SubjectAnnouncement,
+        };
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(
+            Catalogue::from_toml(
+                r#"
+[[subjects]]
+name = "track"
+"#,
+            )
+            .expect("catalogue must parse"),
+        );
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mbid", "track-mbid")],
+                ),
+                "org.test.p2",
+            )
+            .unwrap();
+
+        let original_a_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+
+        let admin = RegistrySubjectAdmin::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            Arc::clone(&ledger),
+            "admin.plugin",
+        );
+        admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "track-mbid"),
+                Some("dedup".into()),
+            )
+            .await
+            .expect("merge must succeed");
+
+        // Act: drive a wire plugin whose `load()` calls
+        // `subject_querier.describe_alias(original_a_id)`. The
+        // plugin's await must resolve to the alias record.
+        let captured: CapturedAlias = Arc::new(std::sync::Mutex::new(None));
+        let plugin = TestPlugin {
+            name: "org.test.x".into(),
+            describe_alias_id: Some(original_a_id.clone()),
+            capture_alias: Some(Arc::clone(&captured)),
+            ..Default::default()
+        };
+        let (mut respondent, host) = connect_test_pair(plugin).await;
+
+        let ctx = test_load_context_with_querier(
+            "org.test.x",
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+        );
+
+        respondent.load(&ctx).await.unwrap();
+
+        // Assert: the wire plugin sees the same alias record an
+        // in-process plugin would.
+        let outcome = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("plugin must have captured the describe_alias outcome");
+        let record = outcome
+            .expect("describe_alias must succeed")
+            .expect("merged source must produce an alias record");
+        assert_eq!(record.old_id.as_str(), original_a_id);
+        assert_eq!(record.kind, AliasKind::Merged);
+        assert_eq!(record.new_ids.len(), 1);
+        assert_eq!(record.admin_plugin, "admin.plugin");
+        assert_eq!(record.reason.as_deref(), Some("dedup"));
+
+        respondent.unload().await.unwrap();
+        drop(respondent);
+        let _ = host.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wire_subject_querier_describe_subject_with_aliases_returns_found()
+    {
+        // Live (non-aliased) subject: describe_subject_with_aliases
+        // round-tripped over the wire returns Found.
+        use crate::admission::ErasedRespondent;
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        let live_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+
+        let captured: CapturedSubjectQuery =
+            Arc::new(std::sync::Mutex::new(None));
+        let plugin = TestPlugin {
+            name: "org.test.x".into(),
+            describe_subject_id: Some(live_id.clone()),
+            capture_subject_query: Some(Arc::clone(&captured)),
+            ..Default::default()
+        };
+        let (mut respondent, host) = connect_test_pair(plugin).await;
+
+        let ctx = test_load_context_with_querier(
+            "org.test.x",
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+        );
+
+        respondent.load(&ctx).await.unwrap();
+
+        let outcome =
+            captured.lock().unwrap().clone().expect(
+                "plugin must have captured the describe_subject outcome",
+            );
+        let result = outcome.expect("describe_subject must succeed");
+        match result {
+            SubjectQueryResult::Found { record } => {
+                assert_eq!(record.id.as_str(), live_id);
+                assert_eq!(record.subject_type, "track");
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+
+        respondent.unload().await.unwrap();
+        drop(respondent);
+        let _ = host.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wire_subject_querier_describe_subject_with_aliases_walks_chain_via_wire(
+    ) {
+        // Multi-hop merge chain queried over the wire: the result
+        // should be an Aliased outcome with both alias records and
+        // the final live terminal subject.
+        use crate::admin::AdminLedger;
+        use crate::admission::ErasedRespondent;
+        use crate::context::RegistrySubjectAdmin;
+        use evo_plugin_sdk::contract::{
+            AliasKind, SubjectAdmin, SubjectAnnouncement,
+        };
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(
+            Catalogue::from_toml(
+                r#"
+[[subjects]]
+name = "track"
+"#,
+            )
+            .expect("catalogue must parse"),
+        );
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mbid", "b-mbid")],
+                ),
+                "org.test.p2",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mbid", "c-mbid")],
+                ),
+                "org.test.p3",
+            )
+            .unwrap();
+
+        let original_a_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+
+        let admin = RegistrySubjectAdmin::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            Arc::clone(&ledger),
+            "admin.plugin",
+        );
+
+        admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "b-mbid"),
+                None,
+            )
+            .await
+            .expect("first merge must succeed");
+        let intermediate_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+        admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "c-mbid"),
+                None,
+            )
+            .await
+            .expect("second merge must succeed");
+        let final_id = registry
+            .resolve(&ExternalAddressing::new("mpd-path", "/a.flac"))
+            .unwrap();
+
+        let captured: CapturedSubjectQuery =
+            Arc::new(std::sync::Mutex::new(None));
+        let plugin = TestPlugin {
+            name: "org.test.x".into(),
+            describe_subject_id: Some(original_a_id.clone()),
+            capture_subject_query: Some(Arc::clone(&captured)),
+            ..Default::default()
+        };
+        let (mut respondent, host) = connect_test_pair(plugin).await;
+
+        let ctx = test_load_context_with_querier(
+            "org.test.x",
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+        );
+
+        respondent.load(&ctx).await.unwrap();
+
+        let outcome =
+            captured.lock().unwrap().clone().expect(
+                "plugin must have captured the describe_subject outcome",
+            );
+        let result = outcome.expect("describe_subject must succeed");
+        match result {
+            SubjectQueryResult::Aliased { chain, terminal } => {
+                assert_eq!(chain.len(), 2, "must walk both merge hops");
+                assert_eq!(chain[0].old_id.as_str(), original_a_id);
+                assert_eq!(chain[0].new_ids[0].as_str(), intermediate_id);
+                assert_eq!(chain[0].kind, AliasKind::Merged);
+                assert_eq!(chain[1].old_id.as_str(), intermediate_id);
+                assert_eq!(chain[1].new_ids[0].as_str(), final_id);
+                assert_eq!(chain[1].kind, AliasKind::Merged);
+                let terminal =
+                    terminal.expect("multi-hop merge must have a terminal");
+                assert_eq!(terminal.id.as_str(), final_id);
+            }
+            other => panic!("expected Aliased, got {other:?}"),
+        }
+
+        respondent.unload().await.unwrap();
+        drop(respondent);
         let _ = host.await;
     }
 }
