@@ -329,6 +329,59 @@ pub enum ForcedRetractAddressingOutcome {
     NotFound,
 }
 
+/// One addressing relocation performed by a merge or split.
+///
+/// Carries the per-addressing transition: the claimant that
+/// originally owned the addressing, the addressing itself, and
+/// the canonical IDs the addressing moved between. Used by the
+/// wiring layer to emit per-transfer happenings; the registry
+/// state itself reflects the relocation unconditionally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressingTransfer {
+    /// Plugin that originally claimed the addressing on the
+    /// source subject.
+    pub claimant: String,
+    /// The addressing that was relocated.
+    pub addressing: ExternalAddressing,
+    /// Canonical ID the addressing was on before the cascade.
+    pub old_subject_id: String,
+    /// Canonical ID the addressing is on after the cascade.
+    pub new_subject_id: String,
+}
+
+/// Outcome of a [`SubjectRegistry::merge_aliases`] call.
+///
+/// Carries the new canonical ID minted for the merged subject
+/// plus per-addressing transfer records so the wiring layer can
+/// surface the cascade as happenings. The registry state itself
+/// reflects the merge unconditionally.
+#[derive(Debug, Clone)]
+pub struct MergeAliasesOutcome {
+    /// The canonical ID minted for the merged subject.
+    pub new_id: String,
+    /// One entry per addressing relocated from a source ID to
+    /// the new ID. Order follows the source-A then source-B
+    /// concatenation order used internally.
+    pub addressing_transfers: Vec<AddressingTransfer>,
+}
+
+/// Outcome of a [`SubjectRegistry::split_subject`] call.
+///
+/// Carries the new canonical IDs minted for the partition groups
+/// (in partition order) plus per-addressing transfer records so
+/// the wiring layer can surface the cascade as happenings. The
+/// registry state itself reflects the split unconditionally.
+#[derive(Debug, Clone)]
+pub struct SplitSubjectOutcome {
+    /// The canonical IDs minted for the partition groups, in
+    /// partition order.
+    pub new_ids: Vec<String>,
+    /// One entry per addressing relocated from the source ID to
+    /// one of the new IDs. Order follows the partition group
+    /// order.
+    pub addressing_transfers: Vec<AddressingTransfer>,
+}
+
 impl Default for SubjectRegistry {
     fn default() -> Self {
         Self::new()
@@ -798,14 +851,16 @@ impl SubjectRegistry {
     /// the wiring layer
     /// ([`RegistrySubjectAdmin`](crate::context::RegistrySubjectAdmin))
     /// is responsible for graph rewrite and happening emission.
-    /// Returns the new canonical ID on success.
+    /// Returns a [`MergeAliasesOutcome`] carrying the new
+    /// canonical ID and one [`AddressingTransfer`] per addressing
+    /// relocated from a source subject to the new subject.
     pub fn merge_aliases(
         &self,
         source_a_id: &str,
         source_b_id: &str,
         admin_plugin: &str,
         reason: Option<String>,
-    ) -> Result<String, StewardError> {
+    ) -> Result<MergeAliasesOutcome, StewardError> {
         let mut inner = self.inner.lock().expect("registry mutex poisoned");
 
         if source_a_id == source_b_id {
@@ -851,6 +906,27 @@ impl SubjectRegistry {
         let mut merged_addressings: Vec<AddressingRecord> = Vec::new();
         merged_addressings.extend(record_a.addressings.iter().cloned());
         merged_addressings.extend(record_b.addressings.iter().cloned());
+
+        // Per-addressing transfer records for the wiring layer.
+        // Order matches the source-A then source-B concatenation
+        // used to build merged_addressings, so the indices line up.
+        let mut addressing_transfers: Vec<AddressingTransfer> = Vec::new();
+        for ar in &record_a.addressings {
+            addressing_transfers.push(AddressingTransfer {
+                claimant: ar.claimant.clone(),
+                addressing: ar.addressing.clone(),
+                old_subject_id: source_a_id.to_string(),
+                new_subject_id: new_id.clone(),
+            });
+        }
+        for ar in &record_b.addressings {
+            addressing_transfers.push(AddressingTransfer {
+                claimant: ar.claimant.clone(),
+                addressing: ar.addressing.clone(),
+                old_subject_id: source_b_id.to_string(),
+                new_subject_id: new_id.clone(),
+            });
+        }
 
         let new_record = SubjectRecord {
             id: new_id.clone(),
@@ -925,7 +1001,10 @@ impl SubjectRegistry {
             "SubjectMerged: two subjects collapsed into one"
         );
 
-        Ok(new_id)
+        Ok(MergeAliasesOutcome {
+            new_id,
+            addressing_transfers,
+        })
     }
 
     /// Split one canonical subject into two or more.
@@ -964,15 +1043,17 @@ impl SubjectRegistry {
     /// wiring layer
     /// ([`RegistrySubjectAdmin`](crate::context::RegistrySubjectAdmin))
     /// drives the graph rewrite per the operator's chosen
-    /// `SplitRelationStrategy`. Returns the new canonical IDs in
-    /// partition order on success.
+    /// `SplitRelationStrategy`. Returns a [`SplitSubjectOutcome`]
+    /// carrying the new canonical IDs in partition order plus
+    /// one [`AddressingTransfer`] per addressing relocated from
+    /// the source ID to a new ID.
     pub fn split_subject(
         &self,
         source_id: &str,
         partition: Vec<Vec<ExternalAddressing>>,
         admin_plugin: &str,
         reason: Option<String>,
-    ) -> Result<Vec<String>, StewardError> {
+    ) -> Result<SplitSubjectOutcome, StewardError> {
         let mut inner = self.inner.lock().expect("registry mutex poisoned");
 
         let source_record =
@@ -1045,6 +1126,7 @@ impl SubjectRegistry {
                 .map(|ar| (ar.addressing.clone(), ar))
                 .collect();
 
+        let mut addressing_transfers: Vec<AddressingTransfer> = Vec::new();
         for (i, group) in partition.iter().enumerate() {
             let new_id = &new_ids[i];
             let group_records: Vec<AddressingRecord> = group
@@ -1068,6 +1150,12 @@ impl SubjectRegistry {
                 inner
                     .addressings
                     .insert(ar.addressing.clone(), new_id.clone());
+                addressing_transfers.push(AddressingTransfer {
+                    claimant: ar.claimant.clone(),
+                    addressing: ar.addressing.clone(),
+                    old_subject_id: source_id.to_string(),
+                    new_subject_id: new_id.clone(),
+                });
             }
         }
 
@@ -1106,7 +1194,10 @@ impl SubjectRegistry {
             "SubjectSplit: subject partitioned into multiple new subjects"
         );
 
-        Ok(new_ids)
+        Ok(SplitSubjectOutcome {
+            new_ids,
+            addressing_transfers,
+        })
     }
 
     /// Look up the alias record for a canonical ID that was
@@ -1683,9 +1774,12 @@ mod tests {
         assert_eq!(r.subject_count(), 2);
         assert_eq!(r.addressing_count(), 2);
 
-        let new_id = r
+        let outcome = r
             .merge_aliases(&id_a, &id_b, "admin.plugin", Some("dup".into()))
             .expect("merge must succeed");
+        let new_id = outcome.new_id;
+        // Two addressings transferred (one per source).
+        assert_eq!(outcome.addressing_transfers.len(), 2);
 
         assert_ne!(new_id, id_a);
         assert_ne!(new_id, id_b);
@@ -1724,7 +1818,8 @@ mod tests {
                 "admin.plugin",
                 Some("operator confirmed".into()),
             )
-            .unwrap();
+            .unwrap()
+            .new_id;
 
         let alias_a = r.describe_alias(&id_a).expect("alias for source_a");
         assert_eq!(alias_a.kind, AliasKind::Merged);
@@ -1747,8 +1842,10 @@ mod tests {
         // index is not rewritten, downstream lookups break.
         let r = SubjectRegistry::new();
         let (id_a, id_b) = seed_two_subjects(&r);
-        let new_id =
-            r.merge_aliases(&id_a, &id_b, "admin.plugin", None).unwrap();
+        let new_id = r
+            .merge_aliases(&id_a, &id_b, "admin.plugin", None)
+            .unwrap()
+            .new_id;
 
         assert_eq!(
             r.resolve(&addr("mpd-path", "/a.flac")),
@@ -1874,7 +1971,7 @@ mod tests {
         assert_eq!(r.subject_count(), 1);
         assert_eq!(r.addressing_count(), 3);
 
-        let new_ids = r
+        let outcome = r
             .split_subject(
                 &source_id,
                 vec![
@@ -1886,6 +1983,9 @@ mod tests {
                 Some("three distinct things".into()),
             )
             .expect("split must succeed");
+        let new_ids = outcome.new_ids;
+        // Three addressings transferred (one per partition group).
+        assert_eq!(outcome.addressing_transfers.len(), 3);
 
         assert_eq!(new_ids.len(), 3);
         for new_id in &new_ids {
@@ -1934,7 +2034,8 @@ mod tests {
                 "admin.plugin",
                 None,
             )
-            .unwrap();
+            .unwrap()
+            .new_ids;
 
         let alias = r.describe_alias(&source_id).expect("alias for source");
         assert_eq!(alias.kind, AliasKind::Split);

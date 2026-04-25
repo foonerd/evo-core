@@ -1003,8 +1003,13 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             // installs alias records. Pre-validation above covers
             // self-merge and cross-type; anything else returned by
             // the primitive is genuinely unforeseen and surfaces as
-            // MergeInternal.
-            let new_id = registry
+            // MergeInternal. The per-addressing transfer records on
+            // the outcome are ignored here; the cascade-emission
+            // wiring consumes them.
+            let crate::subjects::MergeAliasesOutcome {
+                new_id,
+                addressing_transfers: _,
+            } = registry
                 .merge_aliases(
                     &source_a_id,
                     &source_b_id,
@@ -1034,13 +1039,15 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             // are independent; the second sees the post-first
             // state and may collapse further if the rewritten
             // edges from source_a coincide with edges already
-            // touched by source_b.
-            graph
+            // touched by source_b. The per-edge outcome records
+            // are ignored here; the cascade-emission wiring
+            // consumes them.
+            let _rewrite_a = graph
                 .rewrite_subject_to(&source_a_id, &new_id)
                 .map_err(|e| ReportError::MergeInternal {
                     detail: format!("graph rewrite (source_a): {e}"),
                 })?;
-            graph
+            let _rewrite_b = graph
                 .rewrite_subject_to(&source_b_id, &new_id)
                 .map_err(|e| ReportError::MergeInternal {
                     detail: format!("graph rewrite (source_b): {e}"),
@@ -1143,8 +1150,13 @@ impl SubjectAdmin for RegistrySubjectAdmin {
 
             // Storage primitive: registers N new subjects and
             // retires the source ID with an alias record carrying
-            // every new ID.
-            let new_ids = registry
+            // every new ID. The per-addressing transfer records
+            // on the outcome are ignored here; the cascade-emission
+            // wiring consumes them.
+            let crate::subjects::SplitSubjectOutcome {
+                new_ids,
+                addressing_transfers: _,
+            } = registry
                 .split_subject(
                     &source_id,
                     partition,

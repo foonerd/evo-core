@@ -172,12 +172,13 @@ fn run_sequence(
                 }
                 let b = live.pop().unwrap();
                 let a = live.pop().unwrap();
-                if let Ok(new_id) = registry.merge_aliases(
+                if let Ok(outcome) = registry.merge_aliases(
                     &a,
                     &b,
                     "org.test.admin",
                     Some("proptest merge".into()),
                 ) {
+                    let new_id = outcome.new_id;
                     let inserted = minted_ids.insert(new_id.clone());
                     assert!(
                         inserted,
@@ -213,12 +214,13 @@ fn run_sequence(
                     continue;
                 }
                 let partition = vec![group_a.clone(), group_b.clone()];
-                if let Ok(new_ids) = registry.split_subject(
+                if let Ok(outcome) = registry.split_subject(
                     &target,
                     partition,
                     "org.test.admin",
                     Some("proptest split".into()),
                 ) {
+                    let new_ids = outcome.new_ids;
                     for id in &new_ids {
                         let inserted = minted_ids.insert(id.clone());
                         assert!(

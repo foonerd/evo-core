@@ -375,6 +375,12 @@ pub struct AmbiguousEdge {
 }
 
 /// Outcome of a [`RelationGraph::split_relations`] call.
+///
+/// Carries the structural side effects of the cascade so the
+/// wiring layer can surface them as happenings. The graph state
+/// itself reflects the cascade unconditionally; this struct
+/// merely makes the per-edge transitions inspectable to callers
+/// that want to emit observability events.
 #[derive(Debug, Clone)]
 pub struct SplitRelationsOutcome {
     /// Edges that fell through to the `ToBoth` fallback under
@@ -382,6 +388,97 @@ pub struct SplitRelationsOutcome {
     /// [`ResolvedSplitAssignment`] matched. Empty for the other
     /// strategies.
     pub ambiguous: Vec<AmbiguousEdge>,
+    /// One entry per output edge produced by the cascade. A
+    /// single input edge can contribute multiple entries when the
+    /// strategy replicates it (e.g.
+    /// [`SplitRelationStrategy::ToBoth`]).
+    pub rewrites: Vec<EdgeRewrite>,
+    /// One entry per output edge whose triple already existed in
+    /// the graph and whose claimants were unioned in. Contains
+    /// only the claimants that were not already present on the
+    /// surviving record.
+    pub claim_unions: Vec<ClaimUnion>,
+}
+
+/// Outcome of a [`RelationGraph::rewrite_subject_to`] call.
+///
+/// Carries the structural side effects of the merge cascade so
+/// the wiring layer can surface them as happenings. The graph
+/// state reflects the cascade unconditionally; this struct
+/// merely makes the per-edge transitions inspectable.
+#[derive(Debug, Clone)]
+pub struct RewriteSubjectOutcome {
+    /// One entry per relation that was relabelled. Records both
+    /// the pre- and post-rewrite triple keys plus a snapshot of
+    /// the claim list on the rewritten record.
+    pub rewrites: Vec<EdgeRewrite>,
+    /// One entry per rewrite that collapsed into an existing
+    /// surviving record without a suppression marker. Carries the
+    /// claimants the surviving record gained from the dying
+    /// record.
+    pub claim_unions: Vec<ClaimUnion>,
+    /// One entry per rewrite that collapsed into an existing
+    /// surviving record carrying a suppression marker. The
+    /// claimants the dying record contributed are demoted: they
+    /// remain on the surviving record's claim list but the record
+    /// itself is invisible to neighbour queries, walks, and
+    /// cardinality counts.
+    pub suppression_collapses: Vec<SuppressionCollapse>,
+}
+
+/// One relation rewritten by a cascade: an old triple key, the
+/// new triple key after the rewrite, and the claim list on the
+/// rewritten record.
+///
+/// The claim list is a snapshot of the dying record's claims at
+/// the moment of rewrite. It is captured even when the rewrite
+/// collapses into an existing surviving record (in which case the
+/// surviving record's own claim list separately gains the
+/// non-overlapping subset of these claimants; see
+/// [`ClaimUnion`] / [`SuppressionCollapse`]).
+#[derive(Debug, Clone)]
+pub struct EdgeRewrite {
+    /// The triple before the rewrite.
+    pub old_key: RelationKey,
+    /// The triple after the rewrite.
+    pub new_key: RelationKey,
+    /// The dying record's claim list at the moment of rewrite.
+    pub claims: Vec<RelationClaim>,
+}
+
+/// One claim-set union performed by a cascade.
+///
+/// Surfaces when a rewritten triple already existed in the graph
+/// and the surviving record was NOT suppressed: the surviving
+/// record's claimants gained the dying record's claimants that
+/// were not already present.
+#[derive(Debug, Clone)]
+pub struct ClaimUnion {
+    /// The triple of the surviving record (post-cascade).
+    pub surviving_key: RelationKey,
+    /// The claimants the surviving record gained from the dying
+    /// record. Excludes claimants already present on the
+    /// surviving record before the cascade.
+    pub absorbed_claimants: Vec<RelationClaim>,
+}
+
+/// One suppression-collapse performed by a cascade.
+///
+/// Surfaces when a rewritten triple already existed in the graph
+/// and the surviving record carries a suppression marker: the
+/// dying record's claimants that were unioned in are no longer
+/// visible in projections (the surviving record is hidden by
+/// suppression). The claimants are still present on the
+/// surviving record's claim list for audit.
+#[derive(Debug, Clone)]
+pub struct SuppressionCollapse {
+    /// The triple of the surviving record (post-cascade).
+    pub surviving_key: RelationKey,
+    /// The claimants that were unioned in but are now invisible
+    /// in projections because the surviving record is suppressed.
+    pub demoted_claimants: Vec<RelationClaim>,
+    /// The suppression marker on the surviving record.
+    pub surviving_suppression: SuppressionRecord,
 }
 
 /// Direction of a graph walk.
@@ -1213,22 +1310,30 @@ impl RelationGraph {
     ///
     /// Returns `Err(StewardError::Dispatch)` only when `old_id`
     /// or `new_id` is empty. `old_id == new_id` is a no-op and
-    /// returns `Ok(())`. The method does NOT emit happenings;
-    /// the wiring layer fires `Happening::SubjectMerged` once
-    /// (covering the cascade as a whole) and surfaces any new
-    /// cardinality violations introduced by the rewrite.
+    /// returns `Ok(RewriteSubjectOutcome::default())`. The
+    /// method does NOT emit happenings; the wiring layer fires
+    /// `Happening::SubjectMerged` once (covering the cascade as
+    /// a whole) and surfaces any new cardinality violations
+    /// introduced by the rewrite. The returned
+    /// [`RewriteSubjectOutcome`] enumerates each per-edge effect
+    /// so the wiring layer can emit per-rewrite happenings.
     pub fn rewrite_subject_to(
         &self,
         old_id: &str,
         new_id: &str,
-    ) -> Result<(), StewardError> {
+    ) -> Result<RewriteSubjectOutcome, StewardError> {
         if old_id.is_empty() || new_id.is_empty() {
             return Err(StewardError::Dispatch(
                 "rewrite_subject_to: empty old_id or new_id".into(),
             ));
         }
+        let mut outcome = RewriteSubjectOutcome {
+            rewrites: Vec::new(),
+            claim_unions: Vec::new(),
+            suppression_collapses: Vec::new(),
+        };
         if old_id == new_id {
-            return Ok(());
+            return Ok(outcome);
         }
 
         let mut inner = self.inner.lock().expect("graph mutex poisoned");
@@ -1284,6 +1389,13 @@ impl RelationGraph {
                 new_target,
             );
 
+            // Snapshot the dying record's claims for the per-edge
+            // outcome. The match arms below consume `record.claims`
+            // when collapsing into a surviving record; this snapshot
+            // is independent and reflects what the rewrite carried
+            // forward.
+            let edge_claims_snapshot = record.claims.clone();
+
             let now = SystemTime::now();
             match inner.relations.get_mut(&new_key) {
                 Some(existing) => {
@@ -1291,16 +1403,45 @@ impl RelationGraph {
                     // state of the surviving record is
                     // preserved; the disappearing record's
                     // suppression marker is dropped.
+                    //
+                    // Only claimants not already present on the
+                    // surviving record are transferred. The
+                    // outcome reports exactly that set, mirroring
+                    // the structural effect on the surviving
+                    // record's claim list.
+                    let mut transferred: Vec<RelationClaim> = Vec::new();
                     for claim in record.claims {
                         if !existing
                             .claims
                             .iter()
                             .any(|c| c.claimant == claim.claimant)
                         {
+                            transferred.push(claim.clone());
                             existing.claims.push(claim);
                         }
                     }
                     existing.modified_at = now;
+
+                    // Distinguish suppression-collapse from a
+                    // plain claim-union by inspecting the
+                    // surviving record's suppression marker AFTER
+                    // the union (the marker is preserved across
+                    // the collapse so this is equivalent to the
+                    // pre-union state).
+                    if let Some(suppression) = existing.suppression.clone() {
+                        outcome.suppression_collapses.push(
+                            SuppressionCollapse {
+                                surviving_key: new_key.clone(),
+                                demoted_claimants: transferred,
+                                surviving_suppression: suppression,
+                            },
+                        );
+                    } else {
+                        outcome.claim_unions.push(ClaimUnion {
+                            surviving_key: new_key.clone(),
+                            absorbed_claimants: transferred,
+                        });
+                    }
                 }
                 None => {
                     let suppression = record.suppression.clone();
@@ -1336,6 +1477,12 @@ impl RelationGraph {
                 }
             }
 
+            outcome.rewrites.push(EdgeRewrite {
+                old_key: old_key.clone(),
+                new_key: new_key.clone(),
+                claims: edge_claims_snapshot,
+            });
+
             tracing::info!(
                 old_source = %old_key.source_id,
                 predicate = %old_key.predicate,
@@ -1346,7 +1493,7 @@ impl RelationGraph {
             );
         }
 
-        Ok(())
+        Ok(outcome)
     }
 
     /// Distribute every relation involving `source_subject`
@@ -1412,6 +1559,8 @@ impl RelationGraph {
 
         let mut inner = self.inner.lock().expect("graph mutex poisoned");
         let mut ambiguous: Vec<AmbiguousEdge> = Vec::new();
+        let mut rewrites: Vec<EdgeRewrite> = Vec::new();
+        let mut claim_unions: Vec<ClaimUnion> = Vec::new();
 
         let to_split: Vec<RelationKey> = inner
             .relations
@@ -1495,16 +1644,30 @@ impl RelationGraph {
                 let now = SystemTime::now();
                 match inner.relations.get_mut(&new_key) {
                     Some(existing) => {
+                        let mut transferred: Vec<RelationClaim> = Vec::new();
                         for claim in &record.claims {
                             if !existing
                                 .claims
                                 .iter()
                                 .any(|c| c.claimant == claim.claimant)
                             {
+                                transferred.push(claim.clone());
                                 existing.claims.push(claim.clone());
                             }
                         }
                         existing.modified_at = now;
+                        // Split distributes outward; collisions
+                        // surface as plain claim-unions on the
+                        // pre-existing surviving record. A split
+                        // never creates the "surviving carries a
+                        // suppression marker, dying carried
+                        // claims that are now invisible" scenario
+                        // that rewrite_subject_to handles, so no
+                        // suppression-collapse is recorded here.
+                        claim_unions.push(ClaimUnion {
+                            surviving_key: new_key.clone(),
+                            absorbed_claimants: transferred,
+                        });
                     }
                     None => {
                         let suppression = record.suppression.clone();
@@ -1537,6 +1700,16 @@ impl RelationGraph {
                         }
                     }
                 }
+
+                // One EdgeRewrite per OUTPUT edge produced by the
+                // strategy. ToBoth fans out to N entries, ToFirst
+                // and matched-Explicit produce 1, fallthrough
+                // Explicit fans out to N (same as ToBoth).
+                rewrites.push(EdgeRewrite {
+                    old_key: old_key.clone(),
+                    new_key: new_key.clone(),
+                    claims: record.claims.clone(),
+                });
             }
 
             tracing::info!(
@@ -1549,7 +1722,11 @@ impl RelationGraph {
             );
         }
 
-        Ok(SplitRelationsOutcome { ambiguous })
+        Ok(SplitRelationsOutcome {
+            ambiguous,
+            rewrites,
+            claim_unions,
+        })
     }
 
     /// Walk the graph starting from `start_id` under the given scope.
