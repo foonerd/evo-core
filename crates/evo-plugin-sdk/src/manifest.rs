@@ -275,6 +275,11 @@ pub struct Trust {
 }
 
 /// Trust classes per `PLUGIN_PACKAGING.md` section 5.
+///
+/// `#[non_exhaustive]` so downstream code allows for new trust classes
+/// to be introduced without a SemVer break. Add a wildcard arm with a
+/// structured error or `unreachable!` when matching on this enum across
+/// crate boundaries.
 #[derive(
     Debug,
     Clone,
@@ -288,6 +293,7 @@ pub struct Trust {
     Ord,
 )]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum TrustClass {
     /// Highest class. In-process residency. System-wide custody.
     Platform,
@@ -778,6 +784,28 @@ instance_ttl_seconds = 0
         assert!(TrustClass::Privileged < TrustClass::Standard);
         assert!(TrustClass::Standard < TrustClass::Unprivileged);
         assert!(TrustClass::Unprivileged < TrustClass::Sandbox);
+    }
+
+    #[test]
+    fn trust_class_round_trips_under_non_exhaustive() {
+        // TrustClass is `#[non_exhaustive]`: downstream pattern matches
+        // must include a wildcard arm. The attribute does not affect
+        // same-crate construction or serialisation — this test pins that
+        // invariant by exercising every variant through TOML serde and
+        // confirming round-trip equality.
+        for class in [
+            TrustClass::Platform,
+            TrustClass::Privileged,
+            TrustClass::Standard,
+            TrustClass::Unprivileged,
+            TrustClass::Sandbox,
+        ] {
+            let trust = Trust { class };
+            let toml = toml::to_string(&trust).expect("serialise trust");
+            let parsed: Trust =
+                toml::from_str(&toml).expect("deserialise trust");
+            assert_eq!(parsed.class, class);
+        }
     }
 
     #[test]
