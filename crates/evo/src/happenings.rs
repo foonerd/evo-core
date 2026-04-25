@@ -427,11 +427,11 @@ pub enum Happening {
     /// after the subject registry's merge primitive succeeds and
     /// BEFORE the relation graph is rewritten.
     ///
-    /// Per `SUBJECTS.md` section 10.1 and ADR-0008, the merge
-    /// produced a new canonical ID; the two source IDs survive in
-    /// the registry as alias records of kind `Merged` so
-    /// consumers holding stale references can resolve them via
-    /// the steward's `describe_alias` operation.
+    /// Per `SUBJECTS.md` section 10.1, the merge produced a new
+    /// canonical ID; the two source IDs survive in the registry
+    /// as alias records of kind `Merged` so consumers holding
+    /// stale references can resolve them via the steward's
+    /// `describe_alias` operation.
     ///
     /// Cardinality violations introduced by the relation-graph
     /// rewrite (two distinct edges to the same target collapsing
@@ -463,10 +463,10 @@ pub enum Happening {
     /// after the subject registry's split primitive succeeds and
     /// BEFORE per-edge structural rewrites in the relation graph.
     ///
-    /// Per `SUBJECTS.md` section 10.2 and ADR-0008, the split
-    /// produced N new canonical IDs; the source ID survives in
-    /// the registry as a single alias record of kind `Split`
-    /// carrying all new IDs.
+    /// Per `SUBJECTS.md` section 10.2, the split produced N new
+    /// canonical IDs; the source ID survives in the registry as
+    /// a single alias record of kind `Split` carrying all new
+    /// IDs.
     ///
     /// `strategy` records which relation-distribution policy the
     /// operator chose; per

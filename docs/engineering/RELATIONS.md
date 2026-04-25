@@ -337,7 +337,7 @@ When subjects A and B merge into new subject C (per `SUBJECTS.md` section 10.1):
 
 The merge is atomic: consumers either see the pre-merge graph or the post-merge graph, never a mix.
 
-**Status: implemented.** The cascade is realised by `RelationGraph::rewrite_subject_to`, called twice by the `RegistrySubjectAdmin::merge` wiring layer (once per source ID). Duplicate triples produced by the rewrite collapse with claim-set union: the surviving record's provenance set absorbs the disappearing record's claims. Suppression markers on collapsed records are preserved on the survivor; the disappearing record's marker is dropped. Per ADR-0004 the `Happening::SubjectMerged` event fires BEFORE the cascade so subscribers see the identity transition before any post-rewrite cardinality-violation happenings the rewrite triggers.
+**Status: implemented.** The cascade is realised by `RelationGraph::rewrite_subject_to`, called twice by the `RegistrySubjectAdmin::merge` wiring layer (once per source ID). Duplicate triples produced by the rewrite collapse with claim-set union: the surviving record's provenance set absorbs the disappearing record's claims. Suppression markers on collapsed records are preserved on the survivor; the disappearing record's marker is dropped. The `Happening::SubjectMerged` event fires BEFORE the cascade so subscribers see the identity transition before any post-rewrite cardinality-violation happenings the rewrite triggers.
 
 ### 8.2 Split
 
@@ -355,7 +355,7 @@ Default is `to_both` because it is conservative: no information is lost. Consume
 
 If the operator chose `explicit`, any relation not explicitly assigned goes to both with a `RelationSplitAmbiguous` happening.
 
-**Status: implemented.** The cascade is realised by `RelationGraph::split_relations`, called by the `RegistrySubjectAdmin::split` wiring layer. The strategy parameter is the SDK's `SplitRelationStrategy::ToBoth`, `ToFirst`, or `Explicit`. For `Explicit`, the operator's per-relation assignments are resolved to canonical IDs BEFORE the registry split runs (after the split, addressings re-point to the new IDs and would not match the pre-split graph triples). Unmatched relations under `Explicit` fall through to `ToBoth` and surface as `Happening::RelationSplitAmbiguous` events, one per gap. Suppression markers transfer to the new records. Cardinality violations introduced by the distribution surface as `Happening::RelationCardinalityViolation` events. Per ADR-0004 the `Happening::SubjectSplit` event fires BEFORE the per-edge distribution; any `RelationSplitAmbiguous` events follow it.
+**Status: implemented.** The cascade is realised by `RelationGraph::split_relations`, called by the `RegistrySubjectAdmin::split` wiring layer. The strategy parameter is the SDK's `SplitRelationStrategy::ToBoth`, `ToFirst`, or `Explicit`. For `Explicit`, the operator's per-relation assignments are resolved to canonical IDs BEFORE the registry split runs (after the split, addressings re-point to the new IDs and would not match the pre-split graph triples). Unmatched relations under `Explicit` fall through to `ToBoth` and surface as `Happening::RelationSplitAmbiguous` events, one per gap. Suppression markers transfer to the new records. Cardinality violations introduced by the distribution surface as `Happening::RelationCardinalityViolation` events. The `Happening::SubjectSplit` event fires BEFORE the per-edge distribution; any `RelationSplitAmbiguous` events follow it.
 
 ### 8.3 Forget
 

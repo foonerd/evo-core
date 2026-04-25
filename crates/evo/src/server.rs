@@ -700,9 +700,8 @@ enum HappeningWire {
     /// Wire form of [`Happening::SubjectMerged`].
     ///
     /// Emitted on the successful merge of two canonical subjects
-    /// into one. Per ADR-0008 the result is a NEW canonical ID;
-    /// the two source IDs survive in the registry as alias
-    /// records.
+    /// into one. The result is a NEW canonical ID; the two
+    /// source IDs survive in the registry as alias records.
     SubjectMerged {
         /// Canonical name of the admin plugin that performed the
         /// merge.
@@ -719,9 +718,9 @@ enum HappeningWire {
     /// Wire form of [`Happening::SubjectSplit`].
     ///
     /// Emitted on the successful split of one canonical subject
-    /// into two or more. Per ADR-0008 the result is N new
-    /// canonical IDs; the source ID survives in the registry as a
-    /// single alias record carrying all new IDs.
+    /// into two or more. The result is N new canonical IDs; the
+    /// source ID survives in the registry as a single alias
+    /// record carrying all new IDs.
     SubjectSplit {
         /// Canonical name of the admin plugin that performed the
         /// split.

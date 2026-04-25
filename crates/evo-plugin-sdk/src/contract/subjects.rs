@@ -198,7 +198,7 @@ impl SubjectAnnouncement {
 /// pre-merge or pre-split IDs can resolve them via the steward's
 /// `describe_alias` operation and learn what the new identity is.
 /// The framework does NOT transparently follow aliases on resolve;
-/// chasing the alias is an explicit consumer step (per ADR-0008).
+/// chasing the alias is an explicit consumer step.
 ///
 /// For a merge, `new_ids` has length 1: the single new subject the
 /// two sources collapsed into. For a split, `new_ids` has length
