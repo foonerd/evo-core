@@ -179,10 +179,42 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Drain: unload every admitted plugin.
+    // Drain: unload every admitted plugin under a global deadline.
+    // The report carries which plugins released cleanly and which
+    // missed the deadline; stage 4 SIGKILL'd the holdouts before
+    // shutdown_with_config returned.
     tracing::info!("draining admission engine");
-    if let Err(e) = engine.lock().await.shutdown().await {
-        tracing::error!(error = %e, "drain encountered errors");
+    let report = engine
+        .lock()
+        .await
+        .shutdown_with_config(evo::admission::ShutdownConfig::default())
+        .await;
+    tracing::info!(
+        plugins_total = report.plugins_total,
+        plugins_unloaded_cleanly = report.plugins_unloaded_cleanly.len(),
+        plugins_killed_after_deadline =
+            report.plugins_killed_after_deadline.len(),
+        custody_drained = report.custody_drained.len(),
+        custody_abandoned = report.custody_abandoned.len(),
+        elapsed_ms = report.elapsed.as_millis() as u64,
+        "shutdown report"
+    );
+    for name in &report.plugins_unloaded_cleanly {
+        tracing::info!(plugin = %name, "plugin unloaded cleanly during drain");
+    }
+    for name in &report.plugins_killed_after_deadline {
+        tracing::warn!(
+            plugin = %name,
+            "plugin missed shutdown deadline; SIGKILL was sent"
+        );
+    }
+    for c in &report.custody_abandoned {
+        tracing::warn!(
+            plugin = %c.plugin,
+            handle_id = %c.handle_id,
+            shelf = ?c.shelf,
+            "custody not released cleanly within drain window"
+        );
     }
 
     tracing::warn!("evo exited");

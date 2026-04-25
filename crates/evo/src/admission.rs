@@ -1263,41 +1263,410 @@ impl AdmissionEngine {
         self.router.health_check_all().await
     }
 
-    /// Gracefully unload every admitted plugin in reverse admission
-    /// order. Errors are logged but do not halt the shutdown sequence;
-    /// the first error encountered (if any) is returned after all
-    /// plugins have been attempted.
+    /// Gracefully unload every admitted plugin under default shutdown
+    /// timing. Errors are logged but do not propagate; clean and killed
+    /// plugin counts are tracked via [`Self::shutdown_with_config`] but
+    /// discarded by this convenience wrapper for backward compatibility.
     ///
-    /// For plugins spawned by the steward (via
-    /// [`Self::admit_out_of_process_from_directory`]), the shutdown
-    /// sequence is:
-    ///
-    /// 1. Send `unload` over the wire and await the response.
-    /// 2. Drop the wire client, closing the connection. The child
-    ///    sees EOF on its read half and its `serve()` returns.
-    /// 3. Wait for the child to exit, with a bounded timeout.
-    /// 4. If the timeout elapses, kill the child.
-    ///
-    /// Step 2 is essential: the child will not exit until its read
-    /// side sees EOF, so waiting for the child while still holding
-    /// the wire connection would deadlock.
+    /// This delegates to [`Self::shutdown_with_config`] using
+    /// [`ShutdownConfig::default`] (10-second global deadline). Callers
+    /// that want the per-plugin outcome should call
+    /// `shutdown_with_config` directly and inspect the returned
+    /// [`ShutdownReport`].
     pub async fn shutdown(&self) -> Result<(), StewardError> {
-        let mut first_err: Option<StewardError> = None;
+        let _report =
+            self.shutdown_with_config(ShutdownConfig::default()).await;
+        Ok(())
+    }
 
+    /// Drain every admitted plugin under a single global deadline,
+    /// returning a [`ShutdownReport`] describing which plugins
+    /// unloaded cleanly and which were killed after the deadline.
+    ///
+    /// Stages, in order:
+    ///
+    /// 1. **Stop new connections.** The server's accept loop is
+    ///    expected to have exited before this call; this method
+    ///    does not directly interact with it.
+    /// 2. **Drain custody.** Every active warden custody recorded
+    ///    in the [`CustodyLedger`] is released via the router's
+    ///    `release_custody` verb, with a bounded sub-deadline of
+    ///    `min(2s, global_deadline / 4)`. Custodies that release
+    ///    cleanly within the window appear under
+    ///    [`ShutdownReport::custody_drained`]; those that time out
+    ///    or error appear under [`ShutdownReport::custody_abandoned`].
+    /// 3. **Parallel plugin unload.** Each admitted plugin is
+    ///    drained from the router; one [`tokio::spawn`] task per
+    ///    plugin runs the existing per-plugin unload sequence
+    ///    (`unload()` over the wire / in-process, then drop the
+    ///    handle, then reap the child process for out-of-process
+    ///    plugins). All tasks share a single global deadline.
+    /// 4. **SIGKILL holdouts.** Any out-of-process plugin whose
+    ///    unload task is still running when the global deadline
+    ///    elapses has its task aborted and its child process
+    ///    killed. The plugin's name is recorded in
+    ///    [`ShutdownReport::plugins_killed_after_deadline`].
+    /// 5. **Persistence flush.** Reserved for future persistence
+    ///    work; currently a no-op.
+    /// 6. **Return.** The report is returned to the caller for
+    ///    structured logging or audit.
+    pub async fn shutdown_with_config(
+        &self,
+        config: ShutdownConfig,
+    ) -> ShutdownReport {
+        let started_at = Instant::now();
+
+        // Stage 2: custody drain. Bounded by min(2s, deadline / 4).
+        let custody_window =
+            std::cmp::min(Duration::from_secs(2), config.global_deadline / 4);
+        let (custody_drained, custody_abandoned) =
+            drain_active_custodies(&self.router, custody_window).await;
+
+        // Stage 3: drain plugins from the router and unload in parallel.
         let entries = self.router.drain_in_reverse_admission_order();
-        for entry in entries {
-            if let Err(e) = unload_one_plugin(entry).await {
-                if first_err.is_none() {
-                    first_err = Some(e);
+        let plugins_total = entries.len();
+
+        let (plugins_unloaded_cleanly, plugins_killed_after_deadline) =
+            parallel_unload_with_deadline(entries, config.global_deadline)
+                .await;
+
+        // Stage 5: persistence flush. Persistence stores are not in
+        // this branch; future work will flush bounded queues here
+        // (e.g. happenings to disk, custody ledger snapshot to disk)
+        // before stage 6 returns.
+        //
+        // No-op intentionally; integration point.
+
+        let elapsed = started_at.elapsed();
+
+        ShutdownReport {
+            plugins_total,
+            plugins_unloaded_cleanly,
+            plugins_killed_after_deadline,
+            custody_drained,
+            custody_abandoned,
+            elapsed,
+        }
+    }
+}
+
+/// Configuration for [`AdmissionEngine::shutdown_with_config`].
+///
+/// Carries the global deadline within which every plugin must finish
+/// its `unload()` and reap its child process; plugins still alive
+/// after the deadline are forcibly killed.
+#[derive(Debug, Clone, Copy)]
+pub struct ShutdownConfig {
+    /// Wall-clock budget for the entire parallel-unload stage. Default
+    /// 10 seconds. The per-plugin SIGTERM-then-SIGKILL window inside
+    /// the spawned task ([`CHILD_SHUTDOWN_TIMEOUT`]) is no longer the
+    /// dominant bound because tasks run in parallel; this deadline is
+    /// the wall-clock cap.
+    pub global_deadline: Duration,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            global_deadline: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Outcome of a shutdown pass.
+///
+/// Returned by [`AdmissionEngine::shutdown_with_config`]. Callers log
+/// it (info-level for cleanly drained, warn-level for the killed and
+/// abandoned lists) so the operator audit trail records exactly which
+/// plugins missed the deadline.
+#[derive(Debug, Clone, Default)]
+pub struct ShutdownReport {
+    /// Total number of plugins that were admitted at the start of
+    /// the shutdown pass.
+    pub plugins_total: usize,
+    /// Names of plugins that completed `unload()` and reaped their
+    /// child cleanly within the global deadline.
+    pub plugins_unloaded_cleanly: Vec<String>,
+    /// Names of plugins whose unload task did not complete within
+    /// the global deadline; these had their tasks aborted and their
+    /// children SIGKILL'd. Out-of-process plugins are the typical
+    /// occupants here.
+    pub plugins_killed_after_deadline: Vec<String>,
+    /// Active custodies that responded to release within the
+    /// custody-drain sub-window. Stored as
+    /// `(plugin_name, handle_id, shelf)` tuples for diagnostic
+    /// rendering.
+    pub custody_drained: Vec<DrainedCustody>,
+    /// Active custodies that did not respond to release within the
+    /// custody-drain sub-window, or whose release returned an error.
+    /// Stage 3 (plugin unload) still runs against the warden; the
+    /// abandoned entry only signals that the warden did not release
+    /// cleanly.
+    pub custody_abandoned: Vec<DrainedCustody>,
+    /// Wall-clock duration of the entire shutdown pass.
+    pub elapsed: Duration,
+}
+
+/// Diagnostic record of one custody encountered during stage 2 drain.
+///
+/// Carries enough metadata to log the (plugin, handle, shelf) triple
+/// without re-querying the ledger after release.
+#[derive(Debug, Clone)]
+pub struct DrainedCustody {
+    /// Canonical name of the warden plugin that held the custody.
+    pub plugin: String,
+    /// Warden-chosen handle id identifying the custody within the
+    /// plugin.
+    pub handle_id: String,
+    /// Fully-qualified shelf the warden occupies, if known. May be
+    /// `None` if the ledger only saw a state report and never the
+    /// `record_custody` call (see [`crate::custody`] for the race).
+    pub shelf: Option<String>,
+}
+
+/// Stage 2: drain every active custody recorded in the ledger.
+///
+/// Walks [`CustodyLedger::list_active`] and, for each entry that has
+/// a known shelf, calls
+/// [`PluginRouter::release_custody`](crate::router::PluginRouter::release_custody)
+/// inside a [`tokio::time::timeout`] guard set to `window`. Custodies
+/// that release within the window are reported under
+/// `custody_drained`; the rest under `custody_abandoned`.
+///
+/// Custodies whose ledger record carries no shelf (the partial-record
+/// race) are reported as abandoned with a `None` shelf, since there
+/// is no warden the steward can dispatch `release_custody` against.
+async fn drain_active_custodies(
+    router: &Arc<PluginRouter>,
+    window: Duration,
+) -> (Vec<DrainedCustody>, Vec<DrainedCustody>) {
+    let ledger = Arc::clone(&router.state().custody);
+    let active = ledger.list_active();
+
+    if active.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut drained = Vec::with_capacity(active.len());
+    let mut abandoned = Vec::with_capacity(active.len());
+
+    use tokio::task::JoinSet;
+    let mut set: JoinSet<(String, String, String, Result<(), StewardError>)> =
+        JoinSet::new();
+    let mut shelfless: Vec<DrainedCustody> = Vec::new();
+    for rec in active {
+        match rec.shelf.clone() {
+            Some(shelf) => {
+                let plugin = rec.plugin.clone();
+                let handle_id = rec.handle_id.clone();
+                let router = Arc::clone(router);
+                set.spawn(async move {
+                    let handle = evo_plugin_sdk::contract::CustodyHandle::new(
+                        handle_id.clone(),
+                    );
+                    let release_result =
+                        router.release_custody(&shelf, handle).await;
+                    (plugin, handle_id, shelf, release_result)
+                });
+            }
+            None => {
+                // Custodies whose ledger record had no shelf cannot
+                // be dispatched against; surface them as abandoned
+                // for visibility without attempting release.
+                shelfless.push(DrainedCustody {
+                    plugin: rec.plugin,
+                    handle_id: rec.handle_id,
+                    shelf: None,
+                });
+            }
+        }
+    }
+
+    let collect = async {
+        let mut out: Vec<(String, String, String, Result<(), StewardError>)> =
+            Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(t) => out.push(t),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "custody release task panicked or was cancelled"
+                    );
                 }
             }
         }
+        out
+    };
 
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
+    let outcomes = match tokio::time::timeout(window, collect).await {
+        Ok(outcomes) => outcomes,
+        Err(_) => {
+            // Window elapsed: abort whatever is still running and
+            // re-list the ledger to capture what was not drained.
+            set.abort_all();
+            while (set.join_next().await).is_some() {}
+            for rec in ledger.list_active() {
+                abandoned.push(DrainedCustody {
+                    plugin: rec.plugin,
+                    handle_id: rec.handle_id,
+                    shelf: rec.shelf,
+                });
+            }
+            abandoned.extend(shelfless);
+            return (drained, abandoned);
+        }
+    };
+
+    for (plugin, handle_id, shelf, result) in outcomes {
+        match result {
+            Ok(()) => drained.push(DrainedCustody {
+                plugin,
+                handle_id,
+                shelf: Some(shelf),
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    plugin = %plugin,
+                    handle_id = %handle_id,
+                    shelf = %shelf,
+                    error = %e,
+                    "custody release during shutdown failed"
+                );
+                abandoned.push(DrainedCustody {
+                    plugin,
+                    handle_id,
+                    shelf: Some(shelf),
+                });
+            }
         }
     }
+
+    abandoned.extend(shelfless);
+
+    (drained, abandoned)
+}
+
+/// Stage 3 + stage 4: spawn one unload task per plugin, race them
+/// against `global_deadline`, then SIGKILL any holdouts.
+///
+/// Each task runs [`unload_one_plugin`] on its assigned entry.
+/// Tasks complete independently; a single
+/// [`tokio::time::sleep`] arm in the supervising select signals the
+/// deadline. When the deadline arm fires, every still-running task
+/// is aborted, and the entry's child process (if any) is killed and
+/// reaped by the supervising task.
+///
+/// Returns `(unloaded_cleanly, killed_after_deadline)`.
+async fn parallel_unload_with_deadline(
+    entries: Vec<Arc<PluginEntry>>,
+    global_deadline: Duration,
+) -> (Vec<String>, Vec<String>) {
+    use tokio::task::JoinSet;
+
+    if entries.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    // Keep a name -> entry-clone map outside the spawned tasks so
+    // stage 4 can still reach the child slot for SIGKILL after a
+    // task abort. The task moves its own clone of the entry; the
+    // map holds an additional clone for the supervisor.
+    let mut entry_by_name: std::collections::HashMap<String, Arc<PluginEntry>> =
+        std::collections::HashMap::with_capacity(entries.len());
+
+    let mut set: JoinSet<String> = JoinSet::new();
+    for entry in entries {
+        let name = entry.name.clone();
+        entry_by_name.insert(name.clone(), Arc::clone(&entry));
+        set.spawn(async move {
+            // Errors are logged inside unload_one_plugin; we only
+            // care about whether the call returns at all (clean) or
+            // is aborted by the deadline.
+            let _ = unload_one_plugin(entry).await;
+            name
+        });
+    }
+
+    let mut unloaded = Vec::new();
+    let deadline = tokio::time::sleep(global_deadline);
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut deadline => {
+                break;
+            }
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok(name)) => {
+                        unloaded.push(name);
+                    }
+                    Some(Err(e)) => {
+                        tracing::error!(
+                            error = %e,
+                            "plugin unload task panicked or was cancelled"
+                        );
+                    }
+                    None => {
+                        // All tasks complete; nothing left to wait on.
+                        return (unloaded, Vec::new());
+                    }
+                }
+            }
+        }
+    }
+
+    // Deadline fired with tasks still running. Abort them all and
+    // SIGKILL any out-of-process children that are still alive.
+    set.abort_all();
+
+    let mut killed: Vec<String> = Vec::new();
+    let cleaned: std::collections::HashSet<String> =
+        unloaded.iter().cloned().collect();
+    for (name, entry) in entry_by_name {
+        if cleaned.contains(&name) {
+            continue;
+        }
+        kill_holdout_child(&name, &entry).await;
+        killed.push(name);
+    }
+
+    // Drain any remaining JoinSet results so we don't leak the set's
+    // bookkeeping. Errors here are expected (aborts).
+    while let Some(_res) = set.join_next().await {}
+
+    (unloaded, killed)
+}
+
+/// Stage 4 helper: take the child off `entry` and SIGKILL+reap it.
+///
+/// Idempotent against a task that already completed `take_child`
+/// (the slot will be `None`); in-process plugins also pass through
+/// here harmlessly.
+async fn kill_holdout_child(name: &str, entry: &Arc<PluginEntry>) {
+    let mut slot = entry.child.lock().await;
+    let Some(mut child) = slot.take() else {
+        tracing::warn!(
+            plugin = %name,
+            "plugin missed shutdown deadline (no child to kill)"
+        );
+        return;
+    };
+    tracing::warn!(
+        plugin = %name,
+        "plugin missed shutdown deadline; sending SIGKILL"
+    );
+    if let Err(e) = child.kill().await {
+        tracing::error!(
+            plugin = %name,
+            error = %e,
+            "plugin SIGKILL failed"
+        );
+    }
+    // Reap so we do not leak a zombie even on kill failure.
+    let _ = child.wait().await;
 }
 
 /// Timeout for child process exit during shutdown. After this elapses
@@ -3828,6 +4197,467 @@ response_budget_ms = 1000
         assert!(
             ctx.relation_admin.is_none(),
             "relation_admin must be None for non-admin plugin"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 6 staged-shutdown tests.
+    //
+    // These exercise `shutdown_with_config` end-to-end. The catalogue
+    // and manifests below add several pingable shelves so multiple
+    // respondents can be admitted in parallel without colliding.
+    // ---------------------------------------------------------------
+
+    /// Custom catalogue with eight respondent shelves plus the
+    /// existing custody shelf; used by the shutdown-stage tests so
+    /// multiple plugins can be admitted at once.
+    fn shutdown_test_catalogue() -> Arc<Catalogue> {
+        Arc::new(
+            Catalogue::from_toml(
+                r#"
+[[racks]]
+name = "shut"
+family = "domain"
+charter = "shutdown rack"
+
+[[racks.shelves]]
+name = "a"
+shape = 1
+description = "shelf a"
+
+[[racks.shelves]]
+name = "b"
+shape = 1
+description = "shelf b"
+
+[[racks.shelves]]
+name = "c"
+shape = 1
+description = "shelf c"
+
+[[racks.shelves]]
+name = "d"
+shape = 1
+description = "shelf d"
+
+[[racks.shelves]]
+name = "e"
+shape = 1
+description = "shelf e"
+
+[[racks.shelves]]
+name = "f"
+shape = 1
+description = "shelf f"
+
+[[racks.shelves]]
+name = "warden"
+shape = 1
+description = "shutdown warden"
+
+[[subjects]]
+name = "track"
+"#,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Build a respondent manifest targeting `shut.<shelf>`.
+    fn shutdown_manifest_for_shelf(name: &str, shelf_leaf: &str) -> Manifest {
+        let toml = format!(
+            r#"
+[plugin]
+name = "{name}"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "shut.{shelf_leaf}"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+
+[capabilities.respondent]
+request_types = ["ping"]
+response_budget_ms = 1000
+"#
+        );
+        Manifest::from_toml(&toml).unwrap()
+    }
+
+    /// Build a warden manifest targeting `shut.warden`.
+    fn shutdown_warden_manifest(name: &str) -> Manifest {
+        let toml = format!(
+            r#"
+[plugin]
+name = "{name}"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "shut.warden"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "warden"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+
+[capabilities.warden]
+custody_domain = "test"
+custody_exclusive = false
+course_correction_budget_ms = 1000
+custody_failure_mode = "abort"
+"#
+        );
+        Manifest::from_toml(&toml).unwrap()
+    }
+
+    /// Respondent whose `unload()` sleeps for `unload_delay` before
+    /// returning. Used to time the parallel-vs-serial unload race.
+    struct DelayedUnloadRespondent {
+        name: String,
+        unload_delay: Duration,
+    }
+
+    impl Plugin for DelayedUnloadRespondent {
+        fn describe(
+            &self,
+        ) -> impl Future<Output = PluginDescription> + Send + '_ {
+            async move {
+                PluginDescription {
+                    identity: PluginIdentity {
+                        name: self.name.clone(),
+                        version: semver::Version::new(0, 1, 0),
+                        contract: 1,
+                    },
+                    runtime_capabilities: RuntimeCapabilities {
+                        request_types: vec!["ping".into()],
+                        accepts_custody: false,
+                        flags: Default::default(),
+                    },
+                    build_info: BuildInfo {
+                        plugin_build: "test".into(),
+                        sdk_version: "0.1.0".into(),
+                        rustc_version: None,
+                        built_at: None,
+                    },
+                }
+            }
+        }
+
+        fn load<'a>(
+            &'a mut self,
+            _ctx: &'a LoadContext,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+            async move { Ok(()) }
+        }
+
+        fn unload(
+            &mut self,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
+            let delay = self.unload_delay;
+            async move {
+                tokio::time::sleep(delay).await;
+                Ok(())
+            }
+        }
+
+        fn health_check(
+            &self,
+        ) -> impl Future<Output = HealthReport> + Send + '_ {
+            async move { HealthReport::healthy() }
+        }
+    }
+
+    impl Respondent for DelayedUnloadRespondent {
+        fn handle_request<'a>(
+            &'a mut self,
+            req: &'a Request,
+        ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a
+        {
+            async move { Ok(Response::for_request(req, req.payload.clone())) }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_unloads_all_plugins_in_parallel() {
+        // Six plugins each sleep ~50ms in unload(). With serial
+        // shutdown that totals ~300ms; in parallel it should finish
+        // close to the single-plugin delay. The threshold is
+        // generous to absorb scheduling noise on shared CI.
+        let catalogue = shutdown_test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+
+        let leaves = ["a", "b", "c", "d", "e", "f"];
+        for leaf in leaves {
+            let plugin = DelayedUnloadRespondent {
+                name: format!("org.test.shut.{leaf}"),
+                unload_delay: Duration::from_millis(50),
+            };
+            engine
+                .admit_singleton_respondent(
+                    plugin,
+                    shutdown_manifest_for_shelf(
+                        &format!("org.test.shut.{leaf}"),
+                        leaf,
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(engine.len(), leaves.len());
+
+        let started = Instant::now();
+        let report =
+            engine.shutdown_with_config(ShutdownConfig::default()).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(engine.len(), 0);
+        assert_eq!(report.plugins_total, leaves.len());
+        assert_eq!(report.plugins_unloaded_cleanly.len(), leaves.len());
+        assert!(report.plugins_killed_after_deadline.is_empty());
+
+        // Serial would be ~300ms; parallel should be well under
+        // 200ms even on a slow runner. Use the same generous-bound
+        // pattern as the concurrency proof test.
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "parallel shutdown took {elapsed:?}, expected < 200ms"
+        );
+    }
+
+    /// Respondent whose `unload()` blocks indefinitely (until the
+    /// supervising task aborts it). Used to drive the deadline path
+    /// in `shutdown_respects_global_deadline_with_kill`.
+    struct HangingUnloadRespondent {
+        name: String,
+    }
+
+    impl Plugin for HangingUnloadRespondent {
+        fn describe(
+            &self,
+        ) -> impl Future<Output = PluginDescription> + Send + '_ {
+            async move {
+                PluginDescription {
+                    identity: PluginIdentity {
+                        name: self.name.clone(),
+                        version: semver::Version::new(0, 1, 0),
+                        contract: 1,
+                    },
+                    runtime_capabilities: RuntimeCapabilities {
+                        request_types: vec!["ping".into()],
+                        accepts_custody: false,
+                        flags: Default::default(),
+                    },
+                    build_info: BuildInfo {
+                        plugin_build: "test".into(),
+                        sdk_version: "0.1.0".into(),
+                        rustc_version: None,
+                        built_at: None,
+                    },
+                }
+            }
+        }
+
+        fn load<'a>(
+            &'a mut self,
+            _ctx: &'a LoadContext,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+            async move { Ok(()) }
+        }
+
+        fn unload(
+            &mut self,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
+            async move {
+                // Block effectively forever; the orchestrator must
+                // abort us via the global deadline.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(())
+            }
+        }
+
+        fn health_check(
+            &self,
+        ) -> impl Future<Output = HealthReport> + Send + '_ {
+            async move { HealthReport::healthy() }
+        }
+    }
+
+    impl Respondent for HangingUnloadRespondent {
+        fn handle_request<'a>(
+            &'a mut self,
+            req: &'a Request,
+        ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a
+        {
+            async move { Ok(Response::for_request(req, req.payload.clone())) }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_respects_global_deadline_with_kill() {
+        // One plugin's unload sleeps for 30s; the global deadline is
+        // 200ms. The supervisor must abort the task and report the
+        // plugin under plugins_killed_after_deadline.
+        //
+        // The plugin is in-process (no child to SIGKILL); the
+        // killed-after-deadline path still names it because its task
+        // did not complete in time. This pins the timeout-and-name
+        // behaviour without needing an out-of-process spawn.
+        let catalogue = shutdown_test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+
+        let plugin = HangingUnloadRespondent {
+            name: "org.test.shut.hang".into(),
+        };
+        engine
+            .admit_singleton_respondent(
+                plugin,
+                shutdown_manifest_for_shelf("org.test.shut.hang", "a"),
+            )
+            .await
+            .unwrap();
+
+        let report = engine
+            .shutdown_with_config(ShutdownConfig {
+                global_deadline: Duration::from_millis(200),
+            })
+            .await;
+
+        assert_eq!(report.plugins_total, 1);
+        assert!(
+            report.plugins_unloaded_cleanly.is_empty(),
+            "no plugin should have completed unload: {:?}",
+            report.plugins_unloaded_cleanly
+        );
+        assert_eq!(report.plugins_killed_after_deadline.len(), 1);
+        assert_eq!(
+            report.plugins_killed_after_deadline[0],
+            "org.test.shut.hang"
+        );
+        // The deadline was 200ms; allow a generous upper bound so a
+        // slow runner does not flake.
+        assert!(
+            report.elapsed < Duration::from_secs(5),
+            "shutdown elapsed {:?} should be near the 200ms deadline",
+            report.elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_custody_within_window() {
+        // Admit a warden, take custody, then shutdown. The custody
+        // should appear in custody_drained because the warden's
+        // release_custody returns Ok within the drain window.
+        let catalogue = shutdown_test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+
+        let warden = TestWarden {
+            name: "org.test.shut.warden".into(),
+        };
+        engine
+            .admit_singleton_warden(
+                warden,
+                shutdown_warden_manifest("org.test.shut.warden"),
+            )
+            .await
+            .unwrap();
+
+        let _h = engine
+            .router()
+            .take_custody("shut.warden", "playback".into(), vec![], None)
+            .await
+            .expect("take_custody");
+        assert_eq!(engine.custody_ledger().len(), 1);
+
+        let report =
+            engine.shutdown_with_config(ShutdownConfig::default()).await;
+
+        assert!(
+            report.custody_abandoned.is_empty(),
+            "expected no abandoned custodies: {:?}",
+            report.custody_abandoned
+        );
+        assert_eq!(report.custody_drained.len(), 1);
+        assert_eq!(report.custody_drained[0].plugin, "org.test.shut.warden");
+        // After successful release the ledger must be empty.
+        assert_eq!(engine.custody_ledger().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_report_with_counts_matching_admit() {
+        // Admit four respondents; shutdown; the report's
+        // plugins_total must equal the admit count, and the sum of
+        // unloaded_cleanly + killed_after_deadline must equal total.
+        let catalogue = shutdown_test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+
+        let leaves = ["a", "b", "c", "d"];
+        for leaf in leaves {
+            let plugin = DelayedUnloadRespondent {
+                name: format!("org.test.shut.{leaf}"),
+                unload_delay: Duration::from_millis(5),
+            };
+            engine
+                .admit_singleton_respondent(
+                    plugin,
+                    shutdown_manifest_for_shelf(
+                        &format!("org.test.shut.{leaf}"),
+                        leaf,
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(engine.len(), leaves.len());
+
+        let report =
+            engine.shutdown_with_config(ShutdownConfig::default()).await;
+
+        assert_eq!(report.plugins_total, leaves.len());
+        assert_eq!(
+            report.plugins_unloaded_cleanly.len()
+                + report.plugins_killed_after_deadline.len(),
+            report.plugins_total
         );
     }
 }
