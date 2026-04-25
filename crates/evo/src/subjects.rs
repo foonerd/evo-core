@@ -25,18 +25,18 @@
 //!   ([`SubjectRegistry::forced_retract_addressing`]).
 //! - Merge primitive (section 10.1):
 //!   [`SubjectRegistry::merge_aliases`] collapses two canonical
-//!   subjects into a NEW canonical ID per ADR-0008, retaining the
-//!   two source IDs as alias records.
+//!   subjects into a NEW canonical ID, retaining the two source
+//!   IDs as alias records.
 //! - Split primitive (section 10.2):
 //!   [`SubjectRegistry::split_subject`] partitions one canonical
-//!   subject into N NEW canonical IDs per ADR-0008, retaining the
-//!   source ID as a single alias record carrying every new ID.
+//!   subject into N NEW canonical IDs, retaining the source ID as
+//!   a single alias record carrying every new ID.
 //! - Alias resolution helper
 //!   ([`SubjectRegistry::describe_alias`]) returns the
 //!   [`AliasRecord`] for a pre-merge or pre-split canonical ID.
 //!   Aliases are append-only and the registry does NOT
-//!   transparently follow them on resolve (per ADR-0008); chasing
-//!   the alias is an explicit consumer step.
+//!   transparently follow them on resolve; chasing the alias is
+//!   an explicit consumer step.
 //!
 //! ## What's deferred
 //!
@@ -117,6 +117,45 @@ struct RegistryInner {
     /// split, mapped to the alias record naming the new ID(s).
     /// Append-only; entries are never removed.
     aliases: HashMap<String, AliasRecord>,
+}
+
+/// Append-only-violation tag.
+///
+/// Returned by [`aliases_try_insert`] when the caller attempted to
+/// insert an alias record under a key that already has one. The
+/// alias index is APPEND-ONLY: every retired canonical ID maps to
+/// exactly one [`AliasRecord`] for the lifetime of the registry.
+/// Today the invariant holds because canonical IDs are UUIDv4 and
+/// a collision is improbable, but the storage primitive must not
+/// silently overwrite if it ever did happen.
+#[derive(Debug)]
+struct AppendOnlyViolation {
+    key: String,
+}
+
+/// Insert an alias record while enforcing the append-only invariant.
+///
+/// SAFETY-INVARIANT: every retired canonical ID maps to exactly one
+/// [`AliasRecord`]; the alias index is append-only. Today
+/// the `Err` branch is structurally unreachable: keys are UUIDv4
+/// canonical IDs minted by [`SubjectRegistry::announce`] /
+/// [`SubjectRegistry::merge_aliases`] / [`SubjectRegistry::split_subject`]
+/// and a collision would require a UUIDv4 birthday-bound miracle.
+/// Reaching the `Err` arm therefore means a deeper invariant is
+/// already broken (corrupted memory, replayed-state bug, or a future
+/// change that reused IDs). Treat it as a `panic`-class fault rather
+/// than a graceful-error case: silent overwrites would corrupt
+/// alias history without a visible signal.
+fn aliases_try_insert(
+    inner: &mut RegistryInner,
+    key: String,
+    record: AliasRecord,
+) -> Result<(), AppendOnlyViolation> {
+    if inner.aliases.contains_key(&key) {
+        return Err(AppendOnlyViolation { key });
+    }
+    inner.aliases.insert(key, record);
+    Ok(())
 }
 
 /// A record for one canonical subject.
@@ -731,8 +770,8 @@ impl SubjectRegistry {
 
     /// Merge two canonical subjects into one.
     ///
-    /// Per SUBJECTS.md section 10.1 and ADR-0008, a merge produces
-    /// a NEW canonical ID. Both source IDs are retained in the
+    /// Per SUBJECTS.md section 10.1, a merge produces a NEW
+    /// canonical ID. Both source IDs are retained in the
     /// registry as alias records of kind
     /// [`AliasKind::Merged`] so consumers holding stale references
     /// can discover the new identity via [`Self::describe_alias`].
@@ -839,7 +878,8 @@ impl SubjectRegistry {
         let recorded_at_ms = system_time_to_ms(now);
         let new_id_canonical = CanonicalSubjectId::new(&new_id);
 
-        inner.aliases.insert(
+        aliases_try_insert(
+            &mut inner,
             source_a_id.to_string(),
             AliasRecord {
                 old_id: CanonicalSubjectId::new(source_a_id),
@@ -849,8 +889,16 @@ impl SubjectRegistry {
                 admin_plugin: admin_plugin.to_string(),
                 reason: reason.clone(),
             },
-        );
-        inner.aliases.insert(
+        )
+        .unwrap_or_else(|v| {
+            panic!(
+                "alias index append-only invariant violated: key {} \
+                 already had an AliasRecord (merge source_a)",
+                v.key
+            )
+        });
+        aliases_try_insert(
+            &mut inner,
             source_b_id.to_string(),
             AliasRecord {
                 old_id: CanonicalSubjectId::new(source_b_id),
@@ -860,7 +908,14 @@ impl SubjectRegistry {
                 admin_plugin: admin_plugin.to_string(),
                 reason,
             },
-        );
+        )
+        .unwrap_or_else(|v| {
+            panic!(
+                "alias index append-only invariant violated: key {} \
+                 already had an AliasRecord (merge source_b)",
+                v.key
+            )
+        });
 
         tracing::info!(
             new_id = %new_id,
@@ -875,8 +930,8 @@ impl SubjectRegistry {
 
     /// Split one canonical subject into two or more.
     ///
-    /// Per SUBJECTS.md section 10.2 and ADR-0008, a split produces
-    /// N NEW canonical IDs (one per partition group). The source
+    /// Per SUBJECTS.md section 10.2, a split produces N NEW
+    /// canonical IDs (one per partition group). The source
     /// ID is retained in the registry as a single alias record of
     /// kind [`AliasKind::Split`] carrying every new ID in its
     /// `new_ids` field.
@@ -1024,7 +1079,8 @@ impl SubjectRegistry {
             .iter()
             .map(|s| CanonicalSubjectId::new(s.as_str()))
             .collect();
-        inner.aliases.insert(
+        aliases_try_insert(
+            &mut inner,
             source_id.to_string(),
             AliasRecord {
                 old_id: CanonicalSubjectId::new(source_id),
@@ -1034,7 +1090,14 @@ impl SubjectRegistry {
                 admin_plugin: admin_plugin.to_string(),
                 reason,
             },
-        );
+        )
+        .unwrap_or_else(|v| {
+            panic!(
+                "alias index append-only invariant violated: key {} \
+                 already had an AliasRecord (split source)",
+                v.key
+            )
+        });
 
         tracing::info!(
             source_id = %source_id,
@@ -1054,10 +1117,9 @@ impl SubjectRegistry {
     /// another subject ([`AliasKind::Merged`]) or split into
     /// multiple new subjects ([`AliasKind::Split`]). Returns
     /// `None` when `old_id` is unknown to the registry, or when
-    /// it still resolves directly to a live subject (per
-    /// ADR-0008, `resolve` does NOT transparently follow
-    /// aliases; an ID that resolves directly is not in the alias
-    /// map).
+    /// it still resolves directly to a live subject (`resolve`
+    /// does NOT transparently follow aliases; an ID that resolves
+    /// directly is not in the alias map).
     ///
     /// The returned record carries the new canonical ID(s) the
     /// caller's stale reference now corresponds to. It is the
@@ -1569,9 +1631,9 @@ mod tests {
     // ---------------------------------------------------------------
     // merge_aliases / split_subject / describe_alias storage primitives.
     //
-    // Per ADR-0008, both merge and split produce NEW canonical IDs.
-    // The old IDs survive in the alias map (append-only) so consumers
-    // holding stale references can resolve them via describe_alias.
+    // Both merge and split produce NEW canonical IDs. The old IDs
+    // survive in the alias map (append-only) so consumers holding
+    // stale references can resolve them via describe_alias.
     // resolve() does NOT transparently follow aliases.
     //
     // The wiring-layer side of these primitives (happenings, audit
@@ -1612,8 +1674,8 @@ mod tests {
     #[test]
     fn merge_aliases_creates_new_subject_with_union_addressings() {
         // Happy path: two subjects of the same type collapse into
-        // a single new subject. Per ADR-0008 the new ID is fresh
-        // (not equal to either source). The new subject's
+        // a single new subject. The new ID is fresh (not equal to
+        // either source). The new subject's
         // addressings are the union of both sources, with each
         // AddressingRecord's claimant preserved.
         let r = SubjectRegistry::new();
@@ -1767,9 +1829,9 @@ mod tests {
     fn describe_alias_returns_none_for_unknown() {
         // Negative control: describe_alias on an ID that was
         // never in the alias map returns None. Live IDs that
-        // resolve directly are also None per ADR-0008 (resolve
-        // does not transparently follow aliases, so a live ID
-        // is not in the alias map).
+        // resolve directly are also None (resolve does not
+        // transparently follow aliases, so a live ID is not in
+        // the alias map).
         let r = SubjectRegistry::new();
         assert!(r.describe_alias("never-existed").is_none());
 
@@ -1789,9 +1851,9 @@ mod tests {
     #[test]
     fn split_subject_partitions_addressings_into_n_subjects() {
         // Happy path: a subject with three addressings splits
-        // into three new subjects, one addressing each. Per
-        // ADR-0008, each new ID is fresh; the source ID does not
-        // resolve directly afterward.
+        // into three new subjects, one addressing each. Each new
+        // ID is fresh; the source ID does not resolve directly
+        // afterward.
         let r = SubjectRegistry::new();
         let AnnounceOutcome::Created(source_id) = r
             .announce(
@@ -1993,5 +2055,47 @@ mod tests {
         assert_eq!(r.subject_count(), 1);
         assert_eq!(r.addressing_count(), 3);
         assert!(r.describe_alias(&source_id).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "alias index append-only invariant violated")]
+    fn aliases_try_insert_panics_on_collision() {
+        // B5: directly exercise the helper's collision branch.
+        // Today the branch is structurally unreachable (UUIDv4
+        // birthday-bound), but the steward must panic rather than
+        // silently overwrite if the invariant ever does break: a
+        // lost alias record is silent corruption of merge/split
+        // history.
+        let mut inner = RegistryInner {
+            subjects: HashMap::new(),
+            addressings: HashMap::new(),
+            claims: Vec::new(),
+            aliases: HashMap::new(),
+        };
+        let key = "collision-key".to_string();
+        let record = AliasRecord {
+            old_id: CanonicalSubjectId::new(&key),
+            new_ids: vec![CanonicalSubjectId::new("new-id")],
+            kind: AliasKind::Merged,
+            recorded_at_ms: 0,
+            admin_plugin: "admin.plugin".into(),
+            reason: None,
+        };
+
+        // First insert succeeds.
+        aliases_try_insert(&mut inner, key.clone(), record.clone())
+            .expect("first insert must succeed");
+
+        // Second insert under the same key would silently
+        // overwrite with HashMap::insert; the helper rejects.
+        // The wiring panics on Err per the SAFETY-INVARIANT
+        // comment beside the helper.
+        aliases_try_insert(&mut inner, key, record).unwrap_or_else(|v| {
+            panic!(
+                "alias index append-only invariant violated: \
+                 key {} already had an AliasRecord (test)",
+                v.key
+            )
+        });
     }
 }
