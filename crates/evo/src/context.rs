@@ -521,21 +521,23 @@ fn emit_post_rewrite_cardinality_violations(
                 predicate_rule.target_cardinality,
                 Cardinality::AtMostOne | Cardinality::ExactlyOne
             ) {
-                let count = graph
-                    .inverse_count(subject_id, &predicate_rule.predicate);
+                let count =
+                    graph.inverse_count(subject_id, &predicate_rule.predicate);
                 if cardinality_exceeded(
                     predicate_rule.target_cardinality,
                     count,
                 ) {
-                    bus.emit(Happening::RelationCardinalityViolatedPostRewrite {
-                        admin_plugin: admin_plugin.to_string(),
-                        subject_id: subject_id.clone(),
-                        predicate: predicate_rule.predicate.clone(),
-                        side: CardinalityViolationSide::Target,
-                        declared: predicate_rule.target_cardinality,
-                        observed_count: count,
-                        at,
-                    });
+                    bus.emit(
+                        Happening::RelationCardinalityViolatedPostRewrite {
+                            admin_plugin: admin_plugin.to_string(),
+                            subject_id: subject_id.clone(),
+                            predicate: predicate_rule.predicate.clone(),
+                            side: CardinalityViolationSide::Target,
+                            declared: predicate_rule.target_cardinality,
+                            observed_count: count,
+                            at,
+                        },
+                    );
                 }
             }
             // Source side: predicate.source_cardinality bounds how
@@ -545,21 +547,23 @@ fn emit_post_rewrite_cardinality_violations(
                 predicate_rule.source_cardinality,
                 Cardinality::AtMostOne | Cardinality::ExactlyOne
             ) {
-                let count = graph
-                    .forward_count(subject_id, &predicate_rule.predicate);
+                let count =
+                    graph.forward_count(subject_id, &predicate_rule.predicate);
                 if cardinality_exceeded(
                     predicate_rule.source_cardinality,
                     count,
                 ) {
-                    bus.emit(Happening::RelationCardinalityViolatedPostRewrite {
-                        admin_plugin: admin_plugin.to_string(),
-                        subject_id: subject_id.clone(),
-                        predicate: predicate_rule.predicate.clone(),
-                        side: CardinalityViolationSide::Source,
-                        declared: predicate_rule.source_cardinality,
-                        observed_count: count,
-                        at,
-                    });
+                    bus.emit(
+                        Happening::RelationCardinalityViolatedPostRewrite {
+                            admin_plugin: admin_plugin.to_string(),
+                            subject_id: subject_id.clone(),
+                            predicate: predicate_rule.predicate.clone(),
+                            side: CardinalityViolationSide::Source,
+                            declared: predicate_rule.source_cardinality,
+                            observed_count: count,
+                            at,
+                        },
+                    );
                 }
             }
         }
@@ -1171,10 +1175,9 @@ impl SubjectAdmin for RegistrySubjectAdmin {
 
             // Step 1: RelationRewritten in source_a then source_b
             // outcome order.
-            for (source_id, outcome) in [
-                (&source_a_id, &rewrite_a),
-                (&source_b_id, &rewrite_b),
-            ] {
+            for (source_id, outcome) in
+                [(&source_a_id, &rewrite_a), (&source_b_id, &rewrite_b)]
+            {
                 for edge in &outcome.rewrites {
                     let unchanged_endpoint =
                         if edge.old_key.source_id == *source_id {
@@ -1247,10 +1250,9 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             // claimants) but not forbidden by the snapshot; this
             // wiring fires once per claim entry rather than once
             // per claimant, mirroring the snapshot's granularity.
-            for (source_id, outcome) in [
-                (&source_a_id, &rewrite_a),
-                (&source_b_id, &rewrite_b),
-            ] {
+            for (source_id, outcome) in
+                [(&source_a_id, &rewrite_a), (&source_b_id, &rewrite_b)]
+            {
                 for edge in &outcome.rewrites {
                     let unchanged_endpoint =
                         if edge.old_key.source_id == *source_id {
@@ -1414,9 +1416,10 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             // SubjectSplit happening is emitted and BEFORE
             // graph.split_relations runs, so no observable graph
             // corruption can result from a bogus target_new_id.
-            if let Some(bogus) = resolved_assignments.iter().find(|a| {
-                !new_ids.iter().any(|nid| nid == &a.target_new_id)
-            }) {
+            if let Some(bogus) = resolved_assignments
+                .iter()
+                .find(|a| !new_ids.iter().any(|nid| nid == &a.target_new_id))
+            {
                 return Err(ReportError::SplitTargetNewIdUnknown {
                     target_new_id: bogus.target_new_id.clone(),
                 });
@@ -1532,18 +1535,18 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             // primitive deduplicates claimants, so this is a
             // conservative fan-out).
             for edge in &split_outcome.rewrites {
-                let rewritten_endpoint =
-                    if edge.old_key.source_id == source_id {
-                        edge.new_key.source_id.clone()
-                    } else {
-                        edge.new_key.target_id.clone()
-                    };
-                let unchanged_endpoint =
-                    if edge.old_key.source_id == source_id {
-                        edge.new_key.target_id.clone()
-                    } else {
-                        edge.new_key.source_id.clone()
-                    };
+                let rewritten_endpoint = if edge.old_key.source_id == source_id
+                {
+                    edge.new_key.source_id.clone()
+                } else {
+                    edge.new_key.target_id.clone()
+                };
+                let unchanged_endpoint = if edge.old_key.source_id == source_id
+                {
+                    edge.new_key.target_id.clone()
+                } else {
+                    edge.new_key.source_id.clone()
+                };
                 for claim in &edge.claims {
                     bus.emit(Happening::ClaimReassigned {
                         admin_plugin: admin_plugin.clone(),
@@ -1971,7 +1974,9 @@ fn system_time_to_ms(t: SystemTime) -> u64 {
 /// for stable on-wire form), while the steward's internal record
 /// stores `SystemTime` for arithmetic convenience inside the
 /// registry.
-fn project_subject_record(record: crate::subjects::SubjectRecord) -> SdkSubjectRecord {
+fn project_subject_record(
+    record: crate::subjects::SubjectRecord,
+) -> SdkSubjectRecord {
     SdkSubjectRecord {
         id: CanonicalSubjectId::new(record.id),
         subject_type: record.subject_type,
@@ -2079,8 +2084,7 @@ impl SubjectQuerier for RegistrySubjectQuerier {
 
                 // 2. Otherwise look for an alias record. Append it
                 //    to the chain and decide whether to follow.
-                if let Some(alias_record) =
-                    registry.describe_alias(&current_id)
+                if let Some(alias_record) = registry.describe_alias(&current_id)
                 {
                     let kind = alias_record.kind;
                     let new_ids = alias_record.new_ids.clone();
@@ -2093,8 +2097,7 @@ impl SubjectQuerier for RegistrySubjectQuerier {
                     // be returned). The contract surface treats
                     // these uniformly: caller follows individual
                     // chain entries' new_ids by re-querying.
-                    if matches!(kind, AliasKind::Split) || new_ids.len() != 1
-                    {
+                    if matches!(kind, AliasKind::Split) || new_ids.len() != 1 {
                         return Ok(SubjectQueryResult::Aliased {
                             chain,
                             terminal: None,
@@ -5662,9 +5665,9 @@ target_type = "*"
                         addressing_reassigned += 1;
                     }
                 },
-                other => panic!(
-                    "unexpected happening in cascade tail: {other:?}"
-                ),
+                other => {
+                    panic!("unexpected happening in cascade tail: {other:?}")
+                }
             }
             if rx.is_empty() {
                 break;
@@ -5826,16 +5829,12 @@ target_type = "*"
         while !rx.is_empty() {
             match rx.recv().await.unwrap() {
                 Happening::ClaimReassigned { kind, .. } => match kind {
-                    ReassignedClaimKind::Relation => {
-                        relation_reassigned += 1
-                    }
+                    ReassignedClaimKind::Relation => relation_reassigned += 1,
                     ReassignedClaimKind::Addressing => {
                         addressing_reassigned += 1
                     }
                 },
-                other => panic!(
-                    "expected ClaimReassigned tail, got {other:?}"
-                ),
+                other => panic!("expected ClaimReassigned tail, got {other:?}"),
             }
         }
         assert_eq!(relation_reassigned, 2);
@@ -6000,16 +5999,12 @@ target_type = "*"
         while !rx.is_empty() {
             match rx.recv().await.unwrap() {
                 Happening::ClaimReassigned { kind, .. } => match kind {
-                    ReassignedClaimKind::Relation => {
-                        relation_reassigned += 1
-                    }
+                    ReassignedClaimKind::Relation => relation_reassigned += 1,
                     ReassignedClaimKind::Addressing => {
                         addressing_reassigned += 1
                     }
                 },
-                other => panic!(
-                    "expected ClaimReassigned tail, got {other:?}"
-                ),
+                other => panic!("expected ClaimReassigned tail, got {other:?}"),
             }
         }
         assert_eq!(relation_reassigned, 2);
@@ -6120,16 +6115,12 @@ target_type = "*"
         while !rx.is_empty() {
             match rx.recv().await.unwrap() {
                 Happening::ClaimReassigned { kind, .. } => match kind {
-                    ReassignedClaimKind::Relation => {
-                        relation_reassigned += 1
-                    }
+                    ReassignedClaimKind::Relation => relation_reassigned += 1,
                     ReassignedClaimKind::Addressing => {
                         addressing_reassigned += 1
                     }
                 },
-                other => panic!(
-                    "expected ClaimReassigned tail, got {other:?}"
-                ),
+                other => panic!("expected ClaimReassigned tail, got {other:?}"),
             }
         }
         assert_eq!(relation_reassigned, 2);
@@ -6255,16 +6246,12 @@ target_type = "*"
         while !rx.is_empty() {
             match rx.recv().await.unwrap() {
                 Happening::ClaimReassigned { kind, .. } => match kind {
-                    ReassignedClaimKind::Relation => {
-                        relation_reassigned += 1
-                    }
+                    ReassignedClaimKind::Relation => relation_reassigned += 1,
                     ReassignedClaimKind::Addressing => {
                         addressing_reassigned += 1
                     }
                 },
-                other => panic!(
-                    "expected ClaimReassigned tail, got {other:?}"
-                ),
+                other => panic!("expected ClaimReassigned tail, got {other:?}"),
             }
         }
         assert_eq!(relation_reassigned, 2);
@@ -6663,8 +6650,8 @@ target_type = "*"
                 assert_eq!(chain[1].old_id.as_str(), intermediate_id);
                 assert_eq!(chain[1].new_ids[0].as_str(), final_id);
                 assert_eq!(chain[1].kind, AliasKind::Merged);
-                let terminal = terminal
-                    .expect("multi-hop merge must have a terminal");
+                let terminal =
+                    terminal.expect("multi-hop merge must have a terminal");
                 assert_eq!(terminal.id.as_str(), final_id);
             }
             other => panic!("expected Aliased, got {other:?}"),

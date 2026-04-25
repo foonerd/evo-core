@@ -271,9 +271,7 @@ pub enum ReportError {
     /// Merge refused: at least one operator-supplied addressing did
     /// not resolve to a registered subject. The carried addressing
     /// is the bogus one, suitable for surfacing to operators.
-    #[error(
-        "merge refused: source addressing {addressing} is not registered"
-    )]
+    #[error("merge refused: source addressing {addressing} is not registered")]
     MergeSourceUnknown {
         /// The unresolvable operator-supplied addressing, rendered
         /// as `scheme:value`.
@@ -282,9 +280,7 @@ pub enum ReportError {
     /// Merge refused: the two sources have differing subject types.
     /// Cross-type merge would require redefining identity semantics
     /// across catalogue types; the steward refuses.
-    #[error(
-        "merge refused: cross-type merge ({a_type} != {b_type})"
-    )]
+    #[error("merge refused: cross-type merge ({a_type} != {b_type})")]
     MergeCrossType {
         /// Subject type of the first source.
         a_type: String,

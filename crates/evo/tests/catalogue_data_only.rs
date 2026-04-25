@@ -80,7 +80,10 @@ fn ten_megabyte_string_does_not_oom() {
     // from a repeated benign character to keep test memory low for
     // the test runner itself.
     let big: String = "a".repeat(10 * 1024 * 1024);
-    let toml = format!("[[racks]]\nname = \"big\"\nfamily = \"domain\"\ncharter = \"{}\"\n", big);
+    let toml = format!(
+        "[[racks]]\nname = \"big\"\nfamily = \"domain\"\ncharter = \"{}\"\n",
+        big
+    );
     let result = Catalogue::from_toml(&toml);
     // The catalogue may be accepted (a 10 MiB charter is technically
     // legal TOML) or rejected by validation. Either is fine; the

@@ -111,10 +111,7 @@ fn run_sequence(
                     registry.announce(&ann, claimant)
                 {
                     let inserted = minted_ids.insert(id.clone());
-                    assert!(
-                        inserted,
-                        "canonical ID {id} was minted twice"
-                    );
+                    assert!(inserted, "canonical ID {id} was minted twice");
                     *mint_event_count += 1;
                     live.push(id.clone());
                     addressings_by_id.insert(id, vec![addr]);
@@ -180,10 +177,7 @@ fn run_sequence(
                 ) {
                     let new_id = outcome.new_id;
                     let inserted = minted_ids.insert(new_id.clone());
-                    assert!(
-                        inserted,
-                        "merge minted recycled id {new_id}"
-                    );
+                    assert!(inserted, "merge minted recycled id {new_id}");
                     *mint_event_count += 1;
                     // Combine addressing sets under the new ID.
                     let mut combined: Vec<ExternalAddressing> = Vec::new();
@@ -206,10 +200,8 @@ fn run_sequence(
                     _ => continue,
                 };
                 let mid = addrs.len() / 2;
-                let group_a: Vec<ExternalAddressing> =
-                    addrs[..mid].to_vec();
-                let group_b: Vec<ExternalAddressing> =
-                    addrs[mid..].to_vec();
+                let group_a: Vec<ExternalAddressing> = addrs[..mid].to_vec();
+                let group_b: Vec<ExternalAddressing> = addrs[mid..].to_vec();
                 if group_a.is_empty() || group_b.is_empty() {
                     continue;
                 }
@@ -223,10 +215,7 @@ fn run_sequence(
                     let new_ids = outcome.new_ids;
                     for id in &new_ids {
                         let inserted = minted_ids.insert(id.clone());
-                        assert!(
-                            inserted,
-                            "split minted recycled id {id}"
-                        );
+                        assert!(inserted, "split minted recycled id {id}");
                         *mint_event_count += 1;
                     }
                     // Replace target in `live` with the new IDs and

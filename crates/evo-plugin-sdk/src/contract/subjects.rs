@@ -664,8 +664,7 @@ mod tests {
                 terminal: Some(sample_subject_record()),
             },
         };
-        let s = toml::to_string(&q)
-            .expect("query result Aliased serialises");
+        let s = toml::to_string(&q).expect("query result Aliased serialises");
         assert!(
             s.contains(r#"kind = "aliased""#),
             "expected snake_case kind tag, got {s}"
@@ -714,8 +713,7 @@ mod tests {
         let q = Wrap {
             r: SubjectQueryResult::NotFound,
         };
-        let s = toml::to_string(&q)
-            .expect("query result NotFound serialises");
+        let s = toml::to_string(&q).expect("query result NotFound serialises");
         assert!(
             s.contains(r#"kind = "not_found""#),
             "expected snake_case kind tag, got {s}"
