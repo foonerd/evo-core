@@ -146,7 +146,8 @@ use crate::catalogue::Cardinality;
 use crate::custody::{CustodyRecord, StateSnapshot};
 use crate::error::StewardError;
 use crate::happenings::{
-    CardinalityViolationSide, Happening, HappeningBus, RelationForgottenReason,
+    CardinalityViolationSide, Happening, HappeningBus, ReassignedClaimKind,
+    RelationForgottenReason,
 };
 use crate::projections::{
     DegradedReason, DegradedReasonKind, ProjectionEngine, ProjectionError,
@@ -786,6 +787,138 @@ enum HappeningWire {
         /// When the happening was recorded, ms since UNIX epoch.
         at_ms: u64,
     },
+    /// Wire form of [`Happening::RelationRewritten`].
+    ///
+    /// Emitted once per edge whose endpoint changed canonical ID
+    /// during an admin merge or split. Subscribers indexing on
+    /// `(source_id, predicate, target_id)` use this to keep
+    /// indexes coherent across rewrites.
+    RelationRewritten {
+        /// Canonical name of the admin plugin that performed the
+        /// merge or split.
+        admin_plugin: String,
+        /// Predicate of the rewritten relation.
+        predicate: String,
+        /// Endpoint canonical ID before the rewrite.
+        old_subject_id: String,
+        /// Endpoint canonical ID after the rewrite.
+        new_subject_id: String,
+        /// Other endpoint of the relation (the side that did not
+        /// change).
+        target_id: String,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of
+    /// [`Happening::RelationCardinalityViolatedPostRewrite`].
+    ///
+    /// Observational: a merge or split consolidated valid claim
+    /// sets into a violating one. The administration tier decides
+    /// resolution.
+    RelationCardinalityViolatedPostRewrite {
+        /// Canonical name of the admin plugin that performed the
+        /// merge or split.
+        admin_plugin: String,
+        /// Canonical ID of the subject whose count exceeds the
+        /// bound on the indicated side.
+        subject_id: String,
+        /// Predicate whose cardinality was exceeded.
+        predicate: String,
+        /// Which side's bound was exceeded. Serialises as
+        /// `"source"` or `"target"`.
+        side: CardinalityViolationSide,
+        /// The declared bound on the violating side. Serialises
+        /// per [`Cardinality`]'s snake_case rename.
+        declared: Cardinality,
+        /// Count on that side after the rewrite settled.
+        observed_count: usize,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::ClaimReassigned`].
+    ///
+    /// Emitted once per plugin claim moved onto a new canonical
+    /// ID by merge or split, so the claimant can refresh cached
+    /// state.
+    ClaimReassigned {
+        /// Canonical name of the admin plugin that performed the
+        /// merge or split.
+        admin_plugin: String,
+        /// Canonical name of the plugin whose claim was moved.
+        plugin: String,
+        /// Kind of claim reassigned (`"addressing"` or
+        /// `"relation"`).
+        kind: ReassignedClaimKind,
+        /// Canonical ID before reassignment.
+        old_subject_id: String,
+        /// Canonical ID after reassignment.
+        new_subject_id: String,
+        /// Addressing scheme; present when `kind` is
+        /// `addressing`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scheme: Option<String>,
+        /// Addressing value; present when `kind` is `addressing`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+        /// Predicate; present when `kind` is `relation`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        predicate: Option<String>,
+        /// Other endpoint of the relation; present when `kind`
+        /// is `relation`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::RelationClaimSuppressionCollapsed`].
+    ///
+    /// Emitted when a merge rewrite collapses two edges into one
+    /// and the surviving edge is suppressed, demoting the
+    /// previously-visible claim from a sibling edge.
+    RelationClaimSuppressionCollapsed {
+        /// Canonical name of the admin plugin that performed the
+        /// merge.
+        admin_plugin: String,
+        /// Canonical ID of the source subject on the surviving
+        /// relation.
+        subject_id: String,
+        /// Predicate of the surviving relation.
+        predicate: String,
+        /// Canonical ID of the target subject on the surviving
+        /// relation.
+        target_id: String,
+        /// Canonical name of the plugin whose claim was demoted.
+        demoted_claimant: String,
+        /// Suppression provenance now applied to the surviving
+        /// edge.
+        surviving_suppression_record: SuppressionRecordWire,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
+}
+
+/// Wire form of
+/// [`SuppressionRecord`](crate::relations::SuppressionRecord).
+/// Serialises `suppressed_at` as milliseconds since the UNIX epoch
+/// for consistency with every other timestamp on the wire.
+#[derive(Debug, Serialize)]
+struct SuppressionRecordWire {
+    /// Canonical name of the admin plugin that suppressed.
+    admin_plugin: String,
+    /// When the suppression was recorded, ms since UNIX epoch.
+    suppressed_at_ms: u64,
+    /// Operator-supplied reason, if any.
+    reason: Option<String>,
+}
+
+impl From<crate::relations::SuppressionRecord> for SuppressionRecordWire {
+    fn from(s: crate::relations::SuppressionRecord) -> Self {
+        Self {
+            admin_plugin: s.admin_plugin,
+            suppressed_at_ms: system_time_to_ms(s.suppressed_at),
+            reason: s.reason,
+        }
+    }
 }
 
 impl From<Happening> for HappeningWire {
@@ -977,6 +1110,79 @@ impl From<Happening> for HappeningWire {
                 predicate,
                 other_endpoint_id,
                 candidate_new_ids,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::RelationRewritten {
+                admin_plugin,
+                predicate,
+                old_subject_id,
+                new_subject_id,
+                target_id,
+                at,
+            } => HappeningWire::RelationRewritten {
+                admin_plugin,
+                predicate,
+                old_subject_id,
+                new_subject_id,
+                target_id,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::RelationCardinalityViolatedPostRewrite {
+                admin_plugin,
+                subject_id,
+                predicate,
+                side,
+                declared,
+                observed_count,
+                at,
+            } => HappeningWire::RelationCardinalityViolatedPostRewrite {
+                admin_plugin,
+                subject_id,
+                predicate,
+                side,
+                declared,
+                observed_count,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::ClaimReassigned {
+                admin_plugin,
+                plugin,
+                kind,
+                old_subject_id,
+                new_subject_id,
+                scheme,
+                value,
+                predicate,
+                target_id,
+                at,
+            } => HappeningWire::ClaimReassigned {
+                admin_plugin,
+                plugin,
+                kind,
+                old_subject_id,
+                new_subject_id,
+                scheme,
+                value,
+                predicate,
+                target_id,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::RelationClaimSuppressionCollapsed {
+                admin_plugin,
+                subject_id,
+                predicate,
+                target_id,
+                demoted_claimant,
+                surviving_suppression_record,
+                at,
+            } => HappeningWire::RelationClaimSuppressionCollapsed {
+                admin_plugin,
+                subject_id,
+                predicate,
+                target_id,
+                demoted_claimant,
+                surviving_suppression_record: surviving_suppression_record
+                    .into(),
                 at_ms: system_time_to_ms(at),
             },
         }

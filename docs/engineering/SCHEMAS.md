@@ -800,7 +800,7 @@ Custody variants additionally carry `plugin` and `handle_id`. Subject and relati
 
 #### 5.1.2 Variant Reference
 
-Twelve variants ship today. The `Happening` enum is `#[non_exhaustive]`; consumers MUST tolerate unknown `type` values and treat them as ignorable. Variants are grouped here by category for navigation; on the wire they are one flat tagged union.
+Sixteen variants ship today. The `Happening` enum is `#[non_exhaustive]`; consumers MUST tolerate unknown `type` values and treat them as ignorable. Variants are grouped here by category for navigation; on the wire they are one flat tagged union.
 
 **Custody**
 
@@ -1015,6 +1015,93 @@ Fires BEFORE any cascade `relation_forgotten` event. The cascade event's `reason
 ```
 
 `source_subject` is the OLD canonical ID (no longer resolves directly after the parent `subject_split`); `other_endpoint_id` is the relation's other endpoint (may be on either side). `candidate_new_ids` lists every new ID the relation was replicated to under fall-through `to_both` semantics. One emission per gap relation; multiple emissions per split are possible. Fires AFTER the parent `subject_split`.
+
+**`type = "relation_rewritten"`**:
+
+```json
+{
+  "type": "relation_rewritten",
+  "admin_plugin": "<string>",
+  "predicate": "<string>",
+  "old_subject_id": "<uuid>",
+  "new_subject_id": "<uuid>",
+  "target_id": "<uuid>",
+  "at_ms": <u64>
+}
+```
+
+Emitted once per edge whose endpoint changed canonical ID during a merge rewrite or a split-by-strategy. `old_subject_id` and `new_subject_id` identify the endpoint that was rewritten; `target_id` is the OTHER endpoint (the side that did not change). Lets subscribers indexing on `(source_id, predicate, target_id)` keep their index coherent through merges and splits without snapshot reconcile. Fires AFTER the parent `subject_merged` or `subject_split`.
+
+**`type = "relation_cardinality_violated_post_rewrite"`**:
+
+```json
+{
+  "type": "relation_cardinality_violated_post_rewrite",
+  "admin_plugin": "<string>",
+  "subject_id": "<uuid>",
+  "predicate": "<string>",
+  "side": "source" | "target",
+  "declared": "exactly_one" | "at_most_one" | "at_least_one" | "many",
+  "observed_count": <usize>,
+  "at_ms": <u64>
+}
+```
+
+Emitted when a merge rewrite or a split-by-strategy consolidates two valid claim sets on `(subject_id, predicate)` into a count that exceeds the catalogue bound. Cardinality is checked only on assert; this variant covers the rewrite path. `side` matches the convention of `relation_cardinality_violation`: `source` means too many targets via `predicate` from `subject_id`; `target` means too many sources point at `subject_id` via `predicate`. Observational - administration plugins decide reconciliation. Fires AFTER the parent `subject_merged` or `subject_split`.
+
+**`type = "claim_reassigned"`**:
+
+```json
+{
+  "type": "claim_reassigned",
+  "admin_plugin": "<string>",
+  "plugin": "<string>",
+  "kind": "addressing" | "relation",
+  "old_subject_id": "<uuid>",
+  "new_subject_id": "<uuid>",
+  "scheme": "<string>",
+  "value": "<string>",
+  "predicate": "<string>",
+  "target_id": "<uuid>",
+  "at_ms": <u64>
+}
+```
+
+Emitted once per plugin claim transferred from a source subject onto a new canonical ID by merge or split. `plugin` is the affected claimant; `admin_plugin` is the privileged actor that triggered the reassignment. `kind` selects which optional fields are populated:
+
+- `kind = "addressing"`: `scheme` and `value` are present; `predicate` and `target_id` are absent.
+- `kind = "relation"`: `predicate` and `target_id` are present; `scheme` and `value` are absent.
+
+Absent fields are omitted from the JSON object (they do not appear as `null`). Fires AFTER the parent `subject_merged` or `subject_split`.
+
+**`type = "relation_claim_suppression_collapsed"`**:
+
+```json
+{
+  "type": "relation_claim_suppression_collapsed",
+  "admin_plugin": "<string>",
+  "subject_id": "<uuid>",
+  "predicate": "<string>",
+  "target_id": "<uuid>",
+  "demoted_claimant": "<string>",
+  "surviving_suppression_record": <SuppressionRecord>,
+  "at_ms": <u64>
+}
+```
+
+Emitted when suppression-collapse during a merge rewrite demotes a previously-visible claim to invisible: the surviving relation inherited a suppression marker from one of the colliding edges and the other edge's claim is now carried by a suppressed record. `demoted_claimant` is the canonical name of the plugin whose claim was demoted.
+
+`surviving_suppression_record` is the suppression provenance now applied to the surviving edge:
+
+```json
+{
+  "admin_plugin": "<string>",
+  "suppressed_at_ms": <u64>,
+  "reason": "<string>" | null
+}
+```
+
+Fires AFTER the parent `subject_merged`.
 
 ### 5.2 CustodyRecord and StateSnapshot
 

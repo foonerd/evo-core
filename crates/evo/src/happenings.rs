@@ -112,6 +112,7 @@
 //! when it lands (historical trail).
 
 use crate::catalogue::Cardinality;
+use crate::relations::SuppressionRecord;
 use evo_plugin_sdk::contract::{HealthStatus, SplitRelationStrategy};
 use serde::Serialize;
 use std::time::SystemTime;
@@ -201,6 +202,52 @@ pub enum RelationForgottenReason {
         /// the cascade.
         forgotten_subject: String,
     },
+}
+
+/// What kind of claim was transferred onto a new canonical ID by an
+/// admin merge or split, as carried on
+/// [`Happening::ClaimReassigned`].
+///
+/// A merge or split can move two distinct kinds of plugin claim onto
+/// the new canonical ID(s):
+///
+/// - [`Self::Addressing`]: an addressing claim attached to the source
+///   subject was reassigned to the new subject. The `addressing`
+///   fields on the happening (`scheme`, `value`) are populated.
+/// - [`Self::Relation`]: a plugin's relation claim that named the
+///   source subject as one endpoint was reassigned to the new
+///   subject. The relation fields on the happening (`predicate`,
+///   `target_id`) are populated.
+///
+/// Marked `#[non_exhaustive]` so future kinds (factory custody, etc.)
+/// can be added without a breaking change.
+///
+/// Serialises as snake_case (`"addressing"` / `"relation"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ReassignedClaimKind {
+    /// An addressing claim was reassigned.
+    Addressing,
+    /// A relation claim was reassigned.
+    Relation,
+}
+
+impl ReassignedClaimKind {
+    /// Canonical short string (`"addressing"` or `"relation"`) for
+    /// serialisation and logging.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Addressing => "addressing",
+            Self::Relation => "relation",
+        }
+    }
+}
+
+impl std::fmt::Display for ReassignedClaimKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Default buffer size used by [`HappeningBus::new`].
@@ -571,6 +618,167 @@ pub enum Happening {
         /// [`RelationAdmin::forced_retract_claim`](evo_plugin_sdk::contract::RelationAdmin::forced_retract_claim)
         /// on the unwanted copies.
         candidate_new_ids: Vec<String>,
+        /// When the happening was recorded.
+        at: SystemTime,
+    },
+    /// A relation edge was rewritten because one of its endpoints
+    /// changed canonical ID during an admin merge or split. Emitted
+    /// once per affected edge, AFTER the parent
+    /// [`Happening::SubjectMerged`] or [`Happening::SubjectSplit`]
+    /// event.
+    ///
+    /// Subscribers indexing on `(source_id, predicate, target_id)`
+    /// triples use this happening to keep their index coherent
+    /// through merges and splits without resorting to a full
+    /// snapshot reconcile. The triple identifies the edge before
+    /// (`old_subject_id`) and after (`new_subject_id`) the rewrite;
+    /// the side on which the change happened is implicit from
+    /// whichever of `old_subject_id`/`new_subject_id` matches the
+    /// `target_id` versus differs from it.
+    ///
+    /// Dormant in this pass; emission sites are wired in a
+    /// follow-up.
+    RelationRewritten {
+        /// Canonical name of the admin plugin that performed the
+        /// merge or split.
+        admin_plugin: String,
+        /// Predicate of the rewritten relation.
+        predicate: String,
+        /// The endpoint canonical ID before the rewrite. After
+        /// the parent merge or split it no longer resolves
+        /// directly; it survives in the registry as an alias.
+        old_subject_id: String,
+        /// The endpoint canonical ID after the rewrite.
+        new_subject_id: String,
+        /// The other endpoint of the relation (the side that did
+        /// not change).
+        target_id: String,
+        /// When the happening was recorded.
+        at: SystemTime,
+    },
+    /// A `(subject_id, predicate)` exceeds the catalogue's declared
+    /// cardinality bound after a merge rewrite or split-by-strategy
+    /// consolidated two valid claim sets into a violating one.
+    /// Emitted once per offending `(subject_id, predicate, side)`
+    /// after the rewrite settles, AFTER the parent
+    /// [`Happening::SubjectMerged`] or [`Happening::SubjectSplit`]
+    /// event.
+    ///
+    /// Cardinality is checked only on assert today; the merge and
+    /// split paths can introduce a count above the bound that no
+    /// individual assertion would have. The variant is purely
+    /// observational - administration plugins decide reconciliation
+    /// (via forced retract, suppression, or operator review).
+    ///
+    /// Dormant in this pass; emission sites are wired in a
+    /// follow-up.
+    RelationCardinalityViolatedPostRewrite {
+        /// Canonical name of the admin plugin that performed the
+        /// merge or split.
+        admin_plugin: String,
+        /// Canonical ID of the subject whose claim count exceeds
+        /// the bound on the indicated side.
+        subject_id: String,
+        /// Predicate whose cardinality was exceeded.
+        predicate: String,
+        /// Which side's bound was exceeded. Matches the
+        /// convention of [`Happening::RelationCardinalityViolation`]
+        /// for consistency: `Source` means too many targets via
+        /// this predicate from `subject_id`; `Target` means too
+        /// many sources point at `subject_id` via this predicate.
+        side: CardinalityViolationSide,
+        /// The declared bound on the violating side.
+        declared: Cardinality,
+        /// The count on that side after the rewrite settled. For
+        /// an `at_most_one` or `exactly_one` bound this is 2 or
+        /// more; for other bounds the happening is not emitted.
+        observed_count: usize,
+        /// When the happening was recorded.
+        at: SystemTime,
+    },
+    /// A plugin claim was transferred from a source subject onto
+    /// a new canonical ID by an admin merge or split. Emitted once
+    /// per claim moved, AFTER the parent
+    /// [`Happening::SubjectMerged`] or [`Happening::SubjectSplit`]
+    /// event.
+    ///
+    /// Lets the affected plugin observe that its previously cached
+    /// canonical-ID state (held against the old ID) is now stale.
+    /// The plugin can re-query the registry or the relation graph
+    /// for the new ID and reconcile.
+    ///
+    /// Dormant in this pass; emission sites are wired in a
+    /// follow-up.
+    ClaimReassigned {
+        /// Canonical name of the admin plugin that performed the
+        /// merge or split.
+        admin_plugin: String,
+        /// Canonical name of the plugin whose claim was reassigned.
+        plugin: String,
+        /// What kind of claim was reassigned (addressing or
+        /// relation).
+        kind: ReassignedClaimKind,
+        /// The canonical ID before reassignment. After the parent
+        /// merge or split this ID no longer resolves directly; it
+        /// survives in the registry as an alias.
+        old_subject_id: String,
+        /// The canonical ID after reassignment.
+        new_subject_id: String,
+        /// Addressing scheme of the reassigned claim. Populated
+        /// when `kind` is [`ReassignedClaimKind::Addressing`];
+        /// `None` otherwise.
+        scheme: Option<String>,
+        /// Addressing value of the reassigned claim. Populated
+        /// when `kind` is [`ReassignedClaimKind::Addressing`];
+        /// `None` otherwise.
+        value: Option<String>,
+        /// Predicate of the reassigned relation claim. Populated
+        /// when `kind` is [`ReassignedClaimKind::Relation`];
+        /// `None` otherwise.
+        predicate: Option<String>,
+        /// Target endpoint of the reassigned relation claim
+        /// (canonical ID of the side that did not change).
+        /// Populated when `kind` is
+        /// [`ReassignedClaimKind::Relation`]; `None` otherwise.
+        target_id: Option<String>,
+        /// When the happening was recorded.
+        at: SystemTime,
+    },
+    /// During a merge rewrite, suppression collapse demoted a
+    /// previously-visible relation claim into the suppression
+    /// envelope of a surviving relation. Emitted once per demoted
+    /// claim, AFTER the parent [`Happening::SubjectMerged`] event.
+    ///
+    /// When two distinct edges collapse into the same triple under
+    /// a rewrite and one of the source edges was suppressed, the
+    /// surviving edge inherits the suppression marker. Any visible
+    /// claim on the OTHER source edge is therefore demoted to
+    /// invisible (carried by a suppressed edge). Without this
+    /// happening the demotion would be silent; with it, the
+    /// affected claimant can discover and react.
+    ///
+    /// Dormant in this pass; emission sites are wired in a
+    /// follow-up.
+    RelationClaimSuppressionCollapsed {
+        /// Canonical name of the admin plugin that performed the
+        /// merge.
+        admin_plugin: String,
+        /// Canonical ID of the source subject on the surviving
+        /// relation.
+        subject_id: String,
+        /// Predicate of the surviving relation.
+        predicate: String,
+        /// Canonical ID of the target subject on the surviving
+        /// relation.
+        target_id: String,
+        /// Canonical name of the plugin whose claim was demoted
+        /// from visible to invisible.
+        demoted_claimant: String,
+        /// The suppression record now applied to the surviving
+        /// edge. Carries the original suppressing admin, the
+        /// suppression timestamp, and the operator-supplied
+        /// reason if any.
+        surviving_suppression_record: SuppressionRecord,
         /// When the happening was recorded.
         at: SystemTime,
     },

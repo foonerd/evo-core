@@ -44,6 +44,11 @@ pub enum Happening {
     SubjectMerged { admin_plugin, source_ids, new_id, reason, at },
     SubjectSplit { admin_plugin, source_id, new_ids, strategy, reason, at },
     RelationSplitAmbiguous { admin_plugin, source_subject, predicate, other_endpoint_id, candidate_new_ids, at },
+    // Admin merge / split cascade
+    RelationRewritten { admin_plugin, predicate, old_subject_id, new_subject_id, target_id, at },
+    RelationCardinalityViolatedPostRewrite { admin_plugin, subject_id, predicate, side, declared, observed_count, at },
+    ClaimReassigned { admin_plugin, plugin, kind, old_subject_id, new_subject_id, scheme, value, predicate, target_id, at },
+    RelationClaimSuppressionCollapsed { admin_plugin, subject_id, predicate, target_id, demoted_claimant, surviving_suppression_record, at },
     // ... further variants may be added under #[non_exhaustive]
 }
 ```
@@ -52,7 +57,7 @@ pub enum Happening {
 
 ### 3.1 Current Variants
 
-Twelve variants ship today across four categories. All variants carry an `at: SystemTime` field (the steward's clock when the happening was emitted) - omitted from the per-variant tables below to keep them readable. JSON shapes are in `SCHEMAS.md` section 5.1.
+Sixteen variants ship today across five categories. All variants carry an `at: SystemTime` field (the steward's clock when the happening was emitted) - omitted from the per-variant tables below to keep them readable. JSON shapes are in `SCHEMAS.md` section 5.1.
 
 **Custody transitions**
 
@@ -87,6 +92,17 @@ Twelve variants ship today across four categories. All variants carry an `at: Sy
 | `SubjectSplit` | One canonical subject was split into N new canonical IDs (length at least 2). Fires BEFORE per-edge structural rewrites. | `admin_plugin`, `source_id`, `new_ids`, `strategy`, `reason` |
 | `RelationSplitAmbiguous` | A `SplitRelationStrategy::Explicit` split encountered a relation with no matching `ExplicitRelationAssignment`; the steward fell through to `ToBoth` for that relation and surfaces the gap. One emission per gap. Fires AFTER the parent `SubjectSplit`. | `admin_plugin`, `source_subject`, `predicate`, `other_endpoint_id`, `candidate_new_ids` |
 
+**Admin cascade (merge / split)**
+
+These variants surface the per-edge and per-claim consequences of merge and split. They fire AFTER the parent `SubjectMerged` or `SubjectSplit` event and let subscribers indexing on relation triples or caching canonical IDs reconcile without a full snapshot pass.
+
+| Variant | Trigger | Carries (besides `at`) |
+|---------|---------|------------------------|
+| `RelationRewritten` | An edge whose subject ID changed during a merge rewrite or a split-by-strategy. One emission per affected edge. Lets subscribers indexing on `(source_id, predicate, target_id)` keep their index coherent across merges and splits without snapshot reconcile. | `admin_plugin`, `predicate`, `old_subject_id`, `new_subject_id`, `target_id` |
+| `RelationCardinalityViolatedPostRewrite` | A `(subject_id, predicate)` whose claim count exceeds the catalogue cardinality after a rewrite or split. Cardinality is checked only on assert today; merge / split can consolidate two valid claim sets into a violating one. Observational - administration plugins decide resolution. | `admin_plugin`, `subject_id`, `predicate`, `side`, `declared`, `observed_count` |
+| `ClaimReassigned` | A plugin claim transferred from a source subject onto a new canonical ID by merge or split. One emission per moved claim. Lets the affected plugin discover that cached canonical-ID state is now stale. `kind` distinguishes addressing (`scheme`, `value` populated) from relation (`predicate`, `target_id` populated). | `admin_plugin`, `plugin`, `kind`, `old_subject_id`, `new_subject_id`, optional `scheme`, `value`, `predicate`, `target_id` |
+| `RelationClaimSuppressionCollapsed` | Suppression-collapse during `rewrite_subject_to` demoted a previously-visible claim to invisible because the surviving edge inherited a suppression marker. Without this happening the demotion would be silent. | `admin_plugin`, `subject_id`, `predicate`, `target_id`, `demoted_claimant`, `surviving_suppression_record` |
+
 Every variant carries identifying fields so subscribers can correlate happenings with ledger records (custody) or with the registry / graph (subject and relation). `admin_plugin` distinguishes the privileged actor from the `target_plugin` whose claim was modified.
 
 ### 3.2 Ordering Across Cascade Sequences
@@ -98,6 +114,7 @@ Several admin and retract paths produce a sequence of related happenings. The or
 - `RelationClaimForcedRetract` fires BEFORE the cascade `RelationForgotten` (with `reason.kind = "claims_retracted"` and `retracting_plugin` set to the ADMIN, not the target).
 - `SubjectMerged` fires BEFORE the relation-graph rewrite; any `RelationCardinalityViolation` events from the rewrite fire afterwards.
 - `SubjectSplit` fires BEFORE per-edge rewrites; one `RelationSplitAmbiguous` is emitted per gap relation under `Explicit` strategy AFTER the `SubjectSplit`.
+- `SubjectMerged` and `SubjectSplit` fire BEFORE the per-edge cascade variants the rewrite produces. Concretely: the parent event lands first, then the steward emits one `RelationRewritten` per affected edge, one `ClaimReassigned` per moved plugin claim, one `RelationClaimSuppressionCollapsed` per suppression-collapse demotion, and one `RelationCardinalityViolatedPostRewrite` per `(subject_id, predicate, side)` whose count now exceeds the catalogue bound. The relative order of the four cascade variants for a single parent is unspecified; subscribers should treat them as a set keyed by the parent's `at`.
 
 Subscribers that maintain auxiliary state can rely on these orderings to clean up parent records before their children land.
 

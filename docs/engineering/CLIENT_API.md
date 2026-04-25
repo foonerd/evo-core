@@ -231,7 +231,7 @@ The server writes three kinds of frames after accepting the subscription:
 }
 ```
 
-The `happening` object is internally tagged by `type`. Twelve variants ship today across four categories:
+The `happening` object is internally tagged by `type`. Sixteen variants ship today across five categories:
 
 | Category | `type` values |
 |----------|---------------|
@@ -239,6 +239,7 @@ The `happening` object is internally tagged by `type`. Twelve variants ship toda
 | Relation graph | `relation_cardinality_violation`, `relation_forgotten`, `relation_suppressed`, `relation_unsuppressed` |
 | Subject registry | `subject_forgotten` |
 | Admin (privileged) | `subject_addressing_forced_retract`, `relation_claim_forced_retract`, `subject_merged`, `subject_split`, `relation_split_ambiguous` |
+| Admin cascade (merge / split) | `relation_rewritten`, `relation_cardinality_violated_post_rewrite`, `claim_reassigned`, `relation_claim_suppression_collapsed` |
 
 The `Happening` enum is `#[non_exhaustive]`; consumers MUST tolerate unknown `type` values (treat as "ignore" or "log and continue", never crash). See `HAPPENINGS.md` section 3.1 for the per-variant trigger semantics and `SCHEMAS.md` section 5.1 for full JSON shapes per variant.
 
