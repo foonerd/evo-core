@@ -227,6 +227,34 @@ pub enum ClaimKind {
         /// The distinct canonical IDs they resolved to.
         canonical_ids: Vec<String>,
     },
+    /// An admin merge collapsed two source canonical IDs into one
+    /// new canonical ID. The source IDs are retired into the alias
+    /// index ([`AliasKind::Merged`]); this claim is the audit-log
+    /// entry for the operation, so a consumer reconstructing state
+    /// from the claim log observes the merge here without having
+    /// to scan the alias map. The surrounding [`ClaimRecord`]'s
+    /// `claimant` is the admin plugin that authorised the merge.
+    Merged {
+        /// Source canonical IDs that were collapsed. Order follows
+        /// the merge call's `(source_a, source_b)` order.
+        sources: Vec<String>,
+        /// New canonical ID minted for the merged subject.
+        target: String,
+    },
+    /// An admin split partitioned one source canonical ID into N
+    /// new canonical IDs. The source ID is retired into the alias
+    /// index ([`AliasKind::Split`]); this claim is the audit-log
+    /// entry for the operation, symmetric to [`Self::Merged`]. The
+    /// surrounding [`ClaimRecord`]'s `claimant` is the admin plugin
+    /// that authorised the split.
+    Split {
+        /// Source canonical ID that was split.
+        source: String,
+        /// New canonical IDs minted for the partition groups, in
+        /// partition order (matches
+        /// [`SplitSubjectOutcome::new_ids`]).
+        targets: Vec<String>,
+    },
 }
 
 /// Outcome of an announcement.
@@ -420,13 +448,29 @@ impl SubjectRegistry {
     }
 
     /// Current number of recorded claims (equivalent, distinct,
-    /// conflict).
+    /// conflict, merged, split).
     pub fn claim_count(&self) -> usize {
         self.inner
             .lock()
             .expect("registry mutex poisoned")
             .claims
             .len()
+    }
+
+    /// Snapshot of every recorded claim, in insertion order.
+    ///
+    /// The audit/reconcile read path. Consumers walking the claim
+    /// log iterate this snapshot to reconstruct registry state
+    /// without scanning the alias map: a [`ClaimKind::Merged`] or
+    /// [`ClaimKind::Split`] entry is the audit-log entry for the
+    /// corresponding admin operation. Returned by clone — the
+    /// internal vector is not exposed by reference.
+    pub fn claims_snapshot(&self) -> Vec<ClaimRecord> {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .claims
+            .clone()
     }
 
     /// Resolve an addressing to a canonical subject ID if known.
@@ -982,7 +1026,7 @@ impl SubjectRegistry {
                 kind: AliasKind::Merged,
                 recorded_at_ms,
                 admin_plugin: admin_plugin.to_string(),
-                reason,
+                reason: reason.clone(),
             },
         )
         .unwrap_or_else(|v| {
@@ -991,6 +1035,22 @@ impl SubjectRegistry {
                  already had an AliasRecord (merge source_b)",
                 v.key
             )
+        });
+
+        // Audit-log entry. Other state-changing operations append
+        // a `ClaimRecord` to `inner.claims`; merge does the same so
+        // a consumer reconstructing state from the claim log
+        // observes the merge without scanning the alias map. The
+        // variant carries both source IDs and the new target so the
+        // operation is self-contained.
+        inner.claims.push(ClaimRecord {
+            kind: ClaimKind::Merged {
+                sources: vec![source_a_id.to_string(), source_b_id.to_string()],
+                target: new_id.clone(),
+            },
+            claimant: admin_plugin.to_string(),
+            asserted_at: now,
+            reason,
         });
 
         tracing::info!(
@@ -1176,7 +1236,7 @@ impl SubjectRegistry {
                 kind: AliasKind::Split,
                 recorded_at_ms: system_time_to_ms(now),
                 admin_plugin: admin_plugin.to_string(),
-                reason,
+                reason: reason.clone(),
             },
         )
         .unwrap_or_else(|v| {
@@ -1185,6 +1245,21 @@ impl SubjectRegistry {
                  already had an AliasRecord (split source)",
                 v.key
             )
+        });
+
+        // Audit-log entry, symmetric to the merge claim. The split
+        // appends a `ClaimRecord::Split` carrying the source ID and
+        // every new ID in partition order so a consumer
+        // reconstructing state from the claim log observes the
+        // split without scanning the alias map.
+        inner.claims.push(ClaimRecord {
+            kind: ClaimKind::Split {
+                source: source_id.to_string(),
+                targets: new_ids.clone(),
+            },
+            claimant: admin_plugin.to_string(),
+            asserted_at: now,
+            reason,
         });
 
         tracing::info!(
@@ -1835,6 +1910,46 @@ mod tests {
     }
 
     #[test]
+    fn merge_aliases_appends_synthetic_claim_record() {
+        // Merge appends a `ClaimRecord` of kind `Merged` to the
+        // in-registry claim log so audit/replay consumers see the
+        // operation in the log without scanning the alias map. The
+        // variant carries both source IDs and the new target; the
+        // surrounding record carries the admin plugin as `claimant`
+        // and the operator's `reason`.
+        let r = SubjectRegistry::new();
+        let (id_a, id_b) = seed_two_subjects(&r);
+        let claim_count_before = r.claim_count();
+
+        let new_id = r
+            .merge_aliases(
+                &id_a,
+                &id_b,
+                "admin.plugin",
+                Some("operator confirmed".into()),
+            )
+            .unwrap()
+            .new_id;
+
+        assert_eq!(
+            r.claim_count(),
+            claim_count_before + 1,
+            "merge must append exactly one ClaimRecord"
+        );
+        let claims = r.claims_snapshot();
+        let last = claims.last().expect("claim log not empty");
+        match &last.kind {
+            ClaimKind::Merged { sources, target } => {
+                assert_eq!(sources, &vec![id_a.clone(), id_b.clone()]);
+                assert_eq!(target, &new_id);
+            }
+            other => panic!("expected ClaimKind::Merged, got {other:?}"),
+        }
+        assert_eq!(last.claimant, "admin.plugin");
+        assert_eq!(last.reason.as_deref(), Some("operator confirmed"));
+    }
+
+    #[test]
     fn merge_aliases_rewrites_addressing_index() {
         // Per the merge contract, every addressing the two
         // sources owned must now resolve directly to the new ID.
@@ -2044,6 +2159,56 @@ mod tests {
         assert_eq!(alias.new_ids[1].as_str(), &new_ids[1]);
         assert_eq!(alias.admin_plugin, "admin.plugin");
         assert!(alias.reason.is_none());
+    }
+
+    #[test]
+    fn split_subject_appends_synthetic_claim_record() {
+        // Symmetric to the merge claim. Split appends a
+        // `ClaimRecord` of kind `Split` carrying the source ID and
+        // every new ID in partition order. The surrounding record
+        // carries the admin plugin as `claimant` and the operator's
+        // `reason`.
+        let r = SubjectRegistry::new();
+        let AnnounceOutcome::Created(source_id) = r
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![addr("a", "1"), addr("b", "2")],
+                ),
+                "p1",
+            )
+            .unwrap()
+        else {
+            panic!();
+        };
+        let claim_count_before = r.claim_count();
+
+        let new_ids = r
+            .split_subject(
+                &source_id,
+                vec![vec![addr("a", "1")], vec![addr("b", "2")]],
+                "admin.plugin",
+                Some("operator partitioned".into()),
+            )
+            .unwrap()
+            .new_ids;
+
+        assert_eq!(
+            r.claim_count(),
+            claim_count_before + 1,
+            "split must append exactly one ClaimRecord"
+        );
+        let claims = r.claims_snapshot();
+        let last = claims.last().expect("claim log not empty");
+        match &last.kind {
+            ClaimKind::Split { source, targets } => {
+                assert_eq!(source, &source_id);
+                assert_eq!(targets, &new_ids);
+            }
+            other => panic!("expected ClaimKind::Split, got {other:?}"),
+        }
+        assert_eq!(last.claimant, "admin.plugin");
+        assert_eq!(last.reason.as_deref(), Some("operator partitioned"));
     }
 
     #[test]
