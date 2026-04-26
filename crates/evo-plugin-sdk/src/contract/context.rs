@@ -332,6 +332,34 @@ pub enum ReportError {
     },
 }
 
+impl ReportError {
+    /// Map this error onto its cross-boundary
+    /// [`ErrorClass`](crate::error_taxonomy::ErrorClass).
+    ///
+    /// The mapping is total: every variant has exactly one class.
+    /// Subclass detail (e.g. distinguishing `MergeSelfTarget` from
+    /// `MergeCrossType` within `ContractViolation`) is for callers
+    /// that want to populate `details.subclass` on the wire
+    /// envelope; this method returns only the top-level class.
+    pub fn class(&self) -> crate::error_taxonomy::ErrorClass {
+        use crate::error_taxonomy::ErrorClass;
+        match self {
+            ReportError::RateLimited => ErrorClass::ResourceExhausted,
+            ReportError::ShuttingDown => ErrorClass::Unavailable,
+            ReportError::Deregistered => ErrorClass::Unavailable,
+            ReportError::Invalid(_) => ErrorClass::ContractViolation,
+            ReportError::TargetPluginUnknown { .. } => ErrorClass::NotFound,
+            ReportError::MergeSelfTarget => ErrorClass::ContractViolation,
+            ReportError::MergeSourceUnknown { .. } => ErrorClass::NotFound,
+            ReportError::MergeCrossType { .. } => ErrorClass::ContractViolation,
+            ReportError::MergeInternal { .. } => ErrorClass::Internal,
+            ReportError::SplitTargetNewIdIndexOutOfBounds { .. } => {
+                ErrorClass::ContractViolation
+            }
+        }
+    }
+}
+
 /// Priority hint for state reports.
 ///
 /// Influences how the steward rate-limits and aggregates reports.

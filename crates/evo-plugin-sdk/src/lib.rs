@@ -74,6 +74,7 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod error;
+pub mod error_taxonomy;
 pub mod manifest;
 
 #[cfg(feature = "contract")]
@@ -89,6 +90,7 @@ pub mod wire;
 pub mod testing;
 
 pub use error::ManifestError;
+pub use error_taxonomy::ErrorClass;
 pub use manifest::Manifest;
 
 #[cfg(feature = "contract")]

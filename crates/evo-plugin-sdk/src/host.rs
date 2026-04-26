@@ -76,6 +76,7 @@ use crate::contract::{
     SubjectAnnouncement, SubjectAnnouncer, SubjectQuerier, SubjectQueryResult,
     UserInteraction, UserInteractionRequester, Warden,
 };
+use crate::error_taxonomy::ErrorClass;
 use crate::wire::{WireFrame, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::future::Future;
@@ -260,9 +261,9 @@ where
 /// largest mutually-supported feature version and the first
 /// mutually-supported codec, and writes a [`WireFrame::HelloAck`].
 /// On any rejection (plugin-name mismatch, no feature overlap, no
-/// codec overlap) writes a [`WireFrame::Error`] frame with
-/// `fatal = true` and returns a [`HostError::Protocol`] so the
-/// caller tears down the connection.
+/// codec overlap) writes a connection-fatal [`WireFrame::Error`]
+/// frame (class [`ErrorClass::ProtocolViolation`]) and returns a
+/// [`HostError::Protocol`] so the caller tears down the connection.
 async fn perform_plugin_handshake<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -293,11 +294,12 @@ where
                 v: PROTOCOL_VERSION,
                 cid,
                 plugin: plugin_name.to_string(),
+                class: ErrorClass::ProtocolViolation,
                 message: format!(
                     "plugin name mismatch: configured '{plugin_name}', \
                      steward sent '{peer_plugin}'"
                 ),
-                fatal: true,
+                details: None,
             },
         )
         .await;
@@ -344,8 +346,9 @@ where
                     v: PROTOCOL_VERSION,
                     cid,
                     plugin: plugin_name.to_string(),
+                    class: ErrorClass::ProtocolViolation,
                     message: reason.clone(),
-                    fatal: true,
+                    details: None,
                 },
             )
             .await;
@@ -369,8 +372,9 @@ where
                     v: PROTOCOL_VERSION,
                     cid,
                     plugin: plugin_name.to_string(),
+                    class: ErrorClass::ProtocolViolation,
                     message: reason.clone(),
-                    fatal: true,
+                    details: None,
                 },
             )
             .await;
@@ -640,7 +644,13 @@ where
             }) {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    return error_frame(v, cid, &p, e, true);
+                    return error_frame(
+                        v,
+                        cid,
+                        &p,
+                        ErrorClass::Misconfiguration,
+                        e,
+                    );
                 }
             };
 
@@ -702,8 +712,8 @@ where
             other.envelope().0,
             other.envelope().1,
             &config.plugin_name,
+            ErrorClass::ProtocolViolation,
             format!("unexpected frame: {}", variant_name(&other)),
-            true,
         ),
     }
 }
@@ -714,23 +724,45 @@ fn plugin_error_to_frame(
     plugin: &str,
     err: PluginError,
 ) -> WireFrame {
-    let fatal = err.is_fatal();
-    error_frame(v, cid, plugin, format!("{err}"), fatal)
+    let class = plugin_error_class(&err);
+    error_frame(v, cid, plugin, class, format!("{err}"))
+}
+
+/// Map a plugin-side error to its cross-boundary class.
+///
+/// Preserves the connection-fatality of the original error: any
+/// variant that previously returned `is_fatal() == true` maps to a
+/// class for which `ErrorClass::is_connection_fatal()` is also true.
+fn plugin_error_class(err: &PluginError) -> ErrorClass {
+    match err {
+        PluginError::Transient(_) => ErrorClass::Transient,
+        PluginError::Permanent(_) => ErrorClass::ContractViolation,
+        PluginError::Unauthorized(_) => ErrorClass::PermissionDenied,
+        PluginError::Timeout { .. } => ErrorClass::Transient,
+        PluginError::ResourceExhausted { .. } => ErrorClass::ResourceExhausted,
+        // Plugin-recoverable internal: keep non-fatal on the wire.
+        PluginError::Internal { .. } => ErrorClass::ContractViolation,
+        // Fatal: connection is unusable; surface as `Internal` which
+        // is the canonical connection-fatal class for "the plugin
+        // raised an unrecoverable error".
+        PluginError::Fatal { .. } => ErrorClass::Internal,
+    }
 }
 
 fn error_frame(
     v: u16,
     cid: u64,
     plugin: &str,
+    class: ErrorClass,
     message: impl Into<String>,
-    fatal: bool,
 ) -> WireFrame {
     WireFrame::Error {
         v,
         cid,
         plugin: plugin.to_string(),
+        class,
         message: message.into(),
-        fatal,
+        details: None,
     }
 }
 
@@ -1000,11 +1032,12 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
 /// wire as in-process: a rejection by the steward becomes the
 /// caller's `Err`, not a silently dropped log line.
 ///
-/// Until a structured wire error taxonomy lands on the plugin↔
-/// steward surface, non-fatal [`WireFrame::Error`] responses map
-/// to [`ReportError::Invalid`] carrying the wire message; fatal
-/// ones map to [`ReportError::ShuttingDown`] so the trait surface
-/// signals that retrying the call is pointless.
+/// Non-fatal [`WireFrame::Error`] responses map to
+/// [`ReportError::Invalid`] carrying the wire message; connection-
+/// fatal ones (derived from the error class via
+/// [`ErrorClass::is_connection_fatal`]) map to
+/// [`ReportError::ShuttingDown`] so the trait surface signals that
+/// retrying the call is pointless.
 async fn await_event_response(
     tx: &mpsc::Sender<WireFrame>,
     pending: &Arc<Mutex<PendingMap>>,
@@ -1018,8 +1051,8 @@ async fn await_event_response(
     }
     match rx.await {
         Ok(WireFrame::EventAck { .. }) => Ok(()),
-        Ok(WireFrame::Error { message, fatal, .. }) => {
-            if fatal {
+        Ok(WireFrame::Error { message, class, .. }) => {
+            if class.is_connection_fatal() {
                 Err(ReportError::ShuttingDown)
             } else {
                 Err(ReportError::Invalid(message))
@@ -1300,8 +1333,8 @@ async fn await_admin_response(
     }
     match rx.await {
         Ok(frame) if variant_name(&frame) == expected_op => Ok(()),
-        Ok(WireFrame::Error { message, fatal, .. }) => {
-            if fatal {
+        Ok(WireFrame::Error { message, class, .. }) => {
+            if class.is_connection_fatal() {
                 Err(ReportError::ShuttingDown)
             } else {
                 Err(ReportError::Invalid(message))
@@ -1785,7 +1818,13 @@ where
             }) {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    return error_frame(v, cid, &p, e, true);
+                    return error_frame(
+                        v,
+                        cid,
+                        &p,
+                        ErrorClass::Misconfiguration,
+                        e,
+                    );
                 }
             };
 
@@ -1898,16 +1937,16 @@ where
             v,
             cid,
             &p,
+            ErrorClass::ProtocolViolation,
             "warden received a respondent verb (handle_request)",
-            true,
         ),
 
         other => error_frame(
             other.envelope().0,
             other.envelope().1,
             &config.plugin_name,
+            ErrorClass::ProtocolViolation,
             format!("unexpected frame: {}", variant_name(&other)),
-            true,
         ),
     }
 }
@@ -2360,12 +2399,12 @@ mod tests {
         match read_frame_json(&mut client_r).await.unwrap() {
             WireFrame::Error {
                 cid,
-                fatal,
+                class,
                 message,
                 ..
             } => {
                 assert_eq!(cid, 1);
-                assert!(!fatal);
+                assert!(!class.is_connection_fatal());
                 assert!(message.contains("refused to load"));
             }
             other => panic!("expected Error, got {other:?}"),
@@ -2814,12 +2853,12 @@ mod tests {
         match read_frame_json(&mut client_r).await.unwrap() {
             WireFrame::Error {
                 cid,
-                fatal,
+                class,
                 message,
                 ..
             } => {
                 assert_eq!(cid, 11);
-                assert!(!fatal);
+                assert!(!class.is_connection_fatal());
                 assert!(message.contains("refused to take custody"));
             }
             other => panic!("expected Error, got {other:?}"),
@@ -3102,12 +3141,12 @@ mod tests {
         match read_frame_json(&mut client_r).await.unwrap() {
             WireFrame::Error {
                 cid,
-                fatal,
+                class,
                 message,
                 ..
             } => {
                 assert_eq!(cid, 50);
-                assert!(fatal);
+                assert!(class.is_connection_fatal());
                 assert!(message.contains("handle_request"));
             }
             other => panic!("expected Error, got {other:?}"),
@@ -3155,12 +3194,12 @@ mod tests {
         match read_frame_json(&mut client_r).await.unwrap() {
             WireFrame::Error {
                 cid,
-                fatal,
+                class,
                 message,
                 ..
             } => {
                 assert_eq!(cid, 60);
-                assert!(fatal);
+                assert!(class.is_connection_fatal());
                 assert!(message.contains("take_custody"));
             }
             other => panic!("expected Error, got {other:?}"),
@@ -3358,14 +3397,16 @@ mod tests {
                     v,
                     plugin,
                     message,
-                    fatal,
+                    class,
+                    details,
                     ..
                 } => WireFrame::Error {
                     v,
                     cid,
                     plugin,
+                    class,
                     message,
-                    fatal,
+                    details,
                 },
                 other => other,
             };
@@ -3401,8 +3442,9 @@ mod tests {
             v: PROTOCOL_VERSION,
             cid: 0,
             plugin: "org.test".into(),
+            class: ErrorClass::ContractViolation,
             message: "shelf shape rejected addressing".into(),
-            fatal: false,
+            details: None,
         }))
         .await;
         match result {
@@ -3419,8 +3461,9 @@ mod tests {
             v: PROTOCOL_VERSION,
             cid: 0,
             plugin: "org.test".into(),
+            class: ErrorClass::ProtocolViolation,
             message: "deregistered".into(),
-            fatal: true,
+            details: None,
         }))
         .await;
         assert!(matches!(result, Err(ReportError::ShuttingDown)));
@@ -3483,8 +3526,11 @@ mod tests {
         // steward before returning the error.
         let response = read_frame_json(&mut client_r).await.unwrap();
         match response {
-            WireFrame::Error { fatal, message, .. } => {
-                assert!(fatal, "plugin name mismatch is session-fatal");
+            WireFrame::Error { class, message, .. } => {
+                assert!(
+                    class.is_connection_fatal(),
+                    "plugin name mismatch is session-fatal"
+                );
                 assert!(
                     message.contains("plugin name mismatch"),
                     "message must explain the rejection: {message}"
@@ -3586,14 +3632,16 @@ mod tests {
                     v,
                     plugin,
                     message,
-                    fatal,
+                    class,
+                    details,
                     ..
                 } => WireFrame::Error {
                     v,
                     cid,
                     plugin,
+                    class,
                     message,
-                    fatal,
+                    details,
                 },
                 other => other,
             };
@@ -3626,8 +3674,9 @@ mod tests {
                 v: PROTOCOL_VERSION,
                 cid: 0,
                 plugin: "org.test.admin".into(),
+                class: ErrorClass::ContractViolation,
                 message: "admin capability not granted to this plugin".into(),
-                fatal: false,
+                details: None,
             }))
             .await;
         match result {

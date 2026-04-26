@@ -702,11 +702,19 @@ pub enum WireFrame {
         cid: u64,
         /// Canonical plugin name.
         plugin: String,
+        /// Structured taxonomy class. Connection-fatality is derived
+        /// from the class via `ErrorClass::is_connection_fatal`; the
+        /// wire frame carries no independent `fatal` field. Consumers
+        /// that observe an unrecognised class MUST degrade to
+        /// `ErrorClass::Internal` rather than crash.
+        class: crate::error_taxonomy::ErrorClass,
         /// Human-readable error message.
         message: String,
-        /// Whether the error is fatal per section 12. Fatal errors
-        /// cause the steward to unload and deregister the plugin.
-        fatal: bool,
+        /// Structured context. Carries `subclass` and any class-
+        /// specific extra fields. Serialised only when populated so
+        /// the on-the-wire shape stays compact in the common case.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        details: Option<serde_json::Value>,
     },
 
     // ---------------------------------------------------------------
@@ -1417,8 +1425,9 @@ mod tests {
             v: PROTOCOL_VERSION,
             cid: 42,
             plugin: sample_plugin(),
+            class: crate::error_taxonomy::ErrorClass::ProtocolViolation,
             message: "shelf shape mismatch".into(),
-            fatal: true,
+            details: None,
         };
         let json = serde_json::to_string(&orig).unwrap();
         let back: WireFrame = serde_json::from_str(&json).unwrap();
@@ -1780,8 +1789,9 @@ mod tests {
             v: PROTOCOL_VERSION,
             cid: 3,
             plugin: "x".into(),
+            class: crate::error_taxonomy::ErrorClass::ContractViolation,
             message: "boom".into(),
-            fatal: false,
+            details: None,
         };
         assert!(err.is_error());
     }

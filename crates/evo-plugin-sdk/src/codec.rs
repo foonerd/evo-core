@@ -174,6 +174,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error_taxonomy::ErrorClass;
     use crate::wire::PROTOCOL_VERSION;
     use tokio::io::AsyncWriteExt;
 
@@ -226,8 +227,9 @@ mod tests {
             v: PROTOCOL_VERSION,
             cid: 3,
             plugin: "org.test.a".into(),
+            class: ErrorClass::ContractViolation,
             message: "nope".into(),
-            fatal: false,
+            details: None,
         };
 
         let f1c = f1.clone();

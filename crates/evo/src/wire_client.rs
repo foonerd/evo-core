@@ -29,9 +29,10 @@
 //! [`WireClientError`] covers the host-to-plugin failure modes. When
 //! the remote plugin returns an `Error` wire frame,
 //! [`WireClientError::PluginReturnedError`] carries the message and
-//! fatal bit. The [`WireRespondent`] adapter maps this cleanly to the
-//! SDK's [`PluginError`] variants so the steward's admission engine
-//! can classify failures uniformly.
+//! the structured [`ErrorClass`]; connection-fatality is derived via
+//! [`ErrorClass::is_connection_fatal`]. The [`WireRespondent`]
+//! adapter maps this cleanly to the SDK's [`PluginError`] variants
+//! so the steward's admission engine can classify failures uniformly.
 //!
 //! ## Warden support
 //!
@@ -74,6 +75,7 @@ use evo_plugin_sdk::wire::{
     WireFrame, FEATURE_VERSION_MAX, FEATURE_VERSION_MIN, PROTOCOL_VERSION,
     SUPPORTED_CODECS,
 };
+use evo_plugin_sdk::ErrorClass;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
@@ -137,13 +139,15 @@ pub enum WireClientError {
     },
 
     /// The remote plugin returned a structured error frame.
-    #[error("plugin returned error (fatal={fatal}): {message}")]
+    #[error("plugin returned error (class={class}): {message}")]
     PluginReturnedError {
         /// Human-readable message from the plugin.
         message: String,
-        /// Fatal bit from the plugin. If true the steward should
-        /// deregister the plugin.
-        fatal: bool,
+        /// Structured taxonomy class from the plugin's error frame.
+        /// Connection-fatality is derived via
+        /// [`ErrorClass::is_connection_fatal`]; the steward should
+        /// deregister the plugin when that returns true.
+        class: ErrorClass,
     },
 
     /// Config conversion failed (TOML values not representable in JSON,
@@ -440,8 +444,8 @@ impl WireClient {
         };
         match self.request(cid, frame).await? {
             WireFrame::DescribeResponse { description, .. } => Ok(description),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
+            WireFrame::Error { message, class, .. } => {
+                Err(WireClientError::PluginReturnedError { message, class })
             }
             other => Err(WireClientError::Protocol(format!(
                 "expected describe_response, got {}",
@@ -470,8 +474,8 @@ impl WireClient {
         };
         match self.request(cid, frame).await? {
             WireFrame::LoadResponse { .. } => Ok(()),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
+            WireFrame::Error { message, class, .. } => {
+                Err(WireClientError::PluginReturnedError { message, class })
             }
             other => Err(WireClientError::Protocol(format!(
                 "expected load_response, got {}",
@@ -490,8 +494,8 @@ impl WireClient {
         };
         match self.request(cid, frame).await? {
             WireFrame::UnloadResponse { .. } => Ok(()),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
+            WireFrame::Error { message, class, .. } => {
+                Err(WireClientError::PluginReturnedError { message, class })
             }
             other => Err(WireClientError::Protocol(format!(
                 "expected unload_response, got {}",
@@ -510,8 +514,8 @@ impl WireClient {
         };
         match self.request(cid, frame).await? {
             WireFrame::HealthCheckResponse { report, .. } => Ok(report),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
+            WireFrame::Error { message, class, .. } => {
+                Err(WireClientError::PluginReturnedError { message, class })
             }
             other => Err(WireClientError::Protocol(format!(
                 "expected health_check_response, got {}",
@@ -546,8 +550,8 @@ impl WireClient {
                 payload,
                 correlation_id: cid,
             }),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
+            WireFrame::Error { message, class, .. } => {
+                Err(WireClientError::PluginReturnedError { message, class })
             }
             other => Err(WireClientError::Protocol(format!(
                 "expected handle_request_response, got {}",
@@ -578,8 +582,8 @@ impl WireClient {
         };
         match self.request(correlation_id, frame).await? {
             WireFrame::TakeCustodyResponse { handle, .. } => Ok(handle),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
+            WireFrame::Error { message, class, .. } => {
+                Err(WireClientError::PluginReturnedError { message, class })
             }
             other => Err(WireClientError::Protocol(format!(
                 "expected take_custody_response, got {}",
@@ -608,8 +612,8 @@ impl WireClient {
         };
         match self.request(correlation_id, frame).await? {
             WireFrame::CourseCorrectResponse { .. } => Ok(()),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
+            WireFrame::Error { message, class, .. } => {
+                Err(WireClientError::PluginReturnedError { message, class })
             }
             other => Err(WireClientError::Protocol(format!(
                 "expected course_correct_response, got {}",
@@ -632,8 +636,8 @@ impl WireClient {
         };
         match self.request(correlation_id, frame).await? {
             WireFrame::ReleaseCustodyResponse { .. } => Ok(()),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
+            WireFrame::Error { message, class, .. } => {
+                Err(WireClientError::PluginReturnedError { message, class })
             }
             other => Err(WireClientError::Protocol(format!(
                 "expected release_custody_response, got {}",
@@ -722,10 +726,10 @@ where
             }
             Ok(())
         }
-        WireFrame::Error { message, fatal, .. } => {
+        WireFrame::Error { message, class, .. } => {
             Err(WireClientError::HandshakeFailed {
                 reason: format!(
-                    "plugin refused handshake (fatal={fatal}): {message}"
+                    "plugin refused handshake (class={class}): {message}"
                 ),
             })
         }
@@ -855,9 +859,10 @@ async fn handle_inbound_frame(
                         v: PROTOCOL_VERSION,
                         cid,
                         plugin,
+                        class: ErrorClass::ContractViolation,
                         message: "event sink unavailable: plugin not loaded"
                             .into(),
-                        fatal: false,
+                        details: None,
                     })
                     .await;
             }
@@ -888,10 +893,11 @@ async fn handle_inbound_frame(
                         v: PROTOCOL_VERSION,
                         cid,
                         plugin,
+                        class: ErrorClass::ContractViolation,
                         message:
                             "subject querier unavailable: plugin not loaded"
                                 .into(),
-                        fatal: false,
+                        details: None,
                     })
                     .await;
             }
@@ -935,8 +941,9 @@ async fn forward_plugin_request(
                 v,
                 cid,
                 plugin,
+                class: ErrorClass::ContractViolation,
                 message: format!("describe_alias: {e}"),
-                fatal: false,
+                details: None,
             },
         },
         WireFrame::DescribeSubject {
@@ -959,8 +966,9 @@ async fn forward_plugin_request(
                 v,
                 cid,
                 plugin,
+                class: ErrorClass::ContractViolation,
                 message: format!("describe_subject: {e}"),
-                fatal: false,
+                details: None,
             },
         },
 
@@ -986,8 +994,9 @@ async fn forward_plugin_request(
                     v,
                     cid,
                     plugin,
+                    class: ErrorClass::ContractViolation,
                     message: format!("forced_retract_addressing: {e}"),
-                    fatal: false,
+                    details: None,
                 },
             },
             None => admin_capability_denied_error(v, cid, plugin),
@@ -1009,8 +1018,9 @@ async fn forward_plugin_request(
                         v,
                         cid,
                         plugin,
+                        class: ErrorClass::ContractViolation,
                         message: format!("merge_subjects: {e}"),
-                        fatal: false,
+                        details: None,
                     },
                 }
             }
@@ -1041,8 +1051,9 @@ async fn forward_plugin_request(
                     v,
                     cid,
                     plugin,
+                    class: ErrorClass::ContractViolation,
                     message: format!("split_subject: {e}"),
-                    fatal: false,
+                    details: None,
                 },
             },
             None => admin_capability_denied_error(v, cid, plugin),
@@ -1076,8 +1087,9 @@ async fn forward_plugin_request(
                     v,
                     cid,
                     plugin,
+                    class: ErrorClass::ContractViolation,
                     message: format!("forced_retract_claim: {e}"),
-                    fatal: false,
+                    details: None,
                 },
             },
             None => admin_capability_denied_error(v, cid, plugin),
@@ -1100,8 +1112,9 @@ async fn forward_plugin_request(
                         v,
                         cid,
                         plugin,
+                        class: ErrorClass::ContractViolation,
                         message: format!("suppress_relation: {e}"),
-                        fatal: false,
+                        details: None,
                     },
                 }
             }
@@ -1124,8 +1137,9 @@ async fn forward_plugin_request(
                         v,
                         cid,
                         plugin,
+                        class: ErrorClass::ContractViolation,
                         message: format!("unsuppress_relation: {e}"),
-                        fatal: false,
+                        details: None,
                     },
                 }
             }
@@ -1163,8 +1177,9 @@ fn admin_capability_denied_error(
         v,
         cid,
         plugin,
+        class: ErrorClass::PermissionDenied,
         message: "admin capability not granted to this plugin".to_string(),
-        fatal: false,
+        details: None,
     }
 }
 
@@ -1277,20 +1292,26 @@ async fn forward_event(
                 error = %err,
                 "event rejected by sink; replying with Error frame"
             );
+            // Per the SDK contract, only ShuttingDown and
+            // Deregistered are session-fatal for the plugin's
+            // event surface. The other variants reject this one
+            // event without tearing the connection down.
+            let class = if matches!(
+                err,
+                evo_plugin_sdk::contract::ReportError::ShuttingDown
+                    | evo_plugin_sdk::contract::ReportError::Deregistered
+            ) {
+                ErrorClass::Internal
+            } else {
+                ErrorClass::ContractViolation
+            };
             WireFrame::Error {
                 v: PROTOCOL_VERSION,
                 cid,
                 plugin,
+                class,
                 message: err.to_string(),
-                // Per the SDK contract, only ShuttingDown and
-                // Deregistered are session-fatal for the plugin's
-                // event surface. The other variants reject this one
-                // event without tearing the connection down.
-                fatal: matches!(
-                    err,
-                    evo_plugin_sdk::contract::ReportError::ShuttingDown
-                        | evo_plugin_sdk::contract::ReportError::Deregistered
-                ),
+                details: None,
             }
         }
     };
@@ -1479,14 +1500,13 @@ fn wire_error_to_plugin_error(
     context: &'static str,
 ) -> PluginError {
     match err {
-        WireClientError::PluginReturnedError {
-            message,
-            fatal: true,
-        } => PluginError::fatal(context, RemoteErrorSource(message)),
-        WireClientError::PluginReturnedError {
-            message,
-            fatal: false,
-        } => PluginError::Permanent(message),
+        WireClientError::PluginReturnedError { message, class } => {
+            if class.is_connection_fatal() {
+                PluginError::fatal(context, RemoteErrorSource(message))
+            } else {
+                PluginError::Permanent(message)
+            }
+        }
         WireClientError::Disconnected => PluginError::fatal(
             format!("{context}: wire disconnected"),
             RemoteErrorSource("wire connection closed".into()),
@@ -3675,7 +3695,7 @@ name = "track"
                 cid,
                 plugin,
                 message,
-                fatal,
+                class,
                 ..
             } => {
                 assert_eq!(cid, 456);
@@ -3684,7 +3704,10 @@ name = "track"
                     message.contains("shelf shape rejected"),
                     "wire message must carry the rejection text"
                 );
-                assert!(!fatal, "Invalid is per-call, not session-fatal");
+                assert!(
+                    !class.is_connection_fatal(),
+                    "Invalid is per-call, not session-fatal"
+                );
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -3701,10 +3724,10 @@ name = "track"
 
         let response = out_rx.recv().await.expect("response frame");
         match response {
-            WireFrame::Error { cid, fatal, .. } => {
+            WireFrame::Error { cid, class, .. } => {
                 assert_eq!(cid, 789);
                 assert!(
-                    fatal,
+                    class.is_connection_fatal(),
                     "ShuttingDown is session-fatal: signals the plugin to \
                      stop emitting and tear down"
                 );
@@ -3724,7 +3747,9 @@ name = "track"
 
         let response = out_rx.recv().await.expect("response frame");
         match response {
-            WireFrame::Error { fatal, .. } => assert!(fatal),
+            WireFrame::Error { class, .. } => {
+                assert!(class.is_connection_fatal())
+            }
             other => panic!("expected Error, got {other:?}"),
         }
     }
@@ -3875,13 +3900,13 @@ name = "track"
         match response {
             WireFrame::Error {
                 cid,
-                fatal,
+                class,
                 message,
                 ..
             } => {
                 assert_eq!(cid, 78);
                 assert!(
-                    !fatal,
+                    !class.is_connection_fatal(),
                     "non-fatal: per-call rejection, not session-level"
                 );
                 assert!(
@@ -3912,13 +3937,13 @@ name = "track"
         match response {
             WireFrame::Error {
                 cid,
-                fatal,
+                class,
                 message,
                 ..
             } => {
                 assert_eq!(cid, 79);
                 assert!(
-                    !fatal,
+                    !class.is_connection_fatal(),
                     "capability-denied is non-fatal: plugin may continue \
                      with non-admin verbs"
                 );
@@ -3977,8 +4002,9 @@ name = "track"
                     v: PROTOCOL_VERSION,
                     cid: 0,
                     plugin: "org.test.x".into(),
+                    class: ErrorClass::ProtocolViolation,
                     message: "no codec overlap".into(),
-                    fatal: true,
+                    details: None,
                 },
             )
             .await

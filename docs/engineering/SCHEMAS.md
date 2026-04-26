@@ -741,16 +741,63 @@ The integer is the number of happenings dropped.
 **Error response** (to any sync op):
 
 ```json
-{ "error": "<human-readable message>" }
+{
+  "error": {
+    "class": "<class>",
+    "message": "<human-readable message>",
+    "details": { "subclass": "<subclass>", ...class-specific extras }
+  }
+}
 ```
 
-The message text is advisory and not a stable contract. The stable signal is the presence of the `"error"` key.
+The presence of the `"error"` key signals the response is an error. The stable contract is the structured object: `class` is the top-level taxonomy class (one of the eleven snake-case strings below); `message` is operator-readable but advisory and not contractual; `details` is optional and weakly-typed JSON refining the class with a `subclass` discriminator and any class-specific extra fields.
+
+##### Top-level error classes
+
+The class is one of:
+
+| Class                | Connection-fatal | Retryable | Meaning                                                                              |
+|----------------------|------------------|-----------|--------------------------------------------------------------------------------------|
+| `transient`          | no               | yes       | Operation may succeed on retry without state change. Network blip, lock contention.  |
+| `unavailable`        | no               | yes       | Plugin or backend currently down; retry with backoff.                                |
+| `resource_exhausted` | no               | yes       | Quota, memory, disk; retry once pressure relieves.                                   |
+| `contract_violation` | no               | no        | Caller violated the contract (wrong shape, wrong type, cardinality breach).          |
+| `not_found`          | no               | no        | Addressed entity does not exist.                                                     |
+| `permission_denied`  | no               | no        | Caller lacks the capability for the operation. Distinct from `trust_violation`.      |
+| `trust_violation`    | yes              | no        | Verified-identity check failed; trust class, signature, revocation, role.            |
+| `trust_expired`      | yes              | no        | Key in the trust chain is outside its `not_before` / `not_after` window.             |
+| `protocol_violation` | yes              | no        | The wire frame itself is malformed; the version handshake failed; codec disagreement.|
+| `misconfiguration`   | no               | no        | Operator-level configuration error; retrying without operator action is pointless.   |
+| `internal`           | yes              | no        | Steward invariant violated internally. Caller did nothing wrong.                     |
+
+`Connection-fatal` is derived from the class — there is no independent `fatal` flag on the wire. A consumer that observes a class it does not recognise MUST degrade to treating it as `internal` and log a warning rather than crash; this preserves forward-compatibility against future class additions.
+
+##### Subclass taxonomy
+
+`details.subclass` (when present) is a snake_case string refining the class. The taxonomy is additive: existing names are stable across releases; new subclasses are appended without renaming or repurposing earlier names. Documented subclasses:
+
+| Class                | Subclass                           | Meaning                                                                                            |
+|----------------------|------------------------------------|----------------------------------------------------------------------------------------------------|
+| `trust_violation`    | `admin_trust_too_low`              | Effective trust class is below the admin minimum. Extras: `plugin_name`, `effective`, `minimum`.   |
+| `contract_violation` | `cardinality_violation`            | A relation assertion would violate a declared cardinality.                                         |
+| `contract_violation` | `unknown_predicate`                | Relation predicate not declared in the catalogue.                                                  |
+| `contract_violation` | `unknown_subject_type`             | Subject type not declared in the catalogue.                                                        |
+| `contract_violation` | `merge_self_target`                | Operator-supplied addressings resolve to the same canonical subject.                               |
+| `contract_violation` | `merge_cross_type`                 | Merge sources have differing subject types. Extras: `a_type`, `b_type`.                            |
+| `contract_violation` | `split_target_index_out_of_bounds` | Explicit relation assignment names a partition index outside the operator's `partitions`.          |
+| `not_found`          | `merge_source_unknown`             | Merge source addressing is not registered. Extras: `addressing`.                                   |
+| `not_found`          | `target_plugin_unknown`            | Privileged retract names a plugin not currently admitted. Extras: `plugin`.                        |
+| `misconfiguration`   | `catalogue_invalid`                | Catalogue parse or validation failure (including out-of-range `schema_version`).                   |
+| `misconfiguration`   | `manifest_invalid`                 | Plugin manifest parse or validation failure.                                                       |
+
+Consumers wanting to act on a subclass must agree on the vocabulary out of band; the contract is on top-level `class` and the subclass strings published here. Unknown subclasses fall through to the top-level class semantics with no degradation in behaviour.
 
 #### 4.1.4 Invariants
 
-- Errors do not close the connection; clients may send another request on the same socket.
+- Errors do not close the connection unless their `class` is one of `protocol_violation` / `trust_violation` / `trust_expired` / `internal`; clients may send another request on the same socket for the non-fatal classes.
 - A subscribed connection is output-only from then on; client frames are ignored.
 - One request in flight at a time per connection; pipeline across connections.
+- The wire `Error` frame on the plugin protocol carries the same `class` field; translation between the plugin-wire and the client-API surface is lossless.
 
 ### 4.2 Plugin Wire Protocol
 
