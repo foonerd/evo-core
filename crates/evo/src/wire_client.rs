@@ -715,11 +715,25 @@ async fn handle_inbound_frame(
             guard.clone()
         };
         match sink {
-            Some(sink) => forward_event(frame, &sink).await,
+            Some(sink) => forward_event(frame, &sink, out_tx).await,
             None => {
                 tracing::warn!(
-                    "event arrived with no event sink installed; dropping"
+                    cid = cid,
+                    frame = variant_name(&frame),
+                    "event arrived with no event sink installed; replying \
+                     with error"
                 );
+                let plugin = peer_plugin.to_string();
+                let _ = out_tx
+                    .send(WireFrame::Error {
+                        v: PROTOCOL_VERSION,
+                        cid,
+                        plugin,
+                        message: "event sink unavailable: plugin not loaded"
+                            .into(),
+                        fatal: false,
+                    })
+                    .await;
             }
         }
     } else if frame.is_plugin_request() {
@@ -887,52 +901,30 @@ impl SubjectQuerier for NotFoundSubjectQuerier {
     }
 }
 
-async fn forward_event(frame: WireFrame, sink: &EventSink) {
-    match frame {
+async fn forward_event(
+    frame: WireFrame,
+    sink: &EventSink,
+    out_tx: &mpsc::Sender<WireFrame>,
+) {
+    let (_v, cid, peer_plugin) = frame.envelope();
+    let plugin = peer_plugin.to_string();
+
+    let outcome: Result<(), evo_plugin_sdk::contract::ReportError> = match frame
+    {
         WireFrame::ReportState {
             payload, priority, ..
-        } => {
-            if let Err(e) = sink.state_reporter.report(payload, priority).await
-            {
-                tracing::warn!(error = %e, "state_reporter.report failed");
-            }
-        }
+        } => sink.state_reporter.report(payload, priority).await,
         WireFrame::AnnounceSubject { announcement, .. } => {
-            if let Err(e) = sink.subject_announcer.announce(announcement).await
-            {
-                tracing::warn!(
-                    error = %e,
-                    "subject_announcer.announce failed"
-                );
-            }
+            sink.subject_announcer.announce(announcement).await
         }
         WireFrame::RetractSubject {
             addressing, reason, ..
-        } => {
-            if let Err(e) =
-                sink.subject_announcer.retract(addressing, reason).await
-            {
-                tracing::warn!(
-                    error = %e,
-                    "subject_announcer.retract failed"
-                );
-            }
-        }
+        } => sink.subject_announcer.retract(addressing, reason).await,
         WireFrame::AssertRelation { assertion, .. } => {
-            if let Err(e) = sink.relation_announcer.assert(assertion).await {
-                tracing::warn!(
-                    error = %e,
-                    "relation_announcer.assert failed"
-                );
-            }
+            sink.relation_announcer.assert(assertion).await
         }
         WireFrame::RetractRelation { retraction, .. } => {
-            if let Err(e) = sink.relation_announcer.retract(retraction).await {
-                tracing::warn!(
-                    error = %e,
-                    "relation_announcer.retract failed"
-                );
-            }
+            sink.relation_announcer.retract(retraction).await
         }
         WireFrame::ReportCustodyState {
             handle,
@@ -940,28 +932,60 @@ async fn forward_event(frame: WireFrame, sink: &EventSink) {
             health,
             ..
         } => match &sink.custody_state_reporter {
-            Some(reporter) => {
-                if let Err(e) = reporter.report(&handle, payload, health).await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        custody = %handle.id,
-                        "custody_state_reporter.report failed"
-                    );
-                }
-            }
+            Some(reporter) => reporter.report(&handle, payload, health).await,
             None => {
                 tracing::warn!(
                     custody = %handle.id,
                     "report_custody_state arrived but event sink has no \
-                     custody reporter installed; dropping"
+                     custody reporter installed"
                 );
+                Err(evo_plugin_sdk::contract::ReportError::Invalid(
+                    "custody reporter unavailable on this connection".into(),
+                ))
             }
         },
         _ => {
             // Not an event variant; forward_event is only called for
             // events per is_event() filter above.
+            return;
         }
+    };
+
+    let response = match outcome {
+        Ok(()) => WireFrame::EventAck {
+            v: PROTOCOL_VERSION,
+            cid,
+            plugin,
+        },
+        Err(err) => {
+            tracing::debug!(
+                cid = cid,
+                error = %err,
+                "event rejected by sink; replying with Error frame"
+            );
+            WireFrame::Error {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                message: err.to_string(),
+                // Per the SDK contract, only ShuttingDown and
+                // Deregistered are session-fatal for the plugin's
+                // event surface. The other variants reject this one
+                // event without tearing the connection down.
+                fatal: matches!(
+                    err,
+                    evo_plugin_sdk::contract::ReportError::ShuttingDown
+                        | evo_plugin_sdk::contract::ReportError::Deregistered
+                ),
+            }
+        }
+    };
+
+    if out_tx.send(response).await.is_err() {
+        tracing::debug!(
+            cid = cid,
+            "event ack/error not delivered: outbound channel closed"
+        );
     }
 }
 
@@ -1013,6 +1037,7 @@ fn variant_name(frame: &WireFrame) -> &'static str {
             "describe_subject_response"
         }
         WireFrame::Error { .. } => "error",
+        WireFrame::EventAck { .. } => "event_ack",
     }
 }
 
@@ -3142,5 +3167,211 @@ name = "track"
         respondent.unload().await.unwrap();
         drop(respondent);
         let _ = host.await;
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 2.1: forward_event must emit `EventAck` on success and a
+    // structured `Error` frame on failure, never silently drop.
+    // ---------------------------------------------------------------------
+
+    /// Discriminator for the SubjectAnnouncer test stub. Mirrors the
+    /// [`ReportError`] variants the tests need to exercise without
+    /// requiring `ReportError` itself to derive `Clone`.
+    enum ScriptedErr {
+        Invalid(String),
+        ShuttingDown,
+        Deregistered,
+    }
+
+    /// SubjectAnnouncer that always returns a fresh [`ReportError`]
+    /// from `announce`, mapped from the supplied [`ScriptedErr`].
+    /// `retract` panics; only the announce path is exercised here.
+    struct AlwaysErrAnnouncer {
+        which: ScriptedErr,
+    }
+
+    impl evo_plugin_sdk::contract::SubjectAnnouncer for AlwaysErrAnnouncer {
+        fn announce<'a>(
+            &'a self,
+            _announcement: SubjectAnnouncement,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            let err = match &self.which {
+                ScriptedErr::Invalid(s) => ReportError::Invalid(s.clone()),
+                ScriptedErr::ShuttingDown => ReportError::ShuttingDown,
+                ScriptedErr::Deregistered => ReportError::Deregistered,
+            };
+            Box::pin(async move { Err(err) })
+        }
+
+        fn retract<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            unreachable!("forward_event Err-path test only exercises announce")
+        }
+    }
+
+    /// SubjectAnnouncer whose `announce` always succeeds.
+    struct AlwaysOkAnnouncer;
+
+    impl evo_plugin_sdk::contract::SubjectAnnouncer for AlwaysOkAnnouncer {
+        fn announce<'a>(
+            &'a self,
+            _announcement: SubjectAnnouncement,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn retract<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            unreachable!("forward_event Ok-path test only exercises announce")
+        }
+    }
+
+    /// Stub `RelationAnnouncer` for tests that exercise only the
+    /// subject path through `forward_event`. Both methods panic;
+    /// the relevant tests never call them.
+    struct UnreachableRelationAnnouncer;
+
+    impl evo_plugin_sdk::contract::RelationAnnouncer
+        for UnreachableRelationAnnouncer
+    {
+        fn assert<'a>(
+            &'a self,
+            _assertion: RelationAssertion,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            unreachable!("relation path not exercised by these tests")
+        }
+
+        fn retract<'a>(
+            &'a self,
+            _retraction: evo_plugin_sdk::contract::RelationRetraction,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            unreachable!("relation path not exercised by these tests")
+        }
+    }
+
+    /// Build an `EventSink` carrying the supplied subject announcer
+    /// and dummy implementations of the other slots. Sufficient for
+    /// driving `forward_event` against `AnnounceSubject` frames.
+    fn sink_with_announcer(
+        announcer: Arc<dyn evo_plugin_sdk::contract::SubjectAnnouncer>,
+    ) -> EventSink {
+        use crate::context::LoggingStateReporter as LSR;
+        EventSink {
+            state_reporter: Arc::new(LSR::new("org.test")),
+            subject_announcer: announcer,
+            relation_announcer: Arc::new(UnreachableRelationAnnouncer),
+            custody_state_reporter: None,
+            subject_querier: Arc::new(NotFoundSubjectQuerier),
+        }
+    }
+
+    fn announce_frame(cid: u64) -> WireFrame {
+        WireFrame::AnnounceSubject {
+            v: PROTOCOL_VERSION,
+            cid,
+            plugin: "org.test".into(),
+            announcement: SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("mpd-path", "/m/a.flac")],
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_event_emits_event_ack_on_announcer_ok() {
+        let sink = sink_with_announcer(Arc::new(AlwaysOkAnnouncer));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        forward_event(announce_frame(123), &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::EventAck { cid, plugin, .. } => {
+                assert_eq!(cid, 123);
+                assert_eq!(plugin, "org.test");
+            }
+            other => panic!("expected EventAck, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_event_emits_error_on_announcer_err_non_fatal() {
+        let sink = sink_with_announcer(Arc::new(AlwaysErrAnnouncer {
+            which: ScriptedErr::Invalid("shelf shape rejected".into()),
+        }));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        forward_event(announce_frame(456), &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error {
+                cid,
+                plugin,
+                message,
+                fatal,
+                ..
+            } => {
+                assert_eq!(cid, 456);
+                assert_eq!(plugin, "org.test");
+                assert!(
+                    message.contains("shelf shape rejected"),
+                    "wire message must carry the rejection text"
+                );
+                assert!(!fatal, "Invalid is per-call, not session-fatal");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_event_marks_shutting_down_as_fatal() {
+        let sink = sink_with_announcer(Arc::new(AlwaysErrAnnouncer {
+            which: ScriptedErr::ShuttingDown,
+        }));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        forward_event(announce_frame(789), &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { cid, fatal, .. } => {
+                assert_eq!(cid, 789);
+                assert!(
+                    fatal,
+                    "ShuttingDown is session-fatal: signals the plugin to \
+                     stop emitting and tear down"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_event_marks_deregistered_as_fatal() {
+        let sink = sink_with_announcer(Arc::new(AlwaysErrAnnouncer {
+            which: ScriptedErr::Deregistered,
+        }));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        forward_event(announce_frame(101), &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { fatal, .. } => assert!(fatal),
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 }

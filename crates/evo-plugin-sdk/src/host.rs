@@ -378,6 +378,19 @@ async fn reader_loop_serve<R>(
             }
             continue;
         }
+        if frame.is_event_ack() {
+            // Event acks land here. They route through the same
+            // pending map the plugin-initiated requests use; the
+            // wire-backed announcer / reporter holding the matching
+            // oneshot decodes EventAck as Ok.
+            if !route_pending_response(&pending, frame) {
+                tracing::warn!(
+                    "event_ack frame from steward with no matching pending \
+                     event; dropping"
+                );
+            }
+            continue;
+        }
         if frame.is_error() {
             if !route_pending_response(&pending, frame) {
                 tracing::warn!(
@@ -604,6 +617,7 @@ fn variant_name(frame: &WireFrame) -> &'static str {
             "describe_subject_response"
         }
         WireFrame::Error { .. } => "error",
+        WireFrame::EventAck { .. } => "event_ack",
     }
 }
 
@@ -649,6 +663,7 @@ fn build_load_context(
     let state_reporter: Arc<dyn StateReporter> = Arc::new(WireStateReporter {
         tx: tx.clone(),
         event_cid: event_cid.clone(),
+        pending: Arc::clone(&pending),
         plugin_name: plugin_name.to_string(),
     });
     let instance_announcer: Arc<dyn InstanceAnnouncer> =
@@ -659,12 +674,14 @@ fn build_load_context(
         Arc::new(WireSubjectAnnouncer {
             tx: tx.clone(),
             event_cid: event_cid.clone(),
+            pending: Arc::clone(&pending),
             plugin_name: plugin_name.to_string(),
         });
     let relation_announcer: Arc<dyn RelationAnnouncer> =
         Arc::new(WireRelationAnnouncer {
             tx: tx.clone(),
             event_cid: event_cid.clone(),
+            pending: Arc::clone(&pending),
             plugin_name: plugin_name.to_string(),
         });
     // Wire-backed alias-aware subject querier. Mints a fresh cid,
@@ -781,11 +798,59 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
 // Wire-backed callbacks
 // ---------------------------------------------------------------------
 
-/// State reporter that pushes frames into the wire event channel.
+/// Send an event frame and await the steward's matching response.
+///
+/// Registers a oneshot in `pending` keyed by `cid`, sends the frame,
+/// and awaits one of [`WireFrame::EventAck`] (success) or
+/// [`WireFrame::Error`] (rejection). The dispatch loop's reader
+/// routes both kinds of response through the same pending map by
+/// `cid`.
+///
+/// This is the wire-side mechanism that makes the announcer / reporter
+/// trait `Result<(), ReportError>` carry the same semantics over the
+/// wire as in-process: a rejection by the steward becomes the
+/// caller's `Err`, not a silently dropped log line.
+///
+/// Until ADR-0013 introduces a structured wire error taxonomy,
+/// non-fatal [`WireFrame::Error`] responses map to
+/// [`ReportError::Invalid`] carrying the wire message; fatal ones map
+/// to [`ReportError::ShuttingDown`] so the trait surface signals that
+/// retrying the call is pointless.
+async fn await_event_response(
+    tx: &mpsc::Sender<WireFrame>,
+    pending: &Arc<Mutex<PendingMap>>,
+    cid: u64,
+    frame: WireFrame,
+) -> Result<(), ReportError> {
+    let rx = register_pending(pending, cid);
+    if tx.send(frame).await.is_err() {
+        remove_pending(pending, cid);
+        return Err(ReportError::ShuttingDown);
+    }
+    match rx.await {
+        Ok(WireFrame::EventAck { .. }) => Ok(()),
+        Ok(WireFrame::Error { message, fatal, .. }) => {
+            if fatal {
+                Err(ReportError::ShuttingDown)
+            } else {
+                Err(ReportError::Invalid(message))
+            }
+        }
+        Ok(other) => Err(ReportError::Invalid(format!(
+            "unexpected response frame for event: {}",
+            variant_name(&other)
+        ))),
+        Err(_) => Err(ReportError::ShuttingDown),
+    }
+}
+
+/// State reporter that pushes frames into the wire event channel and
+/// awaits the steward's matching ack/error response.
 #[derive(Debug)]
 struct WireStateReporter {
     tx: mpsc::Sender<WireFrame>,
     event_cid: Arc<AtomicU64>,
+    pending: Arc<Mutex<PendingMap>>,
     plugin_name: String,
 }
 
@@ -797,27 +862,29 @@ impl StateReporter for WireStateReporter {
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
     {
         let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
         let plugin = self.plugin_name.clone();
         let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
         Box::pin(async move {
-            tx.send(WireFrame::ReportState {
+            let frame = WireFrame::ReportState {
                 v: PROTOCOL_VERSION,
                 cid,
                 plugin,
                 payload,
                 priority,
-            })
-            .await
-            .map_err(|_| ReportError::ShuttingDown)
+            };
+            await_event_response(&tx, &pending, cid, frame).await
         })
     }
 }
 
-/// Subject announcer that pushes frames into the wire event channel.
+/// Subject announcer that pushes frames into the wire event channel
+/// and awaits the steward's matching ack/error response.
 #[derive(Debug)]
 struct WireSubjectAnnouncer {
     tx: mpsc::Sender<WireFrame>,
     event_cid: Arc<AtomicU64>,
+    pending: Arc<Mutex<PendingMap>>,
     plugin_name: String,
 }
 
@@ -828,17 +895,17 @@ impl SubjectAnnouncer for WireSubjectAnnouncer {
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
     {
         let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
         let plugin = self.plugin_name.clone();
         let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
         Box::pin(async move {
-            tx.send(WireFrame::AnnounceSubject {
+            let frame = WireFrame::AnnounceSubject {
                 v: PROTOCOL_VERSION,
                 cid,
                 plugin,
                 announcement,
-            })
-            .await
-            .map_err(|_| ReportError::ShuttingDown)
+            };
+            await_event_response(&tx, &pending, cid, frame).await
         })
     }
 
@@ -849,27 +916,29 @@ impl SubjectAnnouncer for WireSubjectAnnouncer {
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
     {
         let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
         let plugin = self.plugin_name.clone();
         let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
         Box::pin(async move {
-            tx.send(WireFrame::RetractSubject {
+            let frame = WireFrame::RetractSubject {
                 v: PROTOCOL_VERSION,
                 cid,
                 plugin,
                 addressing,
                 reason,
-            })
-            .await
-            .map_err(|_| ReportError::ShuttingDown)
+            };
+            await_event_response(&tx, &pending, cid, frame).await
         })
     }
 }
 
-/// Relation announcer that pushes frames into the wire event channel.
+/// Relation announcer that pushes frames into the wire event channel
+/// and awaits the steward's matching ack/error response.
 #[derive(Debug)]
 struct WireRelationAnnouncer {
     tx: mpsc::Sender<WireFrame>,
     event_cid: Arc<AtomicU64>,
+    pending: Arc<Mutex<PendingMap>>,
     plugin_name: String,
 }
 
@@ -880,17 +949,17 @@ impl RelationAnnouncer for WireRelationAnnouncer {
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
     {
         let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
         let plugin = self.plugin_name.clone();
         let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
         Box::pin(async move {
-            tx.send(WireFrame::AssertRelation {
+            let frame = WireFrame::AssertRelation {
                 v: PROTOCOL_VERSION,
                 cid,
                 plugin,
                 assertion,
-            })
-            .await
-            .map_err(|_| ReportError::ShuttingDown)
+            };
+            await_event_response(&tx, &pending, cid, frame).await
         })
     }
 
@@ -900,17 +969,17 @@ impl RelationAnnouncer for WireRelationAnnouncer {
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
     {
         let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
         let plugin = self.plugin_name.clone();
         let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
         Box::pin(async move {
-            tx.send(WireFrame::RetractRelation {
+            let frame = WireFrame::RetractRelation {
                 v: PROTOCOL_VERSION,
                 cid,
                 plugin,
                 retraction,
-            })
-            .await
-            .map_err(|_| ReportError::ShuttingDown)
+            };
+            await_event_response(&tx, &pending, cid, frame).await
         })
     }
 }
@@ -1314,6 +1383,7 @@ where
                 Arc::new(WireCustodyStateReporter {
                     tx: tx.clone(),
                     event_cid: event_cid.clone(),
+                    pending: Arc::clone(pending),
                     plugin_name: p.clone(),
                 });
             let assignment = Assignment {
@@ -1400,6 +1470,7 @@ where
 struct WireCustodyStateReporter {
     tx: mpsc::Sender<WireFrame>,
     event_cid: Arc<AtomicU64>,
+    pending: Arc<Mutex<PendingMap>>,
     plugin_name: String,
 }
 
@@ -1412,20 +1483,20 @@ impl CustodyStateReporter for WireCustodyStateReporter {
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
     {
         let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
         let plugin = self.plugin_name.clone();
         let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
         let handle = handle.clone();
         Box::pin(async move {
-            tx.send(WireFrame::ReportCustodyState {
+            let frame = WireFrame::ReportCustodyState {
                 v: PROTOCOL_VERSION,
                 cid,
                 plugin,
                 handle,
                 payload,
                 health,
-            })
-            .await
-            .map_err(|_| ReportError::ShuttingDown)
+            };
+            await_event_response(&tx, &pending, cid, frame).await
         })
     }
 }
@@ -1950,39 +2021,40 @@ mod tests {
         .await
         .unwrap();
 
-        // Read two frames: the announce_subject event and the
-        // load_response. The order is constrained by the plugin code:
-        // the announcement happens before load returns.
-        let first = read_frame_json(&mut client_r).await.unwrap();
-        let second = read_frame_json(&mut client_r).await.unwrap();
-
-        // Whichever order they arrive in, we should see one of each.
-        let (announce, load_resp) = match (&first, &second) {
-            (WireFrame::AnnounceSubject { .. }, WireFrame::LoadResponse { .. }) => {
-                (&first, &second)
-            }
-            (WireFrame::LoadResponse { .. }, WireFrame::AnnounceSubject { .. }) => {
-                (&second, &first)
-            }
-            _ => panic!(
-                "expected AnnounceSubject + LoadResponse, got {first:?} and {second:?}"
-            ),
-        };
-
-        match announce {
+        // The announce_subject event arrives first (the plugin emits
+        // it before returning from load()). Per Wave 2.1, the
+        // wire-side announcer awaits an `EventAck` before the
+        // announce future resolves; without that ack, the plugin's
+        // load() would hang on the announcer call. Send the ack
+        // immediately so load() can proceed and emit LoadResponse.
+        let announce = read_frame_json(&mut client_r).await.unwrap();
+        match &announce {
             WireFrame::AnnounceSubject {
-                plugin,
+                plugin: p,
                 announcement: a,
+                cid,
                 ..
             } => {
-                assert_eq!(plugin, "org.test.x");
+                assert_eq!(p, "org.test.x");
                 assert_eq!(a.subject_type, "track");
+                write_frame_json(
+                    &mut client_w,
+                    &WireFrame::EventAck {
+                        v: PROTOCOL_VERSION,
+                        cid: *cid,
+                        plugin: "org.test.x".into(),
+                    },
+                )
+                .await
+                .unwrap();
             }
-            _ => unreachable!(),
+            other => panic!("expected AnnounceSubject, got {other:?}"),
         }
+
+        let load_resp = read_frame_json(&mut client_r).await.unwrap();
         match load_resp {
-            WireFrame::LoadResponse { cid, .. } => assert_eq!(*cid, 1),
-            _ => unreachable!(),
+            WireFrame::LoadResponse { cid, .. } => assert_eq!(cid, 1),
+            other => panic!("expected LoadResponse, got {other:?}"),
         }
 
         drop(client_w);
@@ -2430,49 +2502,46 @@ mod tests {
         .unwrap();
 
         // Two frames are expected: the event frame emitted by the
-        // plugin during take_custody, and the TakeCustodyResponse.
-        // Order is: the event fires before take_custody returns, but
-        // the mpsc channel serialises them in send order, so we
-        // expect the event first. Be tolerant of either order to
-        // keep the test robust against scheduling differences.
-        let first = read_frame_json(&mut client_r).await.unwrap();
-        let second = read_frame_json(&mut client_r).await.unwrap();
-
-        let (event, response) = match (&first, &second) {
-            (
-                WireFrame::ReportCustodyState { .. },
-                WireFrame::TakeCustodyResponse { .. },
-            ) => (&first, &second),
-            (
-                WireFrame::TakeCustodyResponse { .. },
-                WireFrame::ReportCustodyState { .. },
-            ) => (&second, &first),
-            _ => panic!(
-                "expected ReportCustodyState + TakeCustodyResponse, got {first:?} and {second:?}"
-            ),
-        };
-
-        match event {
+        // plugin during take_custody, then the TakeCustodyResponse.
+        // Per Wave 2.1, the wire-side reporter awaits an `EventAck`
+        // before the report future resolves, so the test must ack
+        // the event before take_custody can return. The event frame
+        // arrives first because the plugin emits it before returning.
+        let event = read_frame_json(&mut client_r).await.unwrap();
+        match &event {
             WireFrame::ReportCustodyState {
-                plugin,
+                plugin: p,
                 handle,
                 payload,
                 health,
+                cid,
                 ..
             } => {
-                assert_eq!(plugin, "org.test.warden");
+                assert_eq!(p, "org.test.warden");
                 assert_eq!(handle.id, "custody-40");
                 assert_eq!(payload, b"state=playing");
                 assert_eq!(*health, HealthStatus::Healthy);
+                write_frame_json(
+                    &mut client_w,
+                    &WireFrame::EventAck {
+                        v: PROTOCOL_VERSION,
+                        cid: *cid,
+                        plugin: "org.test.warden".into(),
+                    },
+                )
+                .await
+                .unwrap();
             }
-            _ => unreachable!(),
+            other => panic!("expected ReportCustodyState, got {other:?}"),
         }
+
+        let response = read_frame_json(&mut client_r).await.unwrap();
         match response {
             WireFrame::TakeCustodyResponse { cid, handle, .. } => {
-                assert_eq!(*cid, 40);
+                assert_eq!(cid, 40);
                 assert_eq!(handle.id, "custody-40");
             }
-            _ => unreachable!(),
+            other => panic!("expected TakeCustodyResponse, got {other:?}"),
         }
 
         drop(client_w);
@@ -2628,7 +2697,9 @@ mod tests {
         }
 
         // Take custody. The plugin emits one state report during
-        // take_custody; then the response arrives.
+        // take_custody; per Wave 2.1 the wire-side reporter awaits an
+        // EventAck, so the test must ack it before the take_custody
+        // response can arrive.
         write_frame_json(
             &mut client_w,
             &WireFrame::TakeCustody {
@@ -2642,21 +2713,26 @@ mod tests {
         )
         .await
         .unwrap();
-        // Drain both frames in whichever order they arrive.
-        let first = read_frame_json(&mut client_r).await.unwrap();
-        let second = read_frame_json(&mut client_r).await.unwrap();
-        let handle = match (&first, &second) {
-            (
-                WireFrame::ReportCustodyState { .. },
-                WireFrame::TakeCustodyResponse { handle, .. },
-            ) => handle.clone(),
-            (
-                WireFrame::TakeCustodyResponse { handle, .. },
-                WireFrame::ReportCustodyState { .. },
-            ) => handle.clone(),
-            _ => panic!(
-                "expected ReportCustodyState + TakeCustodyResponse, got {first:?} and {second:?}"
-            ),
+
+        let event = read_frame_json(&mut client_r).await.unwrap();
+        match &event {
+            WireFrame::ReportCustodyState { cid, .. } => {
+                write_frame_json(
+                    &mut client_w,
+                    &WireFrame::EventAck {
+                        v: PROTOCOL_VERSION,
+                        cid: *cid,
+                        plugin: "org.test.warden".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            other => panic!("expected ReportCustodyState, got {other:?}"),
+        }
+        let handle = match read_frame_json(&mut client_r).await.unwrap() {
+            WireFrame::TakeCustodyResponse { handle, .. } => handle,
+            other => panic!("expected TakeCustodyResponse, got {other:?}"),
         };
 
         // Course correct.
@@ -2714,5 +2790,128 @@ mod tests {
         drop(client_w);
         drop(client_r);
         host.await.unwrap().unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 2.1: WireSubjectAnnouncer / WireRelationAnnouncer /
+    // WireStateReporter / WireCustodyStateReporter — direct unit tests
+    // pinning the request/response semantics over the wire.
+    // ---------------------------------------------------------------------
+
+    /// Drive `WireSubjectAnnouncer.announce` end-to-end against a
+    /// scripted response and assert what the future returns.
+    async fn drive_announce_with_response(
+        response: Option<WireFrame>,
+    ) -> Result<(), ReportError> {
+        let (tx, mut rx) = mpsc::channel::<WireFrame>(8);
+        let event_cid = Arc::new(AtomicU64::new(1));
+        let pending: Arc<Mutex<PendingMap>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let announcer = WireSubjectAnnouncer {
+            tx,
+            event_cid: event_cid.clone(),
+            pending: Arc::clone(&pending),
+            plugin_name: "org.test".into(),
+        };
+        let announcement = SubjectAnnouncement::new(
+            "track",
+            vec![ExternalAddressing::new("mpd-path", "/m/a.flac")],
+        );
+        let pending_for_responder = Arc::clone(&pending);
+        let join =
+            tokio::spawn(async move { announcer.announce(announcement).await });
+
+        // Receive the AnnounceSubject frame the announcer sent and
+        // capture its cid so we can deliver the (scripted) response
+        // through the same pending map the announcer is awaiting.
+        let frame = rx.recv().await.expect("event frame");
+        let cid = frame.envelope().1;
+        assert!(matches!(frame, WireFrame::AnnounceSubject { .. }));
+
+        if let Some(resp) = response {
+            // Patch the response's cid to match the announcer's.
+            let routed = match resp {
+                WireFrame::EventAck { v, plugin, .. } => {
+                    WireFrame::EventAck { v, cid, plugin }
+                }
+                WireFrame::Error {
+                    v,
+                    plugin,
+                    message,
+                    fatal,
+                    ..
+                } => WireFrame::Error {
+                    v,
+                    cid,
+                    plugin,
+                    message,
+                    fatal,
+                },
+                other => other,
+            };
+            assert!(route_pending_response(&pending_for_responder, routed));
+        } else {
+            // No response delivered: simulate the steward dropping
+            // the connection. `drain_pending` clears the pending
+            // map, dropping the oneshot sender keyed by `cid` so the
+            // announcer's recv resolves Err and the trait surface
+            // returns ShuttingDown — same path the real dispatch
+            // loop takes when the wire closes.
+            drain_pending(&pending_for_responder);
+        }
+        drop(rx);
+
+        join.await.expect("announce task")
+    }
+
+    #[tokio::test]
+    async fn wire_subject_announcer_returns_ok_on_event_ack() {
+        let result = drive_announce_with_response(Some(WireFrame::EventAck {
+            v: PROTOCOL_VERSION,
+            cid: 0, // patched to the announcer's cid by the helper
+            plugin: "org.test".into(),
+        }))
+        .await;
+        assert!(matches!(result, Ok(())));
+    }
+
+    #[tokio::test]
+    async fn wire_subject_announcer_returns_invalid_on_non_fatal_error() {
+        let result = drive_announce_with_response(Some(WireFrame::Error {
+            v: PROTOCOL_VERSION,
+            cid: 0,
+            plugin: "org.test".into(),
+            message: "shelf shape rejected addressing".into(),
+            fatal: false,
+        }))
+        .await;
+        match result {
+            Err(ReportError::Invalid(msg)) => {
+                assert_eq!(msg, "shelf shape rejected addressing");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wire_subject_announcer_returns_shutting_down_on_fatal_error() {
+        let result = drive_announce_with_response(Some(WireFrame::Error {
+            v: PROTOCOL_VERSION,
+            cid: 0,
+            plugin: "org.test".into(),
+            message: "deregistered".into(),
+            fatal: true,
+        }))
+        .await;
+        assert!(matches!(result, Err(ReportError::ShuttingDown)));
+    }
+
+    #[tokio::test]
+    async fn wire_subject_announcer_returns_shutting_down_when_steward_disappears(
+    ) {
+        // No response delivered; the responder side just drops, which
+        // closes the oneshot the announcer is awaiting.
+        let result = drive_announce_with_response(None).await;
+        assert!(matches!(result, Err(ReportError::ShuttingDown)));
     }
 }

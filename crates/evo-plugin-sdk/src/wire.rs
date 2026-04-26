@@ -484,6 +484,28 @@ pub enum WireFrame {
         /// cause the steward to unload and deregister the plugin.
         fatal: bool,
     },
+
+    // ---------------------------------------------------------------
+    // Event acknowledgement (steward -> plugin). Sent in response to
+    // a plugin-originated event frame (`AnnounceSubject`,
+    // `RetractSubject`, `AssertRelation`, `RetractRelation`,
+    // `ReportState`, `ReportCustodyState`) that the steward accepted.
+    // The wire-side trait implementations of `SubjectAnnouncer` /
+    // `RelationAnnouncer` / `StateReporter` / `CustodyStateReporter`
+    // await one of `EventAck` (success) or `Error` (rejection) per
+    // event `cid`, so the trait's `Result<(), ReportError>` carries
+    // the same semantics over the wire as in-process.
+    // ---------------------------------------------------------------
+    /// Acknowledgement of a successful event. `cid` echoes the event
+    /// the plugin sent.
+    EventAck {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the event.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
 }
 
 impl WireFrame {
@@ -516,7 +538,8 @@ impl WireFrame {
             | Self::DescribeAliasResponse { v, cid, plugin, .. }
             | Self::DescribeSubject { v, cid, plugin, .. }
             | Self::DescribeSubjectResponse { v, cid, plugin, .. }
-            | Self::Error { v, cid, plugin, .. } => (*v, *cid, plugin.as_str()),
+            | Self::Error { v, cid, plugin, .. }
+            | Self::EventAck { v, cid, plugin } => (*v, *cid, plugin.as_str()),
         }
     }
 
@@ -586,6 +609,18 @@ impl WireFrame {
     /// True if this frame is an error.
     pub fn is_error(&self) -> bool {
         matches!(self, Self::Error { .. })
+    }
+
+    /// True if this frame is an event acknowledgement.
+    ///
+    /// `EventAck` is the success-side counterpart to [`Self::Error`]
+    /// when the latter is used as an event-rejection ack. The two
+    /// together form the response surface for plugin-originated
+    /// events; plugin-side wire implementations of the announcer /
+    /// reporter traits await one of them per event `cid` to surface
+    /// a `Result<(), ReportError>` to the trait caller.
+    pub fn is_event_ack(&self) -> bool {
+        matches!(self, Self::EventAck { .. })
     }
 }
 
@@ -1062,6 +1097,33 @@ mod tests {
         let json = serde_json::to_string(&orig).unwrap();
         let back: WireFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn event_ack_round_trip() {
+        let orig = WireFrame::EventAck {
+            v: PROTOCOL_VERSION,
+            cid: 42,
+            plugin: sample_plugin(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"event_ack""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn event_ack_classification() {
+        let f = WireFrame::EventAck {
+            v: PROTOCOL_VERSION,
+            cid: 7,
+            plugin: "x".into(),
+        };
+        assert!(f.is_event_ack());
+        assert!(!f.is_event());
+        assert!(!f.is_response());
+        assert!(!f.is_error());
+        assert!(!f.is_request());
     }
 
     #[test]
