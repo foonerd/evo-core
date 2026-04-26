@@ -23,7 +23,17 @@
 //! zero-allocation while letting the engine store heterogeneous
 //! plugins in a single collection.
 
+mod erasure;
+mod handle;
+mod spawn;
 mod validation;
+
+pub use erasure::{
+    ErasedRespondent, ErasedWarden, RespondentAdapter, WardenAdapter,
+};
+pub use handle::AdmittedHandle;
+
+use spawn::{kill_holdout_child, unload_one_plugin, wait_for_socket_ready};
 
 use crate::admin::AdminLedger;
 use crate::catalogue::Catalogue;
@@ -39,303 +49,17 @@ use crate::error::StewardError;
 use crate::happenings::HappeningBus;
 use crate::plugin_trust::PluginTrustState;
 use crate::relations::RelationGraph;
-use crate::router::{
-    take_child, unload_handle, EnforcementPolicy, PluginEntry, PluginRouter,
-};
+use crate::router::{EnforcementPolicy, PluginEntry, PluginRouter};
 use crate::state::StewardState;
 use crate::subjects::SubjectRegistry;
-use evo_plugin_sdk::contract::{
-    Assignment, CourseCorrection, CustodyHandle, HealthReport, LoadContext,
-    Plugin, PluginDescription, PluginError, Request, Respondent, Response,
-    Warden,
-};
+use evo_plugin_sdk::contract::{HealthReport, LoadContext, Respondent, Warden};
 use evo_plugin_sdk::manifest::{InteractionShape, TransportKind};
 use evo_plugin_sdk::Manifest;
-use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::UnixStream;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
-/// Object-safe internal trait for admitted respondent plugins.
-///
-/// Public SDK traits use native async-in-trait; this internal trait uses
-/// `Pin<Box<dyn Future>>` to be object-safe so the engine can store
-/// heterogeneous plugins as `Box<dyn ErasedRespondent>`.
-pub trait ErasedRespondent: Send + Sync {
-    /// Dispatches to `Plugin::describe`.
-    fn describe(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = PluginDescription> + Send + '_>>;
-
-    /// Dispatches to `Plugin::load`.
-    fn load<'a>(
-        &'a mut self,
-        ctx: &'a LoadContext,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>;
-
-    /// Dispatches to `Plugin::unload`.
-    fn unload(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + '_>>;
-
-    /// Dispatches to `Plugin::health_check`.
-    fn health_check(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = HealthReport> + Send + '_>>;
-
-    /// Dispatches to `Respondent::handle_request`.
-    fn handle_request<'a>(
-        &'a mut self,
-        req: &'a Request,
-    ) -> Pin<Box<dyn Future<Output = Result<Response, PluginError>> + Send + 'a>>;
-}
-
-/// Generic adapter: wraps any `T: Respondent + 'static` as an
-/// [`ErasedRespondent`].
-pub struct RespondentAdapter<T: Respondent + 'static> {
-    inner: T,
-}
-
-impl<T: Respondent + 'static> RespondentAdapter<T> {
-    /// Wrap a concrete respondent.
-    pub fn new(inner: T) -> Self {
-        Self { inner }
-    }
-
-    /// Unwrap the concrete respondent. Useful for tests.
-    pub fn into_inner(self) -> T {
-        self.inner
-    }
-}
-
-impl<T: Respondent + 'static> ErasedRespondent for RespondentAdapter<T> {
-    fn describe(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = PluginDescription> + Send + '_>> {
-        Box::pin(Plugin::describe(&self.inner))
-    }
-
-    fn load<'a>(
-        &'a mut self,
-        ctx: &'a LoadContext,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
-    {
-        Box::pin(Plugin::load(&mut self.inner, ctx))
-    }
-
-    fn unload(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + '_>>
-    {
-        Box::pin(Plugin::unload(&mut self.inner))
-    }
-
-    fn health_check(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = HealthReport> + Send + '_>> {
-        Box::pin(Plugin::health_check(&self.inner))
-    }
-
-    fn handle_request<'a>(
-        &'a mut self,
-        req: &'a Request,
-    ) -> Pin<Box<dyn Future<Output = Result<Response, PluginError>> + Send + 'a>>
-    {
-        Box::pin(Respondent::handle_request(&mut self.inner, req))
-    }
-}
-
-/// Object-safe internal trait for admitted warden plugins.
-///
-/// Parallels [`ErasedRespondent`]: same four core verbs from `Plugin`,
-/// plus the three custody verbs from `Warden`. The engine stores
-/// wardens as `Box<dyn ErasedWarden>` inside an [`AdmittedHandle`].
-pub trait ErasedWarden: Send + Sync {
-    /// Dispatches to `Plugin::describe`.
-    fn describe(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = PluginDescription> + Send + '_>>;
-
-    /// Dispatches to `Plugin::load`.
-    fn load<'a>(
-        &'a mut self,
-        ctx: &'a LoadContext,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>;
-
-    /// Dispatches to `Plugin::unload`.
-    fn unload(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + '_>>;
-
-    /// Dispatches to `Plugin::health_check`.
-    fn health_check(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = HealthReport> + Send + '_>>;
-
-    /// Dispatches to `Warden::take_custody`.
-    fn take_custody<'a>(
-        &'a mut self,
-        assignment: Assignment,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a,
-        >,
-    >;
-
-    /// Dispatches to `Warden::course_correct`.
-    fn course_correct<'a>(
-        &'a mut self,
-        handle: &'a CustodyHandle,
-        correction: CourseCorrection,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>;
-
-    /// Dispatches to `Warden::release_custody`.
-    fn release_custody<'a>(
-        &'a mut self,
-        handle: CustodyHandle,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>;
-}
-
-/// Generic adapter: wraps any `T: Warden + 'static` as an
-/// [`ErasedWarden`]. Parallels [`RespondentAdapter`].
-pub struct WardenAdapter<T: Warden + 'static> {
-    inner: T,
-}
-
-impl<T: Warden + 'static> WardenAdapter<T> {
-    /// Wrap a concrete warden.
-    pub fn new(inner: T) -> Self {
-        Self { inner }
-    }
-
-    /// Unwrap the concrete warden. Useful for tests.
-    pub fn into_inner(self) -> T {
-        self.inner
-    }
-}
-
-impl<T: Warden + 'static> ErasedWarden for WardenAdapter<T> {
-    fn describe(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = PluginDescription> + Send + '_>> {
-        Box::pin(Plugin::describe(&self.inner))
-    }
-
-    fn load<'a>(
-        &'a mut self,
-        ctx: &'a LoadContext,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
-    {
-        Box::pin(Plugin::load(&mut self.inner, ctx))
-    }
-
-    fn unload(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + '_>>
-    {
-        Box::pin(Plugin::unload(&mut self.inner))
-    }
-
-    fn health_check(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = HealthReport> + Send + '_>> {
-        Box::pin(Plugin::health_check(&self.inner))
-    }
-
-    fn take_custody<'a>(
-        &'a mut self,
-        assignment: Assignment,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a,
-        >,
-    > {
-        Box::pin(Warden::take_custody(&mut self.inner, assignment))
-    }
-
-    fn course_correct<'a>(
-        &'a mut self,
-        handle: &'a CustodyHandle,
-        correction: CourseCorrection,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
-    {
-        Box::pin(Warden::course_correct(&mut self.inner, handle, correction))
-    }
-
-    fn release_custody<'a>(
-        &'a mut self,
-        handle: CustodyHandle,
-    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
-    {
-        Box::pin(Warden::release_custody(&mut self.inner, handle))
-    }
-}
-
-/// A handle to an admitted plugin. Each admitted plugin is exactly one
-/// of these variants, disjoint and decided at admission time by the
-/// manifest's `kind.interaction` field.
-///
-/// All four core verbs (`describe`, `load`, `unload`, `health_check`)
-/// are common to both variants and exposed via inherent methods that
-/// dispatch through the enum. Kind-specific verbs are routed by the
-/// engine's public methods, which match on the variant and return a
-/// [`StewardError::Dispatch`] if the shelf's plugin kind does not
-/// match the caller's request (e.g. a `handle_request` on a warden
-/// shelf, or a `take_custody` on a respondent shelf).
-pub enum AdmittedHandle {
-    /// A respondent plugin: handles discrete request-response
-    /// exchanges via [`ErasedRespondent::handle_request`].
-    Respondent(Box<dyn ErasedRespondent>),
-    /// A warden plugin: takes sustained custody via
-    /// [`ErasedWarden::take_custody`], [`ErasedWarden::course_correct`],
-    /// [`ErasedWarden::release_custody`].
-    Warden(Box<dyn ErasedWarden>),
-}
-
-impl AdmittedHandle {
-    /// Dispatch to the inner plugin's `describe`.
-    pub async fn describe(&self) -> PluginDescription {
-        match self {
-            Self::Respondent(r) => r.describe().await,
-            Self::Warden(w) => w.describe().await,
-        }
-    }
-
-    /// Dispatch to the inner plugin's `load`.
-    pub async fn load(&mut self, ctx: &LoadContext) -> Result<(), PluginError> {
-        match self {
-            Self::Respondent(r) => r.load(ctx).await,
-            Self::Warden(w) => w.load(ctx).await,
-        }
-    }
-
-    /// Dispatch to the inner plugin's `unload`.
-    pub async fn unload(&mut self) -> Result<(), PluginError> {
-        match self {
-            Self::Respondent(r) => r.unload().await,
-            Self::Warden(w) => w.unload().await,
-        }
-    }
-
-    /// Dispatch to the inner plugin's `health_check`.
-    pub async fn health_check(&self) -> HealthReport {
-        match self {
-            Self::Respondent(r) => r.health_check().await,
-            Self::Warden(w) => w.health_check().await,
-        }
-    }
-
-    /// Human-readable name of the interaction shape for diagnostics.
-    pub fn kind_name(&self) -> &'static str {
-        match self {
-            Self::Respondent(_) => "respondent",
-            Self::Warden(_) => "warden",
-        }
-    }
-}
 
 /// The admission engine.
 ///
@@ -1655,179 +1379,6 @@ async fn parallel_unload_with_deadline(
     (unloaded, killed)
 }
 
-/// Stage 4 helper: take the child off `entry` and SIGKILL+reap it.
-///
-/// Idempotent against a task that already completed `take_child`
-/// (the slot will be `None`); in-process plugins also pass through
-/// here harmlessly.
-async fn kill_holdout_child(name: &str, entry: &Arc<PluginEntry>) {
-    let mut slot = entry.child.lock().await;
-    let Some(mut child) = slot.take() else {
-        tracing::warn!(
-            plugin = %name,
-            "plugin missed shutdown deadline (no child to kill)"
-        );
-        return;
-    };
-    tracing::warn!(
-        plugin = %name,
-        "plugin missed shutdown deadline; sending SIGKILL"
-    );
-    if let Err(e) = child.kill().await {
-        tracing::error!(
-            plugin = %name,
-            error = %e,
-            "plugin SIGKILL failed"
-        );
-    }
-    // Reap so we do not leak a zombie even on kill failure.
-    let _ = child.wait().await;
-}
-
-/// Timeout for child process exit during shutdown. After this elapses
-/// the steward stops waiting politely and kills the child.
-const CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Timeout for a freshly spawned plugin child to bind and accept on
-/// its Unix socket.
-const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Polling interval when waiting for a plugin socket to be ready.
-const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(25);
-
-/// Unload a single admitted plugin, handling both in-process and
-/// out-of-process cases.
-///
-/// See [`AdmissionEngine::shutdown`] for the sequence rationale.
-///
-/// The entry is the cloned `Arc<PluginEntry>` returned by
-/// [`PluginRouter::drain_in_reverse_admission_order`]; its inner
-/// handle is taken (not borrowed) so the wire client is dropped
-/// before the child is awaited.
-async fn unload_one_plugin(
-    entry: Arc<PluginEntry>,
-) -> Result<(), StewardError> {
-    let name = entry.name.clone();
-    let shelf = entry.shelf.clone();
-
-    tracing::info!(
-        plugin = %name,
-        shelf = %shelf,
-        "plugin unloading"
-    );
-
-    // Take the handle out of the entry so we can both call
-    // `unload()` on it AND drop it before awaiting the child. For
-    // in-process plugins this drop is a no-op. For wire-backed
-    // plugins the drop closes the WireClient's writer channel,
-    // which causes the child to see EOF on its read side. Waiting
-    // on the child while still holding the writer would deadlock.
-    let unload_result = unload_handle(&entry).await;
-
-    match &unload_result {
-        Ok(()) => tracing::info!(plugin = %name, "plugin unloaded"),
-        Err(e) => tracing::error!(
-            plugin = %name,
-            error = %e,
-            "plugin unload failed"
-        ),
-    }
-
-    if let Some(mut child) = take_child(&entry).await {
-        wait_or_kill_child(&name, &mut child).await;
-    }
-
-    unload_result.map_err(StewardError::Plugin)
-}
-
-/// Wait for a plugin's child process to exit; after a bounded timeout
-/// kill it.
-///
-/// All errors are logged; none are propagated. The child is either
-/// reaped cleanly or forcibly killed, in both cases leaving no zombie.
-async fn wait_or_kill_child(name: &str, child: &mut Child) {
-    match tokio::time::timeout(CHILD_SHUTDOWN_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) => {
-            if status.success() {
-                tracing::info!(
-                    plugin = %name,
-                    "plugin child exited cleanly"
-                );
-            } else {
-                tracing::warn!(
-                    plugin = %name,
-                    ?status,
-                    "plugin child exited with non-zero status"
-                );
-            }
-        }
-        Ok(Err(e)) => {
-            tracing::error!(
-                plugin = %name,
-                error = %e,
-                "plugin child wait failed"
-            );
-        }
-        Err(_) => {
-            tracing::warn!(
-                plugin = %name,
-                timeout_ms = CHILD_SHUTDOWN_TIMEOUT.as_millis() as u64,
-                "plugin child did not exit after disconnection, killing"
-            );
-            if let Err(e) = child.kill().await {
-                tracing::error!(
-                    plugin = %name,
-                    error = %e,
-                    "plugin child kill failed"
-                );
-            }
-            // Reap the zombie regardless of kill success.
-            let _ = child.wait().await;
-        }
-    }
-}
-
-/// Poll the plugin socket until the child binds it, or the child
-/// exits, or the timeout elapses.
-///
-/// Returns the connected stream on success. On failure, the caller
-/// is responsible for killing and reaping the child.
-async fn wait_for_socket_ready(
-    socket_path: &Path,
-    child: &mut Child,
-) -> Result<UnixStream, StewardError> {
-    let deadline = Instant::now() + SOCKET_READY_TIMEOUT;
-    loop {
-        // If the child has already exited, stop polling.
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return Err(StewardError::Admission(format!(
-                    "plugin child exited before socket was ready: {status:?}"
-                )));
-            }
-            Ok(None) => {} // still running
-            Err(e) => {
-                return Err(StewardError::Admission(format!(
-                    "error polling plugin child: {e}"
-                )));
-            }
-        }
-
-        match UnixStream::connect(socket_path).await {
-            Ok(stream) => return Ok(stream),
-            Err(_) if Instant::now() >= deadline => {
-                return Err(StewardError::Admission(format!(
-                    "timed out waiting for plugin socket at {} after {:?}",
-                    socket_path.display(),
-                    SOCKET_READY_TIMEOUT
-                )));
-            }
-            Err(_) => {
-                tokio::time::sleep(SOCKET_POLL_INTERVAL).await;
-            }
-        }
-    }
-}
 
 // Pre-admission validation lives in `admission/validation.rs`.
 // Callers reference the helpers as
@@ -1953,8 +1504,11 @@ fn build_load_context(
 mod tests {
     use super::*;
     use evo_plugin_sdk::contract::{
-        BuildInfo, PluginIdentity, RuntimeCapabilities,
+        Assignment, BuildInfo, CourseCorrection, CustodyHandle, Plugin,
+        PluginDescription, PluginError, PluginIdentity, Request, Response,
+        RuntimeCapabilities,
     };
+    use std::future::Future;
 
     /// Minimal test respondent: passes its own identity back as the
     /// response payload.
