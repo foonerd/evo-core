@@ -45,7 +45,9 @@ use evo_plugin_sdk::contract::{
     Plugin, PluginDescription, PluginError, Request, Respondent, Response,
     Warden,
 };
-use evo_plugin_sdk::manifest::{InteractionShape, TransportKind};
+use evo_plugin_sdk::manifest::{
+    InstanceShape, InteractionShape, TransportKind,
+};
 use evo_plugin_sdk::Manifest;
 use evo_trust::ADMIN_MINIMUM_TRUST;
 use std::future::Future;
@@ -544,6 +546,7 @@ impl AdmissionEngine {
                 manifest.plugin.name, manifest.kind.interaction
             )));
         }
+        reject_factory_for_v0(&manifest)?;
 
         let mut handle = AdmittedHandle::Respondent(Box::new(
             RespondentAdapter::new(plugin),
@@ -667,6 +670,7 @@ impl AdmissionEngine {
                 manifest.plugin.name, manifest.kind.interaction
             )));
         }
+        reject_factory_for_v0(&manifest)?;
 
         let mut handle =
             AdmittedHandle::Warden(Box::new(WardenAdapter::new(plugin)));
@@ -804,6 +808,7 @@ impl AdmissionEngine {
                 manifest.plugin.name, manifest.kind.interaction
             )));
         }
+        reject_factory_for_v0(&manifest)?;
 
         // Connect and eagerly describe. If either the connection or
         // the initial describe fails we return here with no partial
@@ -946,6 +951,7 @@ impl AdmissionEngine {
                 manifest.plugin.name, manifest.kind.interaction
             )));
         }
+        reject_factory_for_v0(&manifest)?;
 
         // Connect and eagerly describe. Hands the shared custody
         // ledger and happenings bus to WireWarden so its load()
@@ -1885,6 +1891,31 @@ fn check_admin_trust(manifest: &Manifest) -> Result<(), StewardError> {
             effective,
             minimum: ADMIN_MINIMUM_TRUST,
         });
+    }
+    Ok(())
+}
+
+/// Refuse Factory admission until the framework supports it.
+///
+/// Factory plugins (`kind.instance = "factory"`) emit instances at
+/// runtime; the steward has no live admission path for instance
+/// emission yet (GAP [4] is open). Until that lands, every admit
+/// path rejects Factory at admission time with a structured
+/// `StewardError::Admission`. Previously the gate sat in
+/// `plugin_discovery::discover` and silently skipped Factory
+/// manifests; that surface only covered the directory-scan path
+/// and operators got a `tracing::warn!` rather than a structured
+/// admission refusal. Moving the gate here closes both holes:
+/// every admit_* entry point now refuses, and every Rust caller
+/// observes the refusal as `Err`.
+fn reject_factory_for_v0(manifest: &Manifest) -> Result<(), StewardError> {
+    if manifest.kind.instance != InstanceShape::Singleton {
+        return Err(StewardError::Admission(format!(
+            "{}: factory plugins are not yet supported \
+             (kind.instance = {:?}); only Singleton is admissible \
+             in v0",
+            manifest.plugin.name, manifest.kind.instance
+        )));
     }
     Ok(())
 }
@@ -3128,6 +3159,83 @@ custody_failure_mode = "abort"
                 );
             }
             other => panic!("expected Admission error, got {other:?}"),
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    /// Build a respondent manifest with `kind.instance = "factory"`.
+    /// Used by the Wave 6.a Factory-gate tests; structurally identical
+    /// to `test_manifest` apart from the instance field.
+    fn factory_respondent_manifest(name: &str) -> Manifest {
+        let toml = format!(
+            r#"
+[plugin]
+name = "{name}"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "test.ping"
+shape = 1
+
+[kind]
+instance = "factory"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+
+[capabilities.respondent]
+request_types = ["ping"]
+response_budget_ms = 1000
+
+[capabilities.factory]
+max_instances = 4
+instance_ttl_seconds = 60
+"#
+        );
+        Manifest::from_toml(&toml).unwrap()
+    }
+
+    #[tokio::test]
+    async fn admit_singleton_respondent_rejects_factory_manifest() {
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestRespondent {
+            name: "org.test.factory".into(),
+            ..Default::default()
+        };
+        let r = engine
+            .admit_singleton_respondent(
+                plugin,
+                factory_respondent_manifest("org.test.factory"),
+            )
+            .await;
+        match r {
+            Err(StewardError::Admission(msg)) => {
+                assert!(
+                    msg.contains("factory") && msg.contains("Singleton"),
+                    "expected refusal naming factory + Singleton, got: {msg}"
+                );
+            }
+            other => {
+                panic!("expected Admission(factory ...) error, got {other:?}")
+            }
         }
         assert_eq!(engine.len(), 0);
     }
