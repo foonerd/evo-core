@@ -63,8 +63,36 @@ use crate::contract::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Current protocol version for the wire contract.
+/// Current wire-frame schema version used in the `v` envelope field.
+///
+/// This is the version of the on-wire frame schema itself (the
+/// shape of `WireFrame` and its serde encoding), not the feature
+/// version negotiated at handshake time. Both ends MUST emit
+/// frames with this `v` value; a peer that observes a different
+/// `v` treats the frame as a protocol violation and closes the
+/// connection.
 pub const PROTOCOL_VERSION: u16 = 1;
+
+/// Minimum feature version this build understands at handshake.
+///
+/// Communicated in [`WireFrame::Hello::feature_min`]. Distinct
+/// from [`PROTOCOL_VERSION`]: that pins the wire-frame schema,
+/// while feature versions track the *contract* the two peers
+/// agree to honour after handshake.
+pub const FEATURE_VERSION_MIN: u16 = 1;
+
+/// Maximum feature version this build understands at handshake.
+///
+/// Communicated in [`WireFrame::Hello::feature_max`].
+pub const FEATURE_VERSION_MAX: u16 = 1;
+
+/// Codec names this build can decode on inbound frames.
+///
+/// Sent in [`WireFrame::Hello::codecs`]. Both peers exchange
+/// their decode-side codec list and the answerer picks one
+/// they both speak. JSON is mandatory; CBOR is reserved for a
+/// later feature version and is deliberately not added here.
+pub const SUPPORTED_CODECS: &[&str] = &["json"];
 
 /// One wire message. Serialised internally-tagged by the `op` field.
 ///
@@ -486,6 +514,67 @@ pub enum WireFrame {
     },
 
     // ---------------------------------------------------------------
+    // Handshake (steward -> plugin first, then plugin -> steward).
+    // Both peers exchange Hello / HelloAck before any other frame is
+    // dispatched; the answerer picks a feature version inside the
+    // intersection of both peers' [feature_min, feature_max] ranges
+    // and a codec from the intersection of their codec lists.
+    //
+    // The Hello frame's `v` envelope field is the wire-frame schema
+    // version (currently always [`PROTOCOL_VERSION`]); the
+    // `feature_min` and `feature_max` fields negotiate the *feature*
+    // version that governs which optional traits and verbs the two
+    // peers honour after the handshake. The two are deliberately
+    // separated: the wire schema can stay stable across feature
+    // version bumps so old peers can at least decode the new Hello
+    // and refuse cleanly.
+    // ---------------------------------------------------------------
+    /// Initial handshake frame. Sent by the connecting peer (the
+    /// steward, which initiates the wire connection per the spawn
+    /// model in `admission.rs`) immediately after the transport is
+    /// established. Carries the sender's supported feature-version
+    /// range and the codec names it can decode on inbound frames.
+    Hello {
+        /// Wire-frame schema version. Always [`PROTOCOL_VERSION`].
+        v: u16,
+        /// Correlation ID. The Hello/HelloAck pair uses `cid = 0`
+        /// by convention; subsequent verb requests start at 1.
+        cid: u64,
+        /// Canonical plugin name. The peer validates this against
+        /// its own configuration and refuses with [`Self::Error`]
+        /// (fatal) on mismatch.
+        plugin: String,
+        /// Minimum feature version the sender understands.
+        feature_min: u16,
+        /// Maximum feature version the sender understands.
+        feature_max: u16,
+        /// Codec names the sender can decode on inbound frames,
+        /// in preference order. The answerer picks the first
+        /// entry it can encode on outbound frames.
+        codecs: Vec<String>,
+    },
+
+    /// Handshake reply. The answerer (the plugin) picks a feature
+    /// version from the intersection of both peers' ranges and a
+    /// codec from the intersection of their lists, and echoes the
+    /// Hello's `cid`. On rejection, an [`Self::Error`] frame is
+    /// returned in place of HelloAck and the connection is closed.
+    HelloAck {
+        /// Wire-frame schema version. Always [`PROTOCOL_VERSION`].
+        v: u16,
+        /// Correlation ID echoing the Hello.
+        cid: u64,
+        /// Canonical plugin name (echoed).
+        plugin: String,
+        /// Chosen feature version. MUST be in the intersection of
+        /// the requester's and answerer's ranges.
+        feature: u16,
+        /// Chosen codec name. MUST be present in both peers' codec
+        /// lists.
+        codec: String,
+    },
+
+    // ---------------------------------------------------------------
     // Event acknowledgement (steward -> plugin). Sent in response to
     // a plugin-originated event frame (`AnnounceSubject`,
     // `RetractSubject`, `AssertRelation`, `RetractRelation`,
@@ -539,7 +628,11 @@ impl WireFrame {
             | Self::DescribeSubject { v, cid, plugin, .. }
             | Self::DescribeSubjectResponse { v, cid, plugin, .. }
             | Self::Error { v, cid, plugin, .. }
-            | Self::EventAck { v, cid, plugin } => (*v, *cid, plugin.as_str()),
+            | Self::EventAck { v, cid, plugin }
+            | Self::Hello { v, cid, plugin, .. }
+            | Self::HelloAck { v, cid, plugin, .. } => {
+                (*v, *cid, plugin.as_str())
+            }
         }
     }
 
@@ -621,6 +714,18 @@ impl WireFrame {
     /// a `Result<(), ReportError>` to the trait caller.
     pub fn is_event_ack(&self) -> bool {
         matches!(self, Self::EventAck { .. })
+    }
+
+    /// True if this frame is part of the handshake exchange.
+    ///
+    /// Handshake frames flow before any other dispatch on a fresh
+    /// connection. Both peers refuse non-handshake frames until
+    /// their own handshake exchange completes; conversely, after
+    /// the exchange completes, a peer that observes another
+    /// handshake frame treats it as a protocol violation and
+    /// closes the connection.
+    pub fn is_handshake(&self) -> bool {
+        matches!(self, Self::Hello { .. } | Self::HelloAck { .. })
     }
 }
 
@@ -1124,6 +1229,74 @@ mod tests {
         assert!(!f.is_response());
         assert!(!f.is_error());
         assert!(!f.is_request());
+    }
+
+    #[test]
+    fn hello_round_trip() {
+        let orig = WireFrame::Hello {
+            v: PROTOCOL_VERSION,
+            cid: 0,
+            plugin: sample_plugin(),
+            feature_min: FEATURE_VERSION_MIN,
+            feature_max: FEATURE_VERSION_MAX,
+            codecs: vec!["json".into()],
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"hello""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn hello_ack_round_trip() {
+        let orig = WireFrame::HelloAck {
+            v: PROTOCOL_VERSION,
+            cid: 0,
+            plugin: sample_plugin(),
+            feature: FEATURE_VERSION_MAX,
+            codec: "json".into(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"hello_ack""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn handshake_classification() {
+        let hello = WireFrame::Hello {
+            v: PROTOCOL_VERSION,
+            cid: 0,
+            plugin: "x".into(),
+            feature_min: 1,
+            feature_max: 1,
+            codecs: vec!["json".into()],
+        };
+        assert!(hello.is_handshake());
+        assert!(!hello.is_request());
+        assert!(!hello.is_response());
+        assert!(!hello.is_event());
+        assert!(!hello.is_event_ack());
+
+        let ack = WireFrame::HelloAck {
+            v: PROTOCOL_VERSION,
+            cid: 0,
+            plugin: "x".into(),
+            feature: 1,
+            codec: "json".into(),
+        };
+        assert!(ack.is_handshake());
+        assert!(!ack.is_request());
+        assert!(!ack.is_response());
+        assert!(!ack.is_event_ack());
+    }
+
+    #[test]
+    fn supported_codecs_include_json_first() {
+        // Wave 2.2 only supports JSON; leaving this assertion in
+        // place ensures a future codec addition has to update the
+        // test rather than silently changing the on-wire default.
+        assert_eq!(SUPPORTED_CODECS.first().copied(), Some("json"));
     }
 
     #[test]

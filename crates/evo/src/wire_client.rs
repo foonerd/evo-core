@@ -70,7 +70,10 @@ use evo_plugin_sdk::contract::{
     RelationAnnouncer, Request, Response, StateReporter, SubjectAnnouncer,
     SubjectQuerier,
 };
-use evo_plugin_sdk::wire::{WireFrame, PROTOCOL_VERSION};
+use evo_plugin_sdk::wire::{
+    WireFrame, FEATURE_VERSION_MAX, FEATURE_VERSION_MIN, PROTOCOL_VERSION,
+    SUPPORTED_CODECS,
+};
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
@@ -147,6 +150,15 @@ pub enum WireClientError {
     /// typically a datetime value in operator config).
     #[error("config conversion: {0}")]
     ConfigConversion(String),
+
+    /// The version/codec handshake with the plugin failed. Carries
+    /// a structured reason (no feature-version overlap, no codec
+    /// overlap, malformed reply, etc.) for the operator-facing log.
+    #[error("handshake failed: {reason}")]
+    HandshakeFailed {
+        /// Operator-facing description of the handshake failure.
+        reason: String,
+    },
 }
 
 /// Callbacks the wire client invokes when events arrive from the
@@ -268,11 +280,22 @@ impl WireClient {
     ///
     /// The client owns the halves thereafter; dropping the client
     /// triggers orderly shutdown of both background tasks.
-    pub fn spawn<R, W>(reader: R, writer: W, plugin_name: String) -> Self
+    pub async fn spawn<R, W>(
+        mut reader: R,
+        mut writer: W,
+        plugin_name: String,
+    ) -> Result<Self, WireClientError>
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
+        // Run the version/codec handshake on the raw halves before
+        // spawning the dispatch loops. The steward initiates per the
+        // spawn model (`admission.rs` connects to the plugin's
+        // socket).
+        perform_steward_handshake(&mut reader, &mut writer, &plugin_name)
+            .await?;
+
         let (out_tx, out_rx) =
             mpsc::channel::<WireFrame>(OUTBOUND_CHANNEL_CAPACITY);
         let pending: Arc<Mutex<PendingMap>> =
@@ -297,7 +320,7 @@ impl WireClient {
             Arc::clone(&alive),
         ));
 
-        Self {
+        Ok(Self {
             plugin_name,
             out_tx,
             pending,
@@ -306,7 +329,7 @@ impl WireClient {
             alive,
             _reader_task: reader_task,
             _writer_task: writer_task,
-        }
+        })
     }
 
     /// Canonical plugin name this client talks to.
@@ -607,6 +630,99 @@ impl WireClient {
                 variant_name(&other)
             ))),
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Handshake (steward side)
+// ---------------------------------------------------------------------
+
+/// Run the version/codec handshake on a freshly connected wire.
+///
+/// The steward (this side) sends a [`WireFrame::Hello`] advertising
+/// `[FEATURE_VERSION_MIN, FEATURE_VERSION_MAX]` and the codecs it
+/// can decode, then awaits the plugin's [`WireFrame::HelloAck`].
+/// On a structured rejection ([`WireFrame::Error`]) the message is
+/// surfaced via [`WireClientError::HandshakeFailed`]; on any other
+/// frame, an [`WireClientError::Protocol`] is returned.
+///
+/// Validates that the chosen `feature` and `codec` lie inside the
+/// steward's own ranges; a peer that picks something outside its
+/// declared offer is treated as a protocol violation.
+async fn perform_steward_handshake<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    plugin_name: &str,
+) -> Result<(), WireClientError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let codecs: Vec<String> =
+        SUPPORTED_CODECS.iter().map(|s| s.to_string()).collect();
+    let hello = WireFrame::Hello {
+        v: PROTOCOL_VERSION,
+        cid: 0,
+        plugin: plugin_name.to_string(),
+        feature_min: FEATURE_VERSION_MIN,
+        feature_max: FEATURE_VERSION_MAX,
+        codecs,
+    };
+    write_frame_json(writer, &hello).await?;
+
+    let reply = read_frame_json(reader).await?;
+    let (v, cid, peer_plugin) = reply.envelope();
+    if v != PROTOCOL_VERSION {
+        return Err(WireClientError::VersionMismatch {
+            expected: PROTOCOL_VERSION,
+            actual: v,
+        });
+    }
+    if peer_plugin != plugin_name {
+        return Err(WireClientError::PluginMismatch {
+            expected: plugin_name.to_string(),
+            actual: peer_plugin.to_string(),
+        });
+    }
+    if cid != 0 {
+        return Err(WireClientError::Protocol(format!(
+            "handshake reply cid {cid} does not echo the Hello cid 0"
+        )));
+    }
+
+    match reply {
+        WireFrame::HelloAck { feature, codec, .. } => {
+            if feature < FEATURE_VERSION_MIN || feature > FEATURE_VERSION_MAX {
+                return Err(WireClientError::HandshakeFailed {
+                    reason: format!(
+                        "plugin chose feature version {feature} outside the \
+                         steward's range [{FEATURE_VERSION_MIN}, \
+                         {FEATURE_VERSION_MAX}]"
+                    ),
+                });
+            }
+            if !SUPPORTED_CODECS.iter().any(|c| *c == codec) {
+                return Err(WireClientError::HandshakeFailed {
+                    reason: format!(
+                        "plugin chose codec '{codec}' which the steward \
+                         cannot encode (supported: {:?})",
+                        SUPPORTED_CODECS
+                    ),
+                });
+            }
+            Ok(())
+        }
+        WireFrame::Error { message, fatal, .. } => {
+            Err(WireClientError::HandshakeFailed {
+                reason: format!(
+                    "plugin refused handshake (fatal={fatal}): {message}"
+                ),
+            })
+        }
+        other => Err(WireClientError::Protocol(format!(
+            "expected hello_ack as first frame, got {}",
+            variant_name(&other)
+        ))),
     }
 }
 
@@ -1038,6 +1154,8 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         }
         WireFrame::Error { .. } => "error",
         WireFrame::EventAck { .. } => "event_ack",
+        WireFrame::Hello { .. } => "hello",
+        WireFrame::HelloAck { .. } => "hello_ack",
     }
 }
 
@@ -1095,7 +1213,7 @@ impl WireRespondent {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let client = WireClient::spawn(reader, writer, plugin_name);
+        let client = WireClient::spawn(reader, writer, plugin_name).await?;
         let cached_description = client.describe().await?;
         Ok(Self {
             client,
@@ -1372,7 +1490,7 @@ impl WireWarden {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let client = WireClient::spawn(reader, writer, plugin_name);
+        let client = WireClient::spawn(reader, writer, plugin_name).await?;
         let cached_description = client.describe().await?;
         Ok(Self {
             client,
@@ -3373,5 +3491,165 @@ name = "track"
             WireFrame::Error { fatal, .. } => assert!(fatal),
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 2.2: steward-side handshake (perform_steward_handshake) tests.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn handshake_succeeds_when_peer_sends_valid_hello_ack() {
+        use evo_plugin_sdk::codec::{read_frame_json, write_frame_json};
+        let (client, server) = tokio::io::duplex(8192);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let (mut server_r, mut server_w) = tokio::io::split(server);
+
+        // Peer responder: read Hello, reply HelloAck.
+        let peer = tokio::spawn(async move {
+            let frame = read_frame_json(&mut server_r).await.unwrap();
+            assert!(matches!(frame, WireFrame::Hello { .. }));
+            write_frame_json(
+                &mut server_w,
+                &WireFrame::HelloAck {
+                    v: PROTOCOL_VERSION,
+                    cid: 0,
+                    plugin: "org.test.x".into(),
+                    feature: FEATURE_VERSION_MAX,
+                    codec: "json".into(),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        perform_steward_handshake(&mut client_r, &mut client_w, "org.test.x")
+            .await
+            .expect("handshake must succeed");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_fails_on_error_frame_in_place_of_ack() {
+        use evo_plugin_sdk::codec::{read_frame_json, write_frame_json};
+        let (client, server) = tokio::io::duplex(8192);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let (mut server_r, mut server_w) = tokio::io::split(server);
+
+        let peer = tokio::spawn(async move {
+            let _ = read_frame_json(&mut server_r).await.unwrap();
+            write_frame_json(
+                &mut server_w,
+                &WireFrame::Error {
+                    v: PROTOCOL_VERSION,
+                    cid: 0,
+                    plugin: "org.test.x".into(),
+                    message: "no codec overlap".into(),
+                    fatal: true,
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let result = perform_steward_handshake(
+            &mut client_r,
+            &mut client_w,
+            "org.test.x",
+        )
+        .await;
+        match result {
+            Err(WireClientError::HandshakeFailed { reason }) => {
+                assert!(
+                    reason.contains("no codec overlap"),
+                    "must surface plugin's reason: {reason}"
+                );
+            }
+            other => panic!("expected HandshakeFailed, got {other:?}"),
+        }
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_fails_on_out_of_range_feature() {
+        use evo_plugin_sdk::codec::{read_frame_json, write_frame_json};
+        let (client, server) = tokio::io::duplex(8192);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let (mut server_r, mut server_w) = tokio::io::split(server);
+
+        let peer = tokio::spawn(async move {
+            let _ = read_frame_json(&mut server_r).await.unwrap();
+            write_frame_json(
+                &mut server_w,
+                &WireFrame::HelloAck {
+                    v: PROTOCOL_VERSION,
+                    cid: 0,
+                    plugin: "org.test.x".into(),
+                    // Pick a feature outside our declared range to
+                    // simulate a misbehaving peer.
+                    feature: FEATURE_VERSION_MAX + 5,
+                    codec: "json".into(),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let result = perform_steward_handshake(
+            &mut client_r,
+            &mut client_w,
+            "org.test.x",
+        )
+        .await;
+        match result {
+            Err(WireClientError::HandshakeFailed { reason }) => {
+                assert!(
+                    reason.contains("outside the steward's range"),
+                    "must call out the range violation: {reason}"
+                );
+            }
+            other => panic!("expected HandshakeFailed, got {other:?}"),
+        }
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_fails_on_unknown_codec_choice() {
+        use evo_plugin_sdk::codec::{read_frame_json, write_frame_json};
+        let (client, server) = tokio::io::duplex(8192);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let (mut server_r, mut server_w) = tokio::io::split(server);
+
+        let peer = tokio::spawn(async move {
+            let _ = read_frame_json(&mut server_r).await.unwrap();
+            write_frame_json(
+                &mut server_w,
+                &WireFrame::HelloAck {
+                    v: PROTOCOL_VERSION,
+                    cid: 0,
+                    plugin: "org.test.x".into(),
+                    feature: FEATURE_VERSION_MAX,
+                    codec: "cbor".into(),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let result = perform_steward_handshake(
+            &mut client_r,
+            &mut client_w,
+            "org.test.x",
+        )
+        .await;
+        match result {
+            Err(WireClientError::HandshakeFailed { reason }) => {
+                assert!(
+                    reason.contains("cbor"),
+                    "must name the unsupported codec: {reason}"
+                );
+            }
+            other => panic!("expected HandshakeFailed, got {other:?}"),
+        }
+        peer.await.unwrap();
     }
 }

@@ -182,14 +182,22 @@ impl HostConfig {
 pub async fn serve<P, R, W>(
     plugin: P,
     config: HostConfig,
-    reader: R,
-    writer: W,
+    mut reader: R,
+    mut writer: W,
 ) -> Result<(), HostError>
 where
     P: Plugin + Respondent + 'static,
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
+    // Run the version/codec handshake on the raw halves before any
+    // dispatch loop sees the wire. The plugin (this side) is the
+    // answerer per the spawn model; it reads the steward's Hello,
+    // picks a feature version and codec, and replies with HelloAck
+    // (or an Error frame on rejection).
+    perform_plugin_handshake(&mut reader, &mut writer, &config.plugin_name)
+        .await?;
+
     let (tx, rx) = mpsc::channel::<WireFrame>(config.event_channel_capacity);
     let writer_task = tokio::spawn(writer_loop(writer, rx));
     let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
@@ -241,6 +249,145 @@ where
     while let Some(frame) = rx.recv().await {
         write_frame_json(&mut writer, &frame).await?;
     }
+    Ok(())
+}
+
+/// Run the plugin-side half of the version/codec handshake.
+///
+/// Reads the steward's [`WireFrame::Hello`] frame from the wire,
+/// validates the plugin name and wire-frame version, picks the
+/// largest mutually-supported feature version and the first
+/// mutually-supported codec, and writes a [`WireFrame::HelloAck`].
+/// On any rejection (plugin-name mismatch, no feature overlap, no
+/// codec overlap) writes a [`WireFrame::Error`] frame with
+/// `fatal = true` and returns a [`HostError::Protocol`] so the
+/// caller tears down the connection.
+async fn perform_plugin_handshake<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    plugin_name: &str,
+) -> Result<(), HostError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use crate::wire::{
+        FEATURE_VERSION_MAX, FEATURE_VERSION_MIN, SUPPORTED_CODECS,
+    };
+
+    let frame = read_frame_json(reader).await?;
+    let (v, cid, peer_plugin) = frame.envelope();
+    if v != PROTOCOL_VERSION {
+        return Err(HostError::VersionMismatch {
+            expected: PROTOCOL_VERSION,
+            actual: v,
+        });
+    }
+    if peer_plugin != plugin_name {
+        // Best-effort error frame so the steward sees a structured
+        // refusal rather than a closed socket.
+        let _ = write_frame_json(
+            writer,
+            &WireFrame::Error {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin: plugin_name.to_string(),
+                message: format!(
+                    "plugin name mismatch: configured '{plugin_name}', \
+                     steward sent '{peer_plugin}'"
+                ),
+                fatal: true,
+            },
+        )
+        .await;
+        return Err(HostError::PluginMismatch {
+            expected: plugin_name.to_string(),
+            actual: peer_plugin.to_string(),
+        });
+    }
+
+    let (steward_min, steward_max, steward_codecs) = match frame {
+        WireFrame::Hello {
+            feature_min,
+            feature_max,
+            codecs,
+            ..
+        } => (feature_min, feature_max, codecs),
+        WireFrame::Error { message, .. } => {
+            return Err(HostError::Protocol(format!(
+                "steward sent Error in place of Hello: {message}"
+            )));
+        }
+        other => {
+            return Err(HostError::Protocol(format!(
+                "expected hello as first frame, got {}",
+                variant_name(&other)
+            )));
+        }
+    };
+
+    let chosen_feature = match (
+        steward_min.max(FEATURE_VERSION_MIN),
+        steward_max.min(FEATURE_VERSION_MAX),
+    ) {
+        (lo, hi) if lo <= hi => hi,
+        _ => {
+            let reason = format!(
+                "no feature-version overlap: steward [{steward_min}, \
+                 {steward_max}] vs plugin [{FEATURE_VERSION_MIN}, \
+                 {FEATURE_VERSION_MAX}]"
+            );
+            let _ = write_frame_json(
+                writer,
+                &WireFrame::Error {
+                    v: PROTOCOL_VERSION,
+                    cid,
+                    plugin: plugin_name.to_string(),
+                    message: reason.clone(),
+                    fatal: true,
+                },
+            )
+            .await;
+            return Err(HostError::Protocol(reason));
+        }
+    };
+
+    let chosen_codec = match steward_codecs
+        .iter()
+        .find(|c| SUPPORTED_CODECS.iter().any(|s| s == c))
+    {
+        Some(c) => c.clone(),
+        None => {
+            let reason = format!(
+                "no codec overlap: steward {steward_codecs:?} vs plugin \
+                 {SUPPORTED_CODECS:?}"
+            );
+            let _ = write_frame_json(
+                writer,
+                &WireFrame::Error {
+                    v: PROTOCOL_VERSION,
+                    cid,
+                    plugin: plugin_name.to_string(),
+                    message: reason.clone(),
+                    fatal: true,
+                },
+            )
+            .await;
+            return Err(HostError::Protocol(reason));
+        }
+    };
+
+    write_frame_json(
+        writer,
+        &WireFrame::HelloAck {
+            v: PROTOCOL_VERSION,
+            cid,
+            plugin: plugin_name.to_string(),
+            feature: chosen_feature,
+            codec: chosen_codec,
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -618,6 +765,8 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         }
         WireFrame::Error { .. } => "error",
         WireFrame::EventAck { .. } => "event_ack",
+        WireFrame::Hello { .. } => "hello",
+        WireFrame::HelloAck { .. } => "hello_ack",
     }
 }
 
@@ -1189,14 +1338,18 @@ impl UserInteractionRequester for WireUserInteractionRequester {
 pub async fn serve_warden<P, R, W>(
     plugin: P,
     config: HostConfig,
-    reader: R,
-    writer: W,
+    mut reader: R,
+    mut writer: W,
 ) -> Result<(), HostError>
 where
     P: Plugin + Warden + 'static,
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
+    // Same handshake discipline as `serve`. See its docs.
+    perform_plugin_handshake(&mut reader, &mut writer, &config.plugin_name)
+        .await?;
+
     let (tx, rx) = mpsc::channel::<WireFrame>(config.event_channel_capacity);
     let writer_task = tokio::spawn(writer_loop(writer, rx));
     let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
@@ -1618,6 +1771,48 @@ mod tests {
         tokio::io::duplex(65536)
     }
 
+    /// Drive the version/codec handshake from the test side acting
+    /// as the steward. Sends a Hello mirroring what the steward
+    /// sends in production (`FEATURE_VERSION_MIN..=FEATURE_VERSION_MAX`,
+    /// the project's `SUPPORTED_CODECS`) and validates the
+    /// plugin's HelloAck. Tests call this immediately after
+    /// spawning `serve` / `serve_warden` so the dispatch loop is
+    /// reached before any verb traffic.
+    async fn drive_test_handshake<R, W>(
+        reader: &mut R,
+        writer: &mut W,
+        plugin_name: &str,
+    ) where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        use crate::wire::{
+            FEATURE_VERSION_MAX, FEATURE_VERSION_MIN, SUPPORTED_CODECS,
+        };
+        let codecs: Vec<String> =
+            SUPPORTED_CODECS.iter().map(|s| s.to_string()).collect();
+        write_frame_json(
+            writer,
+            &WireFrame::Hello {
+                v: PROTOCOL_VERSION,
+                cid: 0,
+                plugin: plugin_name.to_string(),
+                feature_min: FEATURE_VERSION_MIN,
+                feature_max: FEATURE_VERSION_MAX,
+                codecs,
+            },
+        )
+        .await
+        .expect("test write Hello");
+        match read_frame_json(reader).await.expect("test read HelloAck") {
+            WireFrame::HelloAck { feature, codec, .. } => {
+                assert_eq!(feature, FEATURE_VERSION_MAX);
+                assert_eq!(codec, SUPPORTED_CODECS[0]);
+            }
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+    }
+
     // -----------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------
@@ -1638,6 +1833,7 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.x").await;
 
         // Send describe request.
         write_frame_json(
@@ -1695,6 +1891,7 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.x").await;
 
         // Load.
         write_frame_json(
@@ -1755,6 +1952,7 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.x").await;
 
         write_frame_json(
             &mut client_w,
@@ -1799,6 +1997,7 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.x").await;
 
         write_frame_json(
             &mut client_w,
@@ -1840,6 +2039,7 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.x").await;
 
         write_frame_json(
             &mut client_w,
@@ -1891,6 +2091,7 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.x").await;
 
         // Send a frame with the wrong plugin name.
         write_frame_json(
@@ -1927,6 +2128,7 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.x").await;
 
         write_frame_json(
             &mut client_w,
@@ -1962,6 +2164,7 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.x").await;
 
         // Send a LoadResponse (direction error: plugin emits, not
         // receives).
@@ -2005,6 +2208,7 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.x").await;
 
         write_frame_json(
             &mut client_w,
@@ -2242,6 +2446,8 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.warden")
+            .await;
 
         write_frame_json(
             &mut client_w,
@@ -2287,6 +2493,8 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.warden")
+            .await;
 
         write_frame_json(
             &mut client_w,
@@ -2339,6 +2547,8 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.warden")
+            .await;
 
         // First take a custody so we have a valid handle. Even though
         // TestWarden does not actually validate the handle in
@@ -2414,6 +2624,8 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.warden")
+            .await;
 
         // Take, then release.
         write_frame_json(
@@ -2486,6 +2698,8 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.warden")
+            .await;
 
         write_frame_json(
             &mut client_w,
@@ -2567,6 +2781,8 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.warden")
+            .await;
 
         write_frame_json(
             &mut client_w,
@@ -2619,6 +2835,7 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.x").await;
 
         write_frame_json(
             &mut client_w,
@@ -2675,6 +2892,8 @@ mod tests {
             server_r,
             server_w,
         ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.warden")
+            .await;
 
         // Load.
         write_frame_json(
@@ -2913,5 +3132,138 @@ mod tests {
         // closes the oneshot the announcer is awaiting.
         let result = drive_announce_with_response(None).await;
         assert!(matches!(result, Err(ReportError::ShuttingDown)));
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 2.2: plugin-side handshake (perform_plugin_handshake) tests.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn handshake_rejects_plugin_name_mismatch() {
+        use crate::wire::{
+            FEATURE_VERSION_MAX, FEATURE_VERSION_MIN, SUPPORTED_CODECS,
+        };
+        let (client, server) = tokio::io::duplex(8192);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let (mut server_r, mut server_w) = tokio::io::split(server);
+
+        // Client (acting as steward) writes Hello carrying a name
+        // that does not match the plugin's configured name.
+        let codecs: Vec<String> =
+            SUPPORTED_CODECS.iter().map(|s| s.to_string()).collect();
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::Hello {
+                v: PROTOCOL_VERSION,
+                cid: 0,
+                plugin: "org.wrong.name".into(),
+                feature_min: FEATURE_VERSION_MIN,
+                feature_max: FEATURE_VERSION_MAX,
+                codecs,
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = perform_plugin_handshake(
+            &mut server_r,
+            &mut server_w,
+            "org.right.name",
+        )
+        .await;
+        match result {
+            Err(HostError::PluginMismatch { expected, actual }) => {
+                assert_eq!(expected, "org.right.name");
+                assert_eq!(actual, "org.wrong.name");
+            }
+            other => panic!("expected PluginMismatch, got {other:?}"),
+        }
+        // Plugin should have written an Error frame back to the
+        // steward before returning the error.
+        let response = read_frame_json(&mut client_r).await.unwrap();
+        match response {
+            WireFrame::Error { fatal, message, .. } => {
+                assert!(fatal, "plugin name mismatch is session-fatal");
+                assert!(
+                    message.contains("plugin name mismatch"),
+                    "message must explain the rejection: {message}"
+                );
+            }
+            other => panic!("expected Error frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_first_frame_other_than_hello() {
+        let (client, server) = tokio::io::duplex(8192);
+        let (mut _client_r, mut client_w) = tokio::io::split(client);
+        let (mut server_r, mut server_w) = tokio::io::split(server);
+
+        // Client writes a Describe frame instead of Hello.
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::Describe {
+                v: PROTOCOL_VERSION,
+                cid: 1,
+                plugin: "org.test.x".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = perform_plugin_handshake(
+            &mut server_r,
+            &mut server_w,
+            "org.test.x",
+        )
+        .await;
+        match result {
+            Err(HostError::Protocol(msg)) => {
+                assert!(
+                    msg.contains("expected hello"),
+                    "message must call out the missing handshake: {msg}"
+                );
+            }
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_succeeds_under_supported_offer() {
+        use crate::wire::{
+            FEATURE_VERSION_MAX, FEATURE_VERSION_MIN, SUPPORTED_CODECS,
+        };
+        let (client, server) = tokio::io::duplex(8192);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let (mut server_r, mut server_w) = tokio::io::split(server);
+
+        let codecs: Vec<String> =
+            SUPPORTED_CODECS.iter().map(|s| s.to_string()).collect();
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::Hello {
+                v: PROTOCOL_VERSION,
+                cid: 0,
+                plugin: "org.test.x".into(),
+                feature_min: FEATURE_VERSION_MIN,
+                feature_max: FEATURE_VERSION_MAX,
+                codecs,
+            },
+        )
+        .await
+        .unwrap();
+
+        perform_plugin_handshake(&mut server_r, &mut server_w, "org.test.x")
+            .await
+            .expect("handshake under supported offer must succeed");
+
+        let ack = read_frame_json(&mut client_r).await.unwrap();
+        match ack {
+            WireFrame::HelloAck { feature, codec, .. } => {
+                assert_eq!(feature, FEATURE_VERSION_MAX);
+                assert_eq!(codec, "json");
+            }
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
     }
 }
