@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod canonical;
 mod digest;
 mod error;
 mod key_meta;
@@ -23,6 +24,7 @@ mod revocation;
 mod trust_root;
 mod verify;
 
+pub use canonical::{canonicalise, CanonicalError};
 pub use digest::{
     format_digest_sha256_hex, install_digest, parse_digest_sha256_hex,
     signing_message,

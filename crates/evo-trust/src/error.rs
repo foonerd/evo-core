@@ -53,6 +53,13 @@ pub enum TrustError {
     /// A PEM or PKCS#8 public key could not be decoded.
     #[error("invalid public key: {0}")]
     BadPublicKey(String),
+    /// The manifest could not be re-serialised to canonical TOML.
+    /// Either the on-disk bytes did not parse as TOML, or a value
+    /// (typically a non-finite float) cannot be represented
+    /// canonically. The canonical TOML is the signing payload per
+    /// ADR-0012; no fallback to raw bytes is permitted.
+    #[error("manifest canonicalisation failed: {0}")]
+    CanonicalisationFailed(String),
 }
 
 impl TrustError {

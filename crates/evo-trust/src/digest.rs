@@ -1,24 +1,47 @@
-//! Install digest: SHA-256 of `manifest.toml` bytes || SHA-256(artefact) bytes
-//! (concatenation), per `PLUGIN_PACKAGING.md` section 5.
+//! Install digest: SHA-256 of canonical `manifest.toml` bytes || SHA-256(artefact) bytes
+//! (concatenation), per `PLUGIN_PACKAGING.md` section 5 and ADR-0012.
+//!
+//! ## Canonical TOML payload
+//!
+//! The manifest half of the signing payload is the **canonical TOML
+//! re-serialisation** produced by [`crate::canonicalise`], not the
+//! raw on-disk bytes. Whitespace, key order, comments, and quoting
+//! style on disk are operator/editor choices — none of them is
+//! semantic. Signing the raw bytes makes signatures fragile against
+//! routine tooling (re-pack, re-format, editor save) that does not
+//! preserve byte equivalence. Canonicalisation closes that hole;
+//! every verifier reproduces the canonical bytes from any
+//! parseable manifest and the signature survives.
+//!
+//! Per ADR-0012, `signing_message` is the only blessed path; raw
+//! bytes are not signed under any code path.
 
 use sha2::{Digest, Sha256};
 
+use crate::canonical::canonicalise;
 use crate::error::TrustError;
 
-/// The signed message: bytes of `manifest.toml` followed by the 32-byte
-/// digest of the artefact file, per `PLUGIN_PACKAGING.md` §5.
+/// The signed message: canonical TOML bytes of `manifest.toml`
+/// followed by the 32-byte digest of the artefact file, per
+/// `PLUGIN_PACKAGING.md` §5 and ADR-0012.
 pub fn signing_message(
     manifest_path: &std::path::Path,
     exec_path: &std::path::Path,
 ) -> Result<Vec<u8>, TrustError> {
-    let m = std::fs::read(manifest_path).map_err(|e| {
+    let raw = std::fs::read(manifest_path).map_err(|e| {
         TrustError::io(format!("read {}", manifest_path.display()), e)
+    })?;
+    let canonical = canonicalise(&raw).map_err(|e| {
+        TrustError::CanonicalisationFailed(format!(
+            "{}: {e}",
+            manifest_path.display()
+        ))
     })?;
     let art = std::fs::read(exec_path).map_err(|e| {
         TrustError::io(format!("read {}", exec_path.display()), e)
     })?;
     let d = Sha256::digest(&art);
-    let mut out = m;
+    let mut out = canonical;
     out.extend_from_slice(&d);
     Ok(out)
 }
