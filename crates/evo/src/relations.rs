@@ -108,6 +108,7 @@
 
 use crate::error::StewardError;
 use evo_plugin_sdk::contract::SplitRelationStrategy;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -212,7 +213,7 @@ pub struct RelationRecord {
 /// [`RelationGraph::describe_relation`] for audit. Removed from
 /// the forward and inverse indices so neighbour queries, walks,
 /// and cardinality counts naturally skip it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SuppressionRecord {
     /// Canonical name of the admin plugin that suppressed.
     pub admin_plugin: String,

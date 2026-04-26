@@ -117,10 +117,13 @@
 //! when it lands (historical trail).
 
 use crate::catalogue::Cardinality;
+use crate::persistence::PersistenceStore;
 use crate::relations::SuppressionRecord;
 use evo_plugin_sdk::contract::{HealthStatus, SplitRelationStrategy};
 use serde::Serialize;
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 /// Which side of a relation's cardinality was violated.
@@ -269,7 +272,8 @@ pub const DEFAULT_CAPACITY: usize = 1024;
 /// Marked `#[non_exhaustive]`: future passes add variants without
 /// breaking match arms on the existing custody variants. Callers
 /// matching on `Happening` MUST include a catch-all arm.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Happening {
     /// A warden accepted custody. Emitted by the admission engine
@@ -831,14 +835,43 @@ pub enum Happening {
 /// Cheap to share via `Arc<HappeningBus>`. Internally backed by a
 /// tokio broadcast channel. Cloning the bus is not supported
 /// directly (the bus owns its sender); callers share it via `Arc`.
+///
+/// ## Cursor durability (ADR-0017)
+///
+/// The bus carries a monotonic [`Self::next_seq`] counter. Every
+/// happening emitted via [`Self::emit_durable`] is written through
+/// to the [`PersistenceStore`]'s `happenings_log` table tagged with
+/// its seq, then broadcast live. Consumers reconnecting after a
+/// transient drop replay missed events by querying the store with
+/// [`PersistenceStore::load_happenings_since`] and their
+/// last-acknowledged seq.
+///
+/// The seq counter is seeded at boot from
+/// [`PersistenceStore::load_max_happening_seq`] via
+/// [`Self::with_persistence`] so seqs continue to grow across
+/// restart.
+///
+/// The legacy [`Self::emit`] entry point is preserved for paths
+/// that have no persistence handle (tests, the in-process boot
+/// sequence before the store opens). It mints a seq on the same
+/// counter but does not write through; consumers using its output
+/// have no replay guarantees.
 pub struct HappeningBus {
     tx: broadcast::Sender<Happening>,
+    /// Monotonic cursor minted on every emit. Always > 0 once a
+    /// happening has been emitted.
+    next_seq: AtomicU64,
+    /// Optional persistence handle. When present, [`Self::emit_durable`]
+    /// writes through to the `happenings_log` table.
+    persistence: Option<Arc<dyn PersistenceStore>>,
 }
 
 impl std::fmt::Debug for HappeningBus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HappeningBus")
             .field("receiver_count", &self.tx.receiver_count())
+            .field("next_seq", &self.next_seq.load(Ordering::Relaxed))
+            .field("durable", &self.persistence.is_some())
             .finish()
     }
 }
@@ -850,12 +883,13 @@ impl Default for HappeningBus {
 }
 
 impl HappeningBus {
-    /// Construct a bus with [`DEFAULT_CAPACITY`].
+    /// Construct a bus with [`DEFAULT_CAPACITY`] and no persistence.
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_CAPACITY)
     }
 
-    /// Construct a bus with a custom buffer capacity.
+    /// Construct a bus with a custom buffer capacity and no
+    /// persistence.
     ///
     /// The capacity is the number of unconsumed happenings the bus
     /// can hold before slow subscribers start receiving
@@ -863,21 +897,104 @@ impl HappeningBus {
     /// panics per tokio's contract.
     pub fn with_capacity(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
-        Self { tx }
+        Self {
+            tx,
+            next_seq: AtomicU64::new(1),
+            persistence: None,
+        }
     }
 
-    /// Emit a happening.
+    /// Construct a bus with the [`DEFAULT_CAPACITY`] broadcast ring,
+    /// a persistence handle, and the seq counter seeded to
+    /// `max(seq) + 1` from the store's `happenings_log` table so
+    /// fresh emits never collide with rows that survived a previous
+    /// run.
+    pub async fn with_persistence(
+        persistence: Arc<dyn PersistenceStore>,
+    ) -> Result<Self, crate::persistence::PersistenceError> {
+        Self::with_persistence_and_capacity(persistence, DEFAULT_CAPACITY).await
+    }
+
+    /// Like [`Self::with_persistence`] but with a custom broadcast
+    /// capacity.
+    pub async fn with_persistence_and_capacity(
+        persistence: Arc<dyn PersistenceStore>,
+        capacity: usize,
+    ) -> Result<Self, crate::persistence::PersistenceError> {
+        let max = persistence.load_max_happening_seq().await?;
+        let (tx, _) = broadcast::channel(capacity);
+        Ok(Self {
+            tx,
+            next_seq: AtomicU64::new(max.saturating_add(1)),
+            persistence: Some(persistence),
+        })
+    }
+
+    /// Emit a happening live, without write-through.
     ///
     /// Fire-and-forget: if no receivers are currently subscribed,
-    /// the happening is dropped silently. This is by design; the
-    /// ledger is the source of truth for current state and
-    /// happenings are a live notification surface.
+    /// the happening is dropped silently. The seq counter still
+    /// advances so the cursor remains contiguous with future
+    /// durable emits.
     ///
-    /// Does not block.
-    pub fn emit(&self, happening: Happening) {
+    /// Use [`Self::emit_durable`] when a [`PersistenceStore`] handle
+    /// is available; reserve this entry point for boot-time
+    /// happenings that fire before the store opens, or for tests
+    /// that do not exercise the durability surface.
+    ///
+    /// Does not block. Returns the minted seq for diagnostic use.
+    pub fn emit(&self, happening: Happening) -> u64 {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         // send() returns Err(SendError(Happening)) only when no
         // receivers exist. Expected and fine.
         let _ = self.tx.send(happening);
+        seq
+    }
+
+    /// Emit a happening with write-through to `happenings_log` per
+    /// ADR-0017.
+    ///
+    /// Mints the next seq, serialises the happening to JSON, calls
+    /// [`PersistenceStore::record_happening`], and finally
+    /// broadcasts the happening to live subscribers. The persist
+    /// happens before the broadcast so a subscriber that immediately
+    /// records the seq it saw can never observe a seq for which the
+    /// row is missing on disk.
+    ///
+    /// Returns the minted seq on success. Persistence failures
+    /// surface as `Err` and the happening is **not** broadcast — the
+    /// caller decides whether to treat the failure as fatal (the
+    /// steward's hot path treats persistence errors as fatal per
+    /// `PERSISTENCE.md` §4.4).
+    ///
+    /// Falls back to a non-durable emit (with a warning trace) when
+    /// the bus has no persistence handle. This preserves
+    /// compatibility with bus instances built via [`Self::new`] /
+    /// [`Self::with_capacity`] for tests.
+    pub async fn emit_durable(
+        &self,
+        happening: Happening,
+    ) -> Result<u64, crate::persistence::PersistenceError> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            tracing::warn!(
+                "emit_durable called on a non-durable bus; falling back to \
+                 transient emit"
+            );
+            return Ok(self.emit(happening));
+        };
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let payload = serde_json::to_value(&happening).map_err(|e| {
+            crate::persistence::PersistenceError::Invalid(format!(
+                "serialising Happening for happenings_log: {e}"
+            ))
+        })?;
+        let kind = happening_kind_str(&happening);
+        let at_ms = system_time_to_ms(SystemTime::now());
+        persistence
+            .record_happening(seq, kind, &payload, at_ms)
+            .await?;
+        let _ = self.tx.send(happening);
+        Ok(seq)
     }
 
     /// Subscribe to happenings.
@@ -889,7 +1006,9 @@ impl HappeningBus {
     /// Handle `RecvError::Lagged(n)` from recv to detect that the
     /// subscriber fell behind and lost `n` happenings. Recovery is
     /// caller-specific; typically the caller re-queries the ledger
-    /// for current state and resumes consuming.
+    /// for current state and resumes consuming, or queries
+    /// [`PersistenceStore::load_happenings_since`] when a durable
+    /// bus is in use.
     pub fn subscribe(&self) -> broadcast::Receiver<Happening> {
         self.tx.subscribe()
     }
@@ -900,6 +1019,59 @@ impl HappeningBus {
     /// not receivers exist.
     pub fn receiver_count(&self) -> usize {
         self.tx.receiver_count()
+    }
+
+    /// Last seq value the bus would mint on the next emit (i.e.
+    /// `next_seq` minus one if any have been emitted, else 0).
+    /// Diagnostic-only; consumer cursors should come from the
+    /// frame they actually observed.
+    pub fn last_emitted_seq(&self) -> u64 {
+        self.next_seq.load(Ordering::Relaxed).saturating_sub(1)
+    }
+}
+
+/// Convert a `SystemTime` to milliseconds since the UNIX epoch.
+fn system_time_to_ms(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Variant tag string for a [`Happening`], matching the serde
+/// `type` field of the tagged form. Used as `happenings_log.kind`
+/// for filtered queries without parsing the full payload.
+fn happening_kind_str(h: &Happening) -> &'static str {
+    match h {
+        Happening::CustodyTaken { .. } => "custody_taken",
+        Happening::CustodyReleased { .. } => "custody_released",
+        Happening::CustodyStateReported { .. } => "custody_state_reported",
+        Happening::RelationCardinalityViolation { .. } => {
+            "relation_cardinality_violation"
+        }
+        Happening::SubjectForgotten { .. } => "subject_forgotten",
+        Happening::RelationForgotten { .. } => "relation_forgotten",
+        Happening::SubjectAddressingForcedRetract { .. } => {
+            "subject_addressing_forced_retract"
+        }
+        Happening::RelationClaimForcedRetract { .. } => {
+            "relation_claim_forced_retract"
+        }
+        Happening::SubjectMerged { .. } => "subject_merged",
+        Happening::SubjectSplit { .. } => "subject_split",
+        Happening::RelationSplitAmbiguous { .. } => "relation_split_ambiguous",
+        Happening::RelationSuppressed { .. } => "relation_suppressed",
+        Happening::RelationUnsuppressed { .. } => "relation_unsuppressed",
+        Happening::RelationSuppressionReasonUpdated { .. } => {
+            "relation_suppression_reason_updated"
+        }
+        Happening::RelationRewritten { .. } => "relation_rewritten",
+        Happening::RelationCardinalityViolatedPostRewrite { .. } => {
+            "relation_cardinality_violated_post_rewrite"
+        }
+        Happening::ClaimReassigned { .. } => "claim_reassigned",
+        Happening::RelationClaimSuppressionCollapsed { .. } => {
+            "relation_claim_suppression_collapsed"
+        }
     }
 }
 
@@ -1226,5 +1398,86 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    // ---- Wave 2.5: durable cursor (ADR-0017) -----------------------------
+
+    #[tokio::test]
+    async fn emit_durable_writes_through_and_broadcasts() {
+        let store: Arc<dyn PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        let bus = HappeningBus::with_persistence(Arc::clone(&store))
+            .await
+            .expect("seed bus");
+        let mut rx = bus.subscribe();
+
+        let seq = bus
+            .emit_durable(sample_taken())
+            .await
+            .expect("emit_durable");
+        assert_eq!(seq, 1, "fresh bus mints seq 1 first");
+
+        // Live subscriber received the broadcast.
+        let live = rx.recv().await.unwrap();
+        assert!(matches!(live, Happening::CustodyTaken { .. }));
+
+        // Persisted exactly one row at seq 1, with the right kind.
+        let rows = store.load_happenings_since(0, u32::MAX).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].seq, 1);
+        assert_eq!(rows[0].kind, "custody_taken");
+        assert_eq!(rows[0].payload["type"], "custody_taken");
+    }
+
+    #[tokio::test]
+    async fn emit_durable_seq_seeded_from_persistence_max() {
+        let store: Arc<dyn PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        // Pre-populate the store with seqs 1..=4 to simulate a
+        // previous run.
+        for seq in 1u64..=4 {
+            store
+                .record_happening(
+                    seq,
+                    "custody_taken",
+                    &serde_json::json!({"type": "custody_taken"}),
+                    seq * 100,
+                )
+                .await
+                .unwrap();
+        }
+        let bus = HappeningBus::with_persistence(Arc::clone(&store))
+            .await
+            .expect("seed bus from existing rows");
+
+        // First fresh emit must mint seq 5, not collide with the
+        // pre-existing 1..=4.
+        let seq = bus.emit_durable(sample_taken()).await.unwrap();
+        assert_eq!(seq, 5, "bus seq must continue past on-disk max");
+    }
+
+    #[tokio::test]
+    async fn emit_durable_falls_back_when_no_persistence() {
+        let bus = HappeningBus::new();
+        let mut rx = bus.subscribe();
+        // Bus has no persistence handle. emit_durable falls back to
+        // a transient emit (warn-traced).
+        let seq = bus
+            .emit_durable(sample_released("h-fallback"))
+            .await
+            .expect("fallback emit");
+        assert!(seq > 0);
+        let live = rx.recv().await.unwrap();
+        assert!(matches!(live, Happening::CustodyReleased { .. }));
+    }
+
+    #[tokio::test]
+    async fn emit_increments_seq_even_without_persistence() {
+        let bus = HappeningBus::new();
+        let s1 = bus.emit(sample_taken());
+        let s2 = bus.emit(sample_released("h"));
+        assert_eq!(s1, 1);
+        assert_eq!(s2, 2);
+        assert_eq!(bus.last_emitted_seq(), 2);
     }
 }

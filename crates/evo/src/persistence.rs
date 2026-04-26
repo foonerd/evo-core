@@ -58,11 +58,21 @@ use evo_plugin_sdk::contract::{
 
 /// Initial schema version: subject-identity slice.
 ///
-/// Subsequent phases append migrations: v2 will introduce the
-/// relation graph, v3 the custody ledger, v4 the admin ledger. The
-/// numbering is reserved here so later phases extend the migration
-/// list without renumbering.
+/// Subsequent phases append migrations: v2 happenings (this slice,
+/// ADR-0017 cursor durability), v3 the relation graph, v4 the
+/// custody ledger, v5 the admin ledger. The numbering is reserved
+/// here so later phases extend the migration list without renumbering.
 pub const SCHEMA_VERSION_SUBJECT_IDENTITY: u32 = 1;
+
+/// Schema version: happenings durable cursor (ADR-0017).
+///
+/// Adds the `happenings_log` table: a monotonically-keyed audit
+/// stream of every fabric transition, written through by
+/// [`HappeningBus`](crate::happenings::HappeningBus) on each
+/// `emit`. The cursor query
+/// [`PersistenceStore::load_happenings_since`] supports replay of
+/// missed events for consumers that disconnected and reconnected.
+pub const SCHEMA_VERSION_HAPPENINGS: u32 = 2;
 
 /// Maximum schema version this build of the steward understands.
 ///
@@ -71,13 +81,17 @@ pub const SCHEMA_VERSION_SUBJECT_IDENTITY: u32 = 1;
 /// than this constant. Downgrades are not supported; an operator
 /// running an older steward against a newer database must restore
 /// from a pre-upgrade backup.
-pub const SUPPORTED_SCHEMA_VERSION: u32 = SCHEMA_VERSION_SUBJECT_IDENTITY;
+pub const SUPPORTED_SCHEMA_VERSION: u32 = SCHEMA_VERSION_HAPPENINGS;
 
 /// SQL text of the initial migration. Embedded at build time so the
 /// schema is part of the binary; running on a fresh database does
 /// not require the source tree to be present.
 const MIGRATION_001_INITIAL: &str =
     include_str!("../migrations/001_initial.sql");
+
+/// SQL text of the v2 migration: happenings audit stream.
+const MIGRATION_002_HAPPENINGS: &str =
+    include_str!("../migrations/002_happenings.sql");
 
 /// Errors raised by the persistence layer.
 ///
@@ -255,6 +269,30 @@ pub struct PersistedAlias {
     /// Optional operator-supplied reason at the time of the
     /// admin operation.
     pub reason: Option<String>,
+}
+
+/// One row of the `happenings_log` table (ADR-0017).
+///
+/// Carries the cursor `seq`, the variant tag, the full happening
+/// payload as opaque JSON, and the wall-clock timestamp. Returned
+/// by [`PersistenceStore::load_happenings_since`] in ascending
+/// `seq` order; consumers reconnecting after a transient drop
+/// replay missed events by passing their last-acknowledged seq.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedHappening {
+    /// Monotonic sequence number, unique within one steward
+    /// installation. Used as the consumer's cursor.
+    pub seq: u64,
+    /// Variant tag (`type` field of the serde-tagged
+    /// [`crate::happenings::Happening`] form, e.g.
+    /// `"subject_forgotten"` or `"relation_cardinality_violation"`).
+    pub kind: String,
+    /// Full happening payload as JSON. Shape is the serde-default
+    /// tagged form of [`crate::happenings::Happening`]; consumers
+    /// MUST tolerate the `#[non_exhaustive]` invariant.
+    pub payload: serde_json::Value,
+    /// Wall-clock millisecond timestamp the bus minted on emit.
+    pub at_ms: u64,
 }
 
 /// One provenance entry to write into `claim_log` alongside the
@@ -538,6 +576,47 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
                 + 'a,
         >,
     >;
+
+    /// Append one happening to the `happenings_log` table (ADR-0017).
+    ///
+    /// `seq` is the bus's monotonic cursor minted at emit time;
+    /// `kind` is the `type` tag of the serde-tagged happening (e.g.
+    /// `"subject_forgotten"`); `payload` is the full happening
+    /// serialised as JSON; `at_ms` is the wall-clock emission time.
+    /// The backend stores the row as a single `INSERT` and respects
+    /// the connection-level `synchronous = FULL` pragma so the
+    /// happening is durable before the call returns.
+    fn record_happening<'a>(
+        &'a self,
+        seq: u64,
+        kind: &'a str,
+        payload: &'a serde_json::Value,
+        at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Load every happening with `seq > cursor`, in ascending `seq`
+    /// order. Capped to `limit` rows; passing `u32::MAX` yields the
+    /// entire missed window. Returns an empty `Vec` when the
+    /// consumer is fully caught up.
+    fn load_happenings_since<'a>(
+        &'a self,
+        cursor: u64,
+        limit: u32,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Vec<PersistedHappening>, PersistenceError>,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+    /// Return the largest `seq` currently in `happenings_log`, or
+    /// `0` if the table is empty. Used at boot to seed the bus's
+    /// monotonic counter so seqs continue to grow across restart.
+    fn load_max_happening_seq<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>;
 }
 
 /// Claim-log kind values used by this slice. Strings are stable
@@ -615,6 +694,15 @@ fn run_migrations(conn: &mut Connection) -> Result<(), PersistenceError> {
         conn.execute_batch(MIGRATION_001_INITIAL).map_err(|e| {
             PersistenceError::MigrationFailed {
                 version: SCHEMA_VERSION_SUBJECT_IDENTITY,
+                source: e,
+            }
+        })?;
+    }
+
+    if current < SCHEMA_VERSION_HAPPENINGS {
+        conn.execute_batch(MIGRATION_002_HAPPENINGS).map_err(|e| {
+            PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_HAPPENINGS,
                 source: e,
             }
         })?;
@@ -1241,6 +1329,57 @@ fn load_all_subjects_query(
     Ok(subjects)
 }
 
+fn load_happenings_since_query(
+    conn: &Connection,
+    cursor: u64,
+    limit: u32,
+) -> Result<Vec<PersistedHappening>, PersistenceError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT seq, kind, payload, at_ms FROM happenings_log \
+             WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
+        )
+        .map_err(|e| {
+            PersistenceError::sqlite("prepare happenings_log query", e)
+        })?;
+
+    let rows = stmt
+        .query_map(params![cursor as i64, limit as i64], |row| {
+            let seq: i64 = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let payload_str: String = row.get(2)?;
+            let at_ms: i64 = row.get(3)?;
+            let payload: serde_json::Value = serde_json::from_str(&payload_str)
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("happenings_log.payload not JSON: {e}"),
+                        )),
+                    )
+                })?;
+            Ok(PersistedHappening {
+                seq: seq as u64,
+                kind,
+                payload,
+                at_ms: at_ms as u64,
+            })
+        })
+        .map_err(|e| {
+            PersistenceError::sqlite("execute happenings_log query", e)
+        })?;
+
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| {
+            PersistenceError::sqlite("read happenings_log row", e)
+        })?);
+    }
+    Ok(out)
+}
+
 fn load_aliases_for_query(
     conn: &Connection,
     canonical_id: &str,
@@ -1450,6 +1589,76 @@ impl PersistenceStore for SqlitePersistenceStore {
             .await
         })
     }
+
+    fn record_happening<'a>(
+        &'a self,
+        seq: u64,
+        kind: &'a str,
+        payload: &'a serde_json::Value,
+        at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let kind = kind.to_string();
+        let payload_str = payload.to_string();
+        Box::pin(async move {
+            self.interact("record_happening", move |conn| {
+                conn.execute(
+                    "INSERT INTO happenings_log (seq, kind, payload, at_ms) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![seq as i64, kind, payload_str, at_ms as i64],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("insert happenings_log", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn load_happenings_since<'a>(
+        &'a self,
+        cursor: u64,
+        limit: u32,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Vec<PersistedHappening>, PersistenceError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("load_happenings_since", move |conn| {
+                load_happenings_since_query(conn, cursor, limit)
+            })
+            .await
+        })
+    }
+
+    fn load_max_happening_seq<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.interact("load_max_happening_seq", |conn| {
+                let max: Option<i64> = conn
+                    .query_row(
+                        "SELECT MAX(seq) FROM happenings_log",
+                        [],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "select MAX(seq) from happenings_log",
+                            e,
+                        )
+                    })?;
+                Ok(max.unwrap_or(0).max(0) as u64)
+            })
+            .await
+        })
+    }
 }
 
 /// In-memory mock implementation of [`PersistenceStore`].
@@ -1476,6 +1685,9 @@ struct MemoryState {
     /// callers do not query this; it exists so the mock stays
     /// faithful to the trait's "every operation appends" promise.
     claim_log: Vec<MemoryClaimEntry>,
+    /// Append-only mirror of `happenings_log`. Tests query this
+    /// via [`PersistenceStore::load_happenings_since`].
+    happenings: Vec<PersistedHappening>,
 }
 
 #[derive(Debug, Clone)]
@@ -1815,6 +2027,62 @@ impl PersistenceStore for MemoryPersistenceStore {
             Ok(out)
         })
     }
+
+    fn record_happening<'a>(
+        &'a self,
+        seq: u64,
+        kind: &'a str,
+        payload: &'a serde_json::Value,
+        at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            g.happenings.push(PersistedHappening {
+                seq,
+                kind: kind.to_string(),
+                payload: payload.clone(),
+                at_ms,
+            });
+            Ok(())
+        })
+    }
+
+    fn load_happenings_since<'a>(
+        &'a self,
+        cursor: u64,
+        limit: u32,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Vec<PersistedHappening>, PersistenceError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            let mut out: Vec<PersistedHappening> = g
+                .happenings
+                .iter()
+                .filter(|h| h.seq > cursor)
+                .take(limit as usize)
+                .cloned()
+                .collect();
+            out.sort_by_key(|h| h.seq);
+            Ok(out)
+        })
+    }
+
+    fn load_max_happening_seq<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            Ok(g.happenings.iter().map(|h| h.seq).max().unwrap_or(0))
+        })
+    }
 }
 
 /// Convenience: test fixture builder for code that needs an
@@ -1974,11 +2242,12 @@ mod tests {
     #[tokio::test]
     async fn sqlite_open_creates_database_file_with_schema() {
         let (_dir, store) = open_temp();
-        // Open a side connection and confirm the schema_version
-        // table is at v1.
+        // Open a side connection and confirm migrations have been
+        // applied up to the current SUPPORTED_SCHEMA_VERSION (v1
+        // subject identity, v2 happenings durable cursor).
         let conn = Connection::open(store.path()).expect("side open");
         let v = current_schema_version(&conn).expect("read version");
-        assert_eq!(v, SCHEMA_VERSION_SUBJECT_IDENTITY);
+        assert_eq!(v, SUPPORTED_SCHEMA_VERSION);
     }
 
     #[tokio::test]
@@ -2673,5 +2942,109 @@ mod tests {
             })
             .await;
         assert!(matches!(r, Err(PersistenceError::Invalid(_))));
+    }
+
+    // --- Wave 2.5: happenings durable cursor (ADR-0017) -------------------
+
+    fn happening_payload(seq_marker: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "subject_forgotten",
+            "subject_id": format!("uuid-{seq_marker}"),
+            "subject_type": "track",
+            "addressings": [],
+            "at": null,
+        })
+    }
+
+    #[tokio::test]
+    async fn memory_happening_round_trip_and_load_since() {
+        let s = MemoryPersistenceStore::new();
+        s.record_happening(1, "subject_forgotten", &happening_payload(1), 100)
+            .await
+            .unwrap();
+        s.record_happening(2, "subject_forgotten", &happening_payload(2), 200)
+            .await
+            .unwrap();
+        s.record_happening(3, "subject_forgotten", &happening_payload(3), 300)
+            .await
+            .unwrap();
+
+        // Cursor at 1 => return seqs 2 and 3 in order.
+        let mid = s.load_happenings_since(1, u32::MAX).await.unwrap();
+        assert_eq!(mid.len(), 2);
+        assert_eq!(mid[0].seq, 2);
+        assert_eq!(mid[0].kind, "subject_forgotten");
+        assert_eq!(mid[0].at_ms, 200);
+        assert_eq!(mid[1].seq, 3);
+
+        // Cursor at the head returns nothing.
+        let head = s.load_happenings_since(3, u32::MAX).await.unwrap();
+        assert!(head.is_empty());
+
+        // Limit honoured.
+        let one = s.load_happenings_since(0, 1).await.unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].seq, 1);
+
+        // Max-seq lookup.
+        let max = s.load_max_happening_seq().await.unwrap();
+        assert_eq!(max, 3);
+    }
+
+    #[tokio::test]
+    async fn memory_max_happening_seq_is_zero_on_empty() {
+        let s = MemoryPersistenceStore::new();
+        let max = s.load_max_happening_seq().await.unwrap();
+        assert_eq!(max, 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_happening_round_trip_payload_preserves_json_shape() {
+        let (_dir, store) = open_temp();
+        let payload = happening_payload(42);
+        store
+            .record_happening(1, "subject_forgotten", &payload, 1000)
+            .await
+            .unwrap();
+
+        let loaded = store.load_happenings_since(0, u32::MAX).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].seq, 1);
+        assert_eq!(loaded[0].kind, "subject_forgotten");
+        assert_eq!(loaded[0].at_ms, 1000);
+        assert_eq!(loaded[0].payload, payload);
+    }
+
+    #[tokio::test]
+    async fn sqlite_happening_seq_uniqueness_enforced() {
+        let (_dir, store) = open_temp();
+        store
+            .record_happening(7, "subject_forgotten", &happening_payload(7), 1)
+            .await
+            .unwrap();
+        // Re-using seq=7 is a primary-key violation.
+        let r = store
+            .record_happening(7, "subject_forgotten", &happening_payload(8), 2)
+            .await;
+        assert!(matches!(r, Err(PersistenceError::Sqlite { .. })));
+    }
+
+    #[tokio::test]
+    async fn sqlite_max_happening_seq_round_trip() {
+        let (_dir, store) = open_temp();
+        for seq in [3u64, 1, 4, 1, 5, 9, 2, 6] {
+            // 1 is repeated; the second call collides on the unique
+            // primary key. Use distinct seqs for the actual emit.
+            let _ = store
+                .record_happening(
+                    seq,
+                    "subject_forgotten",
+                    &happening_payload(seq),
+                    seq * 10,
+                )
+                .await;
+        }
+        let max = store.load_max_happening_seq().await.unwrap();
+        assert_eq!(max, 9);
     }
 }
