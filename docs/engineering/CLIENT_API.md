@@ -65,6 +65,7 @@ Five operations. Four are synchronous request/response; one is streaming.
 | `describe_alias` | Request / response | Resolve a canonical subject ID to its alias record, alias chain, or current subject. |
 | `list_active_custodies` | Request / response | Snapshot the custody ledger. |
 | `subscribe_happenings` | Streaming | Stream every happening the bus emits. |
+| `describe_capabilities` | Request / response | Discover the steward's supported ops and named features. |
 
 Every request carries an `op` discriminator.
 
@@ -477,6 +478,52 @@ The `Happening` enum is `#[non_exhaustive]`; consumers MUST tolerate unknown `ty
 `lagged` carries the number of happenings dropped. Subscribers recover by re-querying the authoritative store (the ledger for custody) and continuing to consume.
 
 The subscription ends when the client closes the connection. There is no explicit unsubscribe frame.
+
+### 4.6 `op = "describe_capabilities"`
+
+Probe the steward's supported ops and named features. Designed for runtime negotiation: a consumer that targets multiple steward versions calls this once on connect, then conditions its behaviour on what is advertised rather than hardcoding compatibility.
+
+Request:
+
+```json
+{ "op": "describe_capabilities" }
+```
+
+Response:
+
+```json
+{
+  "capabilities": true,
+  "wire_version": 1,
+  "ops": [
+    "request",
+    "project_subject",
+    "describe_alias",
+    "list_active_custodies",
+    "subscribe_happenings",
+    "describe_capabilities"
+  ],
+  "features": [
+    "subscribe_happenings_cursor",
+    "alias_chain_walking",
+    "active_custodies_snapshot"
+  ]
+}
+```
+
+`wire_version` is bumped only on incompatible changes. Adding a new op or a new feature does NOT bump it; consumers MUST tolerate unknown entries in `ops` and `features` (they are additive).
+
+`ops` lists every op this build accepts. Order is stable.
+
+`features` lists named capabilities a consumer can probe before relying on:
+
+| Feature | Meaning |
+| --- | --- |
+| `subscribe_happenings_cursor` | The `since` parameter on `subscribe_happenings`, `current_seq` on the ack, and `seq` on every streamed `Happening` frame are honoured (ADR-0017). |
+| `alias_chain_walking` | `op = "describe_alias"` and the alias-aware variants of `op = "project_subject"` are present. |
+| `active_custodies_snapshot` | `op = "list_active_custodies"` returns the full ledger snapshot. |
+
+A consumer that requires a feature absent from the response MUST fall back to pre-feature behaviour or fail explicitly; silent assumption that the feature is honoured is a bug.
 
 ## 5. Error Handling
 

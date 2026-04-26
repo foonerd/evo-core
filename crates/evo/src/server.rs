@@ -255,6 +255,20 @@ enum ClientRequest {
     /// Snapshot the custody ledger - every currently-held custody the
     /// steward has recorded. No fields; v0 returns everything.
     ListActiveCustodies,
+    /// Capability discovery (Wave 2.2).
+    ///
+    /// Returns the wire version, list of supported ops, and a list
+    /// of named features (e.g. `subscribe_happenings_cursor` for the
+    /// ADR-0017 replay surface). Consumers SHOULD call this once on
+    /// connect so they can negotiate behaviour at runtime instead of
+    /// hardcoding compatibility against a specific steward build.
+    ///
+    /// The op set and feature names are stable; new capabilities are
+    /// added (never removed) as the steward grows. A consumer that
+    /// observes a capability not in its known list MAY ignore it; a
+    /// consumer that expects a capability not in the response MUST
+    /// fall back to the pre-capability behaviour or fail.
+    DescribeCapabilities,
     /// Subscribe to the happenings bus. Promotes the connection to
     /// streaming mode; see module-level docs for the sequence of
     /// frames the server emits.
@@ -412,6 +426,26 @@ enum ClientResponse {
         /// Every currently-held custody in the steward's ledger.
         /// Order is unspecified (the ledger is a HashMap).
         active_custodies: Vec<CustodyRecordWire>,
+    },
+    /// Capability discovery response.
+    ///
+    /// Distinguished by the top-level `capabilities` key. Carries
+    /// the wire version, the supported op set, and the named feature
+    /// list (see [`ClientRequest::DescribeCapabilities`]).
+    Capabilities {
+        /// Always `true`; the distinctive top-level key for this
+        /// variant under untagged disambiguation.
+        capabilities: bool,
+        /// Wire-protocol version. Bumped on incompatible changes.
+        wire_version: u16,
+        /// Names of supported ops. Stable across releases — new ops
+        /// are appended; existing ops are never renamed or removed
+        /// without a wire version bump.
+        ops: Vec<&'static str>,
+        /// Named features. A consumer probes for `"feature_name"` in
+        /// this list to decide whether to use the corresponding
+        /// behaviour. Names are stable.
+        features: Vec<&'static str>,
     },
     /// Subscription acknowledgement. Written once, immediately after
     /// the server accepts a `subscribe_happenings` op and has
@@ -1694,6 +1728,7 @@ async fn dispatch_request(
         ClientRequest::ListActiveCustodies => {
             handle_list_active_custodies(state).await
         }
+        ClientRequest::DescribeCapabilities => describe_capabilities(),
         ClientRequest::SubscribeHappenings { .. } => {
             // Intercepted in handle_connection; should not reach here.
             // Defensive: surface an error rather than panicking in case
@@ -2102,6 +2137,61 @@ async fn handle_list_active_custodies(
         .map(Into::into)
         .collect();
     ClientResponse::ActiveCustodies { active_custodies }
+}
+
+/// Wire version reported by `op = "describe_capabilities"`.
+///
+/// Bumped when an existing op or response shape changes
+/// incompatibly. Adding a new op or feature does NOT bump this.
+const CLIENT_WIRE_VERSION: u16 = 1;
+
+/// Op names this build accepts on the client socket.
+///
+/// Stable across releases — new ops are appended; existing ops are
+/// never renamed or removed without bumping
+/// [`CLIENT_WIRE_VERSION`]. Mirrors the variant set in
+/// [`ClientRequest`].
+const SUPPORTED_OPS: &[&str] = &[
+    "request",
+    "project_subject",
+    "describe_alias",
+    "list_active_custodies",
+    "subscribe_happenings",
+    "describe_capabilities",
+];
+
+/// Named features this build supports.
+///
+/// A consumer probes for a name in this list to decide whether to
+/// rely on the corresponding behaviour:
+///
+/// - `subscribe_happenings_cursor`: ADR-0017 cursor surface — the
+///   `since` parameter on `subscribe_happenings`, `current_seq` on
+///   the ack, and `seq` on every streamed `Happening` frame.
+/// - `alias_chain_walking`: `op = "describe_alias"` and the
+///   alias-aware variants of `op = "project_subject"`.
+/// - `active_custodies_snapshot`: `op = "list_active_custodies"`
+///   returns the full ledger.
+///
+/// Names are stable; new features are appended.
+const SUPPORTED_FEATURES: &[&str] = &[
+    "subscribe_happenings_cursor",
+    "alias_chain_walking",
+    "active_custodies_snapshot",
+];
+
+/// Build the capability discovery response.
+///
+/// Centralises the constant-list shape so tests can assert against
+/// a single source of truth and consumers see a deterministic
+/// response.
+fn describe_capabilities() -> ClientResponse {
+    ClientResponse::Capabilities {
+        capabilities: true,
+        wire_version: CLIENT_WIRE_VERSION,
+        ops: SUPPORTED_OPS.to_vec(),
+        features: SUPPORTED_FEATURES.to_vec(),
+    }
 }
 
 #[cfg(test)]
@@ -2611,6 +2701,70 @@ mod tests {
     // The streaming flow itself is covered by the end-to-end
     // integration test in tests/end_to_end.rs.
     // -----------------------------------------------------------------
+
+    #[test]
+    fn client_request_parses_describe_capabilities() {
+        let json = r#"{"op":"describe_capabilities"}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(r, ClientRequest::DescribeCapabilities));
+    }
+
+    #[test]
+    fn describe_capabilities_response_shape_is_stable() {
+        let r = describe_capabilities();
+        let s = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["capabilities"].as_bool(), Some(true));
+        assert_eq!(v["wire_version"].as_u64(), Some(1));
+
+        // Op set must include every dispatchable op so consumers can
+        // probe before invoking. Order is stable (matches the
+        // SUPPORTED_OPS constant).
+        let ops: Vec<&str> = v["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        for expected in [
+            "request",
+            "project_subject",
+            "describe_alias",
+            "list_active_custodies",
+            "subscribe_happenings",
+            "describe_capabilities",
+        ] {
+            assert!(
+                ops.contains(&expected),
+                "op {expected:?} missing from capabilities; got {ops:?}"
+            );
+        }
+
+        // Feature names callers depend on for runtime probing must
+        // be present.
+        let features: Vec<&str> = v["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert!(features.contains(&"subscribe_happenings_cursor"));
+        assert!(features.contains(&"alias_chain_walking"));
+    }
+
+    #[test]
+    fn capabilities_response_distinguishable_from_other_variants() {
+        // The untagged-enum disambiguation relies on the top-level
+        // `capabilities` key being unique to this variant.
+        let r = describe_capabilities();
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"capabilities\""));
+        assert!(!s.contains("\"payload_b64\""));
+        assert!(!s.contains("\"subscribed\""));
+        assert!(!s.contains("\"active_custodies\""));
+        assert!(!s.contains("\"happening\""));
+        assert!(!s.contains("\"error\""));
+    }
 
     #[test]
     fn client_request_parses_subscribe_happenings() {

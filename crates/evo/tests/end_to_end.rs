@@ -755,6 +755,77 @@ async fn subscribe_happenings_delivers_ack_and_events() {
 }
 
 #[tokio::test]
+async fn describe_capabilities_returns_stable_op_and_feature_lists() {
+    // Wave 2.2: capability discovery surface. Consumers SHOULD call
+    // this once on connect and feature-probe before invoking ops
+    // that may not be present on older steward builds. The op set
+    // and feature names are stable (additive only); this test pins
+    // the contract so a refactor that drops a name fails loud.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+    write_frame(&mut stream, br#"{"op":"describe_capabilities"}"#).await;
+
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["capabilities"].as_bool(), Some(true));
+    assert_eq!(v["wire_version"].as_u64(), Some(1));
+
+    let ops: Vec<&str> = v["ops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    for expected in [
+        "request",
+        "project_subject",
+        "describe_alias",
+        "list_active_custodies",
+        "subscribe_happenings",
+        "describe_capabilities",
+    ] {
+        assert!(
+            ops.contains(&expected),
+            "op {expected:?} missing from capabilities response"
+        );
+    }
+
+    let features: Vec<&str> = v["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert!(
+        features.contains(&"subscribe_happenings_cursor"),
+        "subscribe_happenings_cursor must be advertised since the \
+         cursor surface is implemented"
+    );
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
 async fn subscribe_happenings_ack_carries_current_seq() {
     // Verifies the ADR-0017 cursor surface: the subscribe ack
     // exposes `current_seq` (the bus cursor at subscribe time), and
