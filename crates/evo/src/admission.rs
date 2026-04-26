@@ -23,6 +23,8 @@
 //! zero-allocation while letting the engine store heterogeneous
 //! plugins in a single collection.
 
+mod validation;
+
 use crate::admin::AdminLedger;
 use crate::catalogue::Catalogue;
 use crate::config::PluginsSecurityConfig;
@@ -47,11 +49,8 @@ use evo_plugin_sdk::contract::{
     Plugin, PluginDescription, PluginError, Request, Respondent, Response,
     Warden,
 };
-use evo_plugin_sdk::manifest::{
-    InstanceShape, InteractionShape, TransportKind,
-};
+use evo_plugin_sdk::manifest::{InteractionShape, TransportKind};
 use evo_plugin_sdk::Manifest;
-use evo_trust::ADMIN_MINIMUM_TRUST;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -509,8 +508,8 @@ impl AdmissionEngine {
         T: Respondent + 'static,
     {
         manifest.validate()?;
-        check_manifest_prerequisites(&manifest)?;
-        check_admin_trust(&manifest)?;
+        validation::check_manifest_prerequisites(&manifest)?;
+        validation::check_admin_trust(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
         let shelf = self
@@ -548,7 +547,7 @@ impl AdmissionEngine {
                 manifest.plugin.name, manifest.kind.interaction
             )));
         }
-        reject_factory_for_v0(&manifest)?;
+        validation::reject_factory_for_v0(&manifest)?;
 
         let mut handle = AdmittedHandle::Respondent(Box::new(
             RespondentAdapter::new(plugin),
@@ -634,8 +633,8 @@ impl AdmissionEngine {
         T: Warden + 'static,
     {
         manifest.validate()?;
-        check_manifest_prerequisites(&manifest)?;
-        check_admin_trust(&manifest)?;
+        validation::check_manifest_prerequisites(&manifest)?;
+        validation::check_admin_trust(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
         let shelf = self
@@ -673,7 +672,7 @@ impl AdmissionEngine {
                 manifest.plugin.name, manifest.kind.interaction
             )));
         }
-        reject_factory_for_v0(&manifest)?;
+        validation::reject_factory_for_v0(&manifest)?;
 
         let mut handle =
             AdmittedHandle::Warden(Box::new(WardenAdapter::new(plugin)));
@@ -773,8 +772,8 @@ impl AdmissionEngine {
         W: tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
         manifest.validate()?;
-        check_manifest_prerequisites(&manifest)?;
-        check_admin_trust(&manifest)?;
+        validation::check_manifest_prerequisites(&manifest)?;
+        validation::check_admin_trust(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
         let shelf = self
@@ -812,7 +811,7 @@ impl AdmissionEngine {
                 manifest.plugin.name, manifest.kind.interaction
             )));
         }
-        reject_factory_for_v0(&manifest)?;
+        validation::reject_factory_for_v0(&manifest)?;
 
         // Connect and eagerly describe. If either the connection or
         // the initial describe fails we return here with no partial
@@ -917,8 +916,8 @@ impl AdmissionEngine {
         W: tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
         manifest.validate()?;
-        check_manifest_prerequisites(&manifest)?;
-        check_admin_trust(&manifest)?;
+        validation::check_manifest_prerequisites(&manifest)?;
+        validation::check_admin_trust(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
         let shelf = self
@@ -956,7 +955,7 @@ impl AdmissionEngine {
                 manifest.plugin.name, manifest.kind.interaction
             )));
         }
-        reject_factory_for_v0(&manifest)?;
+        validation::reject_factory_for_v0(&manifest)?;
 
         // Connect and eagerly describe. Hands the shared custody
         // ledger and happenings bus to WireWarden so its load()
@@ -1097,7 +1096,7 @@ impl AdmissionEngine {
                 )
             })?;
         let mut manifest = Manifest::from_toml(&manifest_text)?;
-        check_manifest_prerequisites(&manifest)?;
+        validation::check_manifest_prerequisites(&manifest)?;
 
         // This entry point only handles out-of-process plugins. The
         // in-process path requires a concrete Rust type that cannot be
@@ -1830,101 +1829,13 @@ async fn wait_for_socket_ready(
     }
 }
 
-/// Enforce the in-scope half of `[prerequisites]` at admission.
-///
-/// Called from every `admit_*` entry point after `manifest.validate()`.
-/// Checks:
-/// - `evo_min_version` against the evo steward's own version (compiled
-///   in via `env!("CARGO_PKG_VERSION")`).
-/// - `os_family` against the host OS (`std::env::consts::OS`). The
-///   special value `"any"` always matches.
-///
-/// The remaining `[prerequisites]` and `[resources]` fields
-/// (`outbound_network`, `filesystem_scopes`, `max_memory_mb`,
-/// `max_cpu_percent`) are out of scope for core: they require
-/// distribution-owned machinery (cgroups, network namespaces, bind
-/// mounts). Those fields remain in the manifest so distributions
-/// can enforce them via systemd / image policy. See
-/// `PLUGIN_PACKAGING.md` section 2 ("Enforcement scope") for the
-/// split.
-fn check_manifest_prerequisites(
-    manifest: &Manifest,
-) -> Result<(), StewardError> {
-    // `unwrap_or_else` rather than `expect` so a bizarre crate
-    // version (e.g. "0.1.8+dirty" in a fork) gives a runnable error
-    // surface rather than a panic inside admission. In practice the
-    // workspace pins `version.workspace = true` to a clean semver.
-    let evo_version = match semver::Version::parse(env!("CARGO_PKG_VERSION")) {
-        Ok(v) => v,
-        Err(e) => {
-            return Err(StewardError::Admission(format!(
-                "evo's own CARGO_PKG_VERSION is not valid semver: {e}"
-            )));
-        }
-    };
-    manifest.check_prerequisites(&evo_version, std::env::consts::OS)?;
-    Ok(())
-}
-
-/// Enforce the admin-trust gate.
-///
-/// Called from every admit entry point AFTER
-/// [`check_manifest_prerequisites`] and any trust-degradation pass
-/// (for on-disk out-of-process admission) so the manifest's
-/// `trust.class` reflects the effective class, not just the
-/// declared one.
-///
-/// A plugin that declares `capabilities.admin = true` is refused
-/// with [`StewardError::AdminTrustTooLow`] when its effective
-/// class is above
-/// [`evo_trust::ADMIN_MINIMUM_TRUST`]. Recall that on
-/// [`TrustClass`](evo_plugin_sdk::manifest::TrustClass) lower
-/// ordinal = more privileged: `Platform` (0) is strictly more
-/// privileged than `Privileged` (1) which is strictly more
-/// privileged than `Standard` (2), and so on. `Platform` and
-/// `Privileged` qualify; `Standard` and below do not.
-///
-/// Plugins with `capabilities.admin = false` (the default) bypass
-/// this check entirely.
-fn check_admin_trust(manifest: &Manifest) -> Result<(), StewardError> {
-    if !manifest.capabilities.admin {
-        return Ok(());
-    }
-    let effective = manifest.trust.class;
-    if effective > ADMIN_MINIMUM_TRUST {
-        return Err(StewardError::AdminTrustTooLow {
-            plugin_name: manifest.plugin.name.clone(),
-            effective,
-            minimum: ADMIN_MINIMUM_TRUST,
-        });
-    }
-    Ok(())
-}
-
-/// Refuse Factory admission until the framework supports it.
-///
-/// Factory plugins (`kind.instance = "factory"`) emit instances at
-/// runtime; the steward has no live admission path for instance
-/// emission yet (GAP [4] is open). Until that lands, every admit
-/// path rejects Factory at admission time with a structured
-/// `StewardError::Admission`. Previously the gate sat in
-/// `plugin_discovery::discover` and silently skipped Factory
-/// manifests; that surface only covered the directory-scan path
-/// and operators got a `tracing::warn!` rather than a structured
-/// admission refusal. Moving the gate here closes both holes:
-/// every admit_* entry point now refuses, and every Rust caller
-/// observes the refusal as `Err`.
-fn reject_factory_for_v0(manifest: &Manifest) -> Result<(), StewardError> {
-    if manifest.kind.instance != InstanceShape::Singleton {
-        return Err(StewardError::Admission(format!(
-            "{}: factory plugins are not yet supported \
-             (kind.instance = {:?}); only Singleton is admissible \
-             in v0",
-            manifest.plugin.name, manifest.kind.instance
-        )));
-    }
-    Ok(())
-}
+// Pre-admission validation moved to `admission/validation.rs` per
+// ADR-0019 §6. Callers reference the helpers as
+// `validation::check_manifest_prerequisites`,
+// `validation::check_admin_trust`, and
+// `validation::reject_factory_for_v0`. Module-level rustdoc on
+// each helper (including the rationale block on the prerequisites
+// gate that previously lived here) moved with the implementations.
 
 /// Build a v0 LoadContext for a plugin.
 ///
