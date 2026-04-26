@@ -44,10 +44,43 @@ use crate::error::StewardError;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Lowest catalogue schema version this steward parses.
+///
+/// A catalogue document declaring `schema_version = N` is admissible
+/// only when `CATALOGUE_SCHEMA_MIN <= N <= CATALOGUE_SCHEMA_MAX`.
+/// Below this is a refusal at parse time; the steward will not
+/// auto-upgrade older documents.
+pub const CATALOGUE_SCHEMA_MIN: u32 = 1;
+
+/// Highest catalogue schema version this steward parses.
+///
+/// Schema bumps are integer-valued; a breaking grammar change
+/// (removed field, newly-required field, type narrowed, semantic
+/// shift) requires incrementing this constant. Additive changes
+/// (new optional field, new optional section) stay within the
+/// current schema version because parsers tolerate unknown fields.
+pub const CATALOGUE_SCHEMA_MAX: u32 = 1;
+
 /// A catalogue: the full set of racks, subject types, and relation
 /// predicates declared by the distribution.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+///
+/// Catalogue documents carry a top-level `schema_version` integer.
+/// This field is required at parse time; a document without it is
+/// rejected (see [`Catalogue::from_toml`]). The integer indexes a
+/// versioned grammar: distributions know which catalogue grammar
+/// they author against, and the steward declares the supported
+/// range via [`CATALOGUE_SCHEMA_MIN`] / [`CATALOGUE_SCHEMA_MAX`].
+/// Migration is forward-only — the steward never silently rewrites
+/// an operator-edited catalogue.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Catalogue {
+    /// Catalogue document schema version. Required at parse time
+    /// (no default); a missing field rejects with a structured
+    /// `Misconfiguration` error pointing at the catalogue path.
+    /// Must lie in `[CATALOGUE_SCHEMA_MIN, CATALOGUE_SCHEMA_MAX]`
+    /// at validation time. Distinct from per-shelf [`Shelf::shape`],
+    /// which versions a shelf's plugin contract.
+    pub schema_version: u32,
     /// Racks declared in this catalogue. Order is not semantically
     /// significant but is preserved for diagnostic stability.
     #[serde(default)]
@@ -64,6 +97,17 @@ pub struct Catalogue {
     /// `RELATIONS.md` section 3.
     #[serde(default, rename = "relation")]
     pub relations: Vec<RelationPredicate>,
+}
+
+impl Default for Catalogue {
+    fn default() -> Self {
+        Self {
+            schema_version: CATALOGUE_SCHEMA_MIN,
+            racks: Vec::new(),
+            subjects: Vec::new(),
+            relations: Vec::new(),
+        }
+    }
 }
 
 /// A rack: a concern, per `CONCEPT.md` section 4.
@@ -269,11 +313,35 @@ impl Catalogue {
     /// a distribution author can locate the problem in their
     /// catalogue file.
     pub fn validate(&self) -> Result<(), StewardError> {
+        self.validate_schema_version()?;
         self.validate_racks()?;
         self.validate_subjects()?;
         self.validate_relations()?;
         self.validate_relation_type_references()?;
         self.validate_inverses()?;
+        Ok(())
+    }
+
+    /// Reject documents whose declared `schema_version` is outside
+    /// the steward's supported range.
+    ///
+    /// The range is integer-valued and contiguous; the steward
+    /// supports every version in `[CATALOGUE_SCHEMA_MIN,
+    /// CATALOGUE_SCHEMA_MAX]` inclusive. Out-of-range is a hard
+    /// startup failure rather than a partial bring-up because the
+    /// catalogue is essence: a distribution authored against the
+    /// wrong grammar version produces silent feature loss the
+    /// operator cannot diagnose.
+    fn validate_schema_version(&self) -> Result<(), StewardError> {
+        if self.schema_version < CATALOGUE_SCHEMA_MIN
+            || self.schema_version > CATALOGUE_SCHEMA_MAX
+        {
+            return Err(StewardError::Catalogue(format!(
+                "catalogue schema_version {} is out of range; this \
+                 steward supports [{}, {}]",
+                self.schema_version, CATALOGUE_SCHEMA_MIN, CATALOGUE_SCHEMA_MAX,
+            )));
+        }
         Ok(())
     }
 
@@ -525,6 +593,8 @@ mod tests {
     use super::*;
 
     const MINIMAL: &str = r#"
+schema_version = 1
+
 [[racks]]
 name = "example"
 family = "domain"
@@ -573,6 +643,8 @@ description = "Echo test shelf."
     #[test]
     fn rejects_duplicate_rack_names() {
         let bad = r#"
+schema_version = 1
+
 [[racks]]
 name = "a"
 family = "domain"
@@ -598,6 +670,8 @@ charter = "two"
     #[test]
     fn rejects_duplicate_shelf_names() {
         let bad = r#"
+schema_version = 1
+
 [[racks]]
 name = "a"
 family = "domain"
@@ -626,6 +700,8 @@ shape = 2
     #[test]
     fn rejects_empty_rack_name() {
         let bad = r#"
+schema_version = 1
+
 [[racks]]
 name = ""
 family = "domain"
@@ -638,6 +714,8 @@ charter = "x"
     #[test]
     fn rejects_rack_name_with_dot() {
         let bad = r#"
+schema_version = 1
+
 [[racks]]
 name = "a.b"
 family = "domain"
@@ -656,11 +734,65 @@ charter = "x"
     }
 
     #[test]
-    fn empty_catalogue_is_valid() {
-        let c = Catalogue::from_toml("").unwrap();
+    fn schema_version_only_catalogue_is_valid() {
+        // A document declaring just `schema_version = 1` parses to an
+        // empty catalogue: no racks, no subject types, no relation
+        // predicates. This is the minimal admissible catalogue.
+        let c = Catalogue::from_toml("schema_version = 1").unwrap();
+        assert_eq!(c.schema_version, CATALOGUE_SCHEMA_MIN);
         assert!(c.racks.is_empty());
         assert!(c.subjects.is_empty());
         assert!(c.relations.is_empty());
+    }
+
+    #[test]
+    fn empty_document_is_rejected_for_missing_schema_version() {
+        // Truly empty TOML carries no `schema_version`; the parser
+        // refuses it because the field is required (no `serde(default)`)
+        // rather than silently defaulting to a version the steward did
+        // not promise to support.
+        let err = Catalogue::from_toml("").expect_err(
+            "empty document must be rejected for missing schema_version",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("schema_version"),
+            "error must mention the missing field, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn schema_version_above_max_is_rejected() {
+        // A catalogue declaring a schema_version above the steward's
+        // CATALOGUE_SCHEMA_MAX is rejected at validation time. This is
+        // the path a vN+1 distribution deployed against a vN steward
+        // takes; the failure must be explicit, not a silent partial
+        // bring-up.
+        let toml = format!("schema_version = {}", CATALOGUE_SCHEMA_MAX + 1);
+        let err = Catalogue::from_toml(&toml)
+            .expect_err("out-of-range schema_version must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("schema_version") && msg.contains("out of range"),
+            "error must name the offending field and the rejection \
+             reason, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn schema_version_below_min_is_rejected() {
+        // schema_version = 0 is below CATALOGUE_SCHEMA_MIN = 1. Same
+        // rejection path as above-max; the test pins the symmetric case
+        // so a future widening of the supported range cannot silently
+        // accept it.
+        let err = Catalogue::from_toml("schema_version = 0")
+            .expect_err("schema_version = 0 must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("schema_version") && msg.contains("out of range"),
+            "error must name the offending field and the rejection \
+             reason, got: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -670,6 +802,8 @@ charter = "x"
     #[test]
     fn parses_subject_type_declarations() {
         let toml = r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 description = "A playable audio item."
@@ -687,6 +821,8 @@ description = "A collection of tracks with shared metadata."
     #[test]
     fn find_subject_type_returns_declared() {
         let toml = r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 "#;
@@ -698,6 +834,8 @@ name = "track"
     #[test]
     fn rejects_duplicate_subject_types() {
         let bad = r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -720,6 +858,8 @@ name = "track"
     #[test]
     fn rejects_empty_subject_type_name() {
         let bad = r#"
+schema_version = 1
+
 [[subjects]]
 name = ""
 "#;
@@ -738,6 +878,8 @@ name = ""
     #[test]
     fn rejects_subject_type_name_with_dot() {
         let bad = r#"
+schema_version = 1
+
 [[subjects]]
 name = "foo.bar"
 "#;
@@ -758,6 +900,8 @@ name = "foo.bar"
         // `"*"` is reserved for predicate type constraints and may
         // not be a declared subject type.
         let bad = r#"
+schema_version = 1
+
 [[subjects]]
 name = "*"
 "#;
@@ -781,6 +925,8 @@ name = "*"
         // the type-reference check even though the predicate
         // structure is otherwise valid.
         let toml = r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -814,6 +960,8 @@ inverse = "album_of"
     #[test]
     fn parses_relation_predicate_with_multiple_types() {
         let toml = r#"
+schema_version = 1
+
 [[subjects]]
 name = "folder"
 
@@ -868,6 +1016,8 @@ target_type = ["folder", "archive"]
     #[test]
     fn cardinality_defaults_to_many() {
         let toml = r#"
+schema_version = 1
+
 [[subjects]]
 name = "t"
 
@@ -890,6 +1040,8 @@ target_type = "t"
         // validate() to check type references before dedup would
         // surface a different error and we would want to know.
         let toml = r#"
+schema_version = 1
+
 [[subjects]]
 name = "a"
 
@@ -927,6 +1079,8 @@ target_type = "d"
     #[test]
     fn rejects_predicate_with_dot() {
         let toml = r#"
+schema_version = 1
+
 [[subjects]]
 name = "x"
 
@@ -953,6 +1107,8 @@ target_type = "y"
     #[test]
     fn rejects_predicate_with_empty_name() {
         let toml = r#"
+schema_version = 1
+
 [[subjects]]
 name = "x"
 
@@ -971,6 +1127,8 @@ target_type = "y"
     #[test]
     fn rejects_predicate_with_empty_multiple_types() {
         let toml = r#"
+schema_version = 1
+
 [[subjects]]
 name = "t"
 
@@ -998,6 +1156,8 @@ target_type = "t"
     #[test]
     fn rejects_predicate_with_undeclared_source_type() {
         let bad = r#"
+schema_version = 1
+
 [[subjects]]
 name = "album"
 
@@ -1027,6 +1187,8 @@ target_type = "album"
     #[test]
     fn rejects_predicate_with_undeclared_target_type() {
         let bad = r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -1052,6 +1214,8 @@ target_type = "album"
     #[test]
     fn rejects_predicate_with_undeclared_type_in_multiple() {
         let bad = r#"
+schema_version = 1
+
 [[subjects]]
 name = "folder"
 
@@ -1081,6 +1245,8 @@ target_type = ["folder", "archive"]
         // predicates (e.g. `contained_in`) that span every subject
         // kind.
         let toml = r#"
+schema_version = 1
+
 [[relation]]
 predicate = "contained_in"
 source_type = "*"
@@ -1097,6 +1263,8 @@ target_type = "*"
     #[test]
     fn accepts_consistent_inverse_predicates() {
         let toml = r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -1122,6 +1290,8 @@ inverse = "album_of"
     #[test]
     fn rejects_inverse_pointing_at_missing_predicate() {
         let bad = r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -1156,6 +1326,8 @@ inverse = "tracks_of"
         // type of `album_of`). Here it is declared as "track",
         // which breaks the symmetry.
         let bad = r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -1189,6 +1361,8 @@ inverse = "album_of"
     #[test]
     fn rejects_inverse_with_mismatched_target_type() {
         let bad = r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -1222,6 +1396,8 @@ inverse = "album_of"
     #[test]
     fn rejects_inverse_that_does_not_point_back() {
         let bad = r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -1258,6 +1434,8 @@ target_type = "track"
         // tracks_of says its inverse is `other_predicate`, not
         // album_of. Catch the asymmetry.
         let bad = r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -1300,6 +1478,8 @@ inverse = "tracks_of"
         // A predicate may opt out of the inverse index entirely.
         // Inverse validation only fires when `inverse` is set.
         let toml = r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 

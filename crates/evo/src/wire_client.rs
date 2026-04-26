@@ -2498,6 +2498,8 @@ mod tests {
         let catalogue = Arc::new(
             Catalogue::from_toml(
                 r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -3153,6 +3155,8 @@ target_type = "album"
         let catalogue = Arc::new(
             Catalogue::from_toml(
                 r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -3218,6 +3222,8 @@ name = "album"
         let catalogue = Arc::new(
             Catalogue::from_toml(
                 r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 "#,
@@ -3392,6 +3398,8 @@ name = "track"
         let catalogue = Arc::new(
             Catalogue::from_toml(
                 r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 "#,

@@ -53,6 +53,8 @@ use evo_plugin_sdk::Manifest;
 /// hosts one slow respondent so the test can address them
 /// independently from the client side.
 const CONCURRENCY_CATALOGUE_TOML: &str = r#"
+schema_version = 1
+
 [[racks]]
 name = "parallel"
 family = "domain"

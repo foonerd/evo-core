@@ -31,6 +31,8 @@ use evo_plugin_sdk::contract::{
 };
 
 const CATALOGUE_TOML: &str = r#"
+schema_version = 1
+
 [[racks]]
 name = "example"
 family = "domain"

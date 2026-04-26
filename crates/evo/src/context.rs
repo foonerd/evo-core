@@ -2351,6 +2351,8 @@ mod tests {
     fn subjects_only_catalogue() -> crate::catalogue::Catalogue {
         crate::catalogue::Catalogue::from_toml(
             r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -2370,6 +2372,8 @@ name = "album"
     fn test_catalogue_with_predicates() -> crate::catalogue::Catalogue {
         crate::catalogue::Catalogue::from_toml(
             r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 

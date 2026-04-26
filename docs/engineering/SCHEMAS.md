@@ -246,9 +246,39 @@ response_budget_ms = 5000
 
 A distribution declares its fabric in a catalogue file. The steward reads it at startup and refuses to start if it is malformed.
 
+#### 3.2.0 Schema Versioning
+
+Every catalogue document carries a top-level `schema_version` integer. The field is required at parse time; a document without it is rejected with a structured error pointing at the offending path. The integer indexes a versioned grammar so distributions know which catalogue grammar they author against, and the steward declares the supported range via two compile-time constants:
+
+| Constant               | Current value |
+|------------------------|---------------|
+| `CATALOGUE_SCHEMA_MIN` | `1`           |
+| `CATALOGUE_SCHEMA_MAX` | `1`           |
+
+A document declaring `schema_version = N` is admissible iff `MIN <= N <= MAX`. Out-of-range is a hard startup failure rather than a partial bring-up because the catalogue is essence: a distribution authored against the wrong grammar produces silent feature loss the operator cannot diagnose.
+
+Schema bumps are integer-valued; semver does not apply. A breaking grammar change (removed field, newly-required field, type narrowed, semantic shift) requires incrementing `CATALOGUE_SCHEMA_MAX`. Additive grammar changes (new optional field, new optional section) stay within the current schema version because parsers tolerate unknown fields. Migration is forward-only — the steward never silently rewrites an operator-edited catalogue. Distributions update the field deliberately when adopting a new shape.
+
+Per-shelf `shape: u32` (`#[[racks.shelves]] shape = N`, see §3.2.2) is preserved unchanged: that field versions a shelf's plugin contract; `schema_version` versions the catalogue document. They evolve independently.
+
+The `evo-plugin-tool catalogue lint <path>` tool parses and validates a catalogue and surfaces any violation as a non-zero exit. The optional `--schema-version N` flag additionally pins the document's `schema_version` to N exactly, useful at distribution-author time to catch a fixture-update slip-through.
+
+##### Schema version 1
+
+The shape documented in §3.2.1 (and refined in §3.2.2/§3.2.3) is schema version 1. It comprises:
+
+- `schema_version: u32` (required, must equal 1 for documents authored against this version).
+- `[[racks]]` array (optional; defaults to empty).
+- `[[subjects]]` array (optional; defaults to empty).
+- `[[relation]]` array (optional; defaults to empty).
+
+Every other field is per-table as defined below. Future schema versions will be documented as additional `##### Schema version N` subsections, with migration guidance from version N-1.
+
 #### 3.2.1 Full Shape
 
 ```toml
+schema_version = 1                # required; must lie in [CATALOGUE_SCHEMA_MIN, CATALOGUE_SCHEMA_MAX]
+
 [[racks]]
 name = "<lowercase>"              # required; no dots
 family = "<domain|coordination|infrastructure>"    # required

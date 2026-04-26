@@ -60,7 +60,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 
-
 /// The admission engine.
 ///
 /// Holds admitted plugins keyed by fully-qualified shelf name. v0 permits
@@ -1379,7 +1378,6 @@ async fn parallel_unload_with_deadline(
     (unloaded, killed)
 }
 
-
 // Pre-admission validation lives in `admission/validation.rs`.
 // Callers reference the helpers as
 // `validation::check_manifest_prerequisites`,
@@ -1584,6 +1582,8 @@ mod tests {
         Arc::new(
             Catalogue::from_toml(
                 r#"
+schema_version = 1
+
 [[racks]]
 name = "test"
 family = "domain"
@@ -2191,6 +2191,8 @@ response_budget_ms = 1000
         Arc::new(
             Catalogue::from_toml(
                 r#"
+schema_version = 1
+
 [[racks]]
 name = "example"
 family = "domain"
@@ -3834,6 +3836,8 @@ response_budget_ms = 1000
         Arc::new(
             Catalogue::from_toml(
                 r#"
+schema_version = 1
+
 [[racks]]
 name = "shut"
 family = "domain"

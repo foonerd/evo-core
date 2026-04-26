@@ -539,6 +539,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ed25519-dalek",
+ "evo",
  "evo-plugin-sdk",
  "evo-trust",
  "flate2",
