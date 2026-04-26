@@ -31,6 +31,18 @@ use std::time::SystemTime;
 ///
 /// The steward uses the declared policy to optimise shutdown ordering and
 /// instance cleanup.
+///
+/// # Object-safety discipline
+///
+/// `Factory` is object-safe so the steward can erase implementations
+/// behind `Arc<dyn Factory>`. Today the only trait method is
+/// synchronous, so the discipline is unobservable. If a future
+/// asynchronous method is added it MUST adopt the
+/// `Pin<Box<dyn Future<Output = ...> + Send + '_>>` callback shape
+/// rather than `async fn`, otherwise the trait stops being
+/// object-safe and every plugin author who already shipped against
+/// `Arc<dyn Factory>` breaks. The same shape is used by the other
+/// callback-bearing traits in this module; mirror it.
 pub trait Factory: Plugin {
     /// Declare this factory's retraction policy.
     ///
