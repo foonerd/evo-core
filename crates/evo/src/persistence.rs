@@ -52,8 +52,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 
-use evo_plugin_sdk::contract::AliasKind;
-use evo_plugin_sdk::contract::ExternalAddressing;
+use evo_plugin_sdk::contract::{
+    AliasKind, ClaimConfidence, ExternalAddressing,
+};
 
 /// Initial schema version: subject-identity slice.
 ///
@@ -256,6 +257,149 @@ pub struct PersistedAlias {
     pub reason: Option<String>,
 }
 
+/// One provenance entry to write into `claim_log` alongside the
+/// umbrella `subject_announce` row.
+///
+/// Mirrors the in-memory `ClaimKind` enum in `crates/evo/src/
+/// subjects.rs` so a future replay path can reconstruct the
+/// registry's claim ledger from the table. The variant tag
+/// determines the `claim_log.kind` string written; the body
+/// determines the JSON `payload`. The `reason` column carries the
+/// per-claim free-form explanation when the variant supplies one.
+///
+/// The variants are deliberately distinct from
+/// [`evo_plugin_sdk::contract::SubjectClaim`]: the SDK type covers
+/// the explicit equivalence / distinctness assertions a plugin
+/// emits on an announcement, whereas
+/// [`PersistedClaim::MultiSubjectConflict`] records the
+/// registry's *detected* conflict outcome and has no SDK-side
+/// counterpart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PersistedClaim {
+    /// Two addressings asserted equivalent by the announcing
+    /// plugin, with a confidence and an optional free-form
+    /// reason.
+    Equivalent {
+        /// First addressing.
+        a: ExternalAddressing,
+        /// Second addressing.
+        b: ExternalAddressing,
+        /// Claimant's confidence in the equivalence.
+        confidence: ClaimConfidence,
+        /// Optional operator-supplied reason, persisted in the
+        /// `claim_log.reason` column.
+        reason: Option<String>,
+    },
+    /// Two addressings asserted distinct by the announcing
+    /// plugin, with an optional free-form reason.
+    Distinct {
+        /// First addressing.
+        a: ExternalAddressing,
+        /// Second addressing.
+        b: ExternalAddressing,
+        /// Optional operator-supplied reason, persisted in the
+        /// `claim_log.reason` column.
+        reason: Option<String>,
+    },
+    /// The announcement spanned multiple existing canonical
+    /// subjects; the registry recorded the conflict for
+    /// operator-driven reconciliation rather than auto-merging.
+    MultiSubjectConflict {
+        /// The announcement's addressings.
+        addressings: Vec<ExternalAddressing>,
+        /// The distinct canonical IDs the addressings resolved
+        /// to.
+        canonical_ids: Vec<String>,
+    },
+}
+
+impl PersistedClaim {
+    fn kind_str(&self) -> &'static str {
+        match self {
+            PersistedClaim::Equivalent { .. } => claim_kind::EQUIVALENT,
+            PersistedClaim::Distinct { .. } => claim_kind::DISTINCT,
+            PersistedClaim::MultiSubjectConflict { .. } => {
+                claim_kind::MULTI_SUBJECT_CONFLICT
+            }
+        }
+    }
+
+    fn reason(&self) -> Option<&str> {
+        match self {
+            PersistedClaim::Equivalent { reason, .. }
+            | PersistedClaim::Distinct { reason, .. } => reason.as_deref(),
+            PersistedClaim::MultiSubjectConflict { .. } => None,
+        }
+    }
+}
+
+/// All inputs to [`PersistenceStore::record_subject_announce`]
+/// in one struct.
+///
+/// Carrying the inputs as a record keeps the trait method
+/// signature stable as new fields land and lets call sites read
+/// like prose. All fields are borrowed for the lifetime of the
+/// call; the struct is `Copy`.
+#[derive(Debug, Clone, Copy)]
+pub struct AnnounceRecord<'a> {
+    /// Canonical subject identifier the announce resolves to.
+    pub canonical_id: &'a str,
+    /// Catalogue subject type the announcing plugin declared.
+    pub subject_type: &'a str,
+    /// External addressings asserted by the announcement.
+    pub addressings: &'a [ExternalAddressing],
+    /// Canonical name of the announcing plugin.
+    pub claimant: &'a str,
+    /// Per-claim provenance entries the registry retained on
+    /// this announcement, including any registry-detected
+    /// [`PersistedClaim::MultiSubjectConflict`].
+    pub claims: &'a [PersistedClaim],
+    /// Wall-clock timestamp, milliseconds since the UNIX epoch.
+    pub at_ms: u64,
+}
+
+/// All inputs to [`PersistenceStore::record_subject_merge`].
+#[derive(Debug, Clone, Copy)]
+pub struct MergeRecord<'a> {
+    /// First source subject id (consumed by the merge).
+    pub source_a: &'a str,
+    /// Second source subject id (consumed by the merge).
+    pub source_b: &'a str,
+    /// Newly minted canonical id the two sources collapse into.
+    pub new_id: &'a str,
+    /// Catalogue subject type, shared by both sources.
+    pub subject_type: &'a str,
+    /// Canonical name of the admin plugin performing the merge.
+    pub admin_plugin: &'a str,
+    /// Operator-supplied reason, if any.
+    pub reason: Option<&'a str>,
+    /// Wall-clock timestamp, milliseconds since the UNIX epoch.
+    pub at_ms: u64,
+}
+
+/// All inputs to [`PersistenceStore::record_subject_split`].
+#[derive(Debug, Clone, Copy)]
+pub struct SplitRecord<'a> {
+    /// Source subject id (consumed by the split).
+    pub source: &'a str,
+    /// Newly minted canonical ids, one per partition group. Must
+    /// have the same length as `partition` and at least one
+    /// element.
+    pub new_ids: &'a [String],
+    /// Catalogue subject type, preserved by the split.
+    pub subject_type: &'a str,
+    /// Partition of the source's addressings: `partition[i]` is
+    /// the addressing set assigned to `new_ids[i]`.
+    pub partition: &'a [Vec<ExternalAddressing>],
+    /// Canonical name of the admin plugin performing the split.
+    pub admin_plugin: &'a str,
+    /// Operator-supplied reason, if any.
+    pub reason: Option<&'a str>,
+    /// Wall-clock timestamp, milliseconds since the UNIX epoch.
+    pub at_ms: u64,
+}
+
 /// Schema-aware persistence trait for the subject-identity slice.
 ///
 /// Each `record_*` method maps one fabric operation onto one
@@ -279,16 +423,15 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
     ///
     /// Inserts a `subjects` row (or refreshes its modified-at
     /// timestamp if the canonical ID is already present), inserts
-    /// every supplied addressing into `subject_addressings`, and
-    /// appends a single `claim_log` entry of kind
-    /// `subject_announce`. All within one transaction.
+    /// every supplied addressing into `subject_addressings`,
+    /// appends one umbrella `claim_log` entry of kind
+    /// `subject_announce`, and appends one further `claim_log`
+    /// entry per element of `claims` (the per-claim provenance
+    /// the registry retained on this announcement). All within
+    /// one transaction.
     fn record_subject_announce<'a>(
         &'a self,
-        canonical_id: &'a str,
-        subject_type: &'a str,
-        addressings: &'a [ExternalAddressing],
-        claimant: &'a str,
-        at_ms: u64,
+        record: AnnounceRecord<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
 
     /// Record a `subject_retract` fabric operation.
@@ -309,36 +452,54 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
 
     /// Record an admin `subject_merge` operation.
     ///
-    /// Inserts an `aliases` row recording that `source_a` and
-    /// `source_b` now point at `new_id`, and appends a
-    /// `claim_log` entry of kind `subject_merge`. The subject
-    /// rows themselves are not modified by this method; the
-    /// caller (Phase 4 admin path) is responsible for wiring the
-    /// addressings reattach in the same higher-level transaction
-    /// once the admin ledger lands.
+    /// Mirrors the in-memory registry's merge in one transaction:
+    ///
+    /// - Inserts a `subjects` row for `new_id` carrying
+    ///   `subject_type`.
+    /// - Moves every `subject_addressings` row whose `subject_id`
+    ///   was `source_a` or `source_b` to point at `new_id`.
+    /// - Deletes the `source_a` and `source_b` rows from
+    ///   `subjects` (their addressings are already moved, so the
+    ///   `ON DELETE CASCADE` on `subject_addressings` is a no-op).
+    /// - Inserts one `aliases` row per source recording the
+    ///   redirection to `new_id`.
+    /// - Appends a single `claim_log` entry of kind
+    ///   `subject_merge` whose payload describes the merge.
+    ///
+    /// Sources that do not exist in `subjects` are tolerated:
+    /// the moves and deletes operate on zero rows, and the
+    /// alias entries are still recorded (the alias index is
+    /// independent of the subjects table per the schema in
+    /// `PERSISTENCE.md` section 7).
     fn record_subject_merge<'a>(
         &'a self,
-        source_a: &'a str,
-        source_b: &'a str,
-        new_id: &'a str,
-        admin_plugin: &'a str,
-        reason: Option<&'a str>,
-        at_ms: u64,
+        record: MergeRecord<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
 
     /// Record an admin `subject_split` operation.
     ///
-    /// Inserts one `aliases` row per element of `new_ids` (each
-    /// pointing `source -> new_id_n`), and appends a single
-    /// `claim_log` entry of kind `subject_split` whose payload
-    /// describes the full partition.
+    /// Mirrors the in-memory registry's split in one transaction:
+    ///
+    /// - Inserts one `subjects` row per element of `new_ids`,
+    ///   each carrying the shared `subject_type` (split does not
+    ///   change the subject type).
+    /// - For each `partition[i]`, moves the corresponding
+    ///   `subject_addressings` rows (matched by `(scheme, value)`)
+    ///   so they point at `new_ids[i]`.
+    /// - Deletes the `source` row from `subjects` (its
+    ///   addressings are already moved).
+    /// - Inserts one `aliases` row per `new_ids[i]` (all sharing
+    ///   `old_id = source`).
+    /// - Appends a single `claim_log` entry of kind
+    ///   `subject_split` whose payload describes the full
+    ///   partition.
+    ///
+    /// `new_ids` and `partition` must have the same length and at
+    /// least one element each; an empty `new_ids` returns
+    /// [`PersistenceError::Invalid`].
     fn record_subject_split<'a>(
         &'a self,
-        source: &'a str,
-        new_ids: &'a [String],
-        admin_plugin: &'a str,
-        reason: Option<&'a str>,
-        at_ms: u64,
+        record: SplitRecord<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
 
     /// Record a hard-forget of `canonical_id`.
@@ -387,6 +548,9 @@ mod claim_kind {
     pub const SUBJECT_MERGE: &str = "subject_merge";
     pub const SUBJECT_SPLIT: &str = "subject_split";
     pub const SUBJECT_FORGOTTEN: &str = "subject_forgotten";
+    pub const EQUIVALENT: &str = "equivalent";
+    pub const DISTINCT: &str = "distinct";
+    pub const MULTI_SUBJECT_CONFLICT: &str = "multi_subject_conflict";
 }
 
 /// Pragmas applied to every connection at acquisition time.
@@ -629,12 +793,16 @@ impl SqlitePersistenceStore {
 
 fn announce_tx(
     conn: &mut Connection,
-    canonical_id: &str,
-    subject_type: &str,
-    addressings: &[ExternalAddressing],
-    claimant: &str,
-    at_ms: u64,
+    record: AnnounceRecord<'_>,
 ) -> Result<(), PersistenceError> {
+    let AnnounceRecord {
+        canonical_id,
+        subject_type,
+        addressings,
+        claimant,
+        claims,
+        at_ms,
+    } = record;
     let tx = conn
         .transaction()
         .map_err(|e| PersistenceError::sqlite("begin announce tx", e))?;
@@ -668,7 +836,7 @@ fn announce_tx(
         })?;
     }
 
-    let payload = serde_json::json!({
+    let umbrella_payload = serde_json::json!({
         "canonical_id": canonical_id,
         "subject_type": subject_type,
         "addressings": addressings,
@@ -681,12 +849,34 @@ fn announce_tx(
             claim_kind::SUBJECT_ANNOUNCE,
             claimant,
             at_ms as i64,
-            payload
+            umbrella_payload
         ],
     )
     .map_err(|e| {
         PersistenceError::sqlite("append claim_log subject_announce", e)
     })?;
+
+    for claim in claims {
+        let payload = serde_json::to_string(claim).map_err(|e| {
+            PersistenceError::Invalid(format!(
+                "serialising PersistedClaim for claim_log: {e}"
+            ))
+        })?;
+        tx.execute(
+            "INSERT INTO claim_log (kind, claimant, asserted_at_ms, payload, reason) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                claim.kind_str(),
+                claimant,
+                at_ms as i64,
+                payload,
+                claim.reason()
+            ],
+        )
+        .map_err(|e| {
+            PersistenceError::sqlite("append claim_log per-claim entry", e)
+        })?;
+    }
 
     tx.commit()
         .map_err(|e| PersistenceError::sqlite("commit announce tx", e))?;
@@ -745,16 +935,50 @@ fn retract_tx(
 
 fn merge_tx(
     conn: &mut Connection,
-    source_a: &str,
-    source_b: &str,
-    new_id: &str,
-    admin_plugin: &str,
-    reason: Option<&str>,
-    at_ms: u64,
+    record: MergeRecord<'_>,
 ) -> Result<(), PersistenceError> {
+    let MergeRecord {
+        source_a,
+        source_b,
+        new_id,
+        subject_type,
+        admin_plugin,
+        reason,
+        at_ms,
+    } = record;
     let tx = conn
         .transaction()
         .map_err(|e| PersistenceError::sqlite("begin merge tx", e))?;
+
+    // Insert the new subject row first so the foreign key from
+    // subject_addressings is satisfied throughout the move.
+    tx.execute(
+        "INSERT INTO subjects (id, subject_type, created_at_ms, \
+         modified_at_ms, forgotten_at_ms) VALUES (?1, ?2, ?3, ?3, NULL)",
+        params![new_id, subject_type, at_ms as i64],
+    )
+    .map_err(|e| PersistenceError::sqlite("insert merged subject row", e))?;
+
+    // Move every addressing currently pointing at either source
+    // to the new id. Skipped sources (UPDATE matches zero rows)
+    // are tolerated; same for already-orphaned addressings.
+    tx.execute(
+        "UPDATE subject_addressings SET subject_id = ?1, asserted_at_ms = ?4 \
+         WHERE subject_id = ?2 OR subject_id = ?3",
+        params![new_id, source_a, source_b, at_ms as i64],
+    )
+    .map_err(|e| {
+        PersistenceError::sqlite("re-attach addressings to merged id", e)
+    })?;
+
+    // Now drop the source rows. Their addressings are already
+    // moved, so the cascade is a no-op; if a source did not exist
+    // the DELETE matches zero rows.
+    tx.execute(
+        "DELETE FROM subjects WHERE id = ?1 OR id = ?2",
+        params![source_a, source_b],
+    )
+    .map_err(|e| PersistenceError::sqlite("delete merged source rows", e))?;
 
     for old in [source_a, source_b] {
         tx.execute(
@@ -769,6 +993,7 @@ fn merge_tx(
         "source_a": source_a,
         "source_b": source_b,
         "new_id": new_id,
+        "subject_type": subject_type,
         "admin_plugin": admin_plugin,
         "reason": reason,
     })
@@ -795,20 +1020,73 @@ fn merge_tx(
 
 fn split_tx(
     conn: &mut Connection,
-    source: &str,
-    new_ids: &[String],
-    admin_plugin: &str,
-    reason: Option<&str>,
-    at_ms: u64,
+    record: SplitRecord<'_>,
 ) -> Result<(), PersistenceError> {
+    let SplitRecord {
+        source,
+        new_ids,
+        subject_type,
+        partition,
+        admin_plugin,
+        reason,
+        at_ms,
+    } = record;
     if new_ids.is_empty() {
         return Err(PersistenceError::Invalid(
             "split must produce at least one new id".into(),
         ));
     }
+    if new_ids.len() != partition.len() {
+        return Err(PersistenceError::Invalid(format!(
+            "split: new_ids ({}) and partition ({}) must have equal length",
+            new_ids.len(),
+            partition.len()
+        )));
+    }
+
     let tx = conn
         .transaction()
         .map_err(|e| PersistenceError::sqlite("begin split tx", e))?;
+
+    // Insert one subjects row per partition group first so the
+    // foreign key from subject_addressings is satisfied while the
+    // moves run.
+    for new_id in new_ids {
+        tx.execute(
+            "INSERT INTO subjects (id, subject_type, created_at_ms, \
+             modified_at_ms, forgotten_at_ms) VALUES (?1, ?2, ?3, ?3, NULL)",
+            params![new_id, subject_type, at_ms as i64],
+        )
+        .map_err(|e| {
+            PersistenceError::sqlite("insert split partition subject row", e)
+        })?;
+    }
+
+    // Move each addressing in each partition group to its new
+    // subject id. Tolerates addressings that do not match an
+    // existing row (UPDATE matches zero rows).
+    for (group, new_id) in partition.iter().zip(new_ids.iter()) {
+        for a in group {
+            tx.execute(
+                "UPDATE subject_addressings SET subject_id = ?1, \
+                 asserted_at_ms = ?4 \
+                 WHERE scheme = ?2 AND value = ?3",
+                params![new_id, a.scheme, a.value, at_ms as i64],
+            )
+            .map_err(|e| {
+                PersistenceError::sqlite(
+                    "re-attach addressing to split partition",
+                    e,
+                )
+            })?;
+        }
+    }
+
+    // Drop the source subject row. Its addressings have already
+    // been moved off; if the source did not exist the DELETE
+    // matches zero rows.
+    tx.execute("DELETE FROM subjects WHERE id = ?1", params![source])
+        .map_err(|e| PersistenceError::sqlite("delete split source row", e))?;
 
     for new_id in new_ids {
         tx.execute(
@@ -822,6 +1100,8 @@ fn split_tx(
     let payload = serde_json::json!({
         "source": source,
         "new_ids": new_ids,
+        "subject_type": subject_type,
+        "partition": partition,
         "admin_plugin": admin_plugin,
         "reason": reason,
     })
@@ -1012,20 +1292,28 @@ fn load_aliases_for_query(
 impl PersistenceStore for SqlitePersistenceStore {
     fn record_subject_announce<'a>(
         &'a self,
-        canonical_id: &'a str,
-        subject_type: &'a str,
-        addressings: &'a [ExternalAddressing],
-        claimant: &'a str,
-        at_ms: u64,
+        record: AnnounceRecord<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
     {
-        let cid = canonical_id.to_string();
-        let st = subject_type.to_string();
-        let addrs = addressings.to_vec();
-        let cl = claimant.to_string();
+        let cid = record.canonical_id.to_string();
+        let st = record.subject_type.to_string();
+        let addrs = record.addressings.to_vec();
+        let cl = record.claimant.to_string();
+        let cls = record.claims.to_vec();
+        let at_ms = record.at_ms;
         Box::pin(async move {
             self.interact("subject_announce", move |conn| {
-                announce_tx(conn, &cid, &st, &addrs, &cl, at_ms)
+                announce_tx(
+                    conn,
+                    AnnounceRecord {
+                        canonical_id: &cid,
+                        subject_type: &st,
+                        addressings: &addrs,
+                        claimant: &cl,
+                        claims: &cls,
+                        at_ms,
+                    },
+                )
             })
             .await
         })
@@ -1052,22 +1340,30 @@ impl PersistenceStore for SqlitePersistenceStore {
 
     fn record_subject_merge<'a>(
         &'a self,
-        source_a: &'a str,
-        source_b: &'a str,
-        new_id: &'a str,
-        admin_plugin: &'a str,
-        reason: Option<&'a str>,
-        at_ms: u64,
+        record: MergeRecord<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
     {
-        let a = source_a.to_string();
-        let b = source_b.to_string();
-        let n = new_id.to_string();
-        let admin = admin_plugin.to_string();
-        let reason = reason.map(|s| s.to_string());
+        let a = record.source_a.to_string();
+        let b = record.source_b.to_string();
+        let n = record.new_id.to_string();
+        let st = record.subject_type.to_string();
+        let admin = record.admin_plugin.to_string();
+        let reason = record.reason.map(|s| s.to_string());
+        let at_ms = record.at_ms;
         Box::pin(async move {
             self.interact("subject_merge", move |conn| {
-                merge_tx(conn, &a, &b, &n, &admin, reason.as_deref(), at_ms)
+                merge_tx(
+                    conn,
+                    MergeRecord {
+                        source_a: &a,
+                        source_b: &b,
+                        new_id: &n,
+                        subject_type: &st,
+                        admin_plugin: &admin,
+                        reason: reason.as_deref(),
+                        at_ms,
+                    },
+                )
             })
             .await
         })
@@ -1075,20 +1371,30 @@ impl PersistenceStore for SqlitePersistenceStore {
 
     fn record_subject_split<'a>(
         &'a self,
-        source: &'a str,
-        new_ids: &'a [String],
-        admin_plugin: &'a str,
-        reason: Option<&'a str>,
-        at_ms: u64,
+        record: SplitRecord<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
     {
-        let s = source.to_string();
-        let ids = new_ids.to_vec();
-        let admin = admin_plugin.to_string();
-        let reason = reason.map(|s| s.to_string());
+        let s = record.source.to_string();
+        let ids = record.new_ids.to_vec();
+        let st = record.subject_type.to_string();
+        let part = record.partition.to_vec();
+        let admin = record.admin_plugin.to_string();
+        let reason = record.reason.map(|s| s.to_string());
+        let at_ms = record.at_ms;
         Box::pin(async move {
             self.interact("subject_split", move |conn| {
-                split_tx(conn, &s, &ids, &admin, reason.as_deref(), at_ms)
+                split_tx(
+                    conn,
+                    SplitRecord {
+                        source: &s,
+                        new_ids: &ids,
+                        subject_type: &st,
+                        partition: &part,
+                        admin_plugin: &admin,
+                        reason: reason.as_deref(),
+                        at_ms,
+                    },
+                )
             })
             .await
         })
@@ -1196,19 +1502,29 @@ impl MemoryPersistenceStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    #[cfg(test)]
+    async fn claim_log_kinds(&self) -> Vec<&'static str> {
+        let g = self.inner.lock().await;
+        g.claim_log.iter().map(|e| e.kind).collect()
+    }
 }
 
 impl PersistenceStore for MemoryPersistenceStore {
     fn record_subject_announce<'a>(
         &'a self,
-        canonical_id: &'a str,
-        subject_type: &'a str,
-        addressings: &'a [ExternalAddressing],
-        claimant: &'a str,
-        at_ms: u64,
+        record: AnnounceRecord<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
     {
         Box::pin(async move {
+            let AnnounceRecord {
+                canonical_id,
+                subject_type,
+                addressings,
+                claimant,
+                claims,
+                at_ms,
+            } = record;
             let mut g = self.inner.lock().await;
             let entry = g
                 .subjects
@@ -1247,6 +1563,13 @@ impl PersistenceStore for MemoryPersistenceStore {
                 claimant: claimant.to_string(),
                 at_ms,
             });
+            for claim in claims {
+                g.claim_log.push(MemoryClaimEntry {
+                    kind: claim.kind_str(),
+                    claimant: claimant.to_string(),
+                    at_ms,
+                });
+            }
             Ok(())
         })
     }
@@ -1279,16 +1602,46 @@ impl PersistenceStore for MemoryPersistenceStore {
 
     fn record_subject_merge<'a>(
         &'a self,
-        source_a: &'a str,
-        source_b: &'a str,
-        new_id: &'a str,
-        admin_plugin: &'a str,
-        reason: Option<&'a str>,
-        at_ms: u64,
+        record: MergeRecord<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
     {
         Box::pin(async move {
+            let MergeRecord {
+                source_a,
+                source_b,
+                new_id,
+                subject_type,
+                admin_plugin,
+                reason,
+                at_ms,
+            } = record;
             let mut g = self.inner.lock().await;
+
+            // Drain addressings off both sources (if present) and
+            // attach them to the new subject. Order matches the
+            // SQL UPDATE: source_a then source_b.
+            let mut moved: Vec<PersistedAddressing> = Vec::new();
+            if let Some(s) = g.subjects.remove(source_a) {
+                moved.extend(s.addressings);
+            }
+            if let Some(s) = g.subjects.remove(source_b) {
+                moved.extend(s.addressings);
+            }
+            for slot in &mut moved {
+                slot.asserted_at_ms = at_ms;
+            }
+
+            g.subjects.insert(
+                new_id.to_string(),
+                MemorySubject {
+                    subject_type: subject_type.to_string(),
+                    created_at_ms: at_ms,
+                    modified_at_ms: at_ms,
+                    forgotten_at_ms: None,
+                    addressings: moved,
+                },
+            );
+
             for old in [source_a, source_b] {
                 g.next_alias_id += 1;
                 let id = g.next_alias_id;
@@ -1313,20 +1666,65 @@ impl PersistenceStore for MemoryPersistenceStore {
 
     fn record_subject_split<'a>(
         &'a self,
-        source: &'a str,
-        new_ids: &'a [String],
-        admin_plugin: &'a str,
-        reason: Option<&'a str>,
-        at_ms: u64,
+        record: SplitRecord<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
     {
         Box::pin(async move {
+            let SplitRecord {
+                source,
+                new_ids,
+                subject_type,
+                partition,
+                admin_plugin,
+                reason,
+                at_ms,
+            } = record;
             if new_ids.is_empty() {
                 return Err(PersistenceError::Invalid(
                     "split must produce at least one new id".into(),
                 ));
             }
+            if new_ids.len() != partition.len() {
+                return Err(PersistenceError::Invalid(format!(
+                    "split: new_ids ({}) and partition ({}) must have \
+                     equal length",
+                    new_ids.len(),
+                    partition.len()
+                )));
+            }
             let mut g = self.inner.lock().await;
+
+            // Drain the source subject's addressings, then re-distribute
+            // them across the partition groups by `(scheme, value)`.
+            let mut source_addrs: Vec<PersistedAddressing> = g
+                .subjects
+                .remove(source)
+                .map(|s| s.addressings)
+                .unwrap_or_default();
+
+            for (group, new_id) in partition.iter().zip(new_ids.iter()) {
+                let mut group_addrs: Vec<PersistedAddressing> = Vec::new();
+                for a in group {
+                    if let Some(pos) = source_addrs.iter().position(|x| {
+                        x.scheme == a.scheme && x.value == a.value
+                    }) {
+                        let mut moved = source_addrs.swap_remove(pos);
+                        moved.asserted_at_ms = at_ms;
+                        group_addrs.push(moved);
+                    }
+                }
+                g.subjects.insert(
+                    new_id.clone(),
+                    MemorySubject {
+                        subject_type: subject_type.to_string(),
+                        created_at_ms: at_ms,
+                        modified_at_ms: at_ms,
+                        forgotten_at_ms: None,
+                        addressings: group_addrs,
+                    },
+                );
+            }
+
             for new_id in new_ids {
                 g.next_alias_id += 1;
                 let id = g.next_alias_id;
@@ -1440,13 +1838,14 @@ mod tests {
     #[tokio::test]
     async fn memory_announce_then_load_returns_subject() {
         let s = MemoryPersistenceStore::new();
-        s.record_subject_announce(
-            "uuid-a",
-            "track",
-            &[ext("mpd-path", "/m/a.flac")],
-            "p1",
-            1000,
-        )
+        s.record_subject_announce(AnnounceRecord {
+            canonical_id: "uuid-a",
+            subject_type: "track",
+            addressings: &[ext("mpd-path", "/m/a.flac")],
+            claimant: "p1",
+            claims: &[],
+            at_ms: 1000,
+        })
         .await
         .unwrap();
         let all = s.load_all_subjects().await.unwrap();
@@ -1460,13 +1859,14 @@ mod tests {
     #[tokio::test]
     async fn memory_retract_removes_addressing() {
         let s = MemoryPersistenceStore::new();
-        s.record_subject_announce(
-            "uuid-a",
-            "track",
-            &[ext("a", "1"), ext("b", "2")],
-            "p1",
-            1000,
-        )
+        s.record_subject_announce(AnnounceRecord {
+            canonical_id: "uuid-a",
+            subject_type: "track",
+            addressings: &[ext("a", "1"), ext("b", "2")],
+            claimant: "p1",
+            claims: &[],
+            at_ms: 1000,
+        })
         .await
         .unwrap();
         s.record_subject_retract("uuid-a", &ext("a", "1"), "p1", 1100)
@@ -1480,14 +1880,15 @@ mod tests {
     #[tokio::test]
     async fn memory_merge_records_aliases_for_both_sources() {
         let s = MemoryPersistenceStore::new();
-        s.record_subject_merge(
-            "uuid-a",
-            "uuid-b",
-            "uuid-c",
-            "admin",
-            Some("dup"),
-            2000,
-        )
+        s.record_subject_merge(MergeRecord {
+            source_a: "uuid-a",
+            source_b: "uuid-b",
+            new_id: "uuid-c",
+            subject_type: "track",
+            admin_plugin: "admin",
+            reason: Some("dup"),
+            at_ms: 2000,
+        })
         .await
         .unwrap();
         let aa = s.load_aliases_for("uuid-a").await.unwrap();
@@ -1503,9 +1904,19 @@ mod tests {
     async fn memory_split_records_aliases_per_partition() {
         let s = MemoryPersistenceStore::new();
         let new_ids = vec!["uuid-c".to_string(), "uuid-d".to_string()];
-        s.record_subject_split("uuid-a", &new_ids, "admin", None, 3000)
-            .await
-            .unwrap();
+        let partition: Vec<Vec<ExternalAddressing>> =
+            vec![Vec::new(), Vec::new()];
+        s.record_subject_split(SplitRecord {
+            source: "uuid-a",
+            new_ids: &new_ids,
+            subject_type: "track",
+            partition: &partition,
+            admin_plugin: "admin",
+            reason: None,
+            at_ms: 3000,
+        })
+        .await
+        .unwrap();
         let a = s.load_aliases_for("uuid-a").await.unwrap();
         assert_eq!(a.len(), 2);
         assert!(a.iter().all(|x| x.kind == AliasKind::Split));
@@ -1518,13 +1929,14 @@ mod tests {
     #[tokio::test]
     async fn memory_forget_removes_subject() {
         let s = MemoryPersistenceStore::new();
-        s.record_subject_announce(
-            "uuid-a",
-            "track",
-            &[ext("a", "1")],
-            "p1",
-            1000,
-        )
+        s.record_subject_announce(AnnounceRecord {
+            canonical_id: "uuid-a",
+            subject_type: "track",
+            addressings: &[ext("a", "1")],
+            claimant: "p1",
+            claims: &[],
+            at_ms: 1000,
+        })
         .await
         .unwrap();
         s.record_subject_forget("uuid-a", 1500).await.unwrap();
@@ -1536,7 +1948,15 @@ mod tests {
     async fn memory_split_with_empty_new_ids_errors() {
         let s = MemoryPersistenceStore::new();
         let r = s
-            .record_subject_split("uuid-a", &[], "admin", None, 1)
+            .record_subject_split(SplitRecord {
+                source: "uuid-a",
+                new_ids: &[],
+                subject_type: "track",
+                partition: &[],
+                admin_plugin: "admin",
+                reason: None,
+                at_ms: 1,
+            })
             .await;
         assert!(matches!(r, Err(PersistenceError::Invalid(_))));
     }
@@ -1643,13 +2063,14 @@ mod tests {
     async fn sqlite_announce_round_trip() {
         let (_dir, store) = open_temp();
         store
-            .record_subject_announce(
-                "uuid-a",
-                "track",
-                &[ext("mpd", "/x")],
-                "p1",
-                42,
-            )
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: "uuid-a",
+                subject_type: "track",
+                addressings: &[ext("mpd", "/x")],
+                claimant: "p1",
+                claims: &[],
+                at_ms: 42,
+            })
             .await
             .unwrap();
         let all = store.load_all_subjects().await.unwrap();
@@ -1661,13 +2082,14 @@ mod tests {
     async fn sqlite_retract_round_trip() {
         let (_dir, store) = open_temp();
         store
-            .record_subject_announce(
-                "uuid-a",
-                "track",
-                &[ext("a", "1"), ext("b", "2")],
-                "p1",
-                10,
-            )
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: "uuid-a",
+                subject_type: "track",
+                addressings: &[ext("a", "1"), ext("b", "2")],
+                claimant: "p1",
+                claims: &[],
+                at_ms: 10,
+            })
             .await
             .unwrap();
         store
@@ -1683,14 +2105,15 @@ mod tests {
     async fn sqlite_merge_records_two_aliases() {
         let (_dir, store) = open_temp();
         store
-            .record_subject_merge(
-                "uuid-a",
-                "uuid-b",
-                "uuid-c",
-                "admin",
-                Some("dup"),
-                100,
-            )
+            .record_subject_merge(MergeRecord {
+                source_a: "uuid-a",
+                source_b: "uuid-b",
+                new_id: "uuid-c",
+                subject_type: "track",
+                admin_plugin: "admin",
+                reason: Some("dup"),
+                at_ms: 100,
+            })
             .await
             .unwrap();
         let aa = store.load_aliases_for("uuid-a").await.unwrap();
@@ -1705,8 +2128,18 @@ mod tests {
     async fn sqlite_split_records_n_aliases() {
         let (_dir, store) = open_temp();
         let new_ids = vec!["uuid-c".to_string(), "uuid-d".to_string()];
+        let partition: Vec<Vec<ExternalAddressing>> =
+            vec![Vec::new(), Vec::new()];
         store
-            .record_subject_split("uuid-a", &new_ids, "admin", None, 200)
+            .record_subject_split(SplitRecord {
+                source: "uuid-a",
+                new_ids: &new_ids,
+                subject_type: "track",
+                partition: &partition,
+                admin_plugin: "admin",
+                reason: None,
+                at_ms: 200,
+            })
             .await
             .unwrap();
         let a = store.load_aliases_for("uuid-a").await.unwrap();
@@ -1718,13 +2151,14 @@ mod tests {
     async fn sqlite_forget_deletes_subject_and_cascades() {
         let (_dir, store) = open_temp();
         store
-            .record_subject_announce(
-                "uuid-a",
-                "track",
-                &[ext("a", "1")],
-                "p1",
-                10,
-            )
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: "uuid-a",
+                subject_type: "track",
+                addressings: &[ext("a", "1")],
+                claimant: "p1",
+                claims: &[],
+                at_ms: 10,
+            })
             .await
             .unwrap();
         store.record_subject_forget("uuid-a", 20).await.unwrap();
@@ -1744,13 +2178,14 @@ mod tests {
     async fn sqlite_announce_populates_all_three_tables_atomically() {
         let (_dir, store) = open_temp();
         store
-            .record_subject_announce(
-                "uuid-a",
-                "track",
-                &[ext("a", "1")],
-                "p1",
-                42,
-            )
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: "uuid-a",
+                subject_type: "track",
+                addressings: &[ext("a", "1")],
+                claimant: "p1",
+                claims: &[],
+                at_ms: 42,
+            })
             .await
             .unwrap();
         // Side connection, read each table directly.
@@ -1832,13 +2267,14 @@ mod tests {
         let path = dir.path().join("evo.db");
         let store = SqlitePersistenceStore::open(path.clone()).expect("open");
         store
-            .record_subject_announce(
-                "uuid-a",
-                "track",
-                &[ext("a", "1")],
-                "p1",
-                1,
-            )
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: "uuid-a",
+                subject_type: "track",
+                addressings: &[ext("a", "1")],
+                claimant: "p1",
+                claims: &[],
+                at_ms: 1,
+            })
             .await
             .unwrap();
         let wal = path.with_extension("db-wal");
@@ -1850,5 +2286,392 @@ mod tests {
         let shm_alt = dir.path().join("evo.db-shm");
         assert!(wal.exists() || wal_alt.exists(), "expected -wal sidecar");
         assert!(shm.exists() || shm_alt.exists(), "expected -shm sidecar");
+    }
+
+    // --- Wave 1: per-claim claim_log entries on announce ------------------
+
+    #[tokio::test]
+    async fn memory_announce_records_per_claim_log_entries() {
+        let s = MemoryPersistenceStore::new();
+        let claims = vec![
+            PersistedClaim::Equivalent {
+                a: ext("a", "1"),
+                b: ext("b", "2"),
+                confidence: ClaimConfidence::Asserted,
+                reason: Some("same disc".into()),
+            },
+            PersistedClaim::Distinct {
+                a: ext("a", "1"),
+                b: ext("c", "3"),
+                reason: None,
+            },
+            PersistedClaim::MultiSubjectConflict {
+                addressings: vec![ext("a", "1"), ext("b", "2")],
+                canonical_ids: vec!["uuid-x".into(), "uuid-y".into()],
+            },
+        ];
+        s.record_subject_announce(AnnounceRecord {
+            canonical_id: "uuid-a",
+            subject_type: "track",
+            addressings: &[ext("a", "1"), ext("b", "2")],
+            claimant: "p1",
+            claims: &claims,
+            at_ms: 1000,
+        })
+        .await
+        .unwrap();
+
+        let kinds = s.claim_log_kinds().await;
+        // One umbrella subject_announce row plus one row per claim.
+        assert_eq!(
+            kinds,
+            vec![
+                "subject_announce",
+                "equivalent",
+                "distinct",
+                "multi_subject_conflict",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_announce_records_per_claim_log_entries() {
+        let (_dir, store) = open_temp();
+        let claims = vec![
+            PersistedClaim::Equivalent {
+                a: ext("a", "1"),
+                b: ext("b", "2"),
+                confidence: ClaimConfidence::Inferred,
+                reason: Some("matched on hash".into()),
+            },
+            PersistedClaim::Distinct {
+                a: ext("a", "1"),
+                b: ext("c", "3"),
+                reason: None,
+            },
+        ];
+        store
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: "uuid-a",
+                subject_type: "track",
+                addressings: &[ext("a", "1")],
+                claimant: "p1",
+                claims: &claims,
+                at_ms: 42,
+            })
+            .await
+            .unwrap();
+
+        let conn = Connection::open(store.path()).expect("side open");
+        let kinds: Vec<String> = conn
+            .prepare("SELECT kind FROM claim_log ORDER BY log_id ASC")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "subject_announce".to_string(),
+                "equivalent".to_string(),
+                "distinct".to_string(),
+            ]
+        );
+
+        // The Equivalent claim's reason landed in claim_log.reason; the
+        // Distinct's None did not.
+        let reasons: Vec<Option<String>> = conn
+            .prepare(
+                "SELECT reason FROM claim_log WHERE kind != 'subject_announce' \
+                 ORDER BY log_id ASC",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, Option<String>>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(reasons, vec![Some("matched on hash".to_string()), None]);
+    }
+
+    // --- Wave 1: merge mirrors subjects-table mutations -------------------
+
+    #[tokio::test]
+    async fn memory_merge_creates_new_subject_and_drops_sources() {
+        let s = MemoryPersistenceStore::new();
+        s.record_subject_announce(AnnounceRecord {
+            canonical_id: "uuid-a",
+            subject_type: "track",
+            addressings: &[ext("a", "1")],
+            claimant: "p1",
+            claims: &[],
+            at_ms: 10,
+        })
+        .await
+        .unwrap();
+        s.record_subject_announce(AnnounceRecord {
+            canonical_id: "uuid-b",
+            subject_type: "track",
+            addressings: &[ext("b", "2")],
+            claimant: "p2",
+            claims: &[],
+            at_ms: 20,
+        })
+        .await
+        .unwrap();
+
+        s.record_subject_merge(MergeRecord {
+            source_a: "uuid-a",
+            source_b: "uuid-b",
+            new_id: "uuid-c",
+            subject_type: "track",
+            admin_plugin: "admin",
+            reason: Some("dup"),
+            at_ms: 30,
+        })
+        .await
+        .unwrap();
+
+        let all = s.load_all_subjects().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, "uuid-c");
+        assert_eq!(all[0].subject_type, "track");
+        let mut schemes: Vec<&str> = all[0]
+            .addressings
+            .iter()
+            .map(|a| a.scheme.as_str())
+            .collect();
+        schemes.sort();
+        assert_eq!(schemes, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn sqlite_merge_creates_new_subject_and_drops_sources() {
+        let (_dir, store) = open_temp();
+        store
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: "uuid-a",
+                subject_type: "track",
+                addressings: &[ext("a", "1")],
+                claimant: "p1",
+                claims: &[],
+                at_ms: 10,
+            })
+            .await
+            .unwrap();
+        store
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: "uuid-b",
+                subject_type: "track",
+                addressings: &[ext("b", "2")],
+                claimant: "p2",
+                claims: &[],
+                at_ms: 20,
+            })
+            .await
+            .unwrap();
+
+        store
+            .record_subject_merge(MergeRecord {
+                source_a: "uuid-a",
+                source_b: "uuid-b",
+                new_id: "uuid-c",
+                subject_type: "track",
+                admin_plugin: "admin",
+                reason: Some("dup"),
+                at_ms: 30,
+            })
+            .await
+            .unwrap();
+
+        let conn = Connection::open(store.path()).expect("side open");
+        let n_subjects: i64 = conn
+            .query_row("SELECT COUNT(*) FROM subjects", [], |r| r.get(0))
+            .unwrap();
+        let n_new: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM subjects WHERE id = 'uuid-c'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let n_old: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM subjects \
+                 WHERE id = 'uuid-a' OR id = 'uuid-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let n_addr_on_new: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM subject_addressings \
+                 WHERE subject_id = 'uuid-c'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let n_addr_orphan: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM subject_addressings \
+                 WHERE subject_id IN ('uuid-a', 'uuid-b')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_subjects, 1);
+        assert_eq!(n_new, 1);
+        assert_eq!(n_old, 0);
+        assert_eq!(n_addr_on_new, 2);
+        assert_eq!(n_addr_orphan, 0);
+    }
+
+    // --- Wave 1: split mirrors subjects-table mutations -------------------
+
+    #[tokio::test]
+    async fn memory_split_partitions_addressings_and_drops_source() {
+        let s = MemoryPersistenceStore::new();
+        s.record_subject_announce(AnnounceRecord {
+            canonical_id: "uuid-a",
+            subject_type: "track",
+            addressings: &[ext("a", "1"), ext("b", "2"), ext("c", "3")],
+            claimant: "p1",
+            claims: &[],
+            at_ms: 10,
+        })
+        .await
+        .unwrap();
+
+        let new_ids = vec!["uuid-x".to_string(), "uuid-y".to_string()];
+        let partition: Vec<Vec<ExternalAddressing>> =
+            vec![vec![ext("a", "1"), ext("b", "2")], vec![ext("c", "3")]];
+        s.record_subject_split(SplitRecord {
+            source: "uuid-a",
+            new_ids: &new_ids,
+            subject_type: "track",
+            partition: &partition,
+            admin_plugin: "admin",
+            reason: None,
+            at_ms: 20,
+        })
+        .await
+        .unwrap();
+
+        let mut all = s.load_all_subjects().await.unwrap();
+        all.sort_by(|x, y| x.id.cmp(&y.id));
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, "uuid-x");
+        assert_eq!(all[0].addressings.len(), 2);
+        assert_eq!(all[1].id, "uuid-y");
+        assert_eq!(all[1].addressings.len(), 1);
+        // Source is gone.
+        assert!(all.iter().all(|s| s.id != "uuid-a"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_split_partitions_addressings_and_drops_source() {
+        let (_dir, store) = open_temp();
+        store
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: "uuid-a",
+                subject_type: "track",
+                addressings: &[ext("a", "1"), ext("b", "2"), ext("c", "3")],
+                claimant: "p1",
+                claims: &[],
+                at_ms: 10,
+            })
+            .await
+            .unwrap();
+
+        let new_ids = vec!["uuid-x".to_string(), "uuid-y".to_string()];
+        let partition: Vec<Vec<ExternalAddressing>> =
+            vec![vec![ext("a", "1"), ext("b", "2")], vec![ext("c", "3")]];
+        store
+            .record_subject_split(SplitRecord {
+                source: "uuid-a",
+                new_ids: &new_ids,
+                subject_type: "track",
+                partition: &partition,
+                admin_plugin: "admin",
+                reason: None,
+                at_ms: 20,
+            })
+            .await
+            .unwrap();
+
+        let conn = Connection::open(store.path()).expect("side open");
+        let n_source: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM subjects WHERE id = 'uuid-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let n_x_addr: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM subject_addressings \
+                 WHERE subject_id = 'uuid-x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let n_y_addr: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM subject_addressings \
+                 WHERE subject_id = 'uuid-y'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let n_source_addr: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM subject_addressings \
+                 WHERE subject_id = 'uuid-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_source, 0);
+        assert_eq!(n_x_addr, 2);
+        assert_eq!(n_y_addr, 1);
+        assert_eq!(n_source_addr, 0);
+    }
+
+    #[tokio::test]
+    async fn memory_split_partition_length_mismatch_errors() {
+        let s = MemoryPersistenceStore::new();
+        let new_ids = vec!["uuid-x".to_string(), "uuid-y".to_string()];
+        let partition: Vec<Vec<ExternalAddressing>> = vec![Vec::new()];
+        let r = s
+            .record_subject_split(SplitRecord {
+                source: "uuid-a",
+                new_ids: &new_ids,
+                subject_type: "track",
+                partition: &partition,
+                admin_plugin: "admin",
+                reason: None,
+                at_ms: 20,
+            })
+            .await;
+        assert!(matches!(r, Err(PersistenceError::Invalid(_))));
+    }
+
+    #[tokio::test]
+    async fn sqlite_split_partition_length_mismatch_errors() {
+        let (_dir, store) = open_temp();
+        let new_ids = vec!["uuid-x".to_string(), "uuid-y".to_string()];
+        let partition: Vec<Vec<ExternalAddressing>> = vec![Vec::new()];
+        let r = store
+            .record_subject_split(SplitRecord {
+                source: "uuid-a",
+                new_ids: &new_ids,
+                subject_type: "track",
+                partition: &partition,
+                admin_plugin: "admin",
+                reason: None,
+                at_ms: 20,
+            })
+            .await;
+        assert!(matches!(r, Err(PersistenceError::Invalid(_))));
     }
 }
