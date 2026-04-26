@@ -1829,8 +1829,8 @@ async fn wait_for_socket_ready(
     }
 }
 
-// Pre-admission validation moved to `admission/validation.rs` per
-// ADR-0019 §6. Callers reference the helpers as
+// Pre-admission validation lives in `admission/validation.rs`.
+// Callers reference the helpers as
 // `validation::check_manifest_prerequisites`,
 // `validation::check_admin_trust`, and
 // `validation::reject_factory_for_v0`. Module-level rustdoc on

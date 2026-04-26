@@ -800,7 +800,7 @@ These reverse the polarity of the request / response axis: the plugin issues the
 
 **Event ack (steward-to-plugin, echoes the event's cid)**
 
-The wire-side announcer / reporter trait implementations await an `event_ack` (success) or an `error` (rejection) per event `cid`, surfacing the same `Result<(), ReportError>` to the trait caller as in-process plugins receive. See `PLUGIN_CONTRACT.md` and ADR-0011.
+The wire-side announcer / reporter trait implementations await an `event_ack` (success) or an `error` (rejection) per event `cid`, surfacing the same `Result<(), ReportError>` to the trait caller as in-process plugins receive. See `PLUGIN_CONTRACT.md`.
 
 | `op` | Answers | Additional fields |
 |------|---------|-------------------|
@@ -808,7 +808,7 @@ The wire-side announcer / reporter trait implementations await an `event_ack` (s
 
 **Handshake (bidirectional, exchanged once before any other dispatch)**
 
-Per ADR-0010. The connecting peer (the steward) sends `hello`; the answerer (the plugin) replies with `hello_ack`. Frames carry `cid: 0` by convention. Negotiation rejection produces an `error` frame (`fatal: true`) in place of `hello_ack`.
+The connecting peer (the steward) sends `hello`; the answerer (the plugin) replies with `hello_ack`. Frames carry `cid: 0` by convention. Negotiation rejection produces an `error` frame (`fatal: true`) in place of `hello_ack`.
 
 | `op` | Direction | Additional fields |
 |------|-----------|-------------------|
@@ -817,7 +817,7 @@ Per ADR-0010. The connecting peer (the steward) sends `hello`; the answerer (the
 
 **Admin verbs (plugin-to-steward, carry their own cid)**
 
-Per ADR-0011. Plugins admitted at admin trust class invoke `SubjectAdmin` and `RelationAdmin` over the wire through these frames. The steward enforces capability gating server-side; a plugin without admin capability gets a non-fatal `error` frame ("admin capability not granted"). Each request has a paired `*_response` frame whose body is envelope-only (the trait methods return `Result<(), ReportError>`); failures collapse to `error`.
+Plugins admitted at admin trust class invoke `SubjectAdmin` and `RelationAdmin` over the wire through these frames. The steward enforces capability gating server-side; a plugin without admin capability gets a non-fatal `error` frame ("admin capability not granted"). Each request has a paired `*_response` frame whose body is envelope-only (the trait methods return `Result<(), ReportError>`); failures collapse to `error`.
 
 | `op` | Purpose | Additional fields |
 |------|---------|-------------------|

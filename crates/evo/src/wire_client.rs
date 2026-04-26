@@ -187,15 +187,14 @@ pub struct EventSink {
     /// the matching `*_response` frame on the same connection.
     pub subject_querier: Arc<dyn SubjectQuerier>,
     /// Where to route plugin-initiated `forced_retract_addressing` /
-    /// `merge_subjects` / `split_subject` requests (ADR-0011 admin
-    /// surface). `None` for plugins that do not hold the admin
-    /// capability bit; in that case the reader task replies with a
-    /// fatal `Error` frame for those verbs.
+    /// `merge_subjects` / `split_subject` requests (admin surface).
+    /// `None` for plugins that do not hold the admin capability
+    /// bit; in that case the reader task replies with a fatal
+    /// `Error` frame for those verbs.
     pub subject_admin: Option<Arc<dyn SubjectAdmin>>,
     /// Where to route plugin-initiated `forced_retract_claim` /
-    /// `suppress_relation` / `unsuppress_relation` requests
-    /// (ADR-0011 admin surface). Same gating as
-    /// [`Self::subject_admin`].
+    /// `suppress_relation` / `unsuppress_relation` requests (admin
+    /// surface). Same gating as [`Self::subject_admin`].
     pub relation_admin: Option<Arc<dyn RelationAdmin>>,
 }
 
@@ -965,7 +964,7 @@ async fn forward_plugin_request(
             },
         },
 
-        // ----- ADR-0011 admin verbs (SubjectAdmin) -----
+        // ----- Admin verbs (SubjectAdmin) -----
         WireFrame::ForcedRetractAddressing {
             v,
             cid,
@@ -1049,7 +1048,7 @@ async fn forward_plugin_request(
             None => admin_capability_denied_error(v, cid, plugin),
         },
 
-        // ----- ADR-0011 admin verbs (RelationAdmin) -----
+        // ----- Admin verbs (RelationAdmin) -----
         WireFrame::ForcedRetractClaim {
             v,
             cid,

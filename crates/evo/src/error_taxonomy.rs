@@ -1,4 +1,4 @@
-//! Structured error taxonomy for cross-boundary surfaces (ADR-0013).
+//! Structured error taxonomy for cross-boundary surfaces.
 //!
 //! Every error that crosses the client-API socket carries an
 //! [`ErrorClass`] discriminant alongside the human-readable message.
@@ -7,23 +7,22 @@
 //! optional `details.subclass` field) refine the semantics within a
 //! class without forcing a new top-level variant.
 //!
-//! ADR-0013 also calls for the same taxonomy on the steward↔plugin
-//! wire frame and on the internal error enums (`StewardError`,
-//! `PluginError`, `ReportError`). Those rebases are tracked
-//! separately; this module delivers the consumer-facing slice (the
-//! client API JSON shape) without tangling internal-refactor scope.
+//! The same taxonomy will eventually flow through the
+//! steward↔plugin wire frame and the internal error enums
+//! (`StewardError`, `PluginError`, `ReportError`); those rebases
+//! are tracked separately. This module delivers the consumer-facing
+//! slice — the client-API JSON shape — without tangling internal-
+//! refactor scope.
 
 use serde::{Deserialize, Serialize};
 
-/// One of eleven structured classes for a cross-boundary error,
-/// per ADR-0013 §2.
+/// One of eleven structured classes for a cross-boundary error.
 ///
 /// A consumer reading the wire form receives one of these as a
-/// snake_case string. Forward-compatibility (per ADR-0010): a
-/// consumer that observes a class it does not recognise MUST
-/// degrade to treating it as [`Self::Internal`] and log a warning
-/// rather than crash. This module's [`ErrorClass::from_str`] does
-/// that translation.
+/// snake_case string. Forward-compatibility: a consumer that
+/// observes a class it does not recognise MUST degrade to treating
+/// it as [`Self::Internal`] and log a warning rather than crash.
+/// New classes are added only with a wire-version bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -39,9 +38,9 @@ pub enum ErrorClass {
     /// cardinality breach, undeclared predicate). Retrying with the
     /// same input is pointless.
     ContractViolation,
-    /// Addressed entity does not exist. Per ADR-0006, NotFound is
-    /// silent at the storage layer; this class is the
-    /// cross-boundary surface that consumers see.
+    /// Addressed entity does not exist. NotFound is silent at the
+    /// storage layer; this class is the cross-boundary surface
+    /// that consumers see.
     NotFound,
     /// Caller lacks the capability for the operation. Distinct
     /// from [`Self::TrustViolation`].
@@ -51,7 +50,7 @@ pub enum ErrorClass {
     /// revocation, role.
     TrustViolation,
     /// Key in the trust chain is outside its `not_before` /
-    /// `not_after` window (ADR-0012).
+    /// `not_after` window.
     TrustExpired,
     /// The wire frame itself is malformed, the version handshake
     /// failed, or the codec disagreed. Caller should treat as
@@ -72,7 +71,7 @@ impl ErrorClass {
     ///
     /// Derived (not stored): the wire layer no longer carries an
     /// independent `fatal: bool` — every consumer computes this
-    /// from the class. ADR-0013 §4.
+    /// from the class.
     pub fn is_connection_fatal(self) -> bool {
         matches!(
             self,
@@ -120,7 +119,7 @@ impl std::fmt::Display for ErrorClass {
 }
 
 /// Structured error envelope returned by every error-bearing
-/// surface on the client API (ADR-0013 §2).
+/// surface on the client API.
 ///
 /// JSON shape:
 ///
@@ -135,10 +134,11 @@ impl std::fmt::Display for ErrorClass {
 /// `details` is optional and weakly typed by design. A consumer
 /// that wants to act on `details.subclass` must agree on the
 /// subclass vocabulary out of band; the taxonomy is documented in
-/// `SCHEMAS.md` and grows additively per ADR-0010.
+/// `SCHEMAS.md` and grows additively (new subclasses are appended;
+/// existing names are stable across releases).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApiError {
-    /// Top-level taxonomy class (ADR-0013 §2).
+    /// Top-level taxonomy class.
     pub class: ErrorClass,
     /// Operator-readable message. Advisory; the contract is on
     /// `class` and `details.subclass`.
@@ -208,8 +208,9 @@ mod tests {
     }
 
     #[test]
-    fn fatal_classes_match_adr_0013() {
-        // ADR-0013 §4: the class derives the fatality bit.
+    fn fatal_classes_are_derived_from_taxonomy() {
+        // The class derives the fatality bit; the wire layer
+        // never carries an independent `fatal: bool` field.
         assert!(ErrorClass::ProtocolViolation.is_connection_fatal());
         assert!(ErrorClass::Internal.is_connection_fatal());
         assert!(ErrorClass::TrustViolation.is_connection_fatal());

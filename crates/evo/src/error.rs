@@ -99,7 +99,7 @@ impl StewardError {
         }
     }
 
-    /// Map a [`StewardError`] to its ADR-0013 [`ErrorClass`].
+    /// Map a [`StewardError`] to its [`ErrorClass`].
     ///
     /// Heuristic, not contractual: variants whose semantics will be
     /// rebased onto a richer internal taxonomy in a future pass

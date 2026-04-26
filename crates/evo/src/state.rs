@@ -79,13 +79,14 @@ pub struct StewardState {
     /// the boot-time replay through it. The trait is held as a
     /// `dyn` reference so tests can substitute the in-memory mock.
     pub persistence: Arc<dyn PersistenceStore>,
-    /// Issuer for ADR-0018 claimant tokens. Held by every wire-
-    /// emission site that needs to translate a plugin name into the
-    /// consumer-facing token (the `From<Happening>` for
-    /// `HappeningWire` conversion in `server.rs`, the projection-
-    /// wire builders, etc.). Centralised here so all surfaces share
-    /// one source of truth for the token derivation, satisfying
-    /// ADR-0018's no-drift invariant.
+    /// Issuer for claimant tokens. Held by every wire-emission site
+    /// that needs to translate a plugin name into the consumer-
+    /// facing token (the `From<Happening>` for `HappeningWire`
+    /// conversion in `server.rs`, the projection-wire builders,
+    /// etc.). Centralised here so all surfaces share one source of
+    /// truth for the token derivation; the no-drift invariant
+    /// requires every wire surface to mint tokens through this same
+    /// issuer.
     pub claimant_issuer: Arc<ClaimantTokenIssuer>,
 }
 
@@ -166,7 +167,7 @@ impl StewardStateBuilder {
         self
     }
 
-    /// Provide the claimant-token issuer (ADR-0018).
+    /// Provide the claimant-token issuer.
     pub fn claimant_issuer(mut self, issuer: Arc<ClaimantTokenIssuer>) -> Self {
         self.claimant_issuer = Some(issuer);
         self

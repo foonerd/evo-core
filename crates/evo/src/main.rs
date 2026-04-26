@@ -107,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Load the steward instance ID from persistence (migration 003).
     // Pinned at first boot, persisted forever; anchors the per-
-    // deployment unlinkability of ADR-0018 claimant tokens.
+    // deployment unlinkability of claimant tokens.
     let instance_id = persistence
         .load_instance_id()
         .await

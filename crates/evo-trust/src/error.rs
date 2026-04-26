@@ -56,8 +56,8 @@ pub enum TrustError {
     /// The manifest could not be re-serialised to canonical TOML.
     /// Either the on-disk bytes did not parse as TOML, or a value
     /// (typically a non-finite float) cannot be represented
-    /// canonically. The canonical TOML is the signing payload per
-    /// ADR-0012; no fallback to raw bytes is permitted.
+    /// canonically. The canonical TOML is the signing payload; no
+    /// fallback to raw bytes is permitted.
     #[error("manifest canonicalisation failed: {0}")]
     CanonicalisationFailed(String),
 }

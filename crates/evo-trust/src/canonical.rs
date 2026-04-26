@@ -1,4 +1,4 @@
-//! Canonical TOML re-serialiser for the signing payload (ADR-0012).
+//! Canonical TOML re-serialiser for the signing payload.
 //!
 //! Whitespace, comments, key ordering, and TOML quoting style on
 //! disk are the operator's and the editor's choice — none of them
@@ -20,9 +20,8 @@
 //!   trailing newline.
 //!
 //! The output is recoverable by humans inspecting the bundle and
-//! deterministic across operator tooling. ADR-0012 §canonical-TOML
-//! is the normative spec; this module is the only blessed
-//! implementation.
+//! deterministic across operator tooling. This module is the only
+//! blessed implementation.
 //!
 //! ## What is not canonical here
 //!
@@ -64,7 +63,8 @@ pub enum CanonicalError {
     },
 }
 
-/// Canonicalise the TOML in `input` per ADR-0012 §canonical-TOML.
+/// Canonicalise the TOML in `input` per the rules in this module's
+/// header.
 ///
 /// Parses the input, then re-emits a deterministic byte sequence.
 /// Two manifests that round-trip to structurally equal
@@ -279,12 +279,12 @@ fn emit_value(
             out.push(']');
         }
         Value::Table(_) => {
-            // Inline tables in canonical form expand to
-            // standard `[table.path]` form per ADR-0012, which is
-            // emitted by `emit_table`. Arriving here means a table
-            // appeared as a value rather than a sub-table — the
-            // top-level walker routes tables to `emit_table`, so
-            // this branch is unreachable for well-formed input.
+            // Inline tables in canonical form expand to standard
+            // `[table.path]` form, which is emitted by
+            // `emit_table`. Arriving here means a table appeared as
+            // a value rather than a sub-table — the top-level
+            // walker routes tables to `emit_table`, so this branch
+            // is unreachable for well-formed input.
             // Defensive: emit the table contents as an inline
             // table on a single line.
             out.push('{');

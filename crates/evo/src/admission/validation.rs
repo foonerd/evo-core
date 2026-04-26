@@ -1,4 +1,4 @@
-//! Pre-admission manifest validation (ADR-0019 §6).
+//! Pre-admission manifest validation.
 //!
 //! Three checks every admit path runs before constructing a
 //! [`LoadContext`](evo_plugin_sdk::contract::LoadContext) or
@@ -14,10 +14,10 @@
 //!   gains an instance-emission path.
 //!
 //! The four `admit_*` entry points in the parent module call all
-//! three in the same order. Centralising them here per ADR-0019 §6
-//! gives each check one canonical site, makes "what does admission
-//! reject" answerable from one file, and keeps the pipeline
-//! mechanically auditable in code review.
+//! three in the same order. Centralising them here gives each check
+//! one canonical site, makes "what does admission reject"
+//! answerable from one file, and keeps the pipeline mechanically
+//! auditable in code review.
 
 use crate::error::StewardError;
 use evo_plugin_sdk::manifest::InstanceShape;

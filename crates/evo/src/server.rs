@@ -56,7 +56,7 @@
 //! { "op": "subscribe_happenings" }
 //! ```
 //!
-//! Or, with a cursor for replay-then-live (ADR-0017):
+//! Or, with a cursor for replay-then-live:
 //! ```json
 //! { "op": "subscribe_happenings", "since": 1234 }
 //! ```
@@ -256,13 +256,13 @@ enum ClientRequest {
     /// Snapshot the custody ledger - every currently-held custody the
     /// steward has recorded. No fields; v0 returns everything.
     ListActiveCustodies,
-    /// Capability discovery (Wave 2.2).
+    /// Capability discovery.
     ///
     /// Returns the wire version, list of supported ops, and a list
     /// of named features (e.g. `subscribe_happenings_cursor` for the
-    /// ADR-0017 replay surface). Consumers SHOULD call this once on
-    /// connect so they can negotiate behaviour at runtime instead of
-    /// hardcoding compatibility against a specific steward build.
+    /// happenings replay surface). Consumers SHOULD call this once
+    /// on connect so they can negotiate behaviour at runtime instead
+    /// of hardcoding compatibility against a specific steward build.
     ///
     /// The op set and feature names are stable; new capabilities are
     /// added (never removed) as the steward grows. A consumer that
@@ -274,7 +274,7 @@ enum ClientRequest {
     /// streaming mode; see module-level docs for the sequence of
     /// frames the server emits.
     ///
-    /// Optional `since` enables cursor-based replay (ADR-0017): the
+    /// Optional `since` enables cursor-based replay: the
     /// server replays every happening with `seq > since` from the
     /// durable `happenings_log` window before transitioning to
     /// live streaming. When omitted, the connection sees only events
@@ -453,7 +453,7 @@ enum ClientResponse {
     /// registered its receiver on the bus. The `subscribed` field is
     /// always `true`; its sole purpose is the distinctive top-level
     /// key `subscribed` for the untagged-enum disambiguation.
-    /// `current_seq` is the bus's cursor at subscribe time (ADR-0017):
+    /// `current_seq` is the bus's cursor at subscribe time:
     /// consumers pin reconcile-style queries (e.g. `list_subjects`)
     /// to it, then apply happenings with `seq > current_seq` as
     /// deltas on top.
@@ -467,7 +467,7 @@ enum ClientResponse {
     },
     /// One happening from the subscription stream.
     Happening {
-        /// Bus cursor minted at emit time (ADR-0017). Strictly
+        /// Bus cursor minted at emit time. Strictly
         /// monotonic across a steward instance; consumers persist this
         /// value to resume cleanly across reconnect or restart.
         seq: u64,
@@ -485,7 +485,7 @@ enum ClientResponse {
     },
     /// Any failure.
     ///
-    /// The `error` envelope is structured per ADR-0013: it carries
+    /// The `error` envelope is structured: it carries
     /// a top-level `class` (one of eleven taxonomy classes), a
     /// human-readable `message`, and an optional `details` object
     /// (typically `{ "subclass": "..." }` plus class-specific
@@ -510,7 +510,7 @@ struct SubjectProjectionWire {
     composed_at_ms: u64,
     shape_version: u32,
     /// Opaque tokens identifying the plugins that claim the subject
-    /// (ADR-0018). Order matches the projection's claimant list.
+    ///. Order matches the projection's claimant list.
     claimant_tokens: Vec<ClaimantToken>,
     degraded: bool,
     degraded_reasons: Vec<DegradedReasonWire>,
@@ -524,7 +524,7 @@ struct SubjectProjectionWire {
 struct AddressingEntryWire {
     scheme: String,
     value: String,
-    /// Opaque token identifying the claiming plugin (ADR-0018).
+    /// Opaque token identifying the claiming plugin.
     claimant_token: ClaimantToken,
 }
 
@@ -538,7 +538,7 @@ struct RelatedSubjectWire {
     /// relation (the edge target is not in the subject registry).
     target_type: Option<String>,
     /// Opaque tokens identifying the plugins claiming this relation
-    /// (ADR-0018). Order matches the relation graph's claim list.
+    ///. Order matches the relation graph's claim list.
     relation_claimant_tokens: Vec<ClaimantToken>,
     /// Recursively composed projection for the other end of the edge,
     /// when the scope's `max_depth` permitted expansion. `null`
@@ -664,7 +664,7 @@ impl From<DegradedReason> for DegradedReasonWire {
 #[derive(Debug, Serialize)]
 struct CustodyRecordWire {
     /// Opaque token identifying the warden plugin holding this
-    /// custody (ADR-0018).
+    /// custody.
     claimant_token: ClaimantToken,
     /// Warden-chosen handle id. Opaque to the steward.
     handle_id: String,
@@ -750,7 +750,7 @@ fn system_time_to_ms(t: SystemTime) -> u64 {
 enum HappeningWire {
     /// Wire form of [`Happening::CustodyTaken`].
     CustodyTaken {
-        /// Opaque token identifying the warden plugin (ADR-0018).
+        /// Opaque token identifying the warden plugin.
         claimant_token: ClaimantToken,
         /// Warden-chosen handle id.
         handle_id: String,
@@ -763,7 +763,7 @@ enum HappeningWire {
     },
     /// Wire form of [`Happening::CustodyReleased`].
     CustodyReleased {
-        /// Opaque token identifying the warden plugin (ADR-0018).
+        /// Opaque token identifying the warden plugin.
         claimant_token: ClaimantToken,
         /// Handle id of the released custody.
         handle_id: String,
@@ -772,7 +772,7 @@ enum HappeningWire {
     },
     /// Wire form of [`Happening::CustodyStateReported`].
     CustodyStateReported {
-        /// Opaque token identifying the warden plugin (ADR-0018).
+        /// Opaque token identifying the warden plugin.
         claimant_token: ClaimantToken,
         /// Handle id the report pertains to.
         handle_id: String,
@@ -792,7 +792,7 @@ enum HappeningWire {
     /// observed count so subscribers can apply reconciliation
     /// policy.
     RelationCardinalityViolation {
-        /// Opaque token identifying the asserting plugin (ADR-0018).
+        /// Opaque token identifying the asserting plugin.
         claimant_token: ClaimantToken,
         /// Predicate of the violating assertion.
         predicate: String,
@@ -824,7 +824,7 @@ enum HappeningWire {
     /// forget triggers.
     SubjectForgotten {
         /// Opaque token identifying the plugin whose retract
-        /// triggered the forget (ADR-0018).
+        /// triggered the forget.
         claimant_token: ClaimantToken,
         /// Canonical ID of the forgotten subject.
         canonical_id: String,
@@ -843,7 +843,7 @@ enum HappeningWire {
     /// ([`RelationForgottenReason::SubjectCascade`]).
     RelationForgotten {
         /// Opaque token identifying the plugin whose action
-        /// triggered the forget (ADR-0018).
+        /// triggered the forget.
         claimant_token: ClaimantToken,
         /// Canonical ID of the source subject on the forgotten
         /// relation.
@@ -856,8 +856,8 @@ enum HappeningWire {
         /// Why the relation was forgotten. Serialises as a
         /// nested object internally tagged by `kind`
         /// (`claims_retracted` or `subject_cascade`). Wire form so
-        /// the `retracting_plugin` plain name is swapped for
-        /// `retracting_claimant_token` per ADR-0018.
+        /// the internal `retracting_plugin` name is swapped for
+        /// `retracting_claimant_token`.
         reason: RelationForgottenReasonWire,
         /// When the happening was recorded, ms since UNIX epoch.
         at_ms: u64,
@@ -873,10 +873,10 @@ enum HappeningWire {
     /// removed".
     SubjectAddressingForcedRetract {
         /// Opaque token identifying the admin plugin that performed
-        /// the retract (ADR-0018).
+        /// the retract.
         admin_token: ClaimantToken,
         /// Opaque token identifying the plugin whose claim was
-        /// removed (ADR-0018).
+        /// removed.
         target_token: ClaimantToken,
         /// Canonical ID of the subject the addressing was attached
         /// to.
@@ -897,10 +897,10 @@ enum HappeningWire {
     /// [`HappeningWire::RelationForgotten`] event the same retract
     /// triggers.
     RelationClaimForcedRetract {
-        /// Opaque token identifying the admin plugin (ADR-0018).
+        /// Opaque token identifying the admin plugin.
         admin_token: ClaimantToken,
         /// Opaque token identifying the plugin whose claim was
-        /// removed (ADR-0018).
+        /// removed.
         target_token: ClaimantToken,
         /// Canonical ID of the source subject on the relation.
         source_id: String,
@@ -920,7 +920,7 @@ enum HappeningWire {
     /// source IDs survive in the registry as alias records.
     SubjectMerged {
         /// Opaque token identifying the admin plugin that performed
-        /// the merge (ADR-0018).
+        /// the merge.
         admin_token: ClaimantToken,
         /// Canonical IDs of the source subjects.
         source_ids: Vec<String>,
@@ -939,7 +939,7 @@ enum HappeningWire {
     /// record carrying all new IDs.
     SubjectSplit {
         /// Opaque token identifying the admin plugin that performed
-        /// the split (ADR-0018).
+        /// the split.
         admin_token: ClaimantToken,
         /// Canonical ID of the source subject.
         source_id: String,
@@ -957,7 +957,7 @@ enum HappeningWire {
     /// Wire form of [`Happening::RelationSuppressed`].
     RelationSuppressed {
         /// Opaque token identifying the admin plugin that performed
-        /// the suppression (ADR-0018).
+        /// the suppression.
         admin_token: ClaimantToken,
         /// Canonical ID of the source subject.
         source_id: String,
@@ -973,7 +973,7 @@ enum HappeningWire {
     /// Wire form of [`Happening::RelationSuppressionReasonUpdated`].
     RelationSuppressionReasonUpdated {
         /// Opaque token identifying the admin plugin that performed
-        /// the re-suppress with the new reason (ADR-0018).
+        /// the re-suppress with the new reason.
         admin_token: ClaimantToken,
         /// Canonical ID of the source subject.
         source_id: String,
@@ -991,7 +991,7 @@ enum HappeningWire {
     /// Wire form of [`Happening::RelationUnsuppressed`].
     RelationUnsuppressed {
         /// Opaque token identifying the admin plugin that performed
-        /// the unsuppression (ADR-0018).
+        /// the unsuppression.
         admin_token: ClaimantToken,
         /// Canonical ID of the source subject.
         source_id: String,
@@ -1005,7 +1005,7 @@ enum HappeningWire {
     /// Wire form of [`Happening::RelationSplitAmbiguous`].
     RelationSplitAmbiguous {
         /// Opaque token identifying the admin plugin that performed
-        /// the split (ADR-0018).
+        /// the split.
         admin_token: ClaimantToken,
         /// Canonical ID of the source subject that was split
         /// (the OLD ID).
@@ -1028,7 +1028,7 @@ enum HappeningWire {
     /// indexes coherent across rewrites.
     RelationRewritten {
         /// Opaque token identifying the admin plugin that performed
-        /// the merge or split (ADR-0018).
+        /// the merge or split.
         admin_token: ClaimantToken,
         /// Predicate of the rewritten relation.
         predicate: String,
@@ -1050,7 +1050,7 @@ enum HappeningWire {
     /// resolution.
     RelationCardinalityViolatedPostRewrite {
         /// Opaque token identifying the admin plugin that performed
-        /// the merge or split (ADR-0018).
+        /// the merge or split.
         admin_token: ClaimantToken,
         /// Canonical ID of the subject whose count exceeds the
         /// bound on the indicated side.
@@ -1075,10 +1075,10 @@ enum HappeningWire {
     /// state.
     ClaimReassigned {
         /// Opaque token identifying the admin plugin that performed
-        /// the merge or split (ADR-0018).
+        /// the merge or split.
         admin_token: ClaimantToken,
         /// Opaque token identifying the plugin whose claim was
-        /// moved (ADR-0018).
+        /// moved.
         claimant_token: ClaimantToken,
         /// Kind of claim reassigned (`"addressing"` or
         /// `"relation"`).
@@ -1111,7 +1111,7 @@ enum HappeningWire {
     /// previously-visible claim from a sibling edge.
     RelationClaimSuppressionCollapsed {
         /// Opaque token identifying the admin plugin that performed
-        /// the merge (ADR-0018).
+        /// the merge.
         admin_token: ClaimantToken,
         /// Canonical ID of the source subject on the surviving
         /// relation.
@@ -1122,7 +1122,7 @@ enum HappeningWire {
         /// relation.
         target_id: String,
         /// Opaque token identifying the plugin whose claim was
-        /// demoted (ADR-0018).
+        /// demoted.
         demoted_claimant_token: ClaimantToken,
         /// Suppression provenance now applied to the surviving
         /// edge.
@@ -1140,8 +1140,9 @@ enum HappeningWire {
 /// [`RelationForgottenReason`](crate::happenings::RelationForgottenReason).
 ///
 /// Mirrors the domain enum but replaces `retracting_plugin: String`
-/// (the plain plugin name) with `retracting_claimant_token` per
-/// ADR-0018 §Invariants ("no plugin name in any wire frame").
+/// (the plain plugin name) with `retracting_claimant_token`.
+/// Plugin identity never leaves the wire as a plain name; consumers
+/// see opaque tokens only.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RelationForgottenReasonWire {
@@ -1149,7 +1150,7 @@ enum RelationForgottenReasonWire {
     /// no claims remained.
     ClaimsRetracted {
         /// Opaque token identifying the plugin whose retract removed
-        /// the last claim (ADR-0018).
+        /// the last claim.
         retracting_claimant_token: ClaimantToken,
     },
     /// A subject the relation touched was forgotten, cascading
@@ -1180,7 +1181,7 @@ impl RelationForgottenReasonWire {
 #[derive(Debug, Serialize)]
 struct SuppressionRecordWire {
     /// Opaque token identifying the admin plugin that suppressed
-    /// (ADR-0018).
+    ///.
     admin_token: ClaimantToken,
     /// When the suppression was recorded, ms since UNIX epoch.
     suppressed_at_ms: u64,
@@ -1205,7 +1206,7 @@ impl HappeningWire {
     /// Build the wire form from a domain [`Happening`], translating
     /// every plugin name through the steward's
     /// [`ClaimantTokenIssuer`] so no plain plugin name appears on
-    /// the wire (ADR-0018 §Invariants).
+    /// the wire.
     ///
     /// The match is exhaustive: a new [`Happening`] variant fails
     /// compilation here, forcing the wire type to be updated in
@@ -1702,7 +1703,7 @@ async fn handle_connection(
             // Promote the connection to streaming mode. State carries
             // both the bus and the persistence handle; the latter is
             // queried for cursor replay before the live transition
-            // (ADR-0017).
+            //.
             return run_subscription(stream, Arc::clone(&state), since).await;
         }
 
@@ -1848,7 +1849,7 @@ async fn dispatch_request(
 ///    later recv. This order is load-bearing for the live path.
 /// 2. The bus's `last_emitted_seq` is sampled — this is the
 ///    `current_seq` written into the ack so the consumer can pin
-///    reconcile queries to it (ADR-0017).
+///    reconcile queries to it.
 /// 3. The ack is written, carrying `subscribed: true` and
 ///    `current_seq`. If writing fails the client has disconnected
 ///    before receiving it; we return cleanly.
@@ -2314,9 +2315,10 @@ const SUPPORTED_OPS: &[&str] = &[
 /// A consumer probes for a name in this list to decide whether to
 /// rely on the corresponding behaviour:
 ///
-/// - `subscribe_happenings_cursor`: ADR-0017 cursor surface — the
-///   `since` parameter on `subscribe_happenings`, `current_seq` on
-///   the ack, and `seq` on every streamed `Happening` frame.
+/// - `subscribe_happenings_cursor`: cursor-aware happenings stream
+///   — the `since` parameter on `subscribe_happenings`,
+///   `current_seq` on the ack, and `seq` on every streamed
+///   `Happening` frame.
 /// - `alias_chain_walking`: `op = "describe_alias"` and the
 ///   alias-aware variants of `op = "project_subject"`.
 /// - `active_custodies_snapshot`: `op = "list_active_custodies"`
@@ -3004,7 +3006,7 @@ mod tests {
         assert_eq!(v["happening"]["shelf"].as_str(), Some("example.custody"));
         assert_eq!(v["happening"]["custody_type"].as_str(), Some("playback"));
         assert_eq!(v["happening"]["at_ms"].as_u64(), Some(1_700_000_000_000));
-        // ADR-0018 invariant: no plain plugin name on the wire.
+        // Privacy invariant: no plain plugin name on the wire.
         assert!(
             !s.contains("\"plugin\""),
             "plain plugin name field MUST NOT appear; got: {s}"
@@ -3029,12 +3031,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Happening → wire conversion (ADR-0018 token translation).
+    // Happening → wire conversion (plugin-name → claimant token).
     //
     // The 17-variant exhaustiveness is enforced at compile time by
     // the match in `HappeningWire::from_happening`: a new domain
     // variant fails compilation in lockstep. Tests below pin the
-    // ADR-0018 invariant ("no plain plugin name on the wire") and
+    // privacy invariant ("no plain plugin name on the wire") and
     // exercise the representative shapes — custody, admin, the
     // RelationForgottenReasonWire translation, and the reused
     // SuppressionRecordWire embed — so a regression in any of those
@@ -3102,7 +3104,7 @@ mod tests {
     fn from_happening_translates_relation_forgotten_reason_token() {
         // The `retracting_plugin` plain name in
         // RelationForgottenReason::ClaimsRetracted MUST surface as
-        // `retracting_claimant_token` per ADR-0018.
+        // `retracting_claimant_token` on the wire.
         let issuer = ClaimantTokenIssuer::new("test-instance");
         let expected = issuer.token_for("org.retractor");
 
@@ -3133,7 +3135,7 @@ mod tests {
 
     #[test]
     fn wire_form_never_carries_plugin_name_string_for_custody() {
-        // ADR-0018 invariant pin: serialise a CustodyTaken on the
+        // Privacy invariant pin: serialise a CustodyTaken on the
         // wire and assert no plain `plugin` JSON key appears.
         let issuer = ClaimantTokenIssuer::new("test-instance");
         let h = Happening::CustodyTaken {

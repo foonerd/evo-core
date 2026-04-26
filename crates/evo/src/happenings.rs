@@ -268,7 +268,7 @@ impl std::fmt::Display for ReassignedClaimKind {
 pub const DEFAULT_CAPACITY: usize = 1024;
 
 /// One happening paired with the monotonic seq the bus minted for
-/// it (ADR-0017).
+/// it.
 ///
 /// Cursor-aware consumers (the wire-protocol `subscribe_happenings`
 /// handler chief among them) subscribe via
@@ -873,7 +873,7 @@ pub enum Happening {
 /// tokio broadcast channel. Cloning the bus is not supported
 /// directly (the bus owns its sender); callers share it via `Arc`.
 ///
-/// ## Cursor durability (ADR-0017)
+/// ## Cursor durability
 ///
 /// The bus carries a monotonic [`Self::next_seq`] counter. Every
 /// happening emitted via [`Self::emit_durable`] is written through
@@ -903,7 +903,7 @@ pub struct HappeningBus {
     /// happening. The wire-protocol `subscribe_happenings` handler
     /// reads this channel so it can attach `seq` to every
     /// `ClientResponse::Happening` and dedupe replay-vs-live overlap
-    /// cleanly (ADR-0017).
+    /// cleanly.
     tx_env: broadcast::Sender<HappeningEnvelope>,
     /// Monotonic cursor minted on every emit. Always > 0 once a
     /// happening has been emitted.
@@ -1007,8 +1007,7 @@ impl HappeningBus {
         seq
     }
 
-    /// Emit a happening with write-through to `happenings_log` per
-    /// ADR-0017.
+    /// Emit a happening with write-through to `happenings_log`.
     ///
     /// Mints the next seq, serialises the happening to JSON, calls
     /// [`PersistenceStore::record_happening`], and finally
@@ -1074,7 +1073,7 @@ impl HappeningBus {
     }
 
     /// Subscribe to happenings with the bus-minted cursor seq
-    /// attached on every event (ADR-0017).
+    /// attached on every event.
     ///
     /// Returns a tokio broadcast receiver of [`HappeningEnvelope`]s.
     /// Each envelope's `seq` is identical to the seq the bus wrote to
@@ -1488,7 +1487,7 @@ mod tests {
         }
     }
 
-    // ---- Wave 2.5: durable cursor (ADR-0017) -----------------------------
+    // ---- durable cursor --------------------------------------------------
 
     #[tokio::test]
     async fn emit_durable_writes_through_and_broadcasts() {

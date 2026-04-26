@@ -419,7 +419,7 @@ Request:
 { "op": "subscribe_happenings" }
 ```
 
-Or, with a cursor for replay-then-live (ADR-0017):
+Or, with a cursor for replay-then-live:
 
 ```json
 { "op": "subscribe_happenings", "since": 1234 }
@@ -427,7 +427,7 @@ Or, with a cursor for replay-then-live (ADR-0017):
 
 `since` is optional. When omitted, the connection sees only happenings emitted after the subscribe ack — the original "live-only" behaviour. When supplied, the server queries the durable `happenings_log` for every event with `seq > since`, streams those replay frames first in ascending seq order, and only then transitions to live streaming. Live events whose seq is at or below the largest replayed seq are deduped silently; the consumer never observes the same seq twice across the boundary.
 
-A consumer reconnecting after a transient drop passes its last-observed `seq` as `since` and resumes cleanly. Cross-restart resume is supported: the bus's seq counter is durable (ADR-0016), so a `since` smaller than the steward's pre-restart current seq still resolves through the persisted window. If `since` is older than the durable retention window, the replay query returns whatever survives — older events are simply not included, and the consumer is responsible for falling back to a snapshot-style query (e.g. `list_active_custodies`) pinned to `current_seq` if a complete picture is required.
+A consumer reconnecting after a transient drop passes its last-observed `seq` as `since` and resumes cleanly. Cross-restart resume is supported: the bus's seq counter is durable, so a `since` smaller than the steward's pre-restart current seq still resolves through the persisted window. If `since` is older than the durable retention window, the replay query returns whatever survives — older events are simply not included, and the consumer is responsible for falling back to a snapshot-style query (e.g. `list_active_custodies`) pinned to `current_seq` if a complete picture is required.
 
 The server writes three kinds of frames after accepting the subscription:
 
@@ -457,7 +457,7 @@ The server writes three kinds of frames after accepting the subscription:
 
 `seq` is the cursor the bus minted for this event. Strictly monotonic across one steward instance and persisted into `happenings_log` for cursor replay. Consumers should record this on every consumed frame so a subsequent reconnect can resume cleanly via `since`.
 
-Plugin identity (ADR-0018): the `claimant_token` field carries an opaque, steward-issued identifier — not the plugin's plain canonical name. Tokens are stable for the lifetime of a steward instance, distinct between deployments, and treat-as-opaque for consumers (compare by exact-string equality only). Variants emitted by admin plugins additionally carry `admin_token`; variants targeting a specific plugin's claim (forced retract, claim reassignment) carry `target_token`. `RelationForgotten` carries `retracting_claimant_token` under `reason` when the forget came from a last-claimant retract. The same scheme applies to the `claimant_token` and `claimant_tokens` fields in `op = "list_active_custodies"` and `op = "project_subject"` responses. Resolution from token to plain plugin name will be available via a separate `resolve_claimants` op gated on a future capability; today consumers see only tokens.
+Plugin identity on the wire is opaque. The `claimant_token` field carries a steward-issued identifier — not the plugin's plain canonical name. Tokens are stable for the lifetime of a steward instance, distinct between deployments, and treat-as-opaque for consumers (compare by exact-string equality only). Variants emitted by admin plugins additionally carry `admin_token`; variants targeting a specific plugin's claim (forced retract, claim reassignment) carry `target_token`. `RelationForgotten` carries `retracting_claimant_token` under `reason` when the forget came from a last-claimant retract. The same scheme applies to the `claimant_token` and `claimant_tokens` fields in `op = "list_active_custodies"` and `op = "project_subject"` responses. Resolution from token to plain plugin name will be available via a separate `resolve_claimants` op gated on a future capability; today consumers see only tokens.
 
 The `happening` object is internally tagged by `type`. Seventeen variants ship today across five categories:
 
@@ -521,7 +521,7 @@ Response:
 
 | Feature | Meaning |
 | --- | --- |
-| `subscribe_happenings_cursor` | The `since` parameter on `subscribe_happenings`, `current_seq` on the ack, and `seq` on every streamed `Happening` frame are honoured (ADR-0017). |
+| `subscribe_happenings_cursor` | The `since` parameter on `subscribe_happenings`, `current_seq` on the ack, and `seq` on every streamed `Happening` frame are honoured. |
 | `alias_chain_walking` | `op = "describe_alias"` and the alias-aware variants of `op = "project_subject"` are present. |
 | `active_custodies_snapshot` | `op = "list_active_custodies"` returns the full ledger snapshot. |
 
@@ -529,7 +529,7 @@ A consumer that requires a feature absent from the response MUST fall back to pr
 
 ## 5. Error Handling
 
-Every failure on a synchronous op surfaces as a structured envelope (ADR-0013):
+Every failure on a synchronous op surfaces as a structured envelope:
 
 ```json
 {

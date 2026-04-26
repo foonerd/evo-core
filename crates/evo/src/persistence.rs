@@ -58,13 +58,13 @@ use evo_plugin_sdk::contract::{
 
 /// Initial schema version: subject-identity slice.
 ///
-/// Subsequent phases append migrations: v2 happenings (this slice,
-/// ADR-0017 cursor durability), v3 the relation graph, v4 the
-/// custody ledger, v5 the admin ledger. The numbering is reserved
-/// here so later phases extend the migration list without renumbering.
+/// Subsequent phases append migrations: v2 happenings (this slice
+/// adds the durable cursor), v3 steward meta kv, and beyond. The
+/// numbering is reserved here so later phases extend the migration
+/// list without renumbering.
 pub const SCHEMA_VERSION_SUBJECT_IDENTITY: u32 = 1;
 
-/// Schema version: happenings durable cursor (ADR-0017).
+/// Schema version: happenings durable cursor.
 ///
 /// Adds the `happenings_log` table: a monotonically-keyed audit
 /// stream of every fabric transition, written through by
@@ -74,14 +74,13 @@ pub const SCHEMA_VERSION_SUBJECT_IDENTITY: u32 = 1;
 /// missed events for consumers that disconnected and reconnected.
 pub const SCHEMA_VERSION_HAPPENINGS: u32 = 2;
 
-/// Schema version: steward meta kv with `instance_id` (ADR-0016
-/// instance identity, ADR-0018 token derivation input).
+/// Schema version: steward meta kv with `instance_id`.
 ///
 /// Adds the `meta` table — a generic key/value store for steward-
 /// level singletons that span schema versions. The first inhabitant
 /// is `instance_id`, a UUIDv4 minted at first migration and never
 /// rotated. The instance ID anchors per-deployment unlinkability
-/// for ADR-0018 claimant tokens.
+/// for claimant tokens.
 pub const SCHEMA_VERSION_META: u32 = 3;
 
 /// Maximum schema version this build of the steward understands.
@@ -99,7 +98,7 @@ pub const SUPPORTED_SCHEMA_VERSION: u32 = SCHEMA_VERSION_META;
 pub mod meta_keys {
     /// Steward instance ID — a UUIDv4 minted at first boot,
     /// persisted forever, and used as input to claimant-token
-    /// derivation (ADR-0018 §3.3).
+    /// derivation.
     pub const INSTANCE_ID: &str = "instance_id";
 }
 
@@ -294,7 +293,7 @@ pub struct PersistedAlias {
     pub reason: Option<String>,
 }
 
-/// One row of the `happenings_log` table (ADR-0017).
+/// One row of the `happenings_log` table.
 ///
 /// Carries the cursor `seq`, the variant tag, the full happening
 /// payload as opaque JSON, and the wall-clock timestamp. Returned
@@ -600,7 +599,7 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
         >,
     >;
 
-    /// Append one happening to the `happenings_log` table (ADR-0017).
+    /// Append one happening to the `happenings_log` table.
     ///
     /// `seq` is the bus's monotonic cursor minted at emit time;
     /// `kind` is the `type` tag of the serde-tagged happening (e.g.
@@ -642,12 +641,11 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
     ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>;
 
     /// Return the steward instance ID (UUIDv4) minted at first
-    /// migration and persisted in the `meta` table (ADR-0016 § /
-    /// migration 003).
+    /// migration and persisted in the `meta` table (migration 003).
     ///
     /// Stable across the deployment's lifetime, distinct between
     /// independent deployments. Used as the per-deployment
-    /// unlinkability anchor for ADR-0018 claimant tokens; see
+    /// unlinkability anchor for claimant tokens; see
     /// [`crate::claimant::derive_token`].
     ///
     /// Returns [`PersistenceError::Invalid`] if the row is missing
@@ -1755,7 +1753,7 @@ impl PersistenceStore for SqlitePersistenceStore {
 #[derive(Debug)]
 pub struct MemoryPersistenceStore {
     inner: AsyncMutex<MemoryState>,
-    /// Steward instance ID for ADR-0018 token derivation. The
+    /// Steward instance ID for claimant-token derivation. The
     /// in-memory store mints a fresh UUIDv4 on construction so each
     /// test instance has its own unlinkability anchor; restarting a
     /// test process does not pin to the same value.
@@ -3048,7 +3046,7 @@ mod tests {
         assert!(matches!(r, Err(PersistenceError::Invalid(_))));
     }
 
-    // --- Wave 2.5: happenings durable cursor (ADR-0017) -------------------
+    // --- happenings durable cursor ---------------------------------------
 
     fn happening_payload(seq_marker: u64) -> serde_json::Value {
         serde_json::json!({

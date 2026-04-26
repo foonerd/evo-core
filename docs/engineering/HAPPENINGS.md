@@ -323,7 +323,7 @@ The steward exposes the bus to external consumers via the `subscribe_happenings`
 1. Calls `bus.subscribe_envelope()` to register a cursor-aware receiver.
 2. Samples the bus's current cursor.
 3. Writes a `{"subscribed": true, "current_seq": N}` ack frame, where `N` is the sampled cursor.
-4. If the request carried a `since` cursor (ADR-0017), queries `happenings_log` for every event with `seq > since` and streams those replay frames in ascending seq order.
+4. If the request carried a `since` cursor, queries `happenings_log` for every event with `seq > since` and streams those replay frames in ascending seq order.
 5. Enters a loop writing one `{"seq": s, "happening": {...}}` frame per live happening until the client disconnects. Live events whose seq is at or below the largest replayed seq are deduped so the consumer never observes the same seq twice across the boundary.
 
 Two ordering constraints are load-bearing:
@@ -331,7 +331,7 @@ Two ordering constraints are load-bearing:
 - The bus subscribe runs BEFORE the persistence query so events emitted concurrently with the replay read are buffered on the live receiver, not lost.
 - The cursor sample (`current_seq`) runs BEFORE the ack so the consumer can use it as a strict snapshot pin for reconcile-style queries: the snapshot seen by `list_active_custodies` (and other read ops) is consistent with "everything at or before `current_seq`", and live deltas with `seq > current_seq` arrive on the same subscription.
 
-Wire-level details and the cursor surface contract are in `STEWARD.md` section 6.2 and ADR-0017.
+Wire-level details and the cursor surface contract are in `STEWARD.md` section 6.2.
 
 Subscriptions are the only streaming surface in the v0 client protocol; every other op is request/response.
 
@@ -347,7 +347,7 @@ A future design decision may allow plugins to contribute to a constrained set of
 2. A subscriber that reacts to any custody happening by querying the ledger sees a state consistent with the happening's semantics.
 3. `emit` never blocks and never panics, regardless of subscriber count, buffer fill level, or consumer pace.
 4. Every subscriber sees every happening emitted after its `subscribe()` / `subscribe_envelope()` call, up to the buffer capacity. Beyond that, the subscriber receives `Lagged(n)` on its next `recv` and can continue.
-5. Every emitted happening carries a strictly monotonic `seq: u64` (ADR-0017). The seq is durable across restart for events written via `emit_durable`; cursor-aware consumers reconnect with their last-observed seq as `since` and resume cleanly.
+5. Every emitted happening carries a strictly monotonic `seq: u64`. The seq is durable across restart for events written via `emit_durable`; cursor-aware consumers reconnect with their last-observed seq as `since` and resume cleanly.
 6. Late subscribers without a `since` do not receive replayed happenings; with a `since` within the durable window they do.
 7. The `Happening` enum is `#[non_exhaustive]`; adding a variant is not a source-compatibility breaking change for consumers that include a catch-all match arm.
 

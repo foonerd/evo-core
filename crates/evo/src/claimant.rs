@@ -1,30 +1,28 @@
-//! Claimant tokens for plugin-identity privacy (ADR-0018).
+//! Claimant tokens for plugin-identity privacy.
 //!
 //! Plugins are identified to consumers by an opaque, steward-issued
 //! token — not by their plain canonical name. The token is
-//! deterministic and stable across plugin restart, but rotates on
-//! uninstall+reinstall: derived from `plugin.name`, `plugin.version`,
-//! and the steward's persistent `instance_id` (per ADR-0016 §
-//! "Instance identity"), the resulting digest is the same byte-for-
-//! byte across consecutive plugin runs and changes only when the
-//! identity inputs change.
+//! deterministic and stable across plugin restart: derived from the
+//! plugin's canonical name and the steward's persistent
+//! `instance_id`, the resulting digest is the same byte-for-byte
+//! across consecutive runs and changes only when the identity
+//! inputs change.
 //!
 //! ## Why a token, not a name?
 //!
-//! Per ADR-0018 §Context: every projection and happening today
-//! carries the originating plugin's plain name in plain text. A
-//! consumer of the client socket can therefore derive the complete
-//! plugin set, the topology over time, and per-plugin behaviour
-//! patterns. The framework's stated security principle makes
-//! plugin identity privacy-relevant — a vendor's private plugin
+//! Every projection and happening would otherwise carry the
+//! originating plugin's plain name in plain text. A consumer of
+//! the client socket could then derive the complete plugin set,
+//! the topology over time, and per-plugin behaviour patterns.
+//! Plugin identity is privacy-relevant — a vendor's private plugin
 //! set, a distribution's competitive structure, or a security-
 //! sensitive admission tool may all be sensitive — and the
 //! framework should not bake the most permissive choice in
-//! unilaterally. The token is the privacy-preserving public surface;
-//! resolution to plain name is gated on a separate
-//! `resolve_claimants` capability (out of scope for this module).
+//! unilaterally. The token is the privacy-preserving public
+//! surface; resolution from token to plain name will be gated on
+//! a separate `resolve_claimants` capability in a future surface.
 //!
-//! ## What this module provides today
+//! ## What this module provides
 //!
 //! - [`ClaimantToken`]: the opaque newtype wrapping the base64-
 //!   encoded BLAKE3 digest.
@@ -35,23 +33,19 @@
 //!   admitted plugins; one issuer is shared by every wire-emission
 //!   site so all surfaces honour the no-drift invariant.
 //!
-//! ## Deviation from ADR-0018 §3.3
+//! ## Token derivation
 //!
-//! ADR-0018 §3.3 specifies the derivation as `BLAKE3(plugin.name ||
-//! plugin.version || steward_instance_id)`. This module uses
-//! `BLAKE3(plugin.name || steward_instance_id)` — the version is
-//! omitted. Rationale: the privacy properties ADR-0018 §Decision
-//! requires (per-name uniqueness within one steward, per-instance
-//! unlinkability across deployments) hold without the version
-//! input, and including it would force every internal
+//! Token = base64-urlsafe-no-pad(BLAKE3(name || 0x1F || instance_id)\[..16\]).
+//!
+//! Plugin version is deliberately omitted from the input. The
+//! privacy properties (per-name uniqueness within one steward,
+//! per-instance unlinkability across deployments) hold without it,
+//! and including it would force every internal
 //! [`crate::happenings::Happening`] variant to carry `plugin_version`
 //! solely for the conversion to the wire form. A version bump in
 //! place still rotates the token at the next steward reboot when
 //! the persistence layer is reset; a true uninstall+reinstall
 //! produces a new `instance_id` and thus a new token regardless.
-//! If full ADR-0018 §3.3 conformance is wanted, the version path
-//! lands as a future amendment without breaking the public token
-//! shape.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -62,13 +56,13 @@ use std::sync::RwLock;
 // outer `pub` re-export (in `lib.rs`) exposes the same name.
 
 /// Length of the truncated BLAKE3 digest used for the token, in
-/// bytes. ADR-0018 §3.3 picks 16 bytes for collision safety against
-/// any plausible plugin set with margin to spare; base64-encoded
-/// that is 24 ASCII characters.
+/// bytes. 16 bytes gives collision safety against any plausible
+/// plugin set with margin to spare; base64-encoded that is 22
+/// ASCII characters (URL-safe, no padding).
 const TOKEN_DIGEST_LEN: usize = 16;
 
 /// Opaque, steward-issued identifier for a plugin in cross-boundary
-/// surfaces (projections, happenings) per ADR-0018.
+/// surfaces (projections, happenings).
 ///
 /// Stable across the plugin's lifetime in one steward instance;
 /// rotates on uninstall+reinstall (because the inputs change). Two
@@ -118,8 +112,7 @@ impl AsRef<str> for ClaimantToken {
     }
 }
 
-/// Mint a [`ClaimantToken`] for a plugin (ADR-0018 §3.3 with the
-/// deviation documented at module level).
+/// Mint a [`ClaimantToken`] for a plugin.
 ///
 /// Token = base64-urlsafe-no-pad(BLAKE3(name || 0x1F || instance_id)\[..16\]).
 ///
@@ -152,14 +145,14 @@ pub fn derive_token(plugin_name: &str, instance_id: &str) -> ClaimantToken {
 }
 
 /// Mints and caches [`ClaimantToken`]s for the steward's admitted
-/// plugins (ADR-0018 §3.1, §3.2).
+/// plugins.
 ///
 /// One issuer is shared across all surfaces that emit tokens: the
 /// `From<Happening>` conversion in `server.rs`, the projection
 /// builders, and any future surface that admits a plugin into a
 /// consumer-visible response. Centralising the mint ensures the
-/// invariant in ADR-0018 §Invariants holds: drift between code
-/// paths producing different tokens for the same plugin is a bug.
+/// no-drift invariant: drift between code paths producing different
+/// tokens for the same plugin is a bug.
 ///
 /// The issuer caches by plugin name. Cache lookup is read-locked
 /// for the hot path; cache miss takes the write lock to install
@@ -245,8 +238,8 @@ mod tests {
 
     #[test]
     fn token_differs_on_different_instance_id() {
-        // ADR-0018's per-instance unlinkability: same plugin on two
-        // different steward instances produces two different tokens.
+        // Per-instance unlinkability: same plugin on two different
+        // steward instances produces two different tokens.
         let a = derive_token("com.foo.bar", "instance-1");
         let b = derive_token("com.foo.bar", "instance-2");
         assert_ne!(

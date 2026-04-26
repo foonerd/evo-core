@@ -1,5 +1,5 @@
 //! Install digest: SHA-256 of canonical `manifest.toml` bytes || SHA-256(artefact) bytes
-//! (concatenation), per `PLUGIN_PACKAGING.md` section 5 and ADR-0012.
+//! (concatenation), per `PLUGIN_PACKAGING.md` section 5.
 //!
 //! ## Canonical TOML payload
 //!
@@ -13,8 +13,8 @@
 //! every verifier reproduces the canonical bytes from any
 //! parseable manifest and the signature survives.
 //!
-//! Per ADR-0012, `signing_message` is the only blessed path; raw
-//! bytes are not signed under any code path.
+//! `signing_message` is the only blessed path; raw bytes are not
+//! signed under any code path.
 
 use sha2::{Digest, Sha256};
 
@@ -23,7 +23,7 @@ use crate::error::TrustError;
 
 /// The signed message: canonical TOML bytes of `manifest.toml`
 /// followed by the 32-byte digest of the artefact file, per
-/// `PLUGIN_PACKAGING.md` §5 and ADR-0012.
+/// `PLUGIN_PACKAGING.md` §5.
 pub fn signing_message(
     manifest_path: &std::path::Path,
     exec_path: &std::path::Path,

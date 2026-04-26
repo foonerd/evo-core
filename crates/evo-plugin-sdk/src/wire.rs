@@ -494,20 +494,21 @@ pub enum WireFrame {
     },
 
     // ---------------------------------------------------------------
-    // Plugin -> Steward: privileged admin verbs (ADR-0011 wire surface
-    // for `SubjectAdmin` and `RelationAdmin`). The plugin must be
-    // admitted at a trust class that grants admin gating; the steward
-    // refuses these requests with [`Self::Error`] for plugins lacking
-    // the admin capability bit.
+    // Plugin -> Steward: privileged admin verbs — wire surface for
+    // `SubjectAdmin` and `RelationAdmin`. The plugin must be
+    // admitted at a trust class that grants admin gating; the
+    // steward refuses these requests with [`Self::Error`] for
+    // plugins lacking the admin capability bit.
     //
-    // Each request has a paired `*_response` frame the steward emits
-    // on success (the trait methods themselves return `Result<(),
-    // ReportError>`, so the response carries no data beyond echoing
-    // the cid). Errors collapse to the existing [`Self::Error`]
-    // frame with the request's cid; on the plugin side the
-    // wire-backed admin trait impl maps the message back to a
-    // [`crate::contract::ReportError::Invalid`] until ADR-0013
-    // introduces a structured wire error taxonomy.
+    // Each request has a paired `*_response` frame the steward
+    // emits on success (the trait methods themselves return
+    // `Result<(), ReportError>`, so the response carries no data
+    // beyond echoing the cid). Errors collapse to the existing
+    // [`Self::Error`] frame with the request's cid; on the plugin
+    // side the wire-backed admin trait impl maps the message back
+    // to a [`crate::contract::ReportError::Invalid`] until a
+    // structured wire error taxonomy lands on the plugin↔steward
+    // surface.
     // ---------------------------------------------------------------
     /// `forced_retract_addressing` request. Mirrors
     /// [`crate::contract::SubjectAdmin::forced_retract_addressing`].

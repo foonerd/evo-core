@@ -1,7 +1,6 @@
 -- migrations/003_meta.sql
 --
--- Phase 3: steward instance identity (ADR-0016 instance identity,
--- ADR-0018 claimant token derivation input).
+-- Phase 3: steward instance identity.
 --
 -- Adds the `meta` key/value table — a single source of truth for
 -- steward-level singleton facts that span schema versions and need
@@ -11,11 +10,11 @@
 -- every subsequent boot.
 --
 -- The instance ID is the per-deployment unlinkability anchor for
--- ADR-0018 claimant tokens. Identical plugin name+version on two
--- different steward installations produces two different tokens
--- because the instance IDs differ; a token observed in one
--- consumer log reveals nothing about whether the same plugin runs
--- on another device.
+-- claimant tokens. Identical plugin name+version on two different
+-- steward installations produces two different tokens because the
+-- instance IDs differ; a token observed in one consumer log
+-- reveals nothing about whether the same plugin runs on another
+-- device.
 --
 -- The table is intentionally generic. Future schema-version-spanning
 -- singletons (e.g. operator-rotation epochs, last-seen catalogue

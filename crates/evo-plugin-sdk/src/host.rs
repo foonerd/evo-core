@@ -869,9 +869,9 @@ fn build_load_context(
             plugin_name: plugin_name.to_string(),
         });
 
-    // Wire-backed admin surfaces (ADR-0011). The steward enforces the
-    // admin capability at dispatch time: a plugin without the admin
-    // bit gets a non-fatal `Error` frame with "admin capability not
+    // Wire-backed admin surfaces. The steward enforces the admin
+    // capability at dispatch time: a plugin without the admin bit
+    // gets a non-fatal `Error` frame with "admin capability not
     // granted" surfaced as `ReportError::Invalid` on its trait call.
     // The handles are always populated; gating is server-side. A
     // future feature-version bump can add capability discovery to
@@ -1000,11 +1000,11 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
 /// wire as in-process: a rejection by the steward becomes the
 /// caller's `Err`, not a silently dropped log line.
 ///
-/// Until ADR-0013 introduces a structured wire error taxonomy,
-/// non-fatal [`WireFrame::Error`] responses map to
-/// [`ReportError::Invalid`] carrying the wire message; fatal ones map
-/// to [`ReportError::ShuttingDown`] so the trait surface signals that
-/// retrying the call is pointless.
+/// Until a structured wire error taxonomy lands on the plugin↔
+/// steward surface, non-fatal [`WireFrame::Error`] responses map
+/// to [`ReportError::Invalid`] carrying the wire message; fatal
+/// ones map to [`ReportError::ShuttingDown`] so the trait surface
+/// signals that retrying the call is pointless.
 async fn await_event_response(
     tx: &mpsc::Sender<WireFrame>,
     pending: &Arc<Mutex<PendingMap>>,

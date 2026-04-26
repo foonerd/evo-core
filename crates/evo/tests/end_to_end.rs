@@ -198,7 +198,7 @@ async fn unknown_shelf_returns_structured_error() {
     let err = response_value.get("error").expect("structured error");
     assert!(
         err.get("class").and_then(|v| v.as_str()).is_some(),
-        "expected ADR-0013 structured error envelope, got: {}",
+        "expected structured error envelope, got: {}",
         String::from_utf8_lossy(&response_body)
     );
     assert!(
@@ -311,7 +311,7 @@ async fn project_subject_roundtrips_through_socket() {
     assert_eq!(related[0]["target_id"].as_str(), Some(album_id.as_str()));
     assert_eq!(related[0]["target_type"].as_str(), Some("album"));
 
-    // Unknown subject yields a structured error response (ADR-0013).
+    // Unknown subject yields a structured error response.
     let bad_req = r#"{"op":"project_subject","canonical_id":"not-a-real-id"}"#;
     write_frame(&mut stream, bad_req.as_bytes()).await;
     let body = read_frame(&mut stream).await;
@@ -643,10 +643,10 @@ async fn list_active_custodies_returns_populated_ledger() {
     assert_eq!(arr.len(), 1);
 
     let first = &arr[0];
-    // ADR-0018: plugin name replaced by opaque token.
+    // Plugin name is replaced by an opaque token on the wire.
     assert!(
         first["plugin"].is_null(),
-        "plain plugin field must be absent on the wire (ADR-0018)"
+        "plain plugin field must be absent on the wire"
     );
     assert!(
         first["claimant_token"].as_str().is_some(),
@@ -749,11 +749,11 @@ async fn subscribe_happenings_delivers_ack_and_events() {
         "got: {}",
         String::from_utf8_lossy(&body)
     );
-    // ADR-0018: plugin name is replaced by an opaque token on the
-    // wire; the plain `plugin` key MUST NOT appear.
+    // Plugin name is replaced by an opaque token on the wire; the
+    // plain `plugin` key MUST NOT appear.
     assert!(
         v["happening"]["plugin"].is_null(),
-        "plain plugin field must be absent on the wire (ADR-0018)"
+        "plain plugin field must be absent on the wire"
     );
     assert!(
         v["happening"]["claimant_token"].as_str().is_some(),
@@ -860,8 +860,8 @@ async fn describe_capabilities_returns_stable_op_and_feature_lists() {
 
 #[tokio::test]
 async fn subscribe_happenings_ack_carries_current_seq() {
-    // Verifies the ADR-0017 cursor surface: the subscribe ack
-    // exposes `current_seq` (the bus cursor at subscribe time), and
+    // Verifies the cursor surface: the subscribe ack exposes
+    // `current_seq` (the bus cursor at subscribe time), and
     // every streamed `Happening` frame carries the seq the bus
     // minted at emit time. Consumers persist that seq to resume
     // across reconnect or steward restart.
@@ -940,8 +940,8 @@ async fn subscribe_happenings_ack_carries_current_seq() {
 
 #[tokio::test]
 async fn subscribe_happenings_replays_from_since_then_streams_live() {
-    // ADR-0017 replay path: a consumer reconnecting with a `since`
-    // cursor receives every persisted happening with seq > since
+    // Replay path: a consumer reconnecting with a `since` cursor
+    // receives every persisted happening with seq > since
     // before transitioning to live streaming. Live events whose seq
     // is at or below the largest replayed seq are deduped so the
     // consumer never sees the same event twice across the boundary.
@@ -1307,8 +1307,8 @@ async fn project_subject_returns_not_found_for_unknown_id_no_alias() {
     let body = read_frame(&mut stream).await;
     let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
 
-    // ADR-0013 NotFound shape: structured error envelope, no
-    // aliased_from key.
+    // NotFound shape: structured error envelope, no aliased_from
+    // key.
     assert_eq!(
         v["error"]["class"].as_str(),
         Some("not_found"),
