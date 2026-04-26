@@ -30,6 +30,13 @@ base64 = "0.22"
 semver = { version = "1", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 
+# BLAKE3 powers ADR-0018 claimant-token derivation. Pulled here
+# (not via evo-trust) because the steward derives tokens for every
+# admitted plugin; evo-trust's signing path uses sha2 for SPKI
+# fingerprints and the two are deliberately separate crypto
+# concerns.
+blake3 = "1.5"
+
 # Persistence: SQLite via the synchronous rusqlite API.
 # `bundled` compiles SQLite from vendored C source so every target
 # behaves identically regardless of host packaging; `blob` and

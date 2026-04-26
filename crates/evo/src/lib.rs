@@ -69,6 +69,7 @@
 pub mod admin;
 pub mod admission;
 pub mod catalogue;
+pub mod claimant;
 pub mod cli;
 pub mod config;
 pub mod context;
