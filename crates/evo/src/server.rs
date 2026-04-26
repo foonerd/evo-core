@@ -868,14 +868,15 @@ enum HappeningWire {
     /// plugin's addressing claim. Fires BEFORE any cascade
     /// [`HappeningWire::SubjectForgotten`] or
     /// [`HappeningWire::RelationForgotten`] events the same retract
-    /// triggers. The `admin_plugin` and `target_plugin` fields
+    /// triggers. The `admin_token` and `target_token` fields
     /// distinguish "who did the retract" from "whose claim was
     /// removed".
     SubjectAddressingForcedRetract {
-        /// Canonical name of the admin plugin that performed the
-        /// retract.
+        /// Opaque token identifying the admin plugin that performed
+        /// the retract (ADR-0018).
         admin_token: ClaimantToken,
-        /// Canonical name of the plugin whose claim was removed.
+        /// Opaque token identifying the plugin whose claim was
+        /// removed (ADR-0018).
         target_token: ClaimantToken,
         /// Canonical ID of the subject the addressing was attached
         /// to.
@@ -896,9 +897,10 @@ enum HappeningWire {
     /// [`HappeningWire::RelationForgotten`] event the same retract
     /// triggers.
     RelationClaimForcedRetract {
-        /// Canonical name of the admin plugin.
+        /// Opaque token identifying the admin plugin (ADR-0018).
         admin_token: ClaimantToken,
-        /// Canonical name of the plugin whose claim was removed.
+        /// Opaque token identifying the plugin whose claim was
+        /// removed (ADR-0018).
         target_token: ClaimantToken,
         /// Canonical ID of the source subject on the relation.
         source_id: String,
@@ -917,8 +919,8 @@ enum HappeningWire {
     /// into one. The result is a NEW canonical ID; the two
     /// source IDs survive in the registry as alias records.
     SubjectMerged {
-        /// Canonical name of the admin plugin that performed the
-        /// merge.
+        /// Opaque token identifying the admin plugin that performed
+        /// the merge (ADR-0018).
         admin_token: ClaimantToken,
         /// Canonical IDs of the source subjects.
         source_ids: Vec<String>,
@@ -936,8 +938,8 @@ enum HappeningWire {
     /// source ID survives in the registry as a single alias
     /// record carrying all new IDs.
     SubjectSplit {
-        /// Canonical name of the admin plugin that performed the
-        /// split.
+        /// Opaque token identifying the admin plugin that performed
+        /// the split (ADR-0018).
         admin_token: ClaimantToken,
         /// Canonical ID of the source subject.
         source_id: String,
@@ -954,8 +956,8 @@ enum HappeningWire {
     },
     /// Wire form of [`Happening::RelationSuppressed`].
     RelationSuppressed {
-        /// Canonical name of the admin plugin that performed the
-        /// suppression.
+        /// Opaque token identifying the admin plugin that performed
+        /// the suppression (ADR-0018).
         admin_token: ClaimantToken,
         /// Canonical ID of the source subject.
         source_id: String,
@@ -970,8 +972,8 @@ enum HappeningWire {
     },
     /// Wire form of [`Happening::RelationSuppressionReasonUpdated`].
     RelationSuppressionReasonUpdated {
-        /// Canonical name of the admin plugin that performed the
-        /// re-suppress with the new reason.
+        /// Opaque token identifying the admin plugin that performed
+        /// the re-suppress with the new reason (ADR-0018).
         admin_token: ClaimantToken,
         /// Canonical ID of the source subject.
         source_id: String,
@@ -988,8 +990,8 @@ enum HappeningWire {
     },
     /// Wire form of [`Happening::RelationUnsuppressed`].
     RelationUnsuppressed {
-        /// Canonical name of the admin plugin that performed the
-        /// unsuppression.
+        /// Opaque token identifying the admin plugin that performed
+        /// the unsuppression (ADR-0018).
         admin_token: ClaimantToken,
         /// Canonical ID of the source subject.
         source_id: String,
@@ -1002,8 +1004,8 @@ enum HappeningWire {
     },
     /// Wire form of [`Happening::RelationSplitAmbiguous`].
     RelationSplitAmbiguous {
-        /// Canonical name of the admin plugin that performed the
-        /// split.
+        /// Opaque token identifying the admin plugin that performed
+        /// the split (ADR-0018).
         admin_token: ClaimantToken,
         /// Canonical ID of the source subject that was split
         /// (the OLD ID).
@@ -1025,8 +1027,8 @@ enum HappeningWire {
     /// `(source_id, predicate, target_id)` use this to keep
     /// indexes coherent across rewrites.
     RelationRewritten {
-        /// Canonical name of the admin plugin that performed the
-        /// merge or split.
+        /// Opaque token identifying the admin plugin that performed
+        /// the merge or split (ADR-0018).
         admin_token: ClaimantToken,
         /// Predicate of the rewritten relation.
         predicate: String,
@@ -1047,8 +1049,8 @@ enum HappeningWire {
     /// sets into a violating one. The administration tier decides
     /// resolution.
     RelationCardinalityViolatedPostRewrite {
-        /// Canonical name of the admin plugin that performed the
-        /// merge or split.
+        /// Opaque token identifying the admin plugin that performed
+        /// the merge or split (ADR-0018).
         admin_token: ClaimantToken,
         /// Canonical ID of the subject whose count exceeds the
         /// bound on the indicated side.
@@ -1072,8 +1074,8 @@ enum HappeningWire {
     /// ID by merge or split, so the claimant can refresh cached
     /// state.
     ClaimReassigned {
-        /// Canonical name of the admin plugin that performed the
-        /// merge or split.
+        /// Opaque token identifying the admin plugin that performed
+        /// the merge or split (ADR-0018).
         admin_token: ClaimantToken,
         /// Opaque token identifying the plugin whose claim was
         /// moved (ADR-0018).
@@ -1108,8 +1110,8 @@ enum HappeningWire {
     /// and the surviving edge is suppressed, demoting the
     /// previously-visible claim from a sibling edge.
     RelationClaimSuppressionCollapsed {
-        /// Canonical name of the admin plugin that performed the
-        /// merge.
+        /// Opaque token identifying the admin plugin that performed
+        /// the merge (ADR-0018).
         admin_token: ClaimantToken,
         /// Canonical ID of the source subject on the surviving
         /// relation.
