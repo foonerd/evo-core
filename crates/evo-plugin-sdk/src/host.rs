@@ -68,10 +68,11 @@
 use crate::codec::{read_frame_json, write_frame_json, WireError};
 use crate::contract::{
     AliasRecord, Assignment, CallDeadline, CourseCorrection, CustodyHandle,
-    CustodyStateReporter, ExternalAddressing, HealthStatus,
-    InstanceAnnouncement, InstanceAnnouncer, InstanceId, LoadContext, Plugin,
-    PluginError, RelationAnnouncer, RelationAssertion, RelationRetraction,
-    ReportError, ReportPriority, Request, Respondent, StateReporter,
+    CustodyStateReporter, ExplicitRelationAssignment, ExternalAddressing,
+    HealthStatus, InstanceAnnouncement, InstanceAnnouncer, InstanceId,
+    LoadContext, Plugin, PluginError, RelationAdmin, RelationAnnouncer,
+    RelationAssertion, RelationRetraction, ReportError, ReportPriority,
+    Request, Respondent, SplitRelationStrategy, StateReporter, SubjectAdmin,
     SubjectAnnouncement, SubjectAnnouncer, SubjectQuerier, SubjectQueryResult,
     UserInteraction, UserInteractionRequester, Warden,
 };
@@ -767,6 +768,28 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::EventAck { .. } => "event_ack",
         WireFrame::Hello { .. } => "hello",
         WireFrame::HelloAck { .. } => "hello_ack",
+        WireFrame::ForcedRetractAddressing { .. } => {
+            "forced_retract_addressing"
+        }
+        WireFrame::ForcedRetractAddressingResponse { .. } => {
+            "forced_retract_addressing_response"
+        }
+        WireFrame::MergeSubjects { .. } => "merge_subjects",
+        WireFrame::MergeSubjectsResponse { .. } => "merge_subjects_response",
+        WireFrame::SplitSubject { .. } => "split_subject",
+        WireFrame::SplitSubjectResponse { .. } => "split_subject_response",
+        WireFrame::ForcedRetractClaim { .. } => "forced_retract_claim",
+        WireFrame::ForcedRetractClaimResponse { .. } => {
+            "forced_retract_claim_response"
+        }
+        WireFrame::SuppressRelation { .. } => "suppress_relation",
+        WireFrame::SuppressRelationResponse { .. } => {
+            "suppress_relation_response"
+        }
+        WireFrame::UnsuppressRelation { .. } => "unsuppress_relation",
+        WireFrame::UnsuppressRelationResponse { .. } => {
+            "unsuppress_relation_response"
+        }
     }
 }
 
@@ -840,11 +863,32 @@ fn build_load_context(
     // matches a pending entry through the same map.
     let subject_querier: Arc<dyn SubjectQuerier> =
         Arc::new(WireSubjectQuerier {
-            tx,
-            event_cid,
-            pending,
+            tx: tx.clone(),
+            event_cid: event_cid.clone(),
+            pending: Arc::clone(&pending),
             plugin_name: plugin_name.to_string(),
         });
+
+    // Wire-backed admin surfaces (ADR-0011). The steward enforces the
+    // admin capability at dispatch time: a plugin without the admin
+    // bit gets a non-fatal `Error` frame with "admin capability not
+    // granted" surfaced as `ReportError::Invalid` on its trait call.
+    // The handles are always populated; gating is server-side. A
+    // future feature-version bump can add capability discovery to
+    // the Hello/HelloAck pair so non-admin plugins see `None` here
+    // and short-circuit before the round-trip.
+    let subject_admin: Arc<dyn SubjectAdmin> = Arc::new(WireSubjectAdmin {
+        tx: tx.clone(),
+        event_cid: event_cid.clone(),
+        pending: Arc::clone(&pending),
+        plugin_name: plugin_name.to_string(),
+    });
+    let relation_admin: Arc<dyn RelationAdmin> = Arc::new(WireRelationAdmin {
+        tx,
+        event_cid,
+        pending,
+        plugin_name: plugin_name.to_string(),
+    });
 
     let deadline = deadline_ms
         .map(|ms| CallDeadline(Instant::now() + Duration::from_millis(ms)));
@@ -863,12 +907,8 @@ fn build_load_context(
         // alias-aware describe queries to the steward over the same
         // connection.
         subject_querier: Some(subject_querier),
-        // Admin surface is not wired through the wire transport
-        // (the transport-admin story is a future pass). Non-admin
-        // wire plugins see None, which matches the in-process
-        // discipline.
-        subject_admin: None,
-        relation_admin: None,
+        subject_admin: Some(subject_admin),
+        relation_admin: Some(relation_admin),
     })
 }
 
@@ -1233,6 +1273,267 @@ impl SubjectQuerier for WireSubjectQuerier {
                 ))),
                 Err(_) => Err(ReportError::ShuttingDown),
             }
+        })
+    }
+}
+
+/// Send an admin-verb request frame and await the steward's matching
+/// `*_response` variant. Returns `Ok(())` on the expected response;
+/// non-fatal `Error` becomes [`ReportError::Invalid`]; channel
+/// closure or oneshot drop becomes [`ReportError::ShuttingDown`].
+///
+/// `expected_op` is the variant-name string of the success response
+/// (e.g. `"forced_retract_addressing_response"`); any other variant
+/// is treated as a protocol violation surfaced as
+/// [`ReportError::Invalid`].
+async fn await_admin_response(
+    tx: &mpsc::Sender<WireFrame>,
+    pending: &Arc<Mutex<PendingMap>>,
+    cid: u64,
+    request: WireFrame,
+    expected_op: &'static str,
+) -> Result<(), ReportError> {
+    let rx = register_pending(pending, cid);
+    if tx.send(request).await.is_err() {
+        remove_pending(pending, cid);
+        return Err(ReportError::ShuttingDown);
+    }
+    match rx.await {
+        Ok(frame) if variant_name(&frame) == expected_op => Ok(()),
+        Ok(WireFrame::Error { message, fatal, .. }) => {
+            if fatal {
+                Err(ReportError::ShuttingDown)
+            } else {
+                Err(ReportError::Invalid(message))
+            }
+        }
+        Ok(other) => Err(ReportError::Invalid(format!(
+            "unexpected response frame for admin verb (expected {expected_op}): {}",
+            variant_name(&other)
+        ))),
+        Err(_) => Err(ReportError::ShuttingDown),
+    }
+}
+
+/// Wire-backed [`SubjectAdmin`] that round-trips admin verbs to the
+/// steward over the same connection used for events and queries.
+///
+/// Mirrors the [`WireSubjectQuerier`] structure (tx + pending +
+/// shared cid counter); see that type's docs for the request /
+/// response routing model.
+#[derive(Debug)]
+struct WireSubjectAdmin {
+    tx: mpsc::Sender<WireFrame>,
+    event_cid: Arc<AtomicU64>,
+    pending: Arc<Mutex<PendingMap>>,
+    plugin_name: String,
+}
+
+impl SubjectAdmin for WireSubjectAdmin {
+    fn forced_retract_addressing<'a>(
+        &'a self,
+        target_plugin: String,
+        addressing: ExternalAddressing,
+        reason: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let tx = self.tx.clone();
+        let plugin = self.plugin_name.clone();
+        let pending = Arc::clone(&self.pending);
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let frame = WireFrame::ForcedRetractAddressing {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                target_plugin,
+                addressing,
+                reason,
+            };
+            await_admin_response(
+                &tx,
+                &pending,
+                cid,
+                frame,
+                "forced_retract_addressing_response",
+            )
+            .await
+        })
+    }
+
+    fn merge<'a>(
+        &'a self,
+        target_a: ExternalAddressing,
+        target_b: ExternalAddressing,
+        reason: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let tx = self.tx.clone();
+        let plugin = self.plugin_name.clone();
+        let pending = Arc::clone(&self.pending);
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let frame = WireFrame::MergeSubjects {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                target_a,
+                target_b,
+                reason,
+            };
+            await_admin_response(
+                &tx,
+                &pending,
+                cid,
+                frame,
+                "merge_subjects_response",
+            )
+            .await
+        })
+    }
+
+    fn split<'a>(
+        &'a self,
+        source: ExternalAddressing,
+        partition: Vec<Vec<ExternalAddressing>>,
+        strategy: SplitRelationStrategy,
+        explicit_assignments: Vec<ExplicitRelationAssignment>,
+        reason: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let tx = self.tx.clone();
+        let plugin = self.plugin_name.clone();
+        let pending = Arc::clone(&self.pending);
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let frame = WireFrame::SplitSubject {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                source,
+                partition,
+                strategy,
+                explicit_assignments,
+                reason,
+            };
+            await_admin_response(
+                &tx,
+                &pending,
+                cid,
+                frame,
+                "split_subject_response",
+            )
+            .await
+        })
+    }
+}
+
+/// Wire-backed [`RelationAdmin`]. Mirrors [`WireSubjectAdmin`].
+#[derive(Debug)]
+struct WireRelationAdmin {
+    tx: mpsc::Sender<WireFrame>,
+    event_cid: Arc<AtomicU64>,
+    pending: Arc<Mutex<PendingMap>>,
+    plugin_name: String,
+}
+
+impl RelationAdmin for WireRelationAdmin {
+    fn forced_retract_claim<'a>(
+        &'a self,
+        target_plugin: String,
+        source: ExternalAddressing,
+        predicate: String,
+        target: ExternalAddressing,
+        reason: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let tx = self.tx.clone();
+        let plugin = self.plugin_name.clone();
+        let pending = Arc::clone(&self.pending);
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let frame = WireFrame::ForcedRetractClaim {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                target_plugin,
+                source,
+                predicate,
+                target,
+                reason,
+            };
+            await_admin_response(
+                &tx,
+                &pending,
+                cid,
+                frame,
+                "forced_retract_claim_response",
+            )
+            .await
+        })
+    }
+
+    fn suppress<'a>(
+        &'a self,
+        source: ExternalAddressing,
+        predicate: String,
+        target: ExternalAddressing,
+        reason: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let tx = self.tx.clone();
+        let plugin = self.plugin_name.clone();
+        let pending = Arc::clone(&self.pending);
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let frame = WireFrame::SuppressRelation {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                source,
+                predicate,
+                target,
+                reason,
+            };
+            await_admin_response(
+                &tx,
+                &pending,
+                cid,
+                frame,
+                "suppress_relation_response",
+            )
+            .await
+        })
+    }
+
+    fn unsuppress<'a>(
+        &'a self,
+        source: ExternalAddressing,
+        predicate: String,
+        target: ExternalAddressing,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let tx = self.tx.clone();
+        let plugin = self.plugin_name.clone();
+        let pending = Arc::clone(&self.pending);
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let frame = WireFrame::UnsuppressRelation {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                source,
+                predicate,
+                target,
+            };
+            await_admin_response(
+                &tx,
+                &pending,
+                cid,
+                frame,
+                "unsuppress_relation_response",
+            )
+            .await
         })
     }
 }
@@ -3226,6 +3527,183 @@ mod tests {
             }
             other => panic!("expected Protocol error, got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 2.3: WireSubjectAdmin / WireRelationAdmin direct unit tests.
+    // ---------------------------------------------------------------------
+
+    /// Drive `WireSubjectAdmin.forced_retract_addressing` against a
+    /// scripted response, return the trait-method outcome.
+    async fn drive_forced_retract_with_response(
+        response: Option<WireFrame>,
+    ) -> Result<(), ReportError> {
+        let (tx, mut rx) = mpsc::channel::<WireFrame>(8);
+        let event_cid = Arc::new(AtomicU64::new(1));
+        let pending: Arc<Mutex<PendingMap>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let admin = WireSubjectAdmin {
+            tx,
+            event_cid: event_cid.clone(),
+            pending: Arc::clone(&pending),
+            plugin_name: "org.test.admin".into(),
+        };
+        let pending_for_responder = Arc::clone(&pending);
+        let join = tokio::spawn(async move {
+            admin
+                .forced_retract_addressing(
+                    "org.target".into(),
+                    ExternalAddressing::new("mpd-path", "/m/a.flac"),
+                    Some("dup".into()),
+                )
+                .await
+        });
+
+        // Receive the ForcedRetractAddressing request and capture
+        // the cid to deliver the scripted response.
+        let frame = rx.recv().await.expect("admin request frame");
+        let cid = frame.envelope().1;
+        assert!(matches!(frame, WireFrame::ForcedRetractAddressing { .. }));
+
+        if let Some(resp) = response {
+            // Patch the response's cid to match the request's so the
+            // pending-map routing finds the waiting oneshot. We only
+            // need to handle the variants the tests actually script.
+            let routed = match resp {
+                WireFrame::ForcedRetractAddressingResponse {
+                    v,
+                    plugin,
+                    ..
+                } => WireFrame::ForcedRetractAddressingResponse {
+                    v,
+                    cid,
+                    plugin,
+                },
+                WireFrame::MergeSubjectsResponse { v, plugin, .. } => {
+                    WireFrame::MergeSubjectsResponse { v, cid, plugin }
+                }
+                WireFrame::Error {
+                    v,
+                    plugin,
+                    message,
+                    fatal,
+                    ..
+                } => WireFrame::Error {
+                    v,
+                    cid,
+                    plugin,
+                    message,
+                    fatal,
+                },
+                other => other,
+            };
+            assert!(route_pending_response(&pending_for_responder, routed));
+        } else {
+            drain_pending(&pending_for_responder);
+        }
+        drop(rx);
+
+        join.await.expect("admin task")
+    }
+
+    #[tokio::test]
+    async fn wire_subject_admin_returns_ok_on_response() {
+        let result = drive_forced_retract_with_response(Some(
+            WireFrame::ForcedRetractAddressingResponse {
+                v: PROTOCOL_VERSION,
+                cid: 0,
+                plugin: "org.test.admin".into(),
+            },
+        ))
+        .await;
+        assert!(matches!(result, Ok(())));
+    }
+
+    #[tokio::test]
+    async fn wire_subject_admin_returns_invalid_on_error_frame() {
+        let result =
+            drive_forced_retract_with_response(Some(WireFrame::Error {
+                v: PROTOCOL_VERSION,
+                cid: 0,
+                plugin: "org.test.admin".into(),
+                message: "admin capability not granted to this plugin".into(),
+                fatal: false,
+            }))
+            .await;
+        match result {
+            Err(ReportError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("admin capability not granted"),
+                    "msg should pass through: {msg}"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wire_subject_admin_returns_invalid_on_unexpected_response_variant()
+    {
+        // Steward sends MergeSubjectsResponse for a forced_retract
+        // request — protocol violation, expected to surface as
+        // Invalid carrying the variant name.
+        let result = drive_forced_retract_with_response(Some(
+            WireFrame::MergeSubjectsResponse {
+                v: PROTOCOL_VERSION,
+                cid: 0,
+                plugin: "org.test.admin".into(),
+            },
+        ))
+        .await;
+        match result {
+            Err(ReportError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("merge_subjects_response"),
+                    "msg should name the wrong variant: {msg}"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wire_relation_admin_unsuppress_returns_ok_on_response() {
+        let (tx, mut rx) = mpsc::channel::<WireFrame>(8);
+        let event_cid = Arc::new(AtomicU64::new(1));
+        let pending: Arc<Mutex<PendingMap>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let admin = WireRelationAdmin {
+            tx,
+            event_cid: event_cid.clone(),
+            pending: Arc::clone(&pending),
+            plugin_name: "org.test.admin".into(),
+        };
+        let pending_for_responder = Arc::clone(&pending);
+        let join = tokio::spawn(async move {
+            admin
+                .unsuppress(
+                    ExternalAddressing::new("a", "1"),
+                    "album_of".into(),
+                    ExternalAddressing::new("b", "2"),
+                )
+                .await
+        });
+
+        let frame = rx.recv().await.expect("admin request frame");
+        let cid = frame.envelope().1;
+        assert!(matches!(frame, WireFrame::UnsuppressRelation { .. }));
+        assert!(route_pending_response(
+            &pending_for_responder,
+            WireFrame::UnsuppressRelationResponse {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin: "org.test.admin".into(),
+            }
+        ));
+        drop(rx);
+
+        let result = join.await.expect("admin task");
+        assert!(matches!(result, Ok(())));
     }
 
     #[tokio::test]

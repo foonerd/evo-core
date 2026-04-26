@@ -57,8 +57,9 @@
 //! `HandleRequest`.
 
 use crate::contract::{
-    AliasRecord, CustodyHandle, ExternalAddressing, HealthReport, HealthStatus,
-    PluginDescription, RelationAssertion, RelationRetraction, ReportPriority,
+    AliasRecord, CustodyHandle, ExplicitRelationAssignment, ExternalAddressing,
+    HealthReport, HealthStatus, PluginDescription, RelationAssertion,
+    RelationRetraction, ReportPriority, SplitRelationStrategy,
     SubjectAnnouncement, SubjectQueryResult,
 };
 use serde::{Deserialize, Serialize};
@@ -493,6 +494,200 @@ pub enum WireFrame {
     },
 
     // ---------------------------------------------------------------
+    // Plugin -> Steward: privileged admin verbs (ADR-0011 wire surface
+    // for `SubjectAdmin` and `RelationAdmin`). The plugin must be
+    // admitted at a trust class that grants admin gating; the steward
+    // refuses these requests with [`Self::Error`] for plugins lacking
+    // the admin capability bit.
+    //
+    // Each request has a paired `*_response` frame the steward emits
+    // on success (the trait methods themselves return `Result<(),
+    // ReportError>`, so the response carries no data beyond echoing
+    // the cid). Errors collapse to the existing [`Self::Error`]
+    // frame with the request's cid; on the plugin side the
+    // wire-backed admin trait impl maps the message back to a
+    // [`crate::contract::ReportError::Invalid`] until ADR-0013
+    // introduces a structured wire error taxonomy.
+    // ---------------------------------------------------------------
+    /// `forced_retract_addressing` request. Mirrors
+    /// [`crate::contract::SubjectAdmin::forced_retract_addressing`].
+    ForcedRetractAddressing {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical name of the admin plugin issuing the call.
+        plugin: String,
+        /// Plugin whose addressing is being force-retracted.
+        target_plugin: String,
+        /// The addressing to retract.
+        addressing: ExternalAddressing,
+        /// Optional operator-supplied reason.
+        reason: Option<String>,
+    },
+
+    /// `forced_retract_addressing` success response. No payload
+    /// beyond the envelope; failure surfaces as [`Self::Error`].
+    ForcedRetractAddressingResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// `merge_subjects` request. Mirrors
+    /// [`crate::contract::SubjectAdmin::merge`].
+    MergeSubjects {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical name of the admin plugin issuing the call.
+        plugin: String,
+        /// First source addressing.
+        target_a: ExternalAddressing,
+        /// Second source addressing.
+        target_b: ExternalAddressing,
+        /// Optional operator-supplied reason.
+        reason: Option<String>,
+    },
+
+    /// `merge_subjects` success response.
+    MergeSubjectsResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// `split_subject` request. Mirrors
+    /// [`crate::contract::SubjectAdmin::split`].
+    SplitSubject {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical name of the admin plugin issuing the call.
+        plugin: String,
+        /// Source subject addressing.
+        source: ExternalAddressing,
+        /// Partition of the source's addressings into the new
+        /// subjects' addressing sets. `partition.len()` MUST be at
+        /// least 2.
+        partition: Vec<Vec<ExternalAddressing>>,
+        /// Strategy for distributing relations across the new
+        /// subjects.
+        strategy: SplitRelationStrategy,
+        /// Per-relation assignments, consulted only when `strategy`
+        /// is [`SplitRelationStrategy::Explicit`].
+        explicit_assignments: Vec<ExplicitRelationAssignment>,
+        /// Optional operator-supplied reason.
+        reason: Option<String>,
+    },
+
+    /// `split_subject` success response.
+    SplitSubjectResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// `forced_retract_claim` request. Mirrors
+    /// [`crate::contract::RelationAdmin::forced_retract_claim`].
+    ForcedRetractClaim {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical name of the admin plugin issuing the call.
+        plugin: String,
+        /// Plugin whose claim is being force-retracted.
+        target_plugin: String,
+        /// Source addressing of the relation.
+        source: ExternalAddressing,
+        /// Predicate name.
+        predicate: String,
+        /// Target addressing of the relation.
+        target: ExternalAddressing,
+        /// Optional operator-supplied reason.
+        reason: Option<String>,
+    },
+
+    /// `forced_retract_claim` success response.
+    ForcedRetractClaimResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// `suppress_relation` request. Mirrors
+    /// [`crate::contract::RelationAdmin::suppress`].
+    SuppressRelation {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical name of the admin plugin issuing the call.
+        plugin: String,
+        /// Source addressing of the relation.
+        source: ExternalAddressing,
+        /// Predicate name.
+        predicate: String,
+        /// Target addressing of the relation.
+        target: ExternalAddressing,
+        /// Optional operator-supplied reason.
+        reason: Option<String>,
+    },
+
+    /// `suppress_relation` success response.
+    SuppressRelationResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// `unsuppress_relation` request. Mirrors
+    /// [`crate::contract::RelationAdmin::unsuppress`]; takes no
+    /// reason field (the SDK trait does not).
+    UnsuppressRelation {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical name of the admin plugin issuing the call.
+        plugin: String,
+        /// Source addressing of the relation.
+        source: ExternalAddressing,
+        /// Predicate name.
+        predicate: String,
+        /// Target addressing of the relation.
+        target: ExternalAddressing,
+    },
+
+    /// `unsuppress_relation` success response.
+    UnsuppressRelationResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    // ---------------------------------------------------------------
     // Error frames (bidirectional). When returned in response to a
     // request, `cid` matches the request; when returned in response
     // to an event, `cid` matches the event.
@@ -627,6 +822,18 @@ impl WireFrame {
             | Self::DescribeAliasResponse { v, cid, plugin, .. }
             | Self::DescribeSubject { v, cid, plugin, .. }
             | Self::DescribeSubjectResponse { v, cid, plugin, .. }
+            | Self::ForcedRetractAddressing { v, cid, plugin, .. }
+            | Self::ForcedRetractAddressingResponse { v, cid, plugin }
+            | Self::MergeSubjects { v, cid, plugin, .. }
+            | Self::MergeSubjectsResponse { v, cid, plugin }
+            | Self::SplitSubject { v, cid, plugin, .. }
+            | Self::SplitSubjectResponse { v, cid, plugin }
+            | Self::ForcedRetractClaim { v, cid, plugin, .. }
+            | Self::ForcedRetractClaimResponse { v, cid, plugin }
+            | Self::SuppressRelation { v, cid, plugin, .. }
+            | Self::SuppressRelationResponse { v, cid, plugin }
+            | Self::UnsuppressRelation { v, cid, plugin, .. }
+            | Self::UnsuppressRelationResponse { v, cid, plugin }
             | Self::Error { v, cid, plugin, .. }
             | Self::EventAck { v, cid, plugin }
             | Self::Hello { v, cid, plugin, .. }
@@ -664,7 +871,14 @@ impl WireFrame {
     pub fn is_plugin_request(&self) -> bool {
         matches!(
             self,
-            Self::DescribeAlias { .. } | Self::DescribeSubject { .. }
+            Self::DescribeAlias { .. }
+                | Self::DescribeSubject { .. }
+                | Self::ForcedRetractAddressing { .. }
+                | Self::MergeSubjects { .. }
+                | Self::SplitSubject { .. }
+                | Self::ForcedRetractClaim { .. }
+                | Self::SuppressRelation { .. }
+                | Self::UnsuppressRelation { .. }
         )
     }
 
@@ -683,6 +897,12 @@ impl WireFrame {
                 | Self::ReleaseCustodyResponse { .. }
                 | Self::DescribeAliasResponse { .. }
                 | Self::DescribeSubjectResponse { .. }
+                | Self::ForcedRetractAddressingResponse { .. }
+                | Self::MergeSubjectsResponse { .. }
+                | Self::SplitSubjectResponse { .. }
+                | Self::ForcedRetractClaimResponse { .. }
+                | Self::SuppressRelationResponse { .. }
+                | Self::UnsuppressRelationResponse { .. }
         )
     }
 
@@ -1297,6 +1517,223 @@ mod tests {
         // place ensures a future codec addition has to update the
         // test rather than silently changing the on-wire default.
         assert_eq!(SUPPORTED_CODECS.first().copied(), Some("json"));
+    }
+
+    // ---- Wave 2.3 admin-verb wire frames ----
+
+    #[test]
+    fn forced_retract_addressing_round_trip() {
+        let orig = WireFrame::ForcedRetractAddressing {
+            v: PROTOCOL_VERSION,
+            cid: 11,
+            plugin: sample_plugin(),
+            target_plugin: "org.target".into(),
+            addressing: sample_addressing(),
+            reason: Some("operator: dup".into()),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"forced_retract_addressing""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn merge_subjects_round_trip() {
+        let orig = WireFrame::MergeSubjects {
+            v: PROTOCOL_VERSION,
+            cid: 12,
+            plugin: sample_plugin(),
+            target_a: ExternalAddressing::new("mpd-path", "/m/a.flac"),
+            target_b: ExternalAddressing::new("mpd-path", "/m/b.flac"),
+            reason: Some("dup".into()),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"merge_subjects""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn split_subject_round_trip() {
+        let orig = WireFrame::SplitSubject {
+            v: PROTOCOL_VERSION,
+            cid: 13,
+            plugin: sample_plugin(),
+            source: sample_addressing(),
+            partition: vec![
+                vec![ExternalAddressing::new("a", "1")],
+                vec![ExternalAddressing::new("b", "2")],
+            ],
+            strategy: SplitRelationStrategy::ToFirst,
+            explicit_assignments: vec![],
+            reason: None,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"split_subject""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn forced_retract_claim_round_trip() {
+        let orig = WireFrame::ForcedRetractClaim {
+            v: PROTOCOL_VERSION,
+            cid: 14,
+            plugin: sample_plugin(),
+            target_plugin: "org.target".into(),
+            source: ExternalAddressing::new("a", "1"),
+            predicate: "album_of".into(),
+            target: ExternalAddressing::new("b", "2"),
+            reason: None,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"forced_retract_claim""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn suppress_relation_round_trip() {
+        let orig = WireFrame::SuppressRelation {
+            v: PROTOCOL_VERSION,
+            cid: 15,
+            plugin: sample_plugin(),
+            source: ExternalAddressing::new("a", "1"),
+            predicate: "album_of".into(),
+            target: ExternalAddressing::new("b", "2"),
+            reason: Some("audit".into()),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"suppress_relation""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn unsuppress_relation_round_trip() {
+        let orig = WireFrame::UnsuppressRelation {
+            v: PROTOCOL_VERSION,
+            cid: 16,
+            plugin: sample_plugin(),
+            source: ExternalAddressing::new("a", "1"),
+            predicate: "album_of".into(),
+            target: ExternalAddressing::new("b", "2"),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"unsuppress_relation""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn admin_request_frames_classify_as_plugin_requests() {
+        let frames = [
+            WireFrame::ForcedRetractAddressing {
+                v: PROTOCOL_VERSION,
+                cid: 1,
+                plugin: "x".into(),
+                target_plugin: "y".into(),
+                addressing: ExternalAddressing::new("a", "1"),
+                reason: None,
+            },
+            WireFrame::MergeSubjects {
+                v: PROTOCOL_VERSION,
+                cid: 2,
+                plugin: "x".into(),
+                target_a: ExternalAddressing::new("a", "1"),
+                target_b: ExternalAddressing::new("a", "2"),
+                reason: None,
+            },
+            WireFrame::SplitSubject {
+                v: PROTOCOL_VERSION,
+                cid: 3,
+                plugin: "x".into(),
+                source: ExternalAddressing::new("a", "1"),
+                partition: vec![],
+                strategy: SplitRelationStrategy::ToBoth,
+                explicit_assignments: vec![],
+                reason: None,
+            },
+            WireFrame::ForcedRetractClaim {
+                v: PROTOCOL_VERSION,
+                cid: 4,
+                plugin: "x".into(),
+                target_plugin: "y".into(),
+                source: ExternalAddressing::new("a", "1"),
+                predicate: "p".into(),
+                target: ExternalAddressing::new("b", "2"),
+                reason: None,
+            },
+            WireFrame::SuppressRelation {
+                v: PROTOCOL_VERSION,
+                cid: 5,
+                plugin: "x".into(),
+                source: ExternalAddressing::new("a", "1"),
+                predicate: "p".into(),
+                target: ExternalAddressing::new("b", "2"),
+                reason: None,
+            },
+            WireFrame::UnsuppressRelation {
+                v: PROTOCOL_VERSION,
+                cid: 6,
+                plugin: "x".into(),
+                source: ExternalAddressing::new("a", "1"),
+                predicate: "p".into(),
+                target: ExternalAddressing::new("b", "2"),
+            },
+        ];
+        for f in frames.iter() {
+            assert!(
+                f.is_plugin_request(),
+                "{:?} should classify as a plugin request",
+                f
+            );
+            assert!(!f.is_response());
+            assert!(!f.is_request());
+            assert!(!f.is_event());
+        }
+    }
+
+    #[test]
+    fn admin_response_frames_classify_as_responses() {
+        let frames = [
+            WireFrame::ForcedRetractAddressingResponse {
+                v: PROTOCOL_VERSION,
+                cid: 1,
+                plugin: "x".into(),
+            },
+            WireFrame::MergeSubjectsResponse {
+                v: PROTOCOL_VERSION,
+                cid: 2,
+                plugin: "x".into(),
+            },
+            WireFrame::SplitSubjectResponse {
+                v: PROTOCOL_VERSION,
+                cid: 3,
+                plugin: "x".into(),
+            },
+            WireFrame::ForcedRetractClaimResponse {
+                v: PROTOCOL_VERSION,
+                cid: 4,
+                plugin: "x".into(),
+            },
+            WireFrame::SuppressRelationResponse {
+                v: PROTOCOL_VERSION,
+                cid: 5,
+                plugin: "x".into(),
+            },
+            WireFrame::UnsuppressRelationResponse {
+                v: PROTOCOL_VERSION,
+                cid: 6,
+                plugin: "x".into(),
+            },
+        ];
+        for f in frames.iter() {
+            assert!(f.is_response(), "{:?} should classify as a response", f);
+            assert!(!f.is_plugin_request());
+            assert!(!f.is_request());
+            assert!(!f.is_event());
+        }
     }
 
     #[test]

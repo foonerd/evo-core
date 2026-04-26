@@ -66,9 +66,9 @@ use crate::subjects::SubjectRegistry;
 use evo_plugin_sdk::codec::{read_frame_json, write_frame_json, WireError};
 use evo_plugin_sdk::contract::{
     Assignment, CourseCorrection, CustodyHandle, CustodyStateReporter,
-    HealthReport, LoadContext, PluginDescription, PluginError,
-    RelationAnnouncer, Request, Response, StateReporter, SubjectAnnouncer,
-    SubjectQuerier,
+    HealthReport, LoadContext, PluginDescription, PluginError, RelationAdmin,
+    RelationAnnouncer, Request, Response, StateReporter, SubjectAdmin,
+    SubjectAnnouncer, SubjectQuerier,
 };
 use evo_plugin_sdk::wire::{
     WireFrame, FEATURE_VERSION_MAX, FEATURE_VERSION_MIN, PROTOCOL_VERSION,
@@ -186,6 +186,17 @@ pub struct EventSink {
     /// `describe_subject` requests. The reader task answers each with
     /// the matching `*_response` frame on the same connection.
     pub subject_querier: Arc<dyn SubjectQuerier>,
+    /// Where to route plugin-initiated `forced_retract_addressing` /
+    /// `merge_subjects` / `split_subject` requests (ADR-0011 admin
+    /// surface). `None` for plugins that do not hold the admin
+    /// capability bit; in that case the reader task replies with a
+    /// fatal `Error` frame for those verbs.
+    pub subject_admin: Option<Arc<dyn SubjectAdmin>>,
+    /// Where to route plugin-initiated `forced_retract_claim` /
+    /// `suppress_relation` / `unsuppress_relation` requests
+    /// (ADR-0011 admin surface). Same gating as
+    /// [`Self::subject_admin`].
+    pub relation_admin: Option<Arc<dyn RelationAdmin>>,
 }
 
 impl fmt::Debug for EventSink {
@@ -953,6 +964,175 @@ async fn forward_plugin_request(
                 fatal: false,
             },
         },
+
+        // ----- ADR-0011 admin verbs (SubjectAdmin) -----
+        WireFrame::ForcedRetractAddressing {
+            v,
+            cid,
+            plugin,
+            target_plugin,
+            addressing,
+            reason,
+        } => match sink.subject_admin.as_ref() {
+            Some(admin) => match admin
+                .forced_retract_addressing(target_plugin, addressing, reason)
+                .await
+            {
+                Ok(()) => WireFrame::ForcedRetractAddressingResponse {
+                    v,
+                    cid,
+                    plugin,
+                },
+                Err(e) => WireFrame::Error {
+                    v,
+                    cid,
+                    plugin,
+                    message: format!("forced_retract_addressing: {e}"),
+                    fatal: false,
+                },
+            },
+            None => admin_capability_denied_error(v, cid, plugin),
+        },
+        WireFrame::MergeSubjects {
+            v,
+            cid,
+            plugin,
+            target_a,
+            target_b,
+            reason,
+        } => match sink.subject_admin.as_ref() {
+            Some(admin) => {
+                match admin.merge(target_a, target_b, reason).await {
+                    Ok(()) => {
+                        WireFrame::MergeSubjectsResponse { v, cid, plugin }
+                    }
+                    Err(e) => WireFrame::Error {
+                        v,
+                        cid,
+                        plugin,
+                        message: format!("merge_subjects: {e}"),
+                        fatal: false,
+                    },
+                }
+            }
+            None => admin_capability_denied_error(v, cid, plugin),
+        },
+        WireFrame::SplitSubject {
+            v,
+            cid,
+            plugin,
+            source,
+            partition,
+            strategy,
+            explicit_assignments,
+            reason,
+        } => match sink.subject_admin.as_ref() {
+            Some(admin) => match admin
+                .split(
+                    source,
+                    partition,
+                    strategy,
+                    explicit_assignments,
+                    reason,
+                )
+                .await
+            {
+                Ok(()) => WireFrame::SplitSubjectResponse { v, cid, plugin },
+                Err(e) => WireFrame::Error {
+                    v,
+                    cid,
+                    plugin,
+                    message: format!("split_subject: {e}"),
+                    fatal: false,
+                },
+            },
+            None => admin_capability_denied_error(v, cid, plugin),
+        },
+
+        // ----- ADR-0011 admin verbs (RelationAdmin) -----
+        WireFrame::ForcedRetractClaim {
+            v,
+            cid,
+            plugin,
+            target_plugin,
+            source,
+            predicate,
+            target,
+            reason,
+        } => match sink.relation_admin.as_ref() {
+            Some(admin) => match admin
+                .forced_retract_claim(
+                    target_plugin,
+                    source,
+                    predicate,
+                    target,
+                    reason,
+                )
+                .await
+            {
+                Ok(()) => {
+                    WireFrame::ForcedRetractClaimResponse { v, cid, plugin }
+                }
+                Err(e) => WireFrame::Error {
+                    v,
+                    cid,
+                    plugin,
+                    message: format!("forced_retract_claim: {e}"),
+                    fatal: false,
+                },
+            },
+            None => admin_capability_denied_error(v, cid, plugin),
+        },
+        WireFrame::SuppressRelation {
+            v,
+            cid,
+            plugin,
+            source,
+            predicate,
+            target,
+            reason,
+        } => match sink.relation_admin.as_ref() {
+            Some(admin) => {
+                match admin.suppress(source, predicate, target, reason).await {
+                    Ok(()) => {
+                        WireFrame::SuppressRelationResponse { v, cid, plugin }
+                    }
+                    Err(e) => WireFrame::Error {
+                        v,
+                        cid,
+                        plugin,
+                        message: format!("suppress_relation: {e}"),
+                        fatal: false,
+                    },
+                }
+            }
+            None => admin_capability_denied_error(v, cid, plugin),
+        },
+        WireFrame::UnsuppressRelation {
+            v,
+            cid,
+            plugin,
+            source,
+            predicate,
+            target,
+        } => match sink.relation_admin.as_ref() {
+            Some(admin) => {
+                match admin.unsuppress(source, predicate, target).await {
+                    Ok(()) => {
+                        WireFrame::UnsuppressRelationResponse { v, cid, plugin }
+                    }
+                    Err(e) => WireFrame::Error {
+                        v,
+                        cid,
+                        plugin,
+                        message: format!("unsuppress_relation: {e}"),
+                        fatal: false,
+                    },
+                }
+            }
+            None => admin_capability_denied_error(v, cid, plugin),
+        },
+
         other => {
             // Should never happen: caller guards on
             // is_plugin_request() before calling.
@@ -967,6 +1147,25 @@ async fn forward_plugin_request(
         tracing::warn!(
             "writer task closed before plugin-request response could be sent"
         );
+    }
+}
+
+/// Build the structured `Error` frame returned when a plugin
+/// invokes an admin verb but its load context did not carry an
+/// admin handle (the plugin's trust class did not grant the
+/// admin capability). The error is non-fatal: the plugin may
+/// continue with non-admin verbs on the same connection.
+fn admin_capability_denied_error(
+    v: u16,
+    cid: u64,
+    plugin: String,
+) -> WireFrame {
+    WireFrame::Error {
+        v,
+        cid,
+        plugin,
+        message: "admin capability not granted to this plugin".to_string(),
+        fatal: false,
     }
 }
 
@@ -1156,6 +1355,28 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::EventAck { .. } => "event_ack",
         WireFrame::Hello { .. } => "hello",
         WireFrame::HelloAck { .. } => "hello_ack",
+        WireFrame::ForcedRetractAddressing { .. } => {
+            "forced_retract_addressing"
+        }
+        WireFrame::ForcedRetractAddressingResponse { .. } => {
+            "forced_retract_addressing_response"
+        }
+        WireFrame::MergeSubjects { .. } => "merge_subjects",
+        WireFrame::MergeSubjectsResponse { .. } => "merge_subjects_response",
+        WireFrame::SplitSubject { .. } => "split_subject",
+        WireFrame::SplitSubjectResponse { .. } => "split_subject_response",
+        WireFrame::ForcedRetractClaim { .. } => "forced_retract_claim",
+        WireFrame::ForcedRetractClaimResponse { .. } => {
+            "forced_retract_claim_response"
+        }
+        WireFrame::SuppressRelation { .. } => "suppress_relation",
+        WireFrame::SuppressRelationResponse { .. } => {
+            "suppress_relation_response"
+        }
+        WireFrame::UnsuppressRelation { .. } => "unsuppress_relation",
+        WireFrame::UnsuppressRelationResponse { .. } => {
+            "unsuppress_relation_response"
+        }
     }
 }
 
@@ -1312,6 +1533,8 @@ impl crate::admission::ErasedRespondent for WireRespondent {
                 relation_announcer: Arc::clone(&ctx.relation_announcer),
                 custody_state_reporter: None,
                 subject_querier,
+                subject_admin: ctx.subject_admin.clone(),
+                relation_admin: ctx.relation_admin.clone(),
             });
 
             let config_json = toml_table_to_json_value(ctx.config.clone())
@@ -1553,6 +1776,8 @@ impl crate::admission::ErasedWarden for WireWarden {
                 relation_announcer: Arc::clone(&ctx.relation_announcer),
                 custody_state_reporter: Some(custody_reporter),
                 subject_querier,
+                subject_admin: ctx.subject_admin.clone(),
+                relation_admin: ctx.relation_admin.clone(),
             });
 
             let config_json = toml_table_to_json_value(ctx.config.clone())
@@ -2776,6 +3001,8 @@ target_type = "album"
                 },
             )),
             subject_querier: Arc::new(NotFoundSubjectQuerier),
+            subject_admin: None,
+            relation_admin: None,
         });
 
         // Take custody. The plugin emits the state report BEFORE
@@ -3392,6 +3619,8 @@ name = "track"
             relation_announcer: Arc::new(UnreachableRelationAnnouncer),
             custody_state_reporter: None,
             subject_querier: Arc::new(NotFoundSubjectQuerier),
+            subject_admin: None,
+            relation_admin: None,
         }
     }
 
@@ -3496,6 +3725,204 @@ name = "track"
     // ---------------------------------------------------------------------
     // Wave 2.2: steward-side handshake (perform_steward_handshake) tests.
     // ---------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------
+    // Wave 2.3: steward-side admin dispatch (forward_plugin_request)
+    // ---------------------------------------------------------------------
+
+    /// `SubjectAdmin` stub recording the last call so the test can
+    /// assert the dispatch routed the right parameters.
+    #[derive(Default)]
+    struct CapturingSubjectAdmin {
+        captured: std::sync::Mutex<
+            Option<(String, ExternalAddressing, Option<String>)>,
+        >,
+        succeed: bool,
+    }
+
+    impl evo_plugin_sdk::contract::SubjectAdmin for CapturingSubjectAdmin {
+        fn forced_retract_addressing<'a>(
+            &'a self,
+            target_plugin: String,
+            addressing: ExternalAddressing,
+            reason: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            *self.captured.lock().unwrap() =
+                Some((target_plugin, addressing, reason));
+            let succeed = self.succeed;
+            Box::pin(async move {
+                if succeed {
+                    Ok(())
+                } else {
+                    Err(ReportError::Invalid("test-stub: admin refused".into()))
+                }
+            })
+        }
+
+        fn merge<'a>(
+            &'a self,
+            _target_a: ExternalAddressing,
+            _target_b: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            unreachable!("merge not exercised by these tests")
+        }
+
+        fn split<'a>(
+            &'a self,
+            _source: ExternalAddressing,
+            _partition: Vec<Vec<ExternalAddressing>>,
+            _strategy: evo_plugin_sdk::contract::SplitRelationStrategy,
+            _explicit_assignments: Vec<
+                evo_plugin_sdk::contract::ExplicitRelationAssignment,
+            >,
+            _reason: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            unreachable!("split not exercised by these tests")
+        }
+    }
+
+    fn sink_with_subject_admin(
+        admin: Option<Arc<dyn evo_plugin_sdk::contract::SubjectAdmin>>,
+    ) -> EventSink {
+        use crate::context::LoggingStateReporter as LSR;
+        EventSink {
+            state_reporter: Arc::new(LSR::new("org.test")),
+            subject_announcer: Arc::new(AlwaysOkAnnouncer),
+            relation_announcer: Arc::new(UnreachableRelationAnnouncer),
+            custody_state_reporter: None,
+            subject_querier: Arc::new(NotFoundSubjectQuerier),
+            subject_admin: admin,
+            relation_admin: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_forced_retract_addressing_routes_to_subject_admin_handle() {
+        let admin = Arc::new(CapturingSubjectAdmin {
+            captured: Default::default(),
+            succeed: true,
+        });
+        let admin_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> =
+            admin.clone();
+        let sink = sink_with_subject_admin(Some(admin_dyn));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::ForcedRetractAddressing {
+            v: PROTOCOL_VERSION,
+            cid: 77,
+            plugin: "org.admin".into(),
+            target_plugin: "org.target".into(),
+            addressing: ExternalAddressing::new("mpd-path", "/m/x.flac"),
+            reason: Some("dup".into()),
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::ForcedRetractAddressingResponse {
+                cid, plugin, ..
+            } => {
+                assert_eq!(cid, 77);
+                assert_eq!(plugin, "org.admin");
+            }
+            other => panic!(
+                "expected ForcedRetractAddressingResponse, got {other:?}"
+            ),
+        }
+        let captured = admin.captured.lock().unwrap();
+        let (target_plugin, addressing, reason) =
+            captured.as_ref().expect("admin must have been called");
+        assert_eq!(target_plugin, "org.target");
+        assert_eq!(addressing.scheme, "mpd-path");
+        assert_eq!(addressing.value, "/m/x.flac");
+        assert_eq!(reason.as_deref(), Some("dup"));
+    }
+
+    #[tokio::test]
+    async fn admin_forced_retract_addressing_returns_error_when_admin_rejects()
+    {
+        let admin = Arc::new(CapturingSubjectAdmin {
+            captured: Default::default(),
+            succeed: false,
+        });
+        let admin_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> =
+            admin.clone();
+        let sink = sink_with_subject_admin(Some(admin_dyn));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::ForcedRetractAddressing {
+            v: PROTOCOL_VERSION,
+            cid: 78,
+            plugin: "org.admin".into(),
+            target_plugin: "org.target".into(),
+            addressing: ExternalAddressing::new("mpd-path", "/m/x.flac"),
+            reason: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error {
+                cid,
+                fatal,
+                message,
+                ..
+            } => {
+                assert_eq!(cid, 78);
+                assert!(
+                    !fatal,
+                    "non-fatal: per-call rejection, not session-level"
+                );
+                assert!(
+                    message.contains("admin refused"),
+                    "must propagate admin's reason: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_request_returns_capability_denied_when_handle_none() {
+        let sink = sink_with_subject_admin(None);
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::ForcedRetractAddressing {
+            v: PROTOCOL_VERSION,
+            cid: 79,
+            plugin: "org.unprivileged".into(),
+            target_plugin: "org.target".into(),
+            addressing: ExternalAddressing::new("mpd-path", "/m/x.flac"),
+            reason: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error {
+                cid,
+                fatal,
+                message,
+                ..
+            } => {
+                assert_eq!(cid, 79);
+                assert!(
+                    !fatal,
+                    "capability-denied is non-fatal: plugin may continue \
+                     with non-admin verbs"
+                );
+                assert!(
+                    message.contains("admin capability not granted"),
+                    "must surface gating reason: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn handshake_succeeds_when_peer_sends_valid_hello_ack() {
