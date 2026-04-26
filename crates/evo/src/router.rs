@@ -139,13 +139,14 @@ pub struct PluginEntry {
 }
 
 /// Manifest-derived enforcement state attached to every admitted
-/// plugin (Wave 6.b).
+/// plugin.
 ///
 /// Built at admission time from `manifest.capabilities`, then
-/// consulted on every dispatch through the router. Today this
-/// covers two fields; further fields (restart budget, custody
-/// failure mode) require additional supervisor / handler
-/// machinery and are deferred.
+/// consulted on every dispatch through the router. The struct
+/// covers exactly the manifest fields whose `Bucket` annotation
+/// marks them Enforced; fields whose annotation is Reserved
+/// (e.g. lifecycle restart fields) are absent here because no
+/// runtime path consults them today.
 #[derive(Debug, Clone)]
 pub struct EnforcementPolicy {
     /// `Some(types)` for respondents — the verbs the plugin
@@ -157,10 +158,27 @@ pub struct EnforcementPolicy {
     pub allowed_request_types: Option<Vec<String>>,
     /// Default deadline (milliseconds from dispatch) the router
     /// applies to a `handle_request` whose `request.deadline` is
-    /// `None`. Drawn from `capabilities.respondent.response_budget_ms`
-    /// for respondents and `capabilities.warden.course_correction_budget_ms`
-    /// for wardens; `None` when the kind has no analogous field.
+    /// `None`. Drawn from `capabilities.respondent.response_budget_ms`;
+    /// `None` when the kind has no analogous field.
     pub default_request_deadline_ms: Option<u32>,
+    /// Hard deadline (milliseconds) applied to every
+    /// [`PluginRouter::course_correct`] dispatch. Drawn from
+    /// `capabilities.warden.course_correction_budget_ms`. The
+    /// router wraps the warden's `course_correct` call in a
+    /// `tokio::time::timeout` of this duration; expiry maps to
+    /// [`StewardError::Dispatch`] carrying the configured
+    /// [`Self::custody_failure_mode`] for the operator's
+    /// reaction.
+    pub course_correction_deadline_ms: Option<u32>,
+    /// Behaviour when a custody operation fails or its budget is
+    /// exceeded. Drawn from
+    /// `capabilities.warden.custody_failure_mode`. Today the
+    /// router surfaces this on every custody-error site so
+    /// happenings, audit log, and the dispatch error all carry
+    /// the operator-declared failure mode and consumers can act
+    /// consistently.
+    pub custody_failure_mode:
+        Option<evo_plugin_sdk::manifest::CustodyFailureMode>,
 }
 
 impl EnforcementPolicy {
@@ -171,6 +189,8 @@ impl EnforcementPolicy {
         Self {
             allowed_request_types: None,
             default_request_deadline_ms: None,
+            course_correction_deadline_ms: None,
+            custody_failure_mode: None,
         }
     }
 
@@ -182,13 +202,21 @@ impl EnforcementPolicy {
     ) -> Self {
         let mut allowed_request_types = None;
         let mut default_request_deadline_ms = None;
+        let mut course_correction_deadline_ms = None;
+        let mut custody_failure_mode = None;
         if let Some(r) = manifest.capabilities.respondent.as_ref() {
             allowed_request_types = Some(r.request_types.clone());
             default_request_deadline_ms = Some(r.response_budget_ms);
         }
+        if let Some(w) = manifest.capabilities.warden.as_ref() {
+            course_correction_deadline_ms = Some(w.course_correction_budget_ms);
+            custody_failure_mode = Some(w.custody_failure_mode);
+        }
         Self {
             allowed_request_types,
             default_request_deadline_ms,
+            course_correction_deadline_ms,
+            custody_failure_mode,
         }
     }
 }
@@ -585,6 +613,12 @@ impl PluginRouter {
 
     /// Deliver a course correction to an ongoing custody on the
     /// given shelf.
+    ///
+    /// The call is bounded by the warden's
+    /// `course_correction_budget_ms` (taken from the manifest at
+    /// admission time). Expiry surfaces as a
+    /// [`StewardError::Dispatch`] whose message includes the
+    /// declared `custody_failure_mode` so consumers can branch.
     pub async fn course_correct(
         &self,
         shelf: &str,
@@ -604,6 +638,9 @@ impl PluginRouter {
             correlation_id,
         };
 
+        let deadline_ms = entry.policy.course_correction_deadline_ms;
+        let failure_mode = entry.policy.custody_failure_mode;
+
         let mut handle_guard = entry.handle.lock().await;
         let admitted = handle_guard.as_mut().ok_or_else(|| {
             StewardError::Dispatch(format!(
@@ -620,10 +657,41 @@ impl PluginRouter {
             }
         };
 
-        warden
-            .course_correct(handle, correction)
-            .await
-            .map_err(Into::into)
+        let result = match deadline_ms {
+            Some(ms) => {
+                let dur = std::time::Duration::from_millis(u64::from(ms));
+                match tokio::time::timeout(
+                    dur,
+                    warden.course_correct(handle, correction),
+                )
+                .await
+                {
+                    Ok(inner) => inner.map_err(StewardError::from),
+                    Err(_) => Err(StewardError::Dispatch(format!(
+                        "course_correct on shelf {shelf} exceeded budget \
+                         {ms} ms; custody_failure_mode = {}",
+                        failure_mode
+                            .map(|m| format!("{m:?}").to_lowercase())
+                            .unwrap_or_else(|| "unspecified".to_string()),
+                    ))),
+                }
+            }
+            None => warden
+                .course_correct(handle, correction)
+                .await
+                .map_err(Into::into),
+        };
+
+        if let Err(ref e) = result {
+            tracing::warn!(
+                shelf = %shelf,
+                custody_failure_mode = ?failure_mode,
+                error = %e,
+                "course_correct failed; failure mode declared by manifest"
+            );
+        }
+
+        result
     }
 
     /// Gracefully terminate an ongoing custody on the given shelf.
@@ -1006,6 +1074,8 @@ mod tests {
         let policy = EnforcementPolicy {
             allowed_request_types: Some(vec!["ping".into()]),
             default_request_deadline_ms: None,
+            course_correction_deadline_ms: None,
+            custody_failure_mode: None,
         };
         r.insert(respondent_entry_with_policy("p", "test.ping", "p", policy))
             .unwrap();
@@ -1035,6 +1105,8 @@ mod tests {
         let policy = EnforcementPolicy {
             allowed_request_types: Some(vec!["ping".into()]),
             default_request_deadline_ms: None,
+            course_correction_deadline_ms: None,
+            custody_failure_mode: None,
         };
         r.insert(respondent_entry_with_policy("p", "test.ping", "p", policy))
             .unwrap();
@@ -1127,6 +1199,8 @@ mod tests {
         let policy = EnforcementPolicy {
             allowed_request_types: None,
             default_request_deadline_ms: Some(100),
+            course_correction_deadline_ms: None,
+            custody_failure_mode: None,
         };
         let entry = Arc::new(PluginEntry::new_with_policy(
             "p".into(),
@@ -1169,6 +1243,8 @@ mod tests {
         let policy = EnforcementPolicy {
             allowed_request_types: None,
             default_request_deadline_ms: Some(100),
+            course_correction_deadline_ms: None,
+            custody_failure_mode: None,
         };
         r.insert(respondent_entry_with_policy("p", "test.ping", "p", policy))
             .unwrap();

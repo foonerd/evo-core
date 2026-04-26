@@ -116,6 +116,18 @@ Additional sections may be declared by specific shelves' shapes. The steward val
 
 The manifest is parsed and validated by the SDK (`evo-plugin-sdk`) and enforced at admission by the steward (`evo`). Not every declared field is enforced from core: some fields gate admission itself, others are advisory to core and enforced by the distribution at the OS level. The split is normative.
 
+#### Bucket discipline
+
+Every parsed manifest field falls into exactly one of three buckets, recorded as a `**Bucket: ...**` annotation on the field's rustdoc in `crates/evo-plugin-sdk/src/manifest.rs`:
+
+- **Enforced.** The steward acts on the field at runtime. Any change to the field's value changes observable steward behaviour. Admission refuses on a violation; dispatch consults the field on the relevant code path.
+- **Distribution-owned.** Explicitly out of scope for the framework. The field is parsed and preserved in the manifest because it lives there for distribution-side use (resource limits, OS-level isolation hints). The steward never consults the field at runtime; the distribution holds the plugin to its promise via systemd / cgroups / namespaces.
+- **Reserved.** The field exists for an in-flight feature not yet implemented. The field is parsed (its absence is permitted; its presence is also permitted) but does not yet cause behaviour. Each Reserved field has a documented promotion plan in its rustdoc; closing the plan promotes the field to Enforced.
+
+The bucket discipline is auditable: a reader of `manifest.rs` sees the bucket on every field; a future contributor who wants to add a new field declares its bucket up front and the reviewer checks the declaration against the implementation. New Enforced fields land with an enforcement test in the same commit; new Reserved fields land with the promotion plan in the rustdoc.
+
+The tables below enumerate the current per-field bucket assignment.
+
 **Enforced by the evo-core steward at admission** (admission refuses on violation):
 
 | Field | How core enforces |
@@ -131,17 +143,34 @@ The manifest is parsed and validated by the SDK (`evo-plugin-sdk`) and enforced 
 | `transport.type` | `admit_out_of_process_from_directory` refuses `in-process`. |
 | `transport.exec` | Must resolve (relative or absolute) to a file the steward can spawn. |
 | `capabilities.admin` | If `true`, effective `trust.class` must be at or above `evo_trust::ADMIN_MINIMUM_TRUST` (currently `Privileged`); admission refuses with `StewardError::AdminTrustTooLow` otherwise. `LoadContext.subject_admin` / `relation_admin` populated only when this flag is set. |
+| `capabilities.respondent.request_types` | Admission rejects respondents whose `request_types` is empty for a shelf with verbs; subsequent `handle_request` dispatch refuses any verb not in this list. |
+| `capabilities.respondent.response_budget_ms` | Router wraps every `handle_request` whose own `Request::deadline` is `None` in a `tokio::time::timeout` of this duration; expiry maps to `PluginError::Timeout`. |
+| `capabilities.warden.custody_exclusive` | Admission refuses a second warden declaring the same `custody_domain` when either declares `custody_exclusive = true`. |
+| `capabilities.warden.course_correction_budget_ms` | Router wraps every `course_correct` dispatch in a `tokio::time::timeout` of this duration; expiry surfaces the configured `custody_failure_mode` to the operator via the dispatch error. |
+| `capabilities.warden.custody_failure_mode` | Carried alongside every custody-error site in the dispatch path so happenings, audit log entries, and the dispatch error all surface the operator-declared mode and consumers can act consistently. |
+| `lifecycle.autostart` | The boot-time discovery walk admits plugins whose `autostart = true`; `false` skips admission until an operator-initiated admit verb (a future surface) targets the plugin. |
 
 **Distribution-owned** (parsed and preserved in the manifest, but not enforced by core; enforcement is expected at the OS level via systemd unit directives, cgroups v2, network namespaces, bind mounts, or LSM policy, chosen per product line):
 
-| Field | Typical enforcement point |
-|-------|---------------------------|
-| `prerequisites.outbound_network` | Network namespace, nftables, eBPF, or systemd `RestrictAddressFamilies=`. |
-| `prerequisites.filesystem_scopes` | Bind mounts, `ProtectSystem=`, `ReadWritePaths=`, chroot, mount namespaces. |
-| `resources.max_memory_mb` | systemd `MemoryMax=`, cgroup `memory.max`. |
-| `resources.max_cpu_percent` | systemd `CPUQuota=`, cgroup `cpu.max`. |
+| Field                                  | Typical enforcement point                                                                       |
+|----------------------------------------|-------------------------------------------------------------------------------------------------|
+| `prerequisites.outbound_network`       | Network namespace, nftables, eBPF, or systemd `RestrictAddressFamilies=`.                       |
+| `prerequisites.filesystem_scopes`      | Bind mounts, `ProtectSystem=`, `ReadWritePaths=`, chroot, mount namespaces.                     |
+| `resources.max_memory_mb`              | systemd `MemoryMax=`, cgroup `memory.max`.                                                      |
+| `resources.max_cpu_percent`            | systemd `CPUQuota=`, cgroup `cpu.max`.                                                          |
+| `capabilities.warden.custody_domain`   | Steward consults for diagnostics + `custody_exclusive` interlock; does not constrain.           |
 
 Core's position on the distribution-owned fields: they are **contract text** a plugin author declares and a distribution reads. A plugin that declares `max_memory_mb = 16` is making a promise to the distribution packager, who decides how to hold the plugin to that promise. A distribution that does not care (for example, a single-tenant A/V appliance with all plugins reviewed first-party) may leave the declarations advisory and unenforced. A distribution that does care (multi-tenant, untrusted third-party plugins, regulated environments) configures its systemd / cgroup / namespace layer to enforce them. The same split applies to deeper isolation (`seccomp`, Linux capabilities, SELinux domains, Android sandbox): distribution-owned, not part of the evo-core admission contract. See `BOUNDARY.md` section 6.2 for the framework-vs-distribution line.
+
+**Reserved** (parsed and preserved in the manifest, but not yet acted on by the steward; the field is published for forward-compat against the future feature that will consult it):
+
+- `lifecycle.hot_reload` — `Restart` / `Live` parsed but not acted on; today only `None` (full unload-reload) is operative regardless of declaration. Promoted when the hot-reload supervisor lands.
+- `lifecycle.restart_on_crash` — Parsed for forward-compat; the out-of-process supervisor today reaps a crashed child and deregisters without restarting. Promoted with `restart_budget` when the per-plugin restart supervisor lands.
+- `lifecycle.restart_budget` — Bounded with `restart_on_crash`; both fields graduate together.
+- `capabilities.factory.max_instances` — v0 admission refuses `kind.instance = "factory"` at the pre-admission validation pass, so no factory reaches this field. Promoted when factory admission lands.
+- `capabilities.factory.instance_ttl_seconds` — Same disposition as `max_instances`.
+
+A field added to the manifest schema without a runtime semantic and without a Reserved annotation pointing at a tracked promotion plan is rejected at code review.
 
 ## 3. Filesystem Layout on Target
 

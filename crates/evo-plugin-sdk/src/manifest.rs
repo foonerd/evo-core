@@ -337,18 +337,61 @@ pub struct Resources {
 }
 
 /// The `[lifecycle]` section: hot-reload policy and restart behaviour.
+///
+/// # Field enforcement bucket
+///
+/// Every parsed manifest field falls into exactly one of three
+/// buckets, declared in `PLUGIN_PACKAGING.md`:
+///
+/// - **Enforced**: the steward acts on the field at runtime. Any
+///   change to the field changes observable steward behaviour.
+/// - **Distribution-owned**: explicitly out of scope for the
+///   framework; the field is parsed only because it lives in the
+///   manifest for distribution-side use (e.g. resource limits).
+/// - **Reserved**: the field exists for an in-flight feature not
+///   yet implemented. The field is parsed and its absence is
+///   permitted; its presence is also permitted but does not yet
+///   cause behaviour. Each Reserved field has an open tracking
+///   item; closing the tracker promotes the field to Enforced.
+///
+/// Per-field bucket annotations follow on each declaration below.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Lifecycle {
     /// Hot-reload policy per `PLUGIN_CONTRACT.md` section 13.
+    ///
+    /// **Bucket: Reserved.** The `Restart` and `Live` policies are
+    /// parsed but not yet acted on by the steward. Today only `None`
+    /// (full unload-reload) is the operative behaviour regardless of
+    /// declaration. The field is preserved on the manifest for
+    /// forward-compat so distributions can author against the eventual
+    /// supervisor's full grammar.
     pub hot_reload: HotReloadPolicy,
     /// Whether the steward should start this plugin at steward startup.
+    ///
+    /// **Bucket: Enforced.** At boot, the steward iterates the discovery
+    /// path, parses each manifest, and admits plugins whose `autostart`
+    /// is true. `false` skips admission until an operator-initiated
+    /// admit verb (a future surface) targets the plugin.
     #[serde(default = "default_true")]
     pub autostart: bool,
     /// Whether the steward should restart this plugin after a crash.
+    ///
+    /// **Bucket: Reserved.** Parsed for forward-compat; the steward's
+    /// out-of-process supervisor today reaps a crashed child and
+    /// deregisters its plugin without attempting a restart, regardless
+    /// of this flag's value. A future change adds a per-plugin restart
+    /// supervisor that consults this field plus `restart_budget`. Until
+    /// that lands the field is parsed but not acted on; the default
+    /// (true) is harmless under the current implementation.
     #[serde(default = "default_true")]
     pub restart_on_crash: bool,
     /// Maximum number of restarts permitted within a rolling one-hour window
     /// before the steward gives up and de-registers the plugin.
+    ///
+    /// **Bucket: Reserved.** Bounded with `restart_on_crash`; both
+    /// fields graduate together when the restart supervisor lands.
+    /// Today the field is parsed but does not influence supervisor
+    /// behaviour because no restart attempt is made.
     #[serde(default = "default_restart_budget")]
     pub restart_budget: u32,
 }
@@ -494,8 +537,22 @@ impl Capabilities {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RespondentCapabilities {
     /// Shelf-shape-declared request types this plugin handles.
+    ///
+    /// **Bucket: Enforced.** Admission rejects a respondent whose
+    /// `request_types` does not cover at least one verb the target
+    /// shelf shape exposes; subsequent dispatch refuses any
+    /// `handle_request` whose `request_type` is not in this list.
+    /// The two checks together pin the contract: a respondent serves
+    /// exactly the verbs it advertises.
     pub request_types: Vec<String>,
     /// Deadline after which the steward declares a timeout.
+    ///
+    /// **Bucket: Enforced.** Used by the router to populate
+    /// `EnforcementPolicy::default_request_deadline_ms` at admission.
+    /// Every `handle_request` whose own `Request::deadline` is `None`
+    /// inherits this deadline; the dispatch wraps the call in a
+    /// `tokio::time::timeout` and surfaces a `PluginError::Timeout`
+    /// on expiry.
     pub response_budget_ms: u32,
 }
 
@@ -503,12 +560,37 @@ pub struct RespondentCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WardenCapabilities {
     /// What this warden takes custody of, e.g. `playback`.
+    ///
+    /// **Bucket: Distribution-owned.** The catalogue and shelf
+    /// shapes determine which custody domains are valid; the
+    /// steward consults the field for diagnostics and for the
+    /// `custody_exclusive` interlock but does not itself enumerate
+    /// or constrain the domain string.
     pub custody_domain: String,
     /// Whether another warden of the same domain may coexist.
+    ///
+    /// **Bucket: Enforced.** Admission refuses a second warden
+    /// declaring the same `custody_domain` when either declares
+    /// `custody_exclusive = true`. The interlock prevents two
+    /// wardens from racing for the same custody.
     pub custody_exclusive: bool,
     /// Deadline for fast-path course corrections.
+    ///
+    /// **Bucket: Enforced.** Used by the router to populate
+    /// `EnforcementPolicy::course_correction_deadline_ms` at
+    /// admission. Every `course_correct` call is wrapped in a
+    /// `tokio::time::timeout` of this duration; expiry surfaces
+    /// the configured `custody_failure_mode` to the operator.
     pub course_correction_budget_ms: u32,
     /// Behaviour when custody fails.
+    ///
+    /// **Bucket: Enforced.** Used by the router to populate
+    /// `EnforcementPolicy::custody_failure_mode`. The custody
+    /// dispatch path branches on this value: `Abort` aborts
+    /// the custody and surfaces the failure as a hard error;
+    /// `PartialOk` records the failure on the custody record and
+    /// continues. The mode is observable on every custody-failure
+    /// happening so consumers can act consistently.
     pub custody_failure_mode: CustodyFailureMode,
 }
 
@@ -523,13 +605,26 @@ pub enum CustodyFailureMode {
 }
 
 /// Factory-specific capabilities per `PLUGIN_PACKAGING.md` section 2.
+///
+/// **Bucket-level note**: every field on this struct is currently
+/// **Reserved**. Factory plugins are not yet admitted by the v0
+/// steward (admission rejects `kind.instance = "factory"` at the
+/// pre-admission validation pass). The fields are parsed for
+/// forward-compat against the future factory-admission path; their
+/// values do not influence behaviour today because no factory
+/// reaches admission.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FactoryCapabilities {
     /// Maximum number of concurrent instances the steward admits from this
     /// factory. Announcements beyond this are refused.
+    ///
+    /// **Bucket: Reserved.** Will become Enforced when factory admission
+    /// lands; today the field is parsed but no factory passes admission.
     pub max_instances: u32,
     /// Instance TTL in seconds. `0` means no TTL; instances live until
     /// retracted by the factory.
+    ///
+    /// **Bucket: Reserved.** Same disposition as `max_instances`.
     pub instance_ttl_seconds: u32,
 }
 
