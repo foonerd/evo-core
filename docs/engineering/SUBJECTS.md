@@ -466,19 +466,26 @@ A consumer-grade device should comfortably hold a registry of several million su
 
 ## 14. Subject Happenings
 
-The fabric's notification stream (per `CONCEPT.md`) carries subject events alongside everything else. The catalogue defines the following happenings on the subject registry:
+The fabric's notification stream (per `CONCEPT.md`) carries subject events alongside everything else. `HAPPENINGS.md` is the normative catalogue; this section names the subject-registry subset.
+
+**Currently emitted on the bus** (structured `Happening` variants):
 
 | Happening | Fired when |
 |-----------|------------|
-| `SubjectRegistered` | A new canonical ID is created. |
-| `SubjectAddressingAdded` | An existing subject gains a new addressing. |
-| `SubjectAddressingRemoved` | An addressing is removed from a subject (plugin retraction, operator forget). |
-| `SubjectMerged` | Two or more subjects collapse into one. Carries admin plugin, source IDs, new ID, reason, timestamp. Implemented as a structured `Happening::SubjectMerged` on the bus; fires BEFORE the relation-graph rewrite cascade per section 10. |
-| `SubjectSplit` | One subject becomes two or more. Carries admin plugin, source ID, new IDs (in partition order), strategy, reason, timestamp. Implemented as a structured `Happening::SubjectSplit` on the bus; fires BEFORE per-edge graph distribution and any trailing `RelationSplitAmbiguous` events per `RELATIONS.md` section 8.2. |
-| `SubjectForgotten` | A subject is deleted (last addressing retracted, or operator forget). Carries the canonical ID, subject type, and retracting plugin. Implemented as a structured `Happening::SubjectForgotten` on the bus; the remaining entries in this table (`SubjectRegistered`, `SubjectAddressingAdded`, `SubjectAddressingRemoved`) remain tracing-only pending the broader happenings expansion. |
+| `SubjectMerged` | Two canonical subjects collapse into one new canonical ID. Carries admin plugin, source IDs, new ID, reason, timestamp. Fires BEFORE the relation-graph rewrite cascade per section 10. |
+| `SubjectSplit` | One subject splits into N new canonical IDs (length at least 2). Carries admin plugin, source ID, new IDs (in partition order), strategy, reason, timestamp. Fires BEFORE per-edge graph distribution and any trailing `RelationSplitAmbiguous` events per `RELATIONS.md` section 8.2. |
+| `SubjectForgotten` | A subject's last addressing was retracted and the registry record was removed. Carries the canonical ID, subject type, and retracting plugin. Fires BEFORE the cascade `RelationForgotten` events for the same forget. |
 | `SubjectAddressingForcedRetract` | An administration plugin force-retracted an addressing claimed by another plugin. Carries admin plugin, target plugin, canonical ID, scheme, value, reason, timestamp. Fires BEFORE any `SubjectForgotten` / `RelationForgotten` cascade the retract triggers. |
-| `SubjectConflict` | Reconciliation encountered a conflict it could not resolve automatically. |
-| `SubjectTypeChanged` | An operator override changed a subject's declared type. |
+
+**Future variants** (named here for cross-reference; not yet on the bus):
+
+| Happening | Fired when |
+|-----------|------------|
+| `SubjectAnnounced` | A new canonical ID is minted at first registry insertion. Today subscribers infer "new subject" by observing the first projection. Future expansion per `HAPPENINGS.md` §3.3. |
+| `SubjectAddressingAdded` | An existing subject gains a new addressing. Tracing-only today. |
+| `SubjectAddressingRemoved` | An addressing is removed from a subject (plugin retraction, operator forget). Tracing-only today. |
+| `SubjectConflict` | Reconciliation encountered a conflict it could not resolve automatically. The registry today records this internally as a `MultiSubjectConflict` claim ledger entry; no bus happening fires. Future expansion. |
+| `SubjectTypeChanged` | An operator override changed a subject's declared type. Future expansion alongside subject-type correction per section 11. |
 
 Happenings are the primary mechanism by which consumers stay current with subject state. Projections are point-in-time; happenings let consumers invalidate cached projections when the underlying subject changes.
 

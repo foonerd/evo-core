@@ -682,8 +682,11 @@ pub enum Happening {
     /// whichever of `old_subject_id`/`new_subject_id` matches the
     /// `target_id` versus differs from it.
     ///
-    /// Dormant in this pass; emission sites are wired in a
-    /// follow-up.
+    /// Emitted by `RegistrySubjectAdmin::merge` and
+    /// `RegistrySubjectAdmin::split` (in `context.rs`) after
+    /// the relation graph rewrite, after the parent
+    /// `SubjectMerged` / `SubjectSplit` envelope, in the order
+    /// per-edge outcomes are returned by the storage primitive.
     RelationRewritten {
         /// Canonical name of the admin plugin that performed the
         /// merge or split.
@@ -716,8 +719,11 @@ pub enum Happening {
     /// observational - administration plugins decide reconciliation
     /// (via forced retract, suppression, or operator review).
     ///
-    /// Dormant in this pass; emission sites are wired in a
-    /// follow-up.
+    /// Emitted by `RegistrySubjectAdmin::merge` and
+    /// `RegistrySubjectAdmin::split` (in `context.rs`) after
+    /// the relation graph rewrite, after the parent
+    /// `SubjectMerged` / `SubjectSplit` envelope, in the order
+    /// per-edge outcomes are returned by the storage primitive.
     RelationCardinalityViolatedPostRewrite {
         /// Canonical name of the admin plugin that performed the
         /// merge or split.
@@ -753,8 +759,11 @@ pub enum Happening {
     /// The plugin can re-query the registry or the relation graph
     /// for the new ID and reconcile.
     ///
-    /// Dormant in this pass; emission sites are wired in a
-    /// follow-up.
+    /// Emitted by `RegistrySubjectAdmin::merge` and
+    /// `RegistrySubjectAdmin::split` (in `context.rs`) after
+    /// the relation graph rewrite, after the parent
+    /// `SubjectMerged` / `SubjectSplit` envelope, in the order
+    /// per-edge outcomes are returned by the storage primitive.
     ClaimReassigned {
         /// Canonical name of the admin plugin that performed the
         /// merge or split.
@@ -803,8 +812,11 @@ pub enum Happening {
     /// happening the demotion would be silent; with it, the
     /// affected claimant can discover and react.
     ///
-    /// Dormant in this pass; emission sites are wired in a
-    /// follow-up.
+    /// Emitted by `RegistrySubjectAdmin::merge` and
+    /// `RegistrySubjectAdmin::split` (in `context.rs`) after
+    /// the relation graph rewrite, after the parent
+    /// `SubjectMerged` / `SubjectSplit` envelope, in the order
+    /// per-edge outcomes are returned by the storage primitive.
     RelationClaimSuppressionCollapsed {
         /// Canonical name of the admin plugin that performed the
         /// merge.

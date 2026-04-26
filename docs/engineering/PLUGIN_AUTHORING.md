@@ -146,7 +146,7 @@ impl Plugin for MyPlugin {
         async move {
             PluginDescription {
                 identity: PluginIdentity {
-                    name: "org.example.my_plugin".into(),
+                    name: "org.example.my-plugin".into(),
                     version: semver::Version::new(0, 1, 0),
                     contract: 1,
                 },
@@ -254,7 +254,7 @@ Every plugin ships with a `manifest.toml`. For a minimal in-process respondent:
 
 ```toml
 [plugin]
-name = "org.example.my_plugin"
+name = "org.example.my-plugin"
 version = "0.1.0"
 contract = 1
 
@@ -296,7 +296,7 @@ response_budget_ms = 1000
 
 Full manifest schema in `PLUGIN_PACKAGING.md`. Two fields that often confuse first-time authors:
 
-- **`target.shelf`** must be a shelf declared in the distribution's catalogue. If your shelf does not exist, admission fails with `StewardError::MissingShelf`. For development, use a scratch catalogue (see `DEVELOPING.md` section 5.1).
+- **`target.shelf`** must be a shelf declared in the distribution's catalogue. If your shelf does not exist, admission fails with `StewardError::Admission("…: target shelf not in catalogue: …")`. For development, use a scratch catalogue (see `DEVELOPING.md` section 5.1).
 - **`capabilities.respondent.request_types`** must list exactly the strings your `handle_request` accepts. The steward uses this for routing and rejects requests for types you did not declare.
 
 The manifest ships as a file but is typically also embedded in the plugin binary via `include_str!("../manifest.toml")` so the steward can admit the plugin without disk I/O at load time. See the `manifest()` helper in `evo-example-echo/src/lib.rs`.
@@ -337,7 +337,7 @@ use my_plugin::MyPlugin;
 use std::path::PathBuf;
 use tokio::net::UnixListener;
 
-const PLUGIN_NAME: &str = "org.example.my_plugin";
+const PLUGIN_NAME: &str = "org.example.my-plugin";
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
@@ -626,7 +626,7 @@ async fn wire_lifecycle() {
     let (server_r, client_w) = tokio::io::duplex(4096);
 
     let plugin = MyPlugin::default();
-    let config = HostConfig::new("org.example.my_plugin");
+    let config = HostConfig::new("org.example.my-plugin");
 
     let host_task = tokio::spawn(async move {
         serve(plugin, config, server_r, server_w).await

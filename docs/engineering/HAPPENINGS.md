@@ -58,7 +58,7 @@ pub enum Happening {
 
 ### 3.1 Current Variants
 
-Seventeen variants ship today across five categories. All variants carry an `at: SystemTime` field (the steward's clock when the happening was emitted) - omitted from the per-variant tables below to keep them readable. JSON shapes are in `SCHEMAS.md` section 5.1.
+Eighteen variants ship today across five categories. All variants carry an `at: SystemTime` field (the steward's clock when the happening was emitted) - omitted from the per-variant tables below to keep them readable. JSON shapes are in `SCHEMAS.md` section 5.1.
 
 **Custody transitions**
 

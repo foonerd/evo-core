@@ -113,7 +113,22 @@ enable = false
 
 There is deliberately no field to turn off admission validation entirely, lower trust requirements globally, or disable signature checking for particular plugins. Admission policy is binary: signed plugins with valid trust, or unsigned plugins at `sandbox` if explicitly allowed.
 
-### 3.4 Deployment stages (dev, test, and prod) — pointer
+### 3.4 `[persistence]`
+
+Where the steward keeps its durable state.
+
+```toml
+[persistence]
+path = "/var/lib/evo/state/evo.db"
+```
+
+**`path`** points at the SQLite database file the steward opens on start. Default: `/var/lib/evo/state/evo.db`. The directory must exist and be writable by the steward's user; SQLite's WAL mode adds two sidecar files (`evo.db-wal`, `evo.db-shm`) in the same directory at first write. Distributions on a writeable partition typically leave the default; embedded targets pointing at a flash partition supply their own path.
+
+The schema migrates forward on open: a fresh database is initialised to the current version (currently v2: subject identity slice + happenings durable cursor); an existing database at a lower version has the missing migrations applied in order. A database at a version *newer* than the binary supports is refused with a structured error — see `PERSISTENCE.md` for the migration discipline.
+
+There is deliberately no `[persistence].enable` toggle. Persistence is mandatory: the steward never runs in a memory-only mode.
+
+### 3.5 Deployment stages (dev, test, and prod) — pointer
 
 The **full** reference (tables, Mermaid, admission summary, and cross-refs) lives in **`BOUNDARY.md` section 6.2** — the boundary between framework knobs and what a **distribution** commits to per stage. Evo-core has no `stage` or `environment` string in `evo.toml`. You choose `plugins.allow_unsigned` and your trust material per your **dev** checkout, your **test**/CI `evo.toml`, and your **prod** image; **open** and **closed** product lines in production are both modelled in that section.
 

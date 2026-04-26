@@ -743,7 +743,7 @@ The `op` field discriminates between frame types. Frames are internally tagged p
 
 #### 4.2.2 Frame Inventory
 
-Nineteen `op` values across steward-to-plugin requests, plugin-to-steward responses (to those requests), plugin-to-steward requests (alias-aware queries), steward-to-plugin responses (to those queries), and plugin-to-steward async events.
+Forty-two `op` values across handshake (Hello / HelloAck), steward-to-plugin requests, plugin-to-steward responses to those requests, plugin-to-steward async events plus their per-event acks, plugin-to-steward requests (alias-aware queries and admin verbs), steward-to-plugin responses to those requests, and bidirectional error frames.
 
 **Requests (steward-to-plugin)**
 
@@ -797,6 +797,42 @@ These reverse the polarity of the request / response axis: the plugin issues the
 | `assert_relation` | Claim a relation edge | `assertion` (RelationAssertion) |
 | `retract_relation` | Withdraw a relation | `retraction` (RelationRetraction) |
 | `report_custody_state` | Custody state update | `handle` (CustodyHandle), `payload` (base64), `health` (HealthStatus) |
+
+**Event ack (steward-to-plugin, echoes the event's cid)**
+
+The wire-side announcer / reporter trait implementations await an `event_ack` (success) or an `error` (rejection) per event `cid`, surfacing the same `Result<(), ReportError>` to the trait caller as in-process plugins receive. See `PLUGIN_CONTRACT.md` and ADR-0011.
+
+| `op` | Answers | Additional fields |
+|------|---------|-------------------|
+| `event_ack` | any of the six `*` events above | - |
+
+**Handshake (bidirectional, exchanged once before any other dispatch)**
+
+Per ADR-0010. The connecting peer (the steward) sends `hello`; the answerer (the plugin) replies with `hello_ack`. Frames carry `cid: 0` by convention. Negotiation rejection produces an `error` frame (`fatal: true`) in place of `hello_ack`.
+
+| `op` | Direction | Additional fields |
+|------|-----------|-------------------|
+| `hello` | steward → plugin | `feature_min` (u16), `feature_max` (u16), `codecs` (string[]) |
+| `hello_ack` | plugin → steward | `feature` (u16), `codec` (string) |
+
+**Admin verbs (plugin-to-steward, carry their own cid)**
+
+Per ADR-0011. Plugins admitted at admin trust class invoke `SubjectAdmin` and `RelationAdmin` over the wire through these frames. The steward enforces capability gating server-side; a plugin without admin capability gets a non-fatal `error` frame ("admin capability not granted"). Each request has a paired `*_response` frame whose body is envelope-only (the trait methods return `Result<(), ReportError>`); failures collapse to `error`.
+
+| `op` | Purpose | Additional fields |
+|------|---------|-------------------|
+| `forced_retract_addressing` | Force-retract another plugin's addressing claim | `target_plugin`, `addressing`, `reason?` |
+| `forced_retract_addressing_response` | Success ack | - |
+| `merge_subjects` | Merge two canonical subjects into one new ID | `target_a`, `target_b`, `reason?` |
+| `merge_subjects_response` | Success ack | - |
+| `split_subject` | Split one canonical subject into N new IDs | `source`, `partition`, `strategy`, `explicit_assignments`, `reason?` |
+| `split_subject_response` | Success ack | - |
+| `forced_retract_claim` | Force-retract another plugin's relation claim | `target_plugin`, `source`, `predicate`, `target`, `reason?` |
+| `forced_retract_claim_response` | Success ack | - |
+| `suppress_relation` | Hide a relation from neighbour queries | `source`, `predicate`, `target`, `reason?` |
+| `suppress_relation_response` | Success ack | - |
+| `unsuppress_relation` | Restore a suppressed relation | `source`, `predicate`, `target` |
+| `unsuppress_relation_response` | Success ack | - |
 
 **Error (bidirectional)**
 

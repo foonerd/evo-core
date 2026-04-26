@@ -170,12 +170,13 @@ Frames above 1 MiB are rejected as `Dispatch("frame too large")`. Zero-length fr
 
 ### 6.2 Request Shapes
 
-Every request carries an `op` discriminator. v0 defines four ops:
+Every request carries an `op` discriminator. v0 defines five ops:
 
 | Op | Purpose | Shape |
 |----|---------|-------|
 | `request` | Dispatch a plugin request on a specific shelf. | Request / response. |
 | `project_subject` | Compose and return a federated subject projection. | Request / response. |
+| `describe_alias` | Look up the alias chain for a (possibly merged-away) canonical subject ID. | Request / response. |
 | `list_active_custodies` | Snapshot the custody ledger. | Request / response. |
 | `subscribe_happenings` | Stream every happening the bus emits. | Streaming: promotes the connection to streaming mode. |
 
