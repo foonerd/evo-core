@@ -5847,7 +5847,7 @@ target_type = "*"
 
     #[tokio::test]
     async fn admin_merge_self_target_returns_structured_variant() {
-        // M2: merging a subject with itself returns the structured
+        // Merging a subject with itself returns the structured
         // MergeSelfTarget variant, not a stringly-typed Invalid.
         use evo_plugin_sdk::contract::SubjectAnnouncement;
 
@@ -5896,7 +5896,7 @@ target_type = "*"
 
     #[tokio::test]
     async fn admin_merge_cross_type_returns_structured_variant() {
-        // M2: merging across subject types returns the structured
+        // Merging across subject types returns the structured
         // MergeCrossType variant carrying both type names.
         use evo_plugin_sdk::contract::SubjectAnnouncement;
 
@@ -6906,6 +6906,212 @@ target_type = "*"
         }
         assert_eq!(relation_reassigned, 2);
         assert!(addressing_reassigned >= 1);
+    }
+
+    #[tokio::test]
+    async fn admin_merge_then_forget_cascade_walks_full_chain() {
+        // Cross-composition cascade test: walk
+        //   merge → relation rewrite → cardinality violation
+        //         → forget cascade
+        // in one test, asserting ordering through sequential
+        // `recv()`. The four stages compose because each stage's
+        // outcome is the next stage's precondition:
+        //   - merge collapses two tracks into one new id;
+        //   - rewrite relocates each track's album_of edge onto the
+        //     new id, producing two outbound edges;
+        //   - cardinality violation fires because album_of declares
+        //     `source_cardinality = at_most_one`;
+        //   - the operator resolves by retracting the new id's
+        //     addressings; the last-addressing retract forgets the
+        //     subject and cascades into both surviving edges as
+        //     RelationForgotten.
+        // Pinning the four stages in one test prevents a future
+        // refactor that quietly breaks composition (e.g. by holding
+        // a reference across the rewrite loop, or by mis-ordering
+        // the forget cascade against the admin happening) from
+        // passing per-stage tests while breaking the chain.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mbid", "track-b")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-y")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mbid", "track-b"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-y"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(graph.relation_count(), 2);
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        // Stage 1 — merge.
+        admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "track-b"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Drain the merge cascade (covered in detail by the
+        // cardinality-violation test above; here we only assert
+        // the four signatures are present, in order, before
+        // moving on to the forget tail).
+        let h = rx.recv().await.expect("SubjectMerged");
+        assert!(matches!(h, Happening::SubjectMerged { .. }));
+        for _ in 0..2 {
+            let h = rx.recv().await.expect("RelationRewritten");
+            assert!(matches!(h, Happening::RelationRewritten { .. }));
+        }
+        let h = rx.recv().await.expect("violation");
+        assert!(matches!(
+            h,
+            Happening::RelationCardinalityViolatedPostRewrite { .. }
+        ));
+        // Drain ClaimReassigned tail without inspecting payloads.
+        while !rx.is_empty() {
+            match rx.recv().await.unwrap() {
+                Happening::ClaimReassigned { .. } => {}
+                other => panic!("expected ClaimReassigned tail, got {other:?}"),
+            }
+        }
+
+        // Pre-forget invariants: the merge produced one new
+        // subject carrying both source addressings; both album_of
+        // edges still resolve, both attached to the new id.
+        assert_eq!(registry.subject_count(), 3); // merged track + 2 albums
+        assert_eq!(graph.relation_count(), 2);
+
+        // Stage 2 — first force-retract removes one addressing
+        // and leaves the subject alive (no cascade yet).
+        admin
+            .forced_retract_addressing(
+                "org.test.p1".into(),
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                None,
+            )
+            .await
+            .unwrap();
+        let h = rx.recv().await.expect("first force-retract");
+        assert!(matches!(
+            h,
+            Happening::SubjectAddressingForcedRetract { .. }
+        ));
+        assert_eq!(registry.subject_count(), 3);
+        assert_eq!(graph.relation_count(), 2);
+
+        // Stage 3 — second force-retract removes the LAST
+        // addressing of the merged subject. Per the forced-retract
+        // ordering pin (admin happening first, then forgotten,
+        // then cascade), the bus emits in this order:
+        //   SubjectAddressingForcedRetract
+        //   SubjectForgotten
+        //   RelationForgotten (x2 — both album_of edges)
+        admin
+            .forced_retract_addressing(
+                "org.test.p1".into(),
+                ExternalAddressing::new("mbid", "track-b"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let admin_h = rx.recv().await.expect("second force-retract");
+        assert!(
+            matches!(admin_h, Happening::SubjectAddressingForcedRetract { .. }),
+            "first must be SubjectAddressingForcedRetract, got {admin_h:?}"
+        );
+        let forgotten = rx.recv().await.expect("subject forgotten");
+        assert!(
+            matches!(forgotten, Happening::SubjectForgotten { .. }),
+            "second must be SubjectForgotten, got {forgotten:?}"
+        );
+        let mut relation_forgotten = 0usize;
+        while !rx.is_empty() {
+            match rx.recv().await.unwrap() {
+                Happening::RelationForgotten { .. } => relation_forgotten += 1,
+                other => {
+                    panic!("expected RelationForgotten tail, got {other:?}")
+                }
+            }
+        }
+        assert_eq!(
+            relation_forgotten, 2,
+            "both album_of edges must cascade to RelationForgotten"
+        );
+
+        // Post-forget invariants: merged track gone; both albums
+        // survive; relation graph empty (both edges cascaded).
+        assert_eq!(registry.subject_count(), 2);
+        assert_eq!(graph.relation_count(), 0);
     }
 
     #[tokio::test]
