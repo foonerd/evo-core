@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use deadpool_sqlite::{Config as PoolConfig, Pool, Runtime};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
@@ -74,6 +74,16 @@ pub const SCHEMA_VERSION_SUBJECT_IDENTITY: u32 = 1;
 /// missed events for consumers that disconnected and reconnected.
 pub const SCHEMA_VERSION_HAPPENINGS: u32 = 2;
 
+/// Schema version: steward meta kv with `instance_id` (ADR-0016
+/// instance identity, ADR-0018 token derivation input).
+///
+/// Adds the `meta` table — a generic key/value store for steward-
+/// level singletons that span schema versions. The first inhabitant
+/// is `instance_id`, a UUIDv4 minted at first migration and never
+/// rotated. The instance ID anchors per-deployment unlinkability
+/// for ADR-0018 claimant tokens.
+pub const SCHEMA_VERSION_META: u32 = 3;
+
 /// Maximum schema version this build of the steward understands.
 ///
 /// On open, [`SqlitePersistenceStore`] refuses to operate on a
@@ -81,7 +91,17 @@ pub const SCHEMA_VERSION_HAPPENINGS: u32 = 2;
 /// than this constant. Downgrades are not supported; an operator
 /// running an older steward against a newer database must restore
 /// from a pre-upgrade backup.
-pub const SUPPORTED_SCHEMA_VERSION: u32 = SCHEMA_VERSION_HAPPENINGS;
+pub const SUPPORTED_SCHEMA_VERSION: u32 = SCHEMA_VERSION_META;
+
+/// Logical keys used in the `meta` table. Constants are kept in one
+/// place so a misspelling produces a compile error rather than a
+/// silent mismatch between writer and reader.
+pub mod meta_keys {
+    /// Steward instance ID — a UUIDv4 minted at first boot,
+    /// persisted forever, and used as input to claimant-token
+    /// derivation (ADR-0018 §3.3).
+    pub const INSTANCE_ID: &str = "instance_id";
+}
 
 /// SQL text of the initial migration. Embedded at build time so the
 /// schema is part of the binary; running on a fresh database does
@@ -92,6 +112,9 @@ const MIGRATION_001_INITIAL: &str =
 /// SQL text of the v2 migration: happenings audit stream.
 const MIGRATION_002_HAPPENINGS: &str =
     include_str!("../migrations/002_happenings.sql");
+
+/// SQL text of the v3 migration: steward meta kv (instance_id).
+const MIGRATION_003_META: &str = include_str!("../migrations/003_meta.sql");
 
 /// Errors raised by the persistence layer.
 ///
@@ -617,6 +640,24 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
     fn load_max_happening_seq<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>;
+
+    /// Return the steward instance ID (UUIDv4) minted at first
+    /// migration and persisted in the `meta` table (ADR-0016 § /
+    /// migration 003).
+    ///
+    /// Stable across the deployment's lifetime, distinct between
+    /// independent deployments. Used as the per-deployment
+    /// unlinkability anchor for ADR-0018 claimant tokens; see
+    /// [`crate::claimant::derive_token`].
+    ///
+    /// Returns [`PersistenceError::Invalid`] if the row is missing
+    /// (a fresh DB after migration MUST have it; absence indicates
+    /// migration corruption).
+    fn load_instance_id<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<String, PersistenceError>> + Send + 'a>,
+    >;
 }
 
 /// Claim-log kind values used by this slice. Strings are stable
@@ -703,6 +744,15 @@ fn run_migrations(conn: &mut Connection) -> Result<(), PersistenceError> {
         conn.execute_batch(MIGRATION_002_HAPPENINGS).map_err(|e| {
             PersistenceError::MigrationFailed {
                 version: SCHEMA_VERSION_HAPPENINGS,
+                source: e,
+            }
+        })?;
+    }
+
+    if current < SCHEMA_VERSION_META {
+        conn.execute_batch(MIGRATION_003_META).map_err(|e| {
+            PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_META,
                 source: e,
             }
         })?;
@@ -1659,6 +1709,38 @@ impl PersistenceStore for SqlitePersistenceStore {
             .await
         })
     }
+
+    fn load_instance_id<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<String, PersistenceError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.interact("load_instance_id", |conn| {
+                let id: Option<String> = conn
+                    .query_row(
+                        "SELECT value FROM meta WHERE key = ?1",
+                        rusqlite::params![meta_keys::INSTANCE_ID],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "select instance_id from meta",
+                            e,
+                        )
+                    })?;
+                id.ok_or_else(|| {
+                    PersistenceError::Invalid(
+                        "meta.instance_id row is missing; \
+                         migration 003 may not have run"
+                            .to_string(),
+                    )
+                })
+            })
+            .await
+        })
+    }
 }
 
 /// In-memory mock implementation of [`PersistenceStore`].
@@ -1670,9 +1752,23 @@ impl PersistenceStore for SqlitePersistenceStore {
 /// thread-safe via a single `tokio::sync::Mutex`; concurrency is
 /// serialised through the mutex, which matches the trait's
 /// per-call atomicity semantics.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemoryPersistenceStore {
     inner: AsyncMutex<MemoryState>,
+    /// Steward instance ID for ADR-0018 token derivation. The
+    /// in-memory store mints a fresh UUIDv4 on construction so each
+    /// test instance has its own unlinkability anchor; restarting a
+    /// test process does not pin to the same value.
+    instance_id: String,
+}
+
+impl Default for MemoryPersistenceStore {
+    fn default() -> Self {
+        Self {
+            inner: AsyncMutex::default(),
+            instance_id: uuid::Uuid::new_v4().to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2082,6 +2178,14 @@ impl PersistenceStore for MemoryPersistenceStore {
             let g = self.inner.lock().await;
             Ok(g.happenings.iter().map(|h| h.seq).max().unwrap_or(0))
         })
+    }
+
+    fn load_instance_id<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<String, PersistenceError>> + Send + 'a>,
+    > {
+        Box::pin(async move { Ok(self.instance_id.clone()) })
     }
 }
 

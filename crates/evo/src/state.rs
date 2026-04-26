@@ -24,6 +24,7 @@ use thiserror::Error;
 
 use crate::admin::AdminLedger;
 use crate::catalogue::Catalogue;
+use crate::claimant::ClaimantTokenIssuer;
 use crate::custody::CustodyLedger;
 use crate::happenings::HappeningBus;
 use crate::persistence::PersistenceStore;
@@ -78,6 +79,14 @@ pub struct StewardState {
     /// the boot-time replay through it. The trait is held as a
     /// `dyn` reference so tests can substitute the in-memory mock.
     pub persistence: Arc<dyn PersistenceStore>,
+    /// Issuer for ADR-0018 claimant tokens. Held by every wire-
+    /// emission site that needs to translate a plugin name into the
+    /// consumer-facing token (the `From<Happening>` for
+    /// `HappeningWire` conversion in `server.rs`, the projection-
+    /// wire builders, etc.). Centralised here so all surfaces share
+    /// one source of truth for the token derivation, satisfying
+    /// ADR-0018's no-drift invariant.
+    pub claimant_issuer: Arc<ClaimantTokenIssuer>,
 }
 
 impl StewardState {
@@ -108,6 +117,7 @@ pub struct StewardStateBuilder {
     bus: Option<Arc<HappeningBus>>,
     admin: Option<Arc<AdminLedger>>,
     persistence: Option<Arc<dyn PersistenceStore>>,
+    claimant_issuer: Option<Arc<ClaimantTokenIssuer>>,
 }
 
 impl StewardStateBuilder {
@@ -156,6 +166,12 @@ impl StewardStateBuilder {
         self
     }
 
+    /// Provide the claimant-token issuer (ADR-0018).
+    pub fn claimant_issuer(mut self, issuer: Arc<ClaimantTokenIssuer>) -> Self {
+        self.claimant_issuer = Some(issuer);
+        self
+    }
+
     /// Finalise the builder.
     ///
     /// Returns `Arc<StewardState>` on success. Returns
@@ -180,6 +196,9 @@ impl StewardStateBuilder {
             persistence: self
                 .persistence
                 .ok_or(StewardStateBuildError::MissingPersistence)?,
+            claimant_issuer: self
+                .claimant_issuer
+                .ok_or(StewardStateBuildError::MissingClaimantIssuer)?,
         }))
     }
 }
@@ -208,6 +227,9 @@ impl StewardState {
             custody: Arc::new(CustodyLedger::new()),
             bus: Arc::new(HappeningBus::new()),
             admin: Arc::new(AdminLedger::new()),
+            claimant_issuer: Arc::new(ClaimantTokenIssuer::new(
+                "test-instance",
+            )),
             persistence: Arc::new(
                 crate::persistence::MemoryPersistenceStore::new(),
             ),
@@ -244,6 +266,11 @@ pub enum StewardStateBuildError {
     /// Builder was finalised without a persistence-store handle.
     #[error("StewardState builder is missing the persistence-store handle")]
     MissingPersistence,
+    /// Builder was finalised without a claimant-token-issuer handle.
+    #[error(
+        "StewardState builder is missing the claimant-token-issuer handle"
+    )]
+    MissingClaimantIssuer,
 }
 
 #[cfg(test)]
@@ -264,6 +291,9 @@ mod tests {
             .bus(Arc::new(HappeningBus::new()))
             .admin(Arc::new(AdminLedger::new()))
             .persistence(memory_persistence())
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new(
+                "test-instance",
+            )))
     }
 
     #[test]
@@ -280,6 +310,7 @@ mod tests {
         let _ = Arc::clone(&state.bus);
         let _ = Arc::clone(&state.admin);
         let _ = Arc::clone(&state.persistence);
+        let _ = Arc::clone(&state.claimant_issuer);
     }
 
     #[test]
@@ -291,6 +322,9 @@ mod tests {
             .bus(Arc::new(HappeningBus::new()))
             .admin(Arc::new(AdminLedger::new()))
             .persistence(memory_persistence())
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new(
+                "test-instance",
+            )))
             .build()
             .expect_err("build without catalogue should fail");
         assert!(matches!(err, StewardStateBuildError::MissingCatalogue));
@@ -305,6 +339,9 @@ mod tests {
             .bus(Arc::new(HappeningBus::new()))
             .admin(Arc::new(AdminLedger::new()))
             .persistence(memory_persistence())
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new(
+                "test-instance",
+            )))
             .build()
             .expect_err("build without subjects should fail");
         assert!(matches!(err, StewardStateBuildError::MissingSubjects));
@@ -319,6 +356,9 @@ mod tests {
             .bus(Arc::new(HappeningBus::new()))
             .admin(Arc::new(AdminLedger::new()))
             .persistence(memory_persistence())
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new(
+                "test-instance",
+            )))
             .build()
             .expect_err("build without relations should fail");
         assert!(matches!(err, StewardStateBuildError::MissingRelations));
@@ -333,6 +373,9 @@ mod tests {
             .bus(Arc::new(HappeningBus::new()))
             .admin(Arc::new(AdminLedger::new()))
             .persistence(memory_persistence())
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new(
+                "test-instance",
+            )))
             .build()
             .expect_err("build without custody should fail");
         assert!(matches!(err, StewardStateBuildError::MissingCustody));
@@ -347,6 +390,9 @@ mod tests {
             .custody(Arc::new(CustodyLedger::new()))
             .admin(Arc::new(AdminLedger::new()))
             .persistence(memory_persistence())
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new(
+                "test-instance",
+            )))
             .build()
             .expect_err("build without bus should fail");
         assert!(matches!(err, StewardStateBuildError::MissingBus));
@@ -361,6 +407,9 @@ mod tests {
             .custody(Arc::new(CustodyLedger::new()))
             .bus(Arc::new(HappeningBus::new()))
             .persistence(memory_persistence())
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new(
+                "test-instance",
+            )))
             .build()
             .expect_err("build without admin should fail");
         assert!(matches!(err, StewardStateBuildError::MissingAdmin));
@@ -375,9 +424,27 @@ mod tests {
             .custody(Arc::new(CustodyLedger::new()))
             .bus(Arc::new(HappeningBus::new()))
             .admin(Arc::new(AdminLedger::new()))
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new(
+                "test-instance",
+            )))
             .build()
             .expect_err("build without persistence should fail");
         assert!(matches!(err, StewardStateBuildError::MissingPersistence));
+    }
+
+    #[test]
+    fn builder_missing_claimant_issuer_returns_error() {
+        let err = StewardState::builder()
+            .catalogue(Arc::new(Catalogue::default()))
+            .subjects(Arc::new(SubjectRegistry::new()))
+            .relations(Arc::new(RelationGraph::new()))
+            .custody(Arc::new(CustodyLedger::new()))
+            .bus(Arc::new(HappeningBus::new()))
+            .admin(Arc::new(AdminLedger::new()))
+            .persistence(memory_persistence())
+            .build()
+            .expect_err("build without claimant_issuer should fail");
+        assert!(matches!(err, StewardStateBuildError::MissingClaimantIssuer));
     }
 
     #[test]

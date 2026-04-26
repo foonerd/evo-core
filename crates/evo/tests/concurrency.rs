@@ -252,6 +252,9 @@ async fn concurrent_requests_to_different_plugins_run_in_parallel() {
         .bus(Arc::new(HappeningBus::new()))
         .admin(Arc::new(AdminLedger::new()))
         .persistence(Arc::new(MemoryPersistenceStore::new()))
+        .claimant_issuer(Arc::new(evo::claimant::ClaimantTokenIssuer::new(
+            "test-instance",
+        )))
         .build()
         .expect("steward state must build");
 

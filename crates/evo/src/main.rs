@@ -105,6 +105,17 @@ async fn main() -> anyhow::Result<()> {
         "persistence store opened"
     );
 
+    // Load the steward instance ID from persistence (migration 003).
+    // Pinned at first boot, persisted forever; anchors the per-
+    // deployment unlinkability of ADR-0018 claimant tokens.
+    let instance_id = persistence
+        .load_instance_id()
+        .await
+        .map_err(|e| anyhow::anyhow!("loading instance_id: {e}"))?;
+    tracing::info!(instance_id = %instance_id, "steward instance identified");
+    let claimant_issuer =
+        Arc::new(evo::claimant::ClaimantTokenIssuer::new(instance_id));
+
     // Build the shared steward state once: catalogue plus
     // freshly-allocated stores. The same `Arc<StewardState>` is
     // handed to the admission engine and the server so dispatch
@@ -117,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
         .bus(Arc::new(HappeningBus::new()))
         .admin(Arc::new(AdminLedger::new()))
         .persistence(Arc::clone(&persistence))
+        .claimant_issuer(Arc::clone(&claimant_issuer))
         .build()?;
 
     // Construct the admission engine and run plugin discovery

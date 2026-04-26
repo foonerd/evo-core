@@ -39,6 +39,8 @@
 //! foundation those changes will build on.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::RwLock;
 
 /// Length of the truncated BLAKE3 digest used for the token, in
 /// bytes. ADR-0018 §3.3 picks 16 bytes for collision safety against
@@ -136,6 +138,110 @@ pub fn derive_token(
     ClaimantToken(URL_SAFE_NO_PAD.encode(digest))
 }
 
+/// Mints and caches [`ClaimantToken`]s for the steward's admitted
+/// plugins (ADR-0018 §3.1, §3.2).
+///
+/// One issuer is shared across all surfaces that emit tokens: the
+/// `From<Happening> for HappeningWire` conversion, the projection
+/// builders, and any future surface that admits a plugin into a
+/// consumer-visible response. Centralising the mint ensures the
+/// invariant in ADR-0018 §Invariants holds: drift between code
+/// paths producing different tokens for the same plugin is a bug.
+///
+/// The issuer caches by plugin name, since `(name, version,
+/// instance_id)` is the derivation triple and `instance_id` is
+/// fixed per issuer instance. Cache lookup is read-locked for the
+/// hot path; cache miss takes the write lock to install the token,
+/// then reads under the read lock.
+///
+/// A version mismatch between cached and observed plugin versions
+/// is treated as plugin rotation: the new token replaces the old.
+/// This matches ADR-0018 §3.2's "rotates on uninstall+reinstall"
+/// semantics — version is part of the derivation triple.
+#[derive(Debug)]
+pub struct ClaimantTokenIssuer {
+    instance_id: String,
+    cache: RwLock<HashMap<String, CachedToken>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedToken {
+    version: String,
+    token: ClaimantToken,
+}
+
+impl ClaimantTokenIssuer {
+    /// Construct an issuer pinned to one steward instance ID.
+    ///
+    /// In production the instance ID comes from the persistence
+    /// layer's `meta.instance_id` row (migration 003); see
+    /// [`crate::persistence::PersistenceStore::load_instance_id`].
+    /// In tests an arbitrary stable string suffices.
+    pub fn new(instance_id: impl Into<String>) -> Self {
+        Self {
+            instance_id: instance_id.into(),
+            cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Steward instance ID this issuer mints against. Diagnostic
+    /// surface; the contract is on the tokens, not on the ID.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// Get-or-mint a token for one (name, version) pair.
+    ///
+    /// Cache hit: identical name and version returns the cached
+    /// token without re-deriving.
+    ///
+    /// Version change: a cached entry whose `version` differs from
+    /// the observed version is replaced. The previous token
+    /// becomes unreachable through this issuer (consumers holding
+    /// it must re-resolve).
+    pub fn token_for(
+        &self,
+        plugin_name: &str,
+        plugin_version: &str,
+    ) -> ClaimantToken {
+        // Hot path: read-lock and look for an exact (name, version)
+        // hit. Cache returns a fresh `Clone` of the `ClaimantToken`
+        // — Arc-cheap because the inner String is short.
+        if let Some(hit) = self
+            .cache
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(plugin_name).cloned())
+        {
+            if hit.version == plugin_version {
+                return hit.token;
+            }
+        }
+        // Slow path: derive and install. Re-check under the write
+        // lock so two concurrent first-touches on the same plugin
+        // do not race.
+        let mut guard = match self.cache.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(hit) = guard.get(plugin_name) {
+            if hit.version == plugin_version {
+                return hit.token.clone();
+            }
+        }
+        let token =
+            derive_token(plugin_name, plugin_version, &self.instance_id);
+        guard.insert(
+            plugin_name.to_string(),
+            CachedToken {
+                version: plugin_version.to_string(),
+                token: token.clone(),
+            },
+        );
+        token
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +332,45 @@ mod tests {
     fn display_is_the_token_string() {
         let t = ClaimantToken::from_string("xyz".to_string());
         assert_eq!(format!("{t}"), "xyz");
+    }
+
+    #[test]
+    fn issuer_returns_same_token_for_same_plugin() {
+        let issuer = ClaimantTokenIssuer::new("instance-A");
+        let a = issuer.token_for("com.foo", "1.0.0");
+        let b = issuer.token_for("com.foo", "1.0.0");
+        assert_eq!(a, b, "cache hit must return the same token");
+    }
+
+    #[test]
+    fn issuer_rotates_token_on_version_change() {
+        // ADR-0018 §3.2: token rotates on uninstall+reinstall;
+        // version is part of the derivation triple, so a version
+        // change rotates the token.
+        let issuer = ClaimantTokenIssuer::new("instance-A");
+        let v1 = issuer.token_for("com.foo", "1.0.0");
+        let v2 = issuer.token_for("com.foo", "2.0.0");
+        assert_ne!(v1, v2);
+        // Re-asking for v2 is a cache hit on the new entry.
+        let v2b = issuer.token_for("com.foo", "2.0.0");
+        assert_eq!(v2, v2b);
+    }
+
+    #[test]
+    fn issuer_distinguishes_plugins() {
+        let issuer = ClaimantTokenIssuer::new("instance-A");
+        let foo = issuer.token_for("com.foo", "1.0.0");
+        let bar = issuer.token_for("com.bar", "1.0.0");
+        assert_ne!(foo, bar);
+    }
+
+    #[test]
+    fn issuer_token_matches_derive_token() {
+        // The issuer's emitted token MUST equal the bare-call
+        // derivation for the same triple — single source of truth.
+        let issuer = ClaimantTokenIssuer::new("instance-X");
+        let from_issuer = issuer.token_for("com.foo", "1.0.0");
+        let from_fn = derive_token("com.foo", "1.0.0", "instance-X");
+        assert_eq!(from_issuer, from_fn);
     }
 }

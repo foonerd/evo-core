@@ -2558,6 +2558,9 @@ response_budget_ms = 1000
             .persistence(Arc::new(
                 crate::persistence::MemoryPersistenceStore::new(),
             ))
+            .claimant_issuer(Arc::new(
+                crate::claimant::ClaimantTokenIssuer::new("test-instance"),
+            ))
             .build()
             .expect("state must build with all handles");
         let mut engine = engine_with_state(state);
@@ -3518,6 +3521,9 @@ instance_ttl_seconds = 60
             .persistence(Arc::new(
                 crate::persistence::MemoryPersistenceStore::new(),
             ))
+            .claimant_issuer(Arc::new(
+                crate::claimant::ClaimantTokenIssuer::new("test-instance"),
+            ))
             .build()
             .expect("state must build with all handles");
         let mut engine = engine_with_state(state);
@@ -3735,6 +3741,9 @@ instance_ttl_seconds = 60
             .admin(Arc::new(AdminLedger::new()))
             .persistence(Arc::new(
                 crate::persistence::MemoryPersistenceStore::new(),
+            ))
+            .claimant_issuer(Arc::new(
+                crate::claimant::ClaimantTokenIssuer::new("test-instance"),
             ))
             .build()
             .expect("state must build with all handles");
