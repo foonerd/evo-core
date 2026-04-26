@@ -166,13 +166,13 @@
 //! [`SubjectProjection`]: crate::projections::SubjectProjection
 
 use crate::catalogue::Cardinality;
+use crate::claimant::{ClaimantToken, ClaimantTokenIssuer};
 use crate::context::RegistrySubjectQuerier;
 use crate::custody::{CustodyRecord, StateSnapshot};
 use crate::error::StewardError;
 use crate::error_taxonomy::{ApiError, ErrorClass};
 use crate::happenings::{
     CardinalityViolationSide, Happening, ReassignedClaimKind,
-    RelationForgottenReason,
 };
 use crate::projections::{
     DegradedReason, DegradedReasonKind, ProjectionEngine, ProjectionError,
@@ -509,7 +509,9 @@ struct SubjectProjectionWire {
     /// Composition timestamp, milliseconds since the UNIX epoch.
     composed_at_ms: u64,
     shape_version: u32,
-    claimants: Vec<String>,
+    /// Opaque tokens identifying the plugins that claim the subject
+    /// (ADR-0018). Order matches the projection's claimant list.
+    claimant_tokens: Vec<ClaimantToken>,
     degraded: bool,
     degraded_reasons: Vec<DegradedReasonWire>,
     /// True if the relation walk was truncated at or before the point
@@ -522,7 +524,8 @@ struct SubjectProjectionWire {
 struct AddressingEntryWire {
     scheme: String,
     value: String,
-    claimant: String,
+    /// Opaque token identifying the claiming plugin (ADR-0018).
+    claimant_token: ClaimantToken,
 }
 
 #[derive(Debug, Serialize)]
@@ -534,7 +537,9 @@ struct RelatedSubjectWire {
     /// Subject type of the other end. `null` indicates a dangling
     /// relation (the edge target is not in the subject registry).
     target_type: Option<String>,
-    relation_claimants: Vec<String>,
+    /// Opaque tokens identifying the plugins claiming this relation
+    /// (ADR-0018). Order matches the relation graph's claim list.
+    relation_claimant_tokens: Vec<ClaimantToken>,
     /// Recursively composed projection for the other end of the edge,
     /// when the scope's `max_depth` permitted expansion. `null`
     /// otherwise. See [`RelatedSubject::nested`] for the non-expansion
@@ -575,8 +580,11 @@ struct AliasedFromWire {
     terminal_id: Option<String>,
 }
 
-impl From<SubjectProjection> for SubjectProjectionWire {
-    fn from(p: SubjectProjection) -> Self {
+impl SubjectProjectionWire {
+    fn from_projection(
+        p: SubjectProjection,
+        issuer: &ClaimantTokenIssuer,
+    ) -> Self {
         Self {
             canonical_id: p.canonical_id,
             subject_type: p.subject_type,
@@ -586,13 +594,21 @@ impl From<SubjectProjection> for SubjectProjectionWire {
                 .map(|a| AddressingEntryWire {
                     scheme: a.scheme,
                     value: a.value,
-                    claimant: a.claimant,
+                    claimant_token: issuer.token_for(&a.claimant),
                 })
                 .collect(),
-            related: p.related.into_iter().map(Into::into).collect(),
+            related: p
+                .related
+                .into_iter()
+                .map(|r| RelatedSubjectWire::from_related(r, issuer))
+                .collect(),
             composed_at_ms: system_time_to_ms(p.composed_at),
             shape_version: p.shape_version,
-            claimants: p.claimants,
+            claimant_tokens: p
+                .claimants
+                .iter()
+                .map(|c| issuer.token_for(c))
+                .collect(),
             degraded: p.degraded,
             degraded_reasons: p
                 .degraded_reasons
@@ -604,8 +620,8 @@ impl From<SubjectProjection> for SubjectProjectionWire {
     }
 }
 
-impl From<RelatedSubject> for RelatedSubjectWire {
-    fn from(r: RelatedSubject) -> Self {
+impl RelatedSubjectWire {
+    fn from_related(r: RelatedSubject, issuer: &ClaimantTokenIssuer) -> Self {
         Self {
             predicate: r.predicate,
             direction: match r.direction {
@@ -614,10 +630,14 @@ impl From<RelatedSubject> for RelatedSubjectWire {
             },
             target_id: r.target_id,
             target_type: r.target_type,
-            relation_claimants: r.relation_claimants,
-            nested: r
-                .nested
-                .map(|boxed| Box::new(SubjectProjectionWire::from(*boxed))),
+            relation_claimant_tokens: r
+                .relation_claimants
+                .iter()
+                .map(|c| issuer.token_for(c))
+                .collect(),
+            nested: r.nested.map(|boxed| {
+                Box::new(SubjectProjectionWire::from_projection(*boxed, issuer))
+            }),
         }
     }
 }
@@ -643,8 +663,9 @@ impl From<DegradedReason> for DegradedReasonWire {
 /// already serialises as a lowercase string.
 #[derive(Debug, Serialize)]
 struct CustodyRecordWire {
-    /// Canonical name of the warden plugin holding this custody.
-    plugin: String,
+    /// Opaque token identifying the warden plugin holding this
+    /// custody (ADR-0018).
+    claimant_token: ClaimantToken,
     /// Warden-chosen handle id. Opaque to the steward.
     handle_id: String,
     /// Fully-qualified shelf, once recorded.
@@ -674,10 +695,10 @@ struct StateSnapshotWire {
     reported_at_ms: u64,
 }
 
-impl From<CustodyRecord> for CustodyRecordWire {
-    fn from(r: CustodyRecord) -> Self {
+impl CustodyRecordWire {
+    fn from_record(r: CustodyRecord, issuer: &ClaimantTokenIssuer) -> Self {
         Self {
-            plugin: r.plugin,
+            claimant_token: issuer.token_for(&r.plugin),
             handle_id: r.handle_id,
             shelf: r.shelf,
             custody_type: r.custody_type,
@@ -729,8 +750,8 @@ fn system_time_to_ms(t: SystemTime) -> u64 {
 enum HappeningWire {
     /// Wire form of [`Happening::CustodyTaken`].
     CustodyTaken {
-        /// Canonical name of the warden plugin.
-        plugin: String,
+        /// Opaque token identifying the warden plugin (ADR-0018).
+        claimant_token: ClaimantToken,
         /// Warden-chosen handle id.
         handle_id: String,
         /// Fully-qualified shelf.
@@ -742,8 +763,8 @@ enum HappeningWire {
     },
     /// Wire form of [`Happening::CustodyReleased`].
     CustodyReleased {
-        /// Canonical name of the warden plugin.
-        plugin: String,
+        /// Opaque token identifying the warden plugin (ADR-0018).
+        claimant_token: ClaimantToken,
         /// Handle id of the released custody.
         handle_id: String,
         /// When the happening was recorded, ms since UNIX epoch.
@@ -751,8 +772,8 @@ enum HappeningWire {
     },
     /// Wire form of [`Happening::CustodyStateReported`].
     CustodyStateReported {
-        /// Canonical name of the warden plugin.
-        plugin: String,
+        /// Opaque token identifying the warden plugin (ADR-0018).
+        claimant_token: ClaimantToken,
         /// Handle id the report pertains to.
         handle_id: String,
         /// Health declared by the plugin at report time. Uses the
@@ -771,8 +792,8 @@ enum HappeningWire {
     /// observed count so subscribers can apply reconciliation
     /// policy.
     RelationCardinalityViolation {
-        /// Canonical name of the plugin that made the assertion.
-        plugin: String,
+        /// Opaque token identifying the asserting plugin (ADR-0018).
+        claimant_token: ClaimantToken,
         /// Predicate of the violating assertion.
         predicate: String,
         /// Canonical ID of the source subject.
@@ -802,9 +823,9 @@ enum HappeningWire {
     /// [`HappeningWire::RelationForgotten`] events the same
     /// forget triggers.
     SubjectForgotten {
-        /// Canonical name of the plugin whose retract triggered
-        /// the forget.
-        plugin: String,
+        /// Opaque token identifying the plugin whose retract
+        /// triggered the forget (ADR-0018).
+        claimant_token: ClaimantToken,
         /// Canonical ID of the forgotten subject.
         canonical_id: String,
         /// Subject type of the forgotten subject, captured before
@@ -821,9 +842,9 @@ enum HappeningWire {
     /// subject-forget cascade
     /// ([`RelationForgottenReason::SubjectCascade`]).
     RelationForgotten {
-        /// Canonical plugin name whose action triggered the
-        /// forget.
-        plugin: String,
+        /// Opaque token identifying the plugin whose action
+        /// triggered the forget (ADR-0018).
+        claimant_token: ClaimantToken,
         /// Canonical ID of the source subject on the forgotten
         /// relation.
         source_id: String,
@@ -834,8 +855,10 @@ enum HappeningWire {
         target_id: String,
         /// Why the relation was forgotten. Serialises as a
         /// nested object internally tagged by `kind`
-        /// (`claims_retracted` or `subject_cascade`).
-        reason: RelationForgottenReason,
+        /// (`claims_retracted` or `subject_cascade`). Wire form so
+        /// the `retracting_plugin` plain name is swapped for
+        /// `retracting_claimant_token` per ADR-0018.
+        reason: RelationForgottenReasonWire,
         /// When the happening was recorded, ms since UNIX epoch.
         at_ms: u64,
     },
@@ -851,9 +874,9 @@ enum HappeningWire {
     SubjectAddressingForcedRetract {
         /// Canonical name of the admin plugin that performed the
         /// retract.
-        admin_plugin: String,
+        admin_token: ClaimantToken,
         /// Canonical name of the plugin whose claim was removed.
-        target_plugin: String,
+        target_token: ClaimantToken,
         /// Canonical ID of the subject the addressing was attached
         /// to.
         canonical_id: String,
@@ -874,9 +897,9 @@ enum HappeningWire {
     /// triggers.
     RelationClaimForcedRetract {
         /// Canonical name of the admin plugin.
-        admin_plugin: String,
+        admin_token: ClaimantToken,
         /// Canonical name of the plugin whose claim was removed.
-        target_plugin: String,
+        target_token: ClaimantToken,
         /// Canonical ID of the source subject on the relation.
         source_id: String,
         /// Predicate of the relation.
@@ -896,7 +919,7 @@ enum HappeningWire {
     SubjectMerged {
         /// Canonical name of the admin plugin that performed the
         /// merge.
-        admin_plugin: String,
+        admin_token: ClaimantToken,
         /// Canonical IDs of the source subjects.
         source_ids: Vec<String>,
         /// Canonical ID of the new subject.
@@ -915,7 +938,7 @@ enum HappeningWire {
     SubjectSplit {
         /// Canonical name of the admin plugin that performed the
         /// split.
-        admin_plugin: String,
+        admin_token: ClaimantToken,
         /// Canonical ID of the source subject.
         source_id: String,
         /// Canonical IDs of the new subjects, in partition order.
@@ -933,7 +956,7 @@ enum HappeningWire {
     RelationSuppressed {
         /// Canonical name of the admin plugin that performed the
         /// suppression.
-        admin_plugin: String,
+        admin_token: ClaimantToken,
         /// Canonical ID of the source subject.
         source_id: String,
         /// Predicate of the suppressed relation.
@@ -949,7 +972,7 @@ enum HappeningWire {
     RelationSuppressionReasonUpdated {
         /// Canonical name of the admin plugin that performed the
         /// re-suppress with the new reason.
-        admin_plugin: String,
+        admin_token: ClaimantToken,
         /// Canonical ID of the source subject.
         source_id: String,
         /// Predicate of the relation.
@@ -967,7 +990,7 @@ enum HappeningWire {
     RelationUnsuppressed {
         /// Canonical name of the admin plugin that performed the
         /// unsuppression.
-        admin_plugin: String,
+        admin_token: ClaimantToken,
         /// Canonical ID of the source subject.
         source_id: String,
         /// Predicate of the relation.
@@ -981,7 +1004,7 @@ enum HappeningWire {
     RelationSplitAmbiguous {
         /// Canonical name of the admin plugin that performed the
         /// split.
-        admin_plugin: String,
+        admin_token: ClaimantToken,
         /// Canonical ID of the source subject that was split
         /// (the OLD ID).
         source_subject: String,
@@ -1004,7 +1027,7 @@ enum HappeningWire {
     RelationRewritten {
         /// Canonical name of the admin plugin that performed the
         /// merge or split.
-        admin_plugin: String,
+        admin_token: ClaimantToken,
         /// Predicate of the rewritten relation.
         predicate: String,
         /// Endpoint canonical ID before the rewrite.
@@ -1026,7 +1049,7 @@ enum HappeningWire {
     RelationCardinalityViolatedPostRewrite {
         /// Canonical name of the admin plugin that performed the
         /// merge or split.
-        admin_plugin: String,
+        admin_token: ClaimantToken,
         /// Canonical ID of the subject whose count exceeds the
         /// bound on the indicated side.
         subject_id: String,
@@ -1051,9 +1074,10 @@ enum HappeningWire {
     ClaimReassigned {
         /// Canonical name of the admin plugin that performed the
         /// merge or split.
-        admin_plugin: String,
-        /// Canonical name of the plugin whose claim was moved.
-        plugin: String,
+        admin_token: ClaimantToken,
+        /// Opaque token identifying the plugin whose claim was
+        /// moved (ADR-0018).
+        claimant_token: ClaimantToken,
         /// Kind of claim reassigned (`"addressing"` or
         /// `"relation"`).
         kind: ReassignedClaimKind,
@@ -1086,7 +1110,7 @@ enum HappeningWire {
     RelationClaimSuppressionCollapsed {
         /// Canonical name of the admin plugin that performed the
         /// merge.
-        admin_plugin: String,
+        admin_token: ClaimantToken,
         /// Canonical ID of the source subject on the surviving
         /// relation.
         subject_id: String,
@@ -1095,8 +1119,9 @@ enum HappeningWire {
         /// Canonical ID of the target subject on the surviving
         /// relation.
         target_id: String,
-        /// Canonical name of the plugin whose claim was demoted.
-        demoted_claimant: String,
+        /// Opaque token identifying the plugin whose claim was
+        /// demoted (ADR-0018).
+        demoted_claimant_token: ClaimantToken,
         /// Suppression provenance now applied to the surviving
         /// edge.
         surviving_suppression_record: SuppressionRecordWire,
@@ -1109,33 +1134,81 @@ enum HappeningWire {
 /// [`SuppressionRecord`](crate::relations::SuppressionRecord).
 /// Serialises `suppressed_at` as milliseconds since the UNIX epoch
 /// for consistency with every other timestamp on the wire.
+/// Wire form of
+/// [`RelationForgottenReason`](crate::happenings::RelationForgottenReason).
+///
+/// Mirrors the domain enum but replaces `retracting_plugin: String`
+/// (the plain plugin name) with `retracting_claimant_token` per
+/// ADR-0018 §Invariants ("no plugin name in any wire frame").
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RelationForgottenReasonWire {
+    /// The last claimant retracted; the relation was removed because
+    /// no claims remained.
+    ClaimsRetracted {
+        /// Opaque token identifying the plugin whose retract removed
+        /// the last claim (ADR-0018).
+        retracting_claimant_token: ClaimantToken,
+    },
+    /// A subject the relation touched was forgotten, cascading
+    /// removal of every edge that touched it.
+    SubjectCascade {
+        /// Canonical ID of the forgotten subject.
+        forgotten_subject: String,
+    },
+}
+
+impl RelationForgottenReasonWire {
+    fn from_reason(
+        r: crate::happenings::RelationForgottenReason,
+        issuer: &ClaimantTokenIssuer,
+    ) -> Self {
+        use crate::happenings::RelationForgottenReason as R;
+        match r {
+            R::ClaimsRetracted { retracting_plugin } => Self::ClaimsRetracted {
+                retracting_claimant_token: issuer.token_for(&retracting_plugin),
+            },
+            R::SubjectCascade { forgotten_subject } => {
+                Self::SubjectCascade { forgotten_subject }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct SuppressionRecordWire {
-    /// Canonical name of the admin plugin that suppressed.
-    admin_plugin: String,
+    /// Opaque token identifying the admin plugin that suppressed
+    /// (ADR-0018).
+    admin_token: ClaimantToken,
     /// When the suppression was recorded, ms since UNIX epoch.
     suppressed_at_ms: u64,
     /// Operator-supplied reason, if any.
     reason: Option<String>,
 }
 
-impl From<crate::relations::SuppressionRecord> for SuppressionRecordWire {
-    fn from(s: crate::relations::SuppressionRecord) -> Self {
+impl SuppressionRecordWire {
+    fn from_record(
+        s: crate::relations::SuppressionRecord,
+        issuer: &ClaimantTokenIssuer,
+    ) -> Self {
         Self {
-            admin_plugin: s.admin_plugin,
+            admin_token: issuer.token_for(&s.admin_plugin),
             suppressed_at_ms: system_time_to_ms(s.suppressed_at),
             reason: s.reason,
         }
     }
 }
 
-impl From<Happening> for HappeningWire {
-    fn from(h: Happening) -> Self {
-        // Exhaustive match: the `#[non_exhaustive]` attribute on
-        // `Happening` applies to external crates, not within the
-        // defining crate. If a new variant is added, this match
-        // stops compiling, forcing the wire type to be updated in
-        // lockstep - which is exactly what we want.
+impl HappeningWire {
+    /// Build the wire form from a domain [`Happening`], translating
+    /// every plugin name through the steward's
+    /// [`ClaimantTokenIssuer`] so no plain plugin name appears on
+    /// the wire (ADR-0018 §Invariants).
+    ///
+    /// The match is exhaustive: a new [`Happening`] variant fails
+    /// compilation here, forcing the wire type to be updated in
+    /// lockstep.
+    fn from_happening(h: Happening, issuer: &ClaimantTokenIssuer) -> Self {
         match h {
             Happening::CustodyTaken {
                 plugin,
@@ -1144,7 +1217,7 @@ impl From<Happening> for HappeningWire {
                 custody_type,
                 at,
             } => HappeningWire::CustodyTaken {
-                plugin,
+                claimant_token: issuer.token_for(&plugin),
                 handle_id,
                 shelf,
                 custody_type,
@@ -1155,7 +1228,7 @@ impl From<Happening> for HappeningWire {
                 handle_id,
                 at,
             } => HappeningWire::CustodyReleased {
-                plugin,
+                claimant_token: issuer.token_for(&plugin),
                 handle_id,
                 at_ms: system_time_to_ms(at),
             },
@@ -1165,7 +1238,7 @@ impl From<Happening> for HappeningWire {
                 health,
                 at,
             } => HappeningWire::CustodyStateReported {
-                plugin,
+                claimant_token: issuer.token_for(&plugin),
                 handle_id,
                 health,
                 at_ms: system_time_to_ms(at),
@@ -1180,7 +1253,7 @@ impl From<Happening> for HappeningWire {
                 observed_count,
                 at,
             } => HappeningWire::RelationCardinalityViolation {
-                plugin,
+                claimant_token: issuer.token_for(&plugin),
                 predicate,
                 source_id,
                 target_id,
@@ -1195,7 +1268,7 @@ impl From<Happening> for HappeningWire {
                 subject_type,
                 at,
             } => HappeningWire::SubjectForgotten {
-                plugin,
+                claimant_token: issuer.token_for(&plugin),
                 canonical_id,
                 subject_type,
                 at_ms: system_time_to_ms(at),
@@ -1208,11 +1281,13 @@ impl From<Happening> for HappeningWire {
                 reason,
                 at,
             } => HappeningWire::RelationForgotten {
-                plugin,
+                claimant_token: issuer.token_for(&plugin),
                 source_id,
                 predicate,
                 target_id,
-                reason,
+                reason: RelationForgottenReasonWire::from_reason(
+                    reason, issuer,
+                ),
                 at_ms: system_time_to_ms(at),
             },
             Happening::SubjectAddressingForcedRetract {
@@ -1224,8 +1299,8 @@ impl From<Happening> for HappeningWire {
                 reason,
                 at,
             } => HappeningWire::SubjectAddressingForcedRetract {
-                admin_plugin,
-                target_plugin,
+                admin_token: issuer.token_for(&admin_plugin),
+                target_token: issuer.token_for(&target_plugin),
                 canonical_id,
                 scheme,
                 value,
@@ -1241,8 +1316,8 @@ impl From<Happening> for HappeningWire {
                 reason,
                 at,
             } => HappeningWire::RelationClaimForcedRetract {
-                admin_plugin,
-                target_plugin,
+                admin_token: issuer.token_for(&admin_plugin),
+                target_token: issuer.token_for(&target_plugin),
                 source_id,
                 predicate,
                 target_id,
@@ -1256,7 +1331,7 @@ impl From<Happening> for HappeningWire {
                 reason,
                 at,
             } => HappeningWire::SubjectMerged {
-                admin_plugin,
+                admin_token: issuer.token_for(&admin_plugin),
                 source_ids,
                 new_id,
                 reason,
@@ -1270,7 +1345,7 @@ impl From<Happening> for HappeningWire {
                 reason,
                 at,
             } => HappeningWire::SubjectSplit {
-                admin_plugin,
+                admin_token: issuer.token_for(&admin_plugin),
                 source_id,
                 new_ids,
                 strategy,
@@ -1285,7 +1360,7 @@ impl From<Happening> for HappeningWire {
                 reason,
                 at,
             } => HappeningWire::RelationSuppressed {
-                admin_plugin,
+                admin_token: issuer.token_for(&admin_plugin),
                 source_id,
                 predicate,
                 target_id,
@@ -1301,7 +1376,7 @@ impl From<Happening> for HappeningWire {
                 new_reason,
                 at,
             } => HappeningWire::RelationSuppressionReasonUpdated {
-                admin_plugin,
+                admin_token: issuer.token_for(&admin_plugin),
                 source_id,
                 predicate,
                 target_id,
@@ -1316,7 +1391,7 @@ impl From<Happening> for HappeningWire {
                 target_id,
                 at,
             } => HappeningWire::RelationUnsuppressed {
-                admin_plugin,
+                admin_token: issuer.token_for(&admin_plugin),
                 source_id,
                 predicate,
                 target_id,
@@ -1330,7 +1405,7 @@ impl From<Happening> for HappeningWire {
                 candidate_new_ids,
                 at,
             } => HappeningWire::RelationSplitAmbiguous {
-                admin_plugin,
+                admin_token: issuer.token_for(&admin_plugin),
                 source_subject,
                 predicate,
                 other_endpoint_id,
@@ -1345,7 +1420,7 @@ impl From<Happening> for HappeningWire {
                 target_id,
                 at,
             } => HappeningWire::RelationRewritten {
-                admin_plugin,
+                admin_token: issuer.token_for(&admin_plugin),
                 predicate,
                 old_subject_id,
                 new_subject_id,
@@ -1361,7 +1436,7 @@ impl From<Happening> for HappeningWire {
                 observed_count,
                 at,
             } => HappeningWire::RelationCardinalityViolatedPostRewrite {
-                admin_plugin,
+                admin_token: issuer.token_for(&admin_plugin),
                 subject_id,
                 predicate,
                 side,
@@ -1381,8 +1456,8 @@ impl From<Happening> for HappeningWire {
                 target_id,
                 at,
             } => HappeningWire::ClaimReassigned {
-                admin_plugin,
-                plugin,
+                admin_token: issuer.token_for(&admin_plugin),
+                claimant_token: issuer.token_for(&plugin),
                 kind,
                 old_subject_id,
                 new_subject_id,
@@ -1401,13 +1476,16 @@ impl From<Happening> for HappeningWire {
                 surviving_suppression_record,
                 at,
             } => HappeningWire::RelationClaimSuppressionCollapsed {
-                admin_plugin,
+                admin_token: issuer.token_for(&admin_plugin),
                 subject_id,
                 predicate,
                 target_id,
-                demoted_claimant,
-                surviving_suppression_record: surviving_suppression_record
-                    .into(),
+                demoted_claimant_token: issuer.token_for(&demoted_claimant),
+                surviving_suppression_record:
+                    SuppressionRecordWire::from_record(
+                        surviving_suppression_record,
+                        issuer,
+                    ),
                 at_ms: system_time_to_ms(at),
             },
         }
@@ -1725,6 +1803,7 @@ async fn dispatch_request(
         } => {
             handle_project_subject(
                 projections,
+                &state.claimant_issuer,
                 canonical_id,
                 scope,
                 follow_aliases,
@@ -1846,7 +1925,10 @@ async fn run_subscription(
                         };
                     let frame = ClientResponse::Happening {
                         seq: row.seq,
-                        happening: happening.into(),
+                        happening: HappeningWire::from_happening(
+                            happening,
+                            &state.claimant_issuer,
+                        ),
                     };
                     if write_response_frame(&mut stream, &frame).await.is_err()
                     {
@@ -1882,7 +1964,10 @@ async fn run_subscription(
                 }
                 let frame = ClientResponse::Happening {
                     seq: env.seq,
-                    happening: env.happening.into(),
+                    happening: HappeningWire::from_happening(
+                        env.happening,
+                        &state.claimant_issuer,
+                    ),
                 };
                 if write_response_frame(&mut stream, &frame).await.is_err() {
                     // Client disconnected.
@@ -1972,6 +2057,7 @@ async fn handle_plugin_request(
 ///   (no `aliased_from`).
 async fn handle_project_subject(
     projections: &Arc<ProjectionEngine>,
+    issuer: &ClaimantTokenIssuer,
     canonical_id: String,
     scope: ProjectionScopeWire,
     follow_aliases: bool,
@@ -2004,7 +2090,9 @@ async fn handle_project_subject(
             // Live-subject path: identical to the pre-Phase-4
             // behaviour; no `aliased_from` is emitted.
             match projections.project_subject(&canonical_id, &scope) {
-                Ok(p) => ClientResponse::Projection(p.into()),
+                Ok(p) => ClientResponse::Projection(
+                    SubjectProjectionWire::from_projection(p, issuer),
+                ),
                 Err(ProjectionError::UnknownSubject(id)) => {
                     ClientResponse::Error {
                         error: ApiError::new(
@@ -2035,7 +2123,9 @@ async fn handle_project_subject(
             let projected = if follow_aliases {
                 if let Some(t) = terminal_id {
                     match projections.project_subject(&t, &scope) {
-                        Ok(p) => Some(Box::new(SubjectProjectionWire::from(p))),
+                        Ok(p) => Some(Box::new(
+                            SubjectProjectionWire::from_projection(p, issuer),
+                        )),
                         // The terminal was reported live by the
                         // querier; if the projection engine cannot
                         // find it the registry was mutated under us.
@@ -2191,7 +2281,7 @@ async fn handle_list_active_custodies(
         .custody
         .list_active()
         .into_iter()
-        .map(Into::into)
+        .map(|r| CustodyRecordWire::from_record(r, &state.claimant_issuer))
         .collect();
     ClientResponse::ActiveCustodies { active_custodies }
 }
@@ -2400,12 +2490,12 @@ mod tests {
             addressings: vec![AddressingEntryWire {
                 scheme: "s".into(),
                 value: "v".into(),
-                claimant: "p".into(),
+                claimant_token: ClaimantToken::from_string("p".into()),
             }],
             related: vec![],
             composed_at_ms: 1234567890,
             shape_version: 1,
-            claimants: vec!["p".into()],
+            claimant_tokens: vec![ClaimantToken::from_string("p".into())],
             degraded: false,
             degraded_reasons: vec![],
             walk_truncated: false,
@@ -2562,7 +2652,7 @@ mod tests {
             related: vec![],
             composed_at_ms: 0,
             shape_version: 1,
-            claimants: vec![],
+            claimant_tokens: vec![],
             degraded: false,
             degraded_reasons: vec![],
             walk_truncated: false,
@@ -2663,7 +2753,7 @@ mod tests {
     #[test]
     fn client_response_active_custodies_populated_serialises() {
         let rec = CustodyRecordWire {
-            plugin: "org.test.warden".into(),
+            claimant_token: ClaimantToken::from_string("warden-token".into()),
             handle_id: "c-1".into(),
             shelf: Some("example.custody".into()),
             custody_type: Some("playback".into()),
@@ -2683,7 +2773,7 @@ mod tests {
         let arr = v["active_custodies"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         let first = &arr[0];
-        assert_eq!(first["plugin"].as_str(), Some("org.test.warden"));
+        assert_eq!(first["claimant_token"].as_str(), Some("warden-token"));
         assert_eq!(first["handle_id"].as_str(), Some("c-1"));
         assert_eq!(first["shelf"].as_str(), Some("example.custody"));
         assert_eq!(first["custody_type"].as_str(), Some("playback"));
@@ -2719,8 +2809,10 @@ mod tests {
             started_at: UNIX_EPOCH + std::time::Duration::from_millis(100),
             last_updated: UNIX_EPOCH + std::time::Duration::from_millis(500),
         };
-        let wire: CustodyRecordWire = rec.into();
-        assert_eq!(wire.plugin, "org.test.warden");
+        let issuer = ClaimantTokenIssuer::new("test-instance");
+        let expected = issuer.token_for("org.test.warden");
+        let wire = CustodyRecordWire::from_record(rec, &issuer);
+        assert_eq!(wire.claimant_token, expected);
         assert_eq!(wire.handle_id, "c-1");
         assert_eq!(wire.shelf.as_deref(), Some("example.custody"));
         assert_eq!(wire.custody_type.as_deref(), Some("playback"));
@@ -2745,7 +2837,8 @@ mod tests {
             started_at: UNIX_EPOCH + std::time::Duration::from_millis(100),
             last_updated: UNIX_EPOCH + std::time::Duration::from_millis(100),
         };
-        let wire: CustodyRecordWire = rec.into();
+        let issuer = ClaimantTokenIssuer::new("test-instance");
+        let wire = CustodyRecordWire::from_record(rec, &issuer);
         assert!(wire.shelf.is_none());
         assert!(wire.custody_type.is_none());
         assert!(wire.last_state.is_none());
@@ -2888,7 +2981,9 @@ mod tests {
         let r = ClientResponse::Happening {
             seq: 7,
             happening: HappeningWire::CustodyTaken {
-                plugin: "org.test.warden".into(),
+                claimant_token: ClaimantToken::from_string(
+                    "warden-token".into(),
+                ),
                 handle_id: "c-1".into(),
                 shelf: "example.custody".into(),
                 custody_type: "playback".into(),
@@ -2899,11 +2994,19 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["seq"].as_u64(), Some(7));
         assert_eq!(v["happening"]["type"].as_str(), Some("custody_taken"));
-        assert_eq!(v["happening"]["plugin"].as_str(), Some("org.test.warden"));
+        assert_eq!(
+            v["happening"]["claimant_token"].as_str(),
+            Some("warden-token")
+        );
         assert_eq!(v["happening"]["handle_id"].as_str(), Some("c-1"));
         assert_eq!(v["happening"]["shelf"].as_str(), Some("example.custody"));
         assert_eq!(v["happening"]["custody_type"].as_str(), Some("playback"));
         assert_eq!(v["happening"]["at_ms"].as_u64(), Some(1_700_000_000_000));
+        // ADR-0018 invariant: no plain plugin name on the wire.
+        assert!(
+            !s.contains("\"plugin\""),
+            "plain plugin name field MUST NOT appear; got: {s}"
+        );
         // Distinctive top-level key.
         assert!(!s.contains("\"subscribed\""));
         assert!(!s.contains("\"error\""));
@@ -2923,8 +3026,24 @@ mod tests {
         assert!(!s.contains("\"error\""));
     }
 
+    // -----------------------------------------------------------------
+    // Happening → wire conversion (ADR-0018 token translation).
+    //
+    // The 17-variant exhaustiveness is enforced at compile time by
+    // the match in `HappeningWire::from_happening`: a new domain
+    // variant fails compilation in lockstep. Tests below pin the
+    // ADR-0018 invariant ("no plain plugin name on the wire") and
+    // exercise the representative shapes — custody, admin, the
+    // RelationForgottenReasonWire translation, and the reused
+    // SuppressionRecordWire embed — so a regression in any of those
+    // surfaces fails loud.
+    // -----------------------------------------------------------------
+
     #[test]
-    fn happening_wire_from_custody_taken() {
+    fn from_happening_translates_custody_taken_plugin_to_token() {
+        let issuer = ClaimantTokenIssuer::new("test-instance");
+        let expected = issuer.token_for("org.test.warden");
+
         let h = Happening::CustodyTaken {
             plugin: "org.test.warden".into(),
             handle_id: "c-1".into(),
@@ -2932,19 +3051,16 @@ mod tests {
             custody_type: "playback".into(),
             at: UNIX_EPOCH + std::time::Duration::from_millis(1_500),
         };
-        let wire: HappeningWire = h.into();
+        let wire = HappeningWire::from_happening(h, &issuer);
         match wire {
             HappeningWire::CustodyTaken {
-                plugin,
+                claimant_token,
                 handle_id,
-                shelf,
-                custody_type,
                 at_ms,
+                ..
             } => {
-                assert_eq!(plugin, "org.test.warden");
+                assert_eq!(claimant_token, expected);
                 assert_eq!(handle_id, "c-1");
-                assert_eq!(shelf, "example.custody");
-                assert_eq!(custody_type, "playback");
                 assert_eq!(at_ms, 1_500);
             }
             other => panic!("unexpected variant: {other:?}"),
@@ -2952,820 +3068,89 @@ mod tests {
     }
 
     #[test]
-    fn happening_wire_from_custody_released() {
-        let h = Happening::CustodyReleased {
-            plugin: "org.test.warden".into(),
-            handle_id: "c-1".into(),
-            at: UNIX_EPOCH + std::time::Duration::from_millis(2_000),
-        };
-        let wire: HappeningWire = h.into();
-        match wire {
-            HappeningWire::CustodyReleased {
-                plugin,
-                handle_id,
-                at_ms,
-            } => {
-                assert_eq!(plugin, "org.test.warden");
-                assert_eq!(handle_id, "c-1");
-                assert_eq!(at_ms, 2_000);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
+    fn from_happening_translates_admin_plugin_and_target_to_tokens() {
+        let issuer = ClaimantTokenIssuer::new("test-instance");
+        let admin_expected = issuer.token_for("org.admin");
+        let target_expected = issuer.token_for("org.target");
 
-    #[test]
-    fn happening_wire_from_custody_state_reported() {
-        let h = Happening::CustodyStateReported {
-            plugin: "org.test.warden".into(),
-            handle_id: "c-1".into(),
-            health: HealthStatus::Degraded,
-            at: UNIX_EPOCH + std::time::Duration::from_millis(3_000),
-        };
-        let wire: HappeningWire = h.into();
-        match wire {
-            HappeningWire::CustodyStateReported {
-                plugin,
-                handle_id,
-                health,
-                at_ms,
-            } => {
-                assert_eq!(plugin, "org.test.warden");
-                assert_eq!(handle_id, "c-1");
-                assert_eq!(health, HealthStatus::Degraded);
-                assert_eq!(at_ms, 3_000);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn happening_wire_state_reported_health_serialises_lowercase() {
-        // HealthStatus comes through via its SDK serde derive, which
-        // renames to lowercase. Guard against any wire-type override.
-        let wire = HappeningWire::CustodyStateReported {
-            plugin: "org.test.warden".into(),
-            handle_id: "c-1".into(),
-            health: HealthStatus::Unhealthy,
-            at_ms: 0,
-        };
-        let s = serde_json::to_string(&wire).unwrap();
-        assert!(
-            s.contains("\"health\":\"unhealthy\""),
-            "expected lowercase 'unhealthy' in output, got: {s}"
-        );
-    }
-
-    // RelationCardinalityViolation wire coverage.
-
-    #[test]
-    fn happening_wire_from_relation_cardinality_violation_source_side() {
-        let h = Happening::RelationCardinalityViolation {
-            plugin: "org.test.plugin".into(),
-            predicate: "album_of".into(),
-            source_id: "track-uuid".into(),
-            target_id: "album-uuid".into(),
-            side: CardinalityViolationSide::Source,
-            declared: Cardinality::AtMostOne,
-            observed_count: 2,
-            at: UNIX_EPOCH + std::time::Duration::from_millis(4_000),
-        };
-        let wire: HappeningWire = h.into();
-        match wire {
-            HappeningWire::RelationCardinalityViolation {
-                plugin,
-                predicate,
-                source_id,
-                target_id,
-                side,
-                declared,
-                observed_count,
-                at_ms,
-            } => {
-                assert_eq!(plugin, "org.test.plugin");
-                assert_eq!(predicate, "album_of");
-                assert_eq!(source_id, "track-uuid");
-                assert_eq!(target_id, "album-uuid");
-                assert_eq!(side, CardinalityViolationSide::Source);
-                assert_eq!(declared, Cardinality::AtMostOne);
-                assert_eq!(observed_count, 2);
-                assert_eq!(at_ms, 4_000);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn happening_wire_from_relation_cardinality_violation_target_side() {
-        // Independent coverage of target-side semantics; the From
-        // impl must route both sides identically modulo the `side`
-        // field.
-        let h = Happening::RelationCardinalityViolation {
-            plugin: "org.test.plugin".into(),
-            predicate: "tracks_of".into(),
-            source_id: "album-uuid".into(),
-            target_id: "track-uuid".into(),
-            side: CardinalityViolationSide::Target,
-            declared: Cardinality::ExactlyOne,
-            observed_count: 2,
-            at: UNIX_EPOCH + std::time::Duration::from_millis(5_500),
-        };
-        let wire: HappeningWire = h.into();
-        match wire {
-            HappeningWire::RelationCardinalityViolation {
-                side,
-                declared,
-                observed_count,
-                at_ms,
-                ..
-            } => {
-                assert_eq!(side, CardinalityViolationSide::Target);
-                assert_eq!(declared, Cardinality::ExactlyOne);
-                assert_eq!(observed_count, 2);
-                assert_eq!(at_ms, 5_500);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn client_response_relation_cardinality_violation_serialises() {
-        // End-to-end JSON shape check: `type` tag, snake_case side
-        // and declared bounds, numeric observed_count, and
-        // millisecond timestamp. Guards against accidental schema
-        // drift on any field the wire spec names.
-        let r = ClientResponse::Happening {
-            seq: 1,
-            happening: HappeningWire::RelationCardinalityViolation {
-                plugin: "org.test.plugin".into(),
-                predicate: "album_of".into(),
-                source_id: "track-uuid".into(),
-                target_id: "album-uuid".into(),
-                side: CardinalityViolationSide::Source,
-                declared: Cardinality::AtMostOne,
-                observed_count: 3,
-                at_ms: 1_700_000_000_000,
-            },
-        };
-        let s = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(
-            v["happening"]["type"].as_str(),
-            Some("relation_cardinality_violation")
-        );
-        assert_eq!(v["happening"]["plugin"].as_str(), Some("org.test.plugin"));
-        assert_eq!(v["happening"]["predicate"].as_str(), Some("album_of"));
-        assert_eq!(v["happening"]["source_id"].as_str(), Some("track-uuid"));
-        assert_eq!(v["happening"]["target_id"].as_str(), Some("album-uuid"));
-        assert_eq!(v["happening"]["side"].as_str(), Some("source"));
-        assert_eq!(v["happening"]["declared"].as_str(), Some("at_most_one"));
-        assert_eq!(v["happening"]["observed_count"].as_u64(), Some(3));
-        assert_eq!(v["happening"]["at_ms"].as_u64(), Some(1_700_000_000_000));
-    }
-
-    // SubjectForgotten and RelationForgotten wire coverage.
-    // Parallel to the RelationCardinalityViolation coverage
-    // above: one From-conversion test per variant plus one
-    // end-to-end JSON shape test per variant (three for
-    // RelationForgotten, covering both reasons independently).
-
-    #[test]
-    fn happening_wire_from_subject_forgotten() {
-        let h = Happening::SubjectForgotten {
-            plugin: "org.test.a".into(),
-            canonical_id: "subject-uuid".into(),
-            subject_type: "album".into(),
-            at: UNIX_EPOCH + std::time::Duration::from_millis(6_000),
-        };
-        let wire: HappeningWire = h.into();
-        match wire {
-            HappeningWire::SubjectForgotten {
-                plugin,
-                canonical_id,
-                subject_type,
-                at_ms,
-            } => {
-                assert_eq!(plugin, "org.test.a");
-                assert_eq!(canonical_id, "subject-uuid");
-                assert_eq!(subject_type, "album");
-                assert_eq!(at_ms, 6_000);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn happening_wire_from_relation_forgotten_claims_retracted() {
-        let h = Happening::RelationForgotten {
-            plugin: "org.test.a".into(),
-            source_id: "track-uuid".into(),
-            predicate: "album_of".into(),
-            target_id: "album-uuid".into(),
-            reason: RelationForgottenReason::ClaimsRetracted {
-                retracting_plugin: "org.test.a".into(),
-            },
-            at: UNIX_EPOCH + std::time::Duration::from_millis(7_000),
-        };
-        let wire: HappeningWire = h.into();
-        match wire {
-            HappeningWire::RelationForgotten {
-                plugin,
-                source_id,
-                predicate,
-                target_id,
-                reason,
-                at_ms,
-            } => {
-                assert_eq!(plugin, "org.test.a");
-                assert_eq!(source_id, "track-uuid");
-                assert_eq!(predicate, "album_of");
-                assert_eq!(target_id, "album-uuid");
-                match reason {
-                    RelationForgottenReason::ClaimsRetracted {
-                        retracting_plugin,
-                    } => {
-                        assert_eq!(retracting_plugin, "org.test.a");
-                    }
-                    other => panic!("expected ClaimsRetracted, got {other:?}"),
-                }
-                assert_eq!(at_ms, 7_000);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn happening_wire_from_relation_forgotten_subject_cascade() {
-        let h = Happening::RelationForgotten {
-            plugin: "org.test.subjects".into(),
-            source_id: "track-uuid".into(),
-            predicate: "album_of".into(),
-            target_id: "album-uuid".into(),
-            reason: RelationForgottenReason::SubjectCascade {
-                forgotten_subject: "track-uuid".into(),
-            },
-            at: UNIX_EPOCH + std::time::Duration::from_millis(8_000),
-        };
-        let wire: HappeningWire = h.into();
-        match wire {
-            HappeningWire::RelationForgotten {
-                plugin,
-                reason,
-                at_ms,
-                ..
-            } => {
-                assert_eq!(plugin, "org.test.subjects");
-                match reason {
-                    RelationForgottenReason::SubjectCascade {
-                        forgotten_subject,
-                    } => {
-                        assert_eq!(forgotten_subject, "track-uuid");
-                    }
-                    other => panic!("expected SubjectCascade, got {other:?}"),
-                }
-                assert_eq!(at_ms, 8_000);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn client_response_subject_forgotten_serialises() {
-        let r = ClientResponse::Happening {
-            seq: 1,
-            happening: HappeningWire::SubjectForgotten {
-                plugin: "org.test.a".into(),
-                canonical_id: "subject-uuid".into(),
-                subject_type: "album".into(),
-                at_ms: 1_700_000_000_000,
-            },
-        };
-        let s = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["happening"]["type"].as_str(), Some("subject_forgotten"));
-        assert_eq!(v["happening"]["plugin"].as_str(), Some("org.test.a"));
-        assert_eq!(
-            v["happening"]["canonical_id"].as_str(),
-            Some("subject-uuid")
-        );
-        assert_eq!(v["happening"]["subject_type"].as_str(), Some("album"));
-        assert_eq!(v["happening"]["at_ms"].as_u64(), Some(1_700_000_000_000));
-    }
-
-    #[test]
-    fn client_response_relation_forgotten_claims_retracted_serialises() {
-        let r = ClientResponse::Happening {
-            seq: 1,
-            happening: HappeningWire::RelationForgotten {
-                plugin: "org.test.a".into(),
-                source_id: "track-uuid".into(),
-                predicate: "album_of".into(),
-                target_id: "album-uuid".into(),
-                reason: RelationForgottenReason::ClaimsRetracted {
-                    retracting_plugin: "org.test.a".into(),
-                },
-                at_ms: 1_700_000_000_000,
-            },
-        };
-        let s = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["happening"]["type"].as_str(), Some("relation_forgotten"));
-        assert_eq!(v["happening"]["plugin"].as_str(), Some("org.test.a"));
-        assert_eq!(v["happening"]["source_id"].as_str(), Some("track-uuid"));
-        assert_eq!(v["happening"]["predicate"].as_str(), Some("album_of"));
-        assert_eq!(v["happening"]["target_id"].as_str(), Some("album-uuid"));
-        // Nested reason object, internally tagged by `kind`.
-        assert_eq!(
-            v["happening"]["reason"]["kind"].as_str(),
-            Some("claims_retracted")
-        );
-        assert_eq!(
-            v["happening"]["reason"]["retracting_plugin"].as_str(),
-            Some("org.test.a")
-        );
-        // SubjectCascade's payload must NOT appear on a
-        // ClaimsRetracted reason.
-        assert!(v["happening"]["reason"]["forgotten_subject"].is_null());
-        assert_eq!(v["happening"]["at_ms"].as_u64(), Some(1_700_000_000_000));
-    }
-
-    #[test]
-    fn client_response_relation_forgotten_subject_cascade_serialises() {
-        let r = ClientResponse::Happening {
-            seq: 1,
-            happening: HappeningWire::RelationForgotten {
-                plugin: "org.test.subjects".into(),
-                source_id: "track-uuid".into(),
-                predicate: "album_of".into(),
-                target_id: "album-uuid".into(),
-                reason: RelationForgottenReason::SubjectCascade {
-                    forgotten_subject: "track-uuid".into(),
-                },
-                at_ms: 1_700_000_000_000,
-            },
-        };
-        let s = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["happening"]["type"].as_str(), Some("relation_forgotten"));
-        assert_eq!(
-            v["happening"]["reason"]["kind"].as_str(),
-            Some("subject_cascade")
-        );
-        assert_eq!(
-            v["happening"]["reason"]["forgotten_subject"].as_str(),
-            Some("track-uuid")
-        );
-        // ClaimsRetracted's payload must NOT appear on a
-        // SubjectCascade reason.
-        assert!(v["happening"]["reason"]["retracting_plugin"].is_null());
-        assert_eq!(v["happening"]["at_ms"].as_u64(), Some(1_700_000_000_000));
-    }
-
-    // SubjectAddressingForcedRetract and RelationClaimForcedRetract
-    // wire coverage. Parallel to the earlier RelationForgotten and
-    // RelationCardinalityViolation coverage: one From-conversion
-    // test per variant plus end-to-end JSON shape verification via
-    // a ClientResponse::Happening wrapper.
-
-    #[test]
-    fn happening_wire_from_subject_addressing_forced_retract() {
         let h = Happening::SubjectAddressingForcedRetract {
-            admin_plugin: "admin.plugin".into(),
-            target_plugin: "org.test.p1".into(),
-            canonical_id: "subject-uuid".into(),
-            scheme: "mpd-path".into(),
-            value: "/music/a.flac".into(),
-            reason: Some("stale entry".into()),
-            at: UNIX_EPOCH + std::time::Duration::from_millis(9_000),
+            admin_plugin: "org.admin".into(),
+            target_plugin: "org.target".into(),
+            canonical_id: "subj".into(),
+            scheme: "s".into(),
+            value: "v".into(),
+            reason: Some("test".into()),
+            at: UNIX_EPOCH,
         };
-        let wire: HappeningWire = h.into();
+        let wire = HappeningWire::from_happening(h, &issuer);
         match wire {
             HappeningWire::SubjectAddressingForcedRetract {
-                admin_plugin,
-                target_plugin,
-                canonical_id,
-                scheme,
-                value,
-                reason,
-                at_ms,
+                admin_token,
+                target_token,
+                ..
             } => {
-                assert_eq!(admin_plugin, "admin.plugin");
-                assert_eq!(target_plugin, "org.test.p1");
-                assert_eq!(canonical_id, "subject-uuid");
-                assert_eq!(scheme, "mpd-path");
-                assert_eq!(value, "/music/a.flac");
-                assert_eq!(reason.as_deref(), Some("stale entry"));
-                assert_eq!(at_ms, 9_000);
+                assert_eq!(admin_token, admin_expected);
+                assert_eq!(target_token, target_expected);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
-
-        // End-to-end JSON shape check via ClientResponse wrapper.
-        let r = ClientResponse::Happening {
-            seq: 1,
-            happening: HappeningWire::SubjectAddressingForcedRetract {
-                admin_plugin: "admin.plugin".into(),
-                target_plugin: "org.test.p1".into(),
-                canonical_id: "subject-uuid".into(),
-                scheme: "mpd-path".into(),
-                value: "/music/a.flac".into(),
-                reason: None,
-                at_ms: 1_700_000_000_000,
-            },
-        };
-        let s = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(
-            v["happening"]["type"].as_str(),
-            Some("subject_addressing_forced_retract")
-        );
-        assert_eq!(
-            v["happening"]["admin_plugin"].as_str(),
-            Some("admin.plugin")
-        );
-        assert_eq!(
-            v["happening"]["target_plugin"].as_str(),
-            Some("org.test.p1")
-        );
-        assert_eq!(
-            v["happening"]["canonical_id"].as_str(),
-            Some("subject-uuid")
-        );
-        assert_eq!(v["happening"]["scheme"].as_str(), Some("mpd-path"));
-        assert_eq!(v["happening"]["value"].as_str(), Some("/music/a.flac"));
-        // None reason serialises as JSON null so the key is still
-        // present (predictable shape for consumers).
-        assert!(v["happening"]["reason"].is_null());
-        assert_eq!(v["happening"]["at_ms"].as_u64(), Some(1_700_000_000_000));
     }
 
     #[test]
-    fn happening_wire_from_relation_claim_forced_retract() {
-        let h = Happening::RelationClaimForcedRetract {
-            admin_plugin: "admin.plugin".into(),
-            target_plugin: "org.test.p1".into(),
-            source_id: "track-uuid".into(),
-            predicate: "album_of".into(),
-            target_id: "album-uuid".into(),
-            reason: Some("operator sweep".into()),
-            at: UNIX_EPOCH + std::time::Duration::from_millis(10_000),
+    fn from_happening_translates_relation_forgotten_reason_token() {
+        // The `retracting_plugin` plain name in
+        // RelationForgottenReason::ClaimsRetracted MUST surface as
+        // `retracting_claimant_token` per ADR-0018.
+        let issuer = ClaimantTokenIssuer::new("test-instance");
+        let expected = issuer.token_for("org.retractor");
+
+        let h = Happening::RelationForgotten {
+            plugin: "org.r".into(),
+            source_id: "s".into(),
+            predicate: "p".into(),
+            target_id: "t".into(),
+            reason:
+                crate::happenings::RelationForgottenReason::ClaimsRetracted {
+                    retracting_plugin: "org.retractor".into(),
+                },
+            at: UNIX_EPOCH,
         };
-        let wire: HappeningWire = h.into();
+        let wire = HappeningWire::from_happening(h, &issuer);
         match wire {
-            HappeningWire::RelationClaimForcedRetract {
-                admin_plugin,
-                target_plugin,
-                source_id,
-                predicate,
-                target_id,
-                reason,
-                at_ms,
-            } => {
-                assert_eq!(admin_plugin, "admin.plugin");
-                assert_eq!(target_plugin, "org.test.p1");
-                assert_eq!(source_id, "track-uuid");
-                assert_eq!(predicate, "album_of");
-                assert_eq!(target_id, "album-uuid");
-                assert_eq!(reason.as_deref(), Some("operator sweep"));
-                assert_eq!(at_ms, 10_000);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-
-        // End-to-end JSON shape check.
-        let r = ClientResponse::Happening {
-            seq: 1,
-            happening: HappeningWire::RelationClaimForcedRetract {
-                admin_plugin: "admin.plugin".into(),
-                target_plugin: "org.test.p1".into(),
-                source_id: "track-uuid".into(),
-                predicate: "album_of".into(),
-                target_id: "album-uuid".into(),
-                reason: None,
-                at_ms: 1_700_000_000_000,
+            HappeningWire::RelationForgotten { reason, .. } => match reason {
+                RelationForgottenReasonWire::ClaimsRetracted {
+                    retracting_claimant_token,
+                } => {
+                    assert_eq!(retracting_claimant_token, expected);
+                }
+                other => panic!("unexpected reason: {other:?}"),
             },
-        };
-        let s = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(
-            v["happening"]["type"].as_str(),
-            Some("relation_claim_forced_retract")
-        );
-        assert_eq!(
-            v["happening"]["admin_plugin"].as_str(),
-            Some("admin.plugin")
-        );
-        assert_eq!(
-            v["happening"]["target_plugin"].as_str(),
-            Some("org.test.p1")
-        );
-        assert_eq!(v["happening"]["source_id"].as_str(), Some("track-uuid"));
-        assert_eq!(v["happening"]["predicate"].as_str(), Some("album_of"));
-        assert_eq!(v["happening"]["target_id"].as_str(), Some("album-uuid"));
-        assert!(v["happening"]["reason"].is_null());
-        assert_eq!(v["happening"]["at_ms"].as_u64(), Some(1_700_000_000_000));
-    }
-
-    // SubjectMerged, SubjectSplit, RelationSuppressed,
-    // RelationUnsuppressed, RelationSplitAmbiguous wire coverage.
-    // Same shape as the earlier admin-retract coverage: one
-    // From-conversion test per variant plus one JSON shape
-    // verification via ClientResponse::Happening.
-
-    #[test]
-    fn happening_wire_from_subject_merged() {
-        let h = Happening::SubjectMerged {
-            admin_plugin: "admin.plugin".into(),
-            source_ids: vec!["a-1".into(), "b-2".into()],
-            new_id: "c-3".into(),
-            reason: Some("operator confirmed".into()),
-            at: UNIX_EPOCH + std::time::Duration::from_millis(11_000),
-        };
-        let wire: HappeningWire = h.into();
-        match wire {
-            HappeningWire::SubjectMerged {
-                admin_plugin,
-                source_ids,
-                new_id,
-                reason,
-                at_ms,
-            } => {
-                assert_eq!(admin_plugin, "admin.plugin");
-                assert_eq!(source_ids, vec!["a-1", "b-2"]);
-                assert_eq!(new_id, "c-3");
-                assert_eq!(reason.as_deref(), Some("operator confirmed"));
-                assert_eq!(at_ms, 11_000);
-            }
             other => panic!("unexpected variant: {other:?}"),
         }
     }
 
     #[test]
-    fn client_response_subject_merged_serialises() {
-        let r = ClientResponse::Happening {
-            seq: 1,
-            happening: HappeningWire::SubjectMerged {
-                admin_plugin: "admin.plugin".into(),
-                source_ids: vec!["a-1".into(), "b-2".into()],
-                new_id: "c-3".into(),
-                reason: None,
-                at_ms: 1_700_000_000_000,
-            },
+    fn wire_form_never_carries_plugin_name_string_for_custody() {
+        // ADR-0018 invariant pin: serialise a CustodyTaken on the
+        // wire and assert no plain `plugin` JSON key appears.
+        let issuer = ClaimantTokenIssuer::new("test-instance");
+        let h = Happening::CustodyTaken {
+            plugin: "org.secret.plugin".into(),
+            handle_id: "c-1".into(),
+            shelf: "example.custody".into(),
+            custody_type: "playback".into(),
+            at: UNIX_EPOCH,
         };
-        let s = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["happening"]["type"].as_str(), Some("subject_merged"));
-        assert_eq!(
-            v["happening"]["admin_plugin"].as_str(),
-            Some("admin.plugin")
+        let wire = HappeningWire::from_happening(h, &issuer);
+        let s = serde_json::to_string(&wire).unwrap();
+        assert!(
+            !s.contains("\"plugin\""),
+            "plugin name MUST NOT appear on the wire; got: {s}"
         );
-        let arr = v["happening"]["source_ids"].as_array().unwrap();
-        assert_eq!(arr.len(), 2);
-        assert_eq!(arr[0].as_str(), Some("a-1"));
-        assert_eq!(arr[1].as_str(), Some("b-2"));
-        assert_eq!(v["happening"]["new_id"].as_str(), Some("c-3"));
-        assert!(v["happening"]["reason"].is_null());
-        assert_eq!(v["happening"]["at_ms"].as_u64(), Some(1_700_000_000_000));
-    }
-
-    #[test]
-    fn happening_wire_from_subject_split() {
-        let h = Happening::SubjectSplit {
-            admin_plugin: "admin.plugin".into(),
-            source_id: "a-1".into(),
-            new_ids: vec!["b-2".into(), "c-3".into()],
-            strategy: SplitRelationStrategy::Explicit,
-            reason: Some("audit follow-up".into()),
-            at: UNIX_EPOCH + std::time::Duration::from_millis(12_000),
-        };
-        let wire: HappeningWire = h.into();
-        match wire {
-            HappeningWire::SubjectSplit {
-                admin_plugin,
-                source_id,
-                new_ids,
-                strategy,
-                reason,
-                at_ms,
-            } => {
-                assert_eq!(admin_plugin, "admin.plugin");
-                assert_eq!(source_id, "a-1");
-                assert_eq!(new_ids, vec!["b-2", "c-3"]);
-                assert_eq!(strategy, SplitRelationStrategy::Explicit);
-                assert_eq!(reason.as_deref(), Some("audit follow-up"));
-                assert_eq!(at_ms, 12_000);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn client_response_subject_split_serialises() {
-        let r = ClientResponse::Happening {
-            seq: 1,
-            happening: HappeningWire::SubjectSplit {
-                admin_plugin: "admin.plugin".into(),
-                source_id: "a-1".into(),
-                new_ids: vec!["b-2".into(), "c-3".into()],
-                strategy: SplitRelationStrategy::ToBoth,
-                reason: None,
-                at_ms: 1_700_000_000_000,
-            },
-        };
-        let s = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["happening"]["type"].as_str(), Some("subject_split"));
-        assert_eq!(
-            v["happening"]["admin_plugin"].as_str(),
-            Some("admin.plugin")
+        assert!(
+            !s.contains("org.secret.plugin"),
+            "plain plugin name MUST NOT leak to the wire; got: {s}"
         );
-        assert_eq!(v["happening"]["source_id"].as_str(), Some("a-1"));
-        let arr = v["happening"]["new_ids"].as_array().unwrap();
-        assert_eq!(arr.len(), 2);
-        assert_eq!(arr[0].as_str(), Some("b-2"));
-        assert_eq!(arr[1].as_str(), Some("c-3"));
-        // SplitRelationStrategy serialises as snake_case via its
-        // SDK derive: ToBoth -> "to_both".
-        assert_eq!(v["happening"]["strategy"].as_str(), Some("to_both"));
-        assert!(v["happening"]["reason"].is_null());
-        assert_eq!(v["happening"]["at_ms"].as_u64(), Some(1_700_000_000_000));
-    }
-
-    #[test]
-    fn happening_wire_from_relation_suppressed() {
-        let h = Happening::RelationSuppressed {
-            admin_plugin: "admin.plugin".into(),
-            source_id: "track-1".into(),
-            predicate: "album_of".into(),
-            target_id: "album-1".into(),
-            reason: Some("disputed".into()),
-            at: UNIX_EPOCH + std::time::Duration::from_millis(13_000),
-        };
-        let wire: HappeningWire = h.into();
-        match wire {
-            HappeningWire::RelationSuppressed {
-                admin_plugin,
-                source_id,
-                predicate,
-                target_id,
-                reason,
-                at_ms,
-            } => {
-                assert_eq!(admin_plugin, "admin.plugin");
-                assert_eq!(source_id, "track-1");
-                assert_eq!(predicate, "album_of");
-                assert_eq!(target_id, "album-1");
-                assert_eq!(reason.as_deref(), Some("disputed"));
-                assert_eq!(at_ms, 13_000);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn client_response_relation_suppressed_serialises() {
-        let r = ClientResponse::Happening {
-            seq: 1,
-            happening: HappeningWire::RelationSuppressed {
-                admin_plugin: "admin.plugin".into(),
-                source_id: "track-1".into(),
-                predicate: "album_of".into(),
-                target_id: "album-1".into(),
-                reason: None,
-                at_ms: 1_700_000_000_000,
-            },
-        };
-        let s = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(
-            v["happening"]["type"].as_str(),
-            Some("relation_suppressed")
-        );
-        assert_eq!(v["happening"]["source_id"].as_str(), Some("track-1"));
-        assert_eq!(v["happening"]["predicate"].as_str(), Some("album_of"));
-        assert_eq!(v["happening"]["target_id"].as_str(), Some("album-1"));
-        assert!(v["happening"]["reason"].is_null());
-        assert_eq!(v["happening"]["at_ms"].as_u64(), Some(1_700_000_000_000));
-    }
-
-    #[test]
-    fn happening_wire_from_relation_unsuppressed() {
-        let h = Happening::RelationUnsuppressed {
-            admin_plugin: "admin.plugin".into(),
-            source_id: "track-1".into(),
-            predicate: "album_of".into(),
-            target_id: "album-1".into(),
-            at: UNIX_EPOCH + std::time::Duration::from_millis(14_000),
-        };
-        let wire: HappeningWire = h.into();
-        match wire {
-            HappeningWire::RelationUnsuppressed {
-                admin_plugin,
-                source_id,
-                predicate,
-                target_id,
-                at_ms,
-            } => {
-                assert_eq!(admin_plugin, "admin.plugin");
-                assert_eq!(source_id, "track-1");
-                assert_eq!(predicate, "album_of");
-                assert_eq!(target_id, "album-1");
-                assert_eq!(at_ms, 14_000);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn client_response_relation_unsuppressed_serialises() {
-        let r = ClientResponse::Happening {
-            seq: 1,
-            happening: HappeningWire::RelationUnsuppressed {
-                admin_plugin: "admin.plugin".into(),
-                source_id: "track-1".into(),
-                predicate: "album_of".into(),
-                target_id: "album-1".into(),
-                at_ms: 1_700_000_000_000,
-            },
-        };
-        let s = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(
-            v["happening"]["type"].as_str(),
-            Some("relation_unsuppressed")
-        );
-        assert_eq!(v["happening"]["source_id"].as_str(), Some("track-1"));
-        assert_eq!(v["happening"]["predicate"].as_str(), Some("album_of"));
-        assert_eq!(v["happening"]["target_id"].as_str(), Some("album-1"));
-        // Unsuppress carries no reason; the field must be absent
-        // from the wire shape (NOT present-as-null).
-        assert!(v["happening"].get("reason").is_none());
-        assert_eq!(v["happening"]["at_ms"].as_u64(), Some(1_700_000_000_000));
-    }
-
-    #[test]
-    fn happening_wire_from_relation_split_ambiguous() {
-        let h = Happening::RelationSplitAmbiguous {
-            admin_plugin: "admin.plugin".into(),
-            source_subject: "old-id".into(),
-            predicate: "album_of".into(),
-            other_endpoint_id: "album-1".into(),
-            candidate_new_ids: vec!["new-1".into(), "new-2".into()],
-            at: UNIX_EPOCH + std::time::Duration::from_millis(15_000),
-        };
-        let wire: HappeningWire = h.into();
-        match wire {
-            HappeningWire::RelationSplitAmbiguous {
-                admin_plugin,
-                source_subject,
-                predicate,
-                other_endpoint_id,
-                candidate_new_ids,
-                at_ms,
-            } => {
-                assert_eq!(admin_plugin, "admin.plugin");
-                assert_eq!(source_subject, "old-id");
-                assert_eq!(predicate, "album_of");
-                assert_eq!(other_endpoint_id, "album-1");
-                assert_eq!(candidate_new_ids, vec!["new-1", "new-2"]);
-                assert_eq!(at_ms, 15_000);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn client_response_relation_split_ambiguous_serialises() {
-        let r = ClientResponse::Happening {
-            seq: 1,
-            happening: HappeningWire::RelationSplitAmbiguous {
-                admin_plugin: "admin.plugin".into(),
-                source_subject: "old-id".into(),
-                predicate: "album_of".into(),
-                other_endpoint_id: "album-1".into(),
-                candidate_new_ids: vec!["new-1".into(), "new-2".into()],
-                at_ms: 1_700_000_000_000,
-            },
-        };
-        let s = serde_json::to_string(&r).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(
-            v["happening"]["type"].as_str(),
-            Some("relation_split_ambiguous")
-        );
-        assert_eq!(
-            v["happening"]["admin_plugin"].as_str(),
-            Some("admin.plugin")
-        );
-        assert_eq!(v["happening"]["source_subject"].as_str(), Some("old-id"));
-        assert_eq!(v["happening"]["predicate"].as_str(), Some("album_of"));
-        assert_eq!(
-            v["happening"]["other_endpoint_id"].as_str(),
-            Some("album-1")
-        );
-        let arr = v["happening"]["candidate_new_ids"].as_array().unwrap();
-        assert_eq!(arr.len(), 2);
-        assert_eq!(arr[0].as_str(), Some("new-1"));
-        assert_eq!(arr[1].as_str(), Some("new-2"));
-        assert_eq!(v["happening"]["at_ms"].as_u64(), Some(1_700_000_000_000));
+        assert!(s.contains("\"claimant_token\""));
     }
 }

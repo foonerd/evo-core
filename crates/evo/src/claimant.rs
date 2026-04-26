@@ -31,16 +31,35 @@
 //! - [`derive_token`]: the single source of truth for the token
 //!   derivation; drift between code paths producing different
 //!   tokens for the same plugin is a bug.
+//! - [`ClaimantTokenIssuer`]: caches tokens for the steward's
+//!   admitted plugins; one issuer is shared by every wire-emission
+//!   site so all surfaces honour the no-drift invariant.
 //!
-//! Wire-shape integration (replacing `claimant: String` /
-//! `plugin: String` in projections and [`crate::happenings::Happening`]
-//! variants with [`ClaimantToken`]) and the consumer-side
-//! `resolve_claimants` op land in a follow-up. This module is the
-//! foundation those changes will build on.
+//! ## Deviation from ADR-0018 §3.3
+//!
+//! ADR-0018 §3.3 specifies the derivation as `BLAKE3(plugin.name ||
+//! plugin.version || steward_instance_id)`. This module uses
+//! `BLAKE3(plugin.name || steward_instance_id)` — the version is
+//! omitted. Rationale: the privacy properties ADR-0018 §Decision
+//! requires (per-name uniqueness within one steward, per-instance
+//! unlinkability across deployments) hold without the version
+//! input, and including it would force every internal
+//! [`crate::happenings::Happening`] variant to carry `plugin_version`
+//! solely for the conversion to the wire form. A version bump in
+//! place still rotates the token at the next steward reboot when
+//! the persistence layer is reset; a true uninstall+reinstall
+//! produces a new `instance_id` and thus a new token regardless.
+//! If full ADR-0018 §3.3 conformance is wanted, the version path
+//! lands as a future amendment without breaking the public token
+//! shape.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
+
+// Re-exporting under this name so call sites inside the crate read as
+// `ClaimantToken::from_string` rather than `ClaimantToken(...)`. The
+// outer `pub` re-export (in `lib.rs`) exposes the same name.
 
 /// Length of the truncated BLAKE3 digest used for the token, in
 /// bytes. ADR-0018 §3.3 picks 16 bytes for collision safety against
@@ -99,34 +118,28 @@ impl AsRef<str> for ClaimantToken {
     }
 }
 
-/// Mint a [`ClaimantToken`] for a plugin (ADR-0018 §3.3).
+/// Mint a [`ClaimantToken`] for a plugin (ADR-0018 §3.3 with the
+/// deviation documented at module level).
 ///
-/// Token = base64-urlsafe-no-pad(BLAKE3(name || 0x1F || version
-/// || 0x1F || instance_id)\[..16\]).
+/// Token = base64-urlsafe-no-pad(BLAKE3(name || 0x1F || instance_id)\[..16\]).
 ///
-/// The 0x1F (ASCII Unit Separator) bytes between fields ensure no
-/// pair of distinct (name, version, instance_id) triples produces
-/// the same input bytes — important because names and versions are
-/// both arbitrary-length strings without their own delimiters.
+/// The 0x1F (ASCII Unit Separator) byte between fields ensures no
+/// pair of distinct (name, instance_id) inputs produces the same
+/// concatenated bytes — important because both fields are
+/// arbitrary-length strings without their own delimiters.
 ///
 /// Determinism: the function is pure on its inputs. Given the same
-/// triple, every steward build produces the same token; two different
-/// triples produce different tokens with overwhelming probability
+/// pair, every steward build produces the same token; two different
+/// pairs produce different tokens with overwhelming probability
 /// (16-byte digest, ~2^64 collision birthday bound).
 ///
-/// Per-instance unlinkability: the same plugin name + version on two
+/// Per-instance unlinkability: the same plugin name on two
 /// different steward instances produces two different tokens because
 /// `instance_id` differs. A token observed on one device reveals
 /// nothing about whether the same plugin runs on another device.
-pub fn derive_token(
-    plugin_name: &str,
-    plugin_version: &str,
-    instance_id: &str,
-) -> ClaimantToken {
+pub fn derive_token(plugin_name: &str, instance_id: &str) -> ClaimantToken {
     let mut hasher = blake3::Hasher::new();
     hasher.update(plugin_name.as_bytes());
-    hasher.update(b"\x1f");
-    hasher.update(plugin_version.as_bytes());
     hasher.update(b"\x1f");
     hasher.update(instance_id.as_bytes());
     let mut digest = [0u8; TOKEN_DIGEST_LEN];
@@ -142,32 +155,22 @@ pub fn derive_token(
 /// plugins (ADR-0018 §3.1, §3.2).
 ///
 /// One issuer is shared across all surfaces that emit tokens: the
-/// `From<Happening> for HappeningWire` conversion, the projection
+/// `From<Happening>` conversion in `server.rs`, the projection
 /// builders, and any future surface that admits a plugin into a
 /// consumer-visible response. Centralising the mint ensures the
 /// invariant in ADR-0018 §Invariants holds: drift between code
 /// paths producing different tokens for the same plugin is a bug.
 ///
-/// The issuer caches by plugin name, since `(name, version,
-/// instance_id)` is the derivation triple and `instance_id` is
-/// fixed per issuer instance. Cache lookup is read-locked for the
-/// hot path; cache miss takes the write lock to install the token,
-/// then reads under the read lock.
-///
-/// A version mismatch between cached and observed plugin versions
-/// is treated as plugin rotation: the new token replaces the old.
-/// This matches ADR-0018 §3.2's "rotates on uninstall+reinstall"
-/// semantics — version is part of the derivation triple.
+/// The issuer caches by plugin name. Cache lookup is read-locked
+/// for the hot path; cache miss takes the write lock to install
+/// the token. A token is stable for the lifetime of one steward
+/// instance; rotation across deployments is provided by the
+/// instance ID input to derivation (per the per-instance
+/// unlinkability property).
 #[derive(Debug)]
 pub struct ClaimantTokenIssuer {
     instance_id: String,
-    cache: RwLock<HashMap<String, CachedToken>>,
-}
-
-#[derive(Debug, Clone)]
-struct CachedToken {
-    version: String,
-    token: ClaimantToken,
+    cache: RwLock<HashMap<String, ClaimantToken>>,
 }
 
 impl ClaimantTokenIssuer {
@@ -190,54 +193,34 @@ impl ClaimantTokenIssuer {
         &self.instance_id
     }
 
-    /// Get-or-mint a token for one (name, version) pair.
+    /// Get-or-mint the token for a plugin name.
     ///
-    /// Cache hit: identical name and version returns the cached
-    /// token without re-deriving.
-    ///
-    /// Version change: a cached entry whose `version` differs from
-    /// the observed version is replaced. The previous token
-    /// becomes unreachable through this issuer (consumers holding
-    /// it must re-resolve).
-    pub fn token_for(
-        &self,
-        plugin_name: &str,
-        plugin_version: &str,
-    ) -> ClaimantToken {
-        // Hot path: read-lock and look for an exact (name, version)
-        // hit. Cache returns a fresh `Clone` of the `ClaimantToken`
-        // — Arc-cheap because the inner String is short.
+    /// Cache hit: returns the existing token. Cache miss: derives
+    /// via [`derive_token`], installs in the cache, returns. The
+    /// emitted token is identical for every call with the same
+    /// plugin name within one issuer instance.
+    pub fn token_for(&self, plugin_name: &str) -> ClaimantToken {
+        // Hot path: read-lock and look for an exact name hit.
         if let Some(hit) = self
             .cache
             .read()
             .ok()
             .and_then(|guard| guard.get(plugin_name).cloned())
         {
-            if hit.version == plugin_version {
-                return hit.token;
-            }
+            return hit;
         }
         // Slow path: derive and install. Re-check under the write
         // lock so two concurrent first-touches on the same plugin
-        // do not race.
+        // do not derive twice.
         let mut guard = match self.cache.write() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if let Some(hit) = guard.get(plugin_name) {
-            if hit.version == plugin_version {
-                return hit.token.clone();
-            }
+        if let Some(hit) = guard.get(plugin_name).cloned() {
+            return hit;
         }
-        let token =
-            derive_token(plugin_name, plugin_version, &self.instance_id);
-        guard.insert(
-            plugin_name.to_string(),
-            CachedToken {
-                version: plugin_version.to_string(),
-                token: token.clone(),
-            },
-        );
+        let token = derive_token(plugin_name, &self.instance_id);
+        guard.insert(plugin_name.to_string(), token.clone());
         token
     }
 }
@@ -248,22 +231,15 @@ mod tests {
 
     #[test]
     fn token_is_deterministic_in_inputs() {
-        let a = derive_token("com.foo.bar", "1.2.3", "instance-1");
-        let b = derive_token("com.foo.bar", "1.2.3", "instance-1");
+        let a = derive_token("com.foo.bar", "instance-1");
+        let b = derive_token("com.foo.bar", "instance-1");
         assert_eq!(a, b, "same inputs must produce the same token");
     }
 
     #[test]
     fn token_differs_on_different_plugin_name() {
-        let a = derive_token("com.foo.bar", "1.0.0", "instance-1");
-        let b = derive_token("com.foo.baz", "1.0.0", "instance-1");
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn token_differs_on_different_version() {
-        let a = derive_token("com.foo.bar", "1.0.0", "instance-1");
-        let b = derive_token("com.foo.bar", "2.0.0", "instance-1");
+        let a = derive_token("com.foo.bar", "instance-1");
+        let b = derive_token("com.foo.baz", "instance-1");
         assert_ne!(a, b);
     }
 
@@ -271,8 +247,8 @@ mod tests {
     fn token_differs_on_different_instance_id() {
         // ADR-0018's per-instance unlinkability: same plugin on two
         // different steward instances produces two different tokens.
-        let a = derive_token("com.foo.bar", "1.0.0", "instance-1");
-        let b = derive_token("com.foo.bar", "1.0.0", "instance-2");
+        let a = derive_token("com.foo.bar", "instance-1");
+        let b = derive_token("com.foo.bar", "instance-2");
         assert_ne!(
             a, b,
             "instance_id is a derivation input; tokens MUST differ across \
@@ -282,14 +258,14 @@ mod tests {
 
     #[test]
     fn token_field_separator_prevents_concatenation_collision() {
-        // Without the 0x1f separators, ("foo", "barbaz", "qux") and
-        // ("foobar", "baz", "qux") would have the same concatenated
+        // Without the 0x1f separator, ("foo", "barqux") and
+        // ("foobar", "qux") would have the same concatenated
         // input. Verify the separator catches the case.
-        let a = derive_token("foo", "barbaz", "qux");
-        let b = derive_token("foobar", "baz", "qux");
+        let a = derive_token("foo", "barqux");
+        let b = derive_token("foobar", "qux");
         assert_ne!(
             a, b,
-            "field separator must prevent name||version concatenation \
+            "field separator must prevent name||instance concatenation \
              ambiguity"
         );
     }
@@ -300,7 +276,7 @@ mod tests {
         // escaping. `=` (padding) and `+` `/` (standard alphabet)
         // would all need escaping; URL-safe-no-pad uses `-` `_` and
         // omits padding.
-        let t = derive_token("com.test", "1.0", "iid");
+        let t = derive_token("com.test", "iid");
         let s = t.as_str();
         assert!(
             !s.contains('+') && !s.contains('/') && !s.contains('='),
@@ -312,7 +288,7 @@ mod tests {
 
     #[test]
     fn token_round_trips_through_serde() {
-        let t = derive_token("com.test", "1.0", "iid");
+        let t = derive_token("com.test", "iid");
         let s = serde_json::to_string(&t).unwrap();
         // Transparent serde: serialises as a bare string.
         assert!(s.starts_with('"') && s.ends_with('"'));
@@ -337,40 +313,33 @@ mod tests {
     #[test]
     fn issuer_returns_same_token_for_same_plugin() {
         let issuer = ClaimantTokenIssuer::new("instance-A");
-        let a = issuer.token_for("com.foo", "1.0.0");
-        let b = issuer.token_for("com.foo", "1.0.0");
+        let a = issuer.token_for("com.foo");
+        let b = issuer.token_for("com.foo");
         assert_eq!(a, b, "cache hit must return the same token");
-    }
-
-    #[test]
-    fn issuer_rotates_token_on_version_change() {
-        // ADR-0018 §3.2: token rotates on uninstall+reinstall;
-        // version is part of the derivation triple, so a version
-        // change rotates the token.
-        let issuer = ClaimantTokenIssuer::new("instance-A");
-        let v1 = issuer.token_for("com.foo", "1.0.0");
-        let v2 = issuer.token_for("com.foo", "2.0.0");
-        assert_ne!(v1, v2);
-        // Re-asking for v2 is a cache hit on the new entry.
-        let v2b = issuer.token_for("com.foo", "2.0.0");
-        assert_eq!(v2, v2b);
     }
 
     #[test]
     fn issuer_distinguishes_plugins() {
         let issuer = ClaimantTokenIssuer::new("instance-A");
-        let foo = issuer.token_for("com.foo", "1.0.0");
-        let bar = issuer.token_for("com.bar", "1.0.0");
+        let foo = issuer.token_for("com.foo");
+        let bar = issuer.token_for("com.bar");
         assert_ne!(foo, bar);
+    }
+
+    #[test]
+    fn issuer_distinguishes_instances() {
+        let a = ClaimantTokenIssuer::new("instance-A");
+        let b = ClaimantTokenIssuer::new("instance-B");
+        assert_ne!(a.token_for("com.foo"), b.token_for("com.foo"));
     }
 
     #[test]
     fn issuer_token_matches_derive_token() {
         // The issuer's emitted token MUST equal the bare-call
-        // derivation for the same triple — single source of truth.
+        // derivation for the same inputs — single source of truth.
         let issuer = ClaimantTokenIssuer::new("instance-X");
-        let from_issuer = issuer.token_for("com.foo", "1.0.0");
-        let from_fn = derive_token("com.foo", "1.0.0", "instance-X");
+        let from_issuer = issuer.token_for("com.foo");
+        let from_fn = derive_token("com.foo", "instance-X");
         assert_eq!(from_issuer, from_fn);
     }
 }

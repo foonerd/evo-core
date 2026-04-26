@@ -446,7 +446,7 @@ The server writes three kinds of frames after accepting the subscription:
   "seq": 43,
   "happening": {
     "type": "custody_taken",
-    "plugin": "org.example.playback",
+    "claimant_token": "Qx9aN-bk0wUJtH4y6oFCTw",
     "handle_id": "custody-42",
     "shelf": "audio.playback",
     "custody_type": "playback",
@@ -456,6 +456,8 @@ The server writes three kinds of frames after accepting the subscription:
 ```
 
 `seq` is the cursor the bus minted for this event. Strictly monotonic across one steward instance and persisted into `happenings_log` for cursor replay. Consumers should record this on every consumed frame so a subsequent reconnect can resume cleanly via `since`.
+
+Plugin identity (ADR-0018): the `claimant_token` field carries an opaque, steward-issued identifier — not the plugin's plain canonical name. Tokens are stable for the lifetime of a steward instance, distinct between deployments, and treat-as-opaque for consumers (compare by exact-string equality only). Variants emitted by admin plugins additionally carry `admin_token`; variants targeting a specific plugin's claim (forced retract, claim reassignment) carry `target_token`. `RelationForgotten` carries `retracting_claimant_token` under `reason` when the forget came from a last-claimant retract. The same scheme applies to the `claimant_token` and `claimant_tokens` fields in `op = "list_active_custodies"` and `op = "project_subject"` responses. Resolution from token to plain plugin name will be available via a separate `resolve_claimants` op gated on a future capability; today consumers see only tokens.
 
 The `happening` object is internally tagged by `type`. Seventeen variants ship today across five categories:
 

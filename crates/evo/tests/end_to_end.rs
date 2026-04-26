@@ -643,7 +643,15 @@ async fn list_active_custodies_returns_populated_ledger() {
     assert_eq!(arr.len(), 1);
 
     let first = &arr[0];
-    assert_eq!(first["plugin"].as_str(), Some("org.test.warden"));
+    // ADR-0018: plugin name replaced by opaque token.
+    assert!(
+        first["plugin"].is_null(),
+        "plain plugin field must be absent on the wire (ADR-0018)"
+    );
+    assert!(
+        first["claimant_token"].as_str().is_some(),
+        "claimant_token must be present on every wire custody record"
+    );
     assert_eq!(first["handle_id"].as_str(), Some("custody-1"));
     assert_eq!(first["shelf"].as_str(), Some("example.custody"));
     assert_eq!(first["custody_type"].as_str(), Some("playback"));
@@ -741,7 +749,16 @@ async fn subscribe_happenings_delivers_ack_and_events() {
         "got: {}",
         String::from_utf8_lossy(&body)
     );
-    assert_eq!(v["happening"]["plugin"].as_str(), Some("org.test.warden"));
+    // ADR-0018: plugin name is replaced by an opaque token on the
+    // wire; the plain `plugin` key MUST NOT appear.
+    assert!(
+        v["happening"]["plugin"].is_null(),
+        "plain plugin field must be absent on the wire (ADR-0018)"
+    );
+    assert!(
+        v["happening"]["claimant_token"].as_str().is_some(),
+        "claimant_token must be present on every wire happening"
+    );
     assert_eq!(v["happening"]["handle_id"].as_str(), Some("c-1"));
     assert_eq!(v["happening"]["shelf"].as_str(), Some("example.custody"));
     assert_eq!(v["happening"]["custody_type"].as_str(), Some("playback"));
