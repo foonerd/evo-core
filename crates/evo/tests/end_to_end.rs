@@ -754,6 +754,234 @@ async fn subscribe_happenings_delivers_ack_and_events() {
     engine.lock().await.shutdown().await.expect("drain");
 }
 
+#[tokio::test]
+async fn subscribe_happenings_ack_carries_current_seq() {
+    // Verifies the ADR-0017 cursor surface: the subscribe ack
+    // exposes `current_seq` (the bus cursor at subscribe time), and
+    // every streamed `Happening` frame carries the seq the bus
+    // minted at emit time. Consumers persist that seq to resume
+    // across reconnect or steward restart.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let bus = {
+        let guard = engine.lock().await;
+        guard.happening_bus()
+    };
+
+    // Pre-emit two events so the bus has a non-zero current_seq at
+    // subscribe time. These predate the subscribe and are therefore
+    // not delivered on the live stream (consumers wanting them must
+    // pass `since`).
+    bus.emit(Happening::CustodyTaken {
+        plugin: "org.test.warden".into(),
+        handle_id: "c-pre-1".into(),
+        shelf: "example.custody".into(),
+        custody_type: "playback".into(),
+        at: std::time::SystemTime::now(),
+    });
+    bus.emit(Happening::CustodyTaken {
+        plugin: "org.test.warden".into(),
+        handle_id: "c-pre-2".into(),
+        shelf: "example.custody".into(),
+        custody_type: "playback".into(),
+        at: std::time::SystemTime::now(),
+    });
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+    write_frame(&mut stream, br#"{"op":"subscribe_happenings"}"#).await;
+
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["subscribed"].as_bool(), Some(true));
+    assert_eq!(
+        v["current_seq"].as_u64(),
+        Some(2),
+        "ack must report the bus's current cursor; got: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Emit one live event and verify it carries seq=3 on the wire.
+    bus.emit(Happening::CustodyReleased {
+        plugin: "org.test.warden".into(),
+        handle_id: "c-pre-1".into(),
+        at: std::time::SystemTime::now(),
+    });
+
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["seq"].as_u64(), Some(3));
+    assert_eq!(v["happening"]["type"].as_str(), Some("custody_released"));
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn subscribe_happenings_replays_from_since_then_streams_live() {
+    // ADR-0017 replay path: a consumer reconnecting with a `since`
+    // cursor receives every persisted happening with seq > since
+    // before transitioning to live streaming. Live events whose seq
+    // is at or below the largest replayed seq are deduped so the
+    // consumer never sees the same event twice across the boundary.
+    //
+    // Builds a custom harness with a durable bus so emit_durable
+    // writes to happenings_log; the wire-level replay path queries
+    // that table.
+    use evo::admin::AdminLedger;
+    use evo::admission::AdmissionEngine;
+    use evo::catalogue::Catalogue;
+    use evo::config::PluginsSecurityConfig;
+    use evo::custody::CustodyLedger;
+    use evo::persistence::{MemoryPersistenceStore, PersistenceStore};
+    use evo::relations::RelationGraph;
+    use evo::server::Server;
+    use evo::state::StewardState;
+    use evo::subjects::SubjectRegistry;
+
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+    let catalogue_path = tmp.path().join("catalogue.toml");
+    std::fs::write(&catalogue_path, CATALOGUE_TOML).expect("write catalogue");
+    let catalogue =
+        Arc::new(Catalogue::load(&catalogue_path).expect("catalogue"));
+
+    let store: Arc<dyn PersistenceStore> =
+        Arc::new(MemoryPersistenceStore::new());
+    let bus = Arc::new(
+        HappeningBus::with_persistence(Arc::clone(&store))
+            .await
+            .expect("durable bus"),
+    );
+
+    let state = StewardState::builder()
+        .catalogue(catalogue)
+        .subjects(Arc::new(SubjectRegistry::new()))
+        .relations(Arc::new(RelationGraph::new()))
+        .custody(Arc::new(CustodyLedger::new()))
+        .bus(Arc::clone(&bus))
+        .admin(Arc::new(AdminLedger::new()))
+        .persistence(Arc::clone(&store))
+        .build()
+        .expect("steward state must build");
+
+    let mut engine = AdmissionEngine::new(
+        Arc::clone(&state),
+        std::path::PathBuf::from("/tmp/evo-end-to-end-tests-data-root"),
+        None,
+        PluginsSecurityConfig::default(),
+    );
+    let echo_plugin = evo_example_echo::EchoPlugin::new();
+    let echo_manifest = evo_example_echo::manifest();
+    engine
+        .admit_singleton_respondent(echo_plugin, echo_manifest)
+        .await
+        .expect("admit echo plugin");
+
+    let projections = Arc::new(ProjectionEngine::new(
+        Arc::clone(&state.subjects),
+        Arc::clone(&state.relations),
+    ));
+    let router = Arc::clone(engine.router());
+    let engine = Arc::new(Mutex::new(engine));
+    let server = Server::new(
+        socket_path.clone(),
+        router,
+        Arc::clone(&state),
+        Arc::clone(&projections),
+    );
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    // Persist three events durably. Each gets seq 1, 2, 3 written
+    // through to happenings_log.
+    for handle in ["c-1", "c-2", "c-3"] {
+        bus.emit_durable(Happening::CustodyTaken {
+            plugin: "org.test.warden".into(),
+            handle_id: handle.into(),
+            shelf: "example.custody".into(),
+            custody_type: "playback".into(),
+            at: std::time::SystemTime::now(),
+        })
+        .await
+        .expect("emit_durable");
+    }
+    assert_eq!(bus.last_emitted_seq(), 3);
+
+    // Subscribe with since=1: replay must deliver seq=2 and seq=3,
+    // then transition to live.
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+    write_frame(&mut stream, br#"{"op":"subscribe_happenings","since":1}"#)
+        .await;
+
+    // Ack carries the cursor sampled at subscribe time (3).
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["subscribed"].as_bool(), Some(true));
+    assert_eq!(v["current_seq"].as_u64(), Some(3));
+
+    // First replay frame: seq=2.
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["seq"].as_u64(), Some(2));
+    assert_eq!(v["happening"]["type"].as_str(), Some("custody_taken"));
+    assert_eq!(v["happening"]["handle_id"].as_str(), Some("c-2"));
+
+    // Second replay frame: seq=3.
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["seq"].as_u64(), Some(3));
+    assert_eq!(v["happening"]["handle_id"].as_str(), Some("c-3"));
+
+    // Live event must follow the replay window with seq=4 and bypass
+    // the dedupe boundary cleanly.
+    bus.emit_durable(Happening::CustodyReleased {
+        plugin: "org.test.warden".into(),
+        handle_id: "c-3".into(),
+        at: std::time::SystemTime::now(),
+    })
+    .await
+    .expect("live emit_durable");
+
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["seq"].as_u64(), Some(4));
+    assert_eq!(v["happening"]["type"].as_str(), Some("custody_released"));
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
 // ---------------------------------------------------------------------
 // project_subject + describe_alias: alias-aware client API surface.
 //

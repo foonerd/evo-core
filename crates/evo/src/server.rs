@@ -56,26 +56,49 @@
 //! { "op": "subscribe_happenings" }
 //! ```
 //!
-//! No arguments in v0. This is the first streaming op in the client
-//! protocol: once the server accepts the subscription, the connection
-//! becomes output-only for the lifetime of the subscription. Sending
-//! further requests on the same connection is not supported; clients
-//! that need both subscription and other ops open two connections.
+//! Or, with a cursor for replay-then-live (ADR-0017):
+//! ```json
+//! { "op": "subscribe_happenings", "since": 1234 }
+//! ```
+//!
+//! `since` is optional. When omitted, the connection sees only
+//! happenings emitted after the subscribe ack — pre-cursor
+//! behaviour. When supplied, the server queries the durable
+//! `happenings_log` for every event with `seq > since`, streams
+//! those replay frames first, then transitions to live streaming.
+//! Live events with seq at or below the largest replayed seq are
+//! deduped so the consumer never observes the same seq twice
+//! across the boundary.
+//!
+//! This is the first streaming op in the client protocol: once the
+//! server accepts the subscription, the connection becomes
+//! output-only for the lifetime of the subscription. Sending
+//! further requests on the same connection is not supported;
+//! clients that need both subscription and other ops open two
+//! connections.
 //!
 //! Sequence of frames the server writes after accepting a
 //! subscription:
 //!
-//! 1. An immediate `{"subscribed": true}` ack, signalling the
-//!    subscriber is registered on the bus. Any happening emitted
-//!    after the client sees this ack will be delivered.
-//! 2. A `{"happening": {...}}` frame for each subsequent happening.
-//!    The inner object is internally-tagged by `type`
-//!    (`custody_taken`, `custody_released`, `custody_state_reported`)
-//!    with variant-specific fields. See the Response JSON section.
-//! 3. A `{"lagged": n}` frame if the subscriber falls behind the
-//!    bus's buffer, carrying the number of dropped happenings.
-//!    Subscribers recover by re-querying the authoritative store
-//!    (the ledger for custody) and continuing to consume.
+//! 1. An immediate `{"subscribed": true, "current_seq": N}` ack.
+//!    `current_seq` is the bus's monotonic cursor sampled at
+//!    subscribe time; consumers pin reconcile-style queries (e.g.
+//!    `list_active_custodies`) to it, then apply happenings with
+//!    `seq > current_seq` as deltas on top.
+//! 2. Zero or more replay frames if `since` was supplied: one
+//!    `{"seq": s, "happening": {...}}` per persisted event with
+//!    `seq > since`, in ascending seq order.
+//! 3. A `{"seq": s, "happening": {...}}` frame for each subsequent
+//!    live happening. The inner object is internally-tagged by
+//!    `type` (`custody_taken`, `custody_released`,
+//!    `custody_state_reported`, etc.) with variant-specific fields.
+//!    See the Response JSON section.
+//! 4. A `{"lagged": n}` frame if the subscriber falls behind the
+//!    live broadcast buffer, carrying the number of dropped
+//!    happenings. Subscribers recover by reconnecting with their
+//!    last-observed `seq` as `since` (provided that seq is still in
+//!    the durable window) or by re-querying the authoritative store
+//!    when it falls outside.
 //!
 //! The subscription ends when the client closes the connection or
 //! the server is shut down. There is no explicit unsubscribe frame.
@@ -110,12 +133,13 @@
 //! `subscribe_happenings` ack (written once, immediately after the
 //! op is accepted):
 //! ```json
-//! { "subscribed": true }
+//! { "subscribed": true, "current_seq": 42 }
 //! ```
 //!
 //! Happening frame (streamed, one per emitted happening):
 //! ```json
-//! { "happening": {
+//! { "seq": 43,
+//!   "happening": {
 //!     "type": "custody_taken",
 //!     "plugin": "org.example.warden",
 //!     "handle_id": "custody-42",
@@ -146,7 +170,7 @@ use crate::context::RegistrySubjectQuerier;
 use crate::custody::{CustodyRecord, StateSnapshot};
 use crate::error::StewardError;
 use crate::happenings::{
-    CardinalityViolationSide, Happening, HappeningBus, ReassignedClaimKind,
+    CardinalityViolationSide, Happening, ReassignedClaimKind,
     RelationForgottenReason,
 };
 use crate::projections::{
@@ -231,10 +255,22 @@ enum ClientRequest {
     /// Snapshot the custody ledger - every currently-held custody the
     /// steward has recorded. No fields; v0 returns everything.
     ListActiveCustodies,
-    /// Subscribe to the happenings bus. No arguments in v0. Promotes
-    /// the connection to streaming mode; see module-level docs for
-    /// the sequence of frames the server emits.
-    SubscribeHappenings,
+    /// Subscribe to the happenings bus. Promotes the connection to
+    /// streaming mode; see module-level docs for the sequence of
+    /// frames the server emits.
+    ///
+    /// Optional `since` enables cursor-based replay (ADR-0017): the
+    /// server replays every happening with `seq > since` from the
+    /// durable `happenings_log` window before transitioning to
+    /// live streaming. When omitted, the connection sees only events
+    /// emitted after subscription, matching pre-cursor behaviour.
+    SubscribeHappenings {
+        /// Cursor returned by an earlier subscribe ack
+        /// (`current_seq`) or observed on a streamed frame
+        /// (`seq`). Replay starts at `seq > since`.
+        #[serde(default)]
+        since: Option<u64>,
+    },
 }
 
 /// Default for [`ClientRequest::ProjectSubject::follow_aliases`].
@@ -379,16 +415,27 @@ enum ClientResponse {
     },
     /// Subscription acknowledgement. Written once, immediately after
     /// the server accepts a `subscribe_happenings` op and has
-    /// registered its receiver on the bus. The field is always `true`;
-    /// its sole purpose is the distinctive top-level key `subscribed`
-    /// for the untagged-enum disambiguation.
+    /// registered its receiver on the bus. The `subscribed` field is
+    /// always `true`; its sole purpose is the distinctive top-level
+    /// key `subscribed` for the untagged-enum disambiguation.
+    /// `current_seq` is the bus's cursor at subscribe time (ADR-0017):
+    /// consumers pin reconcile-style queries (e.g. `list_subjects`)
+    /// to it, then apply happenings with `seq > current_seq` as
+    /// deltas on top.
     Subscribed {
         /// Always `true`. Present so the key `subscribed` distinguishes
         /// this variant from every other `ClientResponse` shape.
         subscribed: bool,
+        /// Bus cursor at subscribe time. `0` means no happenings have
+        /// been emitted yet on this steward instance.
+        current_seq: u64,
     },
     /// One happening from the subscription stream.
     Happening {
+        /// Bus cursor minted at emit time (ADR-0017). Strictly
+        /// monotonic across a steward instance; consumers persist this
+        /// value to resume cleanly across reconnect or restart.
+        seq: u64,
         /// The happening itself, shaped per [`HappeningWire`].
         happening: HappeningWire,
     },
@@ -1525,12 +1572,12 @@ async fn handle_connection(
             }
         };
 
-        if matches!(req, ClientRequest::SubscribeHappenings) {
-            // Promote the connection to streaming mode. The bus
-            // handle is read directly from the steward state bag;
-            // no engine lock is taken here.
-            let bus = Arc::clone(&state.bus);
-            return run_subscription(stream, bus).await;
+        if let ClientRequest::SubscribeHappenings { since } = req {
+            // Promote the connection to streaming mode. State carries
+            // both the bus and the persistence handle; the latter is
+            // queried for cursor replay before the live transition
+            // (ADR-0017).
+            return run_subscription(stream, Arc::clone(&state), since).await;
         }
 
         let response =
@@ -1647,7 +1694,7 @@ async fn dispatch_request(
         ClientRequest::ListActiveCustodies => {
             handle_list_active_custodies(state).await
         }
-        ClientRequest::SubscribeHappenings => {
+        ClientRequest::SubscribeHappenings { .. } => {
             // Intercepted in handle_connection; should not reach here.
             // Defensive: surface an error rather than panicking in case
             // a future refactor moves the intercept.
@@ -1659,46 +1706,125 @@ async fn dispatch_request(
     }
 }
 
-/// Stream happenings from `bus` over `stream` until the client
+/// Stream happenings to the client over `stream` until the peer
 /// disconnects or the bus is dropped.
 ///
 /// ## Sequence
 ///
-/// 1. `bus.subscribe()` is called BEFORE the `{"subscribed": true}`
-///    ack is written. This order is load-bearing: a happening emitted
-///    between the subscribe and the ack is buffered by the receiver
-///    and delivered on the next `recv()`; if the order were reversed,
-///    such a happening could be missed.
-/// 2. The ack is written. If writing fails the client has disconnected
+/// 1. `bus.subscribe_envelope()` is called BEFORE anything is
+///    written so that any happening emitted between the subscribe
+///    and the ack is buffered on the receiver and delivered on a
+///    later recv. This order is load-bearing for the live path.
+/// 2. The bus's `last_emitted_seq` is sampled — this is the
+///    `current_seq` written into the ack so the consumer can pin
+///    reconcile queries to it (ADR-0017).
+/// 3. The ack is written, carrying `subscribed: true` and
+///    `current_seq`. If writing fails the client has disconnected
 ///    before receiving it; we return cleanly.
-/// 3. A loop reads happenings from the receiver and writes them to
-///    the stream. On `RecvError::Lagged(n)` we emit a `Lagged` frame
-///    and continue; on `RecvError::Closed` (the bus was dropped,
-///    which does not happen in normal operation because the engine
-///    holds an `Arc<HappeningBus>` for its lifetime) we return
-///    cleanly; on write failure we return cleanly (client gone).
+/// 4. If `since` is supplied, the persistence store is queried for
+///    every happening with `seq > since` and each is streamed
+///    directly to the client as a `Happening` frame in ascending
+///    seq order. The largest replayed seq is recorded as the
+///    dedupe boundary.
+/// 5. A loop reads envelopes from the receiver and writes them.
+///    Envelopes whose `seq` is at or below the dedupe boundary are
+///    silently dropped (they would duplicate the replay window).
+///    On `RecvError::Lagged(n)` we emit a `Lagged` frame and
+///    continue; on `RecvError::Closed` we return cleanly; on write
+///    failure we return cleanly (client gone).
 ///
-/// The `engine` is intentionally not passed in: the subscription
-/// streams from the bus alone and does not need to lock the engine.
+/// The order matters: subscribe → sample current_seq → ack →
+/// replay. Sampling current_seq before the ack guarantees the
+/// consumer can use it as a strict upper bound on what the replay
+/// window has covered: any happening with seq > current_seq is
+/// either already in the live receiver (because subscribe ran
+/// first) or will arrive on it. The replay query may itself
+/// include events with seq > current_seq if emits happened during
+/// the persistence read; those are deduped by the live filter.
 async fn run_subscription(
     mut stream: UnixStream,
-    bus: Arc<HappeningBus>,
+    state: Arc<StewardState>,
+    since: Option<u64>,
 ) -> Result<(), StewardError> {
-    // Subscribe first so happenings emitted before the ack reach the
-    // client.
-    let mut rx = bus.subscribe();
+    // Subscribe first so events emitted concurrently with the
+    // persistence read are buffered, not lost.
+    let mut rx = state.bus.subscribe_envelope();
+    let current_seq = state.bus.last_emitted_seq();
 
     // Send the ack. If the client is gone we return cleanly.
-    let ack = ClientResponse::Subscribed { subscribed: true };
+    let ack = ClientResponse::Subscribed {
+        subscribed: true,
+        current_seq,
+    };
     if write_response_frame(&mut stream, &ack).await.is_err() {
         return Ok(());
     }
 
+    // Replay window: stream any persisted events with seq > since.
+    // The dedupe boundary is the largest seq we replayed; live
+    // events at or below it are dropped because the consumer has
+    // already seen them through the replay.
+    let dedupe_boundary = if let Some(cursor) = since {
+        match state
+            .persistence
+            .load_happenings_since(cursor, u32::MAX)
+            .await
+        {
+            Ok(rows) => {
+                let mut last = cursor;
+                for row in rows {
+                    let happening: Happening =
+                        match serde_json::from_value(row.payload) {
+                            Ok(h) => h,
+                            Err(e) => {
+                                let frame = ClientResponse::Error {
+                                    error: format!(
+                                        "replay decode failed at seq \
+                                         {}: {e}",
+                                        row.seq
+                                    ),
+                                };
+                                let _ =
+                                    write_response_frame(&mut stream, &frame)
+                                        .await;
+                                return Ok(());
+                            }
+                        };
+                    let frame = ClientResponse::Happening {
+                        seq: row.seq,
+                        happening: happening.into(),
+                    };
+                    if write_response_frame(&mut stream, &frame).await.is_err()
+                    {
+                        return Ok(());
+                    }
+                    last = row.seq;
+                }
+                last
+            }
+            Err(e) => {
+                let frame = ClientResponse::Error {
+                    error: format!("replay query failed: {e}"),
+                };
+                let _ = write_response_frame(&mut stream, &frame).await;
+                return Ok(());
+            }
+        }
+    } else {
+        // No replay requested; live stream starts at any seq.
+        0
+    };
+
     loop {
         match rx.recv().await {
-            Ok(happening) => {
+            Ok(env) => {
+                if env.seq <= dedupe_boundary {
+                    // Already streamed via the replay window.
+                    continue;
+                }
                 let frame = ClientResponse::Happening {
-                    happening: happening.into(),
+                    seq: env.seq,
+                    happening: env.happening.into(),
                 };
                 if write_response_frame(&mut stream, &frame).await.is_err() {
                     // Client disconnected.
@@ -2490,15 +2616,32 @@ mod tests {
     fn client_request_parses_subscribe_happenings() {
         let json = r#"{"op":"subscribe_happenings"}"#;
         let r: ClientRequest = serde_json::from_str(json).unwrap();
-        assert!(matches!(r, ClientRequest::SubscribeHappenings));
+        assert!(matches!(
+            r,
+            ClientRequest::SubscribeHappenings { since: None }
+        ));
+    }
+
+    #[test]
+    fn client_request_parses_subscribe_happenings_with_since() {
+        let json = r#"{"op":"subscribe_happenings","since":42}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            r,
+            ClientRequest::SubscribeHappenings { since: Some(42) }
+        ));
     }
 
     #[test]
     fn client_response_subscribed_serialises() {
-        let r = ClientResponse::Subscribed { subscribed: true };
+        let r = ClientResponse::Subscribed {
+            subscribed: true,
+            current_seq: 17,
+        };
         let s = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["subscribed"].as_bool(), Some(true));
+        assert_eq!(v["current_seq"].as_u64(), Some(17));
         // Distinctive key; must not collide with other variants.
         assert!(!s.contains("payload_b64"));
         assert!(!s.contains("\"error\""));
@@ -2510,6 +2653,7 @@ mod tests {
     #[test]
     fn client_response_happening_serialises() {
         let r = ClientResponse::Happening {
+            seq: 7,
             happening: HappeningWire::CustodyTaken {
                 plugin: "org.test.warden".into(),
                 handle_id: "c-1".into(),
@@ -2520,6 +2664,7 @@ mod tests {
         };
         let s = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["seq"].as_u64(), Some(7));
         assert_eq!(v["happening"]["type"].as_str(), Some("custody_taken"));
         assert_eq!(v["happening"]["plugin"].as_str(), Some("org.test.warden"));
         assert_eq!(v["happening"]["handle_id"].as_str(), Some("c-1"));
@@ -2716,6 +2861,7 @@ mod tests {
         // millisecond timestamp. Guards against accidental schema
         // drift on any field the wire spec names.
         let r = ClientResponse::Happening {
+            seq: 1,
             happening: HappeningWire::RelationCardinalityViolation {
                 plugin: "org.test.plugin".into(),
                 predicate: "album_of".into(),
@@ -2852,6 +2998,7 @@ mod tests {
     #[test]
     fn client_response_subject_forgotten_serialises() {
         let r = ClientResponse::Happening {
+            seq: 1,
             happening: HappeningWire::SubjectForgotten {
                 plugin: "org.test.a".into(),
                 canonical_id: "subject-uuid".into(),
@@ -2874,6 +3021,7 @@ mod tests {
     #[test]
     fn client_response_relation_forgotten_claims_retracted_serialises() {
         let r = ClientResponse::Happening {
+            seq: 1,
             happening: HappeningWire::RelationForgotten {
                 plugin: "org.test.a".into(),
                 source_id: "track-uuid".into(),
@@ -2910,6 +3058,7 @@ mod tests {
     #[test]
     fn client_response_relation_forgotten_subject_cascade_serialises() {
         let r = ClientResponse::Happening {
+            seq: 1,
             happening: HappeningWire::RelationForgotten {
                 plugin: "org.test.subjects".into(),
                 source_id: "track-uuid".into(),
@@ -2979,6 +3128,7 @@ mod tests {
 
         // End-to-end JSON shape check via ClientResponse wrapper.
         let r = ClientResponse::Happening {
+            seq: 1,
             happening: HappeningWire::SubjectAddressingForcedRetract {
                 admin_plugin: "admin.plugin".into(),
                 target_plugin: "org.test.p1".into(),
@@ -3050,6 +3200,7 @@ mod tests {
 
         // End-to-end JSON shape check.
         let r = ClientResponse::Happening {
+            seq: 1,
             happening: HappeningWire::RelationClaimForcedRetract {
                 admin_plugin: "admin.plugin".into(),
                 target_plugin: "org.test.p1".into(),
@@ -3118,6 +3269,7 @@ mod tests {
     #[test]
     fn client_response_subject_merged_serialises() {
         let r = ClientResponse::Happening {
+            seq: 1,
             happening: HappeningWire::SubjectMerged {
                 admin_plugin: "admin.plugin".into(),
                 source_ids: vec!["a-1".into(), "b-2".into()],
@@ -3176,6 +3328,7 @@ mod tests {
     #[test]
     fn client_response_subject_split_serialises() {
         let r = ClientResponse::Happening {
+            seq: 1,
             happening: HappeningWire::SubjectSplit {
                 admin_plugin: "admin.plugin".into(),
                 source_id: "a-1".into(),
@@ -3238,6 +3391,7 @@ mod tests {
     #[test]
     fn client_response_relation_suppressed_serialises() {
         let r = ClientResponse::Happening {
+            seq: 1,
             happening: HappeningWire::RelationSuppressed {
                 admin_plugin: "admin.plugin".into(),
                 source_id: "track-1".into(),
@@ -3291,6 +3445,7 @@ mod tests {
     #[test]
     fn client_response_relation_unsuppressed_serialises() {
         let r = ClientResponse::Happening {
+            seq: 1,
             happening: HappeningWire::RelationUnsuppressed {
                 admin_plugin: "admin.plugin".into(),
                 source_id: "track-1".into(),
@@ -3348,6 +3503,7 @@ mod tests {
     #[test]
     fn client_response_relation_split_ambiguous_serialises() {
         let r = ClientResponse::Happening {
+            seq: 1,
             happening: HappeningWire::RelationSplitAmbiguous {
                 admin_plugin: "admin.plugin".into(),
                 source_subject: "old-id".into(),

@@ -418,18 +418,31 @@ Request:
 { "op": "subscribe_happenings" }
 ```
 
+Or, with a cursor for replay-then-live (ADR-0017):
+
+```json
+{ "op": "subscribe_happenings", "since": 1234 }
+```
+
+`since` is optional. When omitted, the connection sees only happenings emitted after the subscribe ack — the original "live-only" behaviour. When supplied, the server queries the durable `happenings_log` for every event with `seq > since`, streams those replay frames first in ascending seq order, and only then transitions to live streaming. Live events whose seq is at or below the largest replayed seq are deduped silently; the consumer never observes the same seq twice across the boundary.
+
+A consumer reconnecting after a transient drop passes its last-observed `seq` as `since` and resumes cleanly. Cross-restart resume is supported: the bus's seq counter is durable (ADR-0016), so a `since` smaller than the steward's pre-restart current seq still resolves through the persisted window. If `since` is older than the durable retention window, the replay query returns whatever survives — older events are simply not included, and the consumer is responsible for falling back to a snapshot-style query (e.g. `list_active_custodies`) pinned to `current_seq` if a complete picture is required.
+
 The server writes three kinds of frames after accepting the subscription:
 
 **Ack** (once, immediately after the server has registered on the bus):
 
 ```json
-{ "subscribed": true }
+{ "subscribed": true, "current_seq": 42 }
 ```
+
+`current_seq` is the bus's monotonic cursor sampled at subscribe time. Pin reconcile-style queries to it: query the authoritative store, then apply happenings with `seq > current_seq` from this stream as deltas on top. `0` means no happenings have been emitted yet on the steward instance.
 
 **Happening** (streamed, one per emitted happening):
 
 ```json
 {
+  "seq": 43,
   "happening": {
     "type": "custody_taken",
     "plugin": "org.example.playback",
@@ -440,6 +453,8 @@ The server writes three kinds of frames after accepting the subscription:
   }
 }
 ```
+
+`seq` is the cursor the bus minted for this event. Strictly monotonic across one steward instance and persisted into `happenings_log` for cursor replay. Consumers should record this on every consumed frame so a subsequent reconnect can resume cleanly via `since`.
 
 The `happening` object is internally tagged by `type`. Seventeen variants ship today across five categories:
 
@@ -1187,11 +1202,21 @@ A `subscribe_happenings` connection is output-only for its lifetime. Do not send
 
 The canonical pattern for consumers that need to both display current state and react to changes live. The steward's ordering guarantees (ledger write always happens before happening emission) make this reliable:
 
-1. Open a subscription connection. Send `subscribe_happenings`. Read the `{"subscribed": true}` ack.
-2. On a second connection, issue whatever queries describe current state (`list_active_custodies`, `project_subject` for each subject you care about).
-3. Consume happenings on the subscription connection. For each happening, reconcile: if it describes a state you queried, update it; if it describes a state you did not, query it now.
+1. Open a subscription connection. Send `subscribe_happenings`. Read the `{"subscribed": true, "current_seq": N}` ack and record `N` as the snapshot pin.
+2. On a second connection, issue whatever queries describe current state (`list_active_custodies`, `project_subject` for each subject you care about). The snapshot is consistent with "everything at or before seq=N".
+3. Consume happenings on the subscription connection. Each frame carries a `seq`. Apply happenings with `seq > N` as deltas on top of the snapshot; ignore happenings with `seq <= N` as redundant (they were already reflected in the queried snapshot).
 
-Step order matters. Subscribing first guarantees no happenings are missed between query and subscription; the ack tells you the server has registered on the bus. Any happening from then on reaches you. The query after the ack captures a snapshot that is consistent with "everything before now". From that moment forward, happenings incrementally update the picture.
+Step order matters. Subscribing first guarantees no happenings are missed between query and subscription; the ack tells you the server has registered on the bus and surfaces the cursor used to pin the snapshot. Any happening from then on reaches you with a strictly increasing `seq`. From that moment forward, happenings incrementally update the picture and the consumer can persist the largest `seq` it has applied for cursor-resume on reconnect.
+
+### 7.4.1 Reconnect with `since`
+
+A consumer that previously subscribed and persisted the largest `seq` it consumed can resume cleanly after a transient disconnect or steward restart by passing that seq back as `since`:
+
+```json
+{ "op": "subscribe_happenings", "since": 137 }
+```
+
+The server replays every persisted happening with `seq > 137` first, then transitions to live streaming. Replay-vs-live overlap is deduped on the server side; the consumer does not need to track its own dedupe table. If `since` is older than the steward's durable retention window, the replay is partial — the consumer should detect that `current_seq` in the new ack is much larger than `since + replay-frame-count` and fall back to query-then-subscribe to rebuild a complete picture.
 
 Python implementation of this pattern:
 

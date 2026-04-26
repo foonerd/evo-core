@@ -120,7 +120,7 @@ use crate::catalogue::Cardinality;
 use crate::persistence::PersistenceStore;
 use crate::relations::SuppressionRecord;
 use evo_plugin_sdk::contract::{HealthStatus, SplitRelationStrategy};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -145,7 +145,7 @@ use tokio::sync::broadcast;
 /// Serialises as snake_case (`"source"` / `"target"`) on the wire
 /// for consistency with [`Cardinality`] and other rename_all =
 /// snake_case enums in the catalogue vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CardinalityViolationSide {
     /// The predicate's `source_cardinality` bound is exceeded on the
@@ -192,7 +192,7 @@ impl std::fmt::Display for CardinalityViolationSide {
 /// with snake_case discriminants. Nested inside the wire form
 /// of [`Happening::RelationForgotten`], the reason appears as a
 /// `reason` object alongside the triple identity.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RelationForgottenReason {
     /// The last claimant retracted. No claims remain; the relation
@@ -231,7 +231,7 @@ pub enum RelationForgottenReason {
 /// can be added without a breaking change.
 ///
 /// Serialises as snake_case (`"addressing"` / `"relation"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ReassignedClaimKind {
@@ -267,12 +267,37 @@ impl std::fmt::Display for ReassignedClaimKind {
 /// custodies per minute plus periodic state reports).
 pub const DEFAULT_CAPACITY: usize = 1024;
 
+/// One happening paired with the monotonic seq the bus minted for
+/// it (ADR-0017).
+///
+/// Cursor-aware consumers (the wire-protocol `subscribe_happenings`
+/// handler chief among them) subscribe via
+/// [`HappeningBus::subscribe_envelope`] and receive this envelope
+/// directly on the live broadcast. The seq is identical to the seq
+/// recorded in `happenings_log` for durable emits, so a consumer can
+/// resume across reconnect or steward restart by passing the last
+/// seq it observed back as `since`.
+///
+/// The "plain" [`HappeningBus::subscribe`] surface, retained for
+/// internal tests and non-cursor consumers, broadcasts only the
+/// happening; both channels carry exactly the same events and the
+/// same delivery guarantees, but the envelope channel is the
+/// canonical one for any external surface that needs replay-and-
+/// resume.
+#[derive(Debug, Clone)]
+pub struct HappeningEnvelope {
+    /// Monotonic cursor minted by the bus at emit time. Always > 0.
+    pub seq: u64,
+    /// The happening itself.
+    pub happening: Happening,
+}
+
 /// A fabric transition observable by happening subscribers.
 ///
 /// Marked `#[non_exhaustive]`: future passes add variants without
 /// breaking match arms on the existing custody variants. Callers
 /// matching on `Happening` MUST include a catch-all arm.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Happening {
@@ -869,7 +894,17 @@ pub enum Happening {
 /// counter but does not write through; consumers using its output
 /// have no replay guarantees.
 pub struct HappeningBus {
+    /// Plain broadcast carrying only the happening payload, kept for
+    /// internal callers and tests that observe events without caring
+    /// about the cursor (custody integration tests, the
+    /// admission-path happenings tests, etc.).
     tx: broadcast::Sender<Happening>,
+    /// Cursor-aware broadcast carrying the seq paired with the
+    /// happening. The wire-protocol `subscribe_happenings` handler
+    /// reads this channel so it can attach `seq` to every
+    /// `ClientResponse::Happening` and dedupe replay-vs-live overlap
+    /// cleanly (ADR-0017).
+    tx_env: broadcast::Sender<HappeningEnvelope>,
     /// Monotonic cursor minted on every emit. Always > 0 once a
     /// happening has been emitted.
     next_seq: AtomicU64,
@@ -882,6 +917,7 @@ impl std::fmt::Debug for HappeningBus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HappeningBus")
             .field("receiver_count", &self.tx.receiver_count())
+            .field("envelope_receiver_count", &self.tx_env.receiver_count())
             .field("next_seq", &self.next_seq.load(Ordering::Relaxed))
             .field("durable", &self.persistence.is_some())
             .finish()
@@ -909,8 +945,10 @@ impl HappeningBus {
     /// panics per tokio's contract.
     pub fn with_capacity(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
+        let (tx_env, _) = broadcast::channel(capacity);
         Self {
             tx,
+            tx_env,
             next_seq: AtomicU64::new(1),
             persistence: None,
         }
@@ -935,8 +973,10 @@ impl HappeningBus {
     ) -> Result<Self, crate::persistence::PersistenceError> {
         let max = persistence.load_max_happening_seq().await?;
         let (tx, _) = broadcast::channel(capacity);
+        let (tx_env, _) = broadcast::channel(capacity);
         Ok(Self {
             tx,
+            tx_env,
             next_seq: AtomicU64::new(max.saturating_add(1)),
             persistence: Some(persistence),
         })
@@ -957,8 +997,12 @@ impl HappeningBus {
     /// Does not block. Returns the minted seq for diagnostic use.
     pub fn emit(&self, happening: Happening) -> u64 {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        // send() returns Err(SendError(Happening)) only when no
-        // receivers exist. Expected and fine.
+        // send() returns Err(SendError(_)) only when no receivers
+        // exist on that channel. Expected and fine for both.
+        let _ = self.tx_env.send(HappeningEnvelope {
+            seq,
+            happening: happening.clone(),
+        });
         let _ = self.tx.send(happening);
         seq
     }
@@ -1005,6 +1049,10 @@ impl HappeningBus {
         persistence
             .record_happening(seq, kind, &payload, at_ms)
             .await?;
+        let _ = self.tx_env.send(HappeningEnvelope {
+            seq,
+            happening: happening.clone(),
+        });
         let _ = self.tx.send(happening);
         Ok(seq)
     }
@@ -1025,12 +1073,40 @@ impl HappeningBus {
         self.tx.subscribe()
     }
 
-    /// Number of currently-subscribed receivers.
+    /// Subscribe to happenings with the bus-minted cursor seq
+    /// attached on every event (ADR-0017).
+    ///
+    /// Returns a tokio broadcast receiver of [`HappeningEnvelope`]s.
+    /// Each envelope's `seq` is identical to the seq the bus wrote to
+    /// `happenings_log` for the same happening (when the bus has a
+    /// persistence handle). Cursor-aware consumers — primarily the
+    /// wire-protocol `subscribe_happenings` handler — use this entry
+    /// point so they can attach `seq` to every frame and dedupe
+    /// replay-vs-live overlap when a `since` cursor is supplied.
+    ///
+    /// The envelope channel is parallel to the plain
+    /// [`Self::subscribe`] channel: a single emit publishes to both,
+    /// and the channels' lagged-vs-delivered semantics are
+    /// independent. Callers that need cursor semantics MUST use this
+    /// surface; the plain channel exists for in-process consumers
+    /// that do not.
+    pub fn subscribe_envelope(&self) -> broadcast::Receiver<HappeningEnvelope> {
+        self.tx_env.subscribe()
+    }
+
+    /// Number of currently-subscribed receivers on the plain
+    /// channel.
     ///
     /// Primarily diagnostic; happenings behave the same whether or
     /// not receivers exist.
     pub fn receiver_count(&self) -> usize {
         self.tx.receiver_count()
+    }
+
+    /// Number of currently-subscribed receivers on the envelope
+    /// channel.
+    pub fn envelope_receiver_count(&self) -> usize {
+        self.tx_env.receiver_count()
     }
 
     /// Last seq value the bus would mint on the next emit (i.e.
@@ -1491,5 +1567,88 @@ mod tests {
         assert_eq!(s1, 1);
         assert_eq!(s2, 2);
         assert_eq!(bus.last_emitted_seq(), 2);
+    }
+
+    #[tokio::test]
+    async fn emit_publishes_envelope_with_minted_seq() {
+        let bus = HappeningBus::new();
+        let mut rx = bus.subscribe_envelope();
+
+        let s = bus.emit(sample_taken());
+        assert_eq!(s, 1);
+        let env = rx.recv().await.expect("envelope arrives");
+        assert_eq!(env.seq, 1, "envelope seq must match the minted seq");
+        assert!(matches!(env.happening, Happening::CustodyTaken { .. }));
+    }
+
+    #[tokio::test]
+    async fn envelope_and_plain_subscribers_see_same_event() {
+        // Both channels are populated from one emit. Order between
+        // channels is unspecified (each is its own broadcast), but
+        // both must observe the event.
+        let bus = HappeningBus::new();
+        let mut rx_plain = bus.subscribe();
+        let mut rx_env = bus.subscribe_envelope();
+
+        bus.emit(sample_taken());
+
+        let plain = rx_plain.recv().await.expect("plain arrives");
+        let env = rx_env.recv().await.expect("envelope arrives");
+        assert!(matches!(plain, Happening::CustodyTaken { .. }));
+        assert!(matches!(env.happening, Happening::CustodyTaken { .. }));
+        assert_eq!(env.seq, 1);
+    }
+
+    #[tokio::test]
+    async fn envelope_seq_strictly_monotonic_across_emits() {
+        let bus = HappeningBus::new();
+        let mut rx = bus.subscribe_envelope();
+
+        bus.emit(sample_taken());
+        bus.emit(sample_released("c-1"));
+        bus.emit(sample_released("c-2"));
+
+        let a = rx.recv().await.unwrap();
+        let b = rx.recv().await.unwrap();
+        let c = rx.recv().await.unwrap();
+        assert_eq!(a.seq, 1);
+        assert_eq!(b.seq, 2);
+        assert_eq!(c.seq, 3);
+    }
+
+    #[tokio::test]
+    async fn envelope_receiver_count_tracks_subscriptions() {
+        let bus = HappeningBus::new();
+        assert_eq!(bus.envelope_receiver_count(), 0);
+        let r1 = bus.subscribe_envelope();
+        assert_eq!(bus.envelope_receiver_count(), 1);
+        let r2 = bus.subscribe_envelope();
+        assert_eq!(bus.envelope_receiver_count(), 2);
+        drop(r1);
+        assert_eq!(bus.envelope_receiver_count(), 1);
+        drop(r2);
+        assert_eq!(bus.envelope_receiver_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn emit_durable_envelope_carries_persisted_seq() {
+        // Seq returned by emit_durable, the seq carried on the
+        // envelope, and the seq stored in happenings_log MUST agree:
+        // a consumer that records the envelope's seq and later
+        // resumes via PersistenceStore::load_happenings_since(seq, _)
+        // sees a contiguous tail with no gap or overlap.
+        let store: Arc<dyn crate::persistence::PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        let bus = HappeningBus::with_persistence(Arc::clone(&store))
+            .await
+            .expect("durable bus");
+        let mut rx = bus.subscribe_envelope();
+
+        let returned = bus.emit_durable(sample_taken()).await.expect("emit");
+        let env = rx.recv().await.expect("envelope");
+        assert_eq!(returned, env.seq);
+
+        let max = store.load_max_happening_seq().await.unwrap();
+        assert_eq!(max, env.seq);
     }
 }
