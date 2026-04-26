@@ -37,7 +37,9 @@ use crate::error::StewardError;
 use crate::happenings::HappeningBus;
 use crate::plugin_trust::PluginTrustState;
 use crate::relations::RelationGraph;
-use crate::router::{take_child, unload_handle, PluginEntry, PluginRouter};
+use crate::router::{
+    take_child, unload_handle, EnforcementPolicy, PluginEntry, PluginRouter,
+};
 use crate::state::StewardState;
 use crate::subjects::SubjectRegistry;
 use evo_plugin_sdk::contract::{
@@ -602,10 +604,11 @@ impl AdmissionEngine {
             "plugin admitted"
         );
 
-        let entry = Arc::new(PluginEntry::new(
+        let entry = Arc::new(PluginEntry::new_with_policy(
             manifest.plugin.name.clone(),
             shelf_qualified.clone(),
             handle,
+            EnforcementPolicy::from_manifest(&manifest),
         ));
         self.router.insert(entry)?;
 
@@ -725,10 +728,11 @@ impl AdmissionEngine {
             "plugin admitted"
         );
 
-        let entry = Arc::new(PluginEntry::new(
+        let entry = Arc::new(PluginEntry::new_with_policy(
             manifest.plugin.name.clone(),
             shelf_qualified.clone(),
             handle,
+            EnforcementPolicy::from_manifest(&manifest),
         ));
         self.router.insert(entry)?;
 
@@ -879,10 +883,11 @@ impl AdmissionEngine {
             "plugin admitted"
         );
 
-        let entry = Arc::new(PluginEntry::new(
+        let entry = Arc::new(PluginEntry::new_with_policy(
             manifest.plugin.name.clone(),
             shelf_qualified.clone(),
             handle,
+            EnforcementPolicy::from_manifest(&manifest),
         ));
         self.router.insert(entry)?;
 
@@ -1025,10 +1030,11 @@ impl AdmissionEngine {
             "plugin admitted"
         );
 
-        let entry = Arc::new(PluginEntry::new(
+        let entry = Arc::new(PluginEntry::new_with_policy(
             manifest.plugin.name.clone(),
             shelf_qualified.clone(),
             handle,
+            EnforcementPolicy::from_manifest(&manifest),
         ));
         self.router.insert(entry)?;
 

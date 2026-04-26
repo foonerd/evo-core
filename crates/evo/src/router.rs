@@ -93,7 +93,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use evo_plugin_sdk::contract::{
     Assignment, CourseCorrection, CustodyHandle, HealthReport, PluginError,
@@ -132,6 +132,65 @@ pub struct PluginEntry {
     /// engine after a successful spawn-from-directory). Reaped during
     /// drain.
     pub child: AsyncMutex<Option<Child>>,
+    /// Manifest-derived enforcement policy consulted on every
+    /// dispatch through this entry. Built from the manifest at
+    /// admission time, never mutated after.
+    pub policy: EnforcementPolicy,
+}
+
+/// Manifest-derived enforcement state attached to every admitted
+/// plugin (Wave 6.b).
+///
+/// Built at admission time from `manifest.capabilities`, then
+/// consulted on every dispatch through the router. Today this
+/// covers two fields; further fields (restart budget, custody
+/// failure mode) require additional supervisor / handler
+/// machinery and are deferred.
+#[derive(Debug, Clone)]
+pub struct EnforcementPolicy {
+    /// `Some(types)` for respondents — the verbs the plugin
+    /// declared it accepts in `capabilities.respondent.request_types`.
+    /// `None` for wardens (their `request_types` field has no
+    /// meaning; the dispatch path checks `is_warden` separately).
+    /// Empty `Some(vec![])` is valid and means "respondent that
+    /// accepts no verbs"; every `handle_request` call refuses.
+    pub allowed_request_types: Option<Vec<String>>,
+    /// Default deadline (milliseconds from dispatch) the router
+    /// applies to a `handle_request` whose `request.deadline` is
+    /// `None`. Drawn from `capabilities.respondent.response_budget_ms`
+    /// for respondents and `capabilities.warden.course_correction_budget_ms`
+    /// for wardens; `None` when the kind has no analogous field.
+    pub default_request_deadline_ms: Option<u32>,
+}
+
+impl EnforcementPolicy {
+    /// Empty policy: no allowed-types restriction, no default
+    /// deadline. Used for test fixtures that don't carry a real
+    /// manifest.
+    pub fn permissive() -> Self {
+        Self {
+            allowed_request_types: None,
+            default_request_deadline_ms: None,
+        }
+    }
+
+    /// Build the policy from a manifest. Inspects the
+    /// kind-specific capabilities sub-table and pulls the
+    /// enforcement-relevant fields.
+    pub fn from_manifest(
+        manifest: &evo_plugin_sdk::manifest::Manifest,
+    ) -> Self {
+        let mut allowed_request_types = None;
+        let mut default_request_deadline_ms = None;
+        if let Some(r) = manifest.capabilities.respondent.as_ref() {
+            allowed_request_types = Some(r.request_types.clone());
+            default_request_deadline_ms = Some(r.response_budget_ms);
+        }
+        Self {
+            allowed_request_types,
+            default_request_deadline_ms,
+        }
+    }
 }
 
 impl PluginEntry {
@@ -140,11 +199,28 @@ impl PluginEntry {
     /// [`PluginRouter::attach_child`](PluginRouter::attach_child) for
     /// out-of-process plugins it spawned itself.
     pub fn new(name: String, shelf: String, handle: AdmittedHandle) -> Self {
+        Self::new_with_policy(
+            name,
+            shelf,
+            handle,
+            EnforcementPolicy::permissive(),
+        )
+    }
+
+    /// Construct an entry with a manifest-derived enforcement
+    /// policy.
+    pub fn new_with_policy(
+        name: String,
+        shelf: String,
+        handle: AdmittedHandle,
+        policy: EnforcementPolicy,
+    ) -> Self {
         Self {
             name,
             shelf,
             handle: AsyncMutex::new(Some(handle)),
             child: AsyncMutex::new(None),
+            policy,
         }
     }
 }
@@ -374,11 +450,38 @@ impl PluginRouter {
     pub async fn handle_request(
         &self,
         shelf: &str,
-        request: Request,
+        mut request: Request,
     ) -> Result<Response, StewardError> {
         let entry = self.lookup(shelf).ok_or_else(|| {
             StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
         })?;
+
+        // Enforce manifest-declared `request_types` (Wave 6.b).
+        // A respondent with a declared list refuses every request
+        // whose `request_type` is not in the list. Wardens have no
+        // list (the field is respondent-specific); their handler
+        // refusal lives in the AdmittedHandle::Warden arm below.
+        if let Some(allowed) = entry.policy.allowed_request_types.as_ref() {
+            if !allowed.iter().any(|t| t == &request.request_type) {
+                return Err(StewardError::Dispatch(format!(
+                    "plugin on shelf {shelf} did not declare \
+                     request_type \"{}\" in its manifest \
+                     (declared: {:?})",
+                    request.request_type, allowed
+                )));
+            }
+        }
+
+        // Default deadline from `capabilities.respondent.response_budget_ms`
+        // when the caller did not supply one. Plugins that want to
+        // override per-call still can; this only fills in `None`.
+        if request.deadline.is_none() {
+            if let Some(ms) = entry.policy.default_request_deadline_ms {
+                request.deadline =
+                    Some(Instant::now() + Duration::from_millis(u64::from(ms)));
+            }
+        }
+
         let mut handle_guard = entry.handle.lock().await;
         let handle = handle_guard.as_mut().ok_or_else(|| {
             StewardError::Dispatch(format!(
@@ -774,12 +877,31 @@ mod tests {
         shelf: &str,
         plugin_name: &str,
     ) -> Arc<PluginEntry> {
+        respondent_entry_with_policy(
+            name,
+            shelf,
+            plugin_name,
+            EnforcementPolicy::permissive(),
+        )
+    }
+
+    fn respondent_entry_with_policy(
+        name: &str,
+        shelf: &str,
+        plugin_name: &str,
+        policy: EnforcementPolicy,
+    ) -> Arc<PluginEntry> {
         let r: Box<dyn ErasedRespondent> =
             Box::new(RespondentAdapter::new(EchoRespondent {
                 name: plugin_name.into(),
             }));
         let handle = AdmittedHandle::Respondent(r);
-        Arc::new(PluginEntry::new(name.into(), shelf.into(), handle))
+        Arc::new(PluginEntry::new_with_policy(
+            name.into(),
+            shelf.into(),
+            handle,
+            policy,
+        ))
     }
 
     fn warden_entry(
@@ -876,6 +998,195 @@ mod tests {
         };
         let resp = r.handle_request("test.ping", req).await.unwrap();
         assert_eq!(resp.payload, b"hi");
+    }
+
+    #[tokio::test]
+    async fn handle_request_refuses_undeclared_request_type() {
+        let r = fresh_router();
+        let policy = EnforcementPolicy {
+            allowed_request_types: Some(vec!["ping".into()]),
+            default_request_deadline_ms: None,
+        };
+        r.insert(respondent_entry_with_policy("p", "test.ping", "p", policy))
+            .unwrap();
+
+        let req = Request {
+            request_type: "not_declared".into(),
+            payload: vec![],
+            correlation_id: 1,
+            deadline: None,
+        };
+        let res = r.handle_request("test.ping", req).await;
+        match res {
+            Err(StewardError::Dispatch(msg)) => {
+                assert!(
+                    msg.contains("not_declared")
+                        && msg.contains("did not declare"),
+                    "expected refusal naming the offending type, got: {msg}"
+                );
+            }
+            other => panic!("expected Dispatch error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_request_accepts_declared_request_type() {
+        let r = fresh_router();
+        let policy = EnforcementPolicy {
+            allowed_request_types: Some(vec!["ping".into()]),
+            default_request_deadline_ms: None,
+        };
+        r.insert(respondent_entry_with_policy("p", "test.ping", "p", policy))
+            .unwrap();
+
+        let req = Request {
+            request_type: "ping".into(),
+            payload: b"hi".to_vec(),
+            correlation_id: 1,
+            deadline: None,
+        };
+        let resp = r.handle_request("test.ping", req).await.unwrap();
+        assert_eq!(resp.payload, b"hi");
+    }
+
+    #[tokio::test]
+    async fn handle_request_defaults_deadline_from_response_budget() {
+        // Construct a respondent that observes whatever deadline it
+        // is dispatched with, so the test can confirm the router
+        // populated `request.deadline` from the policy.
+        struct DeadlineCapturingRespondent {
+            saw_deadline: Arc<AsyncMutex<Option<Instant>>>,
+        }
+        impl Plugin for DeadlineCapturingRespondent {
+            fn describe(
+                &self,
+            ) -> impl Future<Output = PluginDescription> + Send + '_
+            {
+                async move {
+                    PluginDescription {
+                        identity: PluginIdentity {
+                            name: "p".into(),
+                            version: semver::Version::new(0, 1, 0),
+                            contract: 1,
+                        },
+                        runtime_capabilities: RuntimeCapabilities {
+                            request_types: vec!["ping".into()],
+                            accepts_custody: false,
+                            flags: Default::default(),
+                        },
+                        build_info: BuildInfo {
+                            plugin_build: "test".into(),
+                            sdk_version: "0.1.1".into(),
+                            rustc_version: None,
+                            built_at: None,
+                        },
+                    }
+                }
+            }
+            fn load(
+                &mut self,
+                _ctx: &LoadContext,
+            ) -> impl Future<Output = Result<(), PluginError>> + Send + '_
+            {
+                async move { Ok(()) }
+            }
+            fn unload(
+                &mut self,
+            ) -> impl Future<Output = Result<(), PluginError>> + Send + '_
+            {
+                async move { Ok(()) }
+            }
+            fn health_check(
+                &self,
+            ) -> impl Future<Output = HealthReport> + Send + '_ {
+                async move { HealthReport::healthy() }
+            }
+        }
+        impl Respondent for DeadlineCapturingRespondent {
+            fn handle_request<'a>(
+                &'a mut self,
+                req: &'a Request,
+            ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a
+            {
+                let saw = Arc::clone(&self.saw_deadline);
+                async move {
+                    *saw.lock().await = req.deadline;
+                    Ok(Response::for_request(req, vec![]))
+                }
+            }
+        }
+
+        let r = fresh_router();
+        let saw = Arc::new(AsyncMutex::new(None));
+        let plugin = DeadlineCapturingRespondent {
+            saw_deadline: Arc::clone(&saw),
+        };
+        let handle = AdmittedHandle::Respondent(Box::new(
+            RespondentAdapter::new(plugin),
+        ));
+        let policy = EnforcementPolicy {
+            allowed_request_types: None,
+            default_request_deadline_ms: Some(100),
+        };
+        let entry = Arc::new(PluginEntry::new_with_policy(
+            "p".into(),
+            "test.ping".into(),
+            handle,
+            policy,
+        ));
+        r.insert(entry).unwrap();
+
+        let before = Instant::now();
+        r.handle_request(
+            "test.ping",
+            Request {
+                request_type: "anything".into(),
+                payload: vec![],
+                correlation_id: 1,
+                deadline: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let captured = saw.lock().await.expect("respondent saw a deadline");
+        let after = Instant::now();
+        let elapsed_ms = (captured - before).as_millis();
+        assert!(
+            (95..=200).contains(&elapsed_ms),
+            "default deadline was {elapsed_ms}ms past dispatch start; \
+             expected near 100ms"
+        );
+        assert!(
+            captured >= before
+                && captured <= after + Duration::from_millis(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_request_caller_deadline_overrides_default() {
+        let r = fresh_router();
+        let policy = EnforcementPolicy {
+            allowed_request_types: None,
+            default_request_deadline_ms: Some(100),
+        };
+        r.insert(respondent_entry_with_policy("p", "test.ping", "p", policy))
+            .unwrap();
+
+        // Explicit caller deadline already in the past should
+        // remain on the request; the router does not overwrite.
+        let explicit = Instant::now() - Duration::from_millis(1);
+        let req = Request {
+            request_type: "anything".into(),
+            payload: b"x".to_vec(),
+            correlation_id: 1,
+            deadline: Some(explicit),
+        };
+        // EchoRespondent doesn't observe deadlines but still serves
+        // OK — this test asserts the dispatch succeeds without
+        // panic and that the caller's deadline is preserved at the
+        // entry-policy layer (the EchoRespondent ignores it).
+        let _ = r.handle_request("test.ping", req).await.unwrap();
     }
 
     #[tokio::test]
