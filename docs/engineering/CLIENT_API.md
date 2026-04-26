@@ -527,26 +527,58 @@ A consumer that requires a feature absent from the response MUST fall back to pr
 
 ## 5. Error Handling
 
-Every failure on a synchronous op surfaces as:
+Every failure on a synchronous op surfaces as a structured envelope (ADR-0013):
 
 ```json
-{ "error": "<human-readable message>" }
+{
+  "error": {
+    "class": "not_found",
+    "message": "unknown subject: track-uuid-...",
+    "details": { "subclass": "unknown_subject" }
+  }
+}
 ```
 
-The error message is advisory. Consumers should not parse it for structured information; the set of possible messages is not a stable contract. The only stable signal is the presence of the top-level `"error"` key.
+The contract is on `class` and `details.subclass`. The `message` field is advisory and may change between releases; consumers MUST NOT parse it for structured information. `details` is optional and class-specific; when omitted the envelope contains only `class` and `message`.
 
-Common error causes:
+### 5.1 Error classes
 
-| Cause | Error message shape |
-|-------|---------------------|
-| Unknown op | `"unknown op: ..."` (caught by the deserializer; message is `serde_json`-shaped) |
-| Invalid JSON | `"invalid JSON: ..."` |
-| Unknown shelf | `"no plugin on shelf: ..."` |
-| Unknown subject | `"unknown subject: ..."` |
-| Plugin error | plugin-shaped; follows the `PluginError` classification |
-| Invalid base64 | `"invalid base64 payload: ..."` |
+| Class | Meaning | Connection-fatal? | Retryable? |
+| --- | --- | --- | --- |
+| `transient` | Operation may succeed on retry without state change. | No | Yes |
+| `unavailable` | Plugin or backend currently down; retry with backoff. | No | Yes |
+| `resource_exhausted` | Quota, memory, disk; retry once pressure relieves. | No | Yes |
+| `contract_violation` | Caller violated the contract (wrong shape, wrong type). Same input will fail again. | No | No |
+| `not_found` | Addressed entity does not exist. | No | No |
+| `permission_denied` | Caller lacks the capability. | No | No |
+| `trust_violation` | Verified-identity check failed. | Yes | No |
+| `trust_expired` | Trust-chain key outside its `not_before`/`not_after` window. | Yes | No |
+| `protocol_violation` | Wire frame malformed, version handshake failed, codec disagreed. | Yes | No |
+| `misconfiguration` | Operator-level configuration error; needs operator action. | No | No |
+| `internal` | Steward invariant violated. Caller did nothing wrong. | Yes | No |
 
-Errors do NOT close the connection. A consumer may send another request on the same socket after receiving an error frame.
+"Connection-fatal" is derived from the class — there is no separate `fatal` field. A consumer that observes a fatal class on a request response SHOULD close and reopen the connection before the next request.
+
+Forward-compatibility: a consumer that observes a `class` value it does not recognise MUST treat it as `internal` and log a warning rather than crash. New classes are added only with a wire-version bump (probe via `op = "describe_capabilities"`).
+
+### 5.2 Common subclasses
+
+The `details.subclass` field refines the class for the most common errors. Names are stable; new subclasses are added additively.
+
+| Class | Subclass | When |
+| --- | --- | --- |
+| `protocol_violation` | `invalid_json` | The request frame was not parsable as JSON or the `op` was unknown. |
+| `contract_violation` | `invalid_base64` | The `payload_b64` field was not valid base64. |
+| `not_found` | `unknown_subject` | The queried `canonical_id` or `subject_id` is not in the registry. |
+| `internal` | `replay_decode_failed` | A persisted happening could not be deserialised during cursor replay (steward-side bug). |
+| `internal` | `replay_query_failed` | Persistence failure during cursor replay; treat as transient operationally even though the class is `internal`. |
+| `internal` | `alias_terminal_missing` | Alias chain promised a terminal that the registry no longer has (race; consumer should retry). |
+| `internal` | `alias_lookup_failed` | Alias-aware lookup raised an unexpected error. |
+| `trust_violation` | `admin_trust_too_low` | A plugin declared `capabilities.admin = true` below the admin trust minimum (configuration-time error surfaced at admission). |
+
+### 5.3 Connection lifetime under errors
+
+Errors do NOT close the connection on their own. A consumer MAY send another request on the same socket after receiving any error frame; only when `class` is connection-fatal should the consumer close and reconnect.
 
 On a streaming subscription, errors are not expected: once the server has written the `{"subscribed": true}` ack, the connection is in the output-only loop and the server only writes `happening` or `lagged` frames. A malformed client frame on a subscribed connection is simply ignored (the server does not read from that connection after subscription starts).
 

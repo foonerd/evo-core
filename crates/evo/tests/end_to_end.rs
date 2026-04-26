@@ -192,13 +192,15 @@ async fn unknown_shelf_returns_structured_error() {
     let response_body = read_frame(&mut stream).await;
     let response_value: serde_json::Value =
         serde_json::from_slice(&response_body).expect("JSON");
+    let err = response_value.get("error").expect("structured error");
     assert!(
-        response_value
-            .get("error")
-            .and_then(|v| v.as_str())
-            .is_some(),
-        "expected error field in response, got: {}",
+        err.get("class").and_then(|v| v.as_str()).is_some(),
+        "expected ADR-0013 structured error envelope, got: {}",
         String::from_utf8_lossy(&response_body)
+    );
+    assert!(
+        err.get("message").and_then(|v| v.as_str()).is_some(),
+        "structured error must carry a message"
     );
 
     drop(stream);
@@ -306,19 +308,25 @@ async fn project_subject_roundtrips_through_socket() {
     assert_eq!(related[0]["target_id"].as_str(), Some(album_id.as_str()));
     assert_eq!(related[0]["target_type"].as_str(), Some("album"));
 
-    // Unknown subject yields an error response.
+    // Unknown subject yields a structured error response (ADR-0013).
     let bad_req = r#"{"op":"project_subject","canonical_id":"not-a-real-id"}"#;
     write_frame(&mut stream, bad_req.as_bytes()).await;
     let body = read_frame(&mut stream).await;
     let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
-    assert!(
-        v["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("unknown subject"),
-        "expected unknown subject error, got: {}",
+    assert_eq!(
+        v["error"]["class"].as_str(),
+        Some("not_found"),
+        "expected NotFound class, got: {}",
         String::from_utf8_lossy(&body)
     );
+    assert_eq!(
+        v["error"]["details"]["subclass"].as_str(),
+        Some("unknown_subject")
+    );
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("unknown subject"));
 
     drop(stream);
     let _ = shutdown_tx.send(());
@@ -506,10 +514,15 @@ async fn invalid_op_returns_structured_error() {
     write_frame(&mut stream, bad_req.as_bytes()).await;
     let body = read_frame(&mut stream).await;
     let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
-    assert!(
-        v["error"].as_str().is_some(),
-        "expected error response, got: {}",
+    assert_eq!(
+        v["error"]["class"].as_str(),
+        Some("protocol_violation"),
+        "expected ProtocolViolation for unknown op, got: {}",
         String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        v["error"]["details"]["subclass"].as_str(),
+        Some("invalid_json")
     );
 
     drop(stream);
@@ -1271,15 +1284,22 @@ async fn project_subject_returns_not_found_for_unknown_id_no_alias() {
     let body = read_frame(&mut stream).await;
     let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
 
-    // Existing NotFound shape: error string, no aliased_from key.
-    assert!(
-        v["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("unknown subject"),
-        "expected unknown subject error, got: {}",
+    // ADR-0013 NotFound shape: structured error envelope, no
+    // aliased_from key.
+    assert_eq!(
+        v["error"]["class"].as_str(),
+        Some("not_found"),
+        "expected NotFound class, got: {}",
         String::from_utf8_lossy(&body)
     );
+    assert_eq!(
+        v["error"]["details"]["subclass"].as_str(),
+        Some("unknown_subject")
+    );
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("unknown subject"));
     assert!(
         v.get("aliased_from").is_none(),
         "aliased_from must be absent when the queried ID is genuinely \

@@ -1,5 +1,6 @@
 //! Steward error type.
 
+use crate::error_taxonomy::{ApiError, ErrorClass};
 use evo_plugin_sdk::manifest::TrustClass;
 use thiserror::Error;
 
@@ -96,5 +97,54 @@ impl StewardError {
             context: context.into(),
             source,
         }
+    }
+
+    /// Map a [`StewardError`] to its ADR-0013 [`ErrorClass`].
+    ///
+    /// Heuristic, not contractual: variants whose semantics will be
+    /// rebased onto a richer internal taxonomy in a future pass
+    /// currently land on the closest broad class. The mapping is
+    /// deterministic and stable so consumers reading
+    /// [`ApiError::class`] on the wire can rely on it.
+    pub fn classify(&self) -> ErrorClass {
+        match self {
+            Self::Config(_) => ErrorClass::Misconfiguration,
+            Self::Catalogue(_) => ErrorClass::Misconfiguration,
+            Self::Admission(_) => ErrorClass::ContractViolation,
+            Self::Dispatch(_) => ErrorClass::ContractViolation,
+            Self::Io { .. } => ErrorClass::Internal,
+            Self::Manifest(_) => ErrorClass::Misconfiguration,
+            Self::Plugin(_) => ErrorClass::Internal,
+            Self::Toml { .. } => ErrorClass::Misconfiguration,
+            Self::AdminTrustTooLow { .. } => ErrorClass::TrustViolation,
+        }
+    }
+}
+
+impl From<&StewardError> for ApiError {
+    fn from(e: &StewardError) -> Self {
+        let mut err = ApiError::new(e.classify(), e.to_string());
+        // Surface structured fields on classes that already carry
+        // them so consumers can act without parsing the message.
+        if let StewardError::AdminTrustTooLow {
+            plugin_name,
+            effective,
+            minimum,
+        } = e
+        {
+            err = err.with_details(serde_json::json!({
+                "subclass": "admin_trust_too_low",
+                "plugin_name": plugin_name,
+                "effective": format!("{effective:?}"),
+                "minimum": format!("{minimum:?}"),
+            }));
+        }
+        err
+    }
+}
+
+impl From<StewardError> for ApiError {
+    fn from(e: StewardError) -> Self {
+        (&e).into()
     }
 }

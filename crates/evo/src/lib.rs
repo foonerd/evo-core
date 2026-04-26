@@ -74,6 +74,7 @@ pub mod config;
 pub mod context;
 pub mod custody;
 pub mod error;
+pub mod error_taxonomy;
 pub mod happenings;
 pub mod logging;
 pub mod persistence;

@@ -169,6 +169,7 @@ use crate::catalogue::Cardinality;
 use crate::context::RegistrySubjectQuerier;
 use crate::custody::{CustodyRecord, StateSnapshot};
 use crate::error::StewardError;
+use crate::error_taxonomy::{ApiError, ErrorClass};
 use crate::happenings::{
     CardinalityViolationSide, Happening, ReassignedClaimKind,
     RelationForgottenReason,
@@ -483,9 +484,16 @@ enum ClientResponse {
         lagged: u64,
     },
     /// Any failure.
+    ///
+    /// The `error` envelope is structured per ADR-0013: it carries
+    /// a top-level `class` (one of eleven taxonomy classes), a
+    /// human-readable `message`, and an optional `details` object
+    /// (typically `{ "subclass": "..." }` plus class-specific
+    /// fields). Consumers act on `class` and `details.subclass`,
+    /// not on the `message` text.
     Error {
-        /// Human-readable error message.
-        error: String,
+        /// Structured error payload.
+        error: ApiError,
     },
 }
 
@@ -1598,7 +1606,11 @@ async fn handle_connection(
                 write_response_frame(
                     &mut stream,
                     &ClientResponse::Error {
-                        error: format!("invalid JSON: {e}"),
+                        error: ApiError::new(
+                            ErrorClass::ProtocolViolation,
+                            format!("invalid JSON: {e}"),
+                        )
+                        .with_subclass("invalid_json"),
                     },
                 )
                 .await?;
@@ -1734,8 +1746,11 @@ async fn dispatch_request(
             // Defensive: surface an error rather than panicking in case
             // a future refactor moves the intercept.
             ClientResponse::Error {
-                error: "internal: subscribe_happenings reached dispatch path"
-                    .into(),
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    "internal: subscribe_happenings reached dispatch path",
+                )
+                .with_subclass("dispatch_misroute"),
             }
         }
     }
@@ -1813,11 +1828,15 @@ async fn run_subscription(
                             Ok(h) => h,
                             Err(e) => {
                                 let frame = ClientResponse::Error {
-                                    error: format!(
-                                        "replay decode failed at seq \
-                                         {}: {e}",
-                                        row.seq
-                                    ),
+                                    error: ApiError::new(
+                                        ErrorClass::Internal,
+                                        format!(
+                                            "replay decode failed at seq \
+                                             {}: {e}",
+                                            row.seq
+                                        ),
+                                    )
+                                    .with_subclass("replay_decode_failed"),
                                 };
                                 let _ =
                                     write_response_frame(&mut stream, &frame)
@@ -1839,7 +1858,11 @@ async fn run_subscription(
             }
             Err(e) => {
                 let frame = ClientResponse::Error {
-                    error: format!("replay query failed: {e}"),
+                    error: ApiError::new(
+                        ErrorClass::Internal,
+                        format!("replay query failed: {e}"),
+                    )
+                    .with_subclass("replay_query_failed"),
                 };
                 let _ = write_response_frame(&mut stream, &frame).await;
                 return Ok(());
@@ -1898,7 +1921,11 @@ async fn handle_plugin_request(
         Ok(p) => p,
         Err(e) => {
             return ClientResponse::Error {
-                error: format!("invalid base64 payload: {e}"),
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!("invalid base64 payload: {e}"),
+                )
+                .with_subclass("invalid_base64"),
             };
         }
     };
@@ -1918,7 +1945,7 @@ async fn handle_plugin_request(
             payload_b64: B64.encode(&resp.payload),
         },
         Err(e) => ClientResponse::Error {
-            error: format!("{e}"),
+            error: ApiError::from(&e),
         },
     }
 }
@@ -1963,7 +1990,11 @@ async fn handle_project_subject(
         Ok(r) => r,
         Err(e) => {
             return ClientResponse::Error {
-                error: format!("describe_subject_with_aliases: {e}"),
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("describe_subject_with_aliases: {e}"),
+                )
+                .with_subclass("alias_lookup_failed"),
             };
         }
     };
@@ -1976,7 +2007,11 @@ async fn handle_project_subject(
                 Ok(p) => ClientResponse::Projection(p.into()),
                 Err(ProjectionError::UnknownSubject(id)) => {
                     ClientResponse::Error {
-                        error: format!("unknown subject: {id}"),
+                        error: ApiError::new(
+                            ErrorClass::NotFound,
+                            format!("unknown subject: {id}"),
+                        )
+                        .with_subclass("unknown_subject"),
                     }
                 }
             }
@@ -2008,10 +2043,14 @@ async fn handle_project_subject(
                         // returning subject:null.
                         Err(ProjectionError::UnknownSubject(id)) => {
                             return ClientResponse::Error {
-                                error: format!(
-                                    "alias terminal vanished during \
-                                     projection: {id}"
-                                ),
+                                error: ApiError::new(
+                                    ErrorClass::Internal,
+                                    format!(
+                                        "alias terminal vanished during \
+                                         projection: {id}"
+                                    ),
+                                )
+                                .with_subclass("alias_terminal_missing"),
                             };
                         }
                     }
@@ -2028,17 +2067,27 @@ async fn handle_project_subject(
             }
         }
         SubjectQueryResult::NotFound => {
-            // Preserve the existing not-found shape verbatim: no
-            // `aliased_from` field, identical error text.
+            // Preserve the existing not-found message verbatim under
+            // the structured ApiError envelope. The message text is
+            // advisory; consumers act on `class` and
+            // `details.subclass`.
             ClientResponse::Error {
-                error: format!("unknown subject: {canonical_id}"),
+                error: ApiError::new(
+                    ErrorClass::NotFound,
+                    format!("unknown subject: {canonical_id}"),
+                )
+                .with_subclass("unknown_subject"),
             }
         }
         // `SubjectQueryResult` is `#[non_exhaustive]` per the SDK
         // contract: future variants must surface as a structured
         // error on this old client API rather than panicking.
         _ => ClientResponse::Error {
-            error: "unsupported SubjectQueryResult variant".to_string(),
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "unsupported SubjectQueryResult variant",
+            )
+            .with_subclass("unsupported_variant"),
         },
     }
 }
@@ -2071,7 +2120,11 @@ async fn handle_describe_alias(
                 result,
             },
             Err(e) => ClientResponse::Error {
-                error: format!("describe_subject_with_aliases: {e}"),
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("describe_subject_with_aliases: {e}"),
+                )
+                .with_subclass("alias_lookup_failed"),
             },
         }
     } else {
@@ -2116,7 +2169,11 @@ async fn handle_describe_alias(
                 }
             }
             Err(e) => ClientResponse::Error {
-                error: format!("describe_alias: {e}"),
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("describe_alias: {e}"),
+                )
+                .with_subclass("alias_lookup_failed"),
             },
         }
     }
@@ -2304,13 +2361,35 @@ mod tests {
     }
 
     #[test]
-    fn client_response_error_serialises() {
+    fn client_response_error_serialises_structured_envelope() {
         let r = ClientResponse::Error {
-            error: "nope".into(),
+            error: ApiError::new(ErrorClass::ContractViolation, "nope")
+                .with_subclass("invalid_request"),
         };
         let s = serde_json::to_string(&r).unwrap();
-        assert!(s.contains("error"));
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error"]["class"].as_str(), Some("contract_violation"));
+        assert_eq!(v["error"]["message"].as_str(), Some("nope"));
+        assert_eq!(
+            v["error"]["details"]["subclass"].as_str(),
+            Some("invalid_request")
+        );
         assert!(!s.contains("payload_b64"));
+    }
+
+    #[test]
+    fn client_response_error_omits_details_when_none() {
+        let r = ClientResponse::Error {
+            error: ApiError::new(ErrorClass::NotFound, "missing"),
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error"]["class"].as_str(), Some("not_found"));
+        assert_eq!(v["error"]["message"].as_str(), Some("missing"));
+        assert!(
+            v["error"].get("details").is_none(),
+            "details key omitted when None"
+        );
     }
 
     #[test]
