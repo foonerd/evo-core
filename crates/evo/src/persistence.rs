@@ -93,6 +93,19 @@ pub const SCHEMA_VERSION_META: u32 = 3;
 /// participating in an unresolved conflict.
 pub const SCHEMA_VERSION_PENDING_CONFLICTS: u32 = 4;
 
+/// Schema version: covering index for ordered live-subject scans.
+///
+/// Adds `idx_subjects_live_by_creation`, a partial index on
+/// `subjects(created_at_ms) WHERE forgotten_at_ms IS NULL`. The
+/// original `idx_subjects_live` (a partial index on
+/// `forgotten_at_ms`) supports liveness filtering but is degenerate
+/// for `ORDER BY created_at_ms`: every row carries the same key
+/// (NULL), so the planner sorts at query time. The new index lets
+/// `load_all_subjects_query`'s ordered scan walk the b-tree directly,
+/// removing the sort step on boot-time rehydration. No data shape
+/// change; pure perf polish.
+pub const SCHEMA_VERSION_SUBJECTS_LIVE_BY_CREATION: u32 = 5;
+
 /// Maximum schema version this build of the steward understands.
 ///
 /// On open, [`SqlitePersistenceStore`] refuses to operate on a
@@ -100,7 +113,8 @@ pub const SCHEMA_VERSION_PENDING_CONFLICTS: u32 = 4;
 /// than this constant. Downgrades are not supported; an operator
 /// running an older steward against a newer database must restore
 /// from a pre-upgrade backup.
-pub const SUPPORTED_SCHEMA_VERSION: u32 = SCHEMA_VERSION_PENDING_CONFLICTS;
+pub const SUPPORTED_SCHEMA_VERSION: u32 =
+    SCHEMA_VERSION_SUBJECTS_LIVE_BY_CREATION;
 
 /// Logical keys used in the `meta` table. Constants are kept in one
 /// place so a misspelling produces a compile error rather than a
@@ -128,6 +142,10 @@ const MIGRATION_003_META: &str = include_str!("../migrations/003_meta.sql");
 /// SQL text of the v4 migration: pending multi-subject conflicts.
 const MIGRATION_004_PENDING_CONFLICTS: &str =
     include_str!("../migrations/004_pending_conflicts.sql");
+
+/// SQL text of the v5 migration: ordered live-subject covering index.
+const MIGRATION_005_SUBJECTS_LIVE_BY_CREATION: &str =
+    include_str!("../migrations/005_subjects_live_by_creation.sql");
 
 /// Errors raised by the persistence layer.
 ///
@@ -963,6 +981,14 @@ fn run_migrations(conn: &mut Connection) -> Result<(), PersistenceError> {
         conn.execute_batch(MIGRATION_004_PENDING_CONFLICTS)
             .map_err(|e| PersistenceError::MigrationFailed {
                 version: SCHEMA_VERSION_PENDING_CONFLICTS,
+                source: e,
+            })?;
+    }
+
+    if current < SCHEMA_VERSION_SUBJECTS_LIVE_BY_CREATION {
+        conn.execute_batch(MIGRATION_005_SUBJECTS_LIVE_BY_CREATION)
+            .map_err(|e| PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_SUBJECTS_LIVE_BY_CREATION,
                 source: e,
             })?;
     }
