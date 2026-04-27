@@ -387,6 +387,20 @@ pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
 /// `next_cursor` is null, not the per-page count.
 pub const MAX_LIST_PAGE_SIZE: usize = 1000;
 
+/// Hard upper bound on `project_subject`'s `scope.max_depth`.
+/// Caller-supplied values above this are silently clamped. Five
+/// real chain tiers exist in any sensible deployment; depth 32
+/// leaves headroom while bounding worst-case traversal cost
+/// against an adversarial local-socket peer requesting
+/// `max_depth = usize::MAX`.
+pub const MAX_PROJECTION_DEPTH: usize = 32;
+
+/// Hard upper bound on `project_subject`'s `scope.max_visits`.
+/// Caller-supplied values above this are silently clamped. The
+/// limit caps the number of distinct subjects walked per request,
+/// preventing a peer from forcing a worst-case full-graph traversal.
+pub const MAX_PROJECTION_VISITS: usize = 100_000;
+
 /// Default for [`ClientRequest::ProjectSubject::follow_aliases`].
 /// Auto-follow is the consumer-friendly default: callers holding a
 /// stale canonical ID get the terminal subject without a second
@@ -449,19 +463,24 @@ impl From<WalkDirectionWire> for WalkDirection {
 
 impl From<ProjectionScopeWire> for ProjectionScope {
     fn from(w: ProjectionScopeWire) -> Self {
-        let mut scope = ProjectionScope {
+        // Caller-supplied bounds are clamped to the steward's hard
+        // limits ([`MAX_PROJECTION_DEPTH`], [`MAX_PROJECTION_VISITS`]).
+        // A peer requesting `usize::MAX` for either knob is silently
+        // capped; the contract is "walk what fits within the cap" not
+        // "honour any request the caller can encode". Mirrors the
+        // `clamp_page_size` pattern used by the paginated list ops.
+        ProjectionScope {
             relation_predicates: w.relation_predicates,
             direction: w.direction.into(),
-            max_depth: crate::projections::DEFAULT_MAX_DEPTH,
-            max_visits: crate::projections::DEFAULT_MAX_VISITS,
-        };
-        if let Some(d) = w.max_depth {
-            scope.max_depth = d;
+            max_depth: w
+                .max_depth
+                .unwrap_or(crate::projections::DEFAULT_MAX_DEPTH)
+                .min(MAX_PROJECTION_DEPTH),
+            max_visits: w
+                .max_visits
+                .unwrap_or(crate::projections::DEFAULT_MAX_VISITS)
+                .min(MAX_PROJECTION_VISITS),
         }
-        if let Some(v) = w.max_visits {
-            scope.max_visits = v;
-        }
-        scope
     }
 }
 
@@ -3543,6 +3562,23 @@ mod tests {
         let d: ProjectionScope = w.into();
         assert_eq!(d.max_depth, 7);
         assert_eq!(d.max_visits, 42);
+    }
+
+    #[test]
+    fn projection_scope_wire_clamps_max_depth_and_max_visits() {
+        // A peer requesting `usize::MAX` for either knob must be
+        // silently capped at the steward's hard limits. Without
+        // this clamp a single local-socket request could force a
+        // worst-case full-graph traversal.
+        let w = ProjectionScopeWire {
+            relation_predicates: vec!["a".into()],
+            direction: WalkDirectionWire::Forward,
+            max_depth: Some(usize::MAX),
+            max_visits: Some(usize::MAX),
+        };
+        let d: ProjectionScope = w.into();
+        assert_eq!(d.max_depth, MAX_PROJECTION_DEPTH);
+        assert_eq!(d.max_visits, MAX_PROJECTION_VISITS);
     }
 
     #[test]

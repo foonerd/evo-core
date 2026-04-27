@@ -941,3 +941,295 @@ fn operator_root_signature_is_preferred_when_present() {
     .expect("operator root should admit even with broken vendor chain");
     assert_eq!(outcome.effective_trust, TrustClass::Platform);
 }
+
+// -------------------------------------------------------------------
+// Operator-root override still validates the chain.
+// -------------------------------------------------------------------
+
+/// A key declares `role = operator_root` AND `signed_by =
+/// <missing_parent>`. The override path used to short-circuit
+/// chain validation; after the fix the chain walk runs and refuses
+/// the bundle because the declared parent is absent from the trust
+/// set. Closes the bypass where an operator-root-claimed key with
+/// a fake parent could admit anything.
+#[test]
+fn operator_root_override_runs_chain_walk_and_rejects_missing_parent() {
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+    let key = sign_key(KEY_OPERATOR_SEED);
+
+    write_bundle(plugin_dir.path(), b"artefact-bytes");
+    write_signature(plugin_dir.path(), &key);
+
+    // operator_root with a `signed_by` that points at a key not
+    // present in the trust set. A genuine operator root would have
+    // `signed_by = None`; this fixture models the bypass attempt.
+    install_key_full(
+        trust_etc.path(),
+        "rogue_operator",
+        &key,
+        &["org.example.*"],
+        "platform",
+        Some("operator_rogue"),
+        Some("missing_vendor_parent"),
+        None,
+        Some("operator_root"),
+        None,
+        None,
+    );
+
+    let keys = load_trust_root(trust_opt.path(), trust_etc.path()).unwrap();
+    let paths = BundlePaths::for_dir(plugin_dir.path());
+    let bundle = paths.bundle("org.example.echo", TrustClass::Platform);
+
+    match verify_out_of_process_bundle(
+        &bundle,
+        &keys,
+        &RevocationSet::default(),
+        permissive_opts(),
+    ) {
+        Err(TrustError::ChainBroken { detail }) => {
+            assert!(
+                detail.contains("missing_vendor_parent"),
+                "ChainBroken detail should name the missing parent, got {detail:?}"
+            );
+        }
+        other => panic!("expected ChainBroken, got {other:?}"),
+    }
+}
+
+/// Sanity: a genuine operator-root (`signed_by = None`) still
+/// admits unchanged. The chain walk on a root is trivially
+/// `Ok(())`.
+#[test]
+fn genuine_operator_root_still_admits_after_chain_walk_added() {
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+    let key = sign_key(KEY_OPERATOR_SEED);
+
+    write_bundle(plugin_dir.path(), b"artefact-bytes");
+    write_signature(plugin_dir.path(), &key);
+
+    install_key_full(
+        trust_etc.path(),
+        "operator",
+        &key,
+        &["org.example.*"],
+        "platform",
+        Some("operator_root"),
+        None, // genuine root: no signed_by
+        None,
+        Some("operator_root"),
+        None,
+        None,
+    );
+
+    let keys = load_trust_root(trust_opt.path(), trust_etc.path()).unwrap();
+    let paths = BundlePaths::for_dir(plugin_dir.path());
+    let bundle = paths.bundle("org.example.echo", TrustClass::Platform);
+
+    let outcome = verify_out_of_process_bundle(
+        &bundle,
+        &keys,
+        &RevocationSet::default(),
+        permissive_opts(),
+    )
+    .expect("genuine operator root should still admit");
+    assert_eq!(outcome.effective_trust, TrustClass::Platform);
+}
+
+// -------------------------------------------------------------------
+// Rotation override enforces intersection of authorisations.
+// -------------------------------------------------------------------
+
+/// OLD key authorises `org.foo.*` only; NEW key widens to
+/// `org.foo.*` and `org.bar.*`. A bundle named `org.bar.something`
+/// signed by OLD inside the overlap window must be REJECTED: the
+/// OLD key's intent (what the operator originally signed off on)
+/// did not include `org.bar.*`. Without the intersection check the
+/// bundle would inherit NEW's broader prefix list.
+#[test]
+fn rotation_override_rejects_name_outside_old_keys_prefix_list() {
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+    let old = sign_key(KEY_OLD_SEED);
+    let new = sign_key(KEY_NEW_SEED);
+    let parent = sign_key(KEY_PARENT_SEED);
+
+    // Bundle whose plugin.name is `org.example.echo` but whose
+    // sidecar declares OLD's authorisation only covers
+    // `org.example.*`. To exercise the bug we need a name covered
+    // by NEW but NOT by OLD; install OLD and NEW with disjoint
+    // prefix lists and use a manifest whose name matches NEW only.
+    //
+    // The shared MANIFEST_ECHO names `org.example.echo`, so put
+    // OLD on `org.foo.*` and NEW on both `org.foo.*` and
+    // `org.example.*`. The bundle's name (`org.example.echo`)
+    // matches NEW but not OLD; the override path must refuse.
+    write_bundle(plugin_dir.path(), b"artefact-bytes");
+    write_signature(plugin_dir.path(), &old);
+
+    // OLD valid 2026..2027, signed by parent so its chain is
+    // inspectable; we expire the parent so OLD's chain fails and
+    // the verifier consults the rotation predecessor path.
+    install_key_full(
+        trust_opt.path(),
+        "old",
+        &old,
+        &["org.foo.*"],
+        "platform",
+        Some("vendor_old"),
+        Some("expired_parent"),
+        None,
+        Some("vendor"),
+        Some("2026-01-01T00:00:00Z"),
+        Some("2027-01-01T00:00:00Z"),
+    );
+    install_key_full(
+        trust_opt.path(),
+        "expired_parent",
+        &parent,
+        &["*"],
+        "platform",
+        Some("expired_parent"),
+        None,
+        None,
+        Some("distribution_root"),
+        Some("2020-01-01T00:00:00Z"),
+        Some("2020-06-01T00:00:00Z"),
+    );
+    // NEW supersedes OLD; valid 2026-06-01..2028; chain ends at a
+    // healthy root via no `signed_by`.
+    install_key_full(
+        trust_opt.path(),
+        "new",
+        &new,
+        &["org.foo.*", "org.example.*"],
+        "platform",
+        Some("vendor_new"),
+        None,
+        Some("vendor_old"),
+        Some("operator_root"),
+        Some("2026-06-01T00:00:00Z"),
+        Some("2028-01-01T00:00:00Z"),
+    );
+
+    let keys = load_trust_root(trust_opt.path(), trust_etc.path()).unwrap();
+    let paths = BundlePaths::for_dir(plugin_dir.path());
+    let bundle = paths.bundle("org.example.echo", TrustClass::Standard);
+
+    let now = at("2026-09-01T00:00:00Z");
+    match verify_out_of_process_bundle_at(
+        &bundle,
+        &keys,
+        &RevocationSet::default(),
+        permissive_opts(),
+        now,
+    ) {
+        Err(TrustError::NameNotAuthorised { name, key_basename }) => {
+            assert_eq!(name, "org.example.echo");
+            assert_eq!(
+                key_basename, "old",
+                "the OLD key should be cited as the limiting authority"
+            );
+        }
+        other => panic!(
+            "expected NameNotAuthorised from old's prefix list, got {other:?}"
+        ),
+    }
+}
+
+/// OLD authorises up to `unprivileged` (less privileged ceiling);
+/// NEW widens to `platform` (more privileged ceiling). A bundle
+/// signed by OLD declaring `trust.class = platform` must be
+/// REJECTED in strict mode: the intersection ceiling is OLD's
+/// `unprivileged` cap, and `platform` is more privileged than
+/// `unprivileged`.
+#[test]
+fn rotation_override_clamps_max_trust_class_to_old_keys_ceiling() {
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+    let old = sign_key(KEY_OLD_SEED);
+    let new = sign_key(KEY_NEW_SEED);
+    let parent = sign_key(KEY_PARENT_SEED);
+
+    write_bundle(plugin_dir.path(), b"artefact-bytes");
+    write_signature(plugin_dir.path(), &old);
+
+    install_key_full(
+        trust_opt.path(),
+        "old",
+        &old,
+        &["org.example.*"],
+        "unprivileged",
+        Some("vendor_old"),
+        Some("expired_parent"),
+        None,
+        Some("vendor"),
+        Some("2026-01-01T00:00:00Z"),
+        Some("2027-01-01T00:00:00Z"),
+    );
+    install_key_full(
+        trust_opt.path(),
+        "expired_parent",
+        &parent,
+        &["*"],
+        "platform",
+        Some("expired_parent"),
+        None,
+        None,
+        Some("distribution_root"),
+        Some("2020-01-01T00:00:00Z"),
+        Some("2020-06-01T00:00:00Z"),
+    );
+    install_key_full(
+        trust_opt.path(),
+        "new",
+        &new,
+        &["org.example.*"],
+        "platform",
+        Some("vendor_new"),
+        None,
+        Some("vendor_old"),
+        Some("operator_root"),
+        Some("2026-06-01T00:00:00Z"),
+        Some("2028-01-01T00:00:00Z"),
+    );
+
+    let keys = load_trust_root(trust_opt.path(), trust_etc.path()).unwrap();
+    let paths = BundlePaths::for_dir(plugin_dir.path());
+    // Bundle declares `platform` (most privileged class).
+    let bundle = paths.bundle("org.example.echo", TrustClass::Platform);
+
+    let now = at("2026-09-01T00:00:00Z");
+    match verify_out_of_process_bundle_at(
+        &bundle,
+        &keys,
+        &RevocationSet::default(),
+        TrustOptions {
+            allow_unsigned: false,
+            // Strict so the ceiling violation surfaces as an error
+            // rather than degrading silently.
+            degrade_trust: false,
+        },
+        now,
+    ) {
+        Err(TrustError::TrustClassNotAuthorised { declared, max, key }) => {
+            assert_eq!(declared, TrustClass::Platform);
+            assert_eq!(
+                max,
+                TrustClass::Unprivileged,
+                "intersection ceiling is the OLD key's `unprivileged` cap"
+            );
+            assert_eq!(
+                key, "old",
+                "the OLD key should be cited as the limiting authority"
+            );
+        }
+        other => panic!("expected TrustClassNotAuthorised, got {other:?}"),
+    }
+}

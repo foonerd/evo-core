@@ -636,8 +636,8 @@ Every request carries an `op` discriminator.
 | `scope` | object | no | - | Omit for no relation traversal. |
 | `scope.relation_predicates` | array\<string\> | no | `[]` | Predicates to traverse. |
 | `scope.direction` | string | no | `"forward"` | `forward`, `inverse`, or `both`. |
-| `scope.max_depth` | u32 | no | `1` | Traversal depth limit. |
-| `scope.max_visits` | u32 | no | `1000` | Total visit cap across the walk. |
+| `scope.max_depth` | u32 | no | `1` | Traversal depth limit. Caller-supplied values above the steward's hard cap (32) are silently clamped. |
+| `scope.max_visits` | u32 | no | `1000` | Total visit cap across the walk. Caller-supplied values above the steward's hard cap (100 000) are silently clamped. |
 | `follow_aliases` | bool | no | `true` | Auto-follow alias chains for stale canonical IDs. When `false`, a queried ID retired by merge or split returns `subject: null` plus the populated `aliased_from` so the consumer chooses how to follow. |
 
 **`op = "describe_alias"`**:

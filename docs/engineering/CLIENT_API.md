@@ -673,6 +673,8 @@ The `granted` array carries the subset the steward grants per the operator-contr
 
 The default ACL grants `resolve_claimants` only when the connecting peer's effective UID matches the steward's UID; non-local-UID consumers (frontend processes running as a separate service user, bridges) require explicit `allow_uids`/`allow_gids` entries in the ACL file. A consumer that asked for a capability the operator denied will see it absent from `granted`; the steward returns no other diagnostic.
 
+The ACL file parser is strict: unknown fields and unknown sections (e.g. `allow_uds = [0]` instead of `allow_uids = [0]`, or `[capabilities.resolve_claims]` instead of `[capabilities.resolve_claimants]`) abort the steward at boot with an error naming the offending name. A typo no longer silently default-denies.
+
 ### 4.8 `op = "resolve_claimants"`
 
 Exchange opaque `claimant_token` values for plain plugin names and (when available) versions. Resolution requires the `resolve_claimants` capability to have been granted on the connection via `op = "negotiate"`; without it the op refuses with `permission_denied` (subclass `resolve_claimants_not_granted`).

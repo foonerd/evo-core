@@ -449,7 +449,9 @@ reason = "CVE-2026-1234"
 effective_after = "2026-04-01T00:00:00Z"
 ```
 
-Revocations are checked at every plugin load and at every admission.
+Revocations are checked at every plugin load and at every admission. The loader is **strict**: any `[[revoke]]` entry whose `digest` is not the literal form `sha256:` followed by 64 lowercase hex characters aborts the load with a structured error naming the offending entry's 1-based index. A typo on a revocation line is surfaced at boot rather than silently leaving the corresponding bundle admissible.
+
+Sidecar `*.meta.toml` files and the `revocations.toml` file both reject **unknown fields and unknown tables** at parse time. A typo such as `[authorization]` instead of `[authorisation]`, or `digestt` instead of `digest`, fails the load loudly with the unknown name in the error message.
 
 ## 6. The Plugins Rack
 

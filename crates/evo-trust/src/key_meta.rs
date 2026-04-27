@@ -42,7 +42,13 @@ use subtle::ConstantTimeEq;
 use crate::error::TrustError;
 
 /// TOML shape in `<stem>.meta.toml` beside `<stem>.pem`.
+///
+/// Unknown top-level tables or keys are rejected at parse time.
+/// A typo such as `[authorization]` instead of `[authorisation]`
+/// fails the trust-root load loudly instead of silently producing
+/// a sidecar with default authorisation.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct KeyMeta {
     /// Optional table; may be empty.
     #[serde(default)]
@@ -136,6 +142,7 @@ pub enum KeyRole {
 
 /// Per `PLUGIN_PACKAGING.md` section 5.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Authorisation {
     /// e.g. `org.evo.*`, `com.vendor.*` — `*` is a single-segment or suffix wildcard
     /// implemented as: pattern after splitting on `.` and `*`.
@@ -328,6 +335,42 @@ mod tests {
              max_trust_class=\"sandbox\"\n",
         );
         assert!(validate(&m, &key()).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_table() {
+        // A typo at the table level (e.g. [authorization] instead
+        // of [authorisation]) must abort load loudly. Without
+        // deny_unknown_fields on the outer struct, the typo would
+        // be silently ignored and `[authorisation]` would either
+        // be missing (different error) or default to whatever
+        // serde derives.
+        let err = toml::from_str::<KeyMeta>(
+            "[authorisation]\nname_prefixes=[\"x\"]\n\
+             max_trust_class=\"sandbox\"\n\
+             [extras]\nfoo=\"bar\"\n",
+        )
+        .expect_err("unknown top-level table must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("extras"),
+            "error must name the unknown table; got {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_authorisation_field() {
+        // A typo inside [authorisation] must abort load loudly.
+        let err = toml::from_str::<KeyMeta>(
+            "[authorisation]\nname_prefixes=[\"x\"]\n\
+             max_trust_class=\"sandbox\"\nnname_prefix=[\"y\"]\n",
+        )
+        .expect_err("unknown field must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("nname_prefix"),
+            "error must name the unknown field; got {msg}"
+        );
     }
 
     #[test]

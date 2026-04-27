@@ -127,7 +127,12 @@ impl StewardIdentity {
 /// Each connection's grant decision answers a single question: does
 /// the connecting peer satisfy any one of the configured
 /// allowances? The check short-circuits on the first match.
+///
+/// Unknown fields are rejected at parse time so an operator typo
+/// (`allow_uds = [0]` instead of `allow_uids = [0]`) surfaces as a
+/// clear boot error rather than a silent default-deny.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResolveClaimantsPolicy {
     /// When `true`, any local-socket peer whose UID matches the
     /// steward's UID is granted `resolve_claimants`. Mirrors the
@@ -147,6 +152,7 @@ pub struct ResolveClaimantsPolicy {
 
 /// Top-level structure parsed from `client_acl.toml`.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClientAclFile {
     #[serde(default)]
     capabilities: ClientAclCapabilities,
@@ -154,6 +160,7 @@ struct ClientAclFile {
 
 /// `[capabilities]` section of the ACL file.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClientAclCapabilities {
     #[serde(default)]
     resolve_claimants: ResolveClaimantsPolicy,
@@ -439,6 +446,47 @@ mod tests {
         assert!(
             err.is_err(),
             "malformed input must surface as a parse error"
+        );
+    }
+
+    #[test]
+    fn typo_in_capability_field_is_rejected_at_parse_time() {
+        // A common operator typo: `allow_uds` instead of
+        // `allow_uids`. With `deny_unknown_fields` on the policy
+        // struct, the loader refuses the file and names the unknown
+        // field. Without the deny, the typo would parse cleanly,
+        // the policy would default-deny, and the operator would
+        // discover the silent denial only at runtime.
+        let err = ClientAcl::parse(
+            r#"
+            [capabilities.resolve_claimants]
+            allow_uds = [0]
+            "#,
+            None,
+        );
+        let msg = format!("{:?}", err.expect_err("typo must surface"));
+        assert!(
+            msg.contains("allow_uds"),
+            "error must name the unknown field; got {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_capability_section_is_rejected_at_parse_time() {
+        // A typo at the [capabilities] level (e.g.
+        // `[capabilities.resolve_claims]` instead of
+        // `[capabilities.resolve_claimants]`) must also fail loudly.
+        let err = ClientAcl::parse(
+            r#"
+            [capabilities.resolve_claims]
+            allow_local = true
+            "#,
+            None,
+        );
+        let msg = format!("{:?}", err.expect_err("typo must surface"));
+        assert!(
+            msg.contains("resolve_claims"),
+            "error must name the unknown section; got {msg}"
         );
     }
 

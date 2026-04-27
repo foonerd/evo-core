@@ -165,13 +165,19 @@ pub fn verify_out_of_process_bundle_at(
     }
 
     // Operator-supreme override: an operator_root signature wins
-    // outright. The walk for an operator root is trivial (it is
-    // already a root). Pick the first one if present.
+    // outright. A genuine operator root is `signed_by = None`, so
+    // the chain walk is trivially `Ok(())`. We still run it: if a
+    // key claims `role = operator_root` but also declares a
+    // `signed_by` parent, the parent must be present and the chain
+    // must validate. This closes the bypass where a key claiming
+    // operator-root status with a missing or compromised parent
+    // would skip chain validation entirely.
     if let Some(op) = signers
         .iter()
         .find(|k| matches_role(k, KeyRole::OperatorRoot))
     {
         check_window(op, now_dt)?;
+        validate_chain(op, keys, now_dt)?;
         return finalise(op, bundle, opt);
     }
 
@@ -196,20 +202,24 @@ pub fn verify_out_of_process_bundle_at(
             Err(e) => {
                 // If a rotation predecessor of this leaf would
                 // accept the bundle within the overlap window,
-                // honour that. Otherwise propagate this leaf's
-                // failure as the "best" error to surface.
+                // honour that. The bundle's effective authorisation
+                // is the intersection of the OLD (signing) key's
+                // and the NEW (succeeding) key's authorisations:
+                // the OLD key's grant is what the operator actually
+                // signed off on, clamped by whatever the NEW key
+                // still permits today. This prevents an operator
+                // who widens authorisation across a rotation from
+                // transiently inheriting the broader grant for
+                // bundles signed only by the OLD key during the
+                // overlap window.
                 if let Some(rot) = rotation_window_accepts(leaf, keys, now_dt) {
-                    if !name_matches_prefixes(
-                        bundle.plugin_name,
-                        &rot.meta.authorisation.name_prefixes,
-                    ) {
-                        last_err = Some(TrustError::NameNotAuthorised {
-                            name: bundle.plugin_name.to_string(),
-                            key_basename: rot.basename.clone(),
-                        });
-                        continue;
+                    match finalise_intersection(leaf, rot, bundle, opt) {
+                        Ok(outcome) => return Ok(outcome),
+                        Err(rot_err) => {
+                            last_err = Some(rot_err);
+                            continue;
+                        }
                     }
-                    return finalise(rot, bundle, opt);
                 }
                 last_err = Some(e);
             }
@@ -389,6 +399,70 @@ fn finalise(
         Err((d, m)) => Err(TrustError::TrustClassNotAuthorised {
             declared: d,
             key: k.basename.clone(),
+            max: m,
+        }),
+    }
+}
+
+/// Finalise admission under a rotation override: enforce the
+/// intersection of the OLD (signing) key's authorisation and the
+/// NEW (succeeding) key's authorisation.
+///
+/// Both `name_prefixes` lists must admit the bundle's plugin name;
+/// the effective `max_trust_class` ceiling is the more restrictive
+/// of the two. This guarantees that widening the authorisation
+/// across a rotation does not retroactively widen the grant of
+/// bundles signed only under the OLD key during the overlap window.
+fn finalise_intersection(
+    old: &TrustKey,
+    new: &TrustKey,
+    bundle: &OutOfProcessBundleRef<'_>,
+    opt: TrustOptions,
+) -> Result<TrustOutcome, TrustError> {
+    if !name_matches_prefixes(
+        bundle.plugin_name,
+        &old.meta.authorisation.name_prefixes,
+    ) {
+        return Err(TrustError::NameNotAuthorised {
+            name: bundle.plugin_name.to_string(),
+            key_basename: old.basename.clone(),
+        });
+    }
+    if !name_matches_prefixes(
+        bundle.plugin_name,
+        &new.meta.authorisation.name_prefixes,
+    ) {
+        return Err(TrustError::NameNotAuthorised {
+            name: bundle.plugin_name.to_string(),
+            key_basename: new.basename.clone(),
+        });
+    }
+    // `TrustClass` Ord ranks Platform < Privileged < Standard <
+    // Unprivileged < Sandbox; a higher Ord variant is a stricter
+    // ceiling because `effective_trust_class` requires
+    // `declared >= key_max`. The intersection ceiling is therefore
+    // `max(old, new)`: whichever key allows the narrower set of
+    // classes determines the rotation-override cap, and the
+    // diagnostic surfaces that key as the limiting authority.
+    let (limiting, key_max) = if new.meta.authorisation.max_trust_class
+        > old.meta.authorisation.max_trust_class
+    {
+        (new, new.meta.authorisation.max_trust_class)
+    } else {
+        (old, old.meta.authorisation.max_trust_class)
+    };
+    match effective_trust_class(
+        bundle.declared_trust,
+        key_max,
+        opt.degrade_trust,
+    ) {
+        Ok(eff) => Ok(TrustOutcome {
+            effective_trust: eff,
+            was_unsigned: false,
+        }),
+        Err((d, m)) => Err(TrustError::TrustClassNotAuthorised {
+            declared: d,
+            key: limiting.basename.clone(),
             max: m,
         }),
     }
