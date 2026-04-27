@@ -95,7 +95,9 @@ sequenceDiagram
     S-->>C: { happening: custody_released, ... }
 ```
 
-Any happening emitted after the ack reaches the consumer. The initial list gives a consistent snapshot; each subsequent happening is an incremental update. See [CLIENT_API.md](docs/engineering/CLIENT_API.md) for examples in seven languages.
+Any happening emitted after the ack reaches the consumer. The initial list gives a consistent snapshot; each subsequent happening is an incremental update.
+
+Plugin identity on the wire is opaque: every projection and happening carries an opaque `claimant_token`, never the plugin's plain canonical name. A consumer that needs to display plain names follows the negotiate-then-resolve pattern: send `op = "negotiate"` with `capabilities: ["resolve_claimants"]` as the first frame on the connection, then call `op = "resolve_claimants"` with the tokens to exchange. The default operator policy grants `resolve_claimants` only to local-UID consumers running as the steward's own user; distributions with a frontend or bridge running under a different UID widen the policy through `/etc/evo/client_acl.toml`. See [CLIENT_API.md](docs/engineering/CLIENT_API.md) sections 4.7 and 4.8 for the negotiation and resolution ops, and examples in seven languages.
 
 ## Documentation
 

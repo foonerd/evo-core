@@ -25,6 +25,7 @@ use evo::admin::AdminLedger;
 use evo::admission::AdmissionEngine;
 use evo::catalogue::Catalogue;
 use evo::cli::Args;
+use evo::client_acl::{ClientAcl, StewardIdentity};
 use evo::config::StewardConfig;
 use evo::custody::CustodyLedger;
 use evo::happenings::HappeningBus;
@@ -33,6 +34,7 @@ use evo::plugin_discovery;
 use evo::plugin_trust::load_plugin_trust_arc;
 use evo::projections::ProjectionEngine;
 use evo::relations::RelationGraph;
+use evo::resolution::ResolutionLedger;
 use evo::server::Server;
 use evo::shutdown::wait_for_signal;
 use evo::state::StewardState;
@@ -177,14 +179,45 @@ async fn main() -> anyhow::Result<()> {
     // ledger directly off the steward state bag.
     let engine = Arc::new(Mutex::new(engine));
 
+    // Load the operator-controlled client-API ACL. Missing file
+    // yields the default-deny posture (local steward UID only);
+    // malformed file is a hard boot-time error so the operator
+    // catches the typo before any consumer connects.
+    let client_acl = Arc::new(ClientAcl::load()?);
+    if let Some(src) = client_acl.source() {
+        tracing::info!(
+            path = %src.display(),
+            "client capability ACL loaded"
+        );
+    } else {
+        tracing::info!(
+            "client capability ACL: default policy (no file present)"
+        );
+    }
+
+    // Capture the steward's own identity once at boot. The default
+    // ACL grants the local-UID branch only when the peer's UID
+    // matches this value; resolving it once here avoids a per-
+    // connection metadata read.
+    let steward_identity = StewardIdentity::current();
+
+    // Construct the audit ledger that records every
+    // `resolve_claimants` call (granted or refused). One ledger per
+    // steward instance; held by the server and exposed to operator
+    // tooling via [`Server::resolution_ledger`].
+    let resolution_ledger = Arc::new(ResolutionLedger::new());
+
     // Start the server. The server clones the state Arc directly so
     // it can serve bus subscriptions and ledger snapshots without
     // taking the engine mutex; dispatch flows through the router.
-    let server = Server::new(
+    let server = Server::with_acl(
         socket_path.clone(),
         router,
         Arc::clone(&state),
         Arc::clone(&projections),
+        Arc::clone(&client_acl),
+        steward_identity,
+        Arc::clone(&resolution_ledger),
     );
 
     tracing::warn!(

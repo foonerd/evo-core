@@ -167,6 +167,7 @@
 
 use crate::catalogue::Cardinality;
 use crate::claimant::{ClaimantToken, ClaimantTokenIssuer};
+use crate::client_acl::{ClientAcl, PeerCredentials, StewardIdentity};
 use crate::context::RegistrySubjectQuerier;
 use crate::custody::{CustodyRecord, StateSnapshot};
 use crate::error::StewardError;
@@ -179,6 +180,7 @@ use crate::projections::{
     ProjectionScope, RelatedSubject, RelationDirection, SubjectProjection,
 };
 use crate::relations::WalkDirection;
+use crate::resolution::ResolutionLedger;
 use crate::router::PluginRouter;
 use crate::state::StewardState;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -188,6 +190,7 @@ use evo_plugin_sdk::contract::{
     SubjectQueryResult,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -337,6 +340,40 @@ enum ClientRequest {
         /// [`MAX_LIST_PAGE_SIZE`] are clamped.
         #[serde(default)]
         page_size: Option<usize>,
+    },
+    /// Per-connection capability negotiation.
+    ///
+    /// A consumer SHOULD send this as the first frame on a new
+    /// connection to request named capabilities (e.g.
+    /// `"resolve_claimants"`). The server consults the operator-
+    /// controlled ACL against the connection's peer credentials and
+    /// answers with the subset that is granted; the granted set
+    /// applies for the lifetime of the connection.
+    ///
+    /// Connections that do not negotiate fall back to the empty
+    /// granted set; ops that require a granted capability refuse with
+    /// `permission_denied`.
+    Negotiate {
+        /// Capability names the consumer requests. Unknown names are
+        /// silently dropped from the response; the server never
+        /// errors on a name it does not recognise so consumers can
+        /// negotiate forward-compatibly against newer ops.
+        #[serde(default)]
+        capabilities: Vec<String>,
+    },
+    /// Resolve a set of opaque [`ClaimantToken`]s to plain plugin
+    /// names (and versions, when known).
+    ///
+    /// Requires the `resolve_claimants` capability to have been
+    /// granted on the connection via [`ClientRequest::Negotiate`].
+    /// Tokens not currently issued by the steward are silently
+    /// omitted from the response (no error).
+    ResolveClaimants {
+        /// Tokens to resolve. Order is preserved in the response only
+        /// for tokens the steward has issued; unknown tokens are
+        /// dropped.
+        #[serde(default)]
+        tokens: Vec<String>,
     },
 }
 
@@ -598,6 +635,37 @@ enum ClientResponse {
         /// Bus cursor sampled at snapshot time.
         current_seq: u64,
     },
+    /// Capability-negotiation outcome.
+    ///
+    /// Distinguished by the top-level `granted` key. Carries the
+    /// subset of the consumer's requested capabilities that the
+    /// operator policy permits on this connection. The granted set
+    /// is recorded on the per-connection session state for the
+    /// lifetime of the connection; subsequent ops gated on a name
+    /// not present here refuse with `permission_denied`.
+    Negotiated {
+        /// Always `true`; the distinctive top-level key for this
+        /// variant under untagged disambiguation.
+        ok: bool,
+        /// Subset of the requested capabilities the steward grants
+        /// on this connection. Unknown names from the request are
+        /// silently dropped; names the operator denied via the ACL
+        /// are also dropped.
+        granted: Vec<String>,
+    },
+    /// `resolve_claimants` outcome.
+    ///
+    /// Distinguished by the top-level `resolutions` key. Maps each
+    /// known token to the plain plugin name and (when available)
+    /// version that the issuer has on file. Tokens the issuer has
+    /// not seen are silently omitted from the response, matching the
+    /// rule that resolution never reveals which tokens the steward
+    /// considers valid.
+    Resolutions {
+        /// One entry per resolved token, in the issuer's iteration
+        /// order. Unknown tokens from the request do not appear.
+        resolutions: Vec<ClaimantResolutionWire>,
+    },
     /// Any failure.
     ///
     /// The `error` envelope is structured: it carries
@@ -678,6 +746,27 @@ struct AddressingListEntryWire {
     value: String,
     /// Canonical ID the addressing currently resolves to.
     canonical_id: String,
+}
+
+/// One resolution row in a [`ClientResponse::Resolutions`].
+///
+/// Echoes the token the consumer supplied (so callers correlating
+/// pipelined responses can match without holding state) alongside
+/// the plain plugin name and, when known, version. Unknown tokens
+/// are silently omitted from the parent response; this struct only
+/// represents successful resolutions.
+#[derive(Debug, Serialize)]
+struct ClaimantResolutionWire {
+    /// The opaque token, exactly as supplied in the request.
+    token: String,
+    /// Plain plugin canonical name for the token.
+    plugin_name: String,
+    /// Plugin version, when the issuer has one on record. The
+    /// claimant token is derived without the version so a steward
+    /// that issues a token before the plugin's version is recorded
+    /// may legitimately have `None` here; consumers MUST tolerate
+    /// the field being absent.
+    plugin_version: Option<String>,
 }
 
 /// Wire form of [`SubjectProjection`]. Mirrors the domain shape but
@@ -1679,6 +1768,58 @@ impl HappeningWire {
 }
 
 // ---------------------------------------------------------------------
+// Per-connection state
+// ---------------------------------------------------------------------
+
+/// Capability name covering the `resolve_claimants` op.
+///
+/// Centralised here so the negotiate handler, the resolve dispatch,
+/// and the audit-log integration all spell the name the same way.
+const CAPABILITY_RESOLVE_CLAIMANTS: &str = "resolve_claimants";
+
+/// Capability names a consumer may negotiate today.
+///
+/// The negotiate handler intersects the consumer's request with this
+/// list before consulting the ACL: unknown names are dropped silently
+/// so consumers can probe forward-compatibly against newer steward
+/// builds. Names are stable; new capabilities are appended.
+const NEGOTIABLE_CAPABILITIES: &[&str] = &[CAPABILITY_RESOLVE_CLAIMANTS];
+
+/// Mutable per-connection session state.
+///
+/// Constructed once at accept time alongside the peer credentials,
+/// then passed by reference to every op handler that needs to
+/// consult the granted-capability set or report the peer in the
+/// audit log. Lifetime is the connection's; dropped when the
+/// connection task exits.
+#[derive(Debug)]
+struct ConnectionState {
+    /// Peer credentials captured at accept time. `None` on platforms
+    /// or sandboxes where `peer_cred` is unavailable.
+    peer: PeerCredentials,
+    /// Capabilities granted on this connection by the negotiate
+    /// handler. Empty until the consumer sends a `negotiate` frame
+    /// and the ACL grants at least one name.
+    granted_capabilities: HashSet<String>,
+}
+
+impl ConnectionState {
+    /// Build a fresh per-connection state from peer credentials.
+    fn new(peer: PeerCredentials) -> Self {
+        Self {
+            peer,
+            granted_capabilities: HashSet::new(),
+        }
+    }
+
+    /// Whether the named capability has been granted on this
+    /// connection.
+    fn has(&self, name: &str) -> bool {
+        self.granted_capabilities.contains(name)
+    }
+}
+
+// ---------------------------------------------------------------------
 // The server
 // ---------------------------------------------------------------------
 
@@ -1688,6 +1829,14 @@ pub struct Server {
     router: Arc<PluginRouter>,
     state: Arc<StewardState>,
     projections: Arc<ProjectionEngine>,
+    /// Operator-controlled ACL consulted by the negotiate handler.
+    acl: Arc<ClientAcl>,
+    /// Steward's own identity at boot, used by the default ACL to
+    /// match local-UID peers.
+    steward_identity: StewardIdentity,
+    /// Audit ledger that records every `resolve_claimants` request
+    /// (granted or refused).
+    resolution_ledger: Arc<ResolutionLedger>,
 }
 
 impl Server {
@@ -1721,12 +1870,51 @@ impl Server {
         state: Arc<StewardState>,
         projections: Arc<ProjectionEngine>,
     ) -> Self {
+        Self::with_acl(
+            socket_path,
+            router,
+            state,
+            projections,
+            Arc::new(ClientAcl::default()),
+            StewardIdentity::default(),
+            Arc::new(ResolutionLedger::new()),
+        )
+    }
+
+    /// Construct a server with an explicit operator-controlled ACL,
+    /// the steward's own identity, and a resolution audit ledger.
+    ///
+    /// Used by the binary so the `negotiate` handler enforces the
+    /// configured policy and the `resolve_claimants` op records to a
+    /// shared ledger. Tests and harnesses that do not care about
+    /// either may keep using [`Server::new`], which substitutes the
+    /// default-deny ACL, an empty steward identity (which denies the
+    /// default local-UID grant), and a fresh in-memory ledger.
+    pub fn with_acl(
+        socket_path: PathBuf,
+        router: Arc<PluginRouter>,
+        state: Arc<StewardState>,
+        projections: Arc<ProjectionEngine>,
+        acl: Arc<ClientAcl>,
+        steward_identity: StewardIdentity,
+        resolution_ledger: Arc<ResolutionLedger>,
+    ) -> Self {
         Self {
             socket_path,
             router,
             state,
             projections,
+            acl,
+            steward_identity,
+            resolution_ledger,
         }
+    }
+
+    /// Audit ledger this server records `resolve_claimants` calls
+    /// into. Exposed so test harnesses and operator tooling can
+    /// inspect the recorded entries.
+    pub fn resolution_ledger(&self) -> Arc<ResolutionLedger> {
+        Arc::clone(&self.resolution_ledger)
     }
 
     /// The socket path this server listens on.
@@ -1797,12 +1985,32 @@ impl Server {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, _addr)) => {
+                            // Capture the peer's credentials at accept
+                            // time so the connection's negotiate
+                            // handler and the audit log have a stable
+                            // identity to work from. `peer_cred` may
+                            // fail on unusual platforms or sandboxes;
+                            // the conservative outcome is `None` for
+                            // both UID and GID, which the default ACL
+                            // denies.
+                            let peer = peer_credentials(&stream);
                             let router = Arc::clone(&self.router);
                             let state = Arc::clone(&self.state);
                             let projections = Arc::clone(&self.projections);
+                            let acl = Arc::clone(&self.acl);
+                            let steward_identity = self.steward_identity;
+                            let resolution_ledger =
+                                Arc::clone(&self.resolution_ledger);
                             tokio::spawn(async move {
                                 if let Err(e) = handle_connection(
-                                    stream, router, state, projections
+                                    stream,
+                                    router,
+                                    state,
+                                    projections,
+                                    acl,
+                                    steward_identity,
+                                    resolution_ledger,
+                                    peer,
                                 ).await {
                                     tracing::warn!(
                                         error = %e,
@@ -1842,6 +2050,25 @@ impl Server {
     }
 }
 
+/// Read peer credentials from a connected `UnixStream`.
+///
+/// Wraps the platform-specific `peer_cred` query so the accept loop
+/// stays portable. `peer_cred` failure (which should not happen on
+/// Linux) yields `None`/`None`; the default ACL then refuses every
+/// capability that depends on a known peer identity.
+fn peer_credentials(stream: &UnixStream) -> PeerCredentials {
+    match stream.peer_cred() {
+        Ok(cred) => PeerCredentials {
+            uid: Some(cred.uid()),
+            gid: Some(cred.gid()),
+        },
+        Err(_) => PeerCredentials {
+            uid: None,
+            gid: None,
+        },
+    }
+}
+
 /// Handle one accepted client connection.
 ///
 /// Reads frames in a loop until the client closes the connection.
@@ -1852,12 +2079,18 @@ impl Server {
 /// connection's read half is no longer consumed.
 ///
 /// Errors handling one frame close the connection.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: UnixStream,
     router: Arc<PluginRouter>,
     state: Arc<StewardState>,
     projections: Arc<ProjectionEngine>,
+    acl: Arc<ClientAcl>,
+    steward_identity: StewardIdentity,
+    resolution_ledger: Arc<ResolutionLedger>,
+    peer: PeerCredentials,
 ) -> Result<(), StewardError> {
+    let mut conn = ConnectionState::new(peer);
     loop {
         let body = match read_frame_body(&mut stream).await? {
             Some(b) => b,
@@ -1890,8 +2123,17 @@ async fn handle_connection(
             return run_subscription(stream, Arc::clone(&state), since).await;
         }
 
-        let response =
-            dispatch_request(req, &router, &state, &projections).await;
+        let response = dispatch_request(
+            req,
+            &router,
+            &state,
+            &projections,
+            &acl,
+            steward_identity,
+            &resolution_ledger,
+            &mut conn,
+        )
+        .await;
         write_response_frame(&mut stream, &response).await?;
     }
 }
@@ -1967,11 +2209,16 @@ async fn write_response_frame(
 ///
 /// Never panics; dispatch failures surface as `ClientResponse::Error`
 /// rather than bubbling up to close the connection.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_request(
     req: ClientRequest,
     router: &Arc<PluginRouter>,
     state: &Arc<StewardState>,
     projections: &Arc<ProjectionEngine>,
+    acl: &Arc<ClientAcl>,
+    steward_identity: StewardIdentity,
+    resolution_ledger: &Arc<ResolutionLedger>,
+    conn: &mut ConnectionState,
 ) -> ClientResponse {
     match req {
         ClientRequest::Request {
@@ -2015,6 +2262,12 @@ async fn dispatch_request(
             handle_enumerate_addressings(state, cursor, page_size)
         }
         ClientRequest::DescribeCapabilities => describe_capabilities(),
+        ClientRequest::Negotiate { capabilities } => {
+            handle_negotiate(capabilities, acl, steward_identity, conn)
+        }
+        ClientRequest::ResolveClaimants { tokens } => {
+            handle_resolve_claimants(state, resolution_ledger, conn, tokens)
+        }
         ClientRequest::SubscribeHappenings { .. } => {
             // Intercepted in handle_connection; should not reach here.
             // Defensive: surface an error rather than panicking in case
@@ -2028,6 +2281,111 @@ async fn dispatch_request(
             }
         }
     }
+}
+
+/// Handle the `op = "negotiate"` capability-negotiation frame.
+///
+/// Intersects the consumer's requested set with the names this build
+/// recognises, consults the operator-controlled [`ClientAcl`] for
+/// each, and records the granted subset on the per-connection
+/// session state. Subsequent ops gated on a name not in the granted
+/// set refuse with `permission_denied`.
+fn handle_negotiate(
+    capabilities: Vec<String>,
+    acl: &Arc<ClientAcl>,
+    steward_identity: StewardIdentity,
+    conn: &mut ConnectionState,
+) -> ClientResponse {
+    let mut granted: Vec<String> = Vec::new();
+    for requested in &capabilities {
+        let known = NEGOTIABLE_CAPABILITIES.contains(&requested.as_str());
+        if !known {
+            // Unknown name: silently dropped per the forward-compat
+            // contract on the negotiate handler.
+            continue;
+        }
+        let permitted = match requested.as_str() {
+            CAPABILITY_RESOLVE_CLAIMANTS => {
+                acl.allows_resolve_claimants(conn.peer, steward_identity)
+            }
+            // Defensive: a name in NEGOTIABLE_CAPABILITIES without an
+            // ACL gate above is a build-time bug. Treat as not
+            // granted rather than panicking; the test
+            // `negotiable_capabilities_are_all_gated` pins the
+            // invariant in the test suite.
+            _ => false,
+        };
+        if permitted && !granted.iter().any(|g| g == requested) {
+            granted.push(requested.clone());
+        }
+    }
+    conn.granted_capabilities = granted.iter().cloned().collect();
+    ClientResponse::Negotiated { ok: true, granted }
+}
+
+/// Handle the `op = "resolve_claimants"` frame.
+///
+/// Resolutions are NOT happenings: the subscribe stream MUST NOT
+/// emit anything as a side-effect of this op. Resolution is a
+/// privacy-relevant query the operator may have refused at policy
+/// time; broadcasting it on the bus would leak the existence of the
+/// query to every other subscriber. The audit ledger records the
+/// call in a private store consulted only by operator tooling. The
+/// regression test
+/// `resolve_claimants_does_not_emit_a_happening` pins the
+/// invariant.
+fn handle_resolve_claimants(
+    state: &Arc<StewardState>,
+    resolution_ledger: &Arc<ResolutionLedger>,
+    conn: &mut ConnectionState,
+    tokens: Vec<String>,
+) -> ClientResponse {
+    let granted = conn.has(CAPABILITY_RESOLVE_CLAIMANTS);
+    if !granted {
+        // Audit before refusing so the operator can see denials
+        // alongside grants. `tokens_resolved` is zero on the refused
+        // path because the steward never inspected the issuer.
+        resolution_ledger.record(crate::resolution::ResolutionLogEntry {
+            peer_uid: conn.peer.uid,
+            peer_gid: conn.peer.gid,
+            tokens_requested: tokens.len(),
+            tokens_resolved: 0,
+            granted: false,
+            at: SystemTime::now(),
+        });
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "resolve_claimants not granted on this connection",
+            )
+            .with_subclass("resolve_claimants_not_granted"),
+        };
+    }
+
+    let mut resolutions: Vec<ClaimantResolutionWire> = Vec::new();
+    for raw in &tokens {
+        if let Some((plugin_name, plugin_version)) =
+            state.claimant_issuer.resolve(raw)
+        {
+            resolutions.push(ClaimantResolutionWire {
+                token: raw.clone(),
+                plugin_name,
+                plugin_version,
+            });
+        }
+        // Unknown tokens are silently dropped (no error).
+    }
+
+    resolution_ledger.record(crate::resolution::ResolutionLogEntry {
+        peer_uid: conn.peer.uid,
+        peer_gid: conn.peer.gid,
+        tokens_requested: tokens.len(),
+        tokens_resolved: resolutions.len(),
+        granted: true,
+        at: SystemTime::now(),
+    });
+
+    ClientResponse::Resolutions { resolutions }
 }
 
 /// Stream happenings to the client over `stream` until the peer
@@ -2834,6 +3192,8 @@ const SUPPORTED_OPS: &[&str] = &[
     "enumerate_addressings",
     "subscribe_happenings",
     "describe_capabilities",
+    "negotiate",
+    "resolve_claimants",
 ];
 
 /// Named features this build supports.
@@ -2861,6 +3221,7 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "alias_chain_walking",
     "active_custodies_snapshot",
     "paginated_state_snapshots",
+    "capability_negotiation",
 ];
 
 /// Build the capability discovery response.
@@ -3444,6 +3805,8 @@ mod tests {
             "enumerate_addressings",
             "subscribe_happenings",
             "describe_capabilities",
+            "negotiate",
+            "resolve_claimants",
         ] {
             assert!(
                 ops.contains(&expected),
@@ -3462,6 +3825,7 @@ mod tests {
         assert!(features.contains(&"subscribe_happenings_cursor"));
         assert!(features.contains(&"alias_chain_walking"));
         assert!(features.contains(&"paginated_state_snapshots"));
+        assert!(features.contains(&"capability_negotiation"));
     }
 
     #[test]
@@ -4081,5 +4445,248 @@ mod tests {
 
         drop(client_end);
         let _ = handle.await;
+    }
+
+    #[test]
+    fn negotiable_capabilities_are_all_gated() {
+        // Every name in NEGOTIABLE_CAPABILITIES must have a
+        // matching arm in handle_negotiate's match. Add the name
+        // here and forget the arm and the connection silently denies
+        // every consumer that asks for it. This unit test runs the
+        // handler against a wide-open ACL and asserts every known
+        // name comes back granted; an ungated name would fall
+        // through to the defensive `_ => false` and trip the
+        // assertion.
+        let acl = Arc::new(
+            ClientAcl::parse(
+                r#"
+                [capabilities.resolve_claimants]
+                allow_local = true
+                allow_uids = [0, 1, 1000]
+                allow_gids = [0, 1, 1000]
+                "#,
+                None,
+            )
+            .expect("parse permissive ACL"),
+        );
+        let steward_identity = StewardIdentity {
+            uid: Some(1000),
+            gid: Some(1000),
+        };
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        });
+        let request: Vec<String> = NEGOTIABLE_CAPABILITIES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let response = handle_negotiate(
+            request.clone(),
+            &acl,
+            steward_identity,
+            &mut conn,
+        );
+        match response {
+            ClientResponse::Negotiated { ok, granted } => {
+                assert!(ok);
+                for name in &request {
+                    assert!(
+                        granted.contains(name),
+                        "every known capability must be gated; {name:?} \
+                         was dropped — likely a missing arm in \
+                         handle_negotiate"
+                    );
+                }
+            }
+            other => panic!("expected Negotiated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negotiate_drops_unknown_capability_names_silently() {
+        // Forward-compat: a consumer probing for a capability the
+        // steward does not recognise must not error; the unknown
+        // name is dropped from the granted set.
+        let acl = Arc::new(ClientAcl::default());
+        let steward_identity = StewardIdentity {
+            uid: Some(0),
+            gid: Some(0),
+        };
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: Some(0),
+            gid: Some(0),
+        });
+        let response = handle_negotiate(
+            vec![
+                "resolve_claimants".to_string(),
+                "made_up_capability_v999".to_string(),
+            ],
+            &acl,
+            steward_identity,
+            &mut conn,
+        );
+        match response {
+            ClientResponse::Negotiated { granted, .. } => {
+                assert!(granted.contains(&"resolve_claimants".to_string()));
+                assert!(!granted
+                    .iter()
+                    .any(|g| g == "made_up_capability_v999"));
+            }
+            other => panic!("expected Negotiated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negotiate_records_granted_set_on_connection_state() {
+        // The handler must update conn.granted_capabilities so
+        // subsequent op handlers can consult it. Pinning the
+        // side-effect because it is the load-bearing piece of state
+        // for capability gating.
+        let acl = Arc::new(ClientAcl::default());
+        let steward_identity = StewardIdentity {
+            uid: Some(1234),
+            gid: Some(1234),
+        };
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1234),
+            gid: Some(1234),
+        });
+        assert!(conn.granted_capabilities.is_empty());
+        let _ = handle_negotiate(
+            vec!["resolve_claimants".to_string()],
+            &acl,
+            steward_identity,
+            &mut conn,
+        );
+        assert!(conn.has("resolve_claimants"));
+    }
+
+    #[test]
+    fn resolve_claimants_refuses_when_capability_absent() {
+        // Without the capability the op must refuse with the
+        // specific class+subclass operators code against.
+        let state = StewardState::for_tests();
+        let ledger = Arc::new(ResolutionLedger::new());
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1234),
+            gid: Some(1234),
+        });
+        let token = state.claimant_issuer.token_for("com.foo.bar");
+        let response = handle_resolve_claimants(
+            &state,
+            &ledger,
+            &mut conn,
+            vec![token.as_str().to_string()],
+        );
+        match response {
+            ClientResponse::Error { error } => {
+                assert_eq!(error.class, ErrorClass::PermissionDenied);
+                let details = error.details.as_ref().expect("details");
+                assert_eq!(
+                    details["subclass"].as_str(),
+                    Some("resolve_claimants_not_granted")
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        // Even refused calls land in the audit ledger.
+        assert_eq!(ledger.count(), 1);
+        let entry = &ledger.entries()[0];
+        assert!(!entry.granted);
+        assert_eq!(entry.tokens_requested, 1);
+        assert_eq!(entry.tokens_resolved, 0);
+    }
+
+    #[test]
+    fn resolve_claimants_returns_resolutions_for_known_tokens() {
+        let state = StewardState::for_tests();
+        let ledger = Arc::new(ResolutionLedger::new());
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1234),
+            gid: Some(1234),
+        });
+        conn.granted_capabilities.insert("resolve_claimants".into());
+
+        // Pre-mint two tokens with versions, plus one without.
+        state.claimant_issuer.record_version("com.foo.bar", "1.2.3");
+        state.claimant_issuer.record_version("com.baz", "0.1.0");
+        let no_version_token =
+            state.claimant_issuer.token_for("com.no.version");
+
+        let foo_token = state.claimant_issuer.token_for("com.foo.bar");
+        let baz_token = state.claimant_issuer.token_for("com.baz");
+
+        let response = handle_resolve_claimants(
+            &state,
+            &ledger,
+            &mut conn,
+            vec![
+                foo_token.as_str().to_string(),
+                "never-issued-xxxxxxxx".to_string(),
+                baz_token.as_str().to_string(),
+                no_version_token.as_str().to_string(),
+            ],
+        );
+        let resolutions = match response {
+            ClientResponse::Resolutions { resolutions } => resolutions,
+            other => panic!("expected Resolutions, got {other:?}"),
+        };
+        // Three known, one unknown -> three rows. Unknown silently
+        // omitted.
+        assert_eq!(resolutions.len(), 3);
+        let by_name: std::collections::HashMap<
+            String,
+            &ClaimantResolutionWire,
+        > = resolutions
+            .iter()
+            .map(|r| (r.plugin_name.clone(), r))
+            .collect();
+        assert_eq!(
+            by_name
+                .get("com.foo.bar")
+                .unwrap()
+                .plugin_version
+                .as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            by_name.get("com.baz").unwrap().plugin_version.as_deref(),
+            Some("0.1.0")
+        );
+        assert!(by_name
+            .get("com.no.version")
+            .unwrap()
+            .plugin_version
+            .is_none());
+
+        let entry = &ledger.entries()[0];
+        assert!(entry.granted);
+        assert_eq!(entry.tokens_requested, 4);
+        assert_eq!(entry.tokens_resolved, 3);
+    }
+
+    #[test]
+    fn negotiate_request_parses_minimal() {
+        let json = r#"{"op":"negotiate","capabilities":["resolve_claimants"]}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::Negotiate { capabilities } => {
+                assert_eq!(capabilities, vec!["resolve_claimants"]);
+            }
+            other => panic!("expected Negotiate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_claimants_request_parses_minimal() {
+        let json = r#"{"op":"resolve_claimants","tokens":["abc","def"]}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::ResolveClaimants { tokens } => {
+                assert_eq!(tokens, vec!["abc", "def"]);
+            }
+            other => panic!("expected ResolveClaimants, got {other:?}"),
+        }
     }
 }

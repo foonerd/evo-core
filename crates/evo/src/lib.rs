@@ -52,6 +52,10 @@
 //! - [`projections`]: pull-projection engine per `PROJECTIONS.md`. v0
 //!   supports federated (subject-keyed) queries with one-hop relation
 //!   traversal.
+//! - [`resolution`]: audit ledger for `resolve_claimants` queries
+//!   on the client API. One entry per call (granted or refused),
+//!   carrying the peer's UID/GID and the request's request-and-
+//!   resolve counts.
 //! - [`error`]: the steward's error type.
 //! - [`plugin_discovery`]: optional scan of configured search roots and
 //!   admission of out-of-process plugins (used by the shipped binary).
@@ -84,6 +88,7 @@ pub mod plugin_discovery;
 pub mod plugin_trust;
 pub mod projections;
 pub mod relations;
+pub mod resolution;
 pub mod router;
 pub mod server;
 pub mod shutdown;

@@ -1455,6 +1455,411 @@ async fn describe_alias_returns_not_found_for_unknown_id() {
 }
 
 // ---------------------------------------------------------------------
+// Capability negotiation + resolve_claimants
+// ---------------------------------------------------------------------
+//
+// The harness constructs the server through `Server::with_acl` so the
+// tests can vary the ACL independently of the steward identity. Each
+// test exercises one slice of the negotiate / resolve pipeline:
+//
+//   - negotiate granted set under a permissive ACL
+//   - negotiate granted set under the default-deny ACL
+//   - resolve refuses without negotiate
+//   - resolve returns rows under a granted capability
+//   - resolve emits no happening (privacy-preserving regression)
+//   - audit ledger records both granted and refused calls
+
+async fn build_negotiation_harness(
+    socket_path: std::path::PathBuf,
+    acl: Arc<evo::client_acl::ClientAcl>,
+    steward_identity: evo::client_acl::StewardIdentity,
+) -> (
+    Arc<Mutex<AdmissionEngine>>,
+    Arc<HappeningBus>,
+    Arc<evo::resolution::ResolutionLedger>,
+    Server,
+) {
+    let tmp_parent = socket_path.parent().unwrap().to_path_buf();
+    let catalogue_path = tmp_parent.join("catalogue.toml");
+    std::fs::write(&catalogue_path, CATALOGUE_TOML).expect("write catalogue");
+    let catalogue =
+        Arc::new(Catalogue::load(&catalogue_path).expect("catalogue"));
+
+    let bus = Arc::new(HappeningBus::new());
+    let state = StewardState::builder()
+        .catalogue(catalogue)
+        .subjects(Arc::new(SubjectRegistry::new()))
+        .relations(Arc::new(RelationGraph::new()))
+        .custody(Arc::new(CustodyLedger::new()))
+        .bus(Arc::clone(&bus))
+        .admin(Arc::new(AdminLedger::new()))
+        .persistence(Arc::new(MemoryPersistenceStore::new()))
+        .claimant_issuer(Arc::new(evo::claimant::ClaimantTokenIssuer::new(
+            "test-instance",
+        )))
+        .build()
+        .expect("steward state must build");
+
+    // Pre-record a couple of plugin identities the resolve op can
+    // exchange tokens for. No need to admit a plugin: token issuance
+    // is the issuer's responsibility, and `record_version` is the
+    // public surface for that side of the contract.
+    state
+        .claimant_issuer
+        .record_version("com.example.alpha", "1.0.0");
+    state
+        .claimant_issuer
+        .record_version("com.example.beta", "2.3.4");
+
+    let mut engine = AdmissionEngine::new(
+        Arc::clone(&state),
+        std::path::PathBuf::from("/tmp/evo-end-to-end-tests-data-root"),
+        None,
+        PluginsSecurityConfig::default(),
+    );
+    let echo_plugin = evo_example_echo::EchoPlugin::new();
+    let echo_manifest = evo_example_echo::manifest();
+    engine
+        .admit_singleton_respondent(echo_plugin, echo_manifest)
+        .await
+        .expect("admit echo plugin");
+
+    let projections = Arc::new(ProjectionEngine::new(
+        Arc::clone(&state.subjects),
+        Arc::clone(&state.relations),
+    ));
+    let router = Arc::clone(engine.router());
+    let engine = Arc::new(Mutex::new(engine));
+    let resolution_ledger = Arc::new(evo::resolution::ResolutionLedger::new());
+    let server = Server::with_acl(
+        socket_path,
+        router,
+        Arc::clone(&state),
+        Arc::clone(&projections),
+        acl,
+        steward_identity,
+        Arc::clone(&resolution_ledger),
+    );
+
+    (engine, bus, resolution_ledger, server)
+}
+
+#[tokio::test]
+async fn negotiate_grants_resolve_claimants_under_permissive_acl() {
+    // A wide-open ACL grants `resolve_claimants` to any peer; the
+    // negotiate response echoes the granted name back.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+    let acl = Arc::new(
+        evo::client_acl::ClientAcl::parse(
+            r#"
+            [capabilities.resolve_claimants]
+            allow_local = true
+            allow_uids = [0, 1, 1000]
+            allow_gids = [0, 1, 1000]
+            "#,
+            None,
+        )
+        .expect("parse permissive ACL"),
+    );
+    // Match every plausible UID/GID by listing the test process's
+    // own credentials in the ACL. Steward identity needn't match;
+    // the explicit list grants regardless.
+    let steward_identity = evo::client_acl::StewardIdentity::current();
+    let (engine, _bus, _ledger, server) =
+        build_negotiation_harness(socket_path.clone(), acl, steward_identity)
+            .await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+    write_frame(
+        &mut stream,
+        br#"{"op":"negotiate","capabilities":["resolve_claimants"]}"#,
+    )
+    .await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["ok"].as_bool(), Some(true));
+    let granted: Vec<&str> = v["granted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert!(granted.contains(&"resolve_claimants"));
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn resolve_claimants_refuses_without_prior_negotiate() {
+    // Without a negotiate frame the connection's granted set is
+    // empty, so resolve_claimants refuses with the documented
+    // class+subclass.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+    let acl = Arc::new(evo::client_acl::ClientAcl::default());
+    let steward_identity = evo::client_acl::StewardIdentity::current();
+    let (engine, _bus, ledger, server) =
+        build_negotiation_harness(socket_path.clone(), acl, steward_identity)
+            .await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+    write_frame(
+        &mut stream,
+        br#"{"op":"resolve_claimants","tokens":["aaaa"]}"#,
+    )
+    .await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(
+        v["error"]["class"].as_str(),
+        Some("permission_denied"),
+        "got: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        v["error"]["details"]["subclass"].as_str(),
+        Some("resolve_claimants_not_granted")
+    );
+
+    // Audit ledger records the refusal.
+    assert_eq!(ledger.count(), 1);
+    let entry = &ledger.entries()[0];
+    assert!(!entry.granted);
+    assert_eq!(entry.tokens_requested, 1);
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn resolve_claimants_returns_resolutions_after_negotiate() {
+    // Permissive ACL, negotiate then resolve. Pre-recorded plugin
+    // identities surface as plain name + version; an unknown token
+    // is silently dropped from the response.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+    let acl = Arc::new(
+        evo::client_acl::ClientAcl::parse(
+            r#"
+            [capabilities.resolve_claimants]
+            allow_local = true
+            allow_uids = [0, 1, 1000]
+            allow_gids = [0, 1, 1000]
+            "#,
+            None,
+        )
+        .expect("parse permissive ACL"),
+    );
+    let steward_identity = evo::client_acl::StewardIdentity::current();
+    let (engine, _bus, ledger, server) =
+        build_negotiation_harness(socket_path.clone(), acl, steward_identity)
+            .await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    // Look up the tokens the issuer minted for the pre-recorded
+    // plugins. Tokens are deterministic on instance_id, so we can
+    // recompute them client-side.
+    let alpha_token =
+        evo::claimant::derive_token("com.example.alpha", "test-instance");
+    let beta_token =
+        evo::claimant::derive_token("com.example.beta", "test-instance");
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+    write_frame(
+        &mut stream,
+        br#"{"op":"negotiate","capabilities":["resolve_claimants"]}"#,
+    )
+    .await;
+    let _ack = read_frame(&mut stream).await;
+
+    let req = serde_json::json!({
+        "op": "resolve_claimants",
+        "tokens": [
+            alpha_token.as_str(),
+            "never-issued-zzzz",
+            beta_token.as_str(),
+        ]
+    });
+    write_frame(&mut stream, req.to_string().as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    let rows = v["resolutions"].as_array().unwrap_or_else(|| {
+        panic!(
+            "expected resolutions array, got: {}",
+            String::from_utf8_lossy(&body)
+        )
+    });
+    // Two known + one unknown -> two rows.
+    assert_eq!(rows.len(), 2);
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| r["plugin_name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"com.example.alpha"));
+    assert!(names.contains(&"com.example.beta"));
+    for row in rows {
+        if row["plugin_name"].as_str() == Some("com.example.alpha") {
+            assert_eq!(row["plugin_version"].as_str(), Some("1.0.0"));
+        }
+        if row["plugin_name"].as_str() == Some("com.example.beta") {
+            assert_eq!(row["plugin_version"].as_str(), Some("2.3.4"));
+        }
+    }
+
+    // Audit ledger records the granted call.
+    assert_eq!(ledger.count(), 1);
+    let entry = &ledger.entries()[0];
+    assert!(entry.granted);
+    assert_eq!(entry.tokens_requested, 3);
+    assert_eq!(entry.tokens_resolved, 2);
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn resolve_claimants_does_not_emit_a_happening() {
+    // Privacy regression: resolve_claimants is a private query that
+    // MUST NOT broadcast on the happenings bus. A second connection
+    // subscribes; the test issues several resolve calls on the first
+    // connection and verifies the subscriber sees nothing in a
+    // bounded wait.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+    let acl = Arc::new(
+        evo::client_acl::ClientAcl::parse(
+            r#"
+            [capabilities.resolve_claimants]
+            allow_local = true
+            allow_uids = [0, 1, 1000]
+            allow_gids = [0, 1, 1000]
+            "#,
+            None,
+        )
+        .expect("parse permissive ACL"),
+    );
+    let steward_identity = evo::client_acl::StewardIdentity::current();
+    let (engine, _bus, _ledger, server) =
+        build_negotiation_harness(socket_path.clone(), acl, steward_identity)
+            .await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    // Subscriber connection: subscribe, then never read again until
+    // we deliberately try to. Any frame past the ack is a happening.
+    let mut sub_stream = UnixStream::connect(&socket_path)
+        .await
+        .expect("subscribe connect");
+    write_frame(&mut sub_stream, br#"{"op":"subscribe_happenings"}"#).await;
+    let ack = read_frame(&mut sub_stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&ack).expect("JSON");
+    assert_eq!(v["subscribed"].as_bool(), Some(true));
+
+    // Resolver connection: negotiate then issue several resolve
+    // calls.
+    let alpha_token =
+        evo::claimant::derive_token("com.example.alpha", "test-instance");
+    let beta_token =
+        evo::claimant::derive_token("com.example.beta", "test-instance");
+    let mut res_stream = UnixStream::connect(&socket_path)
+        .await
+        .expect("resolve connect");
+    write_frame(
+        &mut res_stream,
+        br#"{"op":"negotiate","capabilities":["resolve_claimants"]}"#,
+    )
+    .await;
+    let _ = read_frame(&mut res_stream).await;
+    for _ in 0..3 {
+        let req = serde_json::json!({
+            "op": "resolve_claimants",
+            "tokens": [alpha_token.as_str(), beta_token.as_str()],
+        });
+        write_frame(&mut res_stream, req.to_string().as_bytes()).await;
+        let _ = read_frame(&mut res_stream).await;
+    }
+
+    // Try to read one happening with a short timeout. A timeout
+    // here is the success condition: the subscriber heard nothing.
+    let next_frame = tokio::time::timeout(
+        Duration::from_millis(250),
+        read_frame(&mut sub_stream),
+    )
+    .await;
+    assert!(
+        next_frame.is_err(),
+        "resolve_claimants must NOT emit a happening; got frame: {}",
+        next_frame
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    );
+
+    drop(sub_stream);
+    drop(res_stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+// ---------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------
 

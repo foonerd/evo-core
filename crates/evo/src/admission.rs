@@ -334,6 +334,16 @@ impl AdmissionEngine {
         ));
         self.router.insert(entry)?;
 
+        // Record the plugin's version against its claimant token so
+        // the `resolve_claimants` op can return both name and
+        // version. Token derivation deliberately omits the version
+        // (see [`crate::claimant`]), so the issuer needs an explicit
+        // record_version call to populate the reverse-lookup row.
+        self.state.claimant_issuer.record_version(
+            &manifest.plugin.name,
+            manifest.plugin.version.to_string(),
+        );
+
         Ok(())
     }
 
@@ -457,6 +467,16 @@ impl AdmissionEngine {
             EnforcementPolicy::from_manifest(&manifest),
         ));
         self.router.insert(entry)?;
+
+        // Record the plugin's version against its claimant token so
+        // the `resolve_claimants` op can return both name and
+        // version. Token derivation deliberately omits the version
+        // (see [`crate::claimant`]), so the issuer needs an explicit
+        // record_version call to populate the reverse-lookup row.
+        self.state.claimant_issuer.record_version(
+            &manifest.plugin.name,
+            manifest.plugin.version.to_string(),
+        );
 
         Ok(())
     }
@@ -613,6 +633,16 @@ impl AdmissionEngine {
         ));
         self.router.insert(entry)?;
 
+        // Record the plugin's version against its claimant token so
+        // the `resolve_claimants` op can return both name and
+        // version. Token derivation deliberately omits the version
+        // (see [`crate::claimant`]), so the issuer needs an explicit
+        // record_version call to populate the reverse-lookup row.
+        self.state.claimant_issuer.record_version(
+            &manifest.plugin.name,
+            manifest.plugin.version.to_string(),
+        );
+
         Ok(())
     }
 
@@ -759,6 +789,16 @@ impl AdmissionEngine {
             EnforcementPolicy::from_manifest(&manifest),
         ));
         self.router.insert(entry)?;
+
+        // Record the plugin's version against its claimant token so
+        // the `resolve_claimants` op can return both name and
+        // version. Token derivation deliberately omits the version
+        // (see [`crate::claimant`]), so the issuer needs an explicit
+        // record_version call to populate the reverse-lookup row.
+        self.state.claimant_issuer.record_version(
+            &manifest.plugin.name,
+            manifest.plugin.version.to_string(),
+        );
 
         Ok(())
     }

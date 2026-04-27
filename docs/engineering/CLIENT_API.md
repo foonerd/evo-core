@@ -56,7 +56,7 @@ A frame carries exactly one JSON object. The object's shape disambiguates whethe
 
 ## 4. Operations Reference
 
-Eight operations. Seven are synchronous request/response (three of them paginated); one is streaming.
+Eleven operations. Ten are synchronous request/response (three of them paginated); one is streaming.
 
 | Op | Shape | Purpose |
 |----|-------|---------|
@@ -69,6 +69,8 @@ Eight operations. Seven are synchronous request/response (three of them paginate
 | `enumerate_addressings` | Request / response (paginated) | Page through every claimed addressing; carries `current_seq`. |
 | `subscribe_happenings` | Streaming | Stream every happening the bus emits. |
 | `describe_capabilities` | Request / response | Discover the steward's supported ops and named features. |
+| `negotiate` | Request / response | Per-connection capability negotiation. SHOULD be the first frame on a new connection. |
+| `resolve_claimants` | Request / response | Exchange opaque `claimant_token` values for plain plugin names. Requires the `resolve_claimants` capability granted via `negotiate`. |
 
 Every request carries an `op` discriminator.
 
@@ -611,13 +613,16 @@ Response:
     "list_relations",
     "enumerate_addressings",
     "subscribe_happenings",
-    "describe_capabilities"
+    "describe_capabilities",
+    "negotiate",
+    "resolve_claimants"
   ],
   "features": [
     "subscribe_happenings_cursor",
     "alias_chain_walking",
     "active_custodies_snapshot",
-    "paginated_state_snapshots"
+    "paginated_state_snapshots",
+    "capability_negotiation"
   ]
 }
 ```
@@ -634,8 +639,78 @@ Response:
 | `alias_chain_walking` | `op = "describe_alias"` and the alias-aware variants of `op = "project_subject"` are present. |
 | `active_custodies_snapshot` | `op = "list_active_custodies"` returns the full ledger snapshot. |
 | `paginated_state_snapshots` | `op = "list_subjects"`, `op = "list_relations"`, and `op = "enumerate_addressings"` are present, each returning paginated rows alongside `current_seq` for reconcile-pinning. |
+| `capability_negotiation` | `op = "negotiate"` is present and grants per-connection capabilities consulted by gated ops (`resolve_claimants` today). |
 
 A consumer that requires a feature absent from the response MUST fall back to pre-feature behaviour or fail explicitly; silent assumption that the feature is honoured is a bug.
+
+### 4.7 `op = "negotiate"`
+
+Per-connection capability negotiation. A consumer SHOULD send this as the first frame on a new connection to request named capabilities; subsequent ops gated on a name not in the granted set refuse with `permission_denied`. Connections that never negotiate fall back to the empty granted set.
+
+Request:
+
+```json
+{
+  "op": "negotiate",
+  "capabilities": ["resolve_claimants"]
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `capabilities` | array of strings | Capability names the consumer requests. Unknown names are silently dropped from the response (forward-compatibility). |
+
+Response:
+
+```json
+{
+  "ok": true,
+  "granted": ["resolve_claimants"]
+}
+```
+
+The `granted` array carries the subset the steward grants per the operator-controlled ACL (`/etc/evo/client_acl.toml`; see §6 of `CONFIG.md`). The granted set applies for the lifetime of the connection and cannot be widened by a second `negotiate` (the second call replaces, never widens, but the policy gate is consulted again). Re-negotiating with a smaller request narrows the set.
+
+The default ACL grants `resolve_claimants` only when the connecting peer's effective UID matches the steward's UID; non-local-UID consumers (frontend processes running as a separate service user, bridges) require explicit `allow_uids`/`allow_gids` entries in the ACL file. A consumer that asked for a capability the operator denied will see it absent from `granted`; the steward returns no other diagnostic.
+
+### 4.8 `op = "resolve_claimants"`
+
+Exchange opaque `claimant_token` values for plain plugin names and (when available) versions. Resolution requires the `resolve_claimants` capability to have been granted on the connection via `op = "negotiate"`; without it the op refuses with `permission_denied` (subclass `resolve_claimants_not_granted`).
+
+Request:
+
+```json
+{
+  "op": "resolve_claimants",
+  "tokens": ["Qx9aN-bk0wUJtH4y6oFCTw", "abcd1234..."]
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `tokens` | array of strings | Tokens to resolve. Tokens not currently issued by this steward are silently omitted from the response (no error). |
+
+Response:
+
+```json
+{
+  "resolutions": [
+    {
+      "token": "Qx9aN-bk0wUJtH4y6oFCTw",
+      "plugin_name": "com.example.alpha",
+      "plugin_version": "1.2.3"
+    }
+  ]
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `token` | string | Echoes the token the consumer supplied. Useful for pipelined responses. |
+| `plugin_name` | string | Plain canonical name of the plugin the steward associates with the token. |
+| `plugin_version` | string \| null | Plugin version on record. The token derivation deliberately omits the version, so a steward that issued a token before the version was recorded MAY return `null`; consumers MUST tolerate the field being absent. |
+
+Resolution is a private query: it does NOT emit on the happenings bus, and a successful or refused call surfaces only in the steward's audit log. Operators consult the audit log to see which connection identities asked to exchange tokens for plain names; the steward records the connecting peer's UID/GID, the request size, the resolved count, and whether the call was granted.
 
 ## 5. Error Handling
 
