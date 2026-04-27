@@ -214,9 +214,16 @@ static NEXT_CID: AtomicU64 = AtomicU64::new(1);
 
 /// A client request as it appears on the wire.
 ///
-/// Internally tagged: the `op` field selects the variant.
+/// Internally tagged: the `op` field selects the variant. Each variant
+/// rejects unknown fields at parse time so an operator typo
+/// (`payload-b64` instead of `payload_b64`, for example) surfaces
+/// immediately as a structured `parse error` response rather than
+/// silently default-zeroed and producing a confusing
+/// "no payload supplied" failure later in the pipeline. New optional
+/// fields ride wire-protocol version bumps via the negotiated `Hello`
+/// frame, not silent forward compatibility on the request shape.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum ClientRequest {
     /// Dispatch a plugin request on a specific shelf.
     Request {
@@ -3394,6 +3401,39 @@ mod tests {
     }
 
     #[test]
+    fn client_request_rejects_unknown_field_at_parse() {
+        // Operator typo or attacker-shaped request: `payload-b64` with
+        // a hyphen instead of `payload_b64` MUST be rejected by the
+        // strict parser, not silently dropped (which would leave the
+        // request running with an empty payload and produce a confusing
+        // downstream "no payload" failure). This pins the
+        // `deny_unknown_fields` discipline on the request envelope.
+        let json = r#"{"op":"request","shelf":"a.b","request_type":"t","payload-b64":"aGVsbG8="}"#;
+        let err = serde_json::from_str::<ClientRequest>(json)
+            .expect_err("unknown field on ClientRequest must reject the parse");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("payload-b64") || msg.contains("unknown field"),
+            "parse error must name the unknown field, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn client_request_rejects_unknown_top_level_field_on_describe_alias() {
+        // Same discipline on every variant: an attacker-shaped
+        // `describe_alias` carrying an extra unknown field must be
+        // rejected, not silently dropped. Pins
+        // `deny_unknown_fields` across the internally-tagged enum.
+        let json = r#"{"op":"describe_alias","subject_id":"abc","include_chain":true,"extra":42}"#;
+        let err = serde_json::from_str::<ClientRequest>(json)
+            .expect_err("unknown field on DescribeAlias must reject the parse");
+        assert!(
+            format!("{err}").contains("unknown field"),
+            "parse error must name the unknown field"
+        );
+    }
+
+    #[test]
     fn client_request_parses_project_subject_minimal() {
         let json = r#"{"op":"project_subject","canonical_id":"abc-123"}"#;
         let r: ClientRequest = serde_json::from_str(json).unwrap();
@@ -4287,6 +4327,108 @@ mod tests {
         assert!(v["error"]["details"]["current_seq"].is_u64());
     }
 
+    /// Concurrent stress on the replay-window check: N subscribers
+    /// all open at once with a cursor older than the durable window
+    /// MUST each independently receive a structured
+    /// `replay_window_exceeded` frame and exit cleanly. The check
+    /// runs in `run_subscription` against the persistence store's
+    /// `load_oldest_happening_seq()` before the ack; each subscriber
+    /// reaches its own oldest-seq query and its own structured
+    /// response. Pinning the path under concurrency catches any
+    /// shared-state mutation that would interleave the queries (e.g.
+    /// a future change that batched the oldest-seq read across
+    /// subscribers and got the bookkeeping wrong).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn run_subscription_concurrent_replay_window_exceeded() {
+        const N_SUBS: usize = 16;
+
+        let store: Arc<dyn crate::persistence::PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        // Oldest retained seq is 7; every subscriber will ask for 0.
+        store
+            .record_happening(
+                7,
+                "custody_taken",
+                &serde_json::json!({"type": "custody_taken"}),
+                1_700_000_000_000,
+            )
+            .await
+            .expect("seed happening");
+
+        let bus = Arc::new(
+            crate::happenings::HappeningBus::with_persistence(Arc::clone(
+                &store,
+            ))
+            .await
+            .expect("seed bus"),
+        );
+        let state = StewardState::builder()
+            .catalogue(Arc::new(crate::catalogue::Catalogue::default()))
+            .subjects(Arc::new(crate::subjects::SubjectRegistry::new()))
+            .relations(Arc::new(crate::relations::RelationGraph::new()))
+            .custody(Arc::new(crate::custody::CustodyLedger::new()))
+            .bus(Arc::clone(&bus))
+            .admin(Arc::new(crate::admin::AdminLedger::new()))
+            .persistence(Arc::clone(&store))
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new(
+                "test-instance",
+            )))
+            .build()
+            .expect("state");
+
+        let mut handles = Vec::with_capacity(N_SUBS);
+        let mut clients = Vec::with_capacity(N_SUBS);
+        for _ in 0..N_SUBS {
+            let (server_end, client_end) = UnixStream::pair().unwrap();
+            let state = Arc::clone(&state);
+            handles.push(tokio::spawn(async move {
+                run_subscription(server_end, state, Some(0)).await
+            }));
+            clients.push(client_end);
+        }
+
+        // Each subscriber MUST receive exactly one structured
+        // `replay_window_exceeded` frame and the task MUST exit
+        // cleanly. Drive every read with a wall-clock budget so a
+        // hang is observable as a failure rather than a timeout on
+        // the whole test binary.
+        for (i, mut client) in clients.into_iter().enumerate() {
+            let mut len = [0u8; 4];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.read_exact(&mut len),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("subscriber #{i}: read length timed out")
+            })
+            .expect("read length");
+            let n = u32::from_be_bytes(len) as usize;
+            let mut body = vec![0u8; n];
+            client.read_exact(&mut body).await.expect("read body");
+            let v: serde_json::Value =
+                serde_json::from_slice(&body).expect("parse frame");
+            assert_eq!(
+                v["error"]["details"]["subclass"].as_str(),
+                Some("replay_window_exceeded"),
+                "subscriber #{i}: expected replay_window_exceeded, got {v}",
+            );
+            assert_eq!(
+                v["error"]["details"]["oldest_available_seq"].as_u64(),
+                Some(7),
+                "subscriber #{i}: oldest_available_seq must be 7",
+            );
+        }
+
+        for (i, h) in handles.into_iter().enumerate() {
+            h.await
+                .unwrap_or_else(|e| panic!("subscriber #{i} panicked: {e}"))
+                .unwrap_or_else(|e| {
+                    panic!("subscriber #{i} returned err: {e}")
+                });
+        }
+    }
+
     /// A subscriber that asks for `since = current_seq + 1`
     /// (i.e. one past the last emitted seq) MUST receive an empty
     /// replay window (no `Happening` frames between the ack and the
@@ -4920,6 +5062,98 @@ mod tests {
             }
             other => panic!("expected Negotiated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn negotiate_refuses_resolve_claimants_when_peer_cred_failed() {
+        // `peer_credentials()` (in this module) returns
+        // `PeerCredentials { uid: None, gid: None }` when the
+        // platform's peer-credential query fails (e.g. a non-Linux
+        // Unix that does not expose SO_PEERCRED at the same socket
+        // option, or a sandbox that strips the credential). The ACL
+        // path through `allow_local` / `allow_uids` / `allow_gids`
+        // MUST refuse `resolve_claimants` for such a connection: a
+        // grant would let an unidentified peer escalate to a
+        // capability the operator gated on identity. This is the
+        // integration test for the failure path; the unit test that
+        // covers the same predicate at the ACL layer alone exists in
+        // `client_acl.rs::tests`.
+        let acl = Arc::new(ClientAcl::default());
+        let steward_identity = StewardIdentity {
+            uid: Some(1234),
+            gid: Some(1234),
+        };
+        // Peer credentials unknown — the failure-path shape that
+        // `peer_credentials(stream)` produces when `peer_cred()`
+        // errors out.
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: None,
+            gid: None,
+        });
+        let response = handle_negotiate(
+            vec!["resolve_claimants".to_string()],
+            &acl,
+            steward_identity,
+            &mut conn,
+        );
+        match response {
+            ClientResponse::Negotiated { ok, granted } => {
+                assert!(
+                    ok,
+                    "negotiate must return ok=true even when no capability is granted"
+                );
+                assert!(
+                    !granted.iter().any(|g| g == "resolve_claimants"),
+                    "resolve_claimants MUST NOT be granted when peer credentials are unknown; got {granted:?}",
+                );
+            }
+            other => panic!("expected Negotiated, got {other:?}"),
+        }
+        assert!(
+            !conn.has(CAPABILITY_RESOLVE_CLAIMANTS),
+            "connection state must not record the capability for an unidentified peer"
+        );
+    }
+
+    #[test]
+    fn negotiate_with_empty_capability_list_returns_empty_granted_set() {
+        // The handler must accept an empty capability list and
+        // return `granted = []` cleanly. A consumer issuing
+        // `negotiate` with no requested capabilities is a valid
+        // probe shape (e.g. confirming the op exists) and MUST NOT
+        // be conflated with "all capabilities granted" or
+        // "negotiation failed". Pinning the contract because the
+        // empty-list edge sat unasserted in the audit MINOR list.
+        let acl = Arc::new(ClientAcl::default());
+        let steward_identity = StewardIdentity {
+            uid: Some(0),
+            gid: Some(0),
+        };
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: Some(0),
+            gid: Some(0),
+        });
+        let response =
+            handle_negotiate(Vec::new(), &acl, steward_identity, &mut conn);
+        match response {
+            ClientResponse::Negotiated { ok, granted } => {
+                assert!(
+                    ok,
+                    "negotiate with empty capability list must succeed"
+                );
+                assert!(
+                    granted.is_empty(),
+                    "empty capability list must yield empty granted set, got {granted:?}",
+                );
+            }
+            other => panic!("expected Negotiated, got {other:?}"),
+        }
+        // Side-effect on the connection state: the granted set on
+        // the per-connection record is also empty.
+        assert!(
+            conn.granted_capabilities.is_empty(),
+            "connection state's granted set must be empty after empty-capability negotiate"
+        );
     }
 
     #[test]

@@ -148,6 +148,15 @@ pub enum WireClientError {
         /// [`ErrorClass::is_connection_fatal`]; the steward should
         /// deregister the plugin when that returns true.
         class: ErrorClass,
+        /// Per-variant `details` envelope from the plugin's error
+        /// frame, when present. Carries the documented subclass
+        /// string and any class-specific extras per
+        /// `SCHEMAS.md` §4.1.2. `None` for variants that do not
+        /// publish a subclass on the wire. Operator-facing logs and
+        /// downstream callers translating to `PluginError` /
+        /// `ReportError` consult this field for the structured
+        /// signal beyond the human message.
+        details: Option<serde_json::Value>,
     },
 
     /// Config conversion failed (TOML values not representable in JSON,
@@ -444,9 +453,16 @@ impl WireClient {
         };
         match self.request(cid, frame).await? {
             WireFrame::DescribeResponse { description, .. } => Ok(description),
-            WireFrame::Error { message, class, .. } => {
-                Err(WireClientError::PluginReturnedError { message, class })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected describe_response, got {}",
                 variant_name(&other)
@@ -474,9 +490,16 @@ impl WireClient {
         };
         match self.request(cid, frame).await? {
             WireFrame::LoadResponse { .. } => Ok(()),
-            WireFrame::Error { message, class, .. } => {
-                Err(WireClientError::PluginReturnedError { message, class })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected load_response, got {}",
                 variant_name(&other)
@@ -494,9 +517,16 @@ impl WireClient {
         };
         match self.request(cid, frame).await? {
             WireFrame::UnloadResponse { .. } => Ok(()),
-            WireFrame::Error { message, class, .. } => {
-                Err(WireClientError::PluginReturnedError { message, class })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected unload_response, got {}",
                 variant_name(&other)
@@ -514,9 +544,16 @@ impl WireClient {
         };
         match self.request(cid, frame).await? {
             WireFrame::HealthCheckResponse { report, .. } => Ok(report),
-            WireFrame::Error { message, class, .. } => {
-                Err(WireClientError::PluginReturnedError { message, class })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected health_check_response, got {}",
                 variant_name(&other)
@@ -550,9 +587,16 @@ impl WireClient {
                 payload,
                 correlation_id: cid,
             }),
-            WireFrame::Error { message, class, .. } => {
-                Err(WireClientError::PluginReturnedError { message, class })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected handle_request_response, got {}",
                 variant_name(&other)
@@ -582,9 +626,16 @@ impl WireClient {
         };
         match self.request(correlation_id, frame).await? {
             WireFrame::TakeCustodyResponse { handle, .. } => Ok(handle),
-            WireFrame::Error { message, class, .. } => {
-                Err(WireClientError::PluginReturnedError { message, class })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected take_custody_response, got {}",
                 variant_name(&other)
@@ -612,9 +663,16 @@ impl WireClient {
         };
         match self.request(correlation_id, frame).await? {
             WireFrame::CourseCorrectResponse { .. } => Ok(()),
-            WireFrame::Error { message, class, .. } => {
-                Err(WireClientError::PluginReturnedError { message, class })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected course_correct_response, got {}",
                 variant_name(&other)
@@ -636,9 +694,16 @@ impl WireClient {
         };
         match self.request(correlation_id, frame).await? {
             WireFrame::ReleaseCustodyResponse { .. } => Ok(()),
-            WireFrame::Error { message, class, .. } => {
-                Err(WireClientError::PluginReturnedError { message, class })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected release_custody_response, got {}",
                 variant_name(&other)
@@ -726,11 +791,24 @@ where
             }
             Ok(())
         }
-        WireFrame::Error { message, class, .. } => {
+        WireFrame::Error {
+            message,
+            class,
+            details,
+            ..
+        } => {
             Err(WireClientError::HandshakeFailed {
-                reason: format!(
-                    "plugin refused handshake (class={class}): {message}"
-                ),
+                reason: match details {
+                    Some(d) => {
+                        format!(
+                        "plugin refused handshake (class={class}): {message} \
+                         (details={d})"
+                    )
+                    }
+                    None => {
+                        format!("plugin refused handshake (class={class}): {message}")
+                    }
+                },
             })
         }
         other => Err(WireClientError::Protocol(format!(
@@ -1631,16 +1709,32 @@ impl StdError for RemoteErrorSource {}
 
 /// Map a wire-client error to a plugin error for reporting back
 /// through the admission engine.
+///
+/// The `details` envelope carried by `PluginReturnedError` (and
+/// originally by the wire `Error` frame) is preserved on the resulting
+/// `PluginError`'s message: when present, the structured subclass and
+/// extras append after the human message. The downstream taxonomy
+/// translation in `error.rs` parses neither shape; this preserves the
+/// signal in the operator-facing log without changing the
+/// `PluginError` enum shape.
 fn wire_error_to_plugin_error(
     err: WireClientError,
     context: &'static str,
 ) -> PluginError {
     match err {
-        WireClientError::PluginReturnedError { message, class } => {
+        WireClientError::PluginReturnedError {
+            message,
+            class,
+            details,
+        } => {
+            let composed = match details {
+                Some(d) => format!("{message} (details={d})"),
+                None => message,
+            };
             if class.is_connection_fatal() {
-                PluginError::fatal(context, RemoteErrorSource(message))
+                PluginError::fatal(context, RemoteErrorSource(composed))
             } else {
-                PluginError::Permanent(message)
+                PluginError::Permanent(composed)
             }
         }
         WireClientError::Disconnected => PluginError::fatal(
@@ -4611,6 +4705,7 @@ name = "track"
             WireClientError::PluginReturnedError {
                 message: "internal blew up".into(),
                 class: ErrorClass::Internal,
+                details: None,
             },
             "ctx",
         );
@@ -4621,6 +4716,7 @@ name = "track"
             WireClientError::PluginReturnedError {
                 message: "bad input".into(),
                 class: ErrorClass::ContractViolation,
+                details: None,
             },
             "ctx",
         );
@@ -4634,6 +4730,7 @@ name = "track"
             WireClientError::PluginReturnedError {
                 message: "missing".into(),
                 class: ErrorClass::NotFound,
+                details: None,
             },
             "ctx",
         );
@@ -4644,10 +4741,41 @@ name = "track"
             WireClientError::PluginReturnedError {
                 message: "bad frame".into(),
                 class: ErrorClass::ProtocolViolation,
+                details: None,
             },
             "ctx",
         );
         assert!(pe.is_fatal());
+    }
+
+    /// `details` from the wire `Error` frame are preserved on the
+    /// resulting `PluginError`'s message text. The translation layer
+    /// composes the human message and the structured envelope into a
+    /// single string so an operator reading the log sees both the
+    /// summary and the subclass / extras without having to plumb a
+    /// new field through every error site.
+    #[test]
+    fn wire_error_to_plugin_error_preserves_details_in_message() {
+        let pe = wire_error_to_plugin_error(
+            WireClientError::PluginReturnedError {
+                message: "merge source unknown".into(),
+                class: ErrorClass::NotFound,
+                details: Some(serde_json::json!({
+                    "subclass": "merge_source_unknown",
+                    "subject_id": "abc-123",
+                })),
+            },
+            "ctx",
+        );
+        let msg = format!("{pe}");
+        assert!(
+            msg.contains("merge source unknown"),
+            "human message must survive: {msg}"
+        );
+        assert!(
+            msg.contains("merge_source_unknown") && msg.contains("abc-123"),
+            "details envelope must surface in the composed message: {msg}"
+        );
     }
 
     // ---------------------------------------------------------------------

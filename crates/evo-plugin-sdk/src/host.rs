@@ -329,6 +329,35 @@ where
         }
     };
 
+    // The handshake `Hello` frame MUST carry `cid = 0`. Symmetric
+    // with the steward's check on the `HelloAck` reply at
+    // `evo/wire_client.rs::perform_steward_handshake_inbound`: a
+    // steward sending `Hello` with a non-zero cid is a protocol
+    // violation that we surface immediately with a structured
+    // `Error` frame rather than echoing the malformed cid back
+    // through `HelloAck` (where the steward's own reply check
+    // would trip and surface a confusing diagnostic on the wrong
+    // side of the wire).
+    if cid != 0 {
+        let _ = write_frame_json(
+            writer,
+            &WireFrame::Error {
+                v: PROTOCOL_VERSION,
+                cid: 0,
+                plugin: plugin_name.to_string(),
+                class: ErrorClass::ProtocolViolation,
+                message: format!(
+                    "handshake `Hello` frame must carry cid = 0; got {cid}"
+                ),
+                details: None,
+            },
+        )
+        .await;
+        return Err(HostError::Protocol(format!(
+            "handshake `Hello` frame must carry cid = 0; got {cid}"
+        )));
+    }
+
     let chosen_feature = match (
         steward_min.max(FEATURE_VERSION_MIN),
         steward_max.min(FEATURE_VERSION_MAX),
@@ -3534,6 +3563,78 @@ mod tests {
                 assert!(
                     message.contains("plugin name mismatch"),
                     "message must explain the rejection: {message}"
+                );
+            }
+            other => panic!("expected Error frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_hello_with_non_zero_cid() {
+        use crate::wire::{
+            FEATURE_VERSION_MAX, FEATURE_VERSION_MIN, SUPPORTED_CODECS,
+        };
+        // The handshake `Hello` frame MUST carry `cid = 0`. If a
+        // steward sends `Hello` with a non-zero cid, the plugin
+        // surfaces a structured `Error` frame and bails immediately
+        // rather than echoing the malformed cid back through
+        // `HelloAck` (which the steward would then trip on its own
+        // reply check, producing a confusing handshake-failure
+        // diagnostic on the wrong side).
+        let (client, server) = tokio::io::duplex(8192);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let (mut server_r, mut server_w) = tokio::io::split(server);
+
+        let codecs: Vec<String> =
+            SUPPORTED_CODECS.iter().map(|s| s.to_string()).collect();
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::Hello {
+                v: PROTOCOL_VERSION,
+                cid: 42, // PROTOCOL VIOLATION: handshake must use cid=0.
+                plugin: "org.example.plugin".into(),
+                feature_min: FEATURE_VERSION_MIN,
+                feature_max: FEATURE_VERSION_MAX,
+                codecs,
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = perform_plugin_handshake(
+            &mut server_r,
+            &mut server_w,
+            "org.example.plugin",
+        )
+        .await;
+        match result {
+            Err(HostError::Protocol(msg)) => {
+                assert!(
+                    msg.contains("cid = 0") && msg.contains("42"),
+                    "Protocol error must name the discipline and the offending cid: {msg}"
+                );
+            }
+            other => panic!("expected Protocol(cid != 0), got {other:?}"),
+        }
+
+        // Plugin should have written an Error frame back to the
+        // steward.
+        let response = read_frame_json(&mut client_r).await.unwrap();
+        match response {
+            WireFrame::Error {
+                cid,
+                class,
+                message,
+                ..
+            } => {
+                assert_eq!(cid, 0, "the rejection itself uses cid=0");
+                assert!(
+                    matches!(class, ErrorClass::ProtocolViolation),
+                    "expected ProtocolViolation class, got {class:?}"
+                );
+                assert!(
+                    message.contains("cid = 0") && message.contains("42"),
+                    "Error message must name the violation: {message}"
                 );
             }
             other => panic!("expected Error frame, got {other:?}"),
