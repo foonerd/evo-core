@@ -91,6 +91,13 @@ impl StewardIdentity {
     /// then denies `resolve_claimants` to every connection (no UID
     /// can match an absent UID), which is the conservative behaviour
     /// for those targets.
+    ///
+    /// On Unix targets where `/proc/self` is unreadable (a sandboxed
+    /// runtime that hides `/proc`, or a non-Linux Unix without a
+    /// procfs equivalent at the same path), the steward emits a
+    /// `tracing::warn!` so the operator sees that the UID/GID
+    /// capture fell back to `None` rather than discovering at runtime
+    /// that every local-grant `resolve_claimants` request is denied.
     pub fn current() -> Self {
         #[cfg(unix)]
         {
@@ -106,10 +113,20 @@ impl StewardIdentity {
                     uid: Some(meta.uid()),
                     gid: Some(meta.gid()),
                 },
-                Err(_) => Self {
-                    uid: None,
-                    gid: None,
-                },
+                Err(e) => {
+                    tracing::warn!(
+                        component = "client_acl",
+                        error = %e,
+                        "could not read /proc/self for steward UID/GID; \
+                         resolve_claimants local-grant path will deny every \
+                         peer until the file is readable. Check whether the \
+                         steward is running under a sandbox that hides /proc."
+                    );
+                    Self {
+                        uid: None,
+                        gid: None,
+                    }
+                }
             }
         }
         #[cfg(not(unix))]

@@ -315,6 +315,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_one_bit_flipped_fingerprint() {
+        // The all-zero fingerprint test above pins the gross-mismatch
+        // case (no prefix shared, no overlap with the actual hash).
+        // The realistic threat model for a tampered sidecar is a
+        // single-bit corruption — an attacker who flipped one bit in
+        // the stored hex value, or filesystem rot that toggled one
+        // byte. The constant-time compare in `validate` MUST refuse
+        // this case, the same as it refuses the all-zero one. Pinning
+        // the bit-level granularity because the all-zero test was
+        // weak as a regression target: a comparison that, e.g.,
+        // accepted any nonzero match prefix would pass the all-zero
+        // case for the wrong reason.
+        let vk = key();
+        let mut actual = Sha256::digest(vk.as_bytes()).to_vec();
+        // Flip the lowest bit of the first byte. Any single-bit
+        // change is sufficient.
+        actual[0] ^= 0x01;
+        let m_text = format!(
+            "[key]\nfingerprint=\"sha256:{}\"\n\
+             [authorisation]\nname_prefixes=[\"x\"]\n\
+             max_trust_class=\"sandbox\"\n",
+            hex::encode(&actual)
+        );
+        let m = parse(&m_text);
+        let e = validate(&m, &vk).unwrap_err();
+        assert!(
+            matches!(e, TrustError::FingerprintMismatch { .. }),
+            "one-bit-flipped fingerprint must reject with FingerprintMismatch, got {e:?}",
+        );
+    }
+
+    #[test]
     fn rejects_inverted_validity_window() {
         let m = parse(
             "[key]\n\
