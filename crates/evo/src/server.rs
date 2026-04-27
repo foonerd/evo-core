@@ -186,8 +186,8 @@ use crate::state::StewardState;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use evo_plugin_sdk::contract::{
-    AliasRecord, HealthStatus, Request, SplitRelationStrategy, SubjectQuerier,
-    SubjectQueryResult,
+    AliasRecord, ExternalAddressing, HealthStatus, Request,
+    SplitRelationStrategy, SubjectQuerier, SubjectQueryResult,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -919,6 +919,7 @@ impl From<DegradedReason> for DegradedReasonWire {
         Self {
             kind: match d.kind {
                 DegradedReasonKind::DanglingRelation => "dangling_relation",
+                DegradedReasonKind::SubjectInConflict => "subject_in_conflict",
             },
             detail: d.detail,
         }
@@ -1402,6 +1403,24 @@ enum HappeningWire {
         /// When the happening was recorded, ms since UNIX epoch.
         at_ms: u64,
     },
+    /// Wire form of [`Happening::SubjectConflictDetected`].
+    ///
+    /// Emitted when an announcement's addressings span more than one
+    /// existing canonical subject. The steward records the conflict
+    /// for operator-driven resolution and surfaces this happening
+    /// alongside the durable `pending_conflicts` row so dashboards
+    /// can react in real time.
+    SubjectConflictDetected {
+        /// Opaque token identifying the plugin whose announcement
+        /// produced the conflict.
+        claimant_token: ClaimantToken,
+        /// The announcement's addressings.
+        addressings: Vec<ExternalAddressing>,
+        /// The distinct canonical IDs the announcement touched.
+        canonical_ids: Vec<String>,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
 }
 
 /// Wire form of
@@ -1761,6 +1780,17 @@ impl HappeningWire {
                         surviving_suppression_record,
                         issuer,
                     ),
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::SubjectConflictDetected {
+                plugin,
+                addressings,
+                canonical_ids,
+                at,
+            } => HappeningWire::SubjectConflictDetected {
+                claimant_token: issuer.token_for(&plugin),
+                addressings,
+                canonical_ids,
                 at_ms: system_time_to_ms(at),
             },
         }

@@ -119,7 +119,9 @@
 use crate::catalogue::Cardinality;
 use crate::persistence::PersistenceStore;
 use crate::relations::SuppressionRecord;
-use evo_plugin_sdk::contract::{HealthStatus, SplitRelationStrategy};
+use evo_plugin_sdk::contract::{
+    ExternalAddressing, HealthStatus, SplitRelationStrategy,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -879,6 +881,29 @@ pub enum Happening {
         /// When the happening was recorded.
         at: SystemTime,
     },
+    /// An announcement spanned more than one existing canonical
+    /// subject. The subject registry recorded a `MultiSubjectConflict`
+    /// claim and returned without merging; the wiring layer emits
+    /// this happening so operator dashboards and audit subscribers
+    /// observe the unresolved conflict in the live event stream.
+    /// The corresponding row in the durable `pending_conflicts`
+    /// table carries the same payload until the operator resolves
+    /// it via the administration tier (subject merge / forget /
+    /// manual).
+    SubjectConflictDetected {
+        /// Canonical name of the plugin whose announcement produced
+        /// the conflict.
+        plugin: String,
+        /// The announcement's addressings (the ones that spanned
+        /// multiple subjects).
+        addressings: Vec<ExternalAddressing>,
+        /// The distinct canonical IDs the announcement touched.
+        /// Length at least 2; ordering matches whatever the registry
+        /// returned (no canonical sort is imposed).
+        canonical_ids: Vec<String>,
+        /// When the happening was recorded.
+        at: SystemTime,
+    },
 }
 
 /// The happenings bus.
@@ -1221,6 +1246,9 @@ fn happening_kind_str(h: &Happening) -> &'static str {
         Happening::ClaimReassigned { .. } => "claim_reassigned",
         Happening::RelationClaimSuppressionCollapsed { .. } => {
             "relation_claim_suppression_collapsed"
+        }
+        Happening::SubjectConflictDetected { .. } => {
+            "subject_conflict_detected"
         }
     }
 }

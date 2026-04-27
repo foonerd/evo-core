@@ -777,6 +777,27 @@ impl SubjectRegistry {
                 .map(|r| r.subject_type.clone())
                 .expect("subject record must exist when should_forget is true");
             inner.subjects.remove(&id);
+
+            // Append a tombstone alias entry so chain walkers see
+            // "this canonical ID was forgotten, no successor"
+            // rather than receiving a bare not-found that cannot be
+            // distinguished from "the ID was never minted". The
+            // tombstone uses the same append-only insert path as
+            // merge / split aliases.
+            let now_ms = system_time_to_ms(SystemTime::now());
+            let _ = aliases_try_insert(
+                &mut inner,
+                id.clone(),
+                AliasRecord {
+                    old_id: CanonicalSubjectId::new(&id),
+                    new_ids: Vec::new(),
+                    kind: AliasKind::Tombstone,
+                    recorded_at_ms: now_ms,
+                    admin_plugin: claimant.to_string(),
+                    reason: reason.clone(),
+                },
+            );
+
             tracing::info!(
                 subject_id = %id,
                 subject_type = %subject_type,
@@ -883,6 +904,28 @@ impl SubjectRegistry {
                 .map(|r| r.subject_type.clone())
                 .expect("subject record must exist when should_forget is true");
             inner.subjects.remove(&id);
+
+            // Tombstone discipline mirrors the regular retract path:
+            // record an alias entry so describe_alias on a forgotten
+            // ID returns a structured "no successor" record. The
+            // admin_plugin owns the tombstone (it caused the forget),
+            // matching the pattern used elsewhere in the
+            // forced-retract surface where the admin's identity is
+            // the operator-visible actor.
+            let now_ms = system_time_to_ms(SystemTime::now());
+            let _ = aliases_try_insert(
+                &mut inner,
+                id.clone(),
+                AliasRecord {
+                    old_id: CanonicalSubjectId::new(&id),
+                    new_ids: Vec::new(),
+                    kind: AliasKind::Tombstone,
+                    recorded_at_ms: now_ms,
+                    admin_plugin: admin_plugin.to_string(),
+                    reason: reason.clone(),
+                },
+            );
+
             tracing::info!(
                 subject_id = %id,
                 subject_type = %subject_type,
@@ -2399,5 +2442,74 @@ mod tests {
                 v.key
             )
         });
+    }
+
+    #[test]
+    fn retract_last_addressing_records_tombstone_alias() {
+        // The plain retract path that ends in `SubjectForgotten`
+        // appends a tombstone alias record under the forgotten
+        // canonical ID. A consumer holding the stale ID can call
+        // describe_alias and see "this subject was forgotten" as a
+        // structured AliasKind::Tombstone record rather than
+        // receiving a bare not-found.
+        let r = SubjectRegistry::new();
+        let a = SubjectAnnouncement::new("track", vec![addr("s", "v")]);
+        let AnnounceOutcome::Created(id) =
+            r.announce(&a, "org.test.plugin").unwrap()
+        else {
+            panic!("expected Created outcome");
+        };
+        let outcome = r
+            .retract(
+                &addr("s", "v"),
+                "org.test.plugin",
+                Some("operator cleanup".into()),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            SubjectRetractOutcome::SubjectForgotten { .. }
+        ));
+
+        let alias = r
+            .describe_alias(&id)
+            .expect("tombstone alias must be present");
+        assert_eq!(alias.kind, AliasKind::Tombstone);
+        assert!(alias.new_ids.is_empty());
+        assert_eq!(alias.admin_plugin, "org.test.plugin");
+        assert_eq!(alias.reason.as_deref(), Some("operator cleanup"));
+    }
+
+    #[test]
+    fn forced_retract_last_addressing_records_tombstone_alias() {
+        // The privileged forced-retract path that ends in
+        // `SubjectForgotten` records the tombstone under the
+        // admin_plugin's identity (the operator-visible actor).
+        let r = SubjectRegistry::new();
+        let a = SubjectAnnouncement::new("album", vec![addr("a", "1")]);
+        let AnnounceOutcome::Created(id) = r.announce(&a, "p.target").unwrap()
+        else {
+            panic!("expected Created outcome");
+        };
+        let outcome = r
+            .forced_retract_addressing(
+                &addr("a", "1"),
+                "p.target",
+                "p.admin",
+                Some("admin sweep".into()),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ForcedRetractAddressingOutcome::SubjectForgotten { .. }
+        ));
+
+        let alias = r
+            .describe_alias(&id)
+            .expect("tombstone alias must be present after forced retract");
+        assert_eq!(alias.kind, AliasKind::Tombstone);
+        assert!(alias.new_ids.is_empty());
+        assert_eq!(alias.admin_plugin, "p.admin");
+        assert_eq!(alias.reason.as_deref(), Some("admin sweep"));
     }
 }

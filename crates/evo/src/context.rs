@@ -35,13 +35,16 @@ use crate::happenings::{
     CardinalityViolationSide, Happening, HappeningBus, ReassignedClaimKind,
     RelationForgottenReason,
 };
+use crate::persistence::PersistenceStore;
+use crate::projections::SubjectConflictIndex;
 use crate::relations::{
     ForcedRetractClaimOutcome, RelationGraph, RelationKey,
     ResolvedSplitAssignment, SuppressOutcome, UnsuppressOutcome,
 };
 use crate::router::PluginRouter;
 use crate::subjects::{
-    ForcedRetractAddressingOutcome, SubjectRegistry, SubjectRetractOutcome,
+    AnnounceOutcome, ForcedRetractAddressingOutcome, SubjectRegistry,
+    SubjectRetractOutcome,
 };
 
 /// A trivial state reporter that logs each report and returns success.
@@ -247,6 +250,18 @@ pub struct RegistrySubjectAnnouncer {
     catalogue: Arc<Catalogue>,
     bus: Arc<HappeningBus>,
     plugin_name: String,
+    /// Optional durable backing store. When present, multi-subject
+    /// conflicts and subject-forget events are mirrored into the
+    /// store alongside the live happening emission so operator
+    /// dashboards reading `pending_conflicts` see unresolved
+    /// conflicts and the alias chain carries tombstones for
+    /// forgotten subjects.
+    persistence: Option<Arc<dyn PersistenceStore>>,
+    /// Optional in-memory conflict index. When present, detected
+    /// multi-subject conflicts feed the index so the projection
+    /// engine surfaces the conflict-degraded reason for affected
+    /// subjects.
+    conflicts: Option<Arc<SubjectConflictIndex>>,
 }
 
 impl RegistrySubjectAnnouncer {
@@ -277,7 +292,37 @@ impl RegistrySubjectAnnouncer {
             catalogue,
             bus,
             plugin_name: plugin_name.into(),
+            persistence: None,
+            conflicts: None,
         }
+    }
+
+    /// Attach a durable backing store to this announcer.
+    ///
+    /// When set, the announcer mirrors detected multi-subject
+    /// conflicts into the `pending_conflicts` table and records a
+    /// tombstone alias entry on every subject-forget event so the
+    /// alias chain remains queryable for forgotten IDs.
+    ///
+    /// Construction without a store keeps existing call sites
+    /// working unchanged; the wiring layer attaches a real store via
+    /// this setter at boot.
+    pub fn with_persistence(
+        mut self,
+        persistence: Arc<dyn PersistenceStore>,
+    ) -> Self {
+        self.persistence = Some(persistence);
+        self
+    }
+
+    /// Attach a [`SubjectConflictIndex`] to this announcer so
+    /// detected conflicts feed the projection-degradation surface.
+    pub fn with_conflict_index(
+        mut self,
+        conflicts: Arc<SubjectConflictIndex>,
+    ) -> Self {
+        self.conflicts = Some(conflicts);
+        self
     }
 }
 
@@ -289,6 +334,9 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
     {
         let registry = Arc::clone(&self.registry);
         let catalogue = Arc::clone(&self.catalogue);
+        let bus = Arc::clone(&self.bus);
+        let persistence = self.persistence.clone();
+        let conflicts = self.conflicts.clone();
         let plugin_name = self.plugin_name.clone();
         Box::pin(async move {
             // Subject-type existence validation at announcement.
@@ -308,10 +356,67 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                     announcement.subject_type
                 )));
             }
-            match registry.announce(&announcement, &plugin_name) {
-                Ok(_outcome) => Ok(()),
-                Err(e) => Err(ReportError::Invalid(format!("announce: {e}"))),
+            let outcome = match registry.announce(&announcement, &plugin_name) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    return Err(ReportError::Invalid(format!("announce: {e}")));
+                }
+            };
+
+            // Multi-subject conflict surface. The registry recorded
+            // the conflict claim and returned without merging; the
+            // wiring layer is the one that turns "detection" into
+            // "operator-observable signal":
+            //
+            // 1. Emit a `SubjectConflictDetected` happening so live
+            //    audit subscribers see the conflict in stream order.
+            // 2. Mirror the conflict into the durable
+            //    `pending_conflicts` table (when persistence is
+            //    attached) so an operator dashboard polling the
+            //    table sees the unresolved row even if it was not
+            //    subscribed to the bus at the moment of detection.
+            //
+            // The persistence write is best-effort: a transient
+            // failure is logged but does not refuse the announce,
+            // because the in-memory registry has already accepted
+            // the conflict claim and the live happening still
+            // carries the data.
+            if let AnnounceOutcome::Conflict { canonical_ids } = &outcome {
+                let at = SystemTime::now();
+                bus.emit(Happening::SubjectConflictDetected {
+                    plugin: plugin_name.clone(),
+                    addressings: announcement.addressings.clone(),
+                    canonical_ids: canonical_ids.clone(),
+                    at,
+                });
+
+                if let Some(store) = persistence.as_ref() {
+                    let at_ms = system_time_to_ms(at);
+                    match store
+                        .record_pending_conflict(
+                            &plugin_name,
+                            &announcement.addressings,
+                            canonical_ids,
+                            at_ms,
+                        )
+                        .await
+                    {
+                        Ok(conflict_id) => {
+                            if let Some(idx) = conflicts.as_ref() {
+                                idx.record(conflict_id, canonical_ids);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin = %plugin_name,
+                                error = %e,
+                                "failed to persist pending conflict"
+                            );
+                        }
+                    }
+                }
             }
+            Ok(())
         })
     }
 
@@ -842,6 +947,16 @@ pub struct RegistrySubjectAdmin {
     ledger: Arc<AdminLedger>,
     router: Arc<PluginRouter>,
     admin_plugin: String,
+    /// Optional durable backing store. When present, the merge path
+    /// queries `list_pending_conflicts` after a successful merge and
+    /// marks any conflict whose canonical-id set is fully covered
+    /// by the merge sources as resolved with `resolution_kind =
+    /// "merged"`.
+    persistence: Option<Arc<dyn PersistenceStore>>,
+    /// Optional in-memory conflict index, kept in sync with the
+    /// durable `pending_conflicts` table so projection composition
+    /// reflects the resolution without an additional store query.
+    conflicts: Option<Arc<SubjectConflictIndex>>,
 }
 
 impl RegistrySubjectAdmin {
@@ -877,7 +992,30 @@ impl RegistrySubjectAdmin {
             ledger,
             router,
             admin_plugin: admin_plugin.into(),
+            persistence: None,
+            conflicts: None,
         }
+    }
+
+    /// Attach a durable backing store so the merge path can mark
+    /// pending conflicts whose IDs were collapsed into a single new
+    /// canonical subject as resolved.
+    pub fn with_persistence(
+        mut self,
+        persistence: Arc<dyn PersistenceStore>,
+    ) -> Self {
+        self.persistence = Some(persistence);
+        self
+    }
+
+    /// Attach a [`SubjectConflictIndex`] so the merge resolution
+    /// also clears the in-memory projection-degradation surface.
+    pub fn with_conflict_index(
+        mut self,
+        conflicts: Arc<SubjectConflictIndex>,
+    ) -> Self {
+        self.conflicts = Some(conflicts);
+        self
     }
 }
 
@@ -1101,6 +1239,8 @@ impl SubjectAdmin for RegistrySubjectAdmin {
         let ledger = Arc::clone(&self.ledger);
         let admin_plugin = self.admin_plugin.clone();
         let catalogue = Arc::clone(&self.catalogue);
+        let persistence = self.persistence.clone();
+        let conflicts = self.conflicts.clone();
         Box::pin(async move {
             let source_a_id = registry.resolve(&target_a).ok_or_else(|| {
                 ReportError::MergeSourceUnknown {
@@ -1334,14 +1474,72 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 kind: AdminLogKind::SubjectMerge,
                 admin_plugin: admin_plugin.clone(),
                 target_plugin: None,
-                target_subject: Some(new_id),
+                target_subject: Some(new_id.clone()),
                 target_addressing: None,
                 target_relation: None,
-                additional_subjects: vec![source_a_id, source_b_id],
+                additional_subjects: vec![
+                    source_a_id.clone(),
+                    source_b_id.clone(),
+                ],
                 reason,
                 prior_reason: None,
                 at,
             });
+
+            // Conflict resolution surface. When persistence and the
+            // in-memory conflict index are both attached, scan the
+            // open conflicts and mark resolved any whose canonical-id
+            // set is fully covered by the merge sources (i.e. the
+            // operator collapsed exactly the IDs the conflict
+            // recorded). The resolution kind is "merged" matching
+            // the open-coded vocabulary in the migration. A
+            // partial-cover conflict — where the merge collapsed
+            // some but not all of the conflict's IDs — is left
+            // unresolved; the operator's next merge or forget will
+            // close it.
+            if let (Some(store), Some(idx)) =
+                (persistence.as_ref(), conflicts.as_ref())
+            {
+                let pending =
+                    store.list_pending_conflicts().await.unwrap_or_else(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "list_pending_conflicts failed during merge \
+                             resolution"
+                        );
+                        Vec::new()
+                    });
+                let merge_set: std::collections::HashSet<&str> =
+                    [source_a_id.as_str(), source_b_id.as_str()]
+                        .into_iter()
+                        .collect();
+                let resolved_at_ms = system_time_to_ms(at);
+                for conflict in pending {
+                    let covered = !conflict.canonical_ids.is_empty()
+                        && conflict
+                            .canonical_ids
+                            .iter()
+                            .all(|cid| merge_set.contains(cid.as_str()));
+                    if covered {
+                        if let Err(e) = store
+                            .mark_conflict_resolved(
+                                conflict.id,
+                                "merged",
+                                resolved_at_ms,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                conflict_id = conflict.id,
+                                error = %e,
+                                "mark_conflict_resolved failed"
+                            );
+                        } else {
+                            idx.resolve(conflict.id);
+                        }
+                    }
+                }
+            }
 
             Ok(())
         })
@@ -2462,6 +2660,97 @@ target_type = "*"
             .await;
         assert!(result.is_ok());
         assert_eq!(registry.subject_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_emits_conflict_detected_happening() {
+        // Two announcements register two distinct canonical subjects.
+        // A third announcement spans both addressings and produces an
+        // AnnounceOutcome::Conflict in the registry; the wiring layer
+        // is expected to surface the structured
+        // Happening::SubjectConflictDetected on the bus carrying the
+        // plugin name, the announcement's addressings, and the
+        // canonical IDs the announcement touched.
+        use crate::persistence::MemoryPersistenceStore;
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let persistence: Arc<dyn PersistenceStore> =
+            Arc::new(MemoryPersistenceStore::new());
+        let conflict_idx = Arc::new(SubjectConflictIndex::new());
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.conflict",
+        )
+        .with_persistence(Arc::clone(&persistence))
+        .with_conflict_index(Arc::clone(&conflict_idx));
+
+        // Pre-seed two distinct canonical subjects.
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("a", "1")],
+            ))
+            .await
+            .unwrap();
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("b", "2")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(registry.subject_count(), 2);
+
+        // Subscribe BEFORE the conflicting announce so the broadcast
+        // channel captures the happening (the broadcast bus drops
+        // events without subscribers).
+        let mut rx = bus.subscribe();
+
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![
+                    ExternalAddressing::new("a", "1"),
+                    ExternalAddressing::new("b", "2"),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        // The first happening on the bus must be SubjectConflictDetected
+        // carrying the announcement's two addressings and the two
+        // distinct canonical IDs the registry detected.
+        let got = rx.try_recv().expect("conflict happening must be present");
+        match got {
+            Happening::SubjectConflictDetected {
+                plugin,
+                addressings,
+                canonical_ids,
+                ..
+            } => {
+                assert_eq!(plugin, "org.test.conflict");
+                assert_eq!(addressings.len(), 2);
+                assert_eq!(canonical_ids.len(), 2);
+            }
+            other => panic!("expected SubjectConflictDetected, got {other:?}"),
+        }
+
+        // The durable persistence layer recorded the conflict and the
+        // in-memory projection-degradation index reflects it: each of
+        // the two canonical IDs sits in the open conflict.
+        let pending = persistence.list_pending_conflicts().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].canonical_ids.len(), 2);
+        for cid in &pending[0].canonical_ids {
+            assert_eq!(conflict_idx.conflicts_for(cid), vec![pending[0].id]);
+        }
     }
 
     #[tokio::test]

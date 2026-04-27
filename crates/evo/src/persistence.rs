@@ -83,6 +83,16 @@ pub const SCHEMA_VERSION_HAPPENINGS: u32 = 2;
 /// for claimant tokens.
 pub const SCHEMA_VERSION_META: u32 = 3;
 
+/// Schema version: pending multi-subject conflicts.
+///
+/// Adds the `pending_conflicts` table — an operator-facing record of
+/// announcements that resolved to more than one canonical subject.
+/// One row per detected conflict; rows stay unresolved until the
+/// administration tier marks them resolved. The table backs the
+/// projection-degradation surface that names a subject as currently
+/// participating in an unresolved conflict.
+pub const SCHEMA_VERSION_PENDING_CONFLICTS: u32 = 4;
+
 /// Maximum schema version this build of the steward understands.
 ///
 /// On open, [`SqlitePersistenceStore`] refuses to operate on a
@@ -90,7 +100,7 @@ pub const SCHEMA_VERSION_META: u32 = 3;
 /// than this constant. Downgrades are not supported; an operator
 /// running an older steward against a newer database must restore
 /// from a pre-upgrade backup.
-pub const SUPPORTED_SCHEMA_VERSION: u32 = SCHEMA_VERSION_META;
+pub const SUPPORTED_SCHEMA_VERSION: u32 = SCHEMA_VERSION_PENDING_CONFLICTS;
 
 /// Logical keys used in the `meta` table. Constants are kept in one
 /// place so a misspelling produces a compile error rather than a
@@ -114,6 +124,10 @@ const MIGRATION_002_HAPPENINGS: &str =
 
 /// SQL text of the v3 migration: steward meta kv (instance_id).
 const MIGRATION_003_META: &str = include_str!("../migrations/003_meta.sql");
+
+/// SQL text of the v4 migration: pending multi-subject conflicts.
+const MIGRATION_004_PENDING_CONFLICTS: &str =
+    include_str!("../migrations/004_pending_conflicts.sql");
 
 /// Errors raised by the persistence layer.
 ///
@@ -315,6 +329,39 @@ pub struct PersistedHappening {
     pub payload: serde_json::Value,
     /// Wall-clock millisecond timestamp the bus minted on emit.
     pub at_ms: u64,
+}
+
+/// One row of the `pending_conflicts` table.
+///
+/// Each row captures one detected multi-subject conflict: an
+/// announcement from `plugin` whose addressings spanned more than one
+/// existing canonical subject. Rows are appended on detection and
+/// updated in place once the operator-driven administration tier
+/// resolves the conflict (the same row's `resolved_at_ms` and
+/// `resolution_kind` columns transition from `None` / `None` to
+/// `Some(...)` / `Some(...)`); the row itself is never deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingConflict {
+    /// Auto-incrementing primary key. Stable within one database;
+    /// not portable across backups.
+    pub id: i64,
+    /// Wall-clock millisecond timestamp the conflict was detected.
+    pub detected_at_ms: u64,
+    /// Canonical name of the plugin whose announcement produced the
+    /// conflict.
+    pub plugin: String,
+    /// The announcement's addressings (the ones that spanned multiple
+    /// subjects).
+    pub addressings: Vec<ExternalAddressing>,
+    /// The distinct canonical IDs the announcement touched.
+    pub canonical_ids: Vec<String>,
+    /// Wall-clock millisecond timestamp at which the operator
+    /// resolved the conflict; `None` while the conflict is still
+    /// unresolved.
+    pub resolved_at_ms: Option<u64>,
+    /// Resolution discriminator (`"merged"`, `"forgotten"`,
+    /// `"manual"`); `None` while the conflict is still unresolved.
+    pub resolution_kind: Option<String>,
 }
 
 /// One provenance entry to write into `claim_log` alongside the
@@ -666,6 +713,52 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
     ) -> Pin<
         Box<dyn Future<Output = Result<String, PersistenceError>> + Send + 'a>,
     >;
+
+    /// Append a new row to `pending_conflicts` describing a detected
+    /// multi-subject conflict. Returns the row's auto-incremented `id`
+    /// so the wiring layer can include it in the structured
+    /// projection-degradation surface.
+    ///
+    /// The `addressings` and `canonical_ids` payloads are stored as
+    /// JSON arrays so consumers reading the row see the same shape
+    /// the in-memory happening variant carries at the same moment.
+    fn record_pending_conflict<'a>(
+        &'a self,
+        plugin: &'a str,
+        addressings: &'a [ExternalAddressing],
+        canonical_ids: &'a [String],
+        at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<i64, PersistenceError>> + Send + 'a>>;
+
+    /// Mark the row in `pending_conflicts` whose primary key is `id`
+    /// as resolved. The `resolution_kind` discriminator names how the
+    /// conflict was resolved (open-coded; see the migration body for
+    /// the current vocabulary). `at_ms` is the wall-clock instant the
+    /// resolution was observed.
+    ///
+    /// Marking a row that does not exist or is already resolved is a
+    /// silent no-op; callers that need to distinguish must consult
+    /// [`Self::list_pending_conflicts`] before issuing the update.
+    fn mark_conflict_resolved<'a>(
+        &'a self,
+        id: i64,
+        resolution_kind: &'a str,
+        at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Return every `pending_conflicts` row whose `resolved_at_ms` is
+    /// `NULL`, in `detected_at_ms` ascending order so operator
+    /// dashboards see the oldest unresolved conflict first. Resolved
+    /// rows are excluded.
+    fn list_pending_conflicts<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<PendingConflict>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    >;
 }
 
 /// Claim-log kind values used by this slice. Strings are stable
@@ -764,6 +857,14 @@ fn run_migrations(conn: &mut Connection) -> Result<(), PersistenceError> {
                 source: e,
             }
         })?;
+    }
+
+    if current < SCHEMA_VERSION_PENDING_CONFLICTS {
+        conn.execute_batch(MIGRATION_004_PENDING_CONFLICTS)
+            .map_err(|e| PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_PENDING_CONFLICTS,
+                source: e,
+            })?;
     }
 
     Ok(())
@@ -1456,6 +1557,7 @@ fn load_aliases_for_query(
             let kind = match kind_str.as_str() {
                 "merged" => AliasKind::Merged,
                 "split" => AliasKind::Split,
+                "tombstone" => AliasKind::Tombstone,
                 other => {
                     return Err(rusqlite::Error::FromSqlConversionFailure(
                         3,
@@ -1773,6 +1875,156 @@ impl PersistenceStore for SqlitePersistenceStore {
             .await
         })
     }
+
+    fn record_pending_conflict<'a>(
+        &'a self,
+        plugin: &'a str,
+        addressings: &'a [ExternalAddressing],
+        canonical_ids: &'a [String],
+        at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<i64, PersistenceError>> + Send + 'a>>
+    {
+        let plugin = plugin.to_string();
+        let addressings_json =
+            serde_json::to_string(addressings).unwrap_or_else(|_| "[]".into());
+        let canonical_ids_json = serde_json::to_string(canonical_ids)
+            .unwrap_or_else(|_| "[]".into());
+        Box::pin(async move {
+            self.interact("record_pending_conflict", move |conn| {
+                conn.execute(
+                    "INSERT INTO pending_conflicts \
+                     (detected_at_ms, plugin, addressings_json, \
+                      canonical_ids_json, resolved_at_ms, resolution_kind) \
+                     VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
+                    params![
+                        at_ms as i64,
+                        plugin,
+                        addressings_json,
+                        canonical_ids_json
+                    ],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("insert pending_conflicts", e)
+                })?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await
+        })
+    }
+
+    fn mark_conflict_resolved<'a>(
+        &'a self,
+        id: i64,
+        resolution_kind: &'a str,
+        at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let kind = resolution_kind.to_string();
+        Box::pin(async move {
+            self.interact("mark_conflict_resolved", move |conn| {
+                conn.execute(
+                    "UPDATE pending_conflicts SET resolved_at_ms = ?2, \
+                     resolution_kind = ?3 WHERE id = ?1 \
+                     AND resolved_at_ms IS NULL",
+                    params![id, at_ms as i64, kind],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("update pending_conflicts", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn list_pending_conflicts<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<PendingConflict>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("list_pending_conflicts", |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, detected_at_ms, plugin, addressings_json, \
+                         canonical_ids_json, resolved_at_ms, resolution_kind \
+                         FROM pending_conflicts WHERE resolved_at_ms IS NULL \
+                         ORDER BY detected_at_ms ASC",
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "prepare pending_conflicts query",
+                            e,
+                        )
+                    })?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let addressings_json: String = row.get(3)?;
+                        let canonical_ids_json: String = row.get(4)?;
+                        let addressings: Vec<ExternalAddressing> =
+                            serde_json::from_str(&addressings_json).map_err(
+                                |e| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        3,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            format!(
+                                                "addressings_json not JSON: {e}"
+                                            ),
+                                        )),
+                                    )
+                                },
+                            )?;
+                        let canonical_ids: Vec<String> = serde_json::from_str(
+                            &canonical_ids_json,
+                        )
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("canonical_ids_json not JSON: {e}"),
+                                )),
+                            )
+                        })?;
+                        Ok(PendingConflict {
+                            id: row.get(0)?,
+                            detected_at_ms: row.get::<_, i64>(1)? as u64,
+                            plugin: row.get(2)?,
+                            addressings,
+                            canonical_ids,
+                            resolved_at_ms: row
+                                .get::<_, Option<i64>>(5)?
+                                .map(|v| v as u64),
+                            resolution_kind: row.get(6)?,
+                        })
+                    })
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "execute pending_conflicts query",
+                            e,
+                        )
+                    })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r.map_err(|e| {
+                        PersistenceError::sqlite(
+                            "read pending_conflicts row",
+                            e,
+                        )
+                    })?);
+                }
+                Ok(out)
+            })
+            .await
+        })
+    }
 }
 
 /// In-memory mock implementation of [`PersistenceStore`].
@@ -1816,6 +2068,11 @@ struct MemoryState {
     /// Append-only mirror of `happenings_log`. Tests query this
     /// via [`PersistenceStore::load_happenings_since`].
     happenings: Vec<PersistedHappening>,
+    /// Mirror of the `pending_conflicts` table. Updated in place
+    /// when a row's resolution columns transition from NULL to a
+    /// concrete value.
+    pending_conflicts: Vec<PendingConflict>,
+    next_conflict_id: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -2228,6 +2485,78 @@ impl PersistenceStore for MemoryPersistenceStore {
         Box<dyn Future<Output = Result<String, PersistenceError>> + Send + 'a>,
     > {
         Box::pin(async move { Ok(self.instance_id.clone()) })
+    }
+
+    fn record_pending_conflict<'a>(
+        &'a self,
+        plugin: &'a str,
+        addressings: &'a [ExternalAddressing],
+        canonical_ids: &'a [String],
+        at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<i64, PersistenceError>> + Send + 'a>>
+    {
+        let plugin = plugin.to_string();
+        let addressings = addressings.to_vec();
+        let canonical_ids = canonical_ids.to_vec();
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            g.next_conflict_id += 1;
+            let id = g.next_conflict_id;
+            g.pending_conflicts.push(PendingConflict {
+                id,
+                detected_at_ms: at_ms,
+                plugin,
+                addressings,
+                canonical_ids,
+                resolved_at_ms: None,
+                resolution_kind: None,
+            });
+            Ok(id)
+        })
+    }
+
+    fn mark_conflict_resolved<'a>(
+        &'a self,
+        id: i64,
+        resolution_kind: &'a str,
+        at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let kind = resolution_kind.to_string();
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            if let Some(slot) =
+                g.pending_conflicts.iter_mut().find(|c| c.id == id)
+            {
+                if slot.resolved_at_ms.is_none() {
+                    slot.resolved_at_ms = Some(at_ms);
+                    slot.resolution_kind = Some(kind);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn list_pending_conflicts<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<PendingConflict>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            let mut out: Vec<PendingConflict> = g
+                .pending_conflicts
+                .iter()
+                .filter(|c| c.resolved_at_ms.is_none())
+                .cloned()
+                .collect();
+            out.sort_by_key(|c| c.detected_at_ms);
+            Ok(out)
+        })
     }
 }
 

@@ -228,8 +228,8 @@ pub struct AliasRecord {
 
 /// Which administrative operation produced an [`AliasRecord`].
 ///
-/// Serialises as snake_case ("merged" / "split") so the on-disk
-/// and on-wire forms stay stable across SDK refactors.
+/// Serialises as snake_case ("merged" / "split" / "tombstone") so the
+/// on-disk and on-wire forms stay stable across SDK refactors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AliasKind {
@@ -239,6 +239,13 @@ pub enum AliasKind {
     /// The old subject was split into multiple subjects. The
     /// alias's `new_ids` has length at least 2.
     Split,
+    /// The old subject was forgotten (its last addressing was
+    /// retracted, or an admin force-retract removed the last
+    /// addressing) and has no successor. The alias's `new_ids` is
+    /// empty; the record exists so consumers walking the alias
+    /// chain see "this canonical ID was forgotten" rather than
+    /// receiving a bare not-found.
+    Tombstone,
 }
 
 /// One addressing currently registered to a subject, with the
