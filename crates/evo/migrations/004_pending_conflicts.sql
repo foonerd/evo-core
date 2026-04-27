@@ -15,10 +15,12 @@
 -- an operator resolves it via the administration tier; at that point
 -- the wiring layer updates resolved_at_ms and resolution_kind in
 -- place. The kind values are open-coded strings; the steward writes
--- 'merged' when an admin merge collapsed the conflicting IDs,
--- 'forgotten' when the conflicting IDs were retracted, and 'manual'
--- when the operator marks the conflict resolved without a structural
--- change. Future kinds append; existing kinds are stable.
+-- 'merged' when an admin merge reduced the conflict's live canonical
+-- IDs to one or zero, 'split' when an admin split did the same, and
+-- 'forgotten' when a retract or forced-retract did the same. The
+-- 'manual' value is reserved for an operator marking the conflict
+-- resolved without a structural change. Future kinds append;
+-- existing kinds are stable.
 --
 -- The unresolved-only partial index supports the common operator
 -- query "list every conflict still open, oldest first". A full scan

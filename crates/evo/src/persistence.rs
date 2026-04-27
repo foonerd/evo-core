@@ -359,7 +359,7 @@ pub struct PendingConflict {
     /// resolved the conflict; `None` while the conflict is still
     /// unresolved.
     pub resolved_at_ms: Option<u64>,
-    /// Resolution discriminator (`"merged"`, `"forgotten"`,
+    /// Resolution discriminator (`"merged"`, `"split"`, `"forgotten"`,
     /// `"manual"`); `None` while the conflict is still unresolved.
     pub resolution_kind: Option<String>,
 }
