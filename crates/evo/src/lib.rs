@@ -71,6 +71,7 @@ pub mod admission;
 pub mod catalogue;
 pub mod claimant;
 pub mod cli;
+pub mod client_acl;
 pub mod config;
 pub mod context;
 pub mod custody;
