@@ -27,17 +27,17 @@ mod verify;
 pub use canonical::{canonicalise, CanonicalError};
 pub use digest::{
     format_digest_sha256_hex, install_digest, parse_digest_sha256_hex,
-    signing_message,
+    signing_message, SIGNING_PAYLOAD_VERSION_V1,
 };
 pub use error::TrustError;
-pub use key_meta::{Authorisation, KeyMeta, KeySection};
+pub use key_meta::{Authorisation, KeyMeta, KeyRole, KeySection};
 pub use matchers::effective_trust_class;
 pub use matchers::name_matches_prefixes;
 pub use revocation::RevocationSet;
 pub use trust_root::{load_trust_root, read_signature_file, TrustKey};
 pub use verify::{
-    verify_out_of_process_bundle, OutOfProcessBundleRef, TrustOptions,
-    TrustOutcome,
+    verify_out_of_process_bundle, verify_out_of_process_bundle_at,
+    OutOfProcessBundleRef, TrustOptions, TrustOutcome, MIN_ROTATION_OVERLAP,
 };
 
 use evo_plugin_sdk::manifest::TrustClass;

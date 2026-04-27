@@ -1,5 +1,5 @@
-//! Install digest: SHA-256 of canonical `manifest.toml` bytes || SHA-256(artefact) bytes
-//! (concatenation), per `PLUGIN_PACKAGING.md` section 5.
+//! Install digest: SHA-256 of the signing payload, which is
+//! `<version-byte> || canonical(manifest.toml) || SHA-256(artefact)`.
 //!
 //! ## Canonical TOML payload
 //!
@@ -15,15 +15,31 @@
 //!
 //! `signing_message` is the only blessed path; raw bytes are not
 //! signed under any code path.
+//!
+//! ## Signing payload version
+//!
+//! The signing payload is prefixed with a single version byte. The
+//! version byte is signed as part of the message, so a future
+//! evolution of the canonical-TOML rules (or of the artefact-digest
+//! choice) lands as a new version. The verifier reads the leading
+//! byte to dispatch to the matching reconstruction. The current and
+//! only accepted version is [`SIGNING_PAYLOAD_VERSION_V1`].
 
 use sha2::{Digest, Sha256};
 
 use crate::canonical::canonicalise;
 use crate::error::TrustError;
 
-/// The signed message: canonical TOML bytes of `manifest.toml`
-/// followed by the 32-byte digest of the artefact file, per
-/// `PLUGIN_PACKAGING.md` §5.
+/// First byte of every signing payload. Distinguishes the layout
+/// the verifier reconstructs. Version 1 is `<0x01> ||
+/// canonical(manifest) || SHA-256(artefact)`.
+pub const SIGNING_PAYLOAD_VERSION_V1: u8 = 0x01;
+
+/// The signed message: a single version byte, the canonical TOML
+/// bytes of `manifest.toml`, and the 32-byte digest of the
+/// artefact file. The version byte is part of the message so it is
+/// covered by the signature; future format changes land as new
+/// versions.
 pub fn signing_message(
     manifest_path: &std::path::Path,
     exec_path: &std::path::Path,
@@ -41,7 +57,9 @@ pub fn signing_message(
         TrustError::io(format!("read {}", exec_path.display()), e)
     })?;
     let d = Sha256::digest(&art);
-    let mut out = canonical;
+    let mut out = Vec::with_capacity(1 + canonical.len() + 32);
+    out.push(SIGNING_PAYLOAD_VERSION_V1);
+    out.extend_from_slice(&canonical);
     out.extend_from_slice(&d);
     Ok(out)
 }
@@ -78,4 +96,27 @@ pub fn parse_digest_sha256_hex(s: &str) -> Option<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes);
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn signing_message_starts_with_version_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("manifest.toml");
+        let exec = dir.path().join("plugin.bin");
+        std::fs::File::create(&manifest)
+            .unwrap()
+            .write_all(b"name = \"x\"\n")
+            .unwrap();
+        std::fs::File::create(&exec)
+            .unwrap()
+            .write_all(b"art")
+            .unwrap();
+        let msg = signing_message(&manifest, &exec).unwrap();
+        assert_eq!(msg[0], SIGNING_PAYLOAD_VERSION_V1);
+    }
 }

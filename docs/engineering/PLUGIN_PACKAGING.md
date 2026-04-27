@@ -309,12 +309,19 @@ Five tiers, declared in the manifest, **authorised at admission** by the signing
 
 ### Signing
 
-Plugins other than in-process-compiled-in are signed. Signature is ed25519 over the concatenation of:
+Plugins other than in-process-compiled-in are signed. Signature is ed25519 over a deterministic **signing payload**:
 
-1. The bytes of `manifest.toml`.
-2. The SHA-256 digest of the artefact file (`plugin.bin`, `plugin.so`, or `plugin.wasm`).
+```
+signing_payload = <version-byte> || canonical(manifest.toml) || SHA-256(artefact)
+```
+
+- `version-byte`: a single byte that identifies the payload layout. The current and only accepted version is **`0x01`**. Future canonicalisation or artefact-digest changes land as new versions; verifiers read the leading byte to dispatch.
+- `canonical(manifest.toml)`: the deterministic re-serialisation of `manifest.toml` produced by the canonical encoder. Whitespace, key order, comments, and TOML quoting style on disk are operator/editor choices and are not semantic — the encoder collapses them. Tables are emitted in lexicographic order, keys within a table in lexicographic order, strings as basic strings (`"..."`) only with non-printable characters `\u`-escaped, arrays preserve declaration order, datetimes and floats in their TOML canonical form, line endings LF, no BOM, exactly one trailing newline. Non-finite floats (NaN, ±inf) are refused. Signing the raw on-disk bytes was rejected because it makes signatures fragile against routine tooling (re-pack, re-format, editor save) that does not preserve byte equivalence.
+- `SHA-256(artefact)`: the 32-byte digest of `plugin.bin`, `plugin.so`, or `plugin.wasm`.
 
 Signature file: `manifest.sig`, binary 64 bytes.
+
+The install digest used in revocations is `SHA-256(signing_payload)` — the hash of the same bytes that are signed.
 
 ### Trust root
 
@@ -323,20 +330,97 @@ The trust root is the union of:
 - `/opt/evo/trust/*.pem` (package-shipped keys: evo's own plus brand keys of the distribution).
 - `/etc/evo/trust.d/*.pem` (operator-installed keys).
 
-Each public key carries associated metadata in a sidecar `<keyname>.meta.toml`:
+Each public key carries associated metadata in a sidecar `<keyname>.meta.toml`. See [Key metadata file](#key-metadata-file-metatoml) below for the full schema.
+
+The trust root is **layered**: every key declares its `role` and (except for roots) names its parent via `signed_by`. Five roles compose the chain, ordered from most authoritative to least:
+
+| Role | Typical issuer | May be signed by |
+| ---- | -------------- | ---------------- |
+| `project_root` | The evo project itself | (root; no parent) |
+| `distribution_root` | A distribution maintainer | `project_root` |
+| `operator_root` | The appliance operator | (root; no parent) |
+| `vendor` | A vendor or distribution component | `project_root`, `distribution_root`, or `operator_root` |
+| `individual_author` | An individual plugin author | any of the above |
+
+A key with `signed_by = None` is a **root**. Verification walks the chain from the leaf (the key that signed the bundle) upward via `signed_by` → `key_id` until it reaches a root, validating each step's window and role compatibility. A missing parent, an out-of-window key, or a role mismatch fails the bundle.
+
+The evo project's own key is authorised for `org.evo.*` at `platform` class. A distribution's key is authorised for its own namespace at `privileged` or lower. Third-party author keys are authorised for their own namespace at whatever class the operator grants.
+
+#### Key rotation with overlap window
+
+When a new key replaces an old one, the new key's sidecar carries `supersedes = "<old_key_id>"` and a `not_before` that overlaps the old key's `not_after`. During the overlap window — the period from the new key's `not_before` to the old key's `not_after` — the verifier accepts a signature from **either** key. After the old key's `not_after`, signatures under the old key alone are rejected as expired.
+
+The minimum overlap window is **30 days**. Operators publishing a rotation with a shorter overlap is treated as misconfiguration: the verifier refuses the rotation rather than silently honouring it.
+
+#### Operator-supreme override
+
+When the trust set contains a key with `role = operator_root`, that key is the appliance's supreme authority. An operator-root signature on a bundle is preferred over any vendor signature: even if the vendor chain is broken (parent missing, parent expired), the operator-root admission still applies. An operator may declare supreme authority by publishing a key with `signed_by = None` and `role = operator_root`. This pattern lets the operator override vendor decisions on their own appliance without requiring the vendor's cooperation.
+
+### Key metadata file (`*.meta.toml`)
+
+Every public key in the trust root has a sibling sidecar `<keyname>.meta.toml`. Two top-level tables: `[key]` (optional metadata about the key itself) and `[authorisation]` (required: which plugin names this key may sign for and the highest trust class it may authorise).
 
 ```toml
 [key]
-fingerprint = "SHA256:..."             # Of the public key itself.
+# Stable opaque identifier. Snake_case, <= 64 chars. Optional.
+# When absent, the verifier computes a default from
+# BLAKE3(public_key_bytes) truncated to 16 bytes hex-encoded.
+key_id = "vendor_acme"
+
+# Signing algorithm. Optional; defaults to "ed25519". Only
+# "ed25519" is accepted in this version.
+algorithm = "ed25519"
+
+# SHA-256 fingerprint of the public key bytes, lowercase hex
+# with "sha256:" prefix. Optional. When present, the loader
+# verifies the declared value matches the actual key bytes
+# (constant-time compare); a mismatch is fatal at startup.
+fingerprint = "sha256:0123abcd..."
+
+# Reserved for future tooling; advisory in this version.
 purpose = "plugin-signing"
 issued_by = "example.com / evo project / operator"
 
+# RFC3339 validity window. Both fields optional and independent;
+# an absent bound is open on that side.
+not_before = "2026-01-01T00:00:00Z"
+not_after  = "2027-01-01T00:00:00Z"
+
+# Rotation: the key_id of a key this one rotates out. Verifier
+# accepts signatures from either key during the overlap window
+# (new.not_before .. old.not_after, minimum 30 days).
+supersedes = "vendor_acme_v1"
+
+# Chain parent: the key_id of the key that signs this key.
+# Absent (None) means this key is a root.
+signed_by = "dist_root"
+
+# Role in the layered chain of trust. Optional; defaults to
+# "vendor". One of:
+#   project_root | distribution_root | operator_root |
+#   vendor | individual_author
+role = "vendor"
+
 [authorisation]
-name_prefixes = ["org.example.*"]      # Name prefixes this key may sign for.
-max_trust_class = "standard"           # Highest trust class this key may authorise.
+# Name prefixes this key may sign for. `*` is a single-segment
+# or trailing-suffix wildcard.
+name_prefixes = ["org.example.*"]
+# Highest trust class this key may authorise. Lower (weaker)
+# classes are admitted at their declared class; declared classes
+# above this max are either degraded or refused per
+# `degrade_trust` policy.
+max_trust_class = "standard"
 ```
 
-The evo project's own key is authorised for `org.evo.*` at `platform` class. A distribution's key is authorised for its own namespace at `privileged` or lower. Third-party author keys are authorised for their own namespace at whatever class the operator grants.
+Validation rules enforced at trust-root load time:
+
+- `algorithm`, when present, must equal `"ed25519"`. Other values reject the sidecar.
+- `key_id`, when present, must be snake_case (lowercase ASCII letters, digits, underscores), non-empty, and ≤ 64 chars.
+- `fingerprint`, when present, must equal the SHA-256 of the public key bytes, compared in constant time. A mismatch fails the whole load — a corrupted or tampered sidecar is reported to the operator at startup rather than silently producing a smaller "partially trusted" set.
+- `not_before` and `not_after`, when both present, must satisfy `not_before <= not_after` (a window with `not_before > not_after` is empty by definition and rejected).
+- `[authorisation]` is required.
+
+Keys whose `*.meta.toml` fails any of these rules abort the trust-root load with an explicit error.
 
 ### Admission policy
 

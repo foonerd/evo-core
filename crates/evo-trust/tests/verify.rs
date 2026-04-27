@@ -14,8 +14,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use evo_plugin_sdk::manifest::TrustClass;
 use evo_trust::{
     format_digest_sha256_hex, install_digest, load_trust_root, signing_message,
-    verify_out_of_process_bundle, OutOfProcessBundleRef, RevocationSet,
-    TrustError, TrustOptions,
+    verify_out_of_process_bundle, verify_out_of_process_bundle_at,
+    OutOfProcessBundleRef, RevocationSet, TrustError, TrustOptions,
 };
 use pkcs8::LineEnding;
 
@@ -562,4 +562,382 @@ fn install_digest_is_hash_of_signing_message() {
     let expected: [u8; 32] = Sha256::digest(&msg).into();
     let actual = install_digest(&manifest_path, &exec_path).unwrap();
     assert_eq!(actual, expected);
+}
+
+// -------------------------------------------------------------------
+// Chain walk and rotation
+// -------------------------------------------------------------------
+
+const KEY_PARENT_SEED: [u8; 32] = [0xCC; 32];
+const KEY_OPERATOR_SEED: [u8; 32] = [0xDD; 32];
+const KEY_OLD_SEED: [u8; 32] = [0xEE; 32];
+const KEY_NEW_SEED: [u8; 32] = [0xFF; 32];
+
+/// Install a key with rich metadata. `key_id`, `signed_by`,
+/// `supersedes`, `role`, and validity window are optional and
+/// default to absent.
+#[allow(clippy::too_many_arguments)]
+fn install_key_full(
+    dir: &Path,
+    stem: &str,
+    key: &SigningKey,
+    name_prefixes: &[&str],
+    max_class: &str,
+    key_id: Option<&str>,
+    signed_by: Option<&str>,
+    supersedes: Option<&str>,
+    role: Option<&str>,
+    not_before: Option<&str>,
+    not_after: Option<&str>,
+) {
+    let pem = key
+        .verifying_key()
+        .to_public_key_pem(LineEnding::LF)
+        .unwrap();
+    std::fs::write(dir.join(format!("{stem}.pem")), pem).unwrap();
+    let prefixes = name_prefixes
+        .iter()
+        .map(|p| format!("\"{p}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut key_section = String::from("[key]\n");
+    if let Some(v) = key_id {
+        key_section.push_str(&format!("key_id = \"{v}\"\n"));
+    }
+    if let Some(v) = signed_by {
+        key_section.push_str(&format!("signed_by = \"{v}\"\n"));
+    }
+    if let Some(v) = supersedes {
+        key_section.push_str(&format!("supersedes = \"{v}\"\n"));
+    }
+    if let Some(v) = role {
+        key_section.push_str(&format!("role = \"{v}\"\n"));
+    }
+    if let Some(v) = not_before {
+        key_section.push_str(&format!("not_before = \"{v}\"\n"));
+    }
+    if let Some(v) = not_after {
+        key_section.push_str(&format!("not_after = \"{v}\"\n"));
+    }
+    let meta = format!(
+        "{key_section}\n[authorisation]\nname_prefixes = [{prefixes}]\n\
+         max_trust_class = \"{max_class}\"\n"
+    );
+    std::fs::write(dir.join(format!("{stem}.meta.toml")), meta).unwrap();
+}
+
+fn at(rfc3339: &str) -> std::time::SystemTime {
+    let dt = chrono::DateTime::parse_from_rfc3339(rfc3339).unwrap();
+    std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_secs(dt.timestamp() as u64)
+}
+
+#[test]
+fn chain_walk_admits_when_parent_present_and_in_window() {
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+    let leaf = sign_key(KEY_A_SEED);
+    let parent = sign_key(KEY_PARENT_SEED);
+
+    write_bundle(plugin_dir.path(), b"artefact-bytes");
+    write_signature(plugin_dir.path(), &leaf);
+
+    install_key_full(
+        trust_opt.path(),
+        "vendor",
+        &leaf,
+        &["org.example.*"],
+        "platform",
+        Some("vendor_a"),
+        Some("dist_root"),
+        None,
+        Some("vendor"),
+        None,
+        None,
+    );
+    install_key_full(
+        trust_opt.path(),
+        "dist",
+        &parent,
+        &["*"],
+        "platform",
+        Some("dist_root"),
+        None,
+        None,
+        Some("distribution_root"),
+        None,
+        None,
+    );
+
+    let keys = load_trust_root(trust_opt.path(), trust_etc.path()).unwrap();
+    let paths = BundlePaths::for_dir(plugin_dir.path());
+    let bundle = paths.bundle("org.example.echo", TrustClass::Standard);
+
+    verify_out_of_process_bundle(
+        &bundle,
+        &keys,
+        &RevocationSet::default(),
+        permissive_opts(),
+    )
+    .expect("chain with present parent should admit");
+}
+
+#[test]
+fn chain_walk_fails_when_parent_missing() {
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+    let leaf = sign_key(KEY_A_SEED);
+
+    write_bundle(plugin_dir.path(), b"artefact-bytes");
+    write_signature(plugin_dir.path(), &leaf);
+
+    // Vendor declares a parent that is not in the trust set.
+    install_key_full(
+        trust_opt.path(),
+        "vendor",
+        &leaf,
+        &["org.example.*"],
+        "platform",
+        Some("vendor_a"),
+        Some("missing_parent"),
+        None,
+        Some("vendor"),
+        None,
+        None,
+    );
+
+    let keys = load_trust_root(trust_opt.path(), trust_etc.path()).unwrap();
+    let paths = BundlePaths::for_dir(plugin_dir.path());
+    let bundle = paths.bundle("org.example.echo", TrustClass::Standard);
+
+    match verify_out_of_process_bundle(
+        &bundle,
+        &keys,
+        &RevocationSet::default(),
+        permissive_opts(),
+    ) {
+        Err(TrustError::ChainBroken { detail }) => {
+            assert!(detail.contains("missing_parent"));
+        }
+        other => panic!("expected ChainBroken, got {other:?}"),
+    }
+}
+
+#[test]
+fn key_outside_window_rejects_with_expired() {
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+    let key = sign_key(KEY_A_SEED);
+
+    write_bundle(plugin_dir.path(), b"artefact-bytes");
+    write_signature(plugin_dir.path(), &key);
+    install_key_full(
+        trust_opt.path(),
+        "expired",
+        &key,
+        &["org.example.*"],
+        "platform",
+        Some("vendor_a"),
+        None,
+        None,
+        Some("vendor"),
+        Some("2020-01-01T00:00:00Z"),
+        Some("2021-01-01T00:00:00Z"),
+    );
+
+    let keys = load_trust_root(trust_opt.path(), trust_etc.path()).unwrap();
+    let paths = BundlePaths::for_dir(plugin_dir.path());
+    let bundle = paths.bundle("org.example.echo", TrustClass::Standard);
+
+    let now = at("2030-01-01T00:00:00Z");
+    match verify_out_of_process_bundle_at(
+        &bundle,
+        &keys,
+        &RevocationSet::default(),
+        permissive_opts(),
+        now,
+    ) {
+        Err(TrustError::KeyExpired { key_id, .. }) => {
+            assert_eq!(key_id, "vendor_a");
+        }
+        other => panic!("expected KeyExpired, got {other:?}"),
+    }
+}
+
+#[test]
+fn rotation_overlap_admits_old_key_inside_window() {
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+    let old = sign_key(KEY_OLD_SEED);
+    let new = sign_key(KEY_NEW_SEED);
+
+    write_bundle(plugin_dir.path(), b"artefact-bytes");
+    // Bundle is signed by the OLD key.
+    write_signature(plugin_dir.path(), &old);
+
+    // Old key valid 2026 .. 2027.
+    install_key_full(
+        trust_opt.path(),
+        "old",
+        &old,
+        &["org.example.*"],
+        "platform",
+        Some("vendor_old"),
+        None,
+        None,
+        Some("vendor"),
+        Some("2026-01-01T00:00:00Z"),
+        Some("2027-01-01T00:00:00Z"),
+    );
+    // New key supersedes old; valid 2026-06-01 .. 2028. The
+    // overlap (old.not_after - new.not_before) = 2026-06-01..2027-01-01
+    // = 7 months >= 30 days minimum.
+    install_key_full(
+        trust_opt.path(),
+        "new",
+        &new,
+        &["org.example.*"],
+        "platform",
+        Some("vendor_new"),
+        None,
+        Some("vendor_old"),
+        Some("vendor"),
+        Some("2026-06-01T00:00:00Z"),
+        Some("2028-01-01T00:00:00Z"),
+    );
+
+    let keys = load_trust_root(trust_opt.path(), trust_etc.path()).unwrap();
+    let paths = BundlePaths::for_dir(plugin_dir.path());
+    let bundle = paths.bundle("org.example.echo", TrustClass::Standard);
+
+    // Verification timestamp inside the overlap window.
+    let now = at("2026-09-01T00:00:00Z");
+    verify_out_of_process_bundle_at(
+        &bundle,
+        &keys,
+        &RevocationSet::default(),
+        permissive_opts(),
+        now,
+    )
+    .expect("old key inside overlap should still admit");
+}
+
+#[test]
+fn rotation_after_overlap_rejects_old_key() {
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+    let old = sign_key(KEY_OLD_SEED);
+    let new = sign_key(KEY_NEW_SEED);
+
+    write_bundle(plugin_dir.path(), b"artefact-bytes");
+    write_signature(plugin_dir.path(), &old);
+
+    install_key_full(
+        trust_opt.path(),
+        "old",
+        &old,
+        &["org.example.*"],
+        "platform",
+        Some("vendor_old"),
+        None,
+        None,
+        Some("vendor"),
+        Some("2026-01-01T00:00:00Z"),
+        Some("2027-01-01T00:00:00Z"),
+    );
+    install_key_full(
+        trust_opt.path(),
+        "new",
+        &new,
+        &["org.example.*"],
+        "platform",
+        Some("vendor_new"),
+        None,
+        Some("vendor_old"),
+        Some("vendor"),
+        Some("2026-06-01T00:00:00Z"),
+        Some("2028-01-01T00:00:00Z"),
+    );
+
+    let keys = load_trust_root(trust_opt.path(), trust_etc.path()).unwrap();
+    let paths = BundlePaths::for_dir(plugin_dir.path());
+    let bundle = paths.bundle("org.example.echo", TrustClass::Standard);
+
+    // After the old key's not_after.
+    let now = at("2027-06-01T00:00:00Z");
+    match verify_out_of_process_bundle_at(
+        &bundle,
+        &keys,
+        &RevocationSet::default(),
+        permissive_opts(),
+        now,
+    ) {
+        Err(TrustError::KeyExpired { key_id, .. }) => {
+            assert_eq!(key_id, "vendor_old");
+        }
+        other => panic!("expected KeyExpired, got {other:?}"),
+    }
+}
+
+#[test]
+fn operator_root_signature_is_preferred_when_present() {
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+    // Single signing key serves both as a vendor and as the
+    // operator-root in this fixture: the bundle's signature
+    // verifies against both because the same private key is
+    // installed twice. The verifier must prefer the operator
+    // root entry.
+    let key = sign_key(KEY_OPERATOR_SEED);
+
+    write_bundle(plugin_dir.path(), b"artefact-bytes");
+    write_signature(plugin_dir.path(), &key);
+
+    install_key_full(
+        trust_opt.path(),
+        "vendor_dup",
+        &key,
+        &["org.example.*"],
+        "standard",
+        Some("vendor_a"),
+        Some("dist_root"),
+        None,
+        Some("vendor"),
+        None,
+        None,
+    );
+    install_key_full(
+        trust_etc.path(),
+        "operator",
+        &key,
+        &["org.example.*"],
+        "platform",
+        Some("operator_root"),
+        None,
+        None,
+        Some("operator_root"),
+        None,
+        None,
+    );
+
+    let keys = load_trust_root(trust_opt.path(), trust_etc.path()).unwrap();
+    let paths = BundlePaths::for_dir(plugin_dir.path());
+    let bundle = paths.bundle("org.example.echo", TrustClass::Platform);
+
+    // The vendor key is incomplete (its parent dist_root is not
+    // present), but the operator root admits the bundle on its own.
+    let outcome = verify_out_of_process_bundle(
+        &bundle,
+        &keys,
+        &RevocationSet::default(),
+        permissive_opts(),
+    )
+    .expect("operator root should admit even with broken vendor chain");
+    assert_eq!(outcome.effective_trust, TrustClass::Platform);
 }

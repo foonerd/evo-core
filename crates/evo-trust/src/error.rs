@@ -60,6 +60,53 @@ pub enum TrustError {
     /// fallback to raw bytes is permitted.
     #[error("manifest canonicalisation failed: {0}")]
     CanonicalisationFailed(String),
+    /// The declared fingerprint in `*.meta.toml` does not match the
+    /// `SHA-256` of the public key bytes the sidecar sits beside.
+    /// Either the sidecar was edited without re-deriving the
+    /// fingerprint or the wrong PEM was paired with the wrong meta.
+    #[error("fingerprint mismatch: declared {declared}, actual {actual}")]
+    FingerprintMismatch {
+        /// What the sidecar claims.
+        declared: String,
+        /// What the public key actually hashes to.
+        actual: String,
+    },
+    /// A key in the chain is outside its `not_before` /
+    /// `not_after` window at the verification timestamp. Mapped to
+    /// `ErrorClass::TrustExpired` at the SDK boundary.
+    #[error("trust key {key_id} expired at {at}")]
+    KeyExpired {
+        /// `key_id` of the key whose window is closed.
+        key_id: String,
+        /// Reason: outside the validity window. Free-form context
+        /// such as `not_before=...` / `not_after=...`.
+        at: String,
+    },
+    /// The chain walk failed to reach a self-declared root. Either
+    /// a parent referenced by `signed_by` is missing from the
+    /// trust set or the chain exceeded the depth limit.
+    #[error("trust chain broken at {detail}")]
+    ChainBroken {
+        /// Free-form context: the missing `signed_by` value, the
+        /// `key_id` where the walk stopped, or the depth-limit
+        /// hit point.
+        detail: String,
+    },
+    /// A child key declared a parent whose role is not allowed to
+    /// sign the child's role. For example, an
+    /// [`crate::KeyRole::IndividualAuthor`] cannot serve as the
+    /// parent of a [`crate::KeyRole::Vendor`].
+    #[error("role mismatch: child {child_role:?} cannot be signed by parent {parent_role:?}")]
+    RoleMismatch {
+        /// `key_id` of the child key.
+        child: String,
+        /// `key_id` of the parent key.
+        parent: String,
+        /// Child's declared role.
+        child_role: crate::key_meta::KeyRole,
+        /// Parent's declared role.
+        parent_role: crate::key_meta::KeyRole,
+    },
 }
 
 impl TrustError {
