@@ -265,7 +265,21 @@ impl std::fmt::Display for ReassignedClaimKind {
 /// behind by hundreds of events before lagging, which is ample for
 /// an appliance-scale custody event rate (low single-digit
 /// custodies per minute plus periodic state reports).
+///
+/// Operators override this via the `[happenings]` config section
+/// (see [`crate::config::HappeningsSection::retention_capacity`]);
+/// the constant here is the fallback used by the `new()` /
+/// `with_capacity()` constructors that have no configuration
+/// surface (chiefly tests and boot-time wiring).
 pub const DEFAULT_CAPACITY: usize = 1024;
+
+/// Default minimum durable retention window, in seconds, the
+/// [`HappeningBus`] advertises when no operator override is
+/// supplied. Mirrors
+/// [`crate::config::DEFAULT_HAPPENINGS_RETENTION_WINDOW_SECS`] so
+/// the constructors that take no configuration surface still carry
+/// a sensible advertised window.
+pub const DEFAULT_RETENTION_WINDOW_SECS: u64 = 30 * 60;
 
 /// One happening paired with the monotonic seq the bus minted for
 /// it.
@@ -911,6 +925,15 @@ pub struct HappeningBus {
     /// Optional persistence handle. When present, [`Self::emit_durable`]
     /// writes through to the `happenings_log` table.
     persistence: Option<Arc<dyn PersistenceStore>>,
+    /// Advertised minimum durable retention window in seconds.
+    /// Operators size this against expected reconnect intervals;
+    /// the value is reported to consumers via observability and
+    /// used by surfaces that translate cursor gaps into
+    /// `replay_window_exceeded` advice. The bus does not actively
+    /// trim rows today — durable retention is enforced read-side
+    /// by comparing the consumer's `since` against the oldest
+    /// retained `seq`.
+    retention_window_secs: u64,
 }
 
 impl std::fmt::Debug for HappeningBus {
@@ -920,6 +943,7 @@ impl std::fmt::Debug for HappeningBus {
             .field("envelope_receiver_count", &self.tx_env.receiver_count())
             .field("next_seq", &self.next_seq.load(Ordering::Relaxed))
             .field("durable", &self.persistence.is_some())
+            .field("retention_window_secs", &self.retention_window_secs)
             .finish()
     }
 }
@@ -944,6 +968,18 @@ impl HappeningBus {
     /// `RecvError::Lagged` on recv. Must be positive; passing zero
     /// panics per tokio's contract.
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_and_window(capacity, DEFAULT_RETENTION_WINDOW_SECS)
+    }
+
+    /// Construct a bus with both an explicit broadcast capacity and
+    /// an explicit advertised retention window. Used by the boot
+    /// path that reads `[happenings]` configuration; the
+    /// retention window is carried for observability and surface-
+    /// level reporting (it does not influence in-memory delivery).
+    pub fn with_capacity_and_window(
+        capacity: usize,
+        retention_window_secs: u64,
+    ) -> Self {
         let (tx, _) = broadcast::channel(capacity);
         let (tx_env, _) = broadcast::channel(capacity);
         Self {
@@ -951,6 +987,7 @@ impl HappeningBus {
             tx_env,
             next_seq: AtomicU64::new(1),
             persistence: None,
+            retention_window_secs,
         }
     }
 
@@ -971,6 +1008,23 @@ impl HappeningBus {
         persistence: Arc<dyn PersistenceStore>,
         capacity: usize,
     ) -> Result<Self, crate::persistence::PersistenceError> {
+        Self::with_persistence_capacity_and_window(
+            persistence,
+            capacity,
+            DEFAULT_RETENTION_WINDOW_SECS,
+        )
+        .await
+    }
+
+    /// Construct a fully-configured bus: persistence handle,
+    /// broadcast capacity, and the advertised retention window. Used
+    /// by the steward boot path that reads operator overrides from
+    /// `[happenings]` in `evo.toml`.
+    pub async fn with_persistence_capacity_and_window(
+        persistence: Arc<dyn PersistenceStore>,
+        capacity: usize,
+        retention_window_secs: u64,
+    ) -> Result<Self, crate::persistence::PersistenceError> {
         let max = persistence.load_max_happening_seq().await?;
         let (tx, _) = broadcast::channel(capacity);
         let (tx_env, _) = broadcast::channel(capacity);
@@ -979,7 +1033,16 @@ impl HappeningBus {
             tx_env,
             next_seq: AtomicU64::new(max.saturating_add(1)),
             persistence: Some(persistence),
+            retention_window_secs,
         })
+    }
+
+    /// Advertised minimum durable retention window in seconds.
+    /// Reported to consumers via observability and used by surfaces
+    /// that translate cursor gaps into `replay_window_exceeded`
+    /// advice.
+    pub fn retention_window_secs(&self) -> u64 {
+        self.retention_window_secs
     }
 
     /// Emit a happening live, without write-through.

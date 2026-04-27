@@ -473,6 +473,42 @@ impl SubjectRegistry {
             .clone()
     }
 
+    /// Snapshot of every live subject record, cloned out under the
+    /// registry lock. Order is unspecified (the underlying map is a
+    /// `HashMap`); callers that need a stable order sort by
+    /// canonical ID.
+    ///
+    /// Used by the cursor-paginated `list_subjects` op on the
+    /// client API. The lock is released before returning so the
+    /// snapshot is consistent at one instant but does not block
+    /// concurrent registry mutations.
+    pub fn snapshot_subjects(&self) -> Vec<SubjectRecord> {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .subjects
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Snapshot of every claimed addressing as `(addressing,
+    /// canonical_id)` pairs, cloned out under the registry lock.
+    /// Order is unspecified; callers that need a stable order sort
+    /// by `(scheme, value)`.
+    ///
+    /// Used by the cursor-paginated `enumerate_addressings` op on
+    /// the client API.
+    pub fn snapshot_addressings(&self) -> Vec<(ExternalAddressing, String)> {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .addressings
+            .iter()
+            .map(|(a, id)| (a.clone(), id.clone()))
+            .collect()
+    }
+
     /// Resolve an addressing to a canonical subject ID if known.
     pub fn resolve(&self, addressing: &ExternalAddressing) -> Option<String> {
         self.inner

@@ -640,6 +640,16 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>;
 
+    /// Return the smallest `seq` currently in `happenings_log`, or
+    /// `0` if the table is empty. Drives the structured
+    /// `replay_window_exceeded` response: when a consumer's `since`
+    /// is older than this value, the durable window has rotated
+    /// past their cursor and they MUST fall back to the snapshot-
+    /// style list ops to rebuild a complete picture.
+    fn load_oldest_happening_seq<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>;
+
     /// Return the steward instance ID (UUIDv4) minted at first
     /// migration and persisted in the `meta` table (migration 003).
     ///
@@ -1708,6 +1718,30 @@ impl PersistenceStore for SqlitePersistenceStore {
         })
     }
 
+    fn load_oldest_happening_seq<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.interact("load_oldest_happening_seq", |conn| {
+                let min: Option<i64> = conn
+                    .query_row(
+                        "SELECT MIN(seq) FROM happenings_log",
+                        [],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "select MIN(seq) from happenings_log",
+                            e,
+                        )
+                    })?;
+                Ok(min.unwrap_or(0).max(0) as u64)
+            })
+            .await
+        })
+    }
+
     fn load_instance_id<'a>(
         &'a self,
     ) -> Pin<
@@ -2175,6 +2209,16 @@ impl PersistenceStore for MemoryPersistenceStore {
         Box::pin(async move {
             let g = self.inner.lock().await;
             Ok(g.happenings.iter().map(|h| h.seq).max().unwrap_or(0))
+        })
+    }
+
+    fn load_oldest_happening_seq<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            Ok(g.happenings.iter().map(|h| h.seq).min().unwrap_or(0))
         })
     }
 

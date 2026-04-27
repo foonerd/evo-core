@@ -116,6 +116,22 @@ async fn main() -> anyhow::Result<()> {
     let claimant_issuer =
         Arc::new(evo::claimant::ClaimantTokenIssuer::new(instance_id));
 
+    // Construct the happenings bus with persistence write-through
+    // and operator-tunable retention. The bus seeds its monotonic
+    // seq counter from the on-disk maximum so cursors continue to
+    // grow across restart; the broadcast capacity sets the live
+    // backpressure ceiling and the retention window is advertised
+    // for observability.
+    let bus = Arc::new(
+        HappeningBus::with_persistence_capacity_and_window(
+            Arc::clone(&persistence),
+            config.happenings.retention_capacity,
+            config.happenings.retention_window_secs,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("seeding happenings bus: {e}"))?,
+    );
+
     // Build the shared steward state once: catalogue plus
     // freshly-allocated stores. The same `Arc<StewardState>` is
     // handed to the admission engine and the server so dispatch
@@ -125,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
         .subjects(Arc::new(SubjectRegistry::new()))
         .relations(Arc::new(RelationGraph::new()))
         .custody(Arc::new(CustodyLedger::new()))
-        .bus(Arc::new(HappeningBus::new()))
+        .bus(bus)
         .admin(Arc::new(AdminLedger::new()))
         .persistence(Arc::clone(&persistence))
         .claimant_issuer(Arc::clone(&claimant_issuer))

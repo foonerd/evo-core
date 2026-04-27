@@ -470,6 +470,10 @@ enable = <bool>                    # default false; when false, uid/gid tables i
 # standard = 2011
 [plugins.security.gid]            # optional; if a class is missing, gid = uid for that class
 # sandbox = 2015
+
+[happenings]
+retention_capacity = <usize>      # optional; default 1024
+retention_window_secs = <u64>     # optional; default 1800 (30 minutes)
 ```
 
 #### 3.3.2 Field Reference
@@ -502,6 +506,13 @@ enable = <bool>                    # default false; when false, uid/gid tables i
 | `security.enable` | bool | no | `false` | When `true` (Unix), out-of-process spawns with a `security.uid` entry for the *effective* trust class use that UID; optional per-class GID in `security.gid`, defaulting the GID to the UID. |
 | `security.uid` | table | no | (empty) | Map trust class (string key, same names as the manifest) → UID. Unmapped classes: child runs as the steward. |
 | `security.gid` | table | no | (empty) | Optional per-class GID; if absent for a class, that class’s GID = its UID. |
+
+**[happenings]**
+
+| Field                   | Type  | Required | Default | Constraint                                                                                                                                                                        |
+|-------------------------|-------|----------|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `retention_capacity`    | usize | no       | `1024`  | In-memory broadcast ring capacity, in events. Caps how many unconsumed live happenings the bus buffers per subscriber before a slow consumer receives a structured lagged signal. |
+| `retention_window_secs` | u64   | no       | `1800`  | Minimum durable retention window the steward guarantees for cursor replay. Cursors older than the oldest retained event get a structured `replay_window_exceeded` response.       |
 
 #### 3.3.3 File Location and Override Precedence
 
@@ -581,6 +592,9 @@ Every request carries an `op` discriminator.
 | `"project_subject"` | Sync request/response | No |
 | `"describe_alias"` | Sync request/response | No |
 | `"list_active_custodies"` | Sync request/response | No |
+| `"list_subjects"` | Sync request/response (paginated) | No |
+| `"list_relations"` | Sync request/response (paginated) | No |
+| `"enumerate_addressings"` | Sync request/response (paginated) | No |
 | `"subscribe_happenings"` | Streaming (ack + stream) | Yes |
 
 **`op = "request"`**:
@@ -650,6 +664,57 @@ Every request carries an `op` discriminator.
 
 No other fields.
 
+**`op = "list_subjects"`**:
+
+```json
+{
+  "op": "list_subjects",
+  "cursor": "<opaque base64>",
+  "page_size": <usize>
+}
+```
+
+| Field       | Type   | Required | Default | Notes                                                                                       |
+|-------------|--------|----------|---------|---------------------------------------------------------------------------------------------|
+| `cursor`    | string | no       | absent  | Opaque base64 returned in the previous response's `next_cursor`. Absent on the first page.  |
+| `page_size` | u32    | no       | 100     | Maximum subjects in this page. Values above 1000 are clamped to 1000.                       |
+
+The response carries `current_seq` so consumers can pin the snapshot to a happenings position; see §4.1.3.
+
+**`op = "list_relations"`**:
+
+```json
+{
+  "op": "list_relations",
+  "cursor": "<opaque base64>",
+  "page_size": <usize>
+}
+```
+
+| Field       | Type   | Required | Default | Notes                                                                                       |
+|-------------|--------|----------|---------|---------------------------------------------------------------------------------------------|
+| `cursor`    | string | no       | absent  | Opaque base64 returned in the previous response's `next_cursor`. Absent on the first page.  |
+| `page_size` | u32    | no       | 100     | Maximum edges in this page. Values above 1000 are clamped to 1000.                          |
+
+The response carries `current_seq`; see §4.1.3.
+
+**`op = "enumerate_addressings"`**:
+
+```json
+{
+  "op": "enumerate_addressings",
+  "cursor": "<opaque base64>",
+  "page_size": <usize>
+}
+```
+
+| Field       | Type   | Required | Default | Notes                                                                                       |
+|-------------|--------|----------|---------|---------------------------------------------------------------------------------------------|
+| `cursor`    | string | no       | absent  | Opaque base64 returned in the previous response's `next_cursor`. Absent on the first page.  |
+| `page_size` | u32    | no       | 100     | Maximum addressings in this page. Values above 1000 are clamped to 1000.                    |
+
+The response carries `current_seq`; see §4.1.3.
+
 **`op = "subscribe_happenings"`**:
 
 ```json
@@ -714,6 +779,60 @@ Consumers test for the presence of the `aliased_from` key (not its value) to dis
 
 Where each record has the shape defined in section 5.2.
 
+**Success response to `op = "list_subjects"`**:
+
+```json
+{
+  "subjects": [
+    {
+      "canonical_id": "<uuid>",
+      "subject_type": "<string>",
+      "addressings": [
+        { "scheme": "<string>", "value": "<string>", "claimant_token": "<token>" }
+      ]
+    }
+  ],
+  "next_cursor": "<opaque base64>" | null,
+  "current_seq": <u64>
+}
+```
+
+Pages iterate in canonical-ID order. `next_cursor` is `null` when the snapshot is exhausted; otherwise the consumer passes it back as `cursor` on the next request. `current_seq` is the bus's monotonic cursor sampled at snapshot time and is identical across pages of the same iteration; pin reconcile-style happening replay to it.
+
+**Success response to `op = "list_relations"`**:
+
+```json
+{
+  "relations": [
+    {
+      "source_id": "<uuid>",
+      "predicate": "<string>",
+      "target_id": "<uuid>",
+      "claimant_tokens": ["<token>", ...],
+      "suppressed": <bool>
+    }
+  ],
+  "next_cursor": "<opaque base64>" | null,
+  "current_seq": <u64>
+}
+```
+
+Pages iterate in `(source_id, predicate, target_id)` order. Suppressed edges are included so the snapshot is structurally complete; consumers that want only visible edges filter on `suppressed == false`. Pagination and `current_seq` semantics match `list_subjects`.
+
+**Success response to `op = "enumerate_addressings"`**:
+
+```json
+{
+  "addressings": [
+    { "scheme": "<string>", "value": "<string>", "canonical_id": "<uuid>" }
+  ],
+  "next_cursor": "<opaque base64>" | null,
+  "current_seq": <u64>
+}
+```
+
+Pages iterate in `(scheme, value)` order. Pagination and `current_seq` semantics match `list_subjects`.
+
 **Ack response to `op = "subscribe_happenings"`**:
 
 ```json
@@ -733,10 +852,16 @@ Where `<HappeningVariant>` is one of the shapes in section 5.1.
 **Streamed lagged frame** (when the subscriber has fallen behind):
 
 ```json
-{ "lagged": <u64> }
+{
+  "lagged": {
+    "missed_count": <u64>,
+    "oldest_available_seq": <u64>,
+    "current_seq": <u64>
+  }
+}
 ```
 
-The integer is the number of happenings dropped.
+`missed_count` is the number of happenings dropped from the broadcast ring since the last successful delivery to this subscriber. `oldest_available_seq` is the smallest seq the steward currently retains in `happenings_log`; a consumer whose last observed seq is at or above this value can resume cleanly via a fresh subscribe with `since` set to that seq, while a consumer whose last seq has rotated past the window MUST fall back to the snapshot list ops pinned to `current_seq`. `current_seq` is the bus's cursor at signal time.
 
 **Error response** (to any sync op):
 
@@ -776,19 +901,21 @@ The class is one of:
 
 `details.subclass` (when present) is a snake_case string refining the class. The taxonomy is additive: existing names are stable across releases; new subclasses are appended without renaming or repurposing earlier names. Documented subclasses:
 
-| Class                | Subclass                           | Meaning                                                                                            |
-|----------------------|------------------------------------|----------------------------------------------------------------------------------------------------|
-| `trust_violation`    | `admin_trust_too_low`              | Effective trust class is below the admin minimum. Extras: `plugin_name`, `effective`, `minimum`.   |
-| `contract_violation` | `cardinality_violation`            | A relation assertion would violate a declared cardinality.                                         |
-| `contract_violation` | `unknown_predicate`                | Relation predicate not declared in the catalogue.                                                  |
-| `contract_violation` | `unknown_subject_type`             | Subject type not declared in the catalogue.                                                        |
-| `contract_violation` | `merge_self_target`                | Operator-supplied addressings resolve to the same canonical subject.                               |
-| `contract_violation` | `merge_cross_type`                 | Merge sources have differing subject types. Extras: `a_type`, `b_type`.                            |
-| `contract_violation` | `split_target_index_out_of_bounds` | Explicit relation assignment names a partition index outside the operator's `partitions`.          |
-| `not_found`          | `merge_source_unknown`             | Merge source addressing is not registered. Extras: `addressing`.                                   |
-| `not_found`          | `target_plugin_unknown`            | Privileged retract names a plugin not currently admitted. Extras: `plugin`.                        |
-| `misconfiguration`   | `catalogue_invalid`                | Catalogue parse or validation failure (including out-of-range `schema_version`).                   |
-| `misconfiguration`   | `manifest_invalid`                 | Plugin manifest parse or validation failure.                                                       |
+| Class                | Subclass                           | Meaning                                                                                                                       |
+|----------------------|------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
+| `trust_violation`    | `admin_trust_too_low`              | Effective trust class is below the admin minimum. Extras: `plugin_name`, `effective`, `minimum`.                              |
+| `contract_violation` | `cardinality_violation`            | A relation assertion would violate a declared cardinality.                                                                    |
+| `contract_violation` | `unknown_predicate`                | Relation predicate not declared in the catalogue.                                                                             |
+| `contract_violation` | `unknown_subject_type`             | Subject type not declared in the catalogue.                                                                                   |
+| `contract_violation` | `merge_self_target`                | Operator-supplied addressings resolve to the same canonical subject.                                                          |
+| `contract_violation` | `merge_cross_type`                 | Merge sources have differing subject types. Extras: `a_type`, `b_type`.                                                       |
+| `contract_violation` | `split_target_index_out_of_bounds` | Explicit relation assignment names a partition index outside the operator's `partitions`.                                     |
+| `contract_violation` | `replay_window_exceeded`           | `subscribe_happenings` `since` cursor is older than the oldest retained `seq`. Extras: `oldest_available_seq`, `current_seq`. |
+| `contract_violation` | `invalid_page_cursor`              | A paginated list op was issued with a cursor that did not decode (bad base64 or non-utf8 payload).                            |
+| `not_found`          | `merge_source_unknown`             | Merge source addressing is not registered. Extras: `addressing`.                                                              |
+| `not_found`          | `target_plugin_unknown`            | Privileged retract names a plugin not currently admitted. Extras: `plugin`.                                                   |
+| `misconfiguration`   | `catalogue_invalid`                | Catalogue parse or validation failure (including out-of-range `schema_version`).                                              |
+| `misconfiguration`   | `manifest_invalid`                 | Plugin manifest parse or validation failure.                                                                                  |
 
 Consumers wanting to act on a subclass must agree on the vocabulary out of band; the contract is on top-level `class` and the subclass strings published here. Unknown subclasses fall through to the top-level class semantics with no degradation in behaviour.
 

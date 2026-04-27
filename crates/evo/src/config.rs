@@ -76,6 +76,20 @@ pub const DEFAULT_REVOCATIONS_PATH: &str = "/etc/evo/revocations.toml";
 /// instead of refusing. See `PLUGIN_PACKAGING.md` section 5.
 pub const DEFAULT_DEGRADE_TRUST: bool = true;
 
+/// Default in-memory broadcast capacity for the happenings bus. The
+/// bus also retains durable rows in `happenings_log`; the broadcast
+/// ring is the live-stream backpressure surface and the value here
+/// caps how far a slow subscriber can fall behind before the bus
+/// emits a structured lagged signal.
+pub const DEFAULT_HAPPENINGS_RETENTION_CAPACITY: usize = 1024;
+
+/// Default minimum durable retention window expressed in seconds.
+/// Distributions size this against expected reconnect intervals
+/// (transient drop, steward restart). The default of 30 minutes
+/// covers brief outages without growing the durable footprint
+/// disproportionately.
+pub const DEFAULT_HAPPENINGS_RETENTION_WINDOW_SECS: u64 = 30 * 60;
+
 /// Root of the steward's configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct StewardConfig {
@@ -92,6 +106,11 @@ pub struct StewardConfig {
     /// database lives.
     #[serde(default)]
     pub persistence: PersistenceSection,
+    /// Happenings bus retention. Tunes the in-memory broadcast ring
+    /// and the minimum durable replay window operators rely on for
+    /// reconnect-resume.
+    #[serde(default)]
+    pub happenings: HappeningsSection,
 }
 
 impl StewardConfig {
@@ -202,6 +221,50 @@ impl Default for PersistenceSection {
 
 fn default_persistence_path() -> PathBuf {
     PathBuf::from(DEFAULT_PERSISTENCE_PATH)
+}
+
+/// `[happenings]` section.
+///
+/// Controls how much backlog the steward keeps for live and
+/// reconnecting subscribers. The two knobs are independent: the
+/// broadcast capacity caps live-stream lag tolerance; the window
+/// seconds value documents the minimum durable retention operators
+/// rely on for cross-restart and cross-disconnect resume.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HappeningsSection {
+    /// In-memory broadcast ring capacity, in events. Controls how
+    /// many unconsumed live happenings the bus buffers per
+    /// subscriber before a slow consumer receives a structured
+    /// lagged signal. Default:
+    /// [`DEFAULT_HAPPENINGS_RETENTION_CAPACITY`].
+    #[serde(default = "default_retention_capacity")]
+    pub retention_capacity: usize,
+    /// Minimum durable retention window the steward guarantees, in
+    /// seconds. Operators size this against expected reconnect
+    /// intervals; the steward enforces the durable replay surface
+    /// against this window and surfaces a structured
+    /// `replay_window_exceeded` response when a consumer asks for a
+    /// cursor older than the oldest retained event. Default:
+    /// [`DEFAULT_HAPPENINGS_RETENTION_WINDOW_SECS`].
+    #[serde(default = "default_retention_window_secs")]
+    pub retention_window_secs: u64,
+}
+
+impl Default for HappeningsSection {
+    fn default() -> Self {
+        Self {
+            retention_capacity: default_retention_capacity(),
+            retention_window_secs: default_retention_window_secs(),
+        }
+    }
+}
+
+fn default_retention_capacity() -> usize {
+    DEFAULT_HAPPENINGS_RETENTION_CAPACITY
+}
+
+fn default_retention_window_secs() -> u64 {
+    DEFAULT_HAPPENINGS_RETENTION_WINDOW_SECS
 }
 
 /// `[catalogue]` section.
@@ -439,6 +502,33 @@ allow_unsigned = true
             PathBuf::from("/etc/evo/catalogue.toml")
         );
         assert!(cfg.plugins.allow_unsigned);
+    }
+
+    #[test]
+    fn happenings_section_defaults_match_constants() {
+        let cfg = StewardConfig::default();
+        assert_eq!(
+            cfg.happenings.retention_capacity,
+            DEFAULT_HAPPENINGS_RETENTION_CAPACITY
+        );
+        assert_eq!(
+            cfg.happenings.retention_window_secs,
+            DEFAULT_HAPPENINGS_RETENTION_WINDOW_SECS
+        );
+    }
+
+    #[test]
+    fn happenings_section_overrides_parse() {
+        let cfg = StewardConfig::from_toml(
+            r#"
+[happenings]
+retention_capacity = 4096
+retention_window_secs = 7200
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.happenings.retention_capacity, 4096);
+        assert_eq!(cfg.happenings.retention_window_secs, 7200);
     }
 
     #[test]

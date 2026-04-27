@@ -286,7 +286,69 @@ enum ClientRequest {
         #[serde(default)]
         since: Option<u64>,
     },
+    /// Paginated list of every live subject in the registry.
+    ///
+    /// Cursor: opaque base64 of the last canonical ID returned on
+    /// the previous page. Page size defaults to
+    /// [`DEFAULT_LIST_PAGE_SIZE`] and is capped at
+    /// [`MAX_LIST_PAGE_SIZE`].
+    ///
+    /// Response carries `current_seq` so consumers can reconcile
+    /// the snapshot with the happenings stream:
+    /// `subscribe → list_subjects → reconcile_via_seq`.
+    ListSubjects {
+        /// Opaque page cursor returned by the previous response's
+        /// `next_cursor`. Absent on the first page.
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Maximum number of subjects to return on this page.
+        /// Absent means [`DEFAULT_LIST_PAGE_SIZE`]; values above
+        /// [`MAX_LIST_PAGE_SIZE`] are clamped.
+        #[serde(default)]
+        page_size: Option<usize>,
+    },
+    /// Paginated list of every live relation edge in the graph.
+    ///
+    /// Cursor: opaque base64 of the last `(source_id, predicate,
+    /// target_id)` tuple returned on the previous page.
+    ListRelations {
+        /// Opaque page cursor returned by the previous response's
+        /// `next_cursor`. Absent on the first page.
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Maximum number of relations to return on this page.
+        /// Absent means [`DEFAULT_LIST_PAGE_SIZE`]; values above
+        /// [`MAX_LIST_PAGE_SIZE`] are clamped.
+        #[serde(default)]
+        page_size: Option<usize>,
+    },
+    /// Paginated enumeration of every claimed addressing in the
+    /// registry.
+    ///
+    /// Cursor: opaque base64 of the last `(scheme, value)` tuple
+    /// returned on the previous page.
+    EnumerateAddressings {
+        /// Opaque page cursor returned by the previous response's
+        /// `next_cursor`. Absent on the first page.
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Maximum number of addressings to return on this page.
+        /// Absent means [`DEFAULT_LIST_PAGE_SIZE`]; values above
+        /// [`MAX_LIST_PAGE_SIZE`] are clamped.
+        #[serde(default)]
+        page_size: Option<usize>,
+    },
 }
+
+/// Default page size for the paginated list ops
+/// (`list_subjects`, `list_relations`, `enumerate_addressings`).
+pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
+
+/// Hard upper bound on the page size for the paginated list ops.
+/// Operator-supplied page sizes above this are clamped silently;
+/// the pagination contract is the caller's iterating until
+/// `next_cursor` is null, not the per-page count.
+pub const MAX_LIST_PAGE_SIZE: usize = 1000;
 
 /// Default for [`ClientRequest::ProjectSubject::follow_aliases`].
 /// Auto-follow is the consumer-friendly default: callers holding a
@@ -475,13 +537,66 @@ enum ClientResponse {
         happening: HappeningWire,
     },
     /// Notification that the subscriber fell behind the bus's buffer
-    /// and missed `lagged` happenings. Subscribers recover by
-    /// re-querying the authoritative store (the ledger for custody)
-    /// and continuing to consume.
+    /// and missed events. Carries enough context for the consumer
+    /// to choose between a durable replay (when the gap is within
+    /// the retention window) and a snapshot reconcile via the list
+    /// ops.
+    ///
+    /// Distinguished by the top-level `lagged` key. The wire shape
+    /// nests the structured fields under that key so the
+    /// untagged-enum disambiguation key set stays stable across
+    /// readers that pre-date the structured shape.
     Lagged {
-        /// Number of happenings dropped since the last successful
-        /// delivery.
-        lagged: u64,
+        /// Structured payload describing the gap and the bus's
+        /// position at signal time.
+        lagged: LaggedSignal,
+    },
+    /// Paginated `list_subjects` response.
+    ///
+    /// Carries one page of live subjects keyed by canonical ID,
+    /// the opaque cursor needed to fetch the next page (or `null`
+    /// when the snapshot is exhausted), and `current_seq` so
+    /// consumers can pin the snapshot to a happenings position.
+    /// Consumers iterate until `next_cursor` is null, then apply
+    /// happenings with `seq > current_seq` as deltas on top.
+    SubjectsPage {
+        /// One page of live subjects in cursor order.
+        subjects: Vec<SubjectListEntryWire>,
+        /// Opaque cursor for the next page, or `null` if this page
+        /// is the last.
+        next_cursor: Option<String>,
+        /// Bus cursor sampled at snapshot time. `0` means no
+        /// happenings have been emitted yet on this steward
+        /// instance.
+        current_seq: u64,
+    },
+    /// Paginated `list_relations` response.
+    ///
+    /// Carries one page of live relation edges keyed by `(source_id,
+    /// predicate, target_id)`, plus the opaque next-page cursor
+    /// and `current_seq` for reconcile-pinning.
+    RelationsPage {
+        /// One page of live relations in cursor order.
+        relations: Vec<RelationListEntryWire>,
+        /// Opaque cursor for the next page, or `null` if this page
+        /// is the last.
+        next_cursor: Option<String>,
+        /// Bus cursor sampled at snapshot time.
+        current_seq: u64,
+    },
+    /// Paginated `enumerate_addressings` response.
+    ///
+    /// Carries one page of claimed addressings keyed by `(scheme,
+    /// value)`, plus the opaque next-page cursor and `current_seq`
+    /// for reconcile-pinning.
+    AddressingsPage {
+        /// One page of claimed addressings in cursor order.
+        addressings: Vec<AddressingListEntryWire>,
+        /// Opaque cursor for the next page, or `null` if this page
+        /// is the last.
+        next_cursor: Option<String>,
+        /// Bus cursor sampled at snapshot time.
+        current_seq: u64,
     },
     /// Any failure.
     ///
@@ -495,6 +610,74 @@ enum ClientResponse {
         /// Structured error payload.
         error: ApiError,
     },
+}
+
+/// Structured payload of a streamed [`ClientResponse::Lagged`]
+/// frame.
+///
+/// Reports the gap (`missed_count`) plus the bus's pinning data
+/// (`oldest_available_seq`, `current_seq`) so the consumer can
+/// decide whether to resume via cursor replay (when the previously-
+/// observed seq is still within the durable window) or fall back to
+/// a snapshot reconcile via the paginated list ops pinned to
+/// `current_seq`.
+#[derive(Debug, Serialize)]
+struct LaggedSignal {
+    /// Number of happenings dropped from the broadcast ring since
+    /// the last successful delivery to this subscriber.
+    missed_count: u64,
+    /// Oldest seq currently retained in `happenings_log`. A
+    /// consumer whose last observed seq is at or above this value
+    /// can resume cleanly via a fresh subscribe with `since` set to
+    /// that seq.
+    oldest_available_seq: u64,
+    /// Bus cursor at signal time. Consumers falling back to
+    /// snapshot reconcile pin the list ops to this value and apply
+    /// happenings with `seq > current_seq` as deltas on top.
+    current_seq: u64,
+}
+
+/// One subject row in a [`ClientResponse::SubjectsPage`].
+#[derive(Debug, Serialize)]
+struct SubjectListEntryWire {
+    /// Canonical subject ID.
+    canonical_id: String,
+    /// Subject type, as declared in the catalogue.
+    subject_type: String,
+    /// Every addressing currently registered to this subject.
+    addressings: Vec<SubjectListAddressingWire>,
+}
+
+/// One addressing entry inside a [`SubjectListEntryWire`].
+#[derive(Debug, Serialize)]
+struct SubjectListAddressingWire {
+    scheme: String,
+    value: String,
+    /// Opaque token identifying the claiming plugin.
+    claimant_token: ClaimantToken,
+}
+
+/// One relation row in a [`ClientResponse::RelationsPage`].
+#[derive(Debug, Serialize)]
+struct RelationListEntryWire {
+    source_id: String,
+    predicate: String,
+    target_id: String,
+    /// Opaque tokens identifying every plugin that claims the
+    /// relation. Order matches the underlying claim list.
+    claimant_tokens: Vec<ClaimantToken>,
+    /// True when an admin has suppressed the relation; consumers
+    /// that want only visible edges filter on `false`.
+    suppressed: bool,
+}
+
+/// One addressing row in a [`ClientResponse::AddressingsPage`].
+#[derive(Debug, Serialize)]
+struct AddressingListEntryWire {
+    scheme: String,
+    value: String,
+    /// Canonical ID the addressing currently resolves to.
+    canonical_id: String,
 }
 
 /// Wire form of [`SubjectProjection`]. Mirrors the domain shape but
@@ -1822,6 +2005,15 @@ async fn dispatch_request(
         ClientRequest::ListActiveCustodies => {
             handle_list_active_custodies(state).await
         }
+        ClientRequest::ListSubjects { cursor, page_size } => {
+            handle_list_subjects(state, cursor, page_size)
+        }
+        ClientRequest::ListRelations { cursor, page_size } => {
+            handle_list_relations(state, cursor, page_size)
+        }
+        ClientRequest::EnumerateAddressings { cursor, page_size } => {
+            handle_enumerate_addressings(state, cursor, page_size)
+        }
         ClientRequest::DescribeCapabilities => describe_capabilities(),
         ClientRequest::SubscribeHappenings { .. } => {
             // Intercepted in handle_connection; should not reach here.
@@ -1882,6 +2074,53 @@ async fn run_subscription(
     // persistence read are buffered, not lost.
     let mut rx = state.bus.subscribe_envelope();
     let current_seq = state.bus.last_emitted_seq();
+
+    // Replay-window check: if the consumer asked for a cursor older
+    // than the oldest retained `seq`, fail fast with a structured
+    // response and close the subscription. The consumer's recovery
+    // is to fall back to the snapshot list ops pinned to
+    // `current_seq`. The check runs BEFORE the ack so a failed
+    // window is never paired with a ghost subscription frame; the
+    // bus subscription remains scoped to this function and is
+    // dropped automatically on early return.
+    if let Some(cursor) = since {
+        match state.persistence.load_oldest_happening_seq().await {
+            Ok(oldest) => {
+                if oldest > 0 && cursor < oldest {
+                    let frame = ClientResponse::Error {
+                        error: ApiError::new(
+                            ErrorClass::ContractViolation,
+                            format!(
+                                "since={cursor} is older than the durable \
+                                 retention window (oldest available seq is \
+                                 {oldest})"
+                            ),
+                        )
+                        .with_details(
+                            serde_json::json!({
+                                "subclass": "replay_window_exceeded",
+                                "oldest_available_seq": oldest,
+                                "current_seq": current_seq,
+                            }),
+                        ),
+                    };
+                    let _ = write_response_frame(&mut stream, &frame).await;
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                let frame = ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::Internal,
+                        format!("oldest-seq query failed: {e}"),
+                    )
+                    .with_subclass("replay_window_query_failed"),
+                };
+                let _ = write_response_frame(&mut stream, &frame).await;
+                return Ok(());
+            }
+        }
+    }
 
     // Send the ack. If the client is gone we return cleanly.
     let ack = ClientResponse::Subscribed {
@@ -1978,7 +2217,22 @@ async fn run_subscription(
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                let frame = ClientResponse::Lagged { lagged: n };
+                // Sample the bus and the durable window so the
+                // consumer can choose between cursor replay and
+                // snapshot reconcile.
+                let live_seq = state.bus.last_emitted_seq();
+                let oldest_available_seq = state
+                    .persistence
+                    .load_oldest_happening_seq()
+                    .await
+                    .unwrap_or(0);
+                let frame = ClientResponse::Lagged {
+                    lagged: LaggedSignal {
+                        missed_count: n,
+                        oldest_available_seq,
+                        current_seq: live_seq,
+                    },
+                };
                 if write_response_frame(&mut stream, &frame).await.is_err() {
                     return Ok(());
                 }
@@ -2289,6 +2543,275 @@ async fn handle_list_active_custodies(
     ClientResponse::ActiveCustodies { active_custodies }
 }
 
+/// Decode an opaque base64 page cursor into the underlying ASCII
+/// key the snapshot iteration sorts on. Returns a structured error
+/// frame when the cursor is malformed; the consumer's recovery is
+/// to drop the cursor and restart from the first page.
+#[allow(clippy::result_large_err)]
+fn decode_page_cursor(cursor: &str) -> Result<String, ClientResponse> {
+    let bytes =
+        B64.decode(cursor.as_bytes())
+            .map_err(|e| ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!("invalid page cursor: {e}"),
+                )
+                .with_subclass("invalid_page_cursor"),
+            })?;
+    let s = String::from_utf8(bytes).map_err(|e| ClientResponse::Error {
+        error: ApiError::new(
+            ErrorClass::ContractViolation,
+            format!("page cursor not utf8: {e}"),
+        )
+        .with_subclass("invalid_page_cursor"),
+    })?;
+    Ok(s)
+}
+
+/// Encode an ASCII key as the opaque base64 page cursor returned to
+/// the consumer.
+fn encode_page_cursor(key: &str) -> String {
+    B64.encode(key.as_bytes())
+}
+
+/// Clamp an operator-supplied page size to the steward's limits.
+fn clamp_page_size(supplied: Option<usize>) -> usize {
+    let raw = supplied.unwrap_or(DEFAULT_LIST_PAGE_SIZE);
+    raw.clamp(1, MAX_LIST_PAGE_SIZE)
+}
+
+/// Cursor key for one subject row in the `list_subjects` snapshot.
+fn subject_cursor_key(canonical_id: &str) -> String {
+    canonical_id.to_string()
+}
+
+/// Cursor key for one relation edge in the `list_relations`
+/// snapshot. Triple components are joined by NUL so any individual
+/// component may itself contain printable separators without
+/// ambiguity.
+fn relation_cursor_key(
+    source_id: &str,
+    predicate: &str,
+    target_id: &str,
+) -> String {
+    format!("{source_id}\x00{predicate}\x00{target_id}")
+}
+
+/// Cursor key for one addressing in the `enumerate_addressings`
+/// snapshot. Components joined by NUL for the same reason as
+/// [`relation_cursor_key`].
+fn addressing_cursor_key(scheme: &str, value: &str) -> String {
+    format!("{scheme}\x00{value}")
+}
+
+/// `op = "list_subjects"` handler. Snapshots the registry, sorts
+/// by canonical ID, slices the page, and returns it paired with
+/// the bus's `current_seq` so consumers can pin reconcile-style
+/// queries.
+fn handle_list_subjects(
+    state: &Arc<StewardState>,
+    cursor: Option<String>,
+    page_size: Option<usize>,
+) -> ClientResponse {
+    let after = match cursor.as_deref() {
+        Some(c) => match decode_page_cursor(c) {
+            Ok(k) => Some(k),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
+    let limit = clamp_page_size(page_size);
+    let current_seq = state.bus.last_emitted_seq();
+
+    let mut snapshot = state.subjects.snapshot_subjects();
+    snapshot.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let start = match after.as_deref() {
+        Some(after_id) => snapshot
+            .iter()
+            .position(|s| s.id.as_str() > after_id)
+            .unwrap_or(snapshot.len()),
+        None => 0,
+    };
+    let end = start.saturating_add(limit).min(snapshot.len());
+
+    let subjects: Vec<SubjectListEntryWire> = snapshot[start..end]
+        .iter()
+        .map(|record| SubjectListEntryWire {
+            canonical_id: record.id.clone(),
+            subject_type: record.subject_type.clone(),
+            addressings: record
+                .addressings
+                .iter()
+                .map(|a| SubjectListAddressingWire {
+                    scheme: a.addressing.scheme.clone(),
+                    value: a.addressing.value.clone(),
+                    claimant_token: state
+                        .claimant_issuer
+                        .token_for(&a.claimant),
+                })
+                .collect(),
+        })
+        .collect();
+
+    let next_cursor = if end < snapshot.len() {
+        subjects
+            .last()
+            .map(|s| encode_page_cursor(&subject_cursor_key(&s.canonical_id)))
+    } else {
+        None
+    };
+
+    ClientResponse::SubjectsPage {
+        subjects,
+        next_cursor,
+        current_seq,
+    }
+}
+
+/// `op = "list_relations"` handler. Snapshots the relation graph,
+/// sorts by `(source_id, predicate, target_id)`, slices the page,
+/// and returns it paired with `current_seq` for reconcile-pinning.
+fn handle_list_relations(
+    state: &Arc<StewardState>,
+    cursor: Option<String>,
+    page_size: Option<usize>,
+) -> ClientResponse {
+    let after = match cursor.as_deref() {
+        Some(c) => match decode_page_cursor(c) {
+            Ok(k) => Some(k),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
+    let limit = clamp_page_size(page_size);
+    let current_seq = state.bus.last_emitted_seq();
+
+    let mut snapshot = state.relations.snapshot_relations();
+    snapshot.sort_by(|a, b| {
+        (
+            a.key.source_id.as_str(),
+            a.key.predicate.as_str(),
+            a.key.target_id.as_str(),
+        )
+            .cmp(&(
+                b.key.source_id.as_str(),
+                b.key.predicate.as_str(),
+                b.key.target_id.as_str(),
+            ))
+    });
+
+    let start = match after.as_deref() {
+        Some(after_key) => snapshot
+            .iter()
+            .position(|r| {
+                relation_cursor_key(
+                    &r.key.source_id,
+                    &r.key.predicate,
+                    &r.key.target_id,
+                )
+                .as_str()
+                    > after_key
+            })
+            .unwrap_or(snapshot.len()),
+        None => 0,
+    };
+    let end = start.saturating_add(limit).min(snapshot.len());
+
+    let relations: Vec<RelationListEntryWire> = snapshot[start..end]
+        .iter()
+        .map(|record| RelationListEntryWire {
+            source_id: record.key.source_id.clone(),
+            predicate: record.key.predicate.clone(),
+            target_id: record.key.target_id.clone(),
+            claimant_tokens: record
+                .claims
+                .iter()
+                .map(|c| state.claimant_issuer.token_for(&c.claimant))
+                .collect(),
+            suppressed: record.suppression.is_some(),
+        })
+        .collect();
+
+    let next_cursor = if end < snapshot.len() {
+        relations.last().map(|r| {
+            encode_page_cursor(&relation_cursor_key(
+                &r.source_id,
+                &r.predicate,
+                &r.target_id,
+            ))
+        })
+    } else {
+        None
+    };
+
+    ClientResponse::RelationsPage {
+        relations,
+        next_cursor,
+        current_seq,
+    }
+}
+
+/// `op = "enumerate_addressings"` handler. Snapshots the
+/// addressing index, sorts by `(scheme, value)`, slices the page,
+/// and returns it paired with `current_seq` for reconcile-pinning.
+fn handle_enumerate_addressings(
+    state: &Arc<StewardState>,
+    cursor: Option<String>,
+    page_size: Option<usize>,
+) -> ClientResponse {
+    let after = match cursor.as_deref() {
+        Some(c) => match decode_page_cursor(c) {
+            Ok(k) => Some(k),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
+    let limit = clamp_page_size(page_size);
+    let current_seq = state.bus.last_emitted_seq();
+
+    let mut snapshot = state.subjects.snapshot_addressings();
+    snapshot.sort_by(|a, b| {
+        (a.0.scheme.as_str(), a.0.value.as_str())
+            .cmp(&(b.0.scheme.as_str(), b.0.value.as_str()))
+    });
+
+    let start = match after.as_deref() {
+        Some(after_key) => snapshot
+            .iter()
+            .position(|(addr, _)| {
+                addressing_cursor_key(&addr.scheme, &addr.value).as_str()
+                    > after_key
+            })
+            .unwrap_or(snapshot.len()),
+        None => 0,
+    };
+    let end = start.saturating_add(limit).min(snapshot.len());
+
+    let addressings: Vec<AddressingListEntryWire> = snapshot[start..end]
+        .iter()
+        .map(|(addr, canonical_id)| AddressingListEntryWire {
+            scheme: addr.scheme.clone(),
+            value: addr.value.clone(),
+            canonical_id: canonical_id.clone(),
+        })
+        .collect();
+
+    let next_cursor = if end < snapshot.len() {
+        addressings.last().map(|a| {
+            encode_page_cursor(&addressing_cursor_key(&a.scheme, &a.value))
+        })
+    } else {
+        None
+    };
+
+    ClientResponse::AddressingsPage {
+        addressings,
+        next_cursor,
+        current_seq,
+    }
+}
+
 /// Wire version reported by `op = "describe_capabilities"`.
 ///
 /// Bumped when an existing op or response shape changes
@@ -2306,6 +2829,9 @@ const SUPPORTED_OPS: &[&str] = &[
     "project_subject",
     "describe_alias",
     "list_active_custodies",
+    "list_subjects",
+    "list_relations",
+    "enumerate_addressings",
     "subscribe_happenings",
     "describe_capabilities",
 ];
@@ -2323,12 +2849,18 @@ const SUPPORTED_OPS: &[&str] = &[
 ///   alias-aware variants of `op = "project_subject"`.
 /// - `active_custodies_snapshot`: `op = "list_active_custodies"`
 ///   returns the full ledger.
+/// - `paginated_state_snapshots`: the `list_subjects`,
+///   `list_relations`, and `enumerate_addressings` ops are
+///   available, each returning paginated rows alongside
+///   `current_seq` so consumers can pin reconcile-style queries to
+///   a happenings position.
 ///
 /// Names are stable; new features are appended.
 const SUPPORTED_FEATURES: &[&str] = &[
     "subscribe_happenings_cursor",
     "alias_chain_walking",
     "active_custodies_snapshot",
+    "paginated_state_snapshots",
 ];
 
 /// Build the capability discovery response.
@@ -2907,6 +3439,9 @@ mod tests {
             "project_subject",
             "describe_alias",
             "list_active_custodies",
+            "list_subjects",
+            "list_relations",
+            "enumerate_addressings",
             "subscribe_happenings",
             "describe_capabilities",
         ] {
@@ -2926,6 +3461,7 @@ mod tests {
             .collect();
         assert!(features.contains(&"subscribe_happenings_cursor"));
         assert!(features.contains(&"alias_chain_walking"));
+        assert!(features.contains(&"paginated_state_snapshots"));
     }
 
     #[test]
@@ -3020,10 +3556,18 @@ mod tests {
 
     #[test]
     fn client_response_lagged_serialises() {
-        let r = ClientResponse::Lagged { lagged: 17 };
+        let r = ClientResponse::Lagged {
+            lagged: LaggedSignal {
+                missed_count: 17,
+                oldest_available_seq: 3,
+                current_seq: 42,
+            },
+        };
         let s = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["lagged"].as_u64(), Some(17));
+        assert_eq!(v["lagged"]["missed_count"].as_u64(), Some(17));
+        assert_eq!(v["lagged"]["oldest_available_seq"].as_u64(), Some(3));
+        assert_eq!(v["lagged"]["current_seq"].as_u64(), Some(42));
         // Distinctive top-level key.
         assert!(!s.contains("\"subscribed\""));
         assert!(!s.contains("\"happening\""));
@@ -3156,5 +3700,386 @@ mod tests {
             "plain plugin name MUST NOT leak to the wire; got: {s}"
         );
         assert!(s.contains("\"claimant_token\""));
+    }
+
+    // -----------------------------------------------------------------
+    // Replay window: a since cursor older than the oldest retained
+    // happening must produce a structured response rather than a
+    // silent partial replay.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_subscription_emits_replay_window_exceeded_when_since_lt_oldest(
+    ) {
+        // Seed the in-memory persistence with a happening at seq 5 so
+        // the oldest available row is well above the consumer's
+        // requested cursor of 0.
+        let store: Arc<dyn crate::persistence::PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        store
+            .record_happening(
+                5,
+                "custody_taken",
+                &serde_json::json!({"type": "custody_taken"}),
+                1_700_000_000_000,
+            )
+            .await
+            .expect("seed happening");
+
+        // Build a state that points at the seeded persistence and a
+        // bus seeded from the same store so seqs continue past 5.
+        let bus = Arc::new(
+            crate::happenings::HappeningBus::with_persistence(Arc::clone(
+                &store,
+            ))
+            .await
+            .expect("seed bus"),
+        );
+        let state = StewardState::builder()
+            .catalogue(Arc::new(crate::catalogue::Catalogue::default()))
+            .subjects(Arc::new(crate::subjects::SubjectRegistry::new()))
+            .relations(Arc::new(crate::relations::RelationGraph::new()))
+            .custody(Arc::new(crate::custody::CustodyLedger::new()))
+            .bus(Arc::clone(&bus))
+            .admin(Arc::new(crate::admin::AdminLedger::new()))
+            .persistence(Arc::clone(&store))
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new(
+                "test-instance",
+            )))
+            .build()
+            .expect("state");
+
+        // Wire two ends of a Unix socket pair; the server side is
+        // handed to run_subscription, the client side reads what the
+        // server writes.
+        let (server_end, mut client_end) = UnixStream::pair().unwrap();
+
+        let handle = tokio::spawn(async move {
+            run_subscription(server_end, state, Some(0)).await
+        });
+
+        // Read one frame off the client end; expect the structured
+        // replay_window_exceeded error.
+        let mut len = [0u8; 4];
+        client_end.read_exact(&mut len).await.expect("read len");
+        let n = u32::from_be_bytes(len) as usize;
+        let mut body = vec![0u8; n];
+        client_end.read_exact(&mut body).await.expect("read body");
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse frame");
+
+        // Subscription returns cleanly after writing the error frame.
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(v["error"]["class"].as_str(), Some("contract_violation"));
+        assert_eq!(
+            v["error"]["details"]["subclass"].as_str(),
+            Some("replay_window_exceeded")
+        );
+        assert_eq!(
+            v["error"]["details"]["oldest_available_seq"].as_u64(),
+            Some(5)
+        );
+        assert!(v["error"]["details"]["current_seq"].is_u64());
+    }
+
+    // -----------------------------------------------------------------
+    // Paginated list ops: every seeded row appears exactly once across
+    // pages, and current_seq is a stable bus pin.
+    // -----------------------------------------------------------------
+
+    fn seeded_state_for_lists(n: usize) -> Arc<StewardState> {
+        use evo_plugin_sdk::contract::{
+            ExternalAddressing, SubjectAnnouncement,
+        };
+        let state = StewardState::for_tests();
+        // Seed N subjects with one addressing each.
+        for i in 0..n {
+            let scheme = "test";
+            let value = format!("v-{i:04}");
+            let ann = SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new(scheme, value)],
+            );
+            state.subjects.announce(&ann, "org.test.plugin").unwrap();
+        }
+        // Seed N relations on a small set of source/target ids.
+        for i in 0..n {
+            let source = format!("s-{:04}", i % 3);
+            let predicate = format!("pred-{:04}", i / 3);
+            let target = format!("t-{i:04}");
+            state
+                .relations
+                .assert(&source, &predicate, &target, "org.test.plugin", None)
+                .unwrap();
+        }
+        state
+    }
+
+    fn pages_through_subjects(
+        state: &Arc<StewardState>,
+        page_size: usize,
+    ) -> (Vec<String>, Vec<u64>) {
+        let mut all = Vec::new();
+        let mut seqs = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let resp = handle_list_subjects(state, cursor, Some(page_size));
+            let (subjects, next_cursor, current_seq) = match resp {
+                ClientResponse::SubjectsPage {
+                    subjects,
+                    next_cursor,
+                    current_seq,
+                } => (subjects, next_cursor, current_seq),
+                other => panic!("unexpected response: {other:?}"),
+            };
+            seqs.push(current_seq);
+            for s in subjects {
+                all.push(s.canonical_id);
+            }
+            cursor = next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        (all, seqs)
+    }
+
+    #[test]
+    fn list_subjects_returns_every_seeded_row_exactly_once() {
+        let state = seeded_state_for_lists(7);
+        let total = state.subjects.subject_count();
+        let (ids, seqs) = pages_through_subjects(&state, 3);
+        assert_eq!(ids.len(), total);
+        let unique: std::collections::HashSet<_> =
+            ids.iter().cloned().collect();
+        assert_eq!(unique.len(), total);
+        // current_seq is a stable bus pin (no emits during the
+        // test); every page reports the same value.
+        for s in &seqs {
+            assert_eq!(*s, seqs[0]);
+        }
+    }
+
+    #[test]
+    fn list_subjects_page_size_clamped_to_limits() {
+        let state = seeded_state_for_lists(3);
+        let resp =
+            handle_list_subjects(&state, None, Some(MAX_LIST_PAGE_SIZE + 5));
+        match resp {
+            ClientResponse::SubjectsPage {
+                subjects,
+                next_cursor,
+                ..
+            } => {
+                assert_eq!(subjects.len(), 3);
+                assert!(next_cursor.is_none());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_relations_returns_every_seeded_edge_exactly_once() {
+        let state = seeded_state_for_lists(9);
+        let total = state.relations.relation_count();
+        let mut all = Vec::new();
+        let mut seqs = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let resp = handle_list_relations(&state, cursor, Some(4));
+            let (relations, next_cursor, current_seq) = match resp {
+                ClientResponse::RelationsPage {
+                    relations,
+                    next_cursor,
+                    current_seq,
+                } => (relations, next_cursor, current_seq),
+                other => panic!("unexpected response: {other:?}"),
+            };
+            seqs.push(current_seq);
+            for r in relations {
+                all.push((r.source_id, r.predicate, r.target_id));
+            }
+            cursor = next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(all.len(), total);
+        let unique: std::collections::HashSet<_> =
+            all.iter().cloned().collect();
+        assert_eq!(unique.len(), total);
+        for s in &seqs {
+            assert_eq!(*s, seqs[0]);
+        }
+    }
+
+    #[test]
+    fn enumerate_addressings_returns_every_seeded_addressing_exactly_once() {
+        let state = seeded_state_for_lists(11);
+        let total = state.subjects.addressing_count();
+        let mut all = Vec::new();
+        let mut seqs = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let resp = handle_enumerate_addressings(&state, cursor, Some(5));
+            let (addressings, next_cursor, current_seq) = match resp {
+                ClientResponse::AddressingsPage {
+                    addressings,
+                    next_cursor,
+                    current_seq,
+                } => (addressings, next_cursor, current_seq),
+                other => panic!("unexpected response: {other:?}"),
+            };
+            seqs.push(current_seq);
+            for a in addressings {
+                all.push((a.scheme, a.value));
+            }
+            cursor = next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(all.len(), total);
+        let unique: std::collections::HashSet<_> =
+            all.iter().cloned().collect();
+        assert_eq!(unique.len(), total);
+        for s in &seqs {
+            assert_eq!(*s, seqs[0]);
+        }
+    }
+
+    #[test]
+    fn list_ops_reject_invalid_cursor_with_structured_error() {
+        let state = seeded_state_for_lists(1);
+        let resp = handle_list_subjects(
+            &state,
+            Some("not-base64-!!!".to_string()),
+            None,
+        );
+        match resp {
+            ClientResponse::Error { error } => {
+                assert_eq!(error.class, ErrorClass::ContractViolation);
+                assert_eq!(
+                    error.details.unwrap()["subclass"].as_str(),
+                    Some("invalid_page_cursor")
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Lagged signal: emits the structured payload with missed_count,
+    // oldest_available_seq, and current_seq when the broadcast ring
+    // overflows.
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_subscription_emits_structured_lagged_signal() {
+        // Tiny capacity bus so we can saturate the broadcast ring.
+        let store: Arc<dyn crate::persistence::PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        // Seed a single durable row so oldest_available_seq is
+        // non-zero and the structured payload carries a meaningful
+        // pin.
+        store
+            .record_happening(
+                1,
+                "custody_taken",
+                &serde_json::json!({"type": "custody_taken"}),
+                1_700_000_000_000,
+            )
+            .await
+            .unwrap();
+
+        let bus = Arc::new(
+            crate::happenings::HappeningBus::with_persistence_capacity_and_window(
+                Arc::clone(&store),
+                2,
+                60,
+            )
+            .await
+            .expect("seed bus"),
+        );
+        let state = StewardState::builder()
+            .catalogue(Arc::new(crate::catalogue::Catalogue::default()))
+            .subjects(Arc::new(crate::subjects::SubjectRegistry::new()))
+            .relations(Arc::new(crate::relations::RelationGraph::new()))
+            .custody(Arc::new(crate::custody::CustodyLedger::new()))
+            .bus(Arc::clone(&bus))
+            .admin(Arc::new(crate::admin::AdminLedger::new()))
+            .persistence(Arc::clone(&store))
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new("test")))
+            .build()
+            .expect("state");
+
+        let (server_end, mut client_end) = UnixStream::pair().unwrap();
+
+        // Spawn the subscription with no cursor (live-only).
+        let state_clone = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            run_subscription(server_end, state_clone, None).await
+        });
+
+        // Read the subscribe ack.
+        let mut len = [0u8; 4];
+        client_end.read_exact(&mut len).await.unwrap();
+        let n = u32::from_be_bytes(len) as usize;
+        let mut body = vec![0u8; n];
+        client_end.read_exact(&mut body).await.unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(ack["subscribed"].as_bool(), Some(true));
+
+        // Saturate the broadcast ring (capacity 2) — emit far more
+        // events than the buffer holds so the receiver MUST observe
+        // a Lagged on its next recv() once the spawned task is
+        // scheduled.
+        for _ in 0..32 {
+            bus.emit(Happening::CustodyReleased {
+                plugin: "p".into(),
+                handle_id: "h".into(),
+                at: SystemTime::now(),
+            });
+        }
+
+        // Read frames with a per-frame timeout so a missing Lagged
+        // does not hang the test indefinitely. Look for the
+        // structured lagged payload within a bounded number of
+        // frames.
+        let mut saw_lagged = false;
+        for _ in 0..64 {
+            let mut len = [0u8; 4];
+            let timed = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                client_end.read_exact(&mut len),
+            )
+            .await;
+            let read_result = match timed {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            if read_result.is_err() {
+                break;
+            }
+            let n = u32::from_be_bytes(len) as usize;
+            let mut body = vec![0u8; n];
+            if client_end.read_exact(&mut body).await.is_err() {
+                break;
+            }
+            let frame: serde_json::Value =
+                serde_json::from_slice(&body).unwrap();
+            if let Some(payload) = frame.get("lagged") {
+                assert!(payload["missed_count"].as_u64().unwrap() > 0);
+                assert_eq!(payload["oldest_available_seq"].as_u64(), Some(1));
+                assert!(payload["current_seq"].is_u64());
+                saw_lagged = true;
+                break;
+            }
+        }
+        assert!(saw_lagged, "structured lagged frame never arrived");
+
+        drop(client_end);
+        let _ = handle.await;
     }
 }
