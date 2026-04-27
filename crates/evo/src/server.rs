@@ -947,6 +947,11 @@ struct CustodyRecordWire {
     custody_type: Option<String>,
     /// Most recent state snapshot, if any reports have been seen.
     last_state: Option<StateSnapshotWire>,
+    /// Lifecycle state of the record. Serialises as an internally
+    /// tagged `{"kind":"active"}` / `{"kind":"degraded","reason":"..."}`
+    /// / `{"kind":"aborted","reason":"..."}` per
+    /// [`crate::custody::CustodyStateKind`].
+    state: crate::custody::CustodyStateKind,
     /// When the record was first created in the ledger, ms since
     /// UNIX epoch.
     started_at_ms: u64,
@@ -976,6 +981,7 @@ impl CustodyRecordWire {
             shelf: r.shelf,
             custody_type: r.custody_type,
             last_state: r.last_state.map(Into::into),
+            state: r.state,
             started_at_ms: system_time_to_ms(r.started_at),
             last_updated_ms: system_time_to_ms(r.last_updated),
         }
@@ -1052,6 +1058,38 @@ enum HappeningWire {
         /// Health declared by the plugin at report time. Uses the
         /// SDK type's built-in lowercase serialisation.
         health: HealthStatus,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::CustodyAborted`]. Signals that a
+    /// custody operation failed under an `abort` failure-mode
+    /// declaration; the custody is over and the steward expects the
+    /// warden to release.
+    CustodyAborted {
+        /// Opaque token identifying the warden plugin.
+        claimant_token: ClaimantToken,
+        /// Handle id of the failing custody.
+        handle_id: String,
+        /// Fully-qualified shelf the warden occupies.
+        shelf: String,
+        /// Steward-recorded failure reason.
+        reason: String,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::CustodyDegraded`]. Signals that a
+    /// custody operation failed under a `partial_ok` failure-mode
+    /// declaration; the warden may keep reporting on the same handle
+    /// and the consumer decides whether to keep consuming or stop.
+    CustodyDegraded {
+        /// Opaque token identifying the warden plugin.
+        claimant_token: ClaimantToken,
+        /// Handle id of the failing custody.
+        handle_id: String,
+        /// Fully-qualified shelf the warden occupies.
+        shelf: String,
+        /// Steward-recorded failure reason.
+        reason: String,
         /// When the happening was recorded, ms since UNIX epoch.
         at_ms: u64,
     },
@@ -1535,6 +1573,32 @@ impl HappeningWire {
                 claimant_token: issuer.token_for(&plugin),
                 handle_id,
                 health,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::CustodyAborted {
+                plugin,
+                handle_id,
+                shelf,
+                reason,
+                at,
+            } => HappeningWire::CustodyAborted {
+                claimant_token: issuer.token_for(&plugin),
+                handle_id,
+                shelf,
+                reason,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::CustodyDegraded {
+                plugin,
+                handle_id,
+                shelf,
+                reason,
+                at,
+            } => HappeningWire::CustodyDegraded {
+                claimant_token: issuer.token_for(&plugin),
+                handle_id,
+                shelf,
+                reason,
                 at_ms: system_time_to_ms(at),
             },
             Happening::RelationCardinalityViolation {
@@ -3689,6 +3753,7 @@ mod tests {
                 health: HealthStatus::Healthy,
                 reported_at_ms: 1_700_000_000_050,
             }),
+            state: crate::custody::CustodyStateKind::Active,
             started_at_ms: 1_700_000_000_000,
             last_updated_ms: 1_700_000_000_050,
         };
@@ -3733,6 +3798,7 @@ mod tests {
             shelf: Some("example.custody".into()),
             custody_type: Some("playback".into()),
             last_state: Some(snap),
+            state: crate::custody::CustodyStateKind::Active,
             started_at: UNIX_EPOCH + std::time::Duration::from_millis(100),
             last_updated: UNIX_EPOCH + std::time::Duration::from_millis(500),
         };
@@ -3761,6 +3827,7 @@ mod tests {
             shelf: None,
             custody_type: None,
             last_state: None,
+            state: crate::custody::CustodyStateKind::Active,
             started_at: UNIX_EPOCH + std::time::Duration::from_millis(100),
             last_updated: UNIX_EPOCH + std::time::Duration::from_millis(100),
         };

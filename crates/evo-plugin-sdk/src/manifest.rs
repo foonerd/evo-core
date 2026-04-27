@@ -582,25 +582,60 @@ pub struct WardenCapabilities {
     /// `tokio::time::timeout` of this duration; expiry surfaces
     /// the configured `custody_failure_mode` to the operator.
     pub course_correction_budget_ms: u32,
-    /// Behaviour when custody fails.
+    /// Behaviour when a custody operation fails.
     ///
     /// **Bucket: Enforced.** Used by the router to populate
-    /// `EnforcementPolicy::custody_failure_mode`. The custody
-    /// dispatch path branches on this value: `Abort` aborts
-    /// the custody and surfaces the failure as a hard error;
-    /// `PartialOk` records the failure on the custody record and
-    /// continues. The mode is observable on every custody-failure
-    /// happening so consumers can act consistently.
+    /// `EnforcementPolicy::custody_failure_mode`. On any failure of
+    /// the `course_correct` dispatch path (warden-returned error or
+    /// `course_correction_budget_ms` deadline expiry), the router
+    /// branches on this value before propagating the dispatch error:
+    ///
+    /// - **`Abort`** marks the custody record as `aborted` on the
+    ///   ledger and emits a `custody_aborted` happening on the
+    ///   durable bus carrying the steward-recorded failure reason.
+    ///   The custody is over from the steward's point of view; the
+    ///   warden is expected to release the handle on its next
+    ///   opportunity. Consumers acting on the handle should treat
+    ///   this as a hard stop signal.
+    /// - **`PartialOk`** marks the custody record as `degraded` on
+    ///   the ledger and emits a `custody_degraded` happening on the
+    ///   durable bus carrying the steward-recorded failure reason.
+    ///   The warden is not released and may continue to report
+    ///   state on the same handle; consumers decide whether to keep
+    ///   consuming partial results or to stop.
+    ///
+    /// In both cases the dispatch error is propagated to the caller
+    /// unchanged; the differential is the ledger transition and the
+    /// happening variant. Take-custody and release-custody paths
+    /// today behave uniformly as if `Abort` were declared (they
+    /// have no failure-mode hook); when those paths grow a
+    /// failure-mode-aware surface, this field will gate them in
+    /// the same way.
     pub custody_failure_mode: CustodyFailureMode,
 }
 
 /// Custody failure modes per `PLUGIN_PACKAGING.md` section 2.
+///
+/// Selects the steward's bookkeeping and signalling behaviour when a
+/// custody operation on a warden's handle fails. The semantic is
+/// pinned by the `course_correct` dispatch path; see
+/// [`WardenCapabilities::custody_failure_mode`] for the full
+/// description of what each mode causes the steward to record and
+/// emit.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum CustodyFailureMode {
-    /// Custody failure terminates the work under custody.
+    /// A custody operation failure terminates the work under
+    /// custody. The steward marks the custody record as `aborted`,
+    /// emits `custody_aborted` on the durable happenings bus, and
+    /// propagates the dispatch error. The warden is expected to
+    /// release the handle on its next opportunity.
     Abort,
-    /// Custody failure leaves partial results intact.
+    /// A custody operation failure leaves partial results intact.
+    /// The steward marks the custody record as `degraded`, emits
+    /// `custody_degraded` on the durable happenings bus, and
+    /// propagates the dispatch error. The warden is not released;
+    /// further state reports on the same handle remain valid.
     PartialOk,
 }
 

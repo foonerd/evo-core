@@ -362,6 +362,56 @@ pub enum Happening {
         /// When the happening was recorded.
         at: SystemTime,
     },
+    /// A custody operation failed under an `abort` failure-mode
+    /// declaration. Emitted by the router after the custody record
+    /// has been transitioned to
+    /// [`crate::custody::CustodyStateKind::Aborted`] and immediately
+    /// before the dispatch error is returned.
+    ///
+    /// Consumers acting on the custody handle SHOULD treat this as
+    /// a hard stop signal: the custody is over from the steward's
+    /// point of view; further work should not be attempted on the
+    /// same handle. The warden is expected to release the custody
+    /// at its next opportunity. The `reason` carries the steward's
+    /// description of the failure (timeout text, plugin error
+    /// message) and is identical to the reason recorded on the
+    /// ledger record.
+    CustodyAborted {
+        /// Canonical name of the warden plugin.
+        plugin: String,
+        /// Handle id of the failing custody.
+        handle_id: String,
+        /// Fully-qualified shelf the warden occupies.
+        shelf: String,
+        /// Steward-recorded failure reason.
+        reason: String,
+        /// When the happening was recorded.
+        at: SystemTime,
+    },
+    /// A custody operation failed under a `partial_ok` failure-mode
+    /// declaration. Emitted by the router after the custody record
+    /// has been transitioned to
+    /// [`crate::custody::CustodyStateKind::Degraded`] and
+    /// immediately before the dispatch error is returned.
+    ///
+    /// Consumers MAY continue to act on the custody handle: the
+    /// warden has not been released and further reports may still
+    /// arrive. The signal is observational so the consumer can
+    /// decide whether to keep consuming partial results or to stop.
+    /// The `reason` mirrors the reason recorded on the ledger
+    /// record.
+    CustodyDegraded {
+        /// Canonical name of the warden plugin.
+        plugin: String,
+        /// Handle id of the failing custody.
+        handle_id: String,
+        /// Fully-qualified shelf the warden occupies.
+        shelf: String,
+        /// Steward-recorded failure reason.
+        reason: String,
+        /// When the happening was recorded.
+        at: SystemTime,
+    },
     /// A relation assertion exceeded a declared cardinality bound.
     /// Emitted by
     /// [`RegistryRelationAnnouncer`](crate::context::RegistryRelationAnnouncer)
@@ -1238,6 +1288,8 @@ fn happening_kind_str(h: &Happening) -> &'static str {
         Happening::CustodyTaken { .. } => "custody_taken",
         Happening::CustodyReleased { .. } => "custody_released",
         Happening::CustodyStateReported { .. } => "custody_state_reported",
+        Happening::CustodyAborted { .. } => "custody_aborted",
+        Happening::CustodyDegraded { .. } => "custody_degraded",
         Happening::RelationCardinalityViolation { .. } => {
             "relation_cardinality_violation"
         }

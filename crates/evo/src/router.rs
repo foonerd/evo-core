@@ -623,6 +623,26 @@ impl PluginRouter {
     /// admission time). Expiry surfaces as a
     /// [`StewardError::Dispatch`] whose message includes the
     /// declared `custody_failure_mode` so consumers can branch.
+    ///
+    /// On any failure path (warden-returned error, deadline expiry)
+    /// the router branches on the entry's
+    /// `policy.custody_failure_mode` to:
+    ///
+    /// - mark the matching custody record on the shared ledger:
+    ///   [`CustodyLedger::mark_aborted`] for `Abort` (and the
+    ///   `None` default, treated as Abort), and
+    ///   [`CustodyLedger::mark_degraded`] for `PartialOk`;
+    /// - emit a matching durable happening
+    ///   ([`Happening::CustodyAborted`] or
+    ///   [`Happening::CustodyDegraded`]) so consumers reading the
+    ///   bus observe the differential outcome before they see the
+    ///   dispatch error;
+    /// - propagate the originating dispatch error unchanged.
+    ///
+    /// The mark-then-emit-then-propagate ordering matches the
+    /// custody-state-reporter discipline: a subscriber that reacts
+    /// to the happening by querying the ledger always sees the new
+    /// state.
     pub async fn course_correct(
         &self,
         shelf: &str,
@@ -630,9 +650,15 @@ impl PluginRouter {
         correction_type: String,
         payload: Vec<u8>,
     ) -> Result<(), StewardError> {
+        let ledger = Arc::clone(&self.state.custody);
+        let bus = Arc::clone(&self.state.bus);
+
         let entry = self.lookup(shelf).ok_or_else(|| {
             StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
         })?;
+
+        let plugin_name = entry.name.clone();
+        let shelf_qualified = entry.shelf.clone();
 
         let correlation_id =
             self.custody_cid_counter.fetch_add(1, Ordering::Relaxed);
@@ -686,13 +712,68 @@ impl PluginRouter {
                 .map_err(Into::into),
         };
 
+        // Drop the per-entry lock before doing any further .await
+        // work (ledger mark + bus emit). The handle guard is no
+        // longer needed; releasing it early keeps the per-entry
+        // mutex contention discipline tight.
+        drop(handle_guard);
+
         if let Err(ref e) = result {
+            let reason = e.to_string();
             tracing::warn!(
                 shelf = %shelf,
                 custody_failure_mode = ?failure_mode,
-                error = %e,
-                "course_correct failed; failure mode declared by manifest"
+                error = %reason,
+                "course_correct failed; applying custody_failure_mode policy"
             );
+
+            // Branch on the declared mode. None is treated as Abort
+            // by default — the policy's own absence gives the
+            // operator the strongest stop semantic.
+            use evo_plugin_sdk::manifest::CustodyFailureMode;
+            let happening = match failure_mode {
+                Some(CustodyFailureMode::PartialOk) => {
+                    ledger.mark_degraded(
+                        &plugin_name,
+                        &handle.id,
+                        reason.clone(),
+                    );
+                    Happening::CustodyDegraded {
+                        plugin: plugin_name.clone(),
+                        handle_id: handle.id.clone(),
+                        shelf: shelf_qualified.clone(),
+                        reason: reason.clone(),
+                        at: SystemTime::now(),
+                    }
+                }
+                Some(CustodyFailureMode::Abort) | None => {
+                    ledger.mark_aborted(
+                        &plugin_name,
+                        &handle.id,
+                        reason.clone(),
+                    );
+                    Happening::CustodyAborted {
+                        plugin: plugin_name.clone(),
+                        handle_id: handle.id.clone(),
+                        shelf: shelf_qualified.clone(),
+                        reason: reason.clone(),
+                        at: SystemTime::now(),
+                    }
+                }
+            };
+
+            // Persist + broadcast. A persistence failure on the
+            // failure-mode happening would be silently lost
+            // without surfacing; we fold it into the dispatch
+            // error so the operator sees both the underlying
+            // failure and the bookkeeping failure together.
+            if let Err(persist_err) = bus.emit_durable(happening).await {
+                return Err(StewardError::Dispatch(format!(
+                    "course_correct failed on shelf {shelf} ({reason}); \
+                     custody_failure_mode happening persist failed: \
+                     {persist_err}"
+                )));
+            }
         }
 
         result
@@ -1400,6 +1481,284 @@ mod tests {
         for j in joins {
             let name = j.await.unwrap();
             assert!(name.starts_with('p'));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Differential custody_failure_mode tests.
+    //
+    // These tests verify that the router branches on the entry's
+    // `custody_failure_mode` policy when a custody operation fails.
+    // The two tests differ only in the policy value passed to the
+    // warden entry; the assertion targets are the ledger transition
+    // and the happening variant.
+    // -----------------------------------------------------------------
+
+    /// A warden whose `course_correct` always returns
+    /// `PluginError::Permanent`. Used by the failure-mode
+    /// differential tests below; `take_custody` succeeds normally
+    /// so the ledger has a record to transition.
+    struct FailingWarden {
+        name: String,
+    }
+
+    impl Plugin for FailingWarden {
+        fn describe(
+            &self,
+        ) -> impl Future<Output = PluginDescription> + Send + '_ {
+            async move {
+                PluginDescription {
+                    identity: PluginIdentity {
+                        name: self.name.clone(),
+                        version: semver::Version::new(0, 1, 0),
+                        contract: 1,
+                    },
+                    runtime_capabilities: RuntimeCapabilities {
+                        request_types: vec![],
+                        accepts_custody: true,
+                        flags: Default::default(),
+                    },
+                    build_info: BuildInfo {
+                        plugin_build: "test".into(),
+                        sdk_version: "0.1.0".into(),
+                        rustc_version: None,
+                        built_at: None,
+                    },
+                }
+            }
+        }
+
+        fn load<'a>(
+            &'a mut self,
+            _ctx: &'a LoadContext,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+            async move { Ok(()) }
+        }
+
+        fn unload(
+            &mut self,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
+            async move { Ok(()) }
+        }
+
+        fn health_check(
+            &self,
+        ) -> impl Future<Output = HealthReport> + Send + '_ {
+            async move { HealthReport::healthy() }
+        }
+    }
+
+    impl Warden for FailingWarden {
+        fn take_custody(
+            &mut self,
+            _assignment: Assignment,
+        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + '_
+        {
+            let id = self.name.clone();
+            async move { Ok(CustodyHandle::new(id)) }
+        }
+
+        fn course_correct<'a>(
+            &'a mut self,
+            _handle: &'a CustodyHandle,
+            _correction: CourseCorrection,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+            async move { Err(PluginError::Permanent("simulated failure".into())) }
+        }
+
+        fn release_custody(
+            &mut self,
+            _handle: CustodyHandle,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
+            async move { Ok(()) }
+        }
+    }
+
+    fn failing_warden_entry_with_policy(
+        name: &str,
+        shelf: &str,
+        plugin_name: &str,
+        policy: EnforcementPolicy,
+    ) -> Arc<PluginEntry> {
+        let w: Box<dyn ErasedWarden> =
+            Box::new(WardenAdapter::new(FailingWarden {
+                name: plugin_name.into(),
+            }));
+        let handle = AdmittedHandle::Warden(w);
+        Arc::new(PluginEntry::new_with_policy(
+            name.into(),
+            shelf.into(),
+            handle,
+            policy,
+        ))
+    }
+
+    #[tokio::test]
+    async fn course_correct_aborts_under_abort_mode() {
+        use crate::happenings::Happening;
+        use evo_plugin_sdk::manifest::CustodyFailureMode;
+
+        let r = fresh_router();
+        let policy = EnforcementPolicy {
+            allowed_request_types: None,
+            default_request_deadline_ms: None,
+            course_correction_deadline_ms: None,
+            custody_failure_mode: Some(CustodyFailureMode::Abort),
+        };
+        r.insert(failing_warden_entry_with_policy(
+            "w",
+            "test.custody",
+            "w",
+            policy,
+        ))
+        .unwrap();
+
+        // Take custody so the ledger has a record to transition.
+        let h = r
+            .take_custody("test.custody", "playback".into(), vec![], None)
+            .await
+            .expect("take_custody");
+
+        // Subscribe to the bus AFTER take_custody so the
+        // CustodyTaken happening doesn't sit in our buffer.
+        let mut rx = r.state().bus.subscribe();
+
+        let res = r
+            .course_correct("test.custody", &h, "go".into(), b"x".to_vec())
+            .await;
+
+        // 1. Dispatch error propagates.
+        assert!(
+            matches!(res, Err(StewardError::Plugin(_))),
+            "expected Plugin error to propagate, got {res:?}"
+        );
+
+        // 2. Ledger record transitioned to Aborted with a reason
+        //    derived from the underlying failure.
+        let rec = r
+            .state()
+            .custody
+            .describe("w", &h.id)
+            .expect("ledger record still present after abort");
+        match &rec.state {
+            crate::custody::CustodyStateKind::Aborted { reason } => {
+                assert!(
+                    reason.contains("simulated failure"),
+                    "abort reason should carry the underlying message, got: \
+                     {reason}"
+                );
+            }
+            other => panic!(
+                "expected Aborted state under Abort policy, got: {other:?}"
+            ),
+        }
+
+        // 3. Bus carries the matching CustodyAborted happening.
+        let happening = rx.recv().await.expect("recv");
+        match happening {
+            Happening::CustodyAborted {
+                plugin,
+                handle_id,
+                shelf,
+                reason,
+                ..
+            } => {
+                assert_eq!(plugin, "w");
+                assert_eq!(handle_id, "w");
+                assert_eq!(shelf, "test.custody");
+                assert!(
+                    reason.contains("simulated failure"),
+                    "happening reason should carry the underlying message, \
+                     got: {reason}"
+                );
+            }
+            other => {
+                panic!("expected CustodyAborted happening, got: {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn course_correct_degrades_under_partial_ok_mode() {
+        use crate::happenings::Happening;
+        use evo_plugin_sdk::manifest::CustodyFailureMode;
+
+        let r = fresh_router();
+        let policy = EnforcementPolicy {
+            allowed_request_types: None,
+            default_request_deadline_ms: None,
+            course_correction_deadline_ms: None,
+            custody_failure_mode: Some(CustodyFailureMode::PartialOk),
+        };
+        r.insert(failing_warden_entry_with_policy(
+            "w",
+            "test.custody",
+            "w",
+            policy,
+        ))
+        .unwrap();
+
+        let h = r
+            .take_custody("test.custody", "playback".into(), vec![], None)
+            .await
+            .expect("take_custody");
+
+        let mut rx = r.state().bus.subscribe();
+
+        let res = r
+            .course_correct("test.custody", &h, "go".into(), b"x".to_vec())
+            .await;
+
+        // 1. Dispatch error propagates the same way regardless of
+        //    failure mode — the differential is the bookkeeping, not
+        //    the propagation.
+        assert!(
+            matches!(res, Err(StewardError::Plugin(_))),
+            "expected Plugin error to propagate, got {res:?}"
+        );
+
+        // 2. Ledger record transitioned to Degraded with a reason.
+        let rec = r
+            .state()
+            .custody
+            .describe("w", &h.id)
+            .expect("ledger record still present after degrade");
+        match &rec.state {
+            crate::custody::CustodyStateKind::Degraded { reason } => {
+                assert!(
+                    reason.contains("simulated failure"),
+                    "degrade reason should carry the underlying message, \
+                     got: {reason}"
+                );
+            }
+            other => panic!(
+                "expected Degraded state under PartialOk policy, got: \
+                 {other:?}"
+            ),
+        }
+
+        // 3. Bus carries the matching CustodyDegraded happening.
+        let happening = rx.recv().await.expect("recv");
+        match happening {
+            Happening::CustodyDegraded {
+                plugin,
+                handle_id,
+                shelf,
+                reason,
+                ..
+            } => {
+                assert_eq!(plugin, "w");
+                assert_eq!(handle_id, "w");
+                assert_eq!(shelf, "test.custody");
+                assert!(
+                    reason.contains("simulated failure"),
+                    "happening reason should carry the underlying message, \
+                     got: {reason}"
+                );
+            }
+            other => {
+                panic!("expected CustodyDegraded happening, got: {other:?}")
+            }
         }
     }
 }
