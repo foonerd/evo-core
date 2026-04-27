@@ -911,8 +911,20 @@ The class is one of:
 | `contract_violation` | `split_target_index_out_of_bounds` | Explicit relation assignment names a partition index outside the operator's `partitions`. Extras: `index`, `partition_count`. |
 | `contract_violation` | `replay_window_exceeded`           | `subscribe_happenings` `since` cursor is older than the oldest retained `seq`. Extras: `oldest_available_seq`, `current_seq`. |
 | `contract_violation` | `invalid_page_cursor`              | A paginated list op was issued with a cursor that did not decode (bad base64 or non-utf8 payload).                            |
+| `contract_violation` | `invalid_base64`                   | Caller-supplied `payload_b64` field did not decode as base64.                                                                 |
+| `contract_violation` | `invalid_request`                  | Caller's request body parsed as JSON but did not satisfy the schema for any documented op (typically a missing required field). |
 | `not_found`          | `merge_source_unknown`             | Merge source addressing is not registered. Extras: `addressing`.                                                              |
 | `not_found`          | `target_plugin_unknown`            | Privileged retract names a plugin not currently admitted. Extras: `plugin`.                                                   |
+| `not_found`          | `unknown_subject`                  | Caller-supplied `canonical_id` is not in the registry and no alias chain resolves it.                                         |
+| `permission_denied`  | `resolve_claimants_not_granted`    | Connected peer did not satisfy the `client_acl.toml` policy for `resolve_claimants` (no UID / GID / local-grant match).       |
+| `protocol_violation` | `invalid_json`                     | Request frame body did not parse as JSON. Wire-level malformation; the connection is closed per `protocol_violation` semantics. |
+| `internal`           | `alias_lookup_failed`              | Storage-layer query for the alias chain failed. Operator-facing diagnostic; consumer should retry or fall back to a snapshot. |
+| `internal`           | `alias_terminal_missing`           | The alias-chain walk reached a terminal `canonical_id` that the registry has no record of. Steward invariant breach.          |
+| `internal`           | `dispatch_misroute`                | Internal dispatch routed a request to the wrong handler. Steward invariant breach.                                            |
+| `internal`           | `replay_decode_failed`             | A persisted `happenings_log` row did not deserialise into a known `Happening` variant. Storage corruption or cross-version drift. |
+| `internal`           | `replay_query_failed`              | Storage-layer query for the replay window failed. Consumer should fall back to a snapshot pinned to a fresh `current_seq`.    |
+| `internal`           | `replay_window_query_failed`       | Storage-layer query for the oldest retained `seq` failed; the steward could not evaluate the replay-window cutoff.            |
+| `internal`           | `unsupported_variant`              | The steward hit a code path that should be unreachable for the validated request shape. Steward invariant breach.             |
 | `misconfiguration`   | `catalogue_invalid`                | Catalogue parse or validation failure (including out-of-range `schema_version`). (Reserved; not yet emitted on the wire — catalogue errors surface only at boot today and reach operator logs, not consumers. Will emit when an operator-callable reload-catalogue verb lands.) |
 | `misconfiguration`   | `manifest_invalid`                 | Plugin manifest parse or validation failure. (Reserved; not yet emitted on the wire — manifest errors surface only at admission today and reach operator logs, not consumers. Will emit when an operator-callable reload-manifest verb lands.) |
 

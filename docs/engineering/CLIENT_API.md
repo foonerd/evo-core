@@ -726,6 +726,8 @@ Response:
 
 Resolution is a private query: it does NOT emit on the happenings bus, and a successful or refused call surfaces only in the steward's audit log. Operators consult the audit log to see which connection identities asked to exchange tokens for plain names; the steward records the connecting peer's UID/GID, the request size, the resolved count, and whether the call was granted.
 
+**Token-existence-count side-channel (intentional).** The response shape lets a granted consumer learn whether each requested token is *currently issued by this steward* by observing whether the token appears in the `resolutions` array. Tokens not currently issued are silently omitted (per the request-table note above), which is what allows the count of returned resolutions to differ from the count of supplied tokens. This is a deliberate design trade-off, not a bug: the `resolve_claimants` capability is privileged for exactly this reason — the operator who granted the capability already trusts the consumer with the plain plugin names and versions of currently-admitted plugins, and the additional signal "this token is currently issued vs not" is no stronger than what the consumer already observes by issuing any operation that would target the same plugin. Operators MUST NOT grant `resolve_claimants` to a consumer the operator would not otherwise allow to enumerate the steward's current plugin set; the ACL gate at `client_acl.toml` is the single point of control. Distributions wishing to harden against this signal MUST do so by tightening the ACL, not by parsing or filtering the response.
+
 ## 5. Error Handling
 
 Every failure on a synchronous op surfaces as a structured envelope:
