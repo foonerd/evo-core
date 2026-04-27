@@ -429,6 +429,155 @@ impl SubjectRegistry {
         }
     }
 
+    /// Rebuild the registry's in-memory state from the durable
+    /// store at boot.
+    ///
+    /// The persistence layer is the source of truth across
+    /// restarts: every successful `announce` / `merge` / `split` /
+    /// `forget` writes through to SQL, and on restart this method
+    /// reads every live subject (with its addressings) and every
+    /// alias row, reassembling the in-memory `subjects`,
+    /// `addressings`, and `aliases` maps so a consumer querying
+    /// the registry sees the same state the steward was in before
+    /// the restart.
+    ///
+    /// The method is intended to be called exactly once at boot,
+    /// on a freshly-constructed registry, BEFORE any plugin is
+    /// admitted. Calling it on a non-empty registry refuses with
+    /// [`StewardError::Dispatch`] rather than merging state — the
+    /// caller's expectation of "rehydrated registry" requires the
+    /// boot ordering, and re-entry would silently corrupt
+    /// invariants like the alias-index append-only rule.
+    ///
+    /// Forgotten subjects (rows whose `forgotten_at_ms` is set in
+    /// the persistence layer) are deliberately NOT loaded into
+    /// `subjects` / `addressings`; their tombstone alias rows are
+    /// loaded into `aliases` so a consumer querying a forgotten
+    /// canonical id receives the documented tombstone chain
+    /// rather than a bare not-found.
+    ///
+    /// The claim log is left empty after rehydration. Re-loading
+    /// the durable claim log is downstream work; today the boot
+    /// path produces a registry whose live state matches the
+    /// pre-restart steward and whose audit log starts fresh
+    /// alongside the new boot.
+    pub async fn rehydrate_from(
+        &self,
+        store: &dyn crate::persistence::PersistenceStore,
+    ) -> Result<RehydrateReport, StewardError> {
+        let inner_count = {
+            let guard = self
+                .inner
+                .lock()
+                .expect("registry mutex poisoned at rehydrate_from entry");
+            (
+                guard.subjects.len(),
+                guard.addressings.len(),
+                guard.aliases.len(),
+            )
+        };
+        if inner_count != (0, 0, 0) {
+            return Err(StewardError::Dispatch(format!(
+                "rehydrate_from refuses to merge into a non-empty registry \
+                 (subjects={}, addressings={}, aliases={})",
+                inner_count.0, inner_count.1, inner_count.2,
+            )));
+        }
+
+        let persisted_subjects =
+            store.load_all_subjects().await.map_err(|e| {
+                StewardError::Dispatch(format!(
+                    "rehydrate_from: load_all_subjects failed: {e}"
+                ))
+            })?;
+        let persisted_aliases =
+            store.load_all_aliases().await.map_err(|e| {
+                StewardError::Dispatch(format!(
+                    "rehydrate_from: load_all_aliases failed: {e}"
+                ))
+            })?;
+
+        let mut report = RehydrateReport::default();
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("registry mutex poisoned at rehydrate_from body");
+
+        for ps in persisted_subjects {
+            if ps.forgotten_at_ms.is_some() {
+                report.forgotten_subjects_seen += 1;
+                continue;
+            }
+            let mut addressings: Vec<AddressingRecord> = Vec::new();
+            for pa in &ps.addressings {
+                let addr = ExternalAddressing::new(
+                    pa.scheme.clone(),
+                    pa.value.clone(),
+                );
+                addressings.push(AddressingRecord {
+                    addressing: addr.clone(),
+                    claimant: pa.claimant.clone(),
+                    added_at: ms_to_system_time(pa.asserted_at_ms),
+                });
+                inner.addressings.insert(addr, ps.id.clone());
+                report.live_addressings_loaded += 1;
+            }
+            inner.subjects.insert(
+                ps.id.clone(),
+                SubjectRecord {
+                    id: ps.id.clone(),
+                    subject_type: ps.subject_type.clone(),
+                    addressings,
+                    created_at: ms_to_system_time(ps.created_at_ms),
+                    modified_at: ms_to_system_time(ps.modified_at_ms),
+                },
+            );
+            report.live_subjects_loaded += 1;
+        }
+
+        // Group flat alias rows by `old_id`. Merge yields one row
+        // per source id; split yields N rows under the same
+        // source id (one per partition group); tombstone yields
+        // one row whose stored `new_id` is the empty-string
+        // sentinel and whose in-memory representation has
+        // `new_ids: vec![]`.
+        let mut grouped: HashMap<
+            String,
+            Vec<crate::persistence::PersistedAlias>,
+        > = HashMap::new();
+        for pa in persisted_aliases {
+            grouped.entry(pa.old_id.clone()).or_default().push(pa);
+        }
+        for (old_id, rows) in grouped {
+            let kind = rows[0].kind;
+            let new_ids: Vec<CanonicalSubjectId> = match kind {
+                AliasKind::Tombstone => Vec::new(),
+                _ => rows
+                    .iter()
+                    .map(|r| CanonicalSubjectId::new(r.new_id.as_str()))
+                    .collect(),
+            };
+            let recorded_at_ms = rows[0].recorded_at_ms;
+            let admin_plugin = rows[0].admin_plugin.clone();
+            let reason = rows[0].reason.clone();
+            let record = AliasRecord {
+                old_id: CanonicalSubjectId::new(old_id.as_str()),
+                new_ids,
+                kind,
+                recorded_at_ms,
+                admin_plugin,
+                reason,
+            };
+            inner.aliases.insert(old_id, record);
+            match kind {
+                AliasKind::Merged => report.merged_aliases_loaded += 1,
+                AliasKind::Split => report.split_aliases_loaded += 1,
+                AliasKind::Tombstone => report.tombstone_aliases_loaded += 1,
+            }
+        }
+        Ok(report)
+    }
+
     /// Current number of canonical subjects in the registry.
     pub fn subject_count(&self) -> usize {
         self.inner
@@ -1388,6 +1537,39 @@ fn system_time_to_ms(t: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
+fn ms_to_system_time(ms: u64) -> SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)
+}
+
+/// Diagnostic counters returned by [`SubjectRegistry::rehydrate_from`].
+///
+/// Mirrors what was loaded so the boot path can log a single
+/// info line summarising the durable state the registry just
+/// reconstructed; helpful when an operator is diagnosing a
+/// restart that ended up with fewer subjects than expected.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RehydrateReport {
+    /// Live (`forgotten_at_ms IS NULL`) subjects loaded into
+    /// the in-memory `subjects` map.
+    pub live_subjects_loaded: usize,
+    /// Live addressings loaded into the in-memory `addressings`
+    /// hot-path index.
+    pub live_addressings_loaded: usize,
+    /// Forgotten subject rows skipped during the live-subject
+    /// pass; their tombstone alias rows (if present) populated
+    /// `aliases` instead.
+    pub forgotten_subjects_seen: usize,
+    /// `AliasKind::Merged` records reassembled into the
+    /// in-memory alias map.
+    pub merged_aliases_loaded: usize,
+    /// `AliasKind::Split` records reassembled (one record per
+    /// source id, with `new_ids` covering every partition group).
+    pub split_aliases_loaded: usize,
+    /// `AliasKind::Tombstone` records reassembled (one record
+    /// per forgotten id, with empty `new_ids`).
+    pub tombstone_aliases_loaded: usize,
+}
+
 fn claim_to_kind_and_reason(
     claim: &SubjectClaim,
 ) -> (ClaimKind, Option<String>) {
@@ -2238,6 +2420,158 @@ mod tests {
         assert_eq!(alias.new_ids[1].as_str(), &new_ids[1]);
         assert_eq!(alias.admin_plugin, "admin.plugin");
         assert!(alias.reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn rehydrate_from_reconstructs_live_state_and_alias_chain() {
+        // Boot rehydration: a fresh registry consults the
+        // persistence trait, walks every live subject (with its
+        // addressings) plus every alias row, and reassembles the
+        // in-memory hot-path indices. Forgotten rows do not enter
+        // the live `subjects` map but their tombstone alias rows
+        // do enter the alias chain so a query for a forgotten id
+        // returns the documented tombstone record.
+        use crate::persistence::{
+            AnnounceRecord, MemoryPersistenceStore, MergeRecord,
+            PersistenceStore,
+        };
+
+        let store: std::sync::Arc<dyn PersistenceStore> =
+            std::sync::Arc::new(MemoryPersistenceStore::new());
+
+        // Live subject A with two addressings.
+        let a_id = "a-uuid";
+        let a_addrs =
+            [addr("scheme.a", "alpha-1"), addr("scheme.a", "alpha-2")];
+        store
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: a_id,
+                subject_type: "track",
+                addressings: &a_addrs,
+                claimant: "p1",
+                claims: &[],
+                at_ms: 1_000,
+            })
+            .await
+            .unwrap();
+
+        // Two more subjects we will merge so the alias chain has a
+        // pair of `Merged` rows pointing at the same target.
+        let b_id = "b-uuid";
+        let c_id = "c-uuid";
+        store
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: b_id,
+                subject_type: "track",
+                addressings: &[addr("scheme.b", "beta-1")],
+                claimant: "p1",
+                claims: &[],
+                at_ms: 1_100,
+            })
+            .await
+            .unwrap();
+        store
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: c_id,
+                subject_type: "track",
+                addressings: &[addr("scheme.c", "gamma-1")],
+                claimant: "p1",
+                claims: &[],
+                at_ms: 1_200,
+            })
+            .await
+            .unwrap();
+
+        let merged_id = "merged-uuid";
+        store
+            .record_subject_merge(MergeRecord {
+                source_a: b_id,
+                source_b: c_id,
+                new_id: merged_id,
+                subject_type: "track",
+                admin_plugin: "admin.plugin",
+                reason: Some("operator confirmed"),
+                at_ms: 1_300,
+            })
+            .await
+            .unwrap();
+
+        // A standalone subject we will forget so a tombstone alias
+        // row appears.
+        let d_id = "d-uuid";
+        let d_addr = addr("scheme.d", "delta-1");
+        store
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: d_id,
+                subject_type: "track",
+                addressings: std::slice::from_ref(&d_addr),
+                claimant: "p1",
+                claims: &[],
+                at_ms: 1_400,
+            })
+            .await
+            .unwrap();
+        store
+            .record_subject_forget(d_id, "admin.plugin", None, 1_500)
+            .await
+            .unwrap();
+
+        // Boot path: fresh registry, rehydrate from the store.
+        let registry = SubjectRegistry::new();
+        let report = registry.rehydrate_from(store.as_ref()).await.unwrap();
+
+        // Live state: a (still standalone) and merged (carrying
+        // both source addressings) are present; b, c, and d are
+        // not in the live `subjects` map. The forget path deletes
+        // the subject row outright (the persistence layer does
+        // not soft-forget today) and inserts a tombstone alias,
+        // so `forgotten_subjects_seen` from the live-subject scan
+        // is zero while `tombstone_aliases_loaded` is one.
+        assert_eq!(report.live_subjects_loaded, 2);
+        assert_eq!(report.live_addressings_loaded, 4);
+        assert_eq!(report.forgotten_subjects_seen, 0);
+        assert_eq!(report.merged_aliases_loaded, 2);
+        assert_eq!(report.split_aliases_loaded, 0);
+        assert_eq!(report.tombstone_aliases_loaded, 1);
+
+        assert!(registry.describe(a_id).is_some());
+        assert!(registry.describe(merged_id).is_some());
+        assert!(registry.describe(b_id).is_none());
+        assert!(registry.describe(c_id).is_none());
+        assert!(registry.describe(d_id).is_none());
+
+        // The two addressings the merge moved onto `merged_id`
+        // resolve to the merged subject.
+        assert_eq!(
+            registry.resolve(&addr("scheme.b", "beta-1")).as_deref(),
+            Some(merged_id)
+        );
+        assert_eq!(
+            registry.resolve(&addr("scheme.c", "gamma-1")).as_deref(),
+            Some(merged_id)
+        );
+
+        // Alias chain: querying either source of the merge returns
+        // the Merged record pointing at the new id.
+        let alias_b = registry.describe_alias(b_id).unwrap();
+        assert_eq!(alias_b.kind, AliasKind::Merged);
+        assert_eq!(alias_b.new_ids.len(), 1);
+        assert_eq!(alias_b.new_ids[0].as_str(), merged_id);
+
+        // Tombstone for the forgotten id surfaces with empty
+        // `new_ids`.
+        let tomb = registry.describe_alias(d_id).unwrap();
+        assert_eq!(tomb.kind, AliasKind::Tombstone);
+        assert!(tomb.new_ids.is_empty());
+        assert_eq!(tomb.admin_plugin, "admin.plugin");
+
+        // Refusal: re-rehydrating into the now-non-empty registry
+        // returns Dispatch rather than corrupting state.
+        let err = registry
+            .rehydrate_from(store.as_ref())
+            .await
+            .expect_err("re-rehydrate must refuse");
+        assert!(matches!(err, StewardError::Dispatch(_)));
     }
 
     #[test]

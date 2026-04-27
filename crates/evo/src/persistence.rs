@@ -660,6 +660,23 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
         >,
     >;
 
+    /// Load every alias row in the store, ordered by `alias_id`
+    /// ascending.
+    ///
+    /// Used by the boot-time rehydration path to repopulate the
+    /// in-memory alias map without per-id round trips. Cheap by
+    /// design (alias rows are small and per-merge/split/forget
+    /// only); intended to run once at startup.
+    fn load_all_aliases<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<PersistedAlias>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
     /// Append one happening to the `happenings_log` table.
     ///
     /// `seq` is the bus's monotonic cursor minted at emit time;
@@ -1629,33 +1646,7 @@ fn load_aliases_for_query(
         .map_err(|e| PersistenceError::sqlite("prepare aliases query", e))?;
 
     let rows = stmt
-        .query_map(params![canonical_id], |row| {
-            let kind_str: String = row.get(3)?;
-            let kind = match kind_str.as_str() {
-                "merged" => AliasKind::Merged,
-                "split" => AliasKind::Split,
-                "tombstone" => AliasKind::Tombstone,
-                other => {
-                    return Err(rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("unknown alias kind: {other}"),
-                        )),
-                    ));
-                }
-            };
-            Ok(PersistedAlias {
-                alias_id: row.get(0)?,
-                old_id: row.get(1)?,
-                new_id: row.get(2)?,
-                kind,
-                recorded_at_ms: row.get::<_, i64>(4)? as u64,
-                admin_plugin: row.get(5)?,
-                reason: row.get(6)?,
-            })
-        })
+        .query_map(params![canonical_id], read_alias_row)
         .map_err(|e| PersistenceError::sqlite("execute aliases query", e))?;
 
     let mut out = Vec::new();
@@ -1663,6 +1654,59 @@ fn load_aliases_for_query(
         out.push(r.map_err(|e| PersistenceError::sqlite("read alias row", e))?);
     }
     Ok(out)
+}
+
+fn load_all_aliases_query(
+    conn: &Connection,
+) -> Result<Vec<PersistedAlias>, PersistenceError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT alias_id, old_id, new_id, kind, recorded_at_ms, \
+             admin_plugin, reason FROM aliases ORDER BY alias_id ASC",
+        )
+        .map_err(|e| {
+            PersistenceError::sqlite("prepare aliases full-scan query", e)
+        })?;
+
+    let rows = stmt.query_map([], read_alias_row).map_err(|e| {
+        PersistenceError::sqlite("execute aliases full-scan query", e)
+    })?;
+
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| PersistenceError::sqlite("read alias row", e))?);
+    }
+    Ok(out)
+}
+
+fn read_alias_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<PersistedAlias, rusqlite::Error> {
+    let kind_str: String = row.get(3)?;
+    let kind = match kind_str.as_str() {
+        "merged" => AliasKind::Merged,
+        "split" => AliasKind::Split,
+        "tombstone" => AliasKind::Tombstone,
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown alias kind: {other}"),
+                )),
+            ));
+        }
+    };
+    Ok(PersistedAlias {
+        alias_id: row.get(0)?,
+        old_id: row.get(1)?,
+        new_id: row.get(2)?,
+        kind,
+        recorded_at_ms: row.get::<_, i64>(4)? as u64,
+        admin_plugin: row.get(5)?,
+        reason: row.get(6)?,
+    })
 }
 
 impl PersistenceStore for SqlitePersistenceStore {
@@ -1826,6 +1870,23 @@ impl PersistenceStore for SqlitePersistenceStore {
         Box::pin(async move {
             self.interact("load_aliases_for", move |conn| {
                 load_aliases_for_query(conn, &cid)
+            })
+            .await
+        })
+    }
+
+    fn load_all_aliases<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<PersistedAlias>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("load_all_aliases", |conn| {
+                load_all_aliases_query(conn)
             })
             .await
         })
@@ -2584,6 +2645,23 @@ impl PersistenceStore for MemoryPersistenceStore {
                 .filter(|a| a.old_id == canonical_id)
                 .cloned()
                 .collect();
+            out.sort_by_key(|a| a.alias_id);
+            Ok(out)
+        })
+    }
+
+    fn load_all_aliases<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<PersistedAlias>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            let mut out: Vec<PersistedAlias> = g.aliases.clone();
             out.sort_by_key(|a| a.alias_id);
             Ok(out)
         })

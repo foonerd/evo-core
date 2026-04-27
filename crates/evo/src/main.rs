@@ -201,13 +201,50 @@ async fn main() -> anyhow::Result<()> {
     // state so every consumer reads the same instance.
     let conflict_index = Arc::new(SubjectConflictIndex::new());
 
+    // Construct the subject registry and rehydrate it from the
+    // durable store BEFORE the admission engine is built. Every
+    // successful announce / merge / split / forget writes through
+    // to SQL on the running steward; on restart the registry is
+    // reconstructed from those rows so a consumer querying the
+    // freshly-booted steward sees the same state it had before
+    // the restart, rather than waiting for plugins to re-announce.
+    // Forgotten subjects are excluded from the live maps; their
+    // tombstone alias rows populate the alias chain so a query
+    // for a forgotten canonical id returns the documented
+    // tombstone record rather than a bare not-found.
+    let subjects = Arc::new(SubjectRegistry::new());
+    match subjects.rehydrate_from(persistence.as_ref()).await {
+        Ok(report) => {
+            tracing::info!(
+                live_subjects = report.live_subjects_loaded,
+                live_addressings = report.live_addressings_loaded,
+                forgotten_subjects_skipped = report.forgotten_subjects_seen,
+                merged_aliases = report.merged_aliases_loaded,
+                split_aliases = report.split_aliases_loaded,
+                tombstone_aliases = report.tombstone_aliases_loaded,
+                "subject registry rehydrated from persistence"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "subject registry rehydration failed; aborting boot to \
+                 avoid serving an inconsistent in-memory view of durable \
+                 state"
+            );
+            return Err(anyhow::anyhow!(
+                "subject registry rehydration failed: {e}"
+            ));
+        }
+    }
+
     // Build the shared steward state once: catalogue plus
     // freshly-allocated stores. The same `Arc<StewardState>` is
     // handed to the admission engine and the server so dispatch
     // does not have to lock the engine to read shared stores.
     let state = StewardState::builder()
         .catalogue(Arc::clone(&catalogue))
-        .subjects(Arc::new(SubjectRegistry::new()))
+        .subjects(subjects)
         .relations(Arc::new(RelationGraph::new()))
         .custody(Arc::new(CustodyLedger::new()))
         .bus(bus)
