@@ -126,7 +126,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 
 /// Which side of a relation's cardinality was violated.
 ///
@@ -959,6 +959,14 @@ pub struct HappeningBus {
     /// by comparing the consumer's `since` against the oldest
     /// retained `seq`.
     retention_window_secs: u64,
+    /// Serialises [`Self::emit_durable`] so the seq the bus mints
+    /// matches the order in which the rows land on disk and the
+    /// envelope reaches subscribers. Without this lock, two
+    /// concurrent `emit_durable` calls can interleave their persist
+    /// and broadcast steps such that the receiver observes seq
+    /// values out of order. The synchronous [`Self::emit`] path
+    /// remains lock-free because it has no durability obligation.
+    emit_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for HappeningBus {
@@ -1013,6 +1021,7 @@ impl HappeningBus {
             next_seq: AtomicU64::new(1),
             persistence: None,
             retention_window_secs,
+            emit_lock: Mutex::new(()),
         }
     }
 
@@ -1059,6 +1068,7 @@ impl HappeningBus {
             next_seq: AtomicU64::new(max.saturating_add(1)),
             persistence: Some(persistence),
             retention_window_secs,
+            emit_lock: Mutex::new(()),
         })
     }
 
@@ -1125,6 +1135,14 @@ impl HappeningBus {
             );
             return Ok(self.emit(happening));
         };
+        // Hold the emit_lock across the seq-mint, the persist, and
+        // the broadcast so concurrent durable emits land on disk
+        // and reach subscribers in the same order their seqs were
+        // minted. The persist is the bottleneck (SQLite serialises
+        // through the deadpool connection); the lock just pins
+        // ordering. The guard drops at end of scope; no other
+        // .await happens inside while it is held.
+        let _guard = self.emit_lock.lock().await;
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let payload = serde_json::to_value(&happening).map_err(|e| {
             crate::persistence::PersistenceError::Invalid(format!(
@@ -1740,5 +1758,48 @@ mod tests {
 
         let max = store.load_max_happening_seq().await.unwrap();
         assert_eq!(max, env.seq);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_emit_durable_preserves_seq_order_to_subscriber() {
+        // Spawn N concurrent emit_durable calls; the subscriber MUST
+        // see envelopes whose seq values arrive strictly increasing
+        // and contiguous. The emit_lock guarantees the persist and
+        // the broadcast happen in seq-mint order; without the lock
+        // a slow persist on an early seq would let a later seq
+        // overtake it on the broadcast channel.
+        const N: u64 = 20;
+        let store: Arc<dyn crate::persistence::PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        let bus = Arc::new(
+            HappeningBus::with_persistence(Arc::clone(&store))
+                .await
+                .expect("durable bus"),
+        );
+        let mut rx = bus.subscribe_envelope();
+
+        let mut tasks = Vec::with_capacity(N as usize);
+        for _ in 0..N {
+            let bus_c = Arc::clone(&bus);
+            tasks.push(tokio::spawn(async move {
+                bus_c.emit_durable(sample_taken()).await
+            }));
+        }
+        for t in tasks {
+            t.await.expect("join").expect("emit_durable");
+        }
+
+        let mut last: u64 = 0;
+        for _ in 0..N {
+            let env = rx.recv().await.expect("envelope");
+            assert!(
+                env.seq > last,
+                "seq must arrive strictly increasing: got {} after {}",
+                env.seq,
+                last
+            );
+            last = env.seq;
+        }
+        assert_eq!(last, N, "final seq must equal the count of emits");
     }
 }

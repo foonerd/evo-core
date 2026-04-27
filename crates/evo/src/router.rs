@@ -600,13 +600,17 @@ impl PluginRouter {
             &custody_type_for_ledger,
         );
 
-        bus.emit(Happening::CustodyTaken {
+        bus.emit_durable(Happening::CustodyTaken {
             plugin: plugin_name,
             handle_id: handle.id.clone(),
             shelf: shelf_qualified,
             custody_type: custody_type_for_ledger,
             at: SystemTime::now(),
-        });
+        })
+        .await
+        .map_err(|e| {
+            StewardError::Dispatch(format!("happenings_log write failed: {e}"))
+        })?;
 
         Ok(handle)
     }
@@ -735,11 +739,15 @@ impl PluginRouter {
 
         ledger.release_custody(&plugin_name, &handle_id);
 
-        bus.emit(Happening::CustodyReleased {
+        bus.emit_durable(Happening::CustodyReleased {
             plugin: plugin_name,
             handle_id,
             at: SystemTime::now(),
-        });
+        })
+        .await
+        .map_err(|e| {
+            StewardError::Dispatch(format!("happenings_log write failed: {e}"))
+        })?;
 
         Ok(())
     }

@@ -611,12 +611,26 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
 
     /// Record a hard-forget of `canonical_id`.
     ///
-    /// Hard-deletes the `subjects` row (cascading
-    /// `subject_addressings` via the foreign key) and appends a
-    /// `claim_log` entry of kind `subject_forgotten`.
+    /// Within one transaction:
+    /// - Hard-deletes the `subjects` row (cascading
+    ///   `subject_addressings` via the foreign key).
+    /// - Inserts a tombstone row into `aliases` with `kind =
+    ///   'tombstone'`, `old_id = canonical_id`, `new_id = ''`
+    ///   (sentinel: no successor), `admin_plugin =
+    ///   forget_claimant`, and `reason = forget_reason`. The
+    ///   tombstone closes the alias chain so describe-alias on a
+    ///   forgotten ID returns a structured "no successor" record
+    ///   rather than a bare not-found.
+    /// - Appends a `claim_log` entry of kind `subject_forgotten`.
+    ///
+    /// The in-memory backend mirrors this behaviour so tests
+    /// agnostic to the concrete store see the same alias chain
+    /// shape on either backend.
     fn record_subject_forget<'a>(
         &'a self,
         canonical_id: &'a str,
+        forget_claimant: &'a str,
+        forget_reason: Option<&'a str>,
         at_ms: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
 
@@ -781,6 +795,20 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
                 + 'a,
         >,
     >;
+
+    /// Run a `PRAGMA wal_checkpoint(TRUNCATE)` (or backend
+    /// equivalent) so the write-ahead log is flushed into the
+    /// main database file and truncated to zero. Called by the
+    /// steward on clean shutdown so an operator backing up the
+    /// database file alone (without the `-wal`/`-shm` siblings)
+    /// captures every committed row.
+    ///
+    /// In-memory backends accept the call as a no-op so the
+    /// shutdown path does not branch on the concrete backend
+    /// type.
+    fn checkpoint_wal<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
 }
 
 /// One row of the boot-time subject-type aggregation: a declared
@@ -1406,6 +1434,8 @@ fn split_tx(
 fn forget_tx(
     conn: &mut Connection,
     canonical_id: &str,
+    forget_claimant: &str,
+    forget_reason: Option<&str>,
     at_ms: u64,
 ) -> Result<(), PersistenceError> {
     let tx = conn
@@ -1415,17 +1445,34 @@ fn forget_tx(
     tx.execute("DELETE FROM subjects WHERE id = ?1", params![canonical_id])
         .map_err(|e| PersistenceError::sqlite("delete subject row", e))?;
 
+    // Tombstone alias row. Mirrors the in-memory registry's
+    // tombstone insertion (subjects.rs `aliases_try_insert` on the
+    // retract / forced-retract paths) so consumers walking the
+    // alias chain see a structured "no successor" record rather
+    // than a bare absence. `new_id = ''` is the sentinel for
+    // "tombstone with no successor"; the schema stores it as a
+    // plain string column.
+    tx.execute(
+        "INSERT INTO aliases \
+         (old_id, new_id, kind, recorded_at_ms, admin_plugin, reason) \
+         VALUES (?1, '', 'tombstone', ?2, ?3, ?4)",
+        params![canonical_id, at_ms as i64, forget_claimant, forget_reason],
+    )
+    .map_err(|e| PersistenceError::sqlite("insert tombstone alias", e))?;
+
     let payload = serde_json::json!({
         "canonical_id": canonical_id,
     })
     .to_string();
     tx.execute(
         "INSERT INTO claim_log (kind, claimant, asserted_at_ms, payload, reason) \
-         VALUES (?1, '', ?2, ?3, NULL)",
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             claim_kind::SUBJECT_FORGOTTEN,
+            forget_claimant,
             at_ms as i64,
-            payload
+            payload,
+            forget_reason
         ],
     )
     .map_err(|e| {
@@ -1732,13 +1779,17 @@ impl PersistenceStore for SqlitePersistenceStore {
     fn record_subject_forget<'a>(
         &'a self,
         canonical_id: &'a str,
+        forget_claimant: &'a str,
+        forget_reason: Option<&'a str>,
         at_ms: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
     {
         let cid = canonical_id.to_string();
+        let claimant = forget_claimant.to_string();
+        let reason = forget_reason.map(|s| s.to_string());
         Box::pin(async move {
             self.interact("subject_forget", move |conn| {
-                forget_tx(conn, &cid, at_ms)
+                forget_tx(conn, &cid, &claimant, reason.as_deref(), at_ms)
             })
             .await
         })
@@ -2106,6 +2157,32 @@ impl PersistenceStore for SqlitePersistenceStore {
             .await
         })
     }
+
+    fn checkpoint_wal<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.interact("checkpoint_wal", |conn| {
+                // PRAGMA wal_checkpoint(TRUNCATE) returns a row of
+                // (busy, log, checkpointed). query_row consumes the
+                // row; we discard the values because the steward
+                // only treats SQL-level errors as failure signals.
+                let (_busy, _log, _ckpt): (i64, i64, i64) = conn
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "PRAGMA wal_checkpoint(TRUNCATE)",
+                            e,
+                        )
+                    })?;
+                Ok(())
+            })
+            .await
+        })
+    }
 }
 
 /// In-memory mock implementation of [`PersistenceStore`].
@@ -2428,15 +2505,33 @@ impl PersistenceStore for MemoryPersistenceStore {
     fn record_subject_forget<'a>(
         &'a self,
         canonical_id: &'a str,
+        forget_claimant: &'a str,
+        forget_reason: Option<&'a str>,
         at_ms: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
     {
+        let claimant = forget_claimant.to_string();
+        let reason = forget_reason.map(|s| s.to_string());
         Box::pin(async move {
             let mut g = self.inner.lock().await;
             g.subjects.remove(canonical_id);
+            // Tombstone alias mirrors the SQLite backend's
+            // forget_tx behaviour: chain walkers see a structured
+            // "forgotten, no successor" record.
+            g.next_alias_id += 1;
+            let id = g.next_alias_id;
+            g.aliases.push(PersistedAlias {
+                alias_id: id,
+                old_id: canonical_id.to_string(),
+                new_id: String::new(),
+                kind: AliasKind::Tombstone,
+                recorded_at_ms: at_ms,
+                admin_plugin: claimant.clone(),
+                reason: reason.clone(),
+            });
             g.claim_log.push(MemoryClaimEntry {
                 kind: claim_kind::SUBJECT_FORGOTTEN,
-                claimant: String::new(),
+                claimant,
                 at_ms,
             });
             Ok(())
@@ -2662,6 +2757,16 @@ impl PersistenceStore for MemoryPersistenceStore {
             Ok(out)
         })
     }
+
+    fn checkpoint_wal<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        // The in-memory backend has no WAL; the call is a no-op so
+        // the shutdown path does not branch on the concrete backend
+        // type.
+        Box::pin(async move { Ok(()) })
+    }
 }
 
 /// Convenience: test fixture builder for code that needs an
@@ -2713,7 +2818,9 @@ mod tests {
 
         // Forget one of the tracks so its row no longer counts
         // toward the live grouping.
-        s.record_subject_forget("uuid-3", 1100).await.unwrap();
+        s.record_subject_forget("uuid-3", "p1", None, 1100)
+            .await
+            .unwrap();
 
         let counts = s.count_subjects_by_type().await.unwrap();
         assert_eq!(
@@ -2832,7 +2939,9 @@ mod tests {
         })
         .await
         .unwrap();
-        s.record_subject_forget("uuid-a", 1500).await.unwrap();
+        s.record_subject_forget("uuid-a", "p1", None, 1500)
+            .await
+            .unwrap();
         let all = s.load_all_subjects().await.unwrap();
         assert!(all.is_empty());
     }
@@ -3055,7 +3164,10 @@ mod tests {
             })
             .await
             .unwrap();
-        store.record_subject_forget("uuid-a", 20).await.unwrap();
+        store
+            .record_subject_forget("uuid-a", "p1", None, 20)
+            .await
+            .unwrap();
         let all = store.load_all_subjects().await.unwrap();
         assert!(all.is_empty());
         // Side-channel verify: the addressing row was cascaded.
@@ -3066,6 +3178,66 @@ mod tests {
             })
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_forget_inserts_tombstone_alias_row() {
+        // forget_tx must insert a tombstone row into `aliases` in
+        // the same transaction as the subject delete. A consumer
+        // walking the alias chain on the forgotten ID sees a
+        // structured "no successor" record rather than a bare
+        // absence; the in-memory backend mirrors this so tests
+        // agnostic to the concrete store see the same shape.
+        let (_dir, store) = open_temp();
+        store
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: "uuid-a",
+                subject_type: "track",
+                addressings: &[ext("a", "1")],
+                claimant: "p1",
+                claims: &[],
+                at_ms: 10,
+            })
+            .await
+            .unwrap();
+        store
+            .record_subject_forget("uuid-a", "p1", Some("operator cleanup"), 20)
+            .await
+            .unwrap();
+        let aliases = store.load_aliases_for("uuid-a").await.unwrap();
+        assert_eq!(aliases.len(), 1, "exactly one tombstone alias row");
+        let a = &aliases[0];
+        assert_eq!(a.kind, AliasKind::Tombstone);
+        assert_eq!(a.old_id, "uuid-a");
+        assert_eq!(a.new_id, "");
+        assert_eq!(a.admin_plugin, "p1");
+        assert_eq!(a.reason.as_deref(), Some("operator cleanup"));
+    }
+
+    #[tokio::test]
+    async fn memory_forget_inserts_tombstone_alias_row() {
+        let s = MemoryPersistenceStore::new();
+        s.record_subject_announce(AnnounceRecord {
+            canonical_id: "uuid-z",
+            subject_type: "album",
+            addressings: &[ext("a", "z")],
+            claimant: "p2",
+            claims: &[],
+            at_ms: 1,
+        })
+        .await
+        .unwrap();
+        s.record_subject_forget("uuid-z", "p2", Some("admin sweep"), 5)
+            .await
+            .unwrap();
+        let aliases = s.load_aliases_for("uuid-z").await.unwrap();
+        assert_eq!(aliases.len(), 1);
+        let a = &aliases[0];
+        assert_eq!(a.kind, AliasKind::Tombstone);
+        assert_eq!(a.old_id, "uuid-z");
+        assert!(a.new_id.is_empty());
+        assert_eq!(a.admin_plugin, "p2");
+        assert_eq!(a.reason.as_deref(), Some("admin sweep"));
     }
 
     #[tokio::test]
@@ -3671,5 +3843,31 @@ mod tests {
         }
         let max = store.load_max_happening_seq().await.unwrap();
         assert_eq!(max, 9);
+    }
+
+    #[tokio::test]
+    async fn memory_checkpoint_wal_is_noop() {
+        // The in-memory backend has no WAL; the trait method must
+        // exist and return Ok so the steward shutdown path can call
+        // it without branching on the concrete backend.
+        let s = MemoryPersistenceStore::new();
+        s.checkpoint_wal().await.expect("memory checkpoint must Ok");
+    }
+
+    #[tokio::test]
+    async fn sqlite_checkpoint_wal_succeeds_on_open_database() {
+        // PRAGMA wal_checkpoint(TRUNCATE) returns Ok on a fresh
+        // database with WAL mode enabled (the pragma is applied at
+        // every connection acquisition by INIT_PRAGMAS).
+        let (_dir, store) = open_temp();
+        // Force at least one row so the WAL has content to flush.
+        store
+            .record_happening(1, "subject_forgotten", &happening_payload(1), 10)
+            .await
+            .unwrap();
+        store
+            .checkpoint_wal()
+            .await
+            .expect("WAL checkpoint must Ok");
     }
 }

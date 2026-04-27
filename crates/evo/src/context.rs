@@ -383,12 +383,18 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
             // carries the data.
             if let AnnounceOutcome::Conflict { canonical_ids } = &outcome {
                 let at = SystemTime::now();
-                bus.emit(Happening::SubjectConflictDetected {
+                bus.emit_durable(Happening::SubjectConflictDetected {
                     plugin: plugin_name.clone(),
                     addressings: announcement.addressings.clone(),
                     canonical_ids: canonical_ids.clone(),
                     at,
-                });
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
 
                 if let Some(store) = persistence.as_ref() {
                     let at_ms = system_time_to_ms(at);
@@ -464,12 +470,18 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                     let at = SystemTime::now();
 
                     // 1. Subject happening.
-                    bus.emit(Happening::SubjectForgotten {
+                    bus.emit_durable(Happening::SubjectForgotten {
                         plugin: plugin_name.clone(),
                         canonical_id: canonical_id.clone(),
                         subject_type,
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
 
                     // 2. Storage cascade. The graph returns the
                     // keys of every removed edge; we iterate them
@@ -484,7 +496,7 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                     // broadcast channel is the authoritative order
                     // for tie-breaking).
                     for key in removed {
-                        bus.emit(Happening::RelationForgotten {
+                        bus.emit_durable(Happening::RelationForgotten {
                             plugin: plugin_name.clone(),
                             source_id: key.source_id,
                             predicate: key.predicate,
@@ -493,7 +505,13 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                                 forgotten_subject: canonical_id.clone(),
                             },
                             at,
-                        });
+                        })
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "persistence write failed: {e}"
+                            ))
+                        })?;
                     }
 
                     Ok(())
@@ -604,13 +622,13 @@ fn cardinality_exceeded(bound: Cardinality, count: usize) -> bool {
 /// side (`inverse_count`). Only `AtMostOne` / `ExactlyOne` bounds
 /// can be violated by a rewrite-driven count growth; other bounds
 /// emit nothing.
-fn emit_post_rewrite_cardinality_violations(
+async fn emit_post_rewrite_cardinality_violations(
     graph: &RelationGraph,
     catalogue: &Catalogue,
     affected_subjects: &HashSet<String>,
     admin_plugin: &str,
     bus: &HappeningBus,
-) {
+) -> Result<(), ReportError> {
     let at = SystemTime::now();
     // Stable iteration order for the bus: sort the affected
     // subjects so the violations appear in deterministic order
@@ -633,7 +651,7 @@ fn emit_post_rewrite_cardinality_violations(
                     predicate_rule.target_cardinality,
                     count,
                 ) {
-                    bus.emit(
+                    bus.emit_durable(
                         Happening::RelationCardinalityViolatedPostRewrite {
                             admin_plugin: admin_plugin.to_string(),
                             subject_id: subject_id.clone(),
@@ -643,7 +661,13 @@ fn emit_post_rewrite_cardinality_violations(
                             observed_count: count,
                             at,
                         },
-                    );
+                    )
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
                 }
             }
             // Source side: predicate.source_cardinality bounds how
@@ -659,7 +683,7 @@ fn emit_post_rewrite_cardinality_violations(
                     predicate_rule.source_cardinality,
                     count,
                 ) {
-                    bus.emit(
+                    bus.emit_durable(
                         Happening::RelationCardinalityViolatedPostRewrite {
                             admin_plugin: admin_plugin.to_string(),
                             subject_id: subject_id.clone(),
@@ -669,11 +693,18 @@ fn emit_post_rewrite_cardinality_violations(
                             observed_count: count,
                             at,
                         },
-                    );
+                    )
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
                 }
             }
         }
     }
+    Ok(())
 }
 
 impl RelationAnnouncer for RegistryRelationAnnouncer {
@@ -783,7 +814,7 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
                     observed_count = source_count,
                     "RelationCardinalityViolation on source side"
                 );
-                bus.emit(Happening::RelationCardinalityViolation {
+                bus.emit_durable(Happening::RelationCardinalityViolation {
                     plugin: plugin_name.clone(),
                     predicate: assertion.predicate.clone(),
                     source_id: source_id.clone(),
@@ -792,7 +823,13 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
                     declared: predicate.source_cardinality,
                     observed_count: source_count,
                     at: SystemTime::now(),
-                });
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
             }
             let target_count =
                 graph.inverse_count(&target_id, &assertion.predicate);
@@ -807,7 +844,7 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
                     observed_count = target_count,
                     "RelationCardinalityViolation on target side"
                 );
-                bus.emit(Happening::RelationCardinalityViolation {
+                bus.emit_durable(Happening::RelationCardinalityViolation {
                     plugin: plugin_name.clone(),
                     predicate: assertion.predicate.clone(),
                     source_id: source_id.clone(),
@@ -816,7 +853,13 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
                     declared: predicate.target_cardinality,
                     observed_count: target_count,
                     at: SystemTime::now(),
-                });
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
             }
 
             Ok(())
@@ -886,7 +929,7 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
                 outcome,
                 crate::relations::RelationRetractOutcome::RelationForgotten
             ) {
-                bus.emit(Happening::RelationForgotten {
+                bus.emit_durable(Happening::RelationForgotten {
                     plugin: plugin_name.clone(),
                     source_id,
                     predicate,
@@ -895,7 +938,13 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
                         retracting_plugin: plugin_name,
                     },
                     at: SystemTime::now(),
-                });
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
             }
 
             Ok(())
@@ -1100,15 +1149,23 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 } => {
                     let at = SystemTime::now();
 
-                    bus.emit(Happening::SubjectAddressingForcedRetract {
-                        admin_plugin: admin_plugin.clone(),
-                        target_plugin: target_plugin.clone(),
-                        canonical_id: canonical_id.clone(),
-                        scheme: addressing.scheme.clone(),
-                        value: addressing.value.clone(),
-                        reason: reason.clone(),
-                        at,
-                    });
+                    bus.emit_durable(
+                        Happening::SubjectAddressingForcedRetract {
+                            admin_plugin: admin_plugin.clone(),
+                            target_plugin: target_plugin.clone(),
+                            canonical_id: canonical_id.clone(),
+                            scheme: addressing.scheme.clone(),
+                            value: addressing.value.clone(),
+                            reason: reason.clone(),
+                            at,
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
 
                     ledger.record(AdminLogEntry {
                         kind: AdminLogKind::SubjectAddressingForcedRetract,
@@ -1137,32 +1194,46 @@ impl SubjectAdmin for RegistrySubjectAdmin {
 
                     // 1. Admin happening with the forgotten
                     //    subject's canonical ID.
-                    bus.emit(Happening::SubjectAddressingForcedRetract {
-                        admin_plugin: admin_plugin.clone(),
-                        target_plugin: target_plugin.clone(),
-                        canonical_id: canonical_id.clone(),
-                        scheme: addressing.scheme.clone(),
-                        value: addressing.value.clone(),
-                        reason: reason.clone(),
-                        at,
-                    });
+                    bus.emit_durable(
+                        Happening::SubjectAddressingForcedRetract {
+                            admin_plugin: admin_plugin.clone(),
+                            target_plugin: target_plugin.clone(),
+                            canonical_id: canonical_id.clone(),
+                            scheme: addressing.scheme.clone(),
+                            value: addressing.value.clone(),
+                            reason: reason.clone(),
+                            at,
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
 
                     // 2. Subject forgotten. The `plugin` field on
                     //    the subject happening names the admin
                     //    plugin (not the target) because the
                     //    admin's action caused the forget.
-                    bus.emit(Happening::SubjectForgotten {
+                    bus.emit_durable(Happening::SubjectForgotten {
                         plugin: admin_plugin.clone(),
                         canonical_id: canonical_id.clone(),
                         subject_type,
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
 
                     // 3. Cascade into the relation graph and fire
                     //    one RelationForgotten per removed edge.
                     let removed = graph.forget_all_touching(&canonical_id);
                     for key in removed {
-                        bus.emit(Happening::RelationForgotten {
+                        bus.emit_durable(Happening::RelationForgotten {
                             plugin: admin_plugin.clone(),
                             source_id: key.source_id,
                             predicate: key.predicate,
@@ -1171,7 +1242,13 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                                 forgotten_subject: canonical_id.clone(),
                             },
                             at,
-                        });
+                        })
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "persistence write failed: {e}"
+                            ))
+                        })?;
                     }
 
                     // 4. Audit ledger entry records the admin
@@ -1298,13 +1375,17 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             // cardinality-violation happenings the rewrite
             // triggers.
             let at = SystemTime::now();
-            bus.emit(Happening::SubjectMerged {
+            bus.emit_durable(Happening::SubjectMerged {
                 admin_plugin: admin_plugin.clone(),
                 source_ids: vec![source_a_id.clone(), source_b_id.clone()],
                 new_id: new_id.clone(),
                 reason: reason.clone(),
                 at,
-            });
+            })
+            .await
+            .map_err(|e| {
+                ReportError::Invalid(format!("persistence write failed: {e}"))
+            })?;
 
             // Rewrite the graph: every edge mentioning either
             // source ID is relabelled to new_id. The two calls
@@ -1363,14 +1444,20 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                             edge.new_key.source_id.clone()
                         };
                     affected_subjects.insert(unchanged_endpoint.clone());
-                    bus.emit(Happening::RelationRewritten {
+                    bus.emit_durable(Happening::RelationRewritten {
                         admin_plugin: admin_plugin.clone(),
                         predicate: edge.new_key.predicate.clone(),
                         old_subject_id: source_id.clone(),
                         new_subject_id: new_id.clone(),
                         target_id: unchanged_endpoint,
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
                 }
             }
 
@@ -1383,14 +1470,15 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 &affected_subjects,
                 &admin_plugin,
                 &bus,
-            );
+            )
+            .await?;
 
             // Step 3: RelationClaimSuppressionCollapsed per demoted
             // claimant per collapse, source_a first then source_b.
             for outcome in [&rewrite_a, &rewrite_b] {
                 for collapse in &outcome.suppression_collapses {
                     for demoted in &collapse.demoted_claimants {
-                        bus.emit(
+                        bus.emit_durable(
                             Happening::RelationClaimSuppressionCollapsed {
                                 admin_plugin: admin_plugin.clone(),
                                 subject_id: collapse
@@ -1411,7 +1499,13 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                                     .clone(),
                                 at,
                             },
-                        );
+                        )
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "persistence write failed: {e}"
+                            ))
+                        })?;
                     }
                 }
             }
@@ -1438,7 +1532,7 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                             edge.new_key.source_id.clone()
                         };
                     for claim in &edge.claims {
-                        bus.emit(Happening::ClaimReassigned {
+                        bus.emit_durable(Happening::ClaimReassigned {
                             admin_plugin: admin_plugin.clone(),
                             plugin: claim.claimant.clone(),
                             kind: ReassignedClaimKind::Relation,
@@ -1449,14 +1543,20 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                             predicate: Some(edge.new_key.predicate.clone()),
                             target_id: Some(unchanged_endpoint.clone()),
                             at,
-                        });
+                        })
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "persistence write failed: {e}"
+                            ))
+                        })?;
                     }
                 }
             }
 
             // Step 5: ClaimReassigned per addressing-claim.
             for transfer in &addressing_transfers {
-                bus.emit(Happening::ClaimReassigned {
+                bus.emit_durable(Happening::ClaimReassigned {
                     admin_plugin: admin_plugin.clone(),
                     plugin: transfer.claimant.clone(),
                     kind: ReassignedClaimKind::Addressing,
@@ -1467,7 +1567,13 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                     predicate: None,
                     target_id: None,
                     at,
-                });
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
             }
 
             ledger.record(AdminLogEntry {
@@ -1704,14 +1810,18 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             // before any RelationSplitAmbiguous events that
             // follow.
             let at = SystemTime::now();
-            bus.emit(Happening::SubjectSplit {
+            bus.emit_durable(Happening::SubjectSplit {
                 admin_plugin: admin_plugin.clone(),
                 source_id: source_id.clone(),
                 new_ids: new_ids.clone(),
                 strategy,
                 reason: reason.clone(),
                 at,
-            });
+            })
+            .await
+            .map_err(|e| {
+                ReportError::Invalid(format!("persistence write failed: {e}"))
+            })?;
 
             // Distribute relations across the new IDs.
             let split_outcome = graph
@@ -1766,27 +1876,39 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                         )
                     };
                 affected_subjects.insert(unchanged_endpoint.clone());
-                bus.emit(Happening::RelationRewritten {
+                bus.emit_durable(Happening::RelationRewritten {
                     admin_plugin: admin_plugin.clone(),
                     predicate: edge.new_key.predicate.clone(),
                     old_subject_id: source_id.clone(),
                     new_subject_id: rewritten_endpoint,
                     target_id: unchanged_endpoint,
                     at,
-                });
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
             }
 
             // Step 2: RelationSplitAmbiguous per Explicit-strategy
             // gap. Same `at` timestamp pins ordering on the wire.
             for edge in &split_outcome.ambiguous {
-                bus.emit(Happening::RelationSplitAmbiguous {
+                bus.emit_durable(Happening::RelationSplitAmbiguous {
                     admin_plugin: admin_plugin.clone(),
                     source_subject: edge.source_subject.clone(),
                     predicate: edge.predicate.clone(),
                     other_endpoint_id: edge.other_endpoint_id.clone(),
                     candidate_new_ids: edge.candidate_new_ids.clone(),
                     at,
-                });
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
             }
 
             // Step 3: post-rewrite cardinality re-evaluation across
@@ -1798,7 +1920,8 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 &affected_subjects,
                 &admin_plugin,
                 &bus,
-            );
+            )
+            .await?;
 
             // Step 4: ClaimReassigned per relation-claim. Old
             // subject is `source_id`; new subject is whichever new
@@ -1822,7 +1945,7 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                     edge.new_key.source_id.clone()
                 };
                 for claim in &edge.claims {
-                    bus.emit(Happening::ClaimReassigned {
+                    bus.emit_durable(Happening::ClaimReassigned {
                         admin_plugin: admin_plugin.clone(),
                         plugin: claim.claimant.clone(),
                         kind: ReassignedClaimKind::Relation,
@@ -1833,13 +1956,19 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                         predicate: Some(edge.new_key.predicate.clone()),
                         target_id: Some(unchanged_endpoint.clone()),
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
                 }
             }
 
             // Step 5: ClaimReassigned per addressing-claim.
             for transfer in &addressing_transfers {
-                bus.emit(Happening::ClaimReassigned {
+                bus.emit_durable(Happening::ClaimReassigned {
                     admin_plugin: admin_plugin.clone(),
                     plugin: transfer.claimant.clone(),
                     kind: ReassignedClaimKind::Addressing,
@@ -1850,7 +1979,13 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                     predicate: None,
                     target_id: None,
                     at,
-                });
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
             }
 
             ledger.record(AdminLogEntry {
@@ -2012,7 +2147,7 @@ impl RelationAdmin for RegistryRelationAdmin {
 
                 ForcedRetractClaimOutcome::ClaimRemoved => {
                     let at = SystemTime::now();
-                    bus.emit(Happening::RelationClaimForcedRetract {
+                    bus.emit_durable(Happening::RelationClaimForcedRetract {
                         admin_plugin: admin_plugin.clone(),
                         target_plugin: target_plugin.clone(),
                         source_id: source_id.clone(),
@@ -2020,7 +2155,13 @@ impl RelationAdmin for RegistryRelationAdmin {
                         target_id: target_id.clone(),
                         reason: reason.clone(),
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
                     ledger.record(AdminLogEntry {
                         kind: AdminLogKind::RelationClaimForcedRetract,
                         admin_plugin: admin_plugin.clone(),
@@ -2042,7 +2183,7 @@ impl RelationAdmin for RegistryRelationAdmin {
                     let at = SystemTime::now();
 
                     // 1. Admin happening FIRST.
-                    bus.emit(Happening::RelationClaimForcedRetract {
+                    bus.emit_durable(Happening::RelationClaimForcedRetract {
                         admin_plugin: admin_plugin.clone(),
                         target_plugin: target_plugin.clone(),
                         source_id: source_id.clone(),
@@ -2050,12 +2191,18 @@ impl RelationAdmin for RegistryRelationAdmin {
                         target_id: target_id.clone(),
                         reason: reason.clone(),
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
 
                     // 2. Relation forgotten, with the admin plugin
                     //    named as retracting_plugin: the admin's
                     //    action caused the retract.
-                    bus.emit(Happening::RelationForgotten {
+                    bus.emit_durable(Happening::RelationForgotten {
                         plugin: admin_plugin.clone(),
                         source_id: source_id.clone(),
                         predicate: predicate.clone(),
@@ -2064,7 +2211,13 @@ impl RelationAdmin for RegistryRelationAdmin {
                             retracting_plugin: admin_plugin.clone(),
                         },
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
 
                     ledger.record(AdminLogEntry {
                         kind: AdminLogKind::RelationClaimForcedRetract,
@@ -2155,14 +2308,20 @@ impl RelationAdmin for RegistryRelationAdmin {
 
                 SuppressOutcome::NewlySuppressed => {
                     let at = SystemTime::now();
-                    bus.emit(Happening::RelationSuppressed {
+                    bus.emit_durable(Happening::RelationSuppressed {
                         admin_plugin: admin_plugin.clone(),
                         source_id: source_id.clone(),
                         predicate: predicate.clone(),
                         target_id: target_id.clone(),
                         reason: reason.clone(),
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
                     ledger.record(AdminLogEntry {
                         kind: AdminLogKind::RelationSuppress,
                         admin_plugin,
@@ -2185,15 +2344,23 @@ impl RelationAdmin for RegistryRelationAdmin {
                     new_reason,
                 } => {
                     let at = SystemTime::now();
-                    bus.emit(Happening::RelationSuppressionReasonUpdated {
-                        admin_plugin: admin_plugin.clone(),
-                        source_id: source_id.clone(),
-                        predicate: predicate.clone(),
-                        target_id: target_id.clone(),
-                        old_reason: old_reason.clone(),
-                        new_reason: new_reason.clone(),
-                        at,
-                    });
+                    bus.emit_durable(
+                        Happening::RelationSuppressionReasonUpdated {
+                            admin_plugin: admin_plugin.clone(),
+                            source_id: source_id.clone(),
+                            predicate: predicate.clone(),
+                            target_id: target_id.clone(),
+                            old_reason: old_reason.clone(),
+                            new_reason: new_reason.clone(),
+                            at,
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
                     ledger.record(AdminLogEntry {
                         kind: AdminLogKind::RelationSuppressionReasonUpdated,
                         admin_plugin,
@@ -2264,13 +2431,19 @@ impl RelationAdmin for RegistryRelationAdmin {
 
                 UnsuppressOutcome::Unsuppressed => {
                     let at = SystemTime::now();
-                    bus.emit(Happening::RelationUnsuppressed {
+                    bus.emit_durable(Happening::RelationUnsuppressed {
                         admin_plugin: admin_plugin.clone(),
                         source_id: source_id.clone(),
                         predicate: predicate.clone(),
                         target_id: target_id.clone(),
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
                     ledger.record(AdminLogEntry {
                         kind: AdminLogKind::RelationUnsuppress,
                         admin_plugin,

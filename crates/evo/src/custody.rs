@@ -317,13 +317,20 @@ impl CustodyStateReporter for LedgerCustodyStateReporter {
             );
             // 2. Happening after ledger write. Owned strings are
             //    moved in since they are not used again in this
-            //    scope; health is Copy.
-            bus.emit(Happening::CustodyStateReported {
+            //    scope; health is Copy. The durable emit propagates
+            //    persistence failure to the caller; a silent drop
+            //    would lose the state-report from happenings_log
+            //    and break downstream replay.
+            bus.emit_durable(Happening::CustodyStateReported {
                 plugin,
                 handle_id,
                 health,
                 at: SystemTime::now(),
-            });
+            })
+            .await
+            .map_err(|e| {
+                ReportError::Invalid(format!("persistence write failed: {e}"))
+            })?;
             Ok(())
         })
     }

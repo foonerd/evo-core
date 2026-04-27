@@ -47,7 +47,9 @@ use crate::context::{
 use crate::custody::CustodyLedger;
 use crate::error::StewardError;
 use crate::happenings::HappeningBus;
+use crate::persistence::PersistenceStore;
 use crate::plugin_trust::PluginTrustState;
+use crate::projections::SubjectConflictIndex;
 use crate::relations::RelationGraph;
 use crate::router::{EnforcementPolicy, PluginEntry, PluginRouter};
 use crate::state::StewardState;
@@ -309,6 +311,8 @@ impl AdmissionEngine {
             Arc::clone(&self.state.bus),
             Arc::clone(&self.state.admin),
             Arc::clone(&self.router),
+            Arc::clone(&self.state.persistence),
+            Arc::clone(&self.state.conflict_index),
         );
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -443,6 +447,8 @@ impl AdmissionEngine {
             Arc::clone(&self.state.bus),
             Arc::clone(&self.state.admin),
             Arc::clone(&self.router),
+            Arc::clone(&self.state.persistence),
+            Arc::clone(&self.state.conflict_index),
         );
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -607,6 +613,8 @@ impl AdmissionEngine {
             Arc::clone(&self.state.bus),
             Arc::clone(&self.state.admin),
             Arc::clone(&self.router),
+            Arc::clone(&self.state.persistence),
+            Arc::clone(&self.state.conflict_index),
         );
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -764,6 +772,8 @@ impl AdmissionEngine {
             Arc::clone(&self.state.bus),
             Arc::clone(&self.state.admin),
             Arc::clone(&self.router),
+            Arc::clone(&self.state.persistence),
+            Arc::clone(&self.state.conflict_index),
         );
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -1455,6 +1465,8 @@ fn build_load_context(
     bus: Arc<HappeningBus>,
     admin_ledger: Arc<AdminLedger>,
     router: Arc<PluginRouter>,
+    persistence: Arc<dyn PersistenceStore>,
+    conflict_index: Arc<SubjectConflictIndex>,
 ) -> LoadContext {
     let state_dir = plugin_data_root.join(&manifest.plugin.name).join("state");
     let credentials_dir = plugin_data_root
@@ -1475,15 +1487,19 @@ fn build_load_context(
     // any storage-primitive call.
     let (subject_admin, relation_admin) = if manifest.capabilities.admin {
         let subject_admin: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> =
-            Arc::new(RegistrySubjectAdmin::new(
-                Arc::clone(&registry),
-                Arc::clone(&graph),
-                Arc::clone(&catalogue),
-                Arc::clone(&bus),
-                Arc::clone(&admin_ledger),
-                Arc::clone(&router),
-                manifest.plugin.name.clone(),
-            ));
+            Arc::new(
+                RegistrySubjectAdmin::new(
+                    Arc::clone(&registry),
+                    Arc::clone(&graph),
+                    Arc::clone(&catalogue),
+                    Arc::clone(&bus),
+                    Arc::clone(&admin_ledger),
+                    Arc::clone(&router),
+                    manifest.plugin.name.clone(),
+                )
+                .with_persistence(Arc::clone(&persistence))
+                .with_conflict_index(Arc::clone(&conflict_index)),
+            );
         let relation_admin: Arc<dyn evo_plugin_sdk::contract::RelationAdmin> =
             Arc::new(RegistryRelationAdmin::new(
                 Arc::clone(&registry),
@@ -1513,13 +1529,17 @@ fn build_load_context(
         user_interaction_requester: Arc::new(
             LoggingUserInteractionRequester::new(manifest.plugin.name.clone()),
         ),
-        subject_announcer: Arc::new(RegistrySubjectAnnouncer::new(
-            Arc::clone(&registry),
-            Arc::clone(&graph),
-            Arc::clone(&catalogue),
-            Arc::clone(&bus),
-            manifest.plugin.name.clone(),
-        )),
+        subject_announcer: Arc::new(
+            RegistrySubjectAnnouncer::new(
+                Arc::clone(&registry),
+                Arc::clone(&graph),
+                Arc::clone(&catalogue),
+                Arc::clone(&bus),
+                manifest.plugin.name.clone(),
+            )
+            .with_persistence(persistence)
+            .with_conflict_index(conflict_index),
+        ),
         relation_announcer: Arc::new(RegistryRelationAnnouncer::new(
             Arc::clone(&registry),
             graph,
@@ -3805,6 +3825,9 @@ response_budget_ms = 1000
         let ledger = Arc::new(AdminLedger::new());
         let router = Arc::new(PluginRouter::new(StewardState::for_tests()));
         let data_root = std::path::PathBuf::from("/tmp");
+        let persistence: Arc<dyn PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        let conflict_index = Arc::new(SubjectConflictIndex::new());
 
         let ctx = build_load_context(
             &data_root,
@@ -3815,6 +3838,8 @@ response_budget_ms = 1000
             bus,
             ledger,
             router,
+            persistence,
+            conflict_index,
         );
         assert!(
             ctx.subject_admin.is_some(),
@@ -3840,6 +3865,9 @@ response_budget_ms = 1000
         let ledger = Arc::new(AdminLedger::new());
         let router = Arc::new(PluginRouter::new(StewardState::for_tests()));
         let data_root = std::path::PathBuf::from("/tmp");
+        let persistence: Arc<dyn PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        let conflict_index = Arc::new(SubjectConflictIndex::new());
 
         let ctx = build_load_context(
             &data_root,
@@ -3850,6 +3878,8 @@ response_budget_ms = 1000
             bus,
             ledger,
             router,
+            persistence,
+            conflict_index,
         );
         assert!(
             ctx.subject_admin.is_none(),

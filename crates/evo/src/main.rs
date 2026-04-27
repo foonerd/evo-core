@@ -32,7 +32,7 @@ use evo::happenings::HappeningBus;
 use evo::persistence::{PersistenceStore, SqlitePersistenceStore};
 use evo::plugin_discovery;
 use evo::plugin_trust::load_plugin_trust_arc;
-use evo::projections::ProjectionEngine;
+use evo::projections::{ProjectionEngine, SubjectConflictIndex};
 use evo::relations::RelationGraph;
 use evo::resolution::ResolutionLedger;
 use evo::server::Server;
@@ -192,6 +192,15 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("seeding happenings bus: {e}"))?,
     );
 
+    // Construct the in-memory conflict index. The wiring layer's
+    // announce path records detected multi-subject conflicts into
+    // it, the admin layer's merge path resolves them, and the
+    // projection engine consults it at composition time so a
+    // subject sitting in an unresolved conflict carries the
+    // structured degraded reason. Held centrally on the steward
+    // state so every consumer reads the same instance.
+    let conflict_index = Arc::new(SubjectConflictIndex::new());
+
     // Build the shared steward state once: catalogue plus
     // freshly-allocated stores. The same `Arc<StewardState>` is
     // handed to the admission engine and the server so dispatch
@@ -205,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
         .admin(Arc::new(AdminLedger::new()))
         .persistence(Arc::clone(&persistence))
         .claimant_issuer(Arc::clone(&claimant_issuer))
+        .conflict_index(Arc::clone(&conflict_index))
         .build()?;
 
     // Construct the admission engine and run plugin discovery
@@ -220,11 +230,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Construct a projection engine sharing the steward's subject
     // registry and relation graph. Plugins announce into the same
-    // stores the projection engine reads from.
-    let projections = Arc::new(ProjectionEngine::new(
-        Arc::clone(&state.subjects),
-        Arc::clone(&state.relations),
-    ));
+    // stores the projection engine reads from. Attach the shared
+    // conflict index so projections name every unresolved conflict
+    // a subject participates in via a structured degraded entry.
+    let projections = Arc::new(
+        ProjectionEngine::new(
+            Arc::clone(&state.subjects),
+            Arc::clone(&state.relations),
+        )
+        .with_conflict_index(Arc::clone(&conflict_index)),
+    );
 
     // Clone an Arc to the router so the server can dispatch directly
     // through it without acquiring the admission-engine mutex. The
@@ -358,6 +373,26 @@ async fn main() -> anyhow::Result<()> {
             shelf = ?c.shelf,
             "custody not released cleanly within drain window"
         );
+    }
+
+    // Final WAL checkpoint before the persistence pool drops. Flushes
+    // the write-ahead log into the main database file and truncates
+    // it to zero so an operator backing up the database alone (without
+    // the `-wal`/`-shm` siblings) captures every committed row.
+    // Failure here is non-fatal: the rows are still on disk in the
+    // WAL and recoverable by SQLite on next open; we log a warning
+    // so the operator notices.
+    match persistence.checkpoint_wal().await {
+        Ok(()) => {
+            tracing::info!("WAL checkpoint truncated on shutdown");
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "WAL checkpoint at shutdown failed; rows are still durable in \
+                 the WAL but not yet folded into the main database file"
+            );
+        }
     }
 
     tracing::warn!("evo exited");
