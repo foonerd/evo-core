@@ -350,11 +350,9 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                 .find_subject_type(&announcement.subject_type)
                 .is_none()
             {
-                return Err(ReportError::Invalid(format!(
-                    "announce: subject type {:?} is not declared in \
-                     the catalogue",
-                    announcement.subject_type
-                )));
+                return Err(ReportError::UnknownSubjectType {
+                    subject_type: announcement.subject_type.clone(),
+                });
             }
             let outcome = match registry.announce(&announcement, &plugin_name) {
                 Ok(outcome) => outcome,
@@ -724,12 +722,8 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
             // to a predicate the catalogue declared.
             let predicate = catalogue
                 .find_predicate(&assertion.predicate)
-                .ok_or_else(|| {
-                    ReportError::Invalid(format!(
-                        "assert: predicate {:?} is not declared in \
-                             the catalogue",
-                        assertion.predicate
-                    ))
+                .ok_or_else(|| ReportError::UnknownPredicate {
+                    predicate: assertion.predicate.clone(),
                 })?;
 
             let source_id =
@@ -886,10 +880,9 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
             // checks do not apply on retract: a retract cannot
             // introduce a new type or push a count over a bound.
             if catalogue.find_predicate(&retraction.predicate).is_none() {
-                return Err(ReportError::Invalid(format!(
-                    "retract: predicate {:?} is not declared in the catalogue",
-                    retraction.predicate
-                )));
+                return Err(ReportError::UnknownPredicate {
+                    predicate: retraction.predicate.clone(),
+                });
             }
 
             let source_id =
@@ -2993,17 +2986,15 @@ target_type = "*"
         );
         let result = announcer.announce(announcement).await;
         match result {
-            Err(ReportError::Invalid(msg)) => {
-                assert!(
-                    msg.contains("podcast_episode"),
-                    "expected error to name the type, got {msg:?}"
-                );
-                assert!(
-                    msg.contains("not declared"),
-                    "expected error to reference the catalogue, got {msg:?}"
+            Err(ReportError::UnknownSubjectType { subject_type }) => {
+                assert_eq!(
+                    subject_type, "podcast_episode",
+                    "expected the carried subject_type to name the bad type"
                 );
             }
-            other => panic!("expected Invalid error, got {other:?}"),
+            other => {
+                panic!("expected UnknownSubjectType error, got {other:?}")
+            }
         }
         // Registry is untouched: the gate runs BEFORE the registry
         // sees the announcement, so undeclared types leave no
@@ -3229,18 +3220,14 @@ target_type = "*"
             .await;
 
         match result {
-            Err(ReportError::Invalid(msg)) => {
-                assert!(
-                    msg.contains("bogus_predicate"),
-                    "expected error to name the predicate, got {msg:?}"
-                );
-                assert!(
-                    msg.contains("not declared"),
-                    "expected error to mention catalogue, got {msg:?}"
+            Err(ReportError::UnknownPredicate { predicate }) => {
+                assert_eq!(
+                    predicate, "bogus_predicate",
+                    "expected the carried predicate to name the bad name"
                 );
             }
             other => {
-                panic!("expected Invalid error, got {other:?}")
+                panic!("expected UnknownPredicate error, got {other:?}")
             }
         }
         // Graph is untouched: the check runs BEFORE subject
@@ -3317,18 +3304,14 @@ target_type = "*"
             .await;
 
         match result {
-            Err(ReportError::Invalid(msg)) => {
-                assert!(
-                    msg.contains("bogus_predicate"),
-                    "expected error to name the predicate, got {msg:?}"
-                );
-                assert!(
-                    msg.contains("not declared"),
-                    "expected error to mention catalogue, got {msg:?}"
+            Err(ReportError::UnknownPredicate { predicate }) => {
+                assert_eq!(
+                    predicate, "bogus_predicate",
+                    "expected the carried predicate to name the bad name"
                 );
             }
             other => {
-                panic!("expected Invalid error, got {other:?}")
+                panic!("expected UnknownPredicate error, got {other:?}")
             }
         }
     }

@@ -903,18 +903,18 @@ The class is one of:
 | Class                | Subclass                           | Meaning                                                                                                                       |
 |----------------------|------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
 | `trust_violation`    | `admin_trust_too_low`              | Effective trust class is below the admin minimum. Extras: `plugin_name`, `effective`, `minimum`.                              |
-| `contract_violation` | `cardinality_violation`            | A relation assertion would violate a declared cardinality.                                                                    |
-| `contract_violation` | `unknown_predicate`                | Relation predicate not declared in the catalogue.                                                                             |
-| `contract_violation` | `unknown_subject_type`             | Subject type not declared in the catalogue.                                                                                   |
+| `contract_violation` | `cardinality_violation`            | A relation assertion would violate a declared cardinality. (Reserved; not yet emitted on the wire — surfaced today as a `relation_cardinality_violation` happening because the relation graph is permissive on assert.) |
+| `contract_violation` | `unknown_predicate`                | Relation predicate not declared in the catalogue. Extras: `predicate`.                                                        |
+| `contract_violation` | `unknown_subject_type`             | Subject type not declared in the catalogue. Extras: `subject_type`.                                                           |
 | `contract_violation` | `merge_self_target`                | Operator-supplied addressings resolve to the same canonical subject.                                                          |
 | `contract_violation` | `merge_cross_type`                 | Merge sources have differing subject types. Extras: `a_type`, `b_type`.                                                       |
-| `contract_violation` | `split_target_index_out_of_bounds` | Explicit relation assignment names a partition index outside the operator's `partitions`.                                     |
+| `contract_violation` | `split_target_index_out_of_bounds` | Explicit relation assignment names a partition index outside the operator's `partitions`. Extras: `index`, `partition_count`. |
 | `contract_violation` | `replay_window_exceeded`           | `subscribe_happenings` `since` cursor is older than the oldest retained `seq`. Extras: `oldest_available_seq`, `current_seq`. |
 | `contract_violation` | `invalid_page_cursor`              | A paginated list op was issued with a cursor that did not decode (bad base64 or non-utf8 payload).                            |
 | `not_found`          | `merge_source_unknown`             | Merge source addressing is not registered. Extras: `addressing`.                                                              |
 | `not_found`          | `target_plugin_unknown`            | Privileged retract names a plugin not currently admitted. Extras: `plugin`.                                                   |
-| `misconfiguration`   | `catalogue_invalid`                | Catalogue parse or validation failure (including out-of-range `schema_version`).                                              |
-| `misconfiguration`   | `manifest_invalid`                 | Plugin manifest parse or validation failure.                                                                                  |
+| `misconfiguration`   | `catalogue_invalid`                | Catalogue parse or validation failure (including out-of-range `schema_version`). (Reserved; not yet emitted on the wire — catalogue errors surface only at boot today and reach operator logs, not consumers. Will emit when an operator-callable reload-catalogue verb lands.) |
+| `misconfiguration`   | `manifest_invalid`                 | Plugin manifest parse or validation failure. (Reserved; not yet emitted on the wire — manifest errors surface only at admission today and reach operator logs, not consumers. Will emit when an operator-callable reload-manifest verb lands.) |
 
 Consumers wanting to act on a subclass must agree on the vocabulary out of band; the contract is on top-level `class` and the subclass strings published here. Unknown subclasses fall through to the top-level class semantics with no degradation in behaviour.
 

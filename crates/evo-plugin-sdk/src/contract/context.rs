@@ -330,6 +330,26 @@ pub enum ReportError {
         /// indices are `0..partition_count`.
         partition_count: usize,
     },
+    /// A relation assertion or retraction named a predicate that the
+    /// catalogue did not declare. Surfaces the offending predicate
+    /// name so consumers can diagnose without scraping a free-form
+    /// string. Wiring-layer refusal: refused before the relation
+    /// graph is touched.
+    #[error("predicate {predicate:?} is not declared in the catalogue")]
+    UnknownPredicate {
+        /// The (unknown) predicate name from the assertion or
+        /// retraction.
+        predicate: String,
+    },
+    /// A subject announcement named a subject type that the catalogue
+    /// did not declare. Surfaces the offending type name so consumers
+    /// can diagnose without scraping a free-form string. Wiring-layer
+    /// refusal: refused before the registry is touched.
+    #[error("subject type {subject_type:?} is not declared in the catalogue")]
+    UnknownSubjectType {
+        /// The (unknown) subject type name from the announcement.
+        subject_type: String,
+    },
 }
 
 impl ReportError {
@@ -354,6 +374,12 @@ impl ReportError {
             ReportError::MergeCrossType { .. } => ErrorClass::ContractViolation,
             ReportError::MergeInternal { .. } => ErrorClass::Internal,
             ReportError::SplitTargetNewIdIndexOutOfBounds { .. } => {
+                ErrorClass::ContractViolation
+            }
+            ReportError::UnknownPredicate { .. } => {
+                ErrorClass::ContractViolation
+            }
+            ReportError::UnknownSubjectType { .. } => {
                 ErrorClass::ContractViolation
             }
         }

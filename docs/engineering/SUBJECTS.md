@@ -239,7 +239,7 @@ announce(
 4. If no addressings resolve: a new canonical ID is generated and all addressings are registered to it.
 5. If addressings resolve to different canonical IDs: see reconciliation (section 9).
 
-**Enforcement status.** Before step 1 runs, `RegistrySubjectAnnouncer` validates that the announced `subject_type` is one the catalogue declares. An undeclared type is refused with `Invalid("announce: subject type ... is not declared in the catalogue")` and the subject registry is not touched; nothing reaches the resolve path. Retraction carries no subject type and skips this check. See section 4.1 for the catalogue-load-time half of the subject-type enforcement picture.
+**Enforcement status.** Before step 1 runs, `RegistrySubjectAnnouncer` validates that the announced `subject_type` is one the catalogue declares. An undeclared type is refused with `UnknownSubjectType { subject_type }` (top-level class `contract_violation`, subclass `unknown_subject_type`, extras `{"subject_type": "..."}`) and the subject registry is not touched; nothing reaches the resolve path. Retraction carries no subject type and skips this check. See section 4.1 for the catalogue-load-time half of the subject-type enforcement picture.
 
 ### 7.4 Claimant Tracking
 

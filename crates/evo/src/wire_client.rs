@@ -944,12 +944,13 @@ async fn forward_plugin_request(
                 // Preserve the originating ReportError's class
                 // (NotFound, Unavailable, ResourceExhausted, etc.)
                 // rather than collapsing every refusal to
-                // ContractViolation. Subclass strings populate
-                // `details` in a follow-up bundle; today this
-                // change keeps the top-level class honest.
+                // ContractViolation. Per-variant subclass strings
+                // and class-specific extras populate `details` via
+                // [`report_error_details`]; variants without a
+                // documented subclass leave `details` unset.
                 class: e.class(),
                 message: format!("describe_alias: {e}"),
-                details: None,
+                details: report_error_details(&e),
             },
         },
         WireFrame::DescribeSubject {
@@ -974,7 +975,7 @@ async fn forward_plugin_request(
                 plugin,
                 class: e.class(),
                 message: format!("describe_subject: {e}"),
-                details: None,
+                details: report_error_details(&e),
             },
         },
 
@@ -1002,7 +1003,7 @@ async fn forward_plugin_request(
                     plugin,
                     class: e.class(),
                     message: format!("forced_retract_addressing: {e}"),
-                    details: None,
+                    details: report_error_details(&e),
                 },
             },
             None => admin_capability_denied_error(v, cid, plugin),
@@ -1026,7 +1027,7 @@ async fn forward_plugin_request(
                         plugin,
                         class: e.class(),
                         message: format!("merge_subjects: {e}"),
-                        details: None,
+                        details: report_error_details(&e),
                     },
                 }
             }
@@ -1059,7 +1060,7 @@ async fn forward_plugin_request(
                     plugin,
                     class: e.class(),
                     message: format!("split_subject: {e}"),
-                    details: None,
+                    details: report_error_details(&e),
                 },
             },
             None => admin_capability_denied_error(v, cid, plugin),
@@ -1095,7 +1096,7 @@ async fn forward_plugin_request(
                     plugin,
                     class: e.class(),
                     message: format!("forced_retract_claim: {e}"),
-                    details: None,
+                    details: report_error_details(&e),
                 },
             },
             None => admin_capability_denied_error(v, cid, plugin),
@@ -1120,7 +1121,7 @@ async fn forward_plugin_request(
                         plugin,
                         class: e.class(),
                         message: format!("suppress_relation: {e}"),
-                        details: None,
+                        details: report_error_details(&e),
                     },
                 }
             }
@@ -1145,7 +1146,7 @@ async fn forward_plugin_request(
                         plugin,
                         class: e.class(),
                         message: format!("unsuppress_relation: {e}"),
-                        details: None,
+                        details: report_error_details(&e),
                     },
                 }
             }
@@ -1166,6 +1167,77 @@ async fn forward_plugin_request(
         tracing::warn!(
             "writer task closed before plugin-request response could be sent"
         );
+    }
+}
+
+/// Map a [`ReportError`] to the structured `details` payload that
+/// rides on a wire `Error` frame.
+///
+/// Returns `Some(json)` when the variant has a documented subclass
+/// in `SCHEMAS.md` §4.1.2, populating both the `subclass` discriminator
+/// and any class-specific extras the doc publishes. Returns `None` for
+/// variants that have no documented subclass today (`RateLimited`,
+/// `ShuttingDown`, `Deregistered`, `Invalid`, `MergeInternal`); the
+/// top-level [`ErrorClass`] alone carries the contract for these.
+///
+/// Subclass strings are stable across releases per the additive
+/// taxonomy contract: existing names are never renamed or repurposed,
+/// only appended.
+///
+/// [`ReportError`]: evo_plugin_sdk::contract::ReportError
+fn report_error_details(
+    err: &evo_plugin_sdk::contract::ReportError,
+) -> Option<serde_json::Value> {
+    use evo_plugin_sdk::contract::ReportError;
+    match err {
+        ReportError::TargetPluginUnknown { plugin } => {
+            Some(serde_json::json!({
+                "subclass": "target_plugin_unknown",
+                "plugin": plugin,
+            }))
+        }
+        ReportError::MergeSelfTarget => Some(serde_json::json!({
+            "subclass": "merge_self_target",
+        })),
+        ReportError::MergeSourceUnknown { addressing } => {
+            Some(serde_json::json!({
+                "subclass": "merge_source_unknown",
+                "addressing": addressing,
+            }))
+        }
+        ReportError::MergeCrossType { a_type, b_type } => {
+            Some(serde_json::json!({
+                "subclass": "merge_cross_type",
+                "a_type": a_type,
+                "b_type": b_type,
+            }))
+        }
+        ReportError::SplitTargetNewIdIndexOutOfBounds {
+            index,
+            partition_count,
+        } => Some(serde_json::json!({
+            "subclass": "split_target_index_out_of_bounds",
+            "index": index,
+            "partition_count": partition_count,
+        })),
+        ReportError::UnknownPredicate { predicate } => {
+            Some(serde_json::json!({
+                "subclass": "unknown_predicate",
+                "predicate": predicate,
+            }))
+        }
+        ReportError::UnknownSubjectType { subject_type } => {
+            Some(serde_json::json!({
+                "subclass": "unknown_subject_type",
+                "subject_type": subject_type,
+            }))
+        }
+        // `RateLimited`, `ShuttingDown`, `Deregistered`, `Invalid`,
+        // `MergeInternal` and any future variant SCHEMAS.md has not
+        // yet published a subclass for: leave `details` unset. The
+        // wire class is the contract; consumers acting on subclass
+        // see `None` and degrade to class-only behaviour.
+        _ => None,
     }
 }
 
@@ -1311,16 +1383,18 @@ async fn forward_event(
             // erased information consumers need to drive retry,
             // backoff, and circuit-breaker decisions.
             //
-            // The per-variant `details.subclass` strings are
-            // populated at the call sites that build this frame;
-            // here only the top-level class is derived.
+            // `details` carries the per-variant subclass string
+            // and any class-specific extras documented in
+            // SCHEMAS.md §4.1.2; variants without a documented
+            // subclass leave `details` unset.
+            let details = report_error_details(&err);
             WireFrame::Error {
                 v: PROTOCOL_VERSION,
                 cid,
                 plugin,
                 class: err.class(),
                 message: err.to_string(),
-                details: None,
+                details,
             }
         }
     };
@@ -4521,5 +4595,260 @@ name = "track"
             "ctx",
         );
         assert!(pe.is_fatal());
+    }
+
+    // ---------------------------------------------------------------------
+    // Wire `Error` frames carry per-variant `details.subclass` and
+    // class-specific extras for every documented subclass in
+    // SCHEMAS.md §4.1.2. Variants without a documented subclass continue
+    // to ship `details = None`; the top-level class remains the contract.
+    // ---------------------------------------------------------------------
+
+    /// SubjectAnnouncer that returns a fresh, configurable
+    /// [`ReportError`] from `announce`. Mirrors `AlwaysErrAnnouncer`
+    /// but parameterised on the full enum so the per-variant subclass
+    /// tests can exercise every variant without the [`ScriptedErr`]
+    /// wrapper.
+    struct ScriptedAnnouncer {
+        next: std::sync::Mutex<Option<ReportError>>,
+    }
+
+    impl ScriptedAnnouncer {
+        fn new(err: ReportError) -> Self {
+            Self {
+                next: std::sync::Mutex::new(Some(err)),
+            }
+        }
+    }
+
+    impl evo_plugin_sdk::contract::SubjectAnnouncer for ScriptedAnnouncer {
+        fn announce<'a>(
+            &'a self,
+            _announcement: SubjectAnnouncement,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            let err = self
+                .next
+                .lock()
+                .unwrap()
+                .take()
+                .expect("scripted announcer called more than once");
+            Box::pin(async move { Err(err) })
+        }
+
+        fn retract<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            unreachable!("per-variant subclass tests only exercise announce")
+        }
+    }
+
+    /// Drive `forward_event` against an `AnnounceSubject` frame and
+    /// extract the resulting `Error` frame's `class` and `details`.
+    /// Helper folds the dispatch boilerplate so each subclass test
+    /// reads as a single class+subclass+extras assertion.
+    async fn drive_event_and_capture_error(
+        err: ReportError,
+    ) -> (ErrorClass, Option<serde_json::Value>) {
+        let sink = sink_with_announcer(Arc::new(ScriptedAnnouncer::new(err)));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+        forward_event(announce_frame(1), &sink, &out_tx).await;
+        match out_rx.recv().await.expect("response frame") {
+            WireFrame::Error { class, details, .. } => (class, details),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn details_carry_unknown_subject_type_subclass_and_extras() {
+        let (class, details) =
+            drive_event_and_capture_error(ReportError::UnknownSubjectType {
+                subject_type: "podcast_episode".into(),
+            })
+            .await;
+        assert_eq!(class, ErrorClass::ContractViolation);
+        let details = details.expect("details payload populated");
+        assert_eq!(details["subclass"].as_str(), Some("unknown_subject_type"));
+        assert_eq!(
+            details["subject_type"].as_str(),
+            Some("podcast_episode"),
+            "extras carry the offending subject type"
+        );
+    }
+
+    #[tokio::test]
+    async fn details_carry_unknown_predicate_subclass_and_extras() {
+        let (class, details) =
+            drive_event_and_capture_error(ReportError::UnknownPredicate {
+                predicate: "bogus_predicate".into(),
+            })
+            .await;
+        assert_eq!(class, ErrorClass::ContractViolation);
+        let details = details.expect("details payload populated");
+        assert_eq!(details["subclass"].as_str(), Some("unknown_predicate"));
+        assert_eq!(
+            details["predicate"].as_str(),
+            Some("bogus_predicate"),
+            "extras carry the offending predicate name"
+        );
+    }
+
+    /// Drive `forward_plugin_request` against a merge admin frame and
+    /// extract the resulting `Error` frame's `class` and `details`.
+    async fn drive_merge_admin_and_capture_error(
+        err: ReportError,
+    ) -> (ErrorClass, Option<serde_json::Value>) {
+        let admin = Arc::new(ScriptedSubjectAdmin::new(err));
+        let admin_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> = admin;
+        let sink = sink_with_subject_admin(Some(admin_dyn));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+        let request = WireFrame::MergeSubjects {
+            v: PROTOCOL_VERSION,
+            cid: 400,
+            plugin: "org.admin".into(),
+            target_a: ExternalAddressing::new("mpd-album", "a"),
+            target_b: ExternalAddressing::new("mpd-album", "b"),
+            reason: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+        match out_rx.recv().await.expect("response frame") {
+            WireFrame::Error { class, details, .. } => (class, details),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn details_carry_merge_self_target_subclass() {
+        let (class, details) =
+            drive_merge_admin_and_capture_error(ReportError::MergeSelfTarget)
+                .await;
+        assert_eq!(class, ErrorClass::ContractViolation);
+        let details = details.expect("details payload populated");
+        assert_eq!(details["subclass"].as_str(), Some("merge_self_target"));
+    }
+
+    #[tokio::test]
+    async fn details_carry_merge_cross_type_subclass_and_extras() {
+        let (class, details) =
+            drive_merge_admin_and_capture_error(ReportError::MergeCrossType {
+                a_type: "track".into(),
+                b_type: "album".into(),
+            })
+            .await;
+        assert_eq!(class, ErrorClass::ContractViolation);
+        let details = details.expect("details payload populated");
+        assert_eq!(details["subclass"].as_str(), Some("merge_cross_type"));
+        assert_eq!(details["a_type"].as_str(), Some("track"));
+        assert_eq!(details["b_type"].as_str(), Some("album"));
+    }
+
+    #[tokio::test]
+    async fn details_carry_merge_source_unknown_subclass_and_extras() {
+        let (class, details) = drive_merge_admin_and_capture_error(
+            ReportError::MergeSourceUnknown {
+                addressing: "mpd-album:bogus".into(),
+            },
+        )
+        .await;
+        assert_eq!(class, ErrorClass::NotFound);
+        let details = details.expect("details payload populated");
+        assert_eq!(details["subclass"].as_str(), Some("merge_source_unknown"));
+        assert_eq!(
+            details["addressing"].as_str(),
+            Some("mpd-album:bogus"),
+            "extras carry the unresolvable addressing"
+        );
+    }
+
+    #[tokio::test]
+    async fn details_carry_target_plugin_unknown_subclass_and_extras() {
+        // Drives the `ForcedRetractAddressing` admin frame so the
+        // dispatch lands on `forced_retract_addressing` rather than
+        // `merge`; both share the `report_error_details` helper but
+        // exercising the second admin entry point pins both wirings.
+        let admin = Arc::new(ScriptedSubjectAdmin::new(
+            ReportError::TargetPluginUnknown {
+                plugin: "org.does-not-exist".into(),
+            },
+        ));
+        let admin_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> = admin;
+        let sink = sink_with_subject_admin(Some(admin_dyn));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::ForcedRetractAddressing {
+            v: PROTOCOL_VERSION,
+            cid: 401,
+            plugin: "org.admin".into(),
+            target_plugin: "org.does-not-exist".into(),
+            addressing: ExternalAddressing::new("mpd-path", "/x"),
+            reason: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { class, details, .. } => {
+                assert_eq!(class, ErrorClass::NotFound);
+                let details = details.expect("details payload populated");
+                assert_eq!(
+                    details["subclass"].as_str(),
+                    Some("target_plugin_unknown")
+                );
+                assert_eq!(
+                    details["plugin"].as_str(),
+                    Some("org.does-not-exist"),
+                    "extras carry the unknown plugin name"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn details_carry_split_target_index_out_of_bounds_subclass_and_extras(
+    ) {
+        let (class, details) = drive_merge_admin_and_capture_error(
+            ReportError::SplitTargetNewIdIndexOutOfBounds {
+                index: 7,
+                partition_count: 3,
+            },
+        )
+        .await;
+        assert_eq!(class, ErrorClass::ContractViolation);
+        let details = details.expect("details payload populated");
+        assert_eq!(
+            details["subclass"].as_str(),
+            Some("split_target_index_out_of_bounds")
+        );
+        assert_eq!(details["index"].as_u64(), Some(7));
+        assert_eq!(details["partition_count"].as_u64(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn details_remain_unset_for_undocumented_subclass_variants() {
+        // RateLimited, ShuttingDown, Deregistered, Invalid and
+        // MergeInternal have no published subclass in SCHEMAS.md
+        // §4.1.2; the wire frame must continue to ship `details =
+        // None` so consumers fall back to top-level class semantics
+        // rather than scrape a partial subclass string.
+        for err in [
+            ReportError::RateLimited,
+            ReportError::ShuttingDown,
+            ReportError::Deregistered,
+            ReportError::Invalid("free-form rejection".into()),
+            ReportError::MergeInternal {
+                detail: "rewrite primitive failed".into(),
+            },
+        ] {
+            let (_class, details) = drive_event_and_capture_error(err).await;
+            assert!(
+                details.is_none(),
+                "undocumented subclass variants must leave details \
+                 unset; got {details:?}"
+            );
+        }
     }
 }
