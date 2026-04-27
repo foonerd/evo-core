@@ -941,7 +941,13 @@ async fn forward_plugin_request(
                 v,
                 cid,
                 plugin,
-                class: ErrorClass::ContractViolation,
+                // Preserve the originating ReportError's class
+                // (NotFound, Unavailable, ResourceExhausted, etc.)
+                // rather than collapsing every refusal to
+                // ContractViolation. Subclass strings populate
+                // `details` in a follow-up bundle; today this
+                // change keeps the top-level class honest.
+                class: e.class(),
                 message: format!("describe_alias: {e}"),
                 details: None,
             },
@@ -966,7 +972,7 @@ async fn forward_plugin_request(
                 v,
                 cid,
                 plugin,
-                class: ErrorClass::ContractViolation,
+                class: e.class(),
                 message: format!("describe_subject: {e}"),
                 details: None,
             },
@@ -994,7 +1000,7 @@ async fn forward_plugin_request(
                     v,
                     cid,
                     plugin,
-                    class: ErrorClass::ContractViolation,
+                    class: e.class(),
                     message: format!("forced_retract_addressing: {e}"),
                     details: None,
                 },
@@ -1018,7 +1024,7 @@ async fn forward_plugin_request(
                         v,
                         cid,
                         plugin,
-                        class: ErrorClass::ContractViolation,
+                        class: e.class(),
                         message: format!("merge_subjects: {e}"),
                         details: None,
                     },
@@ -1051,7 +1057,7 @@ async fn forward_plugin_request(
                     v,
                     cid,
                     plugin,
-                    class: ErrorClass::ContractViolation,
+                    class: e.class(),
                     message: format!("split_subject: {e}"),
                     details: None,
                 },
@@ -1087,7 +1093,7 @@ async fn forward_plugin_request(
                     v,
                     cid,
                     plugin,
-                    class: ErrorClass::ContractViolation,
+                    class: e.class(),
                     message: format!("forced_retract_claim: {e}"),
                     details: None,
                 },
@@ -1112,7 +1118,7 @@ async fn forward_plugin_request(
                         v,
                         cid,
                         plugin,
-                        class: ErrorClass::ContractViolation,
+                        class: e.class(),
                         message: format!("suppress_relation: {e}"),
                         details: None,
                     },
@@ -1137,7 +1143,7 @@ async fn forward_plugin_request(
                         v,
                         cid,
                         plugin,
-                        class: ErrorClass::ContractViolation,
+                        class: e.class(),
                         message: format!("unsuppress_relation: {e}"),
                         details: None,
                     },
@@ -1292,24 +1298,27 @@ async fn forward_event(
                 error = %err,
                 "event rejected by sink; replying with Error frame"
             );
-            // Per the SDK contract, only ShuttingDown and
-            // Deregistered are session-fatal for the plugin's
-            // event surface. The other variants reject this one
-            // event without tearing the connection down.
-            let class = if matches!(
-                err,
-                evo_plugin_sdk::contract::ReportError::ShuttingDown
-                    | evo_plugin_sdk::contract::ReportError::Deregistered
-            ) {
-                ErrorClass::Internal
-            } else {
-                ErrorClass::ContractViolation
-            };
+            // Defer the wire class to ReportError::class(), the
+            // single source of truth for the
+            // [`ReportError`]→[`ErrorClass`] mapping. Each
+            // ReportError variant has a deterministic class
+            // (Invalid → ContractViolation, ShuttingDown /
+            // Deregistered → Unavailable, RateLimited →
+            // ResourceExhausted, MergeSourceUnknown /
+            // TargetPluginUnknown → NotFound, MergeInternal →
+            // Internal, etc.); collapsing every refusal to
+            // ContractViolation or every shutdown to Internal
+            // erased information consumers need to drive retry,
+            // backoff, and circuit-breaker decisions.
+            //
+            // The per-variant `details.subclass` strings are
+            // populated at the call sites that build this frame;
+            // here only the top-level class is derived.
             WireFrame::Error {
                 v: PROTOCOL_VERSION,
                 cid,
                 plugin,
-                class,
+                class: err.class(),
                 message: err.to_string(),
                 details: None,
             }
@@ -3704,17 +3713,24 @@ name = "track"
                     message.contains("shelf shape rejected"),
                     "wire message must carry the rejection text"
                 );
-                assert!(
-                    !class.is_connection_fatal(),
-                    "Invalid is per-call, not session-fatal"
-                );
+                // ReportError::Invalid → ErrorClass::ContractViolation
+                // per ReportError::class(); not connection-fatal.
+                assert_eq!(class, ErrorClass::ContractViolation);
+                assert!(!class.is_connection_fatal());
             }
             other => panic!("expected Error, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn forward_event_marks_shutting_down_as_fatal() {
+    async fn forward_event_emits_unavailable_on_shutting_down() {
+        // ReportError::ShuttingDown → ErrorClass::Unavailable per
+        // ReportError::class(). The previous behaviour mapped this
+        // to ErrorClass::Internal (connection-fatal) on the wire,
+        // which collapsed the per-event refusal taxonomy.
+        // Unavailable correctly signals "transient at the
+        // operational layer; retry once the steward is back" while
+        // leaving connection lifecycle decisions to the consumer.
         let sink = sink_with_announcer(Arc::new(AlwaysErrAnnouncer {
             which: ScriptedErr::ShuttingDown,
         }));
@@ -3726,18 +3742,17 @@ name = "track"
         match response {
             WireFrame::Error { cid, class, .. } => {
                 assert_eq!(cid, 789);
-                assert!(
-                    class.is_connection_fatal(),
-                    "ShuttingDown is session-fatal: signals the plugin to \
-                     stop emitting and tear down"
-                );
+                assert_eq!(class, ErrorClass::Unavailable);
             }
             other => panic!("expected Error, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn forward_event_marks_deregistered_as_fatal() {
+    async fn forward_event_emits_unavailable_on_deregistered() {
+        // ReportError::Deregistered → ErrorClass::Unavailable per
+        // ReportError::class(). Same rationale as the ShuttingDown
+        // test above.
         let sink = sink_with_announcer(Arc::new(AlwaysErrAnnouncer {
             which: ScriptedErr::Deregistered,
         }));
@@ -3748,7 +3763,7 @@ name = "track"
         let response = out_rx.recv().await.expect("response frame");
         match response {
             WireFrame::Error { class, .. } => {
-                assert!(class.is_connection_fatal())
+                assert_eq!(class, ErrorClass::Unavailable);
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -4111,5 +4126,400 @@ name = "track"
             other => panic!("expected HandshakeFailed, got {other:?}"),
         }
         peer.await.unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // Error-class translation in forward_plugin_request (admin verbs
+    // and plugin-initiated requests). The class on the wire `Error`
+    // frame must derive from the originating ReportError's class, not
+    // collapse to ContractViolation.
+    // ---------------------------------------------------------------------
+
+    /// SubjectAdmin stub that returns a configurable [`ReportError`]
+    /// from `forced_retract_addressing`. Mirrors `CapturingSubjectAdmin`
+    /// but parameterised on the error variant rather than a bool.
+    struct ScriptedSubjectAdmin {
+        // Boxed so we can hand any ReportError variant to the stub
+        // without requiring ReportError: Clone (it deliberately is
+        // not, mirroring real plugin error semantics).
+        next: std::sync::Mutex<Option<ReportError>>,
+    }
+
+    impl ScriptedSubjectAdmin {
+        fn new(err: ReportError) -> Self {
+            Self {
+                next: std::sync::Mutex::new(Some(err)),
+            }
+        }
+    }
+
+    impl evo_plugin_sdk::contract::SubjectAdmin for ScriptedSubjectAdmin {
+        fn forced_retract_addressing<'a>(
+            &'a self,
+            _target_plugin: String,
+            _addressing: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            let err = self
+                .next
+                .lock()
+                .unwrap()
+                .take()
+                .expect("scripted admin called more than once");
+            Box::pin(async move { Err(err) })
+        }
+
+        fn merge<'a>(
+            &'a self,
+            _target_a: ExternalAddressing,
+            _target_b: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            let err = self
+                .next
+                .lock()
+                .unwrap()
+                .take()
+                .expect("scripted admin called more than once");
+            Box::pin(async move { Err(err) })
+        }
+
+        fn split<'a>(
+            &'a self,
+            _source: ExternalAddressing,
+            _partition: Vec<Vec<ExternalAddressing>>,
+            _strategy: evo_plugin_sdk::contract::SplitRelationStrategy,
+            _explicit_assignments: Vec<
+                evo_plugin_sdk::contract::ExplicitRelationAssignment,
+            >,
+            _reason: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            unreachable!("split not exercised by these admin error tests")
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_forced_retract_addressing_target_plugin_unknown_maps_to_not_found(
+    ) {
+        // ReportError::TargetPluginUnknown → ErrorClass::NotFound.
+        // Without per-class derivation every admin error would
+        // collapse to ContractViolation, leaving consumers unable
+        // to distinguish "your target plugin name is wrong" from
+        // "your retract payload is malformed".
+        let admin = Arc::new(ScriptedSubjectAdmin::new(
+            ReportError::TargetPluginUnknown {
+                plugin: "org.does-not-exist".into(),
+            },
+        ));
+        let admin_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> = admin;
+        let sink = sink_with_subject_admin(Some(admin_dyn));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::ForcedRetractAddressing {
+            v: PROTOCOL_VERSION,
+            cid: 200,
+            plugin: "org.admin".into(),
+            target_plugin: "org.does-not-exist".into(),
+            addressing: ExternalAddressing::new("mpd-path", "/m/x.flac"),
+            reason: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { cid, class, .. } => {
+                assert_eq!(cid, 200);
+                assert_eq!(class, ErrorClass::NotFound);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_merge_source_unknown_maps_to_not_found() {
+        let admin = Arc::new(ScriptedSubjectAdmin::new(
+            ReportError::MergeSourceUnknown {
+                addressing: "mpd-album:bogus".into(),
+            },
+        ));
+        let admin_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> = admin;
+        let sink = sink_with_subject_admin(Some(admin_dyn));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::MergeSubjects {
+            v: PROTOCOL_VERSION,
+            cid: 201,
+            plugin: "org.admin".into(),
+            target_a: ExternalAddressing::new("mpd-album", "a"),
+            target_b: ExternalAddressing::new("mpd-album", "b"),
+            reason: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { cid, class, .. } => {
+                assert_eq!(cid, 201);
+                assert_eq!(class, ErrorClass::NotFound);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_merge_internal_maps_to_internal() {
+        // ReportError::MergeInternal → ErrorClass::Internal.
+        // Without per-class derivation this would collapse to
+        // ContractViolation, telling consumers "you sent a bad
+        // request" when the truth is "the steward's internal merge
+        // primitive failed".
+        let admin =
+            Arc::new(ScriptedSubjectAdmin::new(ReportError::MergeInternal {
+                detail: "graph rewrite primitive failed".into(),
+            }));
+        let admin_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> = admin;
+        let sink = sink_with_subject_admin(Some(admin_dyn));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::MergeSubjects {
+            v: PROTOCOL_VERSION,
+            cid: 202,
+            plugin: "org.admin".into(),
+            target_a: ExternalAddressing::new("mpd-album", "a"),
+            target_b: ExternalAddressing::new("mpd-album", "b"),
+            reason: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { cid, class, .. } => {
+                assert_eq!(cid, 202);
+                assert_eq!(class, ErrorClass::Internal);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_rate_limited_maps_to_resource_exhausted() {
+        let admin =
+            Arc::new(ScriptedSubjectAdmin::new(ReportError::RateLimited));
+        let admin_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> = admin;
+        let sink = sink_with_subject_admin(Some(admin_dyn));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::ForcedRetractAddressing {
+            v: PROTOCOL_VERSION,
+            cid: 203,
+            plugin: "org.admin".into(),
+            target_plugin: "org.target".into(),
+            addressing: ExternalAddressing::new("mpd-path", "/x"),
+            reason: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { cid, class, .. } => {
+                assert_eq!(cid, 203);
+                assert_eq!(class, ErrorClass::ResourceExhausted);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// SubjectQuerier stub that returns a configurable [`ReportError`]
+    /// from `describe_alias`. Mirrors `NotFoundSubjectQuerier` but
+    /// returns Err instead of Ok(None).
+    struct ScriptedSubjectQuerier {
+        next: std::sync::Mutex<Option<ReportError>>,
+    }
+
+    impl ScriptedSubjectQuerier {
+        fn new(err: ReportError) -> Self {
+            Self {
+                next: std::sync::Mutex::new(Some(err)),
+            }
+        }
+    }
+
+    impl evo_plugin_sdk::contract::SubjectQuerier for ScriptedSubjectQuerier {
+        fn describe_alias<'a>(
+            &'a self,
+            _subject_id: String,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Option<evo_plugin_sdk::contract::AliasRecord>,
+                            ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let err = self
+                .next
+                .lock()
+                .unwrap()
+                .take()
+                .expect("scripted querier called more than once");
+            Box::pin(async move { Err(err) })
+        }
+
+        fn describe_subject_with_aliases<'a>(
+            &'a self,
+            _subject_id: String,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            evo_plugin_sdk::contract::SubjectQueryResult,
+                            ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let err = self
+                .next
+                .lock()
+                .unwrap()
+                .take()
+                .expect("scripted querier called more than once");
+            Box::pin(async move { Err(err) })
+        }
+    }
+
+    fn sink_with_subject_querier(
+        querier: Arc<dyn evo_plugin_sdk::contract::SubjectQuerier>,
+    ) -> EventSink {
+        use crate::context::LoggingStateReporter as LSR;
+        EventSink {
+            state_reporter: Arc::new(LSR::new("org.test")),
+            subject_announcer: Arc::new(AlwaysOkAnnouncer),
+            relation_announcer: Arc::new(UnreachableRelationAnnouncer),
+            custody_state_reporter: None,
+            subject_querier: querier,
+            subject_admin: None,
+            relation_admin: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_request_describe_alias_rate_limited_maps_to_resource_exhausted(
+    ) {
+        // Plugin-initiated request path: when a plugin asks the
+        // steward to resolve an alias and the steward's querier
+        // refuses with RateLimited, the wire `Error` frame must
+        // surface ResourceExhausted, not ContractViolation. The
+        // distinction lets the plugin back off rather than treat
+        // the request as malformed.
+        let querier =
+            Arc::new(ScriptedSubjectQuerier::new(ReportError::RateLimited));
+        let querier_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectQuerier> =
+            querier;
+        let sink = sink_with_subject_querier(querier_dyn);
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::DescribeAlias {
+            v: PROTOCOL_VERSION,
+            cid: 300,
+            plugin: "org.consumer".into(),
+            subject_id: "subj-123".into(),
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { cid, class, .. } => {
+                assert_eq!(cid, 300);
+                assert_eq!(class, ErrorClass::ResourceExhausted);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_request_describe_subject_shutting_down_maps_to_unavailable()
+    {
+        let querier =
+            Arc::new(ScriptedSubjectQuerier::new(ReportError::ShuttingDown));
+        let querier_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectQuerier> =
+            querier;
+        let sink = sink_with_subject_querier(querier_dyn);
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::DescribeSubject {
+            v: PROTOCOL_VERSION,
+            cid: 301,
+            plugin: "org.consumer".into(),
+            subject_id: "subj-456".into(),
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { cid, class, .. } => {
+                assert_eq!(cid, 301);
+                assert_eq!(class, ErrorClass::Unavailable);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // wire_error_to_plugin_error derives fatality from
+    // class.is_connection_fatal(). Pin that contract.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn wire_error_to_plugin_error_derives_fatality_from_class() {
+        // Internal class is connection-fatal → maps to Fatal.
+        let pe = wire_error_to_plugin_error(
+            WireClientError::PluginReturnedError {
+                message: "internal blew up".into(),
+                class: ErrorClass::Internal,
+            },
+            "ctx",
+        );
+        assert!(pe.is_fatal(), "Internal class must map to Fatal");
+
+        // ContractViolation is not connection-fatal → maps to Permanent.
+        let pe = wire_error_to_plugin_error(
+            WireClientError::PluginReturnedError {
+                message: "bad input".into(),
+                class: ErrorClass::ContractViolation,
+            },
+            "ctx",
+        );
+        assert!(
+            pe.is_permanent(),
+            "ContractViolation class must map to Permanent"
+        );
+
+        // NotFound is not connection-fatal → maps to Permanent.
+        let pe = wire_error_to_plugin_error(
+            WireClientError::PluginReturnedError {
+                message: "missing".into(),
+                class: ErrorClass::NotFound,
+            },
+            "ctx",
+        );
+        assert!(pe.is_permanent());
+
+        // ProtocolViolation is connection-fatal → maps to Fatal.
+        let pe = wire_error_to_plugin_error(
+            WireClientError::PluginReturnedError {
+                message: "bad frame".into(),
+                class: ErrorClass::ProtocolViolation,
+            },
+            "ctx",
+        );
+        assert!(pe.is_fatal());
     }
 }
