@@ -122,7 +122,7 @@ Every parsed manifest field falls into exactly one of three buckets, recorded as
 
 - **Enforced.** The steward acts on the field at runtime. Any change to the field's value changes observable steward behaviour. Admission refuses on a violation; dispatch consults the field on the relevant code path.
 - **Distribution-owned.** Explicitly out of scope for the framework. The field is parsed and preserved in the manifest because it lives there for distribution-side use (resource limits, OS-level isolation hints). The steward never consults the field at runtime; the distribution holds the plugin to its promise via systemd / cgroups / namespaces.
-- **Reserved.** The field exists for an in-flight feature not yet implemented. The field is parsed (its absence is permitted; its presence is also permitted) but does not yet cause behaviour. Each Reserved field has a documented promotion plan in its rustdoc; closing the plan promotes the field to Enforced.
+- **Reserved.** The field exists for a feature on the roadmap. The field is parsed (its absence is permitted; its presence is also permitted) but does not cause behaviour today. Each Reserved field has a documented promotion plan in its rustdoc; closing the plan promotes the field to Enforced.
 
 The bucket discipline is auditable: a reader of `manifest.rs` sees the bucket on every field; a future contributor who wants to add a new field declares its bucket up front and the reviewer checks the declaration against the implementation. New Enforced fields land with an enforcement test in the same commit; new Reserved fields land with the promotion plan in the rustdoc.
 
@@ -162,7 +162,7 @@ The tables below enumerate the current per-field bucket assignment.
 
 Core's position on the distribution-owned fields: they are **contract text** a plugin author declares and a distribution reads. A plugin that declares `max_memory_mb = 16` is making a promise to the distribution packager, who decides how to hold the plugin to that promise. A distribution that does not care (for example, a single-tenant A/V appliance with all plugins reviewed first-party) may leave the declarations advisory and unenforced. A distribution that does care (multi-tenant, untrusted third-party plugins, regulated environments) configures its systemd / cgroup / namespace layer to enforce them. The same split applies to deeper isolation (`seccomp`, Linux capabilities, SELinux domains, Android sandbox): distribution-owned, not part of the evo-core admission contract. See `BOUNDARY.md` section 6.2 for the framework-vs-distribution line.
 
-**Reserved** (parsed and preserved in the manifest, but not yet acted on by the steward; the field is published for forward-compat against the future feature that will consult it):
+**Reserved** (parsed and preserved in the manifest, but not acted on by the steward today; the field is published for forward-compatibility against the roadmap feature that will consult it):
 
 - `lifecycle.hot_reload` — `Restart` / `Live` parsed but not acted on; today only `None` (full unload-reload) is operative regardless of declaration. Promoted when the hot-reload supervisor lands.
 - `lifecycle.restart_on_crash` — Parsed for forward-compat; the out-of-process supervisor today reaps a crashed child and deregisters without restarting. Promoted with `restart_budget` when the per-plugin restart supervisor lands.

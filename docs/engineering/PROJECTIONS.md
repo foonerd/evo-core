@@ -199,11 +199,11 @@ Every field in a projection shape declares a composition rule. The catalogue-dec
 | `newest` | Use the contribution with the most recent timestamp. Requires contributions to carry timestamps. |
 | `exclusive` | Exactly one plugin may contribute at a time. A second contribution is a contract violation, logged at `error`. Used for slots where duplication is semantically wrong (the current playback engine's state). |
 
-**Implementation status (v0).** The rules above are the design surface. Today's projection engine
+**Implementation status.** The rules above are the design surface. Today's projection engine
 (`crates/evo/src/projections.rs`) emits a single hard-coded shape covering subject identity, outgoing
 relations, incoming relations, and the deduplicated union of addressing and relation claimants. None
-of the rules in the table is yet exercised by code: the catalogue's projection-shape grammar that
-would declare them per slot is also deferred. The rules are documented here as the contract every
+of the rules in the table is exercised by code today; the catalogue's projection-shape grammar that
+would declare them per slot is on the roadmap. The rules are documented here as the contract every
 future shape will compose against, not as a feature live on the bus today.
 
 ### 6.2 Default Rules By Shape

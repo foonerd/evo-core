@@ -36,9 +36,9 @@ flowchart TD
     Q1 -->|hold sustained work| W{How many<br/>instances?}
 
     R -->|one forever| SR[<b>Singleton<br/>Respondent</b><br/><i>easiest start</i>]
-    R -->|many, event-driven| FR[Factory<br/>Respondent<br/><i>deferred in v0</i>]
+    R -->|many, event-driven| FR[Factory<br/>Respondent<br/><i>reserved</i>]
     W -->|one forever| SW[<b>Singleton<br/>Warden</b>]
-    W -->|many, event-driven| FW[Factory<br/>Warden<br/><i>deferred in v0</i>]
+    W -->|many, event-driven| FW[Factory<br/>Warden<br/><i>reserved</i>]
 
     SR --> T{Transport?}
     SW --> T
@@ -57,7 +57,7 @@ In prose:
 - **Factory Respondent**. Your instances come and go driven by external events; each instance answers requests. Examples: a USB-collection reader (one instance per connected USB drive), a discovered-peer responder (one instance per peer).
 - **Factory Warden**. Your instances come and go, and each holds sustained work. Rarer; a per-connected-client streaming session might fit.
 
-Factory admission is deferred in evo-core v0 (`STEWARD.md` section 12.7). Until it lands, singleton is the only supported instance shape. This document covers Singleton Respondent and Singleton Warden; the factory shapes follow the same tutorial once the steward lands them.
+Factory admission is reserved in evo-core (`STEWARD.md` section 12.7); the steward refuses `kind.instance = "factory"` at validation, and the `[capabilities.factory]` manifest block is parsed but not yet acted on. Singleton is the only supported instance shape today. This document covers Singleton Respondent and Singleton Warden; the factory shapes will follow the same tutorial once admission accepts them.
 
 Orthogonal to the kind, you choose a transport:
 
@@ -526,7 +526,7 @@ course_correction_budget_ms = 1000
 custody_failure_mode = "abort"
 ```
 
-`custody_domain` is a distribution-chosen tag that helps operators and consumers categorise the custody. `custody_exclusive = true` means only one custody may be held at a time; `false` allows multiple. `custody_failure_mode` is `abort` (plugin crashes end the custody) or `retain` (custody survives plugin restart, if persistence supports it; not yet wired).
+`custody_domain` is a distribution-chosen tag that helps operators and consumers categorise the custody. `custody_exclusive = true` means only one custody may be held at a time; `false` allows multiple. `custody_failure_mode` is `abort` (plugin crashes end the custody) or `retain` (custody survives plugin restart). The router enforces `custody_failure_mode` today by logging the chosen mode at every custody-error site; `retain` semantics across a plugin restart additionally require the custody-ledger durability slice from `PERSISTENCE.md` section 20, which is on the roadmap.
 
 ### 6.4 Testing
 

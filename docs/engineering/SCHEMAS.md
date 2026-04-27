@@ -107,7 +107,7 @@ instance_ttl_seconds = <u32>             # required for factories; 0 = no TTL
 | Field | Type | Required | Default | Constraint |
 |-------|------|----------|---------|------------|
 | `shelf` | string | yes | - | Must be a declared shelf in the steward's catalogue. |
-| `shape` | u32 | yes | - | Must **equal** the `shape` of the targeted catalogue shelf. Future range support is not yet in the schema; the slot is a single integer today. |
+| `shape` | u32 | yes | - | Must **equal** the `shape` of the targeted catalogue shelf. Range support is not part of the schema today; the slot is a single integer. |
 
 **[kind]**
 
@@ -272,7 +272,7 @@ The shape documented in §3.2.1 (and refined in §3.2.2/§3.2.3) is schema versi
 - `[[subjects]]` array (optional; defaults to empty).
 - `[[relation]]` array (optional; defaults to empty).
 
-Every other field is per-table as defined below. Future schema versions will be documented as additional `##### Schema version N` subsections, with migration guidance from version N-1.
+Every other field is per-table as defined below. Additional schema versions are documented as further `##### Schema version N` subsections, with migration guidance from version N-1.
 
 #### 3.2.1 Full Shape
 
@@ -357,11 +357,10 @@ Enforced by `Catalogue::validate`:
 8. No predicate name is empty or contains `.`.
 9. If `source_type` or `target_type` is an array, it is non-empty.
 
-Not enforced today but expected to land:
+Roadmap items not enforced today:
 
-- Inverse consistency: if `p.inverse = q`, then `q.inverse = p` and their source/target types are swapped.
+- Inverse consistency: if `p.inverse = q`, then `q.inverse = p` and their source/target types are swapped. (Note: subject-type cross-references and inverse symmetry are validated at catalogue load today; the residual gap here is shelf-shape registry coupling described next.)
 - Shelf shape must match some registered shape schema.
-- Subject-type declarations (the types referenced in `source_type` / `target_type` are not yet validated against any declared subject-type registry).
 
 #### 3.2.4 Example
 
@@ -1787,7 +1786,7 @@ Serialises as a snake_case string.
 | `source` | object | yes | `ExternalAddressing` of the relation's source endpoint. See section 5.3 for the shape. |
 | `predicate` | string | yes | Predicate of the relation. |
 | `target` | object | yes | `ExternalAddressing` of the relation's target endpoint. |
-| `target_new_id_index` | integer (>= 0) | yes | Zero-based index into the operator's `partitions` directive on the surrounding split request. Must be strictly less than `partitions.len()`. The framework maps the index to the freshly-minted canonical ID after the split commits, so operators never need to know UUIDs the framework has not yet generated. Validation runs BEFORE any registry mint; out-of-bounds indices are refused with `SplitTargetNewIdIndexOutOfBounds` and the registry remains untouched. |
+| `target_new_id_index` | integer (>= 0) | yes | Zero-based index into the operator's `partitions` directive on the surrounding split request. Must be strictly less than `partitions.len()`. The framework maps the index to the freshly-minted canonical ID after the split commits, so operators never need to know UUIDs the framework has not minted. Validation runs BEFORE any registry mint; out-of-bounds indices are refused with `SplitTargetNewIdIndexOutOfBounds` and the registry remains untouched. |
 
 The triple `(source, predicate, target)` identifies a single relation in the graph at the time of the split.
 

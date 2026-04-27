@@ -188,8 +188,9 @@ reason = "Different remasters; acoustic fingerprint collides."
 
 # Correct a subject's type. Requires the original claiming plugin
 # to retract and re-announce under the corrected type, OR the
-# cross-plugin type-correction primitive (forthcoming).
-# Status: requires forthcoming primitives.
+# cross-plugin type-correction primitive (on the roadmap).
+# Status: requires the cross-plugin type-correction primitive,
+# which is not part of the current build.
 [[force_type]]
 id = "a1b2c3d4-..."
 type = "album"

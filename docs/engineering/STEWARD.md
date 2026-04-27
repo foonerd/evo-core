@@ -4,7 +4,7 @@ Status: engineering-layer description of the steward process.
 Audience: steward maintainers, plugin authors, consumer authors.
 Vocabulary: per `docs/CONCEPT.md`. Cross-references: `SUBJECTS.md`, `RELATIONS.md`, `PROJECTIONS.md`, `PLUGIN_CONTRACT.md`, `PLUGIN_PACKAGING.md`, `VENDOR_CONTRACT.md`, `LOGGING.md`, `FAST_PATH.md`.
 
-This document describes the steward as it exists today: what it is, how it is structured, how it runs, and which of its responsibilities are fully implemented versus deferred.
+This document describes the steward as it exists today: what it is, how it is structured, how it runs, and which of its responsibilities are fully implemented versus reserved for later work.
 
 Other engineering docs describe individual contracts (subjects, relations, projections, the plugin contract). This one ties them together. If a reader wants to know "what happens when evo starts", "what holds the subject registry", or "where does a plugin's announcement become a consumer's projection", the answer begins here.
 
@@ -16,7 +16,7 @@ The essence statement from `CONCEPT.md` is:
 
 > A device that plays audio from any reachable source, through a configurable audio path, to any present output, while presenting coherent information about what it is doing to any consumer that looks.
 
-The steward is the component that enforces this statement. It owns the catalogue, the subject registry, the relation graph, the projection layer, the admission pipeline, the client-facing socket, the custody ledger, and the happenings bus. The appointments engine and the watches engine from `CONCEPT.md` section 2 remain deferred.
+The steward is the component that enforces this statement. It owns the catalogue, the subject registry, the relation graph, the projection layer, the admission pipeline, the client-facing socket, the custody ledger, the happenings bus, and the SQLite-backed persistence store into which the subject identity slice, the durable happenings log, and the pending-conflicts table write through. The appointments engine and the watches engine from `CONCEPT.md` section 2 are not part of the current build.
 
 Everything else in evo is a plugin, a consumer, a document, or a build artefact. The steward is what runs on the device, and the steward is the thing that knows what the device is doing.
 
@@ -34,7 +34,7 @@ The steward's charter, in order of foundational-to-operational:
 8. Emit happenings for custody transitions on a bus any interested party can subscribe to.
 9. On shutdown: drive every admitted plugin through unload. Release resources. Remove the socket.
 
-These nine are fully implemented. Remaining deferred concepts from `CONCEPT.md` section 2: appointments and watches, persistent state across restarts, factory plugins.
+These nine are fully implemented. The subject identity slice (subjects, addressings, aliases, the claim log), the durable happenings log, and the pending-conflicts table are persisted to SQLite at `/var/lib/evo/state/evo.db` via write-through on every state-changing operation; the persisted rows serve the boot-time orphan diagnostic, the replay-window check on `subscribe_happenings`, and forensic queries. Boot-time rehydration of the in-memory subject registry from those rows is the next slice of persistence work; until it ships, a steward restart re-discovers subjects through normal plugin announcement. Relation, custody, and admin durability also remain on the roadmap (section 12.3). Concepts from `CONCEPT.md` section 2 not part of the current build: appointments and watches, factory plugins.
 
 ## 3. Process Model
 
@@ -112,7 +112,7 @@ AdmissionEngine::admit_out_of_process_from_directory(plugin_dir, runtime_dir, ca
 
 The in-process variants take a constructed plugin instance directly. The low-level out-of-process variants take the reader and writer halves of a pre-established connection and are primarily used by tests that inject in-memory transports. Production callers go through `admit_out_of_process_from_directory`, which reads a manifest from a directory, spawns the plugin binary as a child process, waits for its Unix socket to appear, connects, and branches on `manifest.kind.interaction` to select the respondent or warden path.
 
-Factory admission (`Instance::Factory`) is deferred; v0 supports singleton instances only.
+Factory admission (`Instance::Factory`) is reserved; the steward refuses `kind.instance = "factory"` at validation. Singleton instances are the only supported instance shape today.
 
 ### 5.2 Validation
 
@@ -260,11 +260,11 @@ When a connection handler encounters an I/O error or a malformed frame header, t
 
 ### 6.5 Shutdown
 
-When the shutdown signal fires (section 9), the accept loop exits. In-flight connection tasks are not explicitly joined; they are dropped when the tokio runtime winds down. The socket file is removed on a best-effort basis on exit.
+When the shutdown signal fires (section 9), the accept loop exits. Open connection tasks are not explicitly joined; they are dropped when the tokio runtime winds down. The socket file is removed on a best-effort basis on exit.
 
 ## 7. Plugin-Facing Protocol
 
-Plugins speak the wire protocol defined in `PLUGIN_CONTRACT.md` section 6, implemented by the `evo-plugin-sdk` crate. The steward sees plugins through a uniform trait (`ErasedRespondent` today; warden traits deferred), regardless of transport.
+Plugins speak the wire protocol defined in `PLUGIN_CONTRACT.md` section 6, implemented by the `evo-plugin-sdk` crate. The steward sees plugins through uniform erased traits (`ErasedRespondent` and `ErasedWarden`, both in `crates/evo/src/admission/erasure.rs`), regardless of transport.
 
 ### 7.1 In-Process Plugins
 
@@ -289,7 +289,7 @@ At load time, each plugin receives a `LoadContext`:
 
 | Field | Role |
 |-------|------|
-| `instance_announcer` | Announce factory instances (not yet exercised; factories are deferred). |
+| `instance_announcer` | Announce factory instances (unused today; factory admission is refused at validation and the field is reserved). |
 | `subject_announcer` | Announce and retract subjects. Goes to the shared `SubjectRegistry`. |
 | `relation_announcer` | Assert and retract relations. Goes to the shared `RelationGraph`. |
 | `state_reporter` | Push state reports (logged today; folded into rack projections when those land). |
@@ -312,7 +312,7 @@ The steward owns five long-lived stores, all held as `Arc<T>` and shared between
 
 The admission engine is wrapped in an `Arc<Mutex<AdmissionEngine>>` and shared with the server. The server holds its own `Arc<ProjectionEngine>`.
 
-No store is persisted. Restart yields an empty fabric (section 12.3).
+The subject identity slice (subjects, addressings, aliases, claim log), the durable happenings log, and the pending-conflicts table are persisted to SQLite at `/var/lib/evo/state/evo.db` via write-through on every state-changing operation. The persisted rows serve the boot-time orphan diagnostic, the replay-window check on `subscribe_happenings`, and forensic queries; boot-time rehydration of the in-memory subject registry from those rows is the next slice of persistence work, after which a steward restart will reconstruct the registry directly rather than relying on plugin re-announcement. The relation graph, the custody ledger, and the admin ledger run in memory today and are scheduled for SQLite-backed durability in the same store; section 12.3 names the boundary that remains.
 
 ## 9. Concurrency Model
 
@@ -329,7 +329,7 @@ The steward is asynchronous and single-process. Its concurrency primitives:
 | `tokio::sync::broadcast` | Happenings bus. Multiple consumers, each sees every happening emitted after subscribing; slow consumers get `Lagged` errors and recover. |
 | `tokio::spawn` | Accept loop task, per-connection handler tasks, per-plugin reader/writer tasks for out-of-process plugins. |
 
-The admission engine's mutex serialises admission and shutdown. Per-request handling grabs the admission mutex briefly, fetches the plugin, calls through, and releases. For the current singleton-respondent-only v0 this is not a bottleneck; it will become one when wardens produce high-frequency state reports. The fast path (`FAST_PATH.md`) is how that gets addressed.
+The admission engine's mutex serialises admission and shutdown. Request dispatch lives on the `PluginRouter` (`crates/evo/src/router.rs`) so per-request handling does not need to take the admission mutex; admission and shutdown serialise but request dispatch does not block on either. High-frequency warden state reports flow through the same path, with the fast path (`FAST_PATH.md`) reserved for the real-time mutation channel.
 
 Out-of-process plugin shutdown is serial: one plugin at a time. For a handful of plugins this is fine; for larger plugin sets it will need parallelisation (section 12.1).
 
@@ -382,11 +382,11 @@ The catalogue is a TOML document declaring racks, shelves, slots, and the relati
 
 Catalogue validation runs at steward startup. Malformed catalogues refuse startup with a specific error naming the offending declaration. The steward never writes the catalogue.
 
-## 12. Deferred Capabilities
+## 12. Reserved Capabilities
 
-These are documented in `CONCEPT.md` as fabric-level concepts but are not yet implemented in the steward. Each is named here so the next engineering document can pick it up.
+These are documented in `CONCEPT.md` as fabric-level concepts but are not yet part of the steward's runtime. Each is named here so a follow-on engineering doc can pick it up.
 
-Since this document was first authored, the following capabilities have moved from deferred to implemented: warden admission (in-process and wire), the custody ledger, the custody state reporter, `list_active_custodies` on the client socket, the happenings bus (with custody variants), and the `subscribe_happenings` streaming op.
+Since this document was first authored the following capabilities have shipped: warden admission (in-process and wire), the custody ledger, the custody state reporter, `list_active_custodies` on the client socket, the happenings bus (with custody and subject/relation variants), the `subscribe_happenings` streaming op with replay cursors, the SQLite persistence backend covering subjects/addressings/aliases/claim-log/happenings/pending-conflicts, the unified `ErrorClass` taxonomy on the wire, claimant-token resolution gated by client ACL, and the boot-time orphan diagnostic that diffs persisted subject types against the catalogue.
 
 ### 12.1 Appointments and Watches
 
@@ -394,18 +394,18 @@ Time-originated and condition-originated producers that feed instructions into t
 
 ### 12.2 Happenings Subscription Enrichment
 
-The `subscribe_happenings` op streams every happening from the bus to external consumers (section 6.2). Enrichment beyond v0 is deferred:
+The `subscribe_happenings` op streams every happening from the bus to external consumers (section 6.2). It accepts an optional `since` cursor and emits a `current_seq` ack plus a per-Happening `seq` so consumers can resume after a disconnect; the `[happenings]` config block sizes the retention buffer (`retention_capacity`, default 1024) and the retention window (`retention_window_secs`, default 1800). The following enrichments remain on the roadmap:
 
 - **Server-side filtering**: today a subscriber receives every happening and filters client-side. A filtered subscription (by variant, by plugin, by shelf) becomes attractive as the variant set grows.
 - **Aggregation and coalescing**: high-frequency state reports could be coalesced (at most one `CustodyStateReported` per handle per N ms) to reduce noise for subscribers that only care about coarse transitions.
-- **Additional variants**: the bus carries custody transitions today. Subject/relation/admission events are plausible future additions; the `#[non_exhaustive]` enum and forward-compatible wire shape are ready for them.
-- **Durable replay**: happenings are transient. Persisting a bounded history (for audit or observability) would be its own rack, cross-cut with `HAPPENINGS.md` section 11.4.
+- **Additional variants**: the variant set already covers custody transitions, subject and relation transitions, conflict detection, and degraded-projection causes; further additions land as the consumer needs surface, with the `#[non_exhaustive]` enum and forward-compatible wire shape ready to absorb them.
+- **Durable replay extension**: durable replay is in place via `PersistenceStore::load_happenings_since`; longer retention horizons or a separate observability rack remain a distribution choice.
 
 See `HAPPENINGS.md` section 11 for the full list of enrichment items and design rationales.
 
-### 12.3 Subject, Relation, and Ledger Persistence
+### 12.3 Relation, Custody, and Admin Ledger Persistence
 
-All steward state lives entirely in memory. Restarting the steward yields empty stores. This is fine for a skeleton; it is not fine for a device that must remember "this is the album art I reconciled for subject X" or "this custody was live when we lost power" across a reboot. The engineering question is where the persistence boundary lives (steward-owned sled database, plugin-owned state, hybrid).
+The subject identity slice (`subjects`, `subject_addressings`, `aliases`, `claim_log`), the durable happenings log, and the pending-conflicts table are persisted to SQLite at `/var/lib/evo/state/evo.db` (`PERSISTENCE.md` and the `001_initial.sql` / `002_happenings.sql` / `003_meta.sql` / `004_pending_conflicts.sql` migrations). The relation graph, the custody ledger, and the admin ledger run in memory today; SQLite-backed durability for those three stores is the next piece of the persistence work and lands in the same database file under additional migrations. The chosen boundary is steward-owned SQLite, not plugin-owned state — plugins continue to keep their own state under `/var/lib/evo/plugins/<name>/state/` for their own purposes.
 
 ### 12.4 Shape Version Enforcement
 
@@ -415,15 +415,15 @@ The **range** model (a shelf that admits plugins declaring shape 1 or 2 during a
 
 ### 12.5 Rack-Keyed Projections
 
-Structural queries (`get_projection(rack = "audio")`) are documented in `PROJECTIONS.md` section 3.1 but not yet implemented. They require plugins to push shaped contributions to a state-report channel that the projection engine composes over. The steward-side groundwork (projection engine, subject registry, relation graph) exists; the plugin-facing state-report shape and the composition rules are what remain.
+Structural queries (`get_projection(rack = "audio")`) are documented in `PROJECTIONS.md` section 3.1 but are not part of the current build. They require plugins to push shaped contributions to a state-report channel that the projection engine composes over. The steward-side groundwork (projection engine, subject registry, relation graph) exists; the plugin-facing state-report shape and the composition rules are what remain.
 
 ### 12.6 Fast Path
 
-The real-time mutation channel for parameter changes, transport commands, and volume - see `FAST_PATH.md`. Not yet implemented; the v0 client-facing socket serves everything through the same slow path.
+The real-time mutation channel for parameter changes, transport commands, and volume - see `FAST_PATH.md`. The v0 client-facing socket serves everything through the same slow path; the dedicated low-latency channel remains on the roadmap.
 
 ### 12.7 Factory Plugins
 
-Factory plugins produce variable instances over time (USB drives appearing, peers being discovered). The plugin contract defines `announce_instance` and `retract_instance` verbs. The steward has an `instance_announcer` in `LoadContext` but admission does not yet support factory-kind plugins. Instances would register as separate occupants of their target shelves.
+Factory plugins produce variable instances over time (USB drives appearing, peers being discovered). The plugin contract defines `announce_instance` and `retract_instance` verbs. The steward has an `instance_announcer` in `LoadContext` but admission refuses factory-kind plugins at validation; the `[capabilities.factory]` block in `PLUGIN_PACKAGING.md` is reserved with a documented promotion plan. Instances would register as separate occupants of their target shelves once admission lands.
 
 ### 12.8 User Interaction Routing
 
@@ -479,11 +479,11 @@ Test-specific concurrency caveats worth knowing:
 - Tests using `tokio::io::duplex` with separately-spawned reader and writer tasks must use two unidirectional duplex pairs, not one duplex with `tokio::io::split`. The latter deadlocks.
 - Integration tests touching 5+ async tasks chained through I/O use `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` to avoid starvation on single-threaded runtimes.
 
-Both invariants are documented in the relevant test files and in `WIRE_PROTOCOL.md` (deferred engineering doc).
+Both invariants are documented in the relevant test files; the wire protocol reference itself lives inline in `PLUGIN_CONTRACT.md` section 6 and `SCHEMAS.md` section 8 rather than a separate document.
 
 ## 16. Open Decisions
 
-`CONCEPT.md` section 9 and each engineering doc's closing section name decisions deferred to later layers. Those relevant to the steward specifically:
+`CONCEPT.md` section 9 and each engineering doc's closing section name decisions reserved for later layers. Those relevant to the steward specifically:
 
 | Decision | Where it belongs |
 |----------|------------------|

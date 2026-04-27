@@ -154,7 +154,7 @@ A plugin may choose to use SQLite internally for its own state. That is the plug
 
 ### 5.3 Deliberately not persisted
 
-- **Happenings.** Transient. Subscribers receive happenings emitted after they subscribe; a subscriber that disconnects and reconnects reads from the authoritative stores to reconstruct state and then resumes the stream. Durable replay is gap-worthy but not Phase 3.
+- **Happenings.** Bounded durable trail. The bus keeps a configurable in-memory ring (`[happenings] retention_capacity`, default 1024) and the steward also writes every happening to the SQLite `happenings_log` table; subscribers may pass a `since` cursor to `subscribe_happenings` and the steward will replay through the ring (and through `PersistenceStore::load_happenings_since` once the ring is exhausted) before resuming the live stream. A subscriber that misses the retention window receives a structured `replay_window_exceeded` response carrying the oldest available `seq`.
 - **Projections.** Recomputed on demand. A cached projection is by definition a view over authoritative stores; caching is a performance concern handled separately if ever needed.
 - **Fast-path state.** Fast path (`FAST_PATH.md`) is by definition a low-latency mutation channel; durability is handled by the slow path once the fast-path mutation is committed to the fabric.
 - **Connection pool state.** Obvious but explicit.
@@ -189,31 +189,17 @@ The steward creates new files with these modes and verifies them on every open. 
 
 Which concrete user the steward runs as is a distribution concern, not a framework concern. The framework observes only the effective UID at runtime and the modes on disk; it has no opinion on the user name or how the user came to exist. The distribution's packaging creates the install-time service user, configures the system service unit (systemd, OpenRC, launchd, or whatever the target platform uses) to run the steward as that user, and owns the full choice: a dedicated account named `evo`, a product-named account like `volumio` or `audiokit`, systemd's `DynamicUser=`, a shared service user that predates the evo install, or - in development and certain embedded scenarios - `root`. `PLUGIN_PACKAGING.md` section 5 captures the distribution-side framing ("typical appliances run the whole evo service as a single install-time user"); the boundary split is per `BOUNDARY.md` section 6 ("Packaging" is a distribution concern).
 
-### 6.3 Revisions to other docs
+### 6.3 Cross-references in other docs
 
-Five existing engineering docs carry statements about where steward state lives on disk. Three of them disagree with each other today (different paths for different stores); one defers the question; one lists the parent directory without specifying contents. All five are revised by the persistence landing commit to point at the single `/var/lib/evo/state/evo.db` declared above.
+Other engineering docs that mention where steward state lives on disk all point at the single `/var/lib/evo/state/evo.db` path declared above:
 
-Current (incoherent) state across the docs:
-
-| Doc | Section | Current statement |
-|-----|---------|-------------------|
-| `PLUGIN_PACKAGING.md` | 3 | `/var/lib/evo/state/subjects/` and `/var/lib/evo/state/relations/` as per-store subdirectories |
-| `SUBJECTS.md` | 13.2 ("Location") | *"The registry lives under `/var/lib/evo/subjects/`"* |
-| `RELATIONS.md` | 11.2 ("Location") | *"`/var/lib/evo/relations/`. Distinct from `/var/lib/evo/subjects/` but colocated for backup and atomicity."* |
-| `CUSTODY.md` | 11.1 ("Persistence") | Deferred as an open design question with three candidate boundaries |
-| `BOUNDARY.md` | 9 (filesystem footprint) | *"`/var/lib/evo/` Steward state. Empty today."* |
-
-Post-landing-commit state, uniform across the docs:
-
-| Doc | Section | Revised statement |
-|-----|---------|-------------------|
-| `PLUGIN_PACKAGING.md` | 3 | `/var/lib/evo/state/evo.db` as single SQLite database; cross-reference to `PERSISTENCE.md` |
-| `SUBJECTS.md` | 13.2 | *"The registry is persisted in `/var/lib/evo/state/evo.db`; full contract in `PERSISTENCE.md`."* |
-| `RELATIONS.md` | 11.2 | *"The relation graph is persisted in `/var/lib/evo/state/evo.db` alongside the subject registry and custody ledger; full contract in `PERSISTENCE.md`."* |
-| `CUSTODY.md` | 11.1 | Section rewritten from "deferred" to "persisted alongside subjects and relations in `/var/lib/evo/state/evo.db`; contract in `PERSISTENCE.md`" |
-| `BOUNDARY.md` | 9 | *"`/var/lib/evo/state/` holds the steward's SQLite database; see `PERSISTENCE.md`."* |
-
-Each revision is small and mechanical: a path change plus a single pointer to this document for the full story. The landing commit includes all of them as one atomic edit. No point in the commit history shows the docs agreeing on the wrong path, or disagreeing on the right one.
+| Doc | Section | Statement |
+|-----|---------|-----------|
+| `PLUGIN_PACKAGING.md` | 3 | `/var/lib/evo/state/evo.db` as single SQLite database; cross-reference to `PERSISTENCE.md`. |
+| `SUBJECTS.md` | 13.2 | The subject registry is persisted in `/var/lib/evo/state/evo.db`; full contract in `PERSISTENCE.md`. |
+| `RELATIONS.md` | 11.2 | The relation graph will be persisted in `/var/lib/evo/state/evo.db` alongside the subject registry once the relation-graph durability slice ships; full contract in `PERSISTENCE.md`. |
+| `CUSTODY.md` | 11.1 | Custody ledger destination is `/var/lib/evo/state/evo.db`; the durability slice has not yet shipped (see `PERSISTENCE.md` section 20). |
+| `BOUNDARY.md` | 9 | `/var/lib/evo/state/` holds the steward's SQLite database; see `PERSISTENCE.md`. |
 
 The revised on-disk tree:
 
@@ -466,8 +452,8 @@ A steward running schema version N will apply migrations N+1, N+2, ... up to its
 
 - **Minor version bumps** (for example, `0.1.9` to `0.1.10`) may introduce new migrations that add tables, columns, or indexes. Reading an older database with a newer steward always succeeds (migrations run).
 - **Reading a newer database with an older steward fails hard.** The steward refuses to start rather than operate on a schema it does not understand. This is the industrial-grade stance: silent best-effort operation on an unknown schema is how fabrics get corrupted.
-- **Major version bumps** (for example, `0.x` to `1.0`) may introduce migrations that drop or rename data. The migration itself handles the conversion; no manual operator step is required except on explicitly flagged destructive migrations (none planned for v1).
-- **Downgrades are not supported.** An operator who needs to run an older steward against a newer database must restore from a backup taken before the upgrade. The Phase 3 [7] landing commit adds this statement explicitly to `CONFIG.md` and to the v0.1.9 release notes so operators see it before they hit it.
+- **Major version bumps** (for example, `0.x` to `1.0`) may introduce migrations that drop or rename data. The migration itself handles the conversion; no manual operator step is required except on explicitly flagged destructive migrations (none on the roadmap).
+- **Downgrades are not supported.** An operator who needs to run an older steward against a newer database must restore from a backup taken before the upgrade. `CONFIG.md` and the release notes carry this statement explicitly so operators see it before they hit it.
 
 ### 8.5 Fixture-based migration testing
 
@@ -812,7 +798,7 @@ admin_log = 12
 
 This is the first thing a maintainer diagnosing a field corruption report asks for. Having it written automatically on detection means the report is never "I didn't capture the state, sorry".
 
-### 11.6 Recovery tool (deferred to Phase 3 follow-up)
+### 11.6 Recovery tool (planned follow-up)
 
 A companion binary `evo-recovery` extracts salvageable data from a quarantined database:
 
@@ -1227,37 +1213,39 @@ These hold in every build of the steward and are enforced by the persistence lay
 12. Persisted cardinality violations on startup refuse startup rather than silently carrying on.
 13. A subject soft-forgotten with remaining claimants stays visible; only a subject with zero live claimants is hard-deleted.
 
-## 19. Deferred Decisions
+## 19. Open Questions
 
-Named explicitly so future engineering layers know where the open questions live.
+Named explicitly so a follow-on engineering layer knows where the open questions live.
 
-| Question | Where it will be answered |
-|----------|---------------------------|
-| Custody state history (bounded ring buffer vs last-only) | Future revisit if demand materialises. Current v1: last-only. |
-| Hot revocation without restart | Future revisit. v1: restart-to-apply. |
+| Question | Disposition |
+|----------|-------------|
+| Custody state history (bounded ring buffer vs last-only) | Revisit if demand materialises. Current: last-only. |
+| Hot revocation without restart | Revisit if operational pressure appears. Current: restart-to-apply. |
 | Distributed or replicated persistence | Out of scope; a distribution implementing this would sit above the steward, not inside it. |
-| `evo-recovery` tool | Follow-up commit. Design sketched in section 11.6. |
-| `evo-plugin-tool uninstall --purge` | Future revisit. Section 12.3. |
+| `evo-recovery` tool | Roadmap follow-up. Design sketched in section 11.6. |
+| `evo-plugin-tool uninstall --purge` | Open. Section 12.3. |
 | Projection cache layer | Performance question; only addressed if real devices show projection composition as a bottleneck. |
-| Durable happenings history | `HAPPENINGS.md` section 11.4. |
+| Long-horizon happenings history beyond the configured retention window | Distribution choice; the bus is happy to be a data source for a downstream observability bridge. See `HAPPENINGS.md` section 11.4. |
 | OpenTelemetry export | Distribution choice, not framework choice. |
-| Hot schema migration without restart | Not a planned feature; migrations always happen at startup. |
+| Hot schema migration without restart | Not on the roadmap; migrations always happen at startup. |
 | Read replica connections (for projection-heavy workloads) | Performance question; SQLite WAL supports concurrent readers, and the pool already gives concurrent connections; no replica architecture needed until a benchmark disproves this. |
 
-These are not implementation gaps. They are choices deferred to a later layer because the v1 persistence design does not constrain them and each is large enough to merit its own document when picked up.
+These are not implementation gaps. They are choices held open because the persistence design does not constrain them and each is large enough to merit its own document when picked up.
 
 ## 20. Implementation Status
 
-Phased landing plan, tracked here so a reader of this document knows which sections are live in the current build and which describe the eventual destination.
+Tracked here so a reader of this document knows which sections describe shipped behaviour and which describe the destination still being walked toward.
 
-| Phase | Surface | Status |
-| ----- | ------- | ------ |
-| 1 | `PersistenceStore` trait and SQLite-backed `SqlitePersistenceStore` covering the subject-identity slice of section 7's schema (`subjects`, `subject_addressings`, `aliases`, `claim_log`). Trait carried on `StewardState`; `SqlitePersistenceStore` opened from `StewardConfig::persistence.path` (default `/var/lib/evo/state/evo.db`) by the steward binary. Migrations runner shipped at v1 with reserved version slots for later phases. | Landed (unintegrated). |
-| 2 | Subject-registry write path routed through `PersistenceStore`. Every announce / retract / forget operation lands in SQLite before the in-memory registry returns success. | Pending. |
-| 3 | Boot-time replay. The steward rehydrates the subject registry from `load_all_subjects` on startup; alias chains rejoin via `load_aliases_for`. | Pending. |
-| 4 | Relation graph migration (schema v2), relation-store write path through `PersistenceStore`, on-disk relation cardinality re-validation per section 13.4. | Pending. |
-| 5 | Custody ledger migration (schema v3), custody write path, last-state snapshot persistence. | Pending. |
-| 6 | Admin ledger migration (schema v4), admin operations land in `admin_log`, reversibility primitives walk the persisted log per section 14.5. | Pending. |
-| 7 | Trust re-verification on startup per section 12.1; `plugin_trust_snapshot` table; `trust_quarantine` admin-log entries. | Pending. |
+| Surface | Status |
+| ------- | ------ |
+| `PersistenceStore` trait and SQLite-backed `SqlitePersistenceStore` covering the subject-identity slice of section 7's schema (`subjects`, `subject_addressings`, `aliases`, `claim_log`). Trait carried on `StewardState`; `SqlitePersistenceStore` opened from `StewardConfig::persistence.path` (default `/var/lib/evo/state/evo.db`) by the steward binary. Migrations runner active. | Shipped. |
+| Durable happenings log (`happenings_log` table from migration 002) recording every emitted Happening with a monotonically increasing `seq`; consumers reconnect with a `since` cursor and the bus replays from the SQLite log when the in-memory ring no longer covers the gap. | Shipped. |
+| Pending-conflict surface (`pending_conflicts` table from migration 004) cross-linking each unresolved subject conflict with its addressings and canonical IDs; admin merge marks conflicts resolved as it lands. | Shipped. |
+| Boot-time orphan diagnostic. `PersistenceStore::count_subjects_by_type` powers a startup pass that diffs persisted subject types against the catalogue and emits per-orphan and summary `tracing::warn!` lines. | Shipped. |
+| Subject-registry write path routed through `PersistenceStore`. Every announce / retract / forget operation lands in SQLite before the in-memory registry returns success. | In progress: write path uses `record_subject_*` paths; full boot-time rehydration of the in-memory registry is the next slice. |
+| Relation graph durability (extends schema with `relations`, `relation_claimants`), write path through `PersistenceStore`, on-disk relation cardinality re-validation per section 13.4. | Roadmap. |
+| Custody ledger durability (extends schema with `custodies`, `custody_state`), custody write path, last-state snapshot persistence. | Roadmap. |
+| Admin ledger durability (extends schema with `admin_log`), admin operations recorded persistently, reversibility primitives walk the persisted log per section 14.5. | Roadmap. |
+| Trust re-verification on startup per section 12.1; `plugin_trust_snapshot` table; `trust_quarantine` audit entries. | Roadmap. |
 
-Phase 1 ships the trait, the SQLite implementation, the in-memory mock used by every steward-internal test, and a migrations directory whose initial file (`crates/evo/migrations/001_initial.sql`) creates the four subject-identity tables plus the schema-version metadata. The trait's method shape is schema-aware: each fabric operation maps to one transaction touching every affected table atomically, satisfying the multi-table durability promise from section 4.3 even before any caller is wired through. Subsequent phases append migrations rather than renumber: schema versions 2, 3, and 4 are reserved for the relation graph, custody ledger, and admin ledger respectively.
+The shipped slice ships the trait, the SQLite implementation, the in-memory mock used by every steward-internal test, and a migrations directory (`crates/evo/migrations/{001_initial,002_happenings,003_meta,004_pending_conflicts}.sql`). The trait's method shape is schema-aware: each fabric operation maps to one transaction touching every affected table atomically, satisfying the multi-table durability promise from section 4.3. Future schema additions append new migration files rather than renumber; the `schema_version` table records what has been applied.
