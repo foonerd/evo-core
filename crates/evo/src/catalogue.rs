@@ -780,6 +780,27 @@ charter = "x"
     }
 
     #[test]
+    fn schema_version_at_u32_max_is_rejected() {
+        // Boundary case: `u32::MAX` is the largest value the field
+        // can carry. The validator must reject it with the same
+        // out-of-range diagnostic as `MAX + 1` — the boundary itself
+        // is well-defined, parses cleanly into the field, and tests
+        // that the comparison is "strictly above MAX" rather than
+        // "any value parses". A future widening of the supported
+        // range could accidentally admit `u32::MAX` if the comparison
+        // was loose; this test pins it explicit.
+        let toml = format!("schema_version = {}", u32::MAX);
+        let err = Catalogue::from_toml(&toml)
+            .expect_err("schema_version = u32::MAX must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("schema_version") && msg.contains("out of range"),
+            "error must name the offending field and the rejection \
+             reason, got: {msg}"
+        );
+    }
+
+    #[test]
     fn schema_version_below_min_is_rejected() {
         // schema_version = 0 is below CATALOGUE_SCHEMA_MIN = 1. Same
         // rejection path as above-max; the test pins the symmetric case

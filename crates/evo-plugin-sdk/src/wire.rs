@@ -2019,6 +2019,75 @@ mod tests {
             let back = crate::codec::decode_json(&bytes).expect("decode");
             proptest::prop_assert_eq!(back, frame);
         }
+
+        /// Malformed-bytes fuzz: arbitrary byte sequences (most of
+        /// which are not valid JSON, and of those that ARE valid JSON
+        /// most do not satisfy any `WireFrame` variant) MUST be
+        /// rejected by `decode_json` cleanly — Result-typed error,
+        /// not a panic, not an infinite loop, not a buffer overrun.
+        /// The handshake is the entry point a malicious peer is most
+        /// motivated to attack, so a malformed-bytes property at the
+        /// codec boundary is the audit's load-bearing fuzz target.
+        /// Generating up to 4 KiB so the strategy can produce
+        /// well-formed JSON envelopes by chance and exercise the
+        /// field-mismatch path as well as the "not even JSON" path.
+        #[test]
+        fn decode_json_rejects_arbitrary_bytes_without_panicking(
+            bytes in proptest::collection::vec(
+                proptest::prelude::any::<u8>(),
+                0..4096,
+            )
+        ) {
+            // The contract is "no panic". Whether a given byte
+            // sequence happens to parse as a valid `WireFrame` is
+            // irrelevant; the property is that the decoder is total
+            // over arbitrary inputs.
+            let _ = crate::codec::decode_json(&bytes);
+        }
+
+        /// Hello-shaped malformed input fuzz: starts from a
+        /// well-formed Hello frame, swaps the codec list and
+        /// version-range bounds for arbitrary garbage, and asserts
+        /// the decoder either rejects cleanly OR produces a
+        /// well-formed `WireFrame` whose envelope is consistent.
+        /// Pinning the path because the Hello handshake's
+        /// `codecs: Vec<String>` and `feature_min`/`feature_max:
+        /// u16` are the largest attack surface a malformed-Hello
+        /// attack would aim at: a Vec of arbitrary strings, two
+        /// integers an attacker controls.
+        #[test]
+        fn decode_json_handles_hello_shaped_garbage(
+            cid in proptest::prelude::any::<u64>(),
+            plugin in "[a-z]{1,32}",
+            feature_min in proptest::prelude::any::<u16>(),
+            feature_max in proptest::prelude::any::<u16>(),
+            codecs in proptest::collection::vec(
+                "[a-zA-Z0-9_.-]{0,32}",
+                0..16,
+            ),
+        ) {
+            // Construct the JSON form by hand so the test exercises
+            // the decoder's tolerance for legitimately-shaped Hello
+            // frames whose field values are otherwise unconstrained.
+            let json = serde_json::json!({
+                "type": "hello",
+                "v": PROTOCOL_VERSION,
+                "cid": cid,
+                "plugin": plugin,
+                "feature_min": feature_min,
+                "feature_max": feature_max,
+                "codecs": codecs,
+            });
+            let bytes = serde_json::to_vec(&json).expect("serialise json");
+            // Either decode succeeds (in which case the envelope
+            // round-trips) or fails (in which case it's a clean
+            // error). No third option.
+            if let Ok(frame) = crate::codec::decode_json(&bytes) {
+                let (v, decoded_cid, _plugin) = frame.envelope();
+                proptest::prop_assert_eq!(v, PROTOCOL_VERSION);
+                proptest::prop_assert_eq!(decoded_cid, cid);
+            }
+        }
     }
 
     fn arbitrary_wireframe(
