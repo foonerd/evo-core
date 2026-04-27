@@ -1494,22 +1494,230 @@ fn load_trust_root_partial_load_fails_loud_naming_offending_file() {
 /// Revoking a key in the middle of a chain MUST cause a bundle
 /// signed by a leaf below the revoked key to fail verification.
 ///
-/// The current revocation surface (`RevocationSet`) only carries
-/// install digests, NOT key revocations. Implementing key
-/// revocation requires a new revocation entry kind (or an extended
-/// schema for the existing file). That work is out of scope here;
-/// the test is recorded so the gap is visible, and is `#[ignore]`'d
-/// so CI does not fail until the surface lands.
+/// Fixture: a three-tier chain `proj_root` → `dist_root` → `vendor`,
+/// with the bundle signed by `vendor`. The middle key (`dist_root`)
+/// is added to the revocation set by its `SHA-256` fingerprint.
+/// `validate_chain` walks every key from leaf upward, calling
+/// `check_revoked` at each step; the walk MUST refuse the chain when
+/// it reaches the revoked `dist_root`, regardless of the leaf's
+/// validity, so revoking one mid-chain key invalidates every
+/// descendant in one stroke.
 #[test]
-#[ignore = "key-revocation surface not implemented; install-digest \
-            revocation only (RevocationSet::digests). Re-enable when \
-            a key-revocation entry kind is added."]
 fn revoked_distribution_key_invalidates_descendant_chain() {
-    // Placeholder body so the harness still compiles; when key
-    // revocation lands the body becomes:
-    //   1. Install root → distribution → vendor chain.
-    //   2. Sign a bundle with vendor.
-    //   3. Add `distribution.key_id` to the revocation set.
-    //   4. Verify must fail with the appropriate error.
-    panic!("key-revocation surface not implemented yet");
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+
+    let proj_root = sign_key([0xE1; 32]);
+    let dist_root = sign_key([0xE2; 32]);
+    let vendor = sign_key(KEY_A_SEED);
+
+    write_bundle(plugin_dir.path(), b"artefact-bytes");
+    // Bundle is signed by the vendor (the leaf).
+    write_signature(plugin_dir.path(), &vendor);
+
+    install_key_full(
+        trust_opt.path(),
+        "proj_root",
+        &proj_root,
+        &["*"],
+        "platform",
+        Some("proj_root"),
+        None,
+        None,
+        Some("project_root"),
+        None,
+        None,
+    );
+    install_key_full(
+        trust_opt.path(),
+        "dist_root",
+        &dist_root,
+        &["*"],
+        "platform",
+        Some("dist_root"),
+        Some("proj_root"),
+        None,
+        Some("distribution_root"),
+        None,
+        None,
+    );
+    install_key_full(
+        trust_opt.path(),
+        "vendor",
+        &vendor,
+        &["org.example.*"],
+        "platform",
+        Some("vendor_a"),
+        Some("dist_root"),
+        None,
+        Some("vendor"),
+        None,
+        None,
+    );
+
+    let keys = load_trust_root(trust_opt.path(), trust_etc.path()).unwrap();
+    assert_eq!(keys.len(), 3);
+
+    // Sanity: without the revocation, the chain admits the bundle.
+    let paths = BundlePaths::for_dir(plugin_dir.path());
+    let bundle = paths.bundle("org.example.echo", TrustClass::Standard);
+    verify_out_of_process_bundle(
+        &bundle,
+        &keys,
+        &RevocationSet::default(),
+        permissive_opts(),
+    )
+    .expect("baseline: chain admits bundle when no key revoked");
+
+    // Revoke the middle key by writing a `revocations.toml` with a
+    // `key_fingerprint` entry pointing at `dist_root`'s public key
+    // SHA-256, then loading via the production parser. This
+    // exercises the full surface — file format, parser,
+    // `RevocationSet::is_key_revoked` — that the verifier uses.
+    let dist_fp_hex = sha256_hex(dist_root.verifying_key().as_bytes());
+    let revocations_path = trust_etc.path().join("revocations.toml");
+    std::fs::write(
+        &revocations_path,
+        format!(
+            "[[revoke]]\n\
+             key_fingerprint = \"sha256:{dist_fp_hex}\"\n\
+             reason = \"distribution_root key compromised\"\n",
+        ),
+    )
+    .unwrap();
+    let revocations = RevocationSet::load(&revocations_path)
+        .expect("revocations.toml with key_fingerprint must load cleanly");
+
+    let res = verify_out_of_process_bundle(
+        &bundle,
+        &keys,
+        &revocations,
+        permissive_opts(),
+    );
+    match res {
+        Err(TrustError::Revoked(detail)) => {
+            assert!(
+                detail.contains("dist_root"),
+                "Revoked message must name the revoked key, got: {detail}"
+            );
+            assert!(
+                detail.contains(&dist_fp_hex),
+                "Revoked message must carry the fingerprint that matched, got: {detail}"
+            );
+        }
+        other => panic!(
+            "expected Revoked from mid-chain key revocation, got {other:?}"
+        ),
+    }
+}
+
+/// Revoking the leaf signing key directly (not a mid-chain ancestor)
+/// MUST also fail verification. The chain walk visits the leaf as
+/// the first step, so this is the same code path as the mid-chain
+/// case but with a different revoked position.
+#[test]
+fn revoked_leaf_key_fails_verification() {
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+    let key = sign_key(KEY_A_SEED);
+
+    write_bundle(plugin_dir.path(), b"artefact-bytes");
+    write_signature(plugin_dir.path(), &key);
+    install_key(
+        trust_opt.path(),
+        "vendor",
+        &key,
+        &["org.example.*"],
+        "platform",
+    );
+
+    let keys = load_trust_root(trust_opt.path(), trust_etc.path()).unwrap();
+    let paths = BundlePaths::for_dir(plugin_dir.path());
+    let bundle = paths.bundle("org.example.echo", TrustClass::Standard);
+
+    let leaf_fp_hex = sha256_hex(key.verifying_key().as_bytes());
+    let revocations_path = trust_etc.path().join("revocations.toml");
+    std::fs::write(
+        &revocations_path,
+        format!(
+            "[[revoke]]\n\
+             key_fingerprint = \"sha256:{leaf_fp_hex}\"\n",
+        ),
+    )
+    .unwrap();
+    let revocations = RevocationSet::load(&revocations_path).unwrap();
+
+    let res = verify_out_of_process_bundle(
+        &bundle,
+        &keys,
+        &revocations,
+        permissive_opts(),
+    );
+    assert!(
+        matches!(res, Err(TrustError::Revoked(_))),
+        "expected Revoked on leaf-key revocation, got {res:?}"
+    );
+}
+
+/// Revoking an unrelated key (not in the bundle's chain) MUST NOT
+/// affect verification. The chain walk only visits the leaf and its
+/// ancestors; a revoked key the bundle's chain does not touch is a
+/// no-op for that bundle.
+#[test]
+fn revoking_unrelated_key_does_not_affect_unrelated_bundle() {
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+    let signing = sign_key(KEY_A_SEED);
+    let other = sign_key(KEY_B_SEED);
+
+    write_bundle(plugin_dir.path(), b"artefact-bytes");
+    write_signature(plugin_dir.path(), &signing);
+    install_key(
+        trust_opt.path(),
+        "signing",
+        &signing,
+        &["org.example.*"],
+        "platform",
+    );
+    // `other` is in the trust set but does not sign and is not in
+    // any chain the bundle walks. Revoking it must not bleed into
+    // the bundle's outcome.
+    install_key(
+        trust_opt.path(),
+        "other",
+        &other,
+        &["org.unrelated.*"],
+        "platform",
+    );
+
+    let keys = load_trust_root(trust_opt.path(), trust_etc.path()).unwrap();
+    let other_fp_hex = sha256_hex(other.verifying_key().as_bytes());
+    let revocations_path = trust_etc.path().join("revocations.toml");
+    std::fs::write(
+        &revocations_path,
+        format!(
+            "[[revoke]]\n\
+             key_fingerprint = \"sha256:{other_fp_hex}\"\n",
+        ),
+    )
+    .unwrap();
+    let revocations = RevocationSet::load(&revocations_path).unwrap();
+
+    let paths = BundlePaths::for_dir(plugin_dir.path());
+    let bundle = paths.bundle("org.example.echo", TrustClass::Standard);
+    verify_out_of_process_bundle(
+        &bundle,
+        &keys,
+        &revocations,
+        permissive_opts(),
+    )
+    .expect("revoking an unrelated key must not affect this bundle");
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
 }

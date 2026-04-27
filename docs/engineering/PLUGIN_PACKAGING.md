@@ -443,13 +443,31 @@ At plugin admission, the steward:
 `/etc/evo/revocations.toml`:
 
 ```toml
+# Revoke a specific bundle by its install digest.
 [[revoke]]
 digest = "sha256:..."                  # Install digest.
 reason = "CVE-2026-1234"
 effective_after = "2026-04-01T00:00:00Z"
+
+# Revoke a trust key by its public-key fingerprint. Any bundle
+# signed by a chain that walks through this key — leaf, ancestor,
+# or root — is refused.
+[[revoke]]
+key_fingerprint = "sha256:..."         # SHA-256 of the raw ed25519 public key bytes.
+reason = "vendor key compromised"
 ```
 
-Revocations are checked at every plugin load and at every admission. The loader is **strict**: any `[[revoke]]` entry whose `digest` is not the literal form `sha256:` followed by 64 lowercase hex characters aborts the load with a structured error naming the offending entry's 1-based index. A typo on a revocation line is surfaced at boot rather than silently leaving the corresponding bundle admissible.
+Each `[[revoke]]` entry specifies **exactly one** of `digest` or `key_fingerprint`. An entry with neither, or with both, fails the load.
+
+The `key_fingerprint` is the SHA-256 of the raw 32-byte ed25519 public key. It is the same value the optional `fingerprint` field in `*.meta.toml` declares; an operator with a sidecar in hand can copy that value directly. To compute it from a `.pem`:
+
+```bash
+openssl pkey -in vendor.pem -pubin -outform DER | tail -c 32 | sha256sum
+```
+
+Revocation by key fingerprint is checked at every step of the chain walk: a revoked key invalidates every descendant chain that walks through it, so revoking one mid-chain key removes admission for every leaf below it without needing to enumerate the leaves.
+
+Revocations are checked at every plugin load and at every admission. The loader is **strict**: any `[[revoke]]` entry whose `digest` or `key_fingerprint` is not the literal form `sha256:` followed by 64 lowercase hex characters aborts the load with a structured error naming the offending entry's 1-based index. A typo on a revocation line is surfaced at boot rather than silently leaving the corresponding bundle or key admissible.
 
 Sidecar `*.meta.toml` files and the `revocations.toml` file both reject **unknown fields and unknown tables** at parse time. A typo such as `[authorization]` instead of `[authorisation]`, or `digestt` instead of `digest`, fails the load loudly with the unknown name in the error message.
 

@@ -43,6 +43,7 @@ use std::time::SystemTime;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::Verifier;
 use evo_plugin_sdk::manifest::TrustClass;
+use sha2::{Digest, Sha256};
 
 use crate::digest::install_digest;
 use crate::error::TrustError;
@@ -177,7 +178,7 @@ pub fn verify_out_of_process_bundle_at(
         .find(|k| matches_role(k, KeyRole::OperatorRoot))
     {
         check_window(op, now_dt)?;
-        validate_chain(op, keys, now_dt)?;
+        validate_chain(op, keys, revocations, now_dt)?;
         return finalise(op, bundle, opt);
     }
 
@@ -185,7 +186,7 @@ pub fn verify_out_of_process_bundle_at(
     // whose chain is intact authorises the bundle.
     let mut last_err: Option<TrustError> = None;
     for leaf in &signers {
-        match validate_chain(leaf, keys, now_dt) {
+        match validate_chain(leaf, keys, revocations, now_dt) {
             Ok(()) => {
                 if !name_matches_prefixes(
                     bundle.plugin_name,
@@ -200,24 +201,33 @@ pub fn verify_out_of_process_bundle_at(
                 return finalise(leaf, bundle, opt);
             }
             Err(e) => {
-                // If a rotation predecessor of this leaf would
-                // accept the bundle within the overlap window,
-                // honour that. The bundle's effective authorisation
-                // is the intersection of the OLD (signing) key's
-                // and the NEW (succeeding) key's authorisations:
-                // the OLD key's grant is what the operator actually
-                // signed off on, clamped by whatever the NEW key
-                // still permits today. This prevents an operator
-                // who widens authorisation across a rotation from
-                // transiently inheriting the broader grant for
-                // bundles signed only by the OLD key during the
-                // overlap window.
-                if let Some(rot) = rotation_window_accepts(leaf, keys, now_dt) {
-                    match finalise_intersection(leaf, rot, bundle, opt) {
-                        Ok(outcome) => return Ok(outcome),
-                        Err(rot_err) => {
-                            last_err = Some(rot_err);
-                            continue;
+                // A `Revoked` error from the chain walk MUST NOT be
+                // overridden by a rotation predecessor: a revoked
+                // ancestor invalidates every descendant chain that
+                // walks through it, including the rotation path.
+                // For any other failure (window expiry, role
+                // mismatch, missing parent), if a rotation
+                // predecessor accepts the bundle inside the overlap
+                // window, honour it. The bundle's effective
+                // authorisation is the intersection of the OLD
+                // (signing) key's and the NEW (succeeding) key's
+                // authorisations: the OLD key's grant is what the
+                // operator actually signed off on, clamped by
+                // whatever the NEW key still permits today. This
+                // prevents an operator who widens authorisation
+                // across a rotation from transiently inheriting the
+                // broader grant for bundles signed only by the OLD
+                // key during the overlap window.
+                if !matches!(e, TrustError::Revoked(_)) {
+                    if let Some(rot) =
+                        rotation_window_accepts(leaf, keys, revocations, now_dt)
+                    {
+                        match finalise_intersection(leaf, rot, bundle, opt) {
+                            Ok(outcome) => return Ok(outcome),
+                            Err(rot_err) => {
+                                last_err = Some(rot_err);
+                                continue;
+                            }
                         }
                     }
                 }
@@ -257,18 +267,53 @@ fn check_window(k: &TrustKey, now: DateTime<Utc>) -> Result<(), TrustError> {
     Ok(())
 }
 
+/// SHA-256 fingerprint of the raw ed25519 public key bytes. Stable
+/// across `key_id` renames and across sidecar edits, so it is the
+/// canonical identity used by the revocation surface.
+fn key_fingerprint(k: &TrustKey) -> [u8; 32] {
+    let h = Sha256::digest(k.verifying.as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.as_slice());
+    out
+}
+
+/// Refuse the chain step if the key's fingerprint is in the
+/// revocation set. Surfaces [`TrustError::Revoked`] naming the
+/// revoked key so the operator sees which entry in the trust set
+/// matched.
+fn check_revoked(
+    k: &TrustKey,
+    revocations: &RevocationSet,
+) -> Result<(), TrustError> {
+    let fp = key_fingerprint(k);
+    if revocations.is_key_revoked(&fp) {
+        return Err(TrustError::Revoked(format!(
+            "trust key {} ({})",
+            k.basename,
+            RevocationSet::display_digest(&fp)
+        )));
+    }
+    Ok(())
+}
+
 /// Walk parent chain from `leaf` upward via `signed_by` → `key_id`,
-/// validating window and role at each step, terminating at a root
-/// (`signed_by = None`). Bounded by [`MAX_CHAIN_DEPTH`].
+/// validating window, role, and revocation status at each step,
+/// terminating at a root (`signed_by = None`). Bounded by
+/// [`MAX_CHAIN_DEPTH`]. A revocation hit on any walked key — leaf,
+/// any ancestor, or the root itself — fails the chain so an operator
+/// who revokes a mid-chain key invalidates every descendant in one
+/// stroke without needing to enumerate the descendants.
 fn validate_chain(
     leaf: &TrustKey,
     all: &[TrustKey],
+    revocations: &RevocationSet,
     now: DateTime<Utc>,
 ) -> Result<(), TrustError> {
     let mut cur: &TrustKey = leaf;
     let mut depth = 0usize;
     loop {
         check_window(cur, now)?;
+        check_revoked(cur, revocations)?;
         let parent_id = match cur.meta.key.signed_by.as_deref() {
             Some(p) => p,
             None => return Ok(()),
@@ -327,11 +372,13 @@ fn parent_can_sign_child(parent: KeyRole, child: KeyRole) -> bool {
 /// If the trust set contains a key that supersedes `leaf` (or that
 /// `leaf` supersedes), and the verification timestamp is inside the
 /// overlap window, return that key. The returned key's chain is
-/// validated against `now` so the rotation does not silently admit
-/// a key whose own parent has expired.
+/// validated against `now` and the revocation set so the rotation
+/// does not silently admit a key whose own parent has expired or
+/// been revoked.
 fn rotation_window_accepts<'a>(
     leaf: &TrustKey,
     all: &'a [TrustKey],
+    revocations: &RevocationSet,
     now: DateTime<Utc>,
 ) -> Option<&'a TrustKey> {
     // `leaf` is the OLD key, and a NEW key declares
@@ -342,7 +389,7 @@ fn rotation_window_accepts<'a>(
     all.iter().find(|cand| {
         cand.meta.key.supersedes.as_deref() == Some(leaf.key_id.as_str())
             && in_overlap_window(leaf, cand, now)
-            && validate_chain(cand, all, now).is_ok()
+            && validate_chain(cand, all, revocations, now).is_ok()
     })
 }
 
