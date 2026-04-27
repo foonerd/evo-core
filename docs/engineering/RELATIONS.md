@@ -153,7 +153,7 @@ If any of the addressings do not resolve to existing subjects, the steward:
 1. Registers the missing subject(s) if the relevant rack's resolution policy allows (per `SUBJECTS.md` section 5.3).
 2. Otherwise rejects the assertion with a `SubjectUnknown` error.
 
-If the predicate name is not declared in the current catalogue, the assertion is refused with `Invalid` before addressing resolution runs. Retraction applies the same check symmetrically: an undeclared predicate on retract is a caller bug (the matching assert would itself have been refused) and is rejected at the same error surface. Type-constraint enforcement against the predicate's `source_type` / `target_type` runs symmetrically against the resolved subjects; see section 3.5 for the full enforcement picture.
+If the predicate name is not declared in the current catalogue, the assertion is refused with `UnknownPredicate { predicate }` (top-level class `contract_violation`, subclass `unknown_predicate`, extras `{"predicate": "..."}`) before addressing resolution runs. Retraction applies the same check symmetrically: an undeclared predicate on retract is a caller bug (the matching assert would itself have been refused) and is rejected at the same error surface. Type-constraint enforcement against the predicate's `source_type` / `target_type` runs symmetrically against the resolved subjects; see section 3.5 for the full enforcement picture.
 
 ### 4.2 Multi-Claimant Model
 

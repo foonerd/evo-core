@@ -11,16 +11,20 @@ repository.workspace = true
 evo-plugin-sdk = { path = "../evo-plugin-sdk" }
 ed25519-dalek = { version = "2.1", features = ["std", "pkcs8", "pem", "alloc"] }
 sha2 = "0.10"
+blake3 = "1"
 hex = { version = "0.4", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "1"
 regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+subtle = { version = "2", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
 sha2 = "0.10"
 pkcs8 = { version = "0.10", features = ["pem"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [lints]
 workspace = true

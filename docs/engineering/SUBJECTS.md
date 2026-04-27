@@ -239,7 +239,7 @@ announce(
 4. If no addressings resolve: a new canonical ID is generated and all addressings are registered to it.
 5. If addressings resolve to different canonical IDs: see reconciliation (section 9).
 
-**Enforcement status.** Before step 1 runs, `RegistrySubjectAnnouncer` validates that the announced `subject_type` is one the catalogue declares. An undeclared type is refused with `Invalid("announce: subject type ... is not declared in the catalogue")` and the subject registry is not touched; nothing reaches the resolve path. Retraction carries no subject type and skips this check. See section 4.1 for the catalogue-load-time half of the subject-type enforcement picture.
+**Enforcement status.** Before step 1 runs, `RegistrySubjectAnnouncer` validates that the announced `subject_type` is one the catalogue declares. An undeclared type is refused with `UnknownSubjectType { subject_type }` (top-level class `contract_violation`, subclass `unknown_subject_type`, extras `{"subject_type": "..."}`) and the subject registry is not touched; nothing reaches the resolve path. Retraction carries no subject type and skips this check. See section 4.1 for the catalogue-load-time half of the subject-type enforcement picture.
 
 ### 7.4 Claimant Tracking
 
@@ -427,7 +427,7 @@ All provenance is retained for the life of the subject. Deleted subjects retain 
 
 In-steward operator-override channels (a file or admin socket the steward reads as a parallel source of truth to plugin claims) are out of scope for the framework. Operator-facing correction tooling is built by a distribution as an administration plugin composing framework primitives.
 
-Today's primitives cover most administrative corrections. Equivalence corrections work via same-plugin retract + re-announce per section 7.5 and counter-claims at higher confidence per section 9.2 precedence. Cross-plugin retract (when the claiming plugin cannot or will not cooperate) is realised through `SubjectAdmin::forced_retract_addressing` per section 7.5. Merge and split are realised through `SubjectAdmin::merge` and `::split` per section 10. The remaining gap is subject-type correction the administration plugin did not originate; that primitive is forthcoming.
+Today's primitives cover most administrative corrections. Equivalence corrections work via same-plugin retract + re-announce per section 7.5 and counter-claims at higher confidence per section 9.2 precedence. Cross-plugin retract (when the claiming plugin cannot or will not cooperate) is realised through `SubjectAdmin::forced_retract_addressing` per section 7.5. Merge and split are realised through `SubjectAdmin::merge` and `::split` per section 10. The remaining gap is subject-type correction the administration plugin did not originate; that primitive is on the roadmap.
 
 `BOUNDARY.md` section 6.1 is the authoritative document for this split. It describes the administration-plugin pattern and carries a reference override-file schema whose directives are annotated with their implementation status against the as-shipped framework. Specifications previously drafted in this section have been relocated there.
 
@@ -435,17 +435,18 @@ Today's primitives cover most administrative corrections. Equivalence correction
 
 ### 13.1 What Persists
 
-The entire registry persists across steward restarts:
+Subject identity is the durable part of the registry today:
 
-- Subject records (ID, type, addressings, timestamps).
-- Provenance records.
-- Alias records from past merges and splits.
+- Subject records (ID, type, addressings, timestamps) — written through `PersistenceStore` to the SQLite `subjects` and `subject_addressings` tables.
+- Provenance records — captured as `claim_log` rows on every announce, retract, merge, split, and forget.
+- Alias records from past merges and splits — written to the `aliases` table and walkable through `describe_alias`.
+- Pending conflicts — captured in the `pending_conflicts` table (migration 004) cross-linking the addressings and canonical IDs involved, marked resolved when an admin merge closes them.
 
 Plugin-internal state is NOT in this scope; plugins manage their own persistence under their per-plugin state directory per `PLUGIN_PACKAGING.md` section 3.
 
 ### 13.2 Location
 
-The subject registry is persisted in `/var/lib/evo/state/evo.db` alongside the relation graph and custody ledger. The full contract - schema, migrations, durability, permissions, crash recovery - is in `PERSISTENCE.md`. Implementation is pending; the current codebase holds the registry in memory until that code lands.
+The subject registry is persisted in `/var/lib/evo/state/evo.db` alongside the durable happenings log and the pending-conflicts table. The full contract - schema, migrations, durability, permissions, crash recovery - is in `PERSISTENCE.md`. The relation graph and custody ledger run in memory today and are scheduled to land in the same database file under additional migrations (`PERSISTENCE.md` section 20). Boot-time rehydration of the in-memory registry from `load_all_subjects` is the next slice of work; until it ships, a steward restart re-discovers subjects through normal plugin announcement and the persisted rows serve the boot-time orphan diagnostic and forensic queries.
 
 ### 13.3 Durability Requirements
 
@@ -477,15 +478,20 @@ The fabric's notification stream (per `CONCEPT.md`) carries subject events along
 | `SubjectForgotten` | A subject's last addressing was retracted and the registry record was removed. Carries the canonical ID, subject type, and retracting plugin. Fires BEFORE the cascade `RelationForgotten` events for the same forget. |
 | `SubjectAddressingForcedRetract` | An administration plugin force-retracted an addressing claimed by another plugin. Carries admin plugin, target plugin, canonical ID, scheme, value, reason, timestamp. Fires BEFORE any `SubjectForgotten` / `RelationForgotten` cascade the retract triggers. |
 
-**Future variants** (named here for cross-reference; not yet on the bus):
+**Also currently emitted** (cross-reference):
 
 | Happening | Fired when |
 |-----------|------------|
-| `SubjectAnnounced` | A new canonical ID is minted at first registry insertion. Today subscribers infer "new subject" by observing the first projection. Future expansion per `HAPPENINGS.md` §3.3. |
+| `SubjectConflictDetected` | Reconciliation encountered a conflict it could not resolve automatically. Carries the plugin, the addressings involved, the canonical IDs they each resolve to, and the timestamp. The registry also records the conflict in the `pending_conflicts` table (migration 004); admin merge cross-links and marks the conflict resolved on close. |
+
+**Roadmap variants** (named here for cross-reference; not yet on the bus):
+
+| Happening | Fired when |
+|-----------|------------|
+| `SubjectAnnounced` | A new canonical ID is minted at first registry insertion. Today subscribers infer "new subject" by observing the first projection. Roadmap expansion per `HAPPENINGS.md` §3.3. |
 | `SubjectAddressingAdded` | An existing subject gains a new addressing. Tracing-only today. |
 | `SubjectAddressingRemoved` | An addressing is removed from a subject (plugin retraction, operator forget). Tracing-only today. |
-| `SubjectConflict` | Reconciliation encountered a conflict it could not resolve automatically. The registry today records this internally as a `MultiSubjectConflict` claim ledger entry; no bus happening fires. Future expansion. |
-| `SubjectTypeChanged` | An operator override changed a subject's declared type. Future expansion alongside subject-type correction per section 11. |
+| `SubjectTypeChanged` | An operator override changed a subject's declared type. Roadmap expansion alongside subject-type correction per section 11. |
 
 Happenings are the primary mechanism by which consumers stay current with subject state. Projections are point-in-time; happenings let consumers invalidate cached projections when the underlying subject changes.
 

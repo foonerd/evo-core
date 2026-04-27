@@ -131,6 +131,30 @@ impl PluginError {
             source: Box::new(source),
         }
     }
+
+    /// Map this error onto its cross-boundary
+    /// [`ErrorClass`](crate::error_taxonomy::ErrorClass).
+    ///
+    /// The mapping is total and lossless at the class level: every
+    /// variant has exactly one class, every class is reachable from
+    /// some variant. Subclass detail (e.g. distinguishing
+    /// `Unauthorized` from `Permanent` within `ContractViolation`)
+    /// can be carried as a `details.subclass` field on the wire
+    /// envelope; this method returns only the top-level class.
+    pub fn class(&self) -> crate::error_taxonomy::ErrorClass {
+        use crate::error_taxonomy::ErrorClass;
+        match self {
+            PluginError::Transient(_) => ErrorClass::Transient,
+            PluginError::Timeout { .. } => ErrorClass::Transient,
+            PluginError::Permanent(_) => ErrorClass::ContractViolation,
+            PluginError::Unauthorized(_) => ErrorClass::PermissionDenied,
+            PluginError::ResourceExhausted { .. } => {
+                ErrorClass::ResourceExhausted
+            }
+            PluginError::Internal { .. } => ErrorClass::Internal,
+            PluginError::Fatal { .. } => ErrorClass::Internal,
+        }
+    }
 }
 
 #[cfg(test)]

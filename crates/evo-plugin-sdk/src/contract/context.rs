@@ -330,6 +330,60 @@ pub enum ReportError {
         /// indices are `0..partition_count`.
         partition_count: usize,
     },
+    /// A relation assertion or retraction named a predicate that the
+    /// catalogue did not declare. Surfaces the offending predicate
+    /// name so consumers can diagnose without scraping a free-form
+    /// string. Wiring-layer refusal: refused before the relation
+    /// graph is touched.
+    #[error("predicate {predicate:?} is not declared in the catalogue")]
+    UnknownPredicate {
+        /// The (unknown) predicate name from the assertion or
+        /// retraction.
+        predicate: String,
+    },
+    /// A subject announcement named a subject type that the catalogue
+    /// did not declare. Surfaces the offending type name so consumers
+    /// can diagnose without scraping a free-form string. Wiring-layer
+    /// refusal: refused before the registry is touched.
+    #[error("subject type {subject_type:?} is not declared in the catalogue")]
+    UnknownSubjectType {
+        /// The (unknown) subject type name from the announcement.
+        subject_type: String,
+    },
+}
+
+impl ReportError {
+    /// Map this error onto its cross-boundary
+    /// [`ErrorClass`](crate::error_taxonomy::ErrorClass).
+    ///
+    /// The mapping is total: every variant has exactly one class.
+    /// Subclass detail (e.g. distinguishing `MergeSelfTarget` from
+    /// `MergeCrossType` within `ContractViolation`) is for callers
+    /// that want to populate `details.subclass` on the wire
+    /// envelope; this method returns only the top-level class.
+    pub fn class(&self) -> crate::error_taxonomy::ErrorClass {
+        use crate::error_taxonomy::ErrorClass;
+        match self {
+            ReportError::RateLimited => ErrorClass::ResourceExhausted,
+            ReportError::ShuttingDown => ErrorClass::Unavailable,
+            ReportError::Deregistered => ErrorClass::Unavailable,
+            ReportError::Invalid(_) => ErrorClass::ContractViolation,
+            ReportError::TargetPluginUnknown { .. } => ErrorClass::NotFound,
+            ReportError::MergeSelfTarget => ErrorClass::ContractViolation,
+            ReportError::MergeSourceUnknown { .. } => ErrorClass::NotFound,
+            ReportError::MergeCrossType { .. } => ErrorClass::ContractViolation,
+            ReportError::MergeInternal { .. } => ErrorClass::Internal,
+            ReportError::SplitTargetNewIdIndexOutOfBounds { .. } => {
+                ErrorClass::ContractViolation
+            }
+            ReportError::UnknownPredicate { .. } => {
+                ErrorClass::ContractViolation
+            }
+            ReportError::UnknownSubjectType { .. } => {
+                ErrorClass::ContractViolation
+            }
+        }
+    }
 }
 
 /// Priority hint for state reports.

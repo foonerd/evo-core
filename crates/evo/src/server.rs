@@ -167,6 +167,7 @@
 
 use crate::catalogue::Cardinality;
 use crate::claimant::{ClaimantToken, ClaimantTokenIssuer};
+use crate::client_acl::{ClientAcl, PeerCredentials, StewardIdentity};
 use crate::context::RegistrySubjectQuerier;
 use crate::custody::{CustodyRecord, StateSnapshot};
 use crate::error::StewardError;
@@ -179,15 +180,17 @@ use crate::projections::{
     ProjectionScope, RelatedSubject, RelationDirection, SubjectProjection,
 };
 use crate::relations::WalkDirection;
+use crate::resolution::ResolutionLedger;
 use crate::router::PluginRouter;
 use crate::state::StewardState;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use evo_plugin_sdk::contract::{
-    AliasRecord, HealthStatus, Request, SplitRelationStrategy, SubjectQuerier,
-    SubjectQueryResult,
+    AliasRecord, ExternalAddressing, HealthStatus, Request,
+    SplitRelationStrategy, SubjectQuerier, SubjectQueryResult,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -211,9 +214,16 @@ static NEXT_CID: AtomicU64 = AtomicU64::new(1);
 
 /// A client request as it appears on the wire.
 ///
-/// Internally tagged: the `op` field selects the variant.
+/// Internally tagged: the `op` field selects the variant. Each variant
+/// rejects unknown fields at parse time so an operator typo
+/// (`payload-b64` instead of `payload_b64`, for example) surfaces
+/// immediately as a structured `parse error` response rather than
+/// silently default-zeroed and producing a confusing
+/// "no payload supplied" failure later in the pipeline. New optional
+/// fields ride wire-protocol version bumps via the negotiated `Hello`
+/// frame, not silent forward compatibility on the request shape.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum ClientRequest {
     /// Dispatch a plugin request on a specific shelf.
     Request {
@@ -286,7 +296,117 @@ enum ClientRequest {
         #[serde(default)]
         since: Option<u64>,
     },
+    /// Paginated list of every live subject in the registry.
+    ///
+    /// Cursor: opaque base64 of the last canonical ID returned on
+    /// the previous page. Page size defaults to
+    /// [`DEFAULT_LIST_PAGE_SIZE`] and is capped at
+    /// [`MAX_LIST_PAGE_SIZE`].
+    ///
+    /// Response carries `current_seq` so consumers can reconcile
+    /// the snapshot with the happenings stream:
+    /// `subscribe → list_subjects → reconcile_via_seq`.
+    ListSubjects {
+        /// Opaque page cursor returned by the previous response's
+        /// `next_cursor`. Absent on the first page.
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Maximum number of subjects to return on this page.
+        /// Absent means [`DEFAULT_LIST_PAGE_SIZE`]; values above
+        /// [`MAX_LIST_PAGE_SIZE`] are clamped.
+        #[serde(default)]
+        page_size: Option<usize>,
+    },
+    /// Paginated list of every live relation edge in the graph.
+    ///
+    /// Cursor: opaque base64 of the last `(source_id, predicate,
+    /// target_id)` tuple returned on the previous page.
+    ListRelations {
+        /// Opaque page cursor returned by the previous response's
+        /// `next_cursor`. Absent on the first page.
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Maximum number of relations to return on this page.
+        /// Absent means [`DEFAULT_LIST_PAGE_SIZE`]; values above
+        /// [`MAX_LIST_PAGE_SIZE`] are clamped.
+        #[serde(default)]
+        page_size: Option<usize>,
+    },
+    /// Paginated enumeration of every claimed addressing in the
+    /// registry.
+    ///
+    /// Cursor: opaque base64 of the last `(scheme, value)` tuple
+    /// returned on the previous page.
+    EnumerateAddressings {
+        /// Opaque page cursor returned by the previous response's
+        /// `next_cursor`. Absent on the first page.
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Maximum number of addressings to return on this page.
+        /// Absent means [`DEFAULT_LIST_PAGE_SIZE`]; values above
+        /// [`MAX_LIST_PAGE_SIZE`] are clamped.
+        #[serde(default)]
+        page_size: Option<usize>,
+    },
+    /// Per-connection capability negotiation.
+    ///
+    /// A consumer SHOULD send this as the first frame on a new
+    /// connection to request named capabilities (e.g.
+    /// `"resolve_claimants"`). The server consults the operator-
+    /// controlled ACL against the connection's peer credentials and
+    /// answers with the subset that is granted; the granted set
+    /// applies for the lifetime of the connection.
+    ///
+    /// Connections that do not negotiate fall back to the empty
+    /// granted set; ops that require a granted capability refuse with
+    /// `permission_denied`.
+    Negotiate {
+        /// Capability names the consumer requests. Unknown names are
+        /// silently dropped from the response; the server never
+        /// errors on a name it does not recognise so consumers can
+        /// negotiate forward-compatibly against newer ops.
+        #[serde(default)]
+        capabilities: Vec<String>,
+    },
+    /// Resolve a set of opaque [`ClaimantToken`]s to plain plugin
+    /// names (and versions, when known).
+    ///
+    /// Requires the `resolve_claimants` capability to have been
+    /// granted on the connection via [`ClientRequest::Negotiate`].
+    /// Tokens not currently issued by the steward are silently
+    /// omitted from the response (no error).
+    ResolveClaimants {
+        /// Tokens to resolve. Order is preserved in the response only
+        /// for tokens the steward has issued; unknown tokens are
+        /// dropped.
+        #[serde(default)]
+        tokens: Vec<String>,
+    },
 }
+
+/// Default page size for the paginated list ops
+/// (`list_subjects`, `list_relations`, `enumerate_addressings`).
+pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
+
+/// Hard upper bound on the page size for the paginated list ops.
+/// Operator-supplied page sizes above this are clamped silently;
+/// the pagination contract is the caller's iterating until
+/// `next_cursor` is null, not the per-page count.
+pub const MAX_LIST_PAGE_SIZE: usize = 1000;
+
+/// Hard upper bound on `project_subject`'s `scope.max_depth`.
+/// Caller-supplied values above this are silently clamped. Five
+/// real chain tiers exist in any sensible deployment; depth 32
+/// leaves headroom while bounding worst-case traversal cost
+/// against an adversarial local-socket peer requesting
+/// `max_depth = usize::MAX`.
+pub const MAX_PROJECTION_DEPTH: usize = 32;
+
+/// Hard upper bound on `project_subject`'s `scope.max_visits`.
+/// Caller-supplied values above this are silently clamped. The
+/// limit caps the number of distinct subjects walked per request,
+/// preventing a peer from forcing a worst-case full-graph traversal.
+pub const MAX_PROJECTION_VISITS: usize = 100_000;
 
 /// Default for [`ClientRequest::ProjectSubject::follow_aliases`].
 /// Auto-follow is the consumer-friendly default: callers holding a
@@ -350,19 +470,24 @@ impl From<WalkDirectionWire> for WalkDirection {
 
 impl From<ProjectionScopeWire> for ProjectionScope {
     fn from(w: ProjectionScopeWire) -> Self {
-        let mut scope = ProjectionScope {
+        // Caller-supplied bounds are clamped to the steward's hard
+        // limits ([`MAX_PROJECTION_DEPTH`], [`MAX_PROJECTION_VISITS`]).
+        // A peer requesting `usize::MAX` for either knob is silently
+        // capped; the contract is "walk what fits within the cap" not
+        // "honour any request the caller can encode". Mirrors the
+        // `clamp_page_size` pattern used by the paginated list ops.
+        ProjectionScope {
             relation_predicates: w.relation_predicates,
             direction: w.direction.into(),
-            max_depth: crate::projections::DEFAULT_MAX_DEPTH,
-            max_visits: crate::projections::DEFAULT_MAX_VISITS,
-        };
-        if let Some(d) = w.max_depth {
-            scope.max_depth = d;
+            max_depth: w
+                .max_depth
+                .unwrap_or(crate::projections::DEFAULT_MAX_DEPTH)
+                .min(MAX_PROJECTION_DEPTH),
+            max_visits: w
+                .max_visits
+                .unwrap_or(crate::projections::DEFAULT_MAX_VISITS)
+                .min(MAX_PROJECTION_VISITS),
         }
-        if let Some(v) = w.max_visits {
-            scope.max_visits = v;
-        }
-        scope
     }
 }
 
@@ -475,13 +600,97 @@ enum ClientResponse {
         happening: HappeningWire,
     },
     /// Notification that the subscriber fell behind the bus's buffer
-    /// and missed `lagged` happenings. Subscribers recover by
-    /// re-querying the authoritative store (the ledger for custody)
-    /// and continuing to consume.
+    /// and missed events. Carries enough context for the consumer
+    /// to choose between a durable replay (when the gap is within
+    /// the retention window) and a snapshot reconcile via the list
+    /// ops.
+    ///
+    /// Distinguished by the top-level `lagged` key. The wire shape
+    /// nests the structured fields under that key so the
+    /// untagged-enum disambiguation key set stays stable across
+    /// readers that pre-date the structured shape.
     Lagged {
-        /// Number of happenings dropped since the last successful
-        /// delivery.
-        lagged: u64,
+        /// Structured payload describing the gap and the bus's
+        /// position at signal time.
+        lagged: LaggedSignal,
+    },
+    /// Paginated `list_subjects` response.
+    ///
+    /// Carries one page of live subjects keyed by canonical ID,
+    /// the opaque cursor needed to fetch the next page (or `null`
+    /// when the snapshot is exhausted), and `current_seq` so
+    /// consumers can pin the snapshot to a happenings position.
+    /// Consumers iterate until `next_cursor` is null, then apply
+    /// happenings with `seq > current_seq` as deltas on top.
+    SubjectsPage {
+        /// One page of live subjects in cursor order.
+        subjects: Vec<SubjectListEntryWire>,
+        /// Opaque cursor for the next page, or `null` if this page
+        /// is the last.
+        next_cursor: Option<String>,
+        /// Bus cursor sampled at snapshot time. `0` means no
+        /// happenings have been emitted yet on this steward
+        /// instance.
+        current_seq: u64,
+    },
+    /// Paginated `list_relations` response.
+    ///
+    /// Carries one page of live relation edges keyed by `(source_id,
+    /// predicate, target_id)`, plus the opaque next-page cursor
+    /// and `current_seq` for reconcile-pinning.
+    RelationsPage {
+        /// One page of live relations in cursor order.
+        relations: Vec<RelationListEntryWire>,
+        /// Opaque cursor for the next page, or `null` if this page
+        /// is the last.
+        next_cursor: Option<String>,
+        /// Bus cursor sampled at snapshot time.
+        current_seq: u64,
+    },
+    /// Paginated `enumerate_addressings` response.
+    ///
+    /// Carries one page of claimed addressings keyed by `(scheme,
+    /// value)`, plus the opaque next-page cursor and `current_seq`
+    /// for reconcile-pinning.
+    AddressingsPage {
+        /// One page of claimed addressings in cursor order.
+        addressings: Vec<AddressingListEntryWire>,
+        /// Opaque cursor for the next page, or `null` if this page
+        /// is the last.
+        next_cursor: Option<String>,
+        /// Bus cursor sampled at snapshot time.
+        current_seq: u64,
+    },
+    /// Capability-negotiation outcome.
+    ///
+    /// Distinguished by the top-level `granted` key. Carries the
+    /// subset of the consumer's requested capabilities that the
+    /// operator policy permits on this connection. The granted set
+    /// is recorded on the per-connection session state for the
+    /// lifetime of the connection; subsequent ops gated on a name
+    /// not present here refuse with `permission_denied`.
+    Negotiated {
+        /// Always `true`; the distinctive top-level key for this
+        /// variant under untagged disambiguation.
+        ok: bool,
+        /// Subset of the requested capabilities the steward grants
+        /// on this connection. Unknown names from the request are
+        /// silently dropped; names the operator denied via the ACL
+        /// are also dropped.
+        granted: Vec<String>,
+    },
+    /// `resolve_claimants` outcome.
+    ///
+    /// Distinguished by the top-level `resolutions` key. Maps each
+    /// known token to the plain plugin name and (when available)
+    /// version that the issuer has on file. Tokens the issuer has
+    /// not seen are silently omitted from the response, matching the
+    /// rule that resolution never reveals which tokens the steward
+    /// considers valid.
+    Resolutions {
+        /// One entry per resolved token, in the issuer's iteration
+        /// order. Unknown tokens from the request do not appear.
+        resolutions: Vec<ClaimantResolutionWire>,
     },
     /// Any failure.
     ///
@@ -495,6 +704,95 @@ enum ClientResponse {
         /// Structured error payload.
         error: ApiError,
     },
+}
+
+/// Structured payload of a streamed [`ClientResponse::Lagged`]
+/// frame.
+///
+/// Reports the gap (`missed_count`) plus the bus's pinning data
+/// (`oldest_available_seq`, `current_seq`) so the consumer can
+/// decide whether to resume via cursor replay (when the previously-
+/// observed seq is still within the durable window) or fall back to
+/// a snapshot reconcile via the paginated list ops pinned to
+/// `current_seq`.
+#[derive(Debug, Serialize)]
+struct LaggedSignal {
+    /// Number of happenings dropped from the broadcast ring since
+    /// the last successful delivery to this subscriber.
+    missed_count: u64,
+    /// Oldest seq currently retained in `happenings_log`. A
+    /// consumer whose last observed seq is at or above this value
+    /// can resume cleanly via a fresh subscribe with `since` set to
+    /// that seq.
+    oldest_available_seq: u64,
+    /// Bus cursor at signal time. Consumers falling back to
+    /// snapshot reconcile pin the list ops to this value and apply
+    /// happenings with `seq > current_seq` as deltas on top.
+    current_seq: u64,
+}
+
+/// One subject row in a [`ClientResponse::SubjectsPage`].
+#[derive(Debug, Serialize)]
+struct SubjectListEntryWire {
+    /// Canonical subject ID.
+    canonical_id: String,
+    /// Subject type, as declared in the catalogue.
+    subject_type: String,
+    /// Every addressing currently registered to this subject.
+    addressings: Vec<SubjectListAddressingWire>,
+}
+
+/// One addressing entry inside a [`SubjectListEntryWire`].
+#[derive(Debug, Serialize)]
+struct SubjectListAddressingWire {
+    scheme: String,
+    value: String,
+    /// Opaque token identifying the claiming plugin.
+    claimant_token: ClaimantToken,
+}
+
+/// One relation row in a [`ClientResponse::RelationsPage`].
+#[derive(Debug, Serialize)]
+struct RelationListEntryWire {
+    source_id: String,
+    predicate: String,
+    target_id: String,
+    /// Opaque tokens identifying every plugin that claims the
+    /// relation. Order matches the underlying claim list.
+    claimant_tokens: Vec<ClaimantToken>,
+    /// True when an admin has suppressed the relation; consumers
+    /// that want only visible edges filter on `false`.
+    suppressed: bool,
+}
+
+/// One addressing row in a [`ClientResponse::AddressingsPage`].
+#[derive(Debug, Serialize)]
+struct AddressingListEntryWire {
+    scheme: String,
+    value: String,
+    /// Canonical ID the addressing currently resolves to.
+    canonical_id: String,
+}
+
+/// One resolution row in a [`ClientResponse::Resolutions`].
+///
+/// Echoes the token the consumer supplied (so callers correlating
+/// pipelined responses can match without holding state) alongside
+/// the plain plugin name and, when known, version. Unknown tokens
+/// are silently omitted from the parent response; this struct only
+/// represents successful resolutions.
+#[derive(Debug, Serialize)]
+struct ClaimantResolutionWire {
+    /// The opaque token, exactly as supplied in the request.
+    token: String,
+    /// Plain plugin canonical name for the token.
+    plugin_name: String,
+    /// Plugin version, when the issuer has one on record. The
+    /// claimant token is derived without the version so a steward
+    /// that issues a token before the plugin's version is recorded
+    /// may legitimately have `None` here; consumers MUST tolerate
+    /// the field being absent.
+    plugin_version: Option<String>,
 }
 
 /// Wire form of [`SubjectProjection`]. Mirrors the domain shape but
@@ -647,6 +945,7 @@ impl From<DegradedReason> for DegradedReasonWire {
         Self {
             kind: match d.kind {
                 DegradedReasonKind::DanglingRelation => "dangling_relation",
+                DegradedReasonKind::SubjectInConflict => "subject_in_conflict",
             },
             detail: d.detail,
         }
@@ -674,6 +973,11 @@ struct CustodyRecordWire {
     custody_type: Option<String>,
     /// Most recent state snapshot, if any reports have been seen.
     last_state: Option<StateSnapshotWire>,
+    /// Lifecycle state of the record. Serialises as an internally
+    /// tagged `{"kind":"active"}` / `{"kind":"degraded","reason":"..."}`
+    /// / `{"kind":"aborted","reason":"..."}` per
+    /// [`crate::custody::CustodyStateKind`].
+    state: crate::custody::CustodyStateKind,
     /// When the record was first created in the ledger, ms since
     /// UNIX epoch.
     started_at_ms: u64,
@@ -703,6 +1007,7 @@ impl CustodyRecordWire {
             shelf: r.shelf,
             custody_type: r.custody_type,
             last_state: r.last_state.map(Into::into),
+            state: r.state,
             started_at_ms: system_time_to_ms(r.started_at),
             last_updated_ms: system_time_to_ms(r.last_updated),
         }
@@ -779,6 +1084,38 @@ enum HappeningWire {
         /// Health declared by the plugin at report time. Uses the
         /// SDK type's built-in lowercase serialisation.
         health: HealthStatus,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::CustodyAborted`]. Signals that a
+    /// custody operation failed under an `abort` failure-mode
+    /// declaration; the custody is over and the steward expects the
+    /// warden to release.
+    CustodyAborted {
+        /// Opaque token identifying the warden plugin.
+        claimant_token: ClaimantToken,
+        /// Handle id of the failing custody.
+        handle_id: String,
+        /// Fully-qualified shelf the warden occupies.
+        shelf: String,
+        /// Steward-recorded failure reason.
+        reason: String,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::CustodyDegraded`]. Signals that a
+    /// custody operation failed under a `partial_ok` failure-mode
+    /// declaration; the warden may keep reporting on the same handle
+    /// and the consumer decides whether to keep consuming or stop.
+    CustodyDegraded {
+        /// Opaque token identifying the warden plugin.
+        claimant_token: ClaimantToken,
+        /// Handle id of the failing custody.
+        handle_id: String,
+        /// Fully-qualified shelf the warden occupies.
+        shelf: String,
+        /// Steward-recorded failure reason.
+        reason: String,
         /// When the happening was recorded, ms since UNIX epoch.
         at_ms: u64,
     },
@@ -1130,6 +1467,24 @@ enum HappeningWire {
         /// When the happening was recorded, ms since UNIX epoch.
         at_ms: u64,
     },
+    /// Wire form of [`Happening::SubjectConflictDetected`].
+    ///
+    /// Emitted when an announcement's addressings span more than one
+    /// existing canonical subject. The steward records the conflict
+    /// for operator-driven resolution and surfaces this happening
+    /// alongside the durable `pending_conflicts` row so dashboards
+    /// can react in real time.
+    SubjectConflictDetected {
+        /// Opaque token identifying the plugin whose announcement
+        /// produced the conflict.
+        claimant_token: ClaimantToken,
+        /// The announcement's addressings.
+        addressings: Vec<ExternalAddressing>,
+        /// The distinct canonical IDs the announcement touched.
+        canonical_ids: Vec<String>,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
 }
 
 /// Wire form of
@@ -1244,6 +1599,32 @@ impl HappeningWire {
                 claimant_token: issuer.token_for(&plugin),
                 handle_id,
                 health,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::CustodyAborted {
+                plugin,
+                handle_id,
+                shelf,
+                reason,
+                at,
+            } => HappeningWire::CustodyAborted {
+                claimant_token: issuer.token_for(&plugin),
+                handle_id,
+                shelf,
+                reason,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::CustodyDegraded {
+                plugin,
+                handle_id,
+                shelf,
+                reason,
+                at,
+            } => HappeningWire::CustodyDegraded {
+                claimant_token: issuer.token_for(&plugin),
+                handle_id,
+                shelf,
+                reason,
                 at_ms: system_time_to_ms(at),
             },
             Happening::RelationCardinalityViolation {
@@ -1491,7 +1872,70 @@ impl HappeningWire {
                     ),
                 at_ms: system_time_to_ms(at),
             },
+            Happening::SubjectConflictDetected {
+                plugin,
+                addressings,
+                canonical_ids,
+                at,
+            } => HappeningWire::SubjectConflictDetected {
+                claimant_token: issuer.token_for(&plugin),
+                addressings,
+                canonical_ids,
+                at_ms: system_time_to_ms(at),
+            },
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Per-connection state
+// ---------------------------------------------------------------------
+
+/// Capability name covering the `resolve_claimants` op.
+///
+/// Centralised here so the negotiate handler, the resolve dispatch,
+/// and the audit-log integration all spell the name the same way.
+const CAPABILITY_RESOLVE_CLAIMANTS: &str = "resolve_claimants";
+
+/// Capability names a consumer may negotiate today.
+///
+/// The negotiate handler intersects the consumer's request with this
+/// list before consulting the ACL: unknown names are dropped silently
+/// so consumers can probe forward-compatibly against newer steward
+/// builds. Names are stable; new capabilities are appended.
+const NEGOTIABLE_CAPABILITIES: &[&str] = &[CAPABILITY_RESOLVE_CLAIMANTS];
+
+/// Mutable per-connection session state.
+///
+/// Constructed once at accept time alongside the peer credentials,
+/// then passed by reference to every op handler that needs to
+/// consult the granted-capability set or report the peer in the
+/// audit log. Lifetime is the connection's; dropped when the
+/// connection task exits.
+#[derive(Debug)]
+struct ConnectionState {
+    /// Peer credentials captured at accept time. `None` on platforms
+    /// or sandboxes where `peer_cred` is unavailable.
+    peer: PeerCredentials,
+    /// Capabilities granted on this connection by the negotiate
+    /// handler. Empty until the consumer sends a `negotiate` frame
+    /// and the ACL grants at least one name.
+    granted_capabilities: HashSet<String>,
+}
+
+impl ConnectionState {
+    /// Build a fresh per-connection state from peer credentials.
+    fn new(peer: PeerCredentials) -> Self {
+        Self {
+            peer,
+            granted_capabilities: HashSet::new(),
+        }
+    }
+
+    /// Whether the named capability has been granted on this
+    /// connection.
+    fn has(&self, name: &str) -> bool {
+        self.granted_capabilities.contains(name)
     }
 }
 
@@ -1505,6 +1949,14 @@ pub struct Server {
     router: Arc<PluginRouter>,
     state: Arc<StewardState>,
     projections: Arc<ProjectionEngine>,
+    /// Operator-controlled ACL consulted by the negotiate handler.
+    acl: Arc<ClientAcl>,
+    /// Steward's own identity at boot, used by the default ACL to
+    /// match local-UID peers.
+    steward_identity: StewardIdentity,
+    /// Audit ledger that records every `resolve_claimants` request
+    /// (granted or refused).
+    resolution_ledger: Arc<ResolutionLedger>,
 }
 
 impl Server {
@@ -1538,12 +1990,51 @@ impl Server {
         state: Arc<StewardState>,
         projections: Arc<ProjectionEngine>,
     ) -> Self {
+        Self::with_acl(
+            socket_path,
+            router,
+            state,
+            projections,
+            Arc::new(ClientAcl::default()),
+            StewardIdentity::default(),
+            Arc::new(ResolutionLedger::new()),
+        )
+    }
+
+    /// Construct a server with an explicit operator-controlled ACL,
+    /// the steward's own identity, and a resolution audit ledger.
+    ///
+    /// Used by the binary so the `negotiate` handler enforces the
+    /// configured policy and the `resolve_claimants` op records to a
+    /// shared ledger. Tests and harnesses that do not care about
+    /// either may keep using [`Server::new`], which substitutes the
+    /// default-deny ACL, an empty steward identity (which denies the
+    /// default local-UID grant), and a fresh in-memory ledger.
+    pub fn with_acl(
+        socket_path: PathBuf,
+        router: Arc<PluginRouter>,
+        state: Arc<StewardState>,
+        projections: Arc<ProjectionEngine>,
+        acl: Arc<ClientAcl>,
+        steward_identity: StewardIdentity,
+        resolution_ledger: Arc<ResolutionLedger>,
+    ) -> Self {
         Self {
             socket_path,
             router,
             state,
             projections,
+            acl,
+            steward_identity,
+            resolution_ledger,
         }
+    }
+
+    /// Audit ledger this server records `resolve_claimants` calls
+    /// into. Exposed so test harnesses and operator tooling can
+    /// inspect the recorded entries.
+    pub fn resolution_ledger(&self) -> Arc<ResolutionLedger> {
+        Arc::clone(&self.resolution_ledger)
     }
 
     /// The socket path this server listens on.
@@ -1614,12 +2105,32 @@ impl Server {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, _addr)) => {
+                            // Capture the peer's credentials at accept
+                            // time so the connection's negotiate
+                            // handler and the audit log have a stable
+                            // identity to work from. `peer_cred` may
+                            // fail on unusual platforms or sandboxes;
+                            // the conservative outcome is `None` for
+                            // both UID and GID, which the default ACL
+                            // denies.
+                            let peer = peer_credentials(&stream);
                             let router = Arc::clone(&self.router);
                             let state = Arc::clone(&self.state);
                             let projections = Arc::clone(&self.projections);
+                            let acl = Arc::clone(&self.acl);
+                            let steward_identity = self.steward_identity;
+                            let resolution_ledger =
+                                Arc::clone(&self.resolution_ledger);
                             tokio::spawn(async move {
                                 if let Err(e) = handle_connection(
-                                    stream, router, state, projections
+                                    stream,
+                                    router,
+                                    state,
+                                    projections,
+                                    acl,
+                                    steward_identity,
+                                    resolution_ledger,
+                                    peer,
                                 ).await {
                                     tracing::warn!(
                                         error = %e,
@@ -1659,6 +2170,25 @@ impl Server {
     }
 }
 
+/// Read peer credentials from a connected `UnixStream`.
+///
+/// Wraps the platform-specific `peer_cred` query so the accept loop
+/// stays portable. `peer_cred` failure (which should not happen on
+/// Linux) yields `None`/`None`; the default ACL then refuses every
+/// capability that depends on a known peer identity.
+fn peer_credentials(stream: &UnixStream) -> PeerCredentials {
+    match stream.peer_cred() {
+        Ok(cred) => PeerCredentials {
+            uid: Some(cred.uid()),
+            gid: Some(cred.gid()),
+        },
+        Err(_) => PeerCredentials {
+            uid: None,
+            gid: None,
+        },
+    }
+}
+
 /// Handle one accepted client connection.
 ///
 /// Reads frames in a loop until the client closes the connection.
@@ -1669,12 +2199,18 @@ impl Server {
 /// connection's read half is no longer consumed.
 ///
 /// Errors handling one frame close the connection.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: UnixStream,
     router: Arc<PluginRouter>,
     state: Arc<StewardState>,
     projections: Arc<ProjectionEngine>,
+    acl: Arc<ClientAcl>,
+    steward_identity: StewardIdentity,
+    resolution_ledger: Arc<ResolutionLedger>,
+    peer: PeerCredentials,
 ) -> Result<(), StewardError> {
+    let mut conn = ConnectionState::new(peer);
     loop {
         let body = match read_frame_body(&mut stream).await? {
             Some(b) => b,
@@ -1707,8 +2243,17 @@ async fn handle_connection(
             return run_subscription(stream, Arc::clone(&state), since).await;
         }
 
-        let response =
-            dispatch_request(req, &router, &state, &projections).await;
+        let response = dispatch_request(
+            req,
+            &router,
+            &state,
+            &projections,
+            &acl,
+            steward_identity,
+            &resolution_ledger,
+            &mut conn,
+        )
+        .await;
         write_response_frame(&mut stream, &response).await?;
     }
 }
@@ -1784,11 +2329,16 @@ async fn write_response_frame(
 ///
 /// Never panics; dispatch failures surface as `ClientResponse::Error`
 /// rather than bubbling up to close the connection.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_request(
     req: ClientRequest,
     router: &Arc<PluginRouter>,
     state: &Arc<StewardState>,
     projections: &Arc<ProjectionEngine>,
+    acl: &Arc<ClientAcl>,
+    steward_identity: StewardIdentity,
+    resolution_ledger: &Arc<ResolutionLedger>,
+    conn: &mut ConnectionState,
 ) -> ClientResponse {
     match req {
         ClientRequest::Request {
@@ -1822,7 +2372,22 @@ async fn dispatch_request(
         ClientRequest::ListActiveCustodies => {
             handle_list_active_custodies(state).await
         }
+        ClientRequest::ListSubjects { cursor, page_size } => {
+            handle_list_subjects(state, cursor, page_size)
+        }
+        ClientRequest::ListRelations { cursor, page_size } => {
+            handle_list_relations(state, cursor, page_size)
+        }
+        ClientRequest::EnumerateAddressings { cursor, page_size } => {
+            handle_enumerate_addressings(state, cursor, page_size)
+        }
         ClientRequest::DescribeCapabilities => describe_capabilities(),
+        ClientRequest::Negotiate { capabilities } => {
+            handle_negotiate(capabilities, acl, steward_identity, conn)
+        }
+        ClientRequest::ResolveClaimants { tokens } => {
+            handle_resolve_claimants(state, resolution_ledger, conn, tokens)
+        }
         ClientRequest::SubscribeHappenings { .. } => {
             // Intercepted in handle_connection; should not reach here.
             // Defensive: surface an error rather than panicking in case
@@ -1838,17 +2403,125 @@ async fn dispatch_request(
     }
 }
 
+/// Handle the `op = "negotiate"` capability-negotiation frame.
+///
+/// Intersects the consumer's requested set with the names this build
+/// recognises, consults the operator-controlled [`ClientAcl`] for
+/// each, and records the granted subset on the per-connection
+/// session state. Subsequent ops gated on a name not in the granted
+/// set refuse with `permission_denied`.
+fn handle_negotiate(
+    capabilities: Vec<String>,
+    acl: &Arc<ClientAcl>,
+    steward_identity: StewardIdentity,
+    conn: &mut ConnectionState,
+) -> ClientResponse {
+    let mut granted: Vec<String> = Vec::new();
+    for requested in &capabilities {
+        let known = NEGOTIABLE_CAPABILITIES.contains(&requested.as_str());
+        if !known {
+            // Unknown name: silently dropped per the forward-compat
+            // contract on the negotiate handler.
+            continue;
+        }
+        let permitted = match requested.as_str() {
+            CAPABILITY_RESOLVE_CLAIMANTS => {
+                acl.allows_resolve_claimants(conn.peer, steward_identity)
+            }
+            // Defensive: a name in NEGOTIABLE_CAPABILITIES without an
+            // ACL gate above is a build-time bug. Treat as not
+            // granted rather than panicking; the test
+            // `negotiable_capabilities_are_all_gated` pins the
+            // invariant in the test suite.
+            _ => false,
+        };
+        if permitted && !granted.iter().any(|g| g == requested) {
+            granted.push(requested.clone());
+        }
+    }
+    conn.granted_capabilities = granted.iter().cloned().collect();
+    ClientResponse::Negotiated { ok: true, granted }
+}
+
+/// Handle the `op = "resolve_claimants"` frame.
+///
+/// Resolutions are NOT happenings: the subscribe stream MUST NOT
+/// emit anything as a side-effect of this op. Resolution is a
+/// privacy-relevant query the operator may have refused at policy
+/// time; broadcasting it on the bus would leak the existence of the
+/// query to every other subscriber. The audit ledger records the
+/// call in a private store consulted only by operator tooling. The
+/// regression test
+/// `resolve_claimants_does_not_emit_a_happening` pins the
+/// invariant.
+fn handle_resolve_claimants(
+    state: &Arc<StewardState>,
+    resolution_ledger: &Arc<ResolutionLedger>,
+    conn: &mut ConnectionState,
+    tokens: Vec<String>,
+) -> ClientResponse {
+    let granted = conn.has(CAPABILITY_RESOLVE_CLAIMANTS);
+    if !granted {
+        // Audit before refusing so the operator can see denials
+        // alongside grants. `tokens_resolved` is zero on the refused
+        // path because the steward never inspected the issuer.
+        resolution_ledger.record(crate::resolution::ResolutionLogEntry {
+            peer_uid: conn.peer.uid,
+            peer_gid: conn.peer.gid,
+            tokens_requested: tokens.len(),
+            tokens_resolved: 0,
+            granted: false,
+            at: SystemTime::now(),
+        });
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "resolve_claimants not granted on this connection",
+            )
+            .with_subclass("resolve_claimants_not_granted"),
+        };
+    }
+
+    let mut resolutions: Vec<ClaimantResolutionWire> = Vec::new();
+    for raw in &tokens {
+        if let Some((plugin_name, plugin_version)) =
+            state.claimant_issuer.resolve(raw)
+        {
+            resolutions.push(ClaimantResolutionWire {
+                token: raw.clone(),
+                plugin_name,
+                plugin_version,
+            });
+        }
+        // Unknown tokens are silently dropped (no error).
+    }
+
+    resolution_ledger.record(crate::resolution::ResolutionLogEntry {
+        peer_uid: conn.peer.uid,
+        peer_gid: conn.peer.gid,
+        tokens_requested: tokens.len(),
+        tokens_resolved: resolutions.len(),
+        granted: true,
+        at: SystemTime::now(),
+    });
+
+    ClientResponse::Resolutions { resolutions }
+}
+
 /// Stream happenings to the client over `stream` until the peer
 /// disconnects or the bus is dropped.
 ///
 /// ## Sequence
 ///
-/// 1. `bus.subscribe_envelope()` is called BEFORE anything is
-///    written so that any happening emitted between the subscribe
-///    and the ack is buffered on the receiver and delivered on a
-///    later recv. This order is load-bearing for the live path.
-/// 2. The bus's `last_emitted_seq` is sampled — this is the
-///    `current_seq` written into the ack so the consumer can pin
+/// 1. `bus.subscribe_with_current_seq()` is called BEFORE anything
+///    is written. The call holds the bus's `emit_lock` across both
+///    the broadcast subscribe and the seq sample, so no concurrent
+///    durable emit can interleave between them. Any happening
+///    emitted after the subscribe is buffered on the receiver and
+///    delivered on a later recv.
+/// 2. The `current_seq` returned by step 1 is the seq of the
+///    most-recently-emitted happening at the moment the lock was
+///    held; it is written into the ack so the consumer can pin
 ///    reconcile queries to it.
 /// 3. The ack is written, carrying `subscribed: true` and
 ///    `current_seq`. If writing fails the client has disconnected
@@ -1879,9 +2552,60 @@ async fn run_subscription(
     since: Option<u64>,
 ) -> Result<(), StewardError> {
     // Subscribe first so events emitted concurrently with the
-    // persistence read are buffered, not lost.
-    let mut rx = state.bus.subscribe_envelope();
-    let current_seq = state.bus.last_emitted_seq();
+    // persistence read are buffered, not lost. The subscribe and the
+    // current_seq sample are taken under the same emit_lock the bus
+    // uses to serialise durable emits, so no concurrent emit can
+    // produce a current_seq that is not on either side of the
+    // consumer's first delivered seq. See
+    // `HappeningBus::subscribe_with_current_seq` for the invariant.
+    let (mut rx, current_seq) = state.bus.subscribe_with_current_seq().await;
+
+    // Replay-window check: if the consumer asked for a cursor older
+    // than the oldest retained `seq`, fail fast with a structured
+    // response and close the subscription. The consumer's recovery
+    // is to fall back to the snapshot list ops pinned to
+    // `current_seq`. The check runs BEFORE the ack so a failed
+    // window is never paired with a ghost subscription frame; the
+    // bus subscription remains scoped to this function and is
+    // dropped automatically on early return.
+    if let Some(cursor) = since {
+        match state.persistence.load_oldest_happening_seq().await {
+            Ok(oldest) => {
+                if oldest > 0 && cursor < oldest {
+                    let frame = ClientResponse::Error {
+                        error: ApiError::new(
+                            ErrorClass::ContractViolation,
+                            format!(
+                                "since={cursor} is older than the durable \
+                                 retention window (oldest available seq is \
+                                 {oldest})"
+                            ),
+                        )
+                        .with_details(
+                            serde_json::json!({
+                                "subclass": "replay_window_exceeded",
+                                "oldest_available_seq": oldest,
+                                "current_seq": current_seq,
+                            }),
+                        ),
+                    };
+                    let _ = write_response_frame(&mut stream, &frame).await;
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                let frame = ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::Internal,
+                        format!("oldest-seq query failed: {e}"),
+                    )
+                    .with_subclass("replay_window_query_failed"),
+                };
+                let _ = write_response_frame(&mut stream, &frame).await;
+                return Ok(());
+            }
+        }
+    }
 
     // Send the ack. If the client is gone we return cleanly.
     let ack = ClientResponse::Subscribed {
@@ -1978,7 +2702,22 @@ async fn run_subscription(
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                let frame = ClientResponse::Lagged { lagged: n };
+                // Sample the bus and the durable window so the
+                // consumer can choose between cursor replay and
+                // snapshot reconcile.
+                let live_seq = state.bus.last_emitted_seq();
+                let oldest_available_seq = state
+                    .persistence
+                    .load_oldest_happening_seq()
+                    .await
+                    .unwrap_or(0);
+                let frame = ClientResponse::Lagged {
+                    lagged: LaggedSignal {
+                        missed_count: n,
+                        oldest_available_seq,
+                        current_seq: live_seq,
+                    },
+                };
                 if write_response_frame(&mut stream, &frame).await.is_err() {
                     return Ok(());
                 }
@@ -2289,6 +3028,275 @@ async fn handle_list_active_custodies(
     ClientResponse::ActiveCustodies { active_custodies }
 }
 
+/// Decode an opaque base64 page cursor into the underlying ASCII
+/// key the snapshot iteration sorts on. Returns a structured error
+/// frame when the cursor is malformed; the consumer's recovery is
+/// to drop the cursor and restart from the first page.
+#[allow(clippy::result_large_err)]
+fn decode_page_cursor(cursor: &str) -> Result<String, ClientResponse> {
+    let bytes =
+        B64.decode(cursor.as_bytes())
+            .map_err(|e| ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!("invalid page cursor: {e}"),
+                )
+                .with_subclass("invalid_page_cursor"),
+            })?;
+    let s = String::from_utf8(bytes).map_err(|e| ClientResponse::Error {
+        error: ApiError::new(
+            ErrorClass::ContractViolation,
+            format!("page cursor not utf8: {e}"),
+        )
+        .with_subclass("invalid_page_cursor"),
+    })?;
+    Ok(s)
+}
+
+/// Encode an ASCII key as the opaque base64 page cursor returned to
+/// the consumer.
+fn encode_page_cursor(key: &str) -> String {
+    B64.encode(key.as_bytes())
+}
+
+/// Clamp an operator-supplied page size to the steward's limits.
+fn clamp_page_size(supplied: Option<usize>) -> usize {
+    let raw = supplied.unwrap_or(DEFAULT_LIST_PAGE_SIZE);
+    raw.clamp(1, MAX_LIST_PAGE_SIZE)
+}
+
+/// Cursor key for one subject row in the `list_subjects` snapshot.
+fn subject_cursor_key(canonical_id: &str) -> String {
+    canonical_id.to_string()
+}
+
+/// Cursor key for one relation edge in the `list_relations`
+/// snapshot. Triple components are joined by NUL so any individual
+/// component may itself contain printable separators without
+/// ambiguity.
+fn relation_cursor_key(
+    source_id: &str,
+    predicate: &str,
+    target_id: &str,
+) -> String {
+    format!("{source_id}\x00{predicate}\x00{target_id}")
+}
+
+/// Cursor key for one addressing in the `enumerate_addressings`
+/// snapshot. Components joined by NUL for the same reason as
+/// [`relation_cursor_key`].
+fn addressing_cursor_key(scheme: &str, value: &str) -> String {
+    format!("{scheme}\x00{value}")
+}
+
+/// `op = "list_subjects"` handler. Snapshots the registry, sorts
+/// by canonical ID, slices the page, and returns it paired with
+/// the bus's `current_seq` so consumers can pin reconcile-style
+/// queries.
+fn handle_list_subjects(
+    state: &Arc<StewardState>,
+    cursor: Option<String>,
+    page_size: Option<usize>,
+) -> ClientResponse {
+    let after = match cursor.as_deref() {
+        Some(c) => match decode_page_cursor(c) {
+            Ok(k) => Some(k),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
+    let limit = clamp_page_size(page_size);
+    let current_seq = state.bus.last_emitted_seq();
+
+    let mut snapshot = state.subjects.snapshot_subjects();
+    snapshot.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let start = match after.as_deref() {
+        Some(after_id) => snapshot
+            .iter()
+            .position(|s| s.id.as_str() > after_id)
+            .unwrap_or(snapshot.len()),
+        None => 0,
+    };
+    let end = start.saturating_add(limit).min(snapshot.len());
+
+    let subjects: Vec<SubjectListEntryWire> = snapshot[start..end]
+        .iter()
+        .map(|record| SubjectListEntryWire {
+            canonical_id: record.id.clone(),
+            subject_type: record.subject_type.clone(),
+            addressings: record
+                .addressings
+                .iter()
+                .map(|a| SubjectListAddressingWire {
+                    scheme: a.addressing.scheme.clone(),
+                    value: a.addressing.value.clone(),
+                    claimant_token: state
+                        .claimant_issuer
+                        .token_for(&a.claimant),
+                })
+                .collect(),
+        })
+        .collect();
+
+    let next_cursor = if end < snapshot.len() {
+        subjects
+            .last()
+            .map(|s| encode_page_cursor(&subject_cursor_key(&s.canonical_id)))
+    } else {
+        None
+    };
+
+    ClientResponse::SubjectsPage {
+        subjects,
+        next_cursor,
+        current_seq,
+    }
+}
+
+/// `op = "list_relations"` handler. Snapshots the relation graph,
+/// sorts by `(source_id, predicate, target_id)`, slices the page,
+/// and returns it paired with `current_seq` for reconcile-pinning.
+fn handle_list_relations(
+    state: &Arc<StewardState>,
+    cursor: Option<String>,
+    page_size: Option<usize>,
+) -> ClientResponse {
+    let after = match cursor.as_deref() {
+        Some(c) => match decode_page_cursor(c) {
+            Ok(k) => Some(k),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
+    let limit = clamp_page_size(page_size);
+    let current_seq = state.bus.last_emitted_seq();
+
+    let mut snapshot = state.relations.snapshot_relations();
+    snapshot.sort_by(|a, b| {
+        (
+            a.key.source_id.as_str(),
+            a.key.predicate.as_str(),
+            a.key.target_id.as_str(),
+        )
+            .cmp(&(
+                b.key.source_id.as_str(),
+                b.key.predicate.as_str(),
+                b.key.target_id.as_str(),
+            ))
+    });
+
+    let start = match after.as_deref() {
+        Some(after_key) => snapshot
+            .iter()
+            .position(|r| {
+                relation_cursor_key(
+                    &r.key.source_id,
+                    &r.key.predicate,
+                    &r.key.target_id,
+                )
+                .as_str()
+                    > after_key
+            })
+            .unwrap_or(snapshot.len()),
+        None => 0,
+    };
+    let end = start.saturating_add(limit).min(snapshot.len());
+
+    let relations: Vec<RelationListEntryWire> = snapshot[start..end]
+        .iter()
+        .map(|record| RelationListEntryWire {
+            source_id: record.key.source_id.clone(),
+            predicate: record.key.predicate.clone(),
+            target_id: record.key.target_id.clone(),
+            claimant_tokens: record
+                .claims
+                .iter()
+                .map(|c| state.claimant_issuer.token_for(&c.claimant))
+                .collect(),
+            suppressed: record.suppression.is_some(),
+        })
+        .collect();
+
+    let next_cursor = if end < snapshot.len() {
+        relations.last().map(|r| {
+            encode_page_cursor(&relation_cursor_key(
+                &r.source_id,
+                &r.predicate,
+                &r.target_id,
+            ))
+        })
+    } else {
+        None
+    };
+
+    ClientResponse::RelationsPage {
+        relations,
+        next_cursor,
+        current_seq,
+    }
+}
+
+/// `op = "enumerate_addressings"` handler. Snapshots the
+/// addressing index, sorts by `(scheme, value)`, slices the page,
+/// and returns it paired with `current_seq` for reconcile-pinning.
+fn handle_enumerate_addressings(
+    state: &Arc<StewardState>,
+    cursor: Option<String>,
+    page_size: Option<usize>,
+) -> ClientResponse {
+    let after = match cursor.as_deref() {
+        Some(c) => match decode_page_cursor(c) {
+            Ok(k) => Some(k),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
+    let limit = clamp_page_size(page_size);
+    let current_seq = state.bus.last_emitted_seq();
+
+    let mut snapshot = state.subjects.snapshot_addressings();
+    snapshot.sort_by(|a, b| {
+        (a.0.scheme.as_str(), a.0.value.as_str())
+            .cmp(&(b.0.scheme.as_str(), b.0.value.as_str()))
+    });
+
+    let start = match after.as_deref() {
+        Some(after_key) => snapshot
+            .iter()
+            .position(|(addr, _)| {
+                addressing_cursor_key(&addr.scheme, &addr.value).as_str()
+                    > after_key
+            })
+            .unwrap_or(snapshot.len()),
+        None => 0,
+    };
+    let end = start.saturating_add(limit).min(snapshot.len());
+
+    let addressings: Vec<AddressingListEntryWire> = snapshot[start..end]
+        .iter()
+        .map(|(addr, canonical_id)| AddressingListEntryWire {
+            scheme: addr.scheme.clone(),
+            value: addr.value.clone(),
+            canonical_id: canonical_id.clone(),
+        })
+        .collect();
+
+    let next_cursor = if end < snapshot.len() {
+        addressings.last().map(|a| {
+            encode_page_cursor(&addressing_cursor_key(&a.scheme, &a.value))
+        })
+    } else {
+        None
+    };
+
+    ClientResponse::AddressingsPage {
+        addressings,
+        next_cursor,
+        current_seq,
+    }
+}
+
 /// Wire version reported by `op = "describe_capabilities"`.
 ///
 /// Bumped when an existing op or response shape changes
@@ -2306,8 +3314,13 @@ const SUPPORTED_OPS: &[&str] = &[
     "project_subject",
     "describe_alias",
     "list_active_custodies",
+    "list_subjects",
+    "list_relations",
+    "enumerate_addressings",
     "subscribe_happenings",
     "describe_capabilities",
+    "negotiate",
+    "resolve_claimants",
 ];
 
 /// Named features this build supports.
@@ -2323,12 +3336,19 @@ const SUPPORTED_OPS: &[&str] = &[
 ///   alias-aware variants of `op = "project_subject"`.
 /// - `active_custodies_snapshot`: `op = "list_active_custodies"`
 ///   returns the full ledger.
+/// - `paginated_state_snapshots`: the `list_subjects`,
+///   `list_relations`, and `enumerate_addressings` ops are
+///   available, each returning paginated rows alongside
+///   `current_seq` so consumers can pin reconcile-style queries to
+///   a happenings position.
 ///
 /// Names are stable; new features are appended.
 const SUPPORTED_FEATURES: &[&str] = &[
     "subscribe_happenings_cursor",
     "alias_chain_walking",
     "active_custodies_snapshot",
+    "paginated_state_snapshots",
+    "capability_negotiation",
 ];
 
 /// Build the capability discovery response.
@@ -2378,6 +3398,39 @@ mod tests {
             }
             other => panic!("expected Request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn client_request_rejects_unknown_field_at_parse() {
+        // Operator typo or attacker-shaped request: `payload-b64` with
+        // a hyphen instead of `payload_b64` MUST be rejected by the
+        // strict parser, not silently dropped (which would leave the
+        // request running with an empty payload and produce a confusing
+        // downstream "no payload" failure). This pins the
+        // `deny_unknown_fields` discipline on the request envelope.
+        let json = r#"{"op":"request","shelf":"a.b","request_type":"t","payload-b64":"aGVsbG8="}"#;
+        let err = serde_json::from_str::<ClientRequest>(json)
+            .expect_err("unknown field on ClientRequest must reject the parse");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("payload-b64") || msg.contains("unknown field"),
+            "parse error must name the unknown field, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn client_request_rejects_unknown_top_level_field_on_describe_alias() {
+        // Same discipline on every variant: an attacker-shaped
+        // `describe_alias` carrying an extra unknown field must be
+        // rejected, not silently dropped. Pins
+        // `deny_unknown_fields` across the internally-tagged enum.
+        let json = r#"{"op":"describe_alias","subject_id":"abc","include_chain":true,"extra":42}"#;
+        let err = serde_json::from_str::<ClientRequest>(json)
+            .expect_err("unknown field on DescribeAlias must reject the parse");
+        assert!(
+            format!("{err}").contains("unknown field"),
+            "parse error must name the unknown field"
+        );
     }
 
     #[test]
@@ -2556,6 +3609,23 @@ mod tests {
         let d: ProjectionScope = w.into();
         assert_eq!(d.max_depth, 7);
         assert_eq!(d.max_visits, 42);
+    }
+
+    #[test]
+    fn projection_scope_wire_clamps_max_depth_and_max_visits() {
+        // A peer requesting `usize::MAX` for either knob must be
+        // silently capped at the steward's hard limits. Without
+        // this clamp a single local-socket request could force a
+        // worst-case full-graph traversal.
+        let w = ProjectionScopeWire {
+            relation_predicates: vec!["a".into()],
+            direction: WalkDirectionWire::Forward,
+            max_depth: Some(usize::MAX),
+            max_visits: Some(usize::MAX),
+        };
+        let d: ProjectionScope = w.into();
+        assert_eq!(d.max_depth, MAX_PROJECTION_DEPTH);
+        assert_eq!(d.max_visits, MAX_PROJECTION_VISITS);
     }
 
     #[test]
@@ -2766,6 +3836,7 @@ mod tests {
                 health: HealthStatus::Healthy,
                 reported_at_ms: 1_700_000_000_050,
             }),
+            state: crate::custody::CustodyStateKind::Active,
             started_at_ms: 1_700_000_000_000,
             last_updated_ms: 1_700_000_000_050,
         };
@@ -2810,6 +3881,7 @@ mod tests {
             shelf: Some("example.custody".into()),
             custody_type: Some("playback".into()),
             last_state: Some(snap),
+            state: crate::custody::CustodyStateKind::Active,
             started_at: UNIX_EPOCH + std::time::Duration::from_millis(100),
             last_updated: UNIX_EPOCH + std::time::Duration::from_millis(500),
         };
@@ -2838,6 +3910,7 @@ mod tests {
             shelf: None,
             custody_type: None,
             last_state: None,
+            state: crate::custody::CustodyStateKind::Active,
             started_at: UNIX_EPOCH + std::time::Duration::from_millis(100),
             last_updated: UNIX_EPOCH + std::time::Duration::from_millis(100),
         };
@@ -2907,8 +3980,13 @@ mod tests {
             "project_subject",
             "describe_alias",
             "list_active_custodies",
+            "list_subjects",
+            "list_relations",
+            "enumerate_addressings",
             "subscribe_happenings",
             "describe_capabilities",
+            "negotiate",
+            "resolve_claimants",
         ] {
             assert!(
                 ops.contains(&expected),
@@ -2926,6 +4004,8 @@ mod tests {
             .collect();
         assert!(features.contains(&"subscribe_happenings_cursor"));
         assert!(features.contains(&"alias_chain_walking"));
+        assert!(features.contains(&"paginated_state_snapshots"));
+        assert!(features.contains(&"capability_negotiation"));
     }
 
     #[test]
@@ -3020,10 +4100,18 @@ mod tests {
 
     #[test]
     fn client_response_lagged_serialises() {
-        let r = ClientResponse::Lagged { lagged: 17 };
+        let r = ClientResponse::Lagged {
+            lagged: LaggedSignal {
+                missed_count: 17,
+                oldest_available_seq: 3,
+                current_seq: 42,
+            },
+        };
         let s = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["lagged"].as_u64(), Some(17));
+        assert_eq!(v["lagged"]["missed_count"].as_u64(), Some(17));
+        assert_eq!(v["lagged"]["oldest_available_seq"].as_u64(), Some(3));
+        assert_eq!(v["lagged"]["current_seq"].as_u64(), Some(42));
         // Distinctive top-level key.
         assert!(!s.contains("\"subscribed\""));
         assert!(!s.contains("\"happening\""));
@@ -3156,5 +4244,1102 @@ mod tests {
             "plain plugin name MUST NOT leak to the wire; got: {s}"
         );
         assert!(s.contains("\"claimant_token\""));
+    }
+
+    // -----------------------------------------------------------------
+    // Replay window: a since cursor older than the oldest retained
+    // happening must produce a structured response rather than a
+    // silent partial replay.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_subscription_emits_replay_window_exceeded_when_since_lt_oldest(
+    ) {
+        // Seed the in-memory persistence with a happening at seq 5 so
+        // the oldest available row is well above the consumer's
+        // requested cursor of 0.
+        let store: Arc<dyn crate::persistence::PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        store
+            .record_happening(
+                5,
+                "custody_taken",
+                &serde_json::json!({"type": "custody_taken"}),
+                1_700_000_000_000,
+            )
+            .await
+            .expect("seed happening");
+
+        // Build a state that points at the seeded persistence and a
+        // bus seeded from the same store so seqs continue past 5.
+        let bus = Arc::new(
+            crate::happenings::HappeningBus::with_persistence(Arc::clone(
+                &store,
+            ))
+            .await
+            .expect("seed bus"),
+        );
+        let state = StewardState::builder()
+            .catalogue(Arc::new(crate::catalogue::Catalogue::default()))
+            .subjects(Arc::new(crate::subjects::SubjectRegistry::new()))
+            .relations(Arc::new(crate::relations::RelationGraph::new()))
+            .custody(Arc::new(crate::custody::CustodyLedger::new()))
+            .bus(Arc::clone(&bus))
+            .admin(Arc::new(crate::admin::AdminLedger::new()))
+            .persistence(Arc::clone(&store))
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new(
+                "test-instance",
+            )))
+            .build()
+            .expect("state");
+
+        // Wire two ends of a Unix socket pair; the server side is
+        // handed to run_subscription, the client side reads what the
+        // server writes.
+        let (server_end, mut client_end) = UnixStream::pair().unwrap();
+
+        let handle = tokio::spawn(async move {
+            run_subscription(server_end, state, Some(0)).await
+        });
+
+        // Read one frame off the client end; expect the structured
+        // replay_window_exceeded error.
+        let mut len = [0u8; 4];
+        client_end.read_exact(&mut len).await.expect("read len");
+        let n = u32::from_be_bytes(len) as usize;
+        let mut body = vec![0u8; n];
+        client_end.read_exact(&mut body).await.expect("read body");
+        let v: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse frame");
+
+        // Subscription returns cleanly after writing the error frame.
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(v["error"]["class"].as_str(), Some("contract_violation"));
+        assert_eq!(
+            v["error"]["details"]["subclass"].as_str(),
+            Some("replay_window_exceeded")
+        );
+        assert_eq!(
+            v["error"]["details"]["oldest_available_seq"].as_u64(),
+            Some(5)
+        );
+        assert!(v["error"]["details"]["current_seq"].is_u64());
+    }
+
+    /// Concurrent stress on the replay-window check: N subscribers
+    /// all open at once with a cursor older than the durable window
+    /// MUST each independently receive a structured
+    /// `replay_window_exceeded` frame and exit cleanly. The check
+    /// runs in `run_subscription` against the persistence store's
+    /// `load_oldest_happening_seq()` before the ack; each subscriber
+    /// reaches its own oldest-seq query and its own structured
+    /// response. Pinning the path under concurrency catches any
+    /// shared-state mutation that would interleave the queries (e.g.
+    /// a future change that batched the oldest-seq read across
+    /// subscribers and got the bookkeeping wrong).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn run_subscription_concurrent_replay_window_exceeded() {
+        const N_SUBS: usize = 16;
+
+        let store: Arc<dyn crate::persistence::PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        // Oldest retained seq is 7; every subscriber will ask for 0.
+        store
+            .record_happening(
+                7,
+                "custody_taken",
+                &serde_json::json!({"type": "custody_taken"}),
+                1_700_000_000_000,
+            )
+            .await
+            .expect("seed happening");
+
+        let bus = Arc::new(
+            crate::happenings::HappeningBus::with_persistence(Arc::clone(
+                &store,
+            ))
+            .await
+            .expect("seed bus"),
+        );
+        let state = StewardState::builder()
+            .catalogue(Arc::new(crate::catalogue::Catalogue::default()))
+            .subjects(Arc::new(crate::subjects::SubjectRegistry::new()))
+            .relations(Arc::new(crate::relations::RelationGraph::new()))
+            .custody(Arc::new(crate::custody::CustodyLedger::new()))
+            .bus(Arc::clone(&bus))
+            .admin(Arc::new(crate::admin::AdminLedger::new()))
+            .persistence(Arc::clone(&store))
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new(
+                "test-instance",
+            )))
+            .build()
+            .expect("state");
+
+        let mut handles = Vec::with_capacity(N_SUBS);
+        let mut clients = Vec::with_capacity(N_SUBS);
+        for _ in 0..N_SUBS {
+            let (server_end, client_end) = UnixStream::pair().unwrap();
+            let state = Arc::clone(&state);
+            handles.push(tokio::spawn(async move {
+                run_subscription(server_end, state, Some(0)).await
+            }));
+            clients.push(client_end);
+        }
+
+        // Each subscriber MUST receive exactly one structured
+        // `replay_window_exceeded` frame and the task MUST exit
+        // cleanly. Drive every read with a wall-clock budget so a
+        // hang is observable as a failure rather than a timeout on
+        // the whole test binary.
+        for (i, mut client) in clients.into_iter().enumerate() {
+            let mut len = [0u8; 4];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.read_exact(&mut len),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("subscriber #{i}: read length timed out")
+            })
+            .expect("read length");
+            let n = u32::from_be_bytes(len) as usize;
+            let mut body = vec![0u8; n];
+            client.read_exact(&mut body).await.expect("read body");
+            let v: serde_json::Value =
+                serde_json::from_slice(&body).expect("parse frame");
+            assert_eq!(
+                v["error"]["details"]["subclass"].as_str(),
+                Some("replay_window_exceeded"),
+                "subscriber #{i}: expected replay_window_exceeded, got {v}",
+            );
+            assert_eq!(
+                v["error"]["details"]["oldest_available_seq"].as_u64(),
+                Some(7),
+                "subscriber #{i}: oldest_available_seq must be 7",
+            );
+        }
+
+        for (i, h) in handles.into_iter().enumerate() {
+            h.await
+                .unwrap_or_else(|e| panic!("subscriber #{i} panicked: {e}"))
+                .unwrap_or_else(|e| {
+                    panic!("subscriber #{i} returned err: {e}")
+                });
+        }
+    }
+
+    /// A subscriber that asks for `since = current_seq + 1`
+    /// (i.e. one past the last emitted seq) MUST receive an empty
+    /// replay window (no `Happening` frames between the ack and the
+    /// next live event). Subsequent live emits MUST then arrive in
+    /// seq order, with the dedupe filter excluding any envelope
+    /// whose `seq <= since`.
+    ///
+    /// The mechanism: `run_subscription` queries
+    /// `load_happenings_since(since, MAX)`; with `since = current_seq
+    /// + 1` the persistence query returns empty, so the dedupe
+    /// boundary is set to `since`. The first live emit lands at
+    /// `seq = current_seq + 1` which is `<= dedupe_boundary` and is
+    /// dropped; the second live emit lands at `seq = current_seq + 2`
+    /// which passes the gate and is forwarded to the consumer.
+    ///
+    /// The cursor-edge property is also exercised under the
+    /// happenings module's tests (notably
+    /// `subscribe_with_current_seq_pins_under_emit_lock` and the
+    /// stress harness); the wire-protocol edge is documented here
+    /// for completeness even though the in-process tests cover the
+    /// underlying invariants.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_subscription_with_since_at_current_emits_no_replay() {
+        let store: Arc<dyn crate::persistence::PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        // Seed two happenings so the bus's max seq is 2.
+        store
+            .record_happening(
+                1,
+                "custody_taken",
+                &serde_json::json!({"type": "custody_taken"}),
+                1_700_000_000_000,
+            )
+            .await
+            .unwrap();
+        store
+            .record_happening(
+                2,
+                "custody_released",
+                &serde_json::json!({"type": "custody_released"}),
+                1_700_000_001_000,
+            )
+            .await
+            .unwrap();
+
+        let bus = Arc::new(
+            crate::happenings::HappeningBus::with_persistence(Arc::clone(
+                &store,
+            ))
+            .await
+            .unwrap(),
+        );
+        // Sanity: bus seeded its counter past the on-disk max; the
+        // next emit will be 3.
+        assert_eq!(bus.last_emitted_seq(), 2);
+
+        let state = StewardState::builder()
+            .catalogue(Arc::new(crate::catalogue::Catalogue::default()))
+            .subjects(Arc::new(crate::subjects::SubjectRegistry::new()))
+            .relations(Arc::new(crate::relations::RelationGraph::new()))
+            .custody(Arc::new(crate::custody::CustodyLedger::new()))
+            .bus(Arc::clone(&bus))
+            .admin(Arc::new(crate::admin::AdminLedger::new()))
+            .persistence(Arc::clone(&store))
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new(
+                "test-instance",
+            )))
+            .build()
+            .unwrap();
+
+        let (server_end, mut client_end) = UnixStream::pair().unwrap();
+        // Subscribe with since = current_seq + 1 = 3.
+        let state_for_task = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            run_subscription(server_end, state_for_task, Some(3)).await
+        });
+
+        // First frame on the client end MUST be the Subscribed ack.
+        let mut len = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_end.read_exact(&mut len),
+        )
+        .await
+        .expect("ack length read timed out")
+        .unwrap();
+        let n = u32::from_be_bytes(len) as usize;
+        let mut body = vec![0u8; n];
+        client_end.read_exact(&mut body).await.unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(ack["subscribed"].as_bool(), Some(true));
+        assert_eq!(ack["current_seq"].as_u64(), Some(2));
+
+        // Emit two more happenings on the bus. The bus's next_seq is
+        // 3 (max=2 + 1), so these mint as seq 3 then seq 4. The
+        // subscriber asked for `since=3`, meaning events with
+        // `seq > 3`; the seq=3 emit is filtered by the dedupe gate
+        // and the seq=4 emit is forwarded.
+        use crate::happenings::Happening;
+        bus.emit_durable(Happening::CustodyTaken {
+            plugin: "org.test".into(),
+            handle_id: "h-1".into(),
+            shelf: "x.y".into(),
+            custody_type: "playback".into(),
+            at: std::time::SystemTime::UNIX_EPOCH,
+        })
+        .await
+        .unwrap();
+        bus.emit_durable(Happening::CustodyTaken {
+            plugin: "org.test".into(),
+            handle_id: "h-2".into(),
+            shelf: "x.y".into(),
+            custody_type: "playback".into(),
+            at: std::time::SystemTime::UNIX_EPOCH,
+        })
+        .await
+        .unwrap();
+
+        // Expect exactly one frame on the wire: the live happening
+        // at seq 4. seq 3 was suppressed by the dedupe boundary.
+        let mut len2 = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_end.read_exact(&mut len2),
+        )
+        .await
+        .expect("live frame length read timed out")
+        .unwrap();
+        let n2 = u32::from_be_bytes(len2) as usize;
+        let mut body2 = vec![0u8; n2];
+        client_end.read_exact(&mut body2).await.unwrap();
+        let frame: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(frame["seq"].as_u64(), Some(4));
+
+        // The subscription task is in a recv loop with no
+        // shutdown signal beyond the wire closing. Closing the
+        // client end and aborting the handle gives the runtime
+        // a clean exit path so the test does not hang at
+        // teardown if the rx.recv() future cannot observe the
+        // peer half-close before the test moves on.
+        drop(client_end);
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    // -----------------------------------------------------------------
+    // Paginated list ops: every seeded row appears exactly once across
+    // pages, and current_seq is a stable bus pin.
+    // -----------------------------------------------------------------
+
+    fn seeded_state_for_lists(n: usize) -> Arc<StewardState> {
+        use evo_plugin_sdk::contract::{
+            ExternalAddressing, SubjectAnnouncement,
+        };
+        let state = StewardState::for_tests();
+        // Seed N subjects with one addressing each.
+        for i in 0..n {
+            let scheme = "test";
+            let value = format!("v-{i:04}");
+            let ann = SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new(scheme, value)],
+            );
+            state.subjects.announce(&ann, "org.test.plugin").unwrap();
+        }
+        // Seed N relations on a small set of source/target ids.
+        for i in 0..n {
+            let source = format!("s-{:04}", i % 3);
+            let predicate = format!("pred-{:04}", i / 3);
+            let target = format!("t-{i:04}");
+            state
+                .relations
+                .assert(&source, &predicate, &target, "org.test.plugin", None)
+                .unwrap();
+        }
+        state
+    }
+
+    fn pages_through_subjects(
+        state: &Arc<StewardState>,
+        page_size: usize,
+    ) -> (Vec<String>, Vec<u64>) {
+        let mut all = Vec::new();
+        let mut seqs = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let resp = handle_list_subjects(state, cursor, Some(page_size));
+            let (subjects, next_cursor, current_seq) = match resp {
+                ClientResponse::SubjectsPage {
+                    subjects,
+                    next_cursor,
+                    current_seq,
+                } => (subjects, next_cursor, current_seq),
+                other => panic!("unexpected response: {other:?}"),
+            };
+            seqs.push(current_seq);
+            for s in subjects {
+                all.push(s.canonical_id);
+            }
+            cursor = next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        (all, seqs)
+    }
+
+    #[test]
+    fn list_subjects_returns_every_seeded_row_exactly_once() {
+        let state = seeded_state_for_lists(7);
+        let total = state.subjects.subject_count();
+        let (ids, seqs) = pages_through_subjects(&state, 3);
+        assert_eq!(ids.len(), total);
+        let unique: std::collections::HashSet<_> =
+            ids.iter().cloned().collect();
+        assert_eq!(unique.len(), total);
+        // current_seq is a stable bus pin (no emits during the
+        // test); every page reports the same value.
+        for s in &seqs {
+            assert_eq!(*s, seqs[0]);
+        }
+    }
+
+    #[test]
+    fn list_subjects_page_size_clamped_to_limits() {
+        let state = seeded_state_for_lists(3);
+        let resp =
+            handle_list_subjects(&state, None, Some(MAX_LIST_PAGE_SIZE + 5));
+        match resp {
+            ClientResponse::SubjectsPage {
+                subjects,
+                next_cursor,
+                ..
+            } => {
+                assert_eq!(subjects.len(), 3);
+                assert!(next_cursor.is_none());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_relations_returns_every_seeded_edge_exactly_once() {
+        let state = seeded_state_for_lists(9);
+        let total = state.relations.relation_count();
+        let mut all = Vec::new();
+        let mut seqs = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let resp = handle_list_relations(&state, cursor, Some(4));
+            let (relations, next_cursor, current_seq) = match resp {
+                ClientResponse::RelationsPage {
+                    relations,
+                    next_cursor,
+                    current_seq,
+                } => (relations, next_cursor, current_seq),
+                other => panic!("unexpected response: {other:?}"),
+            };
+            seqs.push(current_seq);
+            for r in relations {
+                all.push((r.source_id, r.predicate, r.target_id));
+            }
+            cursor = next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(all.len(), total);
+        let unique: std::collections::HashSet<_> =
+            all.iter().cloned().collect();
+        assert_eq!(unique.len(), total);
+        for s in &seqs {
+            assert_eq!(*s, seqs[0]);
+        }
+    }
+
+    #[test]
+    fn enumerate_addressings_returns_every_seeded_addressing_exactly_once() {
+        let state = seeded_state_for_lists(11);
+        let total = state.subjects.addressing_count();
+        let mut all = Vec::new();
+        let mut seqs = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let resp = handle_enumerate_addressings(&state, cursor, Some(5));
+            let (addressings, next_cursor, current_seq) = match resp {
+                ClientResponse::AddressingsPage {
+                    addressings,
+                    next_cursor,
+                    current_seq,
+                } => (addressings, next_cursor, current_seq),
+                other => panic!("unexpected response: {other:?}"),
+            };
+            seqs.push(current_seq);
+            for a in addressings {
+                all.push((a.scheme, a.value));
+            }
+            cursor = next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(all.len(), total);
+        let unique: std::collections::HashSet<_> =
+            all.iter().cloned().collect();
+        assert_eq!(unique.len(), total);
+        for s in &seqs {
+            assert_eq!(*s, seqs[0]);
+        }
+    }
+
+    #[test]
+    fn list_subjects_page_size_zero_clamps_up_to_one() {
+        // page_size = 0 is interpreted as "no caller preference"
+        // and clamped up to 1 by `clamp_page_size`. The contract is
+        // documented in CLIENT_API.md; this test pins the behaviour
+        // so a future refactor cannot silently flip it to "errors
+        // with ContractViolation" without also updating the doc.
+        let state = seeded_state_for_lists(3);
+        let resp = handle_list_subjects(&state, None, Some(0));
+        match resp {
+            ClientResponse::SubjectsPage {
+                subjects,
+                next_cursor,
+                ..
+            } => {
+                assert_eq!(
+                    subjects.len(),
+                    1,
+                    "page_size=0 must clamp up to 1, not produce an empty \
+                     page",
+                );
+                assert!(
+                    next_cursor.is_some(),
+                    "with 3 subjects and page_size clamped to 1, the next \
+                     cursor must be set",
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_subjects_mid_pagination_subject_delete_resilience() {
+        // Page through subjects with size 10. After page 1,
+        // retract one of the subjects whose canonical_id is on
+        // page 1. Page 2 must return the next 10 subjects in
+        // canonical-id order with no duplication and no skip.
+        use evo_plugin_sdk::contract::{
+            ExternalAddressing, SubjectAnnouncement,
+        };
+        let state = StewardState::for_tests();
+        // Seed exactly 25 subjects so we have enough for 3 pages of
+        // 10. Each subject is announced with a single addressing so
+        // retract on its sole addressing forgets the subject.
+        let mut announcements: Vec<(String, ExternalAddressing)> =
+            Vec::with_capacity(25);
+        for i in 0..25 {
+            let addr = ExternalAddressing::new("test", format!("v-{i:04}"));
+            let ann = SubjectAnnouncement::new("track", vec![addr.clone()]);
+            let outcome =
+                state.subjects.announce(&ann, "org.test.plugin").unwrap();
+            let id = match outcome {
+                crate::subjects::AnnounceOutcome::Created(id) => id,
+                other => panic!("expected Created on fresh seed: {other:?}"),
+            };
+            announcements.push((id, addr));
+        }
+
+        // Page 1.
+        let p1 = handle_list_subjects(&state, None, Some(10));
+        let (page1_ids, cursor1) = match p1 {
+            ClientResponse::SubjectsPage {
+                subjects,
+                next_cursor,
+                ..
+            } => (
+                subjects
+                    .into_iter()
+                    .map(|s| s.canonical_id)
+                    .collect::<Vec<_>>(),
+                next_cursor,
+            ),
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(page1_ids.len(), 10);
+        assert!(cursor1.is_some(), "more pages expected");
+
+        // Forget one subject whose id is on page 1.
+        let target_id = page1_ids[5].clone();
+        let target_addr = announcements
+            .iter()
+            .find(|(id, _)| id == &target_id)
+            .map(|(_, a)| a.clone())
+            .expect("target addressing");
+        let outcome = state
+            .subjects
+            .retract(&target_addr, "org.test.plugin", None)
+            .expect("retract");
+        // Sanity: this was the subject's last addressing, so it
+        // should have been forgotten.
+        match outcome {
+            crate::subjects::SubjectRetractOutcome::SubjectForgotten {
+                ..
+            } => {}
+            other => panic!("expected SubjectForgotten, got: {other:?}"),
+        }
+
+        // Page 2 against the cursor returned by page 1. The cursor
+        // is the canonical_id of page 1's last entry; the registry
+        // returns ids strictly greater than it.
+        let p2 = handle_list_subjects(&state, cursor1, Some(10));
+        let (page2_ids, _) = match p2 {
+            ClientResponse::SubjectsPage {
+                subjects,
+                next_cursor,
+                ..
+            } => (
+                subjects
+                    .into_iter()
+                    .map(|s| s.canonical_id)
+                    .collect::<Vec<_>>(),
+                next_cursor,
+            ),
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(
+            page2_ids.len(),
+            10,
+            "page 2 must still return 10 surviving subjects after a \
+             mid-pagination delete"
+        );
+
+        // The deleted id MUST NOT appear on either page after the
+        // retract; the page 2 contents MUST be strictly greater than
+        // the page 1 cursor and MUST NOT overlap page 1.
+        for id in &page2_ids {
+            assert_ne!(*id, target_id, "deleted subject must not reappear");
+            assert!(
+                page1_ids.iter().all(|p| p != id),
+                "page 2 must not duplicate page 1 entries"
+            );
+        }
+    }
+
+    #[test]
+    fn list_ops_reject_invalid_cursor_with_structured_error() {
+        let state = seeded_state_for_lists(1);
+        let resp = handle_list_subjects(
+            &state,
+            Some("not-base64-!!!".to_string()),
+            None,
+        );
+        match resp {
+            ClientResponse::Error { error } => {
+                assert_eq!(error.class, ErrorClass::ContractViolation);
+                assert_eq!(
+                    error.details.unwrap()["subclass"].as_str(),
+                    Some("invalid_page_cursor")
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Lagged signal: emits the structured payload with missed_count,
+    // oldest_available_seq, and current_seq when the broadcast ring
+    // overflows.
+    // -----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_subscription_emits_structured_lagged_signal() {
+        // Tiny capacity bus so we can saturate the broadcast ring.
+        let store: Arc<dyn crate::persistence::PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        // Seed a single durable row so oldest_available_seq is
+        // non-zero and the structured payload carries a meaningful
+        // pin.
+        store
+            .record_happening(
+                1,
+                "custody_taken",
+                &serde_json::json!({"type": "custody_taken"}),
+                1_700_000_000_000,
+            )
+            .await
+            .unwrap();
+
+        let bus = Arc::new(
+            crate::happenings::HappeningBus::with_persistence_capacity_and_window(
+                Arc::clone(&store),
+                2,
+                60,
+            )
+            .await
+            .expect("seed bus"),
+        );
+        let state = StewardState::builder()
+            .catalogue(Arc::new(crate::catalogue::Catalogue::default()))
+            .subjects(Arc::new(crate::subjects::SubjectRegistry::new()))
+            .relations(Arc::new(crate::relations::RelationGraph::new()))
+            .custody(Arc::new(crate::custody::CustodyLedger::new()))
+            .bus(Arc::clone(&bus))
+            .admin(Arc::new(crate::admin::AdminLedger::new()))
+            .persistence(Arc::clone(&store))
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new("test")))
+            .build()
+            .expect("state");
+
+        let (server_end, mut client_end) = UnixStream::pair().unwrap();
+
+        // Spawn the subscription with no cursor (live-only).
+        let state_clone = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            run_subscription(server_end, state_clone, None).await
+        });
+
+        // Read the subscribe ack.
+        let mut len = [0u8; 4];
+        client_end.read_exact(&mut len).await.unwrap();
+        let n = u32::from_be_bytes(len) as usize;
+        let mut body = vec![0u8; n];
+        client_end.read_exact(&mut body).await.unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(ack["subscribed"].as_bool(), Some(true));
+
+        // Saturate the broadcast ring (capacity 2) — emit far more
+        // events than the buffer holds so the receiver MUST observe
+        // a Lagged on its next recv() once the spawned task is
+        // scheduled.
+        for _ in 0..32 {
+            bus.emit(Happening::CustodyReleased {
+                plugin: "p".into(),
+                handle_id: "h".into(),
+                at: SystemTime::now(),
+            });
+        }
+
+        // Read frames with a per-frame timeout so a missing Lagged
+        // does not hang the test indefinitely. Look for the
+        // structured lagged payload within a bounded number of
+        // frames.
+        let mut saw_lagged = false;
+        for _ in 0..64 {
+            let mut len = [0u8; 4];
+            let timed = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                client_end.read_exact(&mut len),
+            )
+            .await;
+            let read_result = match timed {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            if read_result.is_err() {
+                break;
+            }
+            let n = u32::from_be_bytes(len) as usize;
+            let mut body = vec![0u8; n];
+            if client_end.read_exact(&mut body).await.is_err() {
+                break;
+            }
+            let frame: serde_json::Value =
+                serde_json::from_slice(&body).unwrap();
+            if let Some(payload) = frame.get("lagged") {
+                assert!(payload["missed_count"].as_u64().unwrap() > 0);
+                assert_eq!(payload["oldest_available_seq"].as_u64(), Some(1));
+                assert!(payload["current_seq"].is_u64());
+                saw_lagged = true;
+                break;
+            }
+        }
+        assert!(saw_lagged, "structured lagged frame never arrived");
+
+        drop(client_end);
+        let _ = handle.await;
+    }
+
+    #[test]
+    fn negotiable_capabilities_are_all_gated() {
+        // Every name in NEGOTIABLE_CAPABILITIES must have a
+        // matching arm in handle_negotiate's match. Add the name
+        // here and forget the arm and the connection silently denies
+        // every consumer that asks for it. This unit test runs the
+        // handler against a wide-open ACL and asserts every known
+        // name comes back granted; an ungated name would fall
+        // through to the defensive `_ => false` and trip the
+        // assertion.
+        let acl = Arc::new(
+            ClientAcl::parse(
+                r#"
+                [capabilities.resolve_claimants]
+                allow_local = true
+                allow_uids = [0, 1, 1000]
+                allow_gids = [0, 1, 1000]
+                "#,
+                None,
+            )
+            .expect("parse permissive ACL"),
+        );
+        let steward_identity = StewardIdentity {
+            uid: Some(1000),
+            gid: Some(1000),
+        };
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        });
+        let request: Vec<String> = NEGOTIABLE_CAPABILITIES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let response = handle_negotiate(
+            request.clone(),
+            &acl,
+            steward_identity,
+            &mut conn,
+        );
+        match response {
+            ClientResponse::Negotiated { ok, granted } => {
+                assert!(ok);
+                for name in &request {
+                    assert!(
+                        granted.contains(name),
+                        "every known capability must be gated; {name:?} \
+                         was dropped — likely a missing arm in \
+                         handle_negotiate"
+                    );
+                }
+            }
+            other => panic!("expected Negotiated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negotiate_refuses_resolve_claimants_when_peer_cred_failed() {
+        // `peer_credentials()` (in this module) returns
+        // `PeerCredentials { uid: None, gid: None }` when the
+        // platform's peer-credential query fails (e.g. a non-Linux
+        // Unix that does not expose SO_PEERCRED at the same socket
+        // option, or a sandbox that strips the credential). The ACL
+        // path through `allow_local` / `allow_uids` / `allow_gids`
+        // MUST refuse `resolve_claimants` for such a connection: a
+        // grant would let an unidentified peer escalate to a
+        // capability the operator gated on identity. This is the
+        // integration test for the failure path; the unit test that
+        // covers the same predicate at the ACL layer alone exists in
+        // `client_acl.rs::tests`.
+        let acl = Arc::new(ClientAcl::default());
+        let steward_identity = StewardIdentity {
+            uid: Some(1234),
+            gid: Some(1234),
+        };
+        // Peer credentials unknown — the failure-path shape that
+        // `peer_credentials(stream)` produces when `peer_cred()`
+        // errors out.
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: None,
+            gid: None,
+        });
+        let response = handle_negotiate(
+            vec!["resolve_claimants".to_string()],
+            &acl,
+            steward_identity,
+            &mut conn,
+        );
+        match response {
+            ClientResponse::Negotiated { ok, granted } => {
+                assert!(
+                    ok,
+                    "negotiate must return ok=true even when no capability is granted"
+                );
+                assert!(
+                    !granted.iter().any(|g| g == "resolve_claimants"),
+                    "resolve_claimants MUST NOT be granted when peer credentials are unknown; got {granted:?}",
+                );
+            }
+            other => panic!("expected Negotiated, got {other:?}"),
+        }
+        assert!(
+            !conn.has(CAPABILITY_RESOLVE_CLAIMANTS),
+            "connection state must not record the capability for an unidentified peer"
+        );
+    }
+
+    #[test]
+    fn negotiate_with_empty_capability_list_returns_empty_granted_set() {
+        // The handler must accept an empty capability list and
+        // return `granted = []` cleanly. A consumer issuing
+        // `negotiate` with no requested capabilities is a valid
+        // probe shape (e.g. confirming the op exists) and MUST NOT
+        // be conflated with "all capabilities granted" or
+        // "negotiation failed". Pinning the contract because the
+        // empty-list edge sat unasserted in the audit MINOR list.
+        let acl = Arc::new(ClientAcl::default());
+        let steward_identity = StewardIdentity {
+            uid: Some(0),
+            gid: Some(0),
+        };
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: Some(0),
+            gid: Some(0),
+        });
+        let response =
+            handle_negotiate(Vec::new(), &acl, steward_identity, &mut conn);
+        match response {
+            ClientResponse::Negotiated { ok, granted } => {
+                assert!(
+                    ok,
+                    "negotiate with empty capability list must succeed"
+                );
+                assert!(
+                    granted.is_empty(),
+                    "empty capability list must yield empty granted set, got {granted:?}",
+                );
+            }
+            other => panic!("expected Negotiated, got {other:?}"),
+        }
+        // Side-effect on the connection state: the granted set on
+        // the per-connection record is also empty.
+        assert!(
+            conn.granted_capabilities.is_empty(),
+            "connection state's granted set must be empty after empty-capability negotiate"
+        );
+    }
+
+    #[test]
+    fn negotiate_drops_unknown_capability_names_silently() {
+        // Forward-compat: a consumer probing for a capability the
+        // steward does not recognise must not error; the unknown
+        // name is dropped from the granted set.
+        let acl = Arc::new(ClientAcl::default());
+        let steward_identity = StewardIdentity {
+            uid: Some(0),
+            gid: Some(0),
+        };
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: Some(0),
+            gid: Some(0),
+        });
+        let response = handle_negotiate(
+            vec![
+                "resolve_claimants".to_string(),
+                "made_up_capability_v999".to_string(),
+            ],
+            &acl,
+            steward_identity,
+            &mut conn,
+        );
+        match response {
+            ClientResponse::Negotiated { granted, .. } => {
+                assert!(granted.contains(&"resolve_claimants".to_string()));
+                assert!(!granted
+                    .iter()
+                    .any(|g| g == "made_up_capability_v999"));
+            }
+            other => panic!("expected Negotiated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negotiate_records_granted_set_on_connection_state() {
+        // The handler must update conn.granted_capabilities so
+        // subsequent op handlers can consult it. Pinning the
+        // side-effect because it is the load-bearing piece of state
+        // for capability gating.
+        let acl = Arc::new(ClientAcl::default());
+        let steward_identity = StewardIdentity {
+            uid: Some(1234),
+            gid: Some(1234),
+        };
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1234),
+            gid: Some(1234),
+        });
+        assert!(conn.granted_capabilities.is_empty());
+        let _ = handle_negotiate(
+            vec!["resolve_claimants".to_string()],
+            &acl,
+            steward_identity,
+            &mut conn,
+        );
+        assert!(conn.has("resolve_claimants"));
+    }
+
+    #[test]
+    fn resolve_claimants_refuses_when_capability_absent() {
+        // Without the capability the op must refuse with the
+        // specific class+subclass operators code against.
+        let state = StewardState::for_tests();
+        let ledger = Arc::new(ResolutionLedger::new());
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1234),
+            gid: Some(1234),
+        });
+        let token = state.claimant_issuer.token_for("com.foo.bar");
+        let response = handle_resolve_claimants(
+            &state,
+            &ledger,
+            &mut conn,
+            vec![token.as_str().to_string()],
+        );
+        match response {
+            ClientResponse::Error { error } => {
+                assert_eq!(error.class, ErrorClass::PermissionDenied);
+                let details = error.details.as_ref().expect("details");
+                assert_eq!(
+                    details["subclass"].as_str(),
+                    Some("resolve_claimants_not_granted")
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        // Even refused calls land in the audit ledger.
+        assert_eq!(ledger.count(), 1);
+        let entry = &ledger.entries()[0];
+        assert!(!entry.granted);
+        assert_eq!(entry.tokens_requested, 1);
+        assert_eq!(entry.tokens_resolved, 0);
+    }
+
+    #[test]
+    fn resolve_claimants_returns_resolutions_for_known_tokens() {
+        let state = StewardState::for_tests();
+        let ledger = Arc::new(ResolutionLedger::new());
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1234),
+            gid: Some(1234),
+        });
+        conn.granted_capabilities.insert("resolve_claimants".into());
+
+        // Pre-mint two tokens with versions, plus one without.
+        state.claimant_issuer.record_version("com.foo.bar", "1.2.3");
+        state.claimant_issuer.record_version("com.baz", "0.1.0");
+        let no_version_token =
+            state.claimant_issuer.token_for("com.no.version");
+
+        let foo_token = state.claimant_issuer.token_for("com.foo.bar");
+        let baz_token = state.claimant_issuer.token_for("com.baz");
+
+        let response = handle_resolve_claimants(
+            &state,
+            &ledger,
+            &mut conn,
+            vec![
+                foo_token.as_str().to_string(),
+                "never-issued-xxxxxxxx".to_string(),
+                baz_token.as_str().to_string(),
+                no_version_token.as_str().to_string(),
+            ],
+        );
+        let resolutions = match response {
+            ClientResponse::Resolutions { resolutions } => resolutions,
+            other => panic!("expected Resolutions, got {other:?}"),
+        };
+        // Three known, one unknown -> three rows. Unknown silently
+        // omitted.
+        assert_eq!(resolutions.len(), 3);
+        let by_name: std::collections::HashMap<
+            String,
+            &ClaimantResolutionWire,
+        > = resolutions
+            .iter()
+            .map(|r| (r.plugin_name.clone(), r))
+            .collect();
+        assert_eq!(
+            by_name
+                .get("com.foo.bar")
+                .unwrap()
+                .plugin_version
+                .as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            by_name.get("com.baz").unwrap().plugin_version.as_deref(),
+            Some("0.1.0")
+        );
+        assert!(by_name
+            .get("com.no.version")
+            .unwrap()
+            .plugin_version
+            .is_none());
+
+        let entry = &ledger.entries()[0];
+        assert!(entry.granted);
+        assert_eq!(entry.tokens_requested, 4);
+        assert_eq!(entry.tokens_resolved, 3);
+    }
+
+    #[test]
+    fn negotiate_request_parses_minimal() {
+        let json = r#"{"op":"negotiate","capabilities":["resolve_claimants"]}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::Negotiate { capabilities } => {
+                assert_eq!(capabilities, vec!["resolve_claimants"]);
+            }
+            other => panic!("expected Negotiate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_claimants_request_parses_minimal() {
+        let json = r#"{"op":"resolve_claimants","tokens":["abc","def"]}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::ResolveClaimants { tokens } => {
+                assert_eq!(tokens, vec!["abc", "def"]);
+            }
+            other => panic!("expected ResolveClaimants, got {other:?}"),
+        }
     }
 }

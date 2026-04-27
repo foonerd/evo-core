@@ -11,6 +11,15 @@ repository.workspace = true
 name = "evo"
 path = "src/main.rs"
 
+# Consumer-facing worked example: connect, describe capabilities,
+# snapshot via list_subjects, then subscribe with `since` set to the
+# snapshot's `current_seq`. See examples/subscribe_and_reconcile.rs
+# for the canonical reconciliation pattern documented in
+# docs/engineering/CLIENT_API.md.
+[[example]]
+name = "subscribe_and_reconcile"
+path = "examples/subscribe_and_reconcile.rs"
+
 [dependencies]
 evo-plugin-sdk = { path = "../evo-plugin-sdk" }
 evo-trust = { path = "../evo-trust" }

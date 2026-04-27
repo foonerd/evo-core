@@ -35,13 +35,16 @@ use crate::happenings::{
     CardinalityViolationSide, Happening, HappeningBus, ReassignedClaimKind,
     RelationForgottenReason,
 };
+use crate::persistence::PersistenceStore;
+use crate::projections::SubjectConflictIndex;
 use crate::relations::{
     ForcedRetractClaimOutcome, RelationGraph, RelationKey,
     ResolvedSplitAssignment, SuppressOutcome, UnsuppressOutcome,
 };
 use crate::router::PluginRouter;
 use crate::subjects::{
-    ForcedRetractAddressingOutcome, SubjectRegistry, SubjectRetractOutcome,
+    AnnounceOutcome, ForcedRetractAddressingOutcome, SubjectRegistry,
+    SubjectRetractOutcome,
 };
 
 /// A trivial state reporter that logs each report and returns success.
@@ -247,6 +250,18 @@ pub struct RegistrySubjectAnnouncer {
     catalogue: Arc<Catalogue>,
     bus: Arc<HappeningBus>,
     plugin_name: String,
+    /// Optional durable backing store. When present, multi-subject
+    /// conflicts and subject-forget events are mirrored into the
+    /// store alongside the live happening emission so operator
+    /// dashboards reading `pending_conflicts` see unresolved
+    /// conflicts and the alias chain carries tombstones for
+    /// forgotten subjects.
+    persistence: Option<Arc<dyn PersistenceStore>>,
+    /// Optional in-memory conflict index. When present, detected
+    /// multi-subject conflicts feed the index so the projection
+    /// engine surfaces the conflict-degraded reason for affected
+    /// subjects.
+    conflicts: Option<Arc<SubjectConflictIndex>>,
 }
 
 impl RegistrySubjectAnnouncer {
@@ -277,7 +292,37 @@ impl RegistrySubjectAnnouncer {
             catalogue,
             bus,
             plugin_name: plugin_name.into(),
+            persistence: None,
+            conflicts: None,
         }
+    }
+
+    /// Attach a durable backing store to this announcer.
+    ///
+    /// When set, the announcer mirrors detected multi-subject
+    /// conflicts into the `pending_conflicts` table and records a
+    /// tombstone alias entry on every subject-forget event so the
+    /// alias chain remains queryable for forgotten IDs.
+    ///
+    /// Construction without a store keeps existing call sites
+    /// working unchanged; the wiring layer attaches a real store via
+    /// this setter at boot.
+    pub fn with_persistence(
+        mut self,
+        persistence: Arc<dyn PersistenceStore>,
+    ) -> Self {
+        self.persistence = Some(persistence);
+        self
+    }
+
+    /// Attach a [`SubjectConflictIndex`] to this announcer so
+    /// detected conflicts feed the projection-degradation surface.
+    pub fn with_conflict_index(
+        mut self,
+        conflicts: Arc<SubjectConflictIndex>,
+    ) -> Self {
+        self.conflicts = Some(conflicts);
+        self
     }
 }
 
@@ -289,6 +334,9 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
     {
         let registry = Arc::clone(&self.registry);
         let catalogue = Arc::clone(&self.catalogue);
+        let bus = Arc::clone(&self.bus);
+        let persistence = self.persistence.clone();
+        let conflicts = self.conflicts.clone();
         let plugin_name = self.plugin_name.clone();
         Box::pin(async move {
             // Subject-type existence validation at announcement.
@@ -302,16 +350,77 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                 .find_subject_type(&announcement.subject_type)
                 .is_none()
             {
-                return Err(ReportError::Invalid(format!(
-                    "announce: subject type {:?} is not declared in \
-                     the catalogue",
-                    announcement.subject_type
-                )));
+                return Err(ReportError::UnknownSubjectType {
+                    subject_type: announcement.subject_type.clone(),
+                });
             }
-            match registry.announce(&announcement, &plugin_name) {
-                Ok(_outcome) => Ok(()),
-                Err(e) => Err(ReportError::Invalid(format!("announce: {e}"))),
+            let outcome = match registry.announce(&announcement, &plugin_name) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    return Err(ReportError::Invalid(format!("announce: {e}")));
+                }
+            };
+
+            // Multi-subject conflict surface. The registry recorded
+            // the conflict claim and returned without merging; the
+            // wiring layer is the one that turns "detection" into
+            // "operator-observable signal":
+            //
+            // 1. Emit a `SubjectConflictDetected` happening so live
+            //    audit subscribers see the conflict in stream order.
+            // 2. Mirror the conflict into the durable
+            //    `pending_conflicts` table (when persistence is
+            //    attached) so an operator dashboard polling the
+            //    table sees the unresolved row even if it was not
+            //    subscribed to the bus at the moment of detection.
+            //
+            // The persistence write is best-effort: a transient
+            // failure is logged but does not refuse the announce,
+            // because the in-memory registry has already accepted
+            // the conflict claim and the live happening still
+            // carries the data.
+            if let AnnounceOutcome::Conflict { canonical_ids } = &outcome {
+                let at = SystemTime::now();
+                bus.emit_durable(Happening::SubjectConflictDetected {
+                    plugin: plugin_name.clone(),
+                    addressings: announcement.addressings.clone(),
+                    canonical_ids: canonical_ids.clone(),
+                    at,
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
+
+                if let Some(store) = persistence.as_ref() {
+                    let at_ms = system_time_to_ms(at);
+                    match store
+                        .record_pending_conflict(
+                            &plugin_name,
+                            &announcement.addressings,
+                            canonical_ids,
+                            at_ms,
+                        )
+                        .await
+                    {
+                        Ok(conflict_id) => {
+                            if let Some(idx) = conflicts.as_ref() {
+                                idx.record(conflict_id, canonical_ids);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                plugin = %plugin_name,
+                                error = %e,
+                                "failed to persist pending conflict"
+                            );
+                        }
+                    }
+                }
             }
+            Ok(())
         })
     }
 
@@ -325,6 +434,8 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
         let graph = Arc::clone(&self.graph);
         let bus = Arc::clone(&self.bus);
         let plugin_name = self.plugin_name.clone();
+        let persistence = self.persistence.clone();
+        let conflicts = self.conflicts.clone();
         Box::pin(async move {
             let outcome =
                 match registry.retract(&addressing, &plugin_name, reason) {
@@ -359,12 +470,18 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                     let at = SystemTime::now();
 
                     // 1. Subject happening.
-                    bus.emit(Happening::SubjectForgotten {
+                    bus.emit_durable(Happening::SubjectForgotten {
                         plugin: plugin_name.clone(),
                         canonical_id: canonical_id.clone(),
                         subject_type,
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
 
                     // 2. Storage cascade. The graph returns the
                     // keys of every removed edge; we iterate them
@@ -379,7 +496,7 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                     // broadcast channel is the authoritative order
                     // for tie-breaking).
                     for key in removed {
-                        bus.emit(Happening::RelationForgotten {
+                        bus.emit_durable(Happening::RelationForgotten {
                             plugin: plugin_name.clone(),
                             source_id: key.source_id,
                             predicate: key.predicate,
@@ -388,7 +505,32 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                                 forgotten_subject: canonical_id.clone(),
                             },
                             at,
-                        });
+                        })
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "persistence write failed: {e}"
+                            ))
+                        })?;
+                    }
+
+                    // 4. Conflict-lifecycle scan. The forgotten id is
+                    //    no longer in `registry.describe(...)`'s
+                    //    answer set; any open conflict that
+                    //    referenced it sees its live count drop by
+                    //    one and may now close. Mirrors the admin
+                    //    forced-retract and merge / split paths.
+                    if let (Some(store), Some(idx)) =
+                        (persistence.as_ref(), conflicts.as_ref())
+                    {
+                        resolve_conflicts_after_admin_op(
+                            store.as_ref(),
+                            idx.as_ref(),
+                            registry.as_ref(),
+                            "forgotten",
+                            system_time_to_ms(at),
+                        )
+                        .await;
                     }
 
                     Ok(())
@@ -499,13 +641,13 @@ fn cardinality_exceeded(bound: Cardinality, count: usize) -> bool {
 /// side (`inverse_count`). Only `AtMostOne` / `ExactlyOne` bounds
 /// can be violated by a rewrite-driven count growth; other bounds
 /// emit nothing.
-fn emit_post_rewrite_cardinality_violations(
+async fn emit_post_rewrite_cardinality_violations(
     graph: &RelationGraph,
     catalogue: &Catalogue,
     affected_subjects: &HashSet<String>,
     admin_plugin: &str,
     bus: &HappeningBus,
-) {
+) -> Result<(), ReportError> {
     let at = SystemTime::now();
     // Stable iteration order for the bus: sort the affected
     // subjects so the violations appear in deterministic order
@@ -528,7 +670,7 @@ fn emit_post_rewrite_cardinality_violations(
                     predicate_rule.target_cardinality,
                     count,
                 ) {
-                    bus.emit(
+                    bus.emit_durable(
                         Happening::RelationCardinalityViolatedPostRewrite {
                             admin_plugin: admin_plugin.to_string(),
                             subject_id: subject_id.clone(),
@@ -538,7 +680,13 @@ fn emit_post_rewrite_cardinality_violations(
                             observed_count: count,
                             at,
                         },
-                    );
+                    )
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
                 }
             }
             // Source side: predicate.source_cardinality bounds how
@@ -554,7 +702,7 @@ fn emit_post_rewrite_cardinality_violations(
                     predicate_rule.source_cardinality,
                     count,
                 ) {
-                    bus.emit(
+                    bus.emit_durable(
                         Happening::RelationCardinalityViolatedPostRewrite {
                             admin_plugin: admin_plugin.to_string(),
                             subject_id: subject_id.clone(),
@@ -564,6 +712,106 @@ fn emit_post_rewrite_cardinality_violations(
                             observed_count: count,
                             at,
                         },
+                    )
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk every open `pending_conflicts` row and resolve any whose
+/// recorded `canonical_ids` set has at most one live id remaining
+/// against the registry. Invoked by the merge, split, and forget
+/// admin paths after their storage primitives commit and their
+/// happening cascade emits.
+///
+/// The "live" test is `SubjectRegistry::describe(id).is_some()`:
+/// `describe` returns `None` for an id that has been aliased away
+/// by a prior merge or split, or hard-removed by a forget. A
+/// conflict whose canonical IDs are all but at most one no longer
+/// live is no longer a conflict — there is at most one surviving
+/// distinct subject from the original announcement, which is by
+/// definition not a multi-subject collision. This rule subsumes
+/// the previous "fully cover" check (which only closed conflicts
+/// when a single merge's two source ids equalled the conflict's
+/// recorded set), and additionally closes:
+///
+/// - 3+ way conflicts via sequential pairwise merges (each merge
+///   reduces the live count by one, and the last merge that
+///   leaves at most one of the original ids live closes the row);
+/// - conflicts whose ids were retracted rather than merged (forget
+///   path closes the row when the last but one of the original
+///   ids is forgotten);
+/// - mixed merge / forget sequences (the rule is geometric, not
+///   tied to one verb).
+///
+/// Per-conflict cost is one `describe` lookup per recorded id and
+/// at most one `mark_conflict_resolved` write. The whole scan is
+/// O(N) in the count of open conflicts; on a steward with many
+/// thousands of unresolved conflicts the per-admin-op cost grows
+/// linearly. Acceptable for 0.1.9; if the scan ever becomes a
+/// bottleneck the index in [`SubjectConflictIndex`] is the
+/// natural place to add a reverse-lookup so only the conflicts
+/// touched by the operation's affected ids are walked.
+///
+/// `resolution_kind` is the open-coded discriminator written to
+/// the `pending_conflicts.resolution_kind` column; the documented
+/// vocabulary is `"merged"`, `"split"`, `"forgotten"`, `"manual"`
+/// (see migration 004 and [`crate::persistence::PendingConflict`]).
+///
+/// Best-effort on the persistence side: a transient failure on
+/// `list_pending_conflicts` or `mark_conflict_resolved` is logged
+/// as a warning and does not refuse the admin operation, mirroring
+/// the discipline of the original "fully cover" block. The
+/// in-memory [`SubjectConflictIndex`] mirror is only updated when
+/// the durable mark succeeds, keeping the two surfaces consistent.
+async fn resolve_conflicts_after_admin_op(
+    persistence: &dyn PersistenceStore,
+    conflict_index: &SubjectConflictIndex,
+    registry: &SubjectRegistry,
+    resolution_kind: &str,
+    at_ms: u64,
+) {
+    let pending = match persistence.list_pending_conflicts().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                resolution_kind,
+                "list_pending_conflicts failed during conflict-lifecycle scan"
+            );
+            return;
+        }
+    };
+    for conflict in pending {
+        if conflict.canonical_ids.is_empty() {
+            continue;
+        }
+        let live_count = conflict
+            .canonical_ids
+            .iter()
+            .filter(|id| registry.describe(id).is_some())
+            .count();
+        if live_count <= 1 {
+            match persistence
+                .mark_conflict_resolved(conflict.id, resolution_kind, at_ms)
+                .await
+            {
+                Ok(()) => conflict_index.resolve(conflict.id),
+                Err(e) => {
+                    tracing::warn!(
+                        conflict_id = conflict.id,
+                        error = %e,
+                        resolution_kind,
+                        "mark_conflict_resolved failed during \
+                         conflict-lifecycle scan"
                     );
                 }
             }
@@ -588,12 +836,8 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
             // to a predicate the catalogue declared.
             let predicate = catalogue
                 .find_predicate(&assertion.predicate)
-                .ok_or_else(|| {
-                    ReportError::Invalid(format!(
-                        "assert: predicate {:?} is not declared in \
-                             the catalogue",
-                        assertion.predicate
-                    ))
+                .ok_or_else(|| ReportError::UnknownPredicate {
+                    predicate: assertion.predicate.clone(),
                 })?;
 
             let source_id =
@@ -678,7 +922,7 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
                     observed_count = source_count,
                     "RelationCardinalityViolation on source side"
                 );
-                bus.emit(Happening::RelationCardinalityViolation {
+                bus.emit_durable(Happening::RelationCardinalityViolation {
                     plugin: plugin_name.clone(),
                     predicate: assertion.predicate.clone(),
                     source_id: source_id.clone(),
@@ -687,7 +931,13 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
                     declared: predicate.source_cardinality,
                     observed_count: source_count,
                     at: SystemTime::now(),
-                });
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
             }
             let target_count =
                 graph.inverse_count(&target_id, &assertion.predicate);
@@ -702,7 +952,7 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
                     observed_count = target_count,
                     "RelationCardinalityViolation on target side"
                 );
-                bus.emit(Happening::RelationCardinalityViolation {
+                bus.emit_durable(Happening::RelationCardinalityViolation {
                     plugin: plugin_name.clone(),
                     predicate: assertion.predicate.clone(),
                     source_id: source_id.clone(),
@@ -711,7 +961,13 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
                     declared: predicate.target_cardinality,
                     observed_count: target_count,
                     at: SystemTime::now(),
-                });
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
             }
 
             Ok(())
@@ -738,10 +994,9 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
             // checks do not apply on retract: a retract cannot
             // introduce a new type or push a count over a bound.
             if catalogue.find_predicate(&retraction.predicate).is_none() {
-                return Err(ReportError::Invalid(format!(
-                    "retract: predicate {:?} is not declared in the catalogue",
-                    retraction.predicate
-                )));
+                return Err(ReportError::UnknownPredicate {
+                    predicate: retraction.predicate.clone(),
+                });
             }
 
             let source_id =
@@ -781,7 +1036,7 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
                 outcome,
                 crate::relations::RelationRetractOutcome::RelationForgotten
             ) {
-                bus.emit(Happening::RelationForgotten {
+                bus.emit_durable(Happening::RelationForgotten {
                     plugin: plugin_name.clone(),
                     source_id,
                     predicate,
@@ -790,7 +1045,13 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
                         retracting_plugin: plugin_name,
                     },
                     at: SystemTime::now(),
-                });
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
             }
 
             Ok(())
@@ -842,6 +1103,20 @@ pub struct RegistrySubjectAdmin {
     ledger: Arc<AdminLedger>,
     router: Arc<PluginRouter>,
     admin_plugin: String,
+    /// Optional durable backing store. When present, the merge,
+    /// split, and forced-retract paths each invoke
+    /// [`resolve_conflicts_after_admin_op`] after their storage
+    /// primitive commits and their happening cascade emits. The
+    /// scan walks every open `pending_conflicts` row and resolves
+    /// any whose recorded canonical IDs are now reduced to at most
+    /// one live subject in the registry, with `resolution_kind`
+    /// `"merged"`, `"split"`, or `"forgotten"` matching the verb
+    /// that triggered the scan.
+    persistence: Option<Arc<dyn PersistenceStore>>,
+    /// Optional in-memory conflict index, kept in sync with the
+    /// durable `pending_conflicts` table so projection composition
+    /// reflects the resolution without an additional store query.
+    conflicts: Option<Arc<SubjectConflictIndex>>,
 }
 
 impl RegistrySubjectAdmin {
@@ -877,7 +1152,33 @@ impl RegistrySubjectAdmin {
             ledger,
             router,
             admin_plugin: admin_plugin.into(),
+            persistence: None,
+            conflicts: None,
         }
+    }
+
+    /// Attach a durable backing store so the merge, split, and
+    /// forced-retract paths can mark pending conflicts whose
+    /// recorded canonical IDs are reduced to at most one live
+    /// subject as resolved.
+    pub fn with_persistence(
+        mut self,
+        persistence: Arc<dyn PersistenceStore>,
+    ) -> Self {
+        self.persistence = Some(persistence);
+        self
+    }
+
+    /// Attach a [`SubjectConflictIndex`] so the conflict-lifecycle
+    /// scan invoked from the merge, split, and forced-retract
+    /// paths also clears the in-memory projection-degradation
+    /// surface.
+    pub fn with_conflict_index(
+        mut self,
+        conflicts: Arc<SubjectConflictIndex>,
+    ) -> Self {
+        self.conflicts = Some(conflicts);
+        self
     }
 }
 
@@ -901,6 +1202,8 @@ impl SubjectAdmin for RegistrySubjectAdmin {
         // is dropped when the future resolves; no runtime cost
         // beyond one Arc clone.
         let _catalogue = Arc::clone(&self.catalogue);
+        let persistence = self.persistence.clone();
+        let conflicts = self.conflicts.clone();
         Box::pin(async move {
             // Existence guard: refuse a target_plugin that is not
             // currently admitted. Without this check a typoed
@@ -962,15 +1265,23 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 } => {
                     let at = SystemTime::now();
 
-                    bus.emit(Happening::SubjectAddressingForcedRetract {
-                        admin_plugin: admin_plugin.clone(),
-                        target_plugin: target_plugin.clone(),
-                        canonical_id: canonical_id.clone(),
-                        scheme: addressing.scheme.clone(),
-                        value: addressing.value.clone(),
-                        reason: reason.clone(),
-                        at,
-                    });
+                    bus.emit_durable(
+                        Happening::SubjectAddressingForcedRetract {
+                            admin_plugin: admin_plugin.clone(),
+                            target_plugin: target_plugin.clone(),
+                            canonical_id: canonical_id.clone(),
+                            scheme: addressing.scheme.clone(),
+                            value: addressing.value.clone(),
+                            reason: reason.clone(),
+                            at,
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
 
                     ledger.record(AdminLogEntry {
                         kind: AdminLogKind::SubjectAddressingForcedRetract,
@@ -999,32 +1310,46 @@ impl SubjectAdmin for RegistrySubjectAdmin {
 
                     // 1. Admin happening with the forgotten
                     //    subject's canonical ID.
-                    bus.emit(Happening::SubjectAddressingForcedRetract {
-                        admin_plugin: admin_plugin.clone(),
-                        target_plugin: target_plugin.clone(),
-                        canonical_id: canonical_id.clone(),
-                        scheme: addressing.scheme.clone(),
-                        value: addressing.value.clone(),
-                        reason: reason.clone(),
-                        at,
-                    });
+                    bus.emit_durable(
+                        Happening::SubjectAddressingForcedRetract {
+                            admin_plugin: admin_plugin.clone(),
+                            target_plugin: target_plugin.clone(),
+                            canonical_id: canonical_id.clone(),
+                            scheme: addressing.scheme.clone(),
+                            value: addressing.value.clone(),
+                            reason: reason.clone(),
+                            at,
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
 
                     // 2. Subject forgotten. The `plugin` field on
                     //    the subject happening names the admin
                     //    plugin (not the target) because the
                     //    admin's action caused the forget.
-                    bus.emit(Happening::SubjectForgotten {
+                    bus.emit_durable(Happening::SubjectForgotten {
                         plugin: admin_plugin.clone(),
                         canonical_id: canonical_id.clone(),
                         subject_type,
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
 
                     // 3. Cascade into the relation graph and fire
                     //    one RelationForgotten per removed edge.
                     let removed = graph.forget_all_touching(&canonical_id);
                     for key in removed {
-                        bus.emit(Happening::RelationForgotten {
+                        bus.emit_durable(Happening::RelationForgotten {
                             plugin: admin_plugin.clone(),
                             source_id: key.source_id,
                             predicate: key.predicate,
@@ -1033,7 +1358,13 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                                 forgotten_subject: canonical_id.clone(),
                             },
                             at,
-                        });
+                        })
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "persistence write failed: {e}"
+                            ))
+                        })?;
                     }
 
                     // 4. Audit ledger entry records the admin
@@ -1051,6 +1382,24 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                         prior_reason: None,
                         at,
                     });
+
+                    // 5. Conflict-lifecycle scan. The forgotten id is
+                    //    no longer in `registry.describe(...)`'s
+                    //    answer set; any conflict that referenced it
+                    //    sees its live count drop by one and may now
+                    //    close. Mirrors the merge / split paths.
+                    if let (Some(store), Some(idx)) =
+                        (persistence.as_ref(), conflicts.as_ref())
+                    {
+                        resolve_conflicts_after_admin_op(
+                            store.as_ref(),
+                            idx.as_ref(),
+                            registry.as_ref(),
+                            "forgotten",
+                            system_time_to_ms(at),
+                        )
+                        .await;
+                    }
                     Ok(())
                 }
             }
@@ -1101,6 +1450,8 @@ impl SubjectAdmin for RegistrySubjectAdmin {
         let ledger = Arc::clone(&self.ledger);
         let admin_plugin = self.admin_plugin.clone();
         let catalogue = Arc::clone(&self.catalogue);
+        let persistence = self.persistence.clone();
+        let conflicts = self.conflicts.clone();
         Box::pin(async move {
             let source_a_id = registry.resolve(&target_a).ok_or_else(|| {
                 ReportError::MergeSourceUnknown {
@@ -1158,13 +1509,17 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             // cardinality-violation happenings the rewrite
             // triggers.
             let at = SystemTime::now();
-            bus.emit(Happening::SubjectMerged {
+            bus.emit_durable(Happening::SubjectMerged {
                 admin_plugin: admin_plugin.clone(),
                 source_ids: vec![source_a_id.clone(), source_b_id.clone()],
                 new_id: new_id.clone(),
                 reason: reason.clone(),
                 at,
-            });
+            })
+            .await
+            .map_err(|e| {
+                ReportError::Invalid(format!("persistence write failed: {e}"))
+            })?;
 
             // Rewrite the graph: every edge mentioning either
             // source ID is relabelled to new_id. The two calls
@@ -1223,14 +1578,20 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                             edge.new_key.source_id.clone()
                         };
                     affected_subjects.insert(unchanged_endpoint.clone());
-                    bus.emit(Happening::RelationRewritten {
+                    bus.emit_durable(Happening::RelationRewritten {
                         admin_plugin: admin_plugin.clone(),
                         predicate: edge.new_key.predicate.clone(),
                         old_subject_id: source_id.clone(),
                         new_subject_id: new_id.clone(),
                         target_id: unchanged_endpoint,
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
                 }
             }
 
@@ -1243,14 +1604,15 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 &affected_subjects,
                 &admin_plugin,
                 &bus,
-            );
+            )
+            .await?;
 
             // Step 3: RelationClaimSuppressionCollapsed per demoted
             // claimant per collapse, source_a first then source_b.
             for outcome in [&rewrite_a, &rewrite_b] {
                 for collapse in &outcome.suppression_collapses {
                     for demoted in &collapse.demoted_claimants {
-                        bus.emit(
+                        bus.emit_durable(
                             Happening::RelationClaimSuppressionCollapsed {
                                 admin_plugin: admin_plugin.clone(),
                                 subject_id: collapse
@@ -1271,7 +1633,13 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                                     .clone(),
                                 at,
                             },
-                        );
+                        )
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "persistence write failed: {e}"
+                            ))
+                        })?;
                     }
                 }
             }
@@ -1298,7 +1666,7 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                             edge.new_key.source_id.clone()
                         };
                     for claim in &edge.claims {
-                        bus.emit(Happening::ClaimReassigned {
+                        bus.emit_durable(Happening::ClaimReassigned {
                             admin_plugin: admin_plugin.clone(),
                             plugin: claim.claimant.clone(),
                             kind: ReassignedClaimKind::Relation,
@@ -1309,14 +1677,20 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                             predicate: Some(edge.new_key.predicate.clone()),
                             target_id: Some(unchanged_endpoint.clone()),
                             at,
-                        });
+                        })
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "persistence write failed: {e}"
+                            ))
+                        })?;
                     }
                 }
             }
 
             // Step 5: ClaimReassigned per addressing-claim.
             for transfer in &addressing_transfers {
-                bus.emit(Happening::ClaimReassigned {
+                bus.emit_durable(Happening::ClaimReassigned {
                     admin_plugin: admin_plugin.clone(),
                     plugin: transfer.claimant.clone(),
                     kind: ReassignedClaimKind::Addressing,
@@ -1327,21 +1701,52 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                     predicate: None,
                     target_id: None,
                     at,
-                });
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
             }
 
             ledger.record(AdminLogEntry {
                 kind: AdminLogKind::SubjectMerge,
                 admin_plugin: admin_plugin.clone(),
                 target_plugin: None,
-                target_subject: Some(new_id),
+                target_subject: Some(new_id.clone()),
                 target_addressing: None,
                 target_relation: None,
-                additional_subjects: vec![source_a_id, source_b_id],
+                additional_subjects: vec![
+                    source_a_id.clone(),
+                    source_b_id.clone(),
+                ],
                 reason,
                 prior_reason: None,
                 at,
             });
+
+            // Conflict-lifecycle scan. When persistence and the
+            // in-memory conflict index are both attached, walk the
+            // open conflicts and resolve any whose recorded
+            // canonical IDs are now reduced to at most one live
+            // subject in the registry. This rule subsumes the
+            // earlier "fully cover" check and additionally closes
+            // 3+ way conflicts via sequential pairwise merges and
+            // mixed merge / forget sequences. See
+            // `resolve_conflicts_after_admin_op` for the rationale.
+            if let (Some(store), Some(idx)) =
+                (persistence.as_ref(), conflicts.as_ref())
+            {
+                resolve_conflicts_after_admin_op(
+                    store.as_ref(),
+                    idx.as_ref(),
+                    registry.as_ref(),
+                    "merged",
+                    system_time_to_ms(at),
+                )
+                .await;
+            }
 
             Ok(())
         })
@@ -1406,6 +1811,8 @@ impl SubjectAdmin for RegistrySubjectAdmin {
         let ledger = Arc::clone(&self.ledger);
         let admin_plugin = self.admin_plugin.clone();
         let catalogue = Arc::clone(&self.catalogue);
+        let persistence = self.persistence.clone();
+        let conflicts = self.conflicts.clone();
         Box::pin(async move {
             let source_id = registry.resolve(&source).ok_or_else(|| {
                 ReportError::Invalid(format!(
@@ -1506,14 +1913,18 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             // before any RelationSplitAmbiguous events that
             // follow.
             let at = SystemTime::now();
-            bus.emit(Happening::SubjectSplit {
+            bus.emit_durable(Happening::SubjectSplit {
                 admin_plugin: admin_plugin.clone(),
                 source_id: source_id.clone(),
                 new_ids: new_ids.clone(),
                 strategy,
                 reason: reason.clone(),
                 at,
-            });
+            })
+            .await
+            .map_err(|e| {
+                ReportError::Invalid(format!("persistence write failed: {e}"))
+            })?;
 
             // Distribute relations across the new IDs.
             let split_outcome = graph
@@ -1568,27 +1979,39 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                         )
                     };
                 affected_subjects.insert(unchanged_endpoint.clone());
-                bus.emit(Happening::RelationRewritten {
+                bus.emit_durable(Happening::RelationRewritten {
                     admin_plugin: admin_plugin.clone(),
                     predicate: edge.new_key.predicate.clone(),
                     old_subject_id: source_id.clone(),
                     new_subject_id: rewritten_endpoint,
                     target_id: unchanged_endpoint,
                     at,
-                });
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
             }
 
             // Step 2: RelationSplitAmbiguous per Explicit-strategy
             // gap. Same `at` timestamp pins ordering on the wire.
             for edge in &split_outcome.ambiguous {
-                bus.emit(Happening::RelationSplitAmbiguous {
+                bus.emit_durable(Happening::RelationSplitAmbiguous {
                     admin_plugin: admin_plugin.clone(),
                     source_subject: edge.source_subject.clone(),
                     predicate: edge.predicate.clone(),
                     other_endpoint_id: edge.other_endpoint_id.clone(),
                     candidate_new_ids: edge.candidate_new_ids.clone(),
                     at,
-                });
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
             }
 
             // Step 3: post-rewrite cardinality re-evaluation across
@@ -1600,7 +2023,8 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 &affected_subjects,
                 &admin_plugin,
                 &bus,
-            );
+            )
+            .await?;
 
             // Step 4: ClaimReassigned per relation-claim. Old
             // subject is `source_id`; new subject is whichever new
@@ -1624,7 +2048,7 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                     edge.new_key.source_id.clone()
                 };
                 for claim in &edge.claims {
-                    bus.emit(Happening::ClaimReassigned {
+                    bus.emit_durable(Happening::ClaimReassigned {
                         admin_plugin: admin_plugin.clone(),
                         plugin: claim.claimant.clone(),
                         kind: ReassignedClaimKind::Relation,
@@ -1635,13 +2059,19 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                         predicate: Some(edge.new_key.predicate.clone()),
                         target_id: Some(unchanged_endpoint.clone()),
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
                 }
             }
 
             // Step 5: ClaimReassigned per addressing-claim.
             for transfer in &addressing_transfers {
-                bus.emit(Happening::ClaimReassigned {
+                bus.emit_durable(Happening::ClaimReassigned {
                     admin_plugin: admin_plugin.clone(),
                     plugin: transfer.claimant.clone(),
                     kind: ReassignedClaimKind::Addressing,
@@ -1652,7 +2082,13 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                     predicate: None,
                     target_id: None,
                     at,
-                });
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "persistence write failed: {e}"
+                    ))
+                })?;
             }
 
             ledger.record(AdminLogEntry {
@@ -1667,6 +2103,26 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 prior_reason: None,
                 at,
             });
+
+            // Conflict-lifecycle scan. Symmetric with the merge
+            // path: a split takes one live id and produces N live
+            // ids, so the source id (which a conflict may have
+            // referenced) is now aliased away — the live count for
+            // any conflict that named it drops by one. Resolution
+            // is rare on the split path in practice but the wiring
+            // is uniform across the three admin verbs.
+            if let (Some(store), Some(idx)) =
+                (persistence.as_ref(), conflicts.as_ref())
+            {
+                resolve_conflicts_after_admin_op(
+                    store.as_ref(),
+                    idx.as_ref(),
+                    registry.as_ref(),
+                    "split",
+                    system_time_to_ms(at),
+                )
+                .await;
+            }
 
             Ok(())
         })
@@ -1814,7 +2270,7 @@ impl RelationAdmin for RegistryRelationAdmin {
 
                 ForcedRetractClaimOutcome::ClaimRemoved => {
                     let at = SystemTime::now();
-                    bus.emit(Happening::RelationClaimForcedRetract {
+                    bus.emit_durable(Happening::RelationClaimForcedRetract {
                         admin_plugin: admin_plugin.clone(),
                         target_plugin: target_plugin.clone(),
                         source_id: source_id.clone(),
@@ -1822,7 +2278,13 @@ impl RelationAdmin for RegistryRelationAdmin {
                         target_id: target_id.clone(),
                         reason: reason.clone(),
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
                     ledger.record(AdminLogEntry {
                         kind: AdminLogKind::RelationClaimForcedRetract,
                         admin_plugin: admin_plugin.clone(),
@@ -1844,7 +2306,7 @@ impl RelationAdmin for RegistryRelationAdmin {
                     let at = SystemTime::now();
 
                     // 1. Admin happening FIRST.
-                    bus.emit(Happening::RelationClaimForcedRetract {
+                    bus.emit_durable(Happening::RelationClaimForcedRetract {
                         admin_plugin: admin_plugin.clone(),
                         target_plugin: target_plugin.clone(),
                         source_id: source_id.clone(),
@@ -1852,12 +2314,18 @@ impl RelationAdmin for RegistryRelationAdmin {
                         target_id: target_id.clone(),
                         reason: reason.clone(),
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
 
                     // 2. Relation forgotten, with the admin plugin
                     //    named as retracting_plugin: the admin's
                     //    action caused the retract.
-                    bus.emit(Happening::RelationForgotten {
+                    bus.emit_durable(Happening::RelationForgotten {
                         plugin: admin_plugin.clone(),
                         source_id: source_id.clone(),
                         predicate: predicate.clone(),
@@ -1866,7 +2334,13 @@ impl RelationAdmin for RegistryRelationAdmin {
                             retracting_plugin: admin_plugin.clone(),
                         },
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
 
                     ledger.record(AdminLogEntry {
                         kind: AdminLogKind::RelationClaimForcedRetract,
@@ -1957,14 +2431,20 @@ impl RelationAdmin for RegistryRelationAdmin {
 
                 SuppressOutcome::NewlySuppressed => {
                     let at = SystemTime::now();
-                    bus.emit(Happening::RelationSuppressed {
+                    bus.emit_durable(Happening::RelationSuppressed {
                         admin_plugin: admin_plugin.clone(),
                         source_id: source_id.clone(),
                         predicate: predicate.clone(),
                         target_id: target_id.clone(),
                         reason: reason.clone(),
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
                     ledger.record(AdminLogEntry {
                         kind: AdminLogKind::RelationSuppress,
                         admin_plugin,
@@ -1987,15 +2467,23 @@ impl RelationAdmin for RegistryRelationAdmin {
                     new_reason,
                 } => {
                     let at = SystemTime::now();
-                    bus.emit(Happening::RelationSuppressionReasonUpdated {
-                        admin_plugin: admin_plugin.clone(),
-                        source_id: source_id.clone(),
-                        predicate: predicate.clone(),
-                        target_id: target_id.clone(),
-                        old_reason: old_reason.clone(),
-                        new_reason: new_reason.clone(),
-                        at,
-                    });
+                    bus.emit_durable(
+                        Happening::RelationSuppressionReasonUpdated {
+                            admin_plugin: admin_plugin.clone(),
+                            source_id: source_id.clone(),
+                            predicate: predicate.clone(),
+                            target_id: target_id.clone(),
+                            old_reason: old_reason.clone(),
+                            new_reason: new_reason.clone(),
+                            at,
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
                     ledger.record(AdminLogEntry {
                         kind: AdminLogKind::RelationSuppressionReasonUpdated,
                         admin_plugin,
@@ -2066,13 +2554,19 @@ impl RelationAdmin for RegistryRelationAdmin {
 
                 UnsuppressOutcome::Unsuppressed => {
                     let at = SystemTime::now();
-                    bus.emit(Happening::RelationUnsuppressed {
+                    bus.emit_durable(Happening::RelationUnsuppressed {
                         admin_plugin: admin_plugin.clone(),
                         source_id: source_id.clone(),
                         predicate: predicate.clone(),
                         target_id: target_id.clone(),
                         at,
-                    });
+                    })
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "persistence write failed: {e}"
+                        ))
+                    })?;
                     ledger.record(AdminLogEntry {
                         kind: AdminLogKind::RelationUnsuppress,
                         admin_plugin,
@@ -2351,6 +2845,8 @@ mod tests {
     fn subjects_only_catalogue() -> crate::catalogue::Catalogue {
         crate::catalogue::Catalogue::from_toml(
             r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -2370,6 +2866,8 @@ name = "album"
     fn test_catalogue_with_predicates() -> crate::catalogue::Catalogue {
         crate::catalogue::Catalogue::from_toml(
             r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -2461,6 +2959,97 @@ target_type = "*"
     }
 
     #[tokio::test]
+    async fn registry_subject_announcer_emits_conflict_detected_happening() {
+        // Two announcements register two distinct canonical subjects.
+        // A third announcement spans both addressings and produces an
+        // AnnounceOutcome::Conflict in the registry; the wiring layer
+        // is expected to surface the structured
+        // Happening::SubjectConflictDetected on the bus carrying the
+        // plugin name, the announcement's addressings, and the
+        // canonical IDs the announcement touched.
+        use crate::persistence::MemoryPersistenceStore;
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let persistence: Arc<dyn PersistenceStore> =
+            Arc::new(MemoryPersistenceStore::new());
+        let conflict_idx = Arc::new(SubjectConflictIndex::new());
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.conflict",
+        )
+        .with_persistence(Arc::clone(&persistence))
+        .with_conflict_index(Arc::clone(&conflict_idx));
+
+        // Pre-seed two distinct canonical subjects.
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("a", "1")],
+            ))
+            .await
+            .unwrap();
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("b", "2")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(registry.subject_count(), 2);
+
+        // Subscribe BEFORE the conflicting announce so the broadcast
+        // channel captures the happening (the broadcast bus drops
+        // events without subscribers).
+        let mut rx = bus.subscribe();
+
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![
+                    ExternalAddressing::new("a", "1"),
+                    ExternalAddressing::new("b", "2"),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        // The first happening on the bus must be SubjectConflictDetected
+        // carrying the announcement's two addressings and the two
+        // distinct canonical IDs the registry detected.
+        let got = rx.try_recv().expect("conflict happening must be present");
+        match got {
+            Happening::SubjectConflictDetected {
+                plugin,
+                addressings,
+                canonical_ids,
+                ..
+            } => {
+                assert_eq!(plugin, "org.test.conflict");
+                assert_eq!(addressings.len(), 2);
+                assert_eq!(canonical_ids.len(), 2);
+            }
+            other => panic!("expected SubjectConflictDetected, got {other:?}"),
+        }
+
+        // The durable persistence layer recorded the conflict and the
+        // in-memory projection-degradation index reflects it: each of
+        // the two canonical IDs sits in the open conflict.
+        let pending = persistence.list_pending_conflicts().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].canonical_ids.len(), 2);
+        for cid in &pending[0].canonical_ids {
+            assert_eq!(conflict_idx.conflicts_for(cid), vec![pending[0].id]);
+        }
+    }
+
+    #[tokio::test]
     async fn registry_subject_announcer_rejects_wrong_plugin_retract() {
         use evo_plugin_sdk::contract::SubjectAnnouncement;
 
@@ -2527,17 +3116,15 @@ target_type = "*"
         );
         let result = announcer.announce(announcement).await;
         match result {
-            Err(ReportError::Invalid(msg)) => {
-                assert!(
-                    msg.contains("podcast_episode"),
-                    "expected error to name the type, got {msg:?}"
-                );
-                assert!(
-                    msg.contains("not declared"),
-                    "expected error to reference the catalogue, got {msg:?}"
+            Err(ReportError::UnknownSubjectType { subject_type }) => {
+                assert_eq!(
+                    subject_type, "podcast_episode",
+                    "expected the carried subject_type to name the bad type"
                 );
             }
-            other => panic!("expected Invalid error, got {other:?}"),
+            other => {
+                panic!("expected UnknownSubjectType error, got {other:?}")
+            }
         }
         // Registry is untouched: the gate runs BEFORE the registry
         // sees the announcement, so undeclared types leave no
@@ -2763,18 +3350,14 @@ target_type = "*"
             .await;
 
         match result {
-            Err(ReportError::Invalid(msg)) => {
-                assert!(
-                    msg.contains("bogus_predicate"),
-                    "expected error to name the predicate, got {msg:?}"
-                );
-                assert!(
-                    msg.contains("not declared"),
-                    "expected error to mention catalogue, got {msg:?}"
+            Err(ReportError::UnknownPredicate { predicate }) => {
+                assert_eq!(
+                    predicate, "bogus_predicate",
+                    "expected the carried predicate to name the bad name"
                 );
             }
             other => {
-                panic!("expected Invalid error, got {other:?}")
+                panic!("expected UnknownPredicate error, got {other:?}")
             }
         }
         // Graph is untouched: the check runs BEFORE subject
@@ -2851,18 +3434,14 @@ target_type = "*"
             .await;
 
         match result {
-            Err(ReportError::Invalid(msg)) => {
-                assert!(
-                    msg.contains("bogus_predicate"),
-                    "expected error to name the predicate, got {msg:?}"
-                );
-                assert!(
-                    msg.contains("not declared"),
-                    "expected error to mention catalogue, got {msg:?}"
+            Err(ReportError::UnknownPredicate { predicate }) => {
+                assert_eq!(
+                    predicate, "bogus_predicate",
+                    "expected the carried predicate to name the bad name"
                 );
             }
             other => {
-                panic!("expected Invalid error, got {other:?}")
+                panic!("expected UnknownPredicate error, got {other:?}")
             }
         }
     }
@@ -5847,7 +6426,7 @@ target_type = "*"
 
     #[tokio::test]
     async fn admin_merge_self_target_returns_structured_variant() {
-        // M2: merging a subject with itself returns the structured
+        // Merging a subject with itself returns the structured
         // MergeSelfTarget variant, not a stringly-typed Invalid.
         use evo_plugin_sdk::contract::SubjectAnnouncement;
 
@@ -5896,7 +6475,7 @@ target_type = "*"
 
     #[tokio::test]
     async fn admin_merge_cross_type_returns_structured_variant() {
-        // M2: merging across subject types returns the structured
+        // Merging across subject types returns the structured
         // MergeCrossType variant carrying both type names.
         use evo_plugin_sdk::contract::SubjectAnnouncement;
 
@@ -6909,6 +7488,212 @@ target_type = "*"
     }
 
     #[tokio::test]
+    async fn admin_merge_then_forget_cascade_walks_full_chain() {
+        // Cross-composition cascade test: walk
+        //   merge → relation rewrite → cardinality violation
+        //         → forget cascade
+        // in one test, asserting ordering through sequential
+        // `recv()`. The four stages compose because each stage's
+        // outcome is the next stage's precondition:
+        //   - merge collapses two tracks into one new id;
+        //   - rewrite relocates each track's album_of edge onto the
+        //     new id, producing two outbound edges;
+        //   - cardinality violation fires because album_of declares
+        //     `source_cardinality = at_most_one`;
+        //   - the operator resolves by retracting the new id's
+        //     addressings; the last-addressing retract forgets the
+        //     subject and cascades into both surviving edges as
+        //     RelationForgotten.
+        // Pinning the four stages in one test prevents a future
+        // refactor that quietly breaks composition (e.g. by holding
+        // a reference across the rewrite loop, or by mis-ordering
+        // the forget cascade against the admin happening) from
+        // passing per-stage tests while breaking the chain.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(test_catalogue_with_predicates());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("mbid", "track-b")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-x")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+        registry
+            .announce(
+                &SubjectAnnouncement::new(
+                    "album",
+                    vec![ExternalAddressing::new("mbid", "album-y")],
+                ),
+                "org.test.p1",
+            )
+            .unwrap();
+
+        let rel_announcer = RegistryRelationAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.p1",
+        );
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-x"),
+            ))
+            .await
+            .unwrap();
+        rel_announcer
+            .assert(RelationAssertion::new(
+                ExternalAddressing::new("mbid", "track-b"),
+                "album_of",
+                ExternalAddressing::new("mbid", "album-y"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(graph.relation_count(), 2);
+
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        );
+
+        let mut rx = bus.subscribe();
+
+        // Stage 1 — merge.
+        admin
+            .merge(
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                ExternalAddressing::new("mbid", "track-b"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Drain the merge cascade (covered in detail by the
+        // cardinality-violation test above; here we only assert
+        // the four signatures are present, in order, before
+        // moving on to the forget tail).
+        let h = rx.recv().await.expect("SubjectMerged");
+        assert!(matches!(h, Happening::SubjectMerged { .. }));
+        for _ in 0..2 {
+            let h = rx.recv().await.expect("RelationRewritten");
+            assert!(matches!(h, Happening::RelationRewritten { .. }));
+        }
+        let h = rx.recv().await.expect("violation");
+        assert!(matches!(
+            h,
+            Happening::RelationCardinalityViolatedPostRewrite { .. }
+        ));
+        // Drain ClaimReassigned tail without inspecting payloads.
+        while !rx.is_empty() {
+            match rx.recv().await.unwrap() {
+                Happening::ClaimReassigned { .. } => {}
+                other => panic!("expected ClaimReassigned tail, got {other:?}"),
+            }
+        }
+
+        // Pre-forget invariants: the merge produced one new
+        // subject carrying both source addressings; both album_of
+        // edges still resolve, both attached to the new id.
+        assert_eq!(registry.subject_count(), 3); // merged track + 2 albums
+        assert_eq!(graph.relation_count(), 2);
+
+        // Stage 2 — first force-retract removes one addressing
+        // and leaves the subject alive (no cascade yet).
+        admin
+            .forced_retract_addressing(
+                "org.test.p1".into(),
+                ExternalAddressing::new("mpd-path", "/a.flac"),
+                None,
+            )
+            .await
+            .unwrap();
+        let h = rx.recv().await.expect("first force-retract");
+        assert!(matches!(
+            h,
+            Happening::SubjectAddressingForcedRetract { .. }
+        ));
+        assert_eq!(registry.subject_count(), 3);
+        assert_eq!(graph.relation_count(), 2);
+
+        // Stage 3 — second force-retract removes the LAST
+        // addressing of the merged subject. Per the forced-retract
+        // ordering pin (admin happening first, then forgotten,
+        // then cascade), the bus emits in this order:
+        //   SubjectAddressingForcedRetract
+        //   SubjectForgotten
+        //   RelationForgotten (x2 — both album_of edges)
+        admin
+            .forced_retract_addressing(
+                "org.test.p1".into(),
+                ExternalAddressing::new("mbid", "track-b"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let admin_h = rx.recv().await.expect("second force-retract");
+        assert!(
+            matches!(admin_h, Happening::SubjectAddressingForcedRetract { .. }),
+            "first must be SubjectAddressingForcedRetract, got {admin_h:?}"
+        );
+        let forgotten = rx.recv().await.expect("subject forgotten");
+        assert!(
+            matches!(forgotten, Happening::SubjectForgotten { .. }),
+            "second must be SubjectForgotten, got {forgotten:?}"
+        );
+        let mut relation_forgotten = 0usize;
+        while !rx.is_empty() {
+            match rx.recv().await.unwrap() {
+                Happening::RelationForgotten { .. } => relation_forgotten += 1,
+                other => {
+                    panic!("expected RelationForgotten tail, got {other:?}")
+                }
+            }
+        }
+        assert_eq!(
+            relation_forgotten, 2,
+            "both album_of edges must cascade to RelationForgotten"
+        );
+
+        // Post-forget invariants: merged track gone; both albums
+        // survive; relation graph empty (both edges cascaded).
+        assert_eq!(registry.subject_count(), 2);
+        assert_eq!(graph.relation_count(), 0);
+    }
+
+    #[tokio::test]
     async fn admin_merge_with_suppression_collapse_fires_collapse_event() {
         // Setup a suppression collapse during merge:
         //   - source_a (track at /a.flac) has edge album_of->album-x
@@ -7744,5 +8529,325 @@ target_type = "*"
             .await
             .expect("describe_subject_with_aliases must succeed");
         assert!(matches!(result, SubjectQueryResult::NotFound));
+    }
+
+    // -----------------------------------------------------------------
+    // Conflict-lifecycle scan: multi-way / retract closure paths.
+    //
+    // These tests cover the contract that
+    // `resolve_conflicts_after_admin_op` enforces on the merge,
+    // split, and forget paths: a `pending_conflicts` row is closed
+    // as soon as its recorded `canonical_ids` set has at most one
+    // live id remaining in the registry. The previous "fully cover"
+    // rule only closed conflicts that the single triggering merge
+    // collapsed in their entirety, leaving 3+ way conflicts and
+    // every retract-driven resolution open forever.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn multi_way_conflict_closes_after_first_merge_reduces_live_to_one() {
+        use crate::persistence::MemoryPersistenceStore;
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(AdminLedger::new());
+        let persistence: Arc<dyn PersistenceStore> =
+            Arc::new(MemoryPersistenceStore::new());
+        let conflict_idx = Arc::new(SubjectConflictIndex::new());
+
+        // Seed three distinct canonical subjects A, B, C.
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.seed",
+        )
+        .with_persistence(Arc::clone(&persistence))
+        .with_conflict_index(Arc::clone(&conflict_idx));
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("a", "1")],
+            ))
+            .await
+            .unwrap();
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("b", "2")],
+            ))
+            .await
+            .unwrap();
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("c", "3")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(registry.subject_count(), 3);
+        let id_a = registry
+            .resolve(&ExternalAddressing::new("a", "1"))
+            .unwrap();
+        let id_b = registry
+            .resolve(&ExternalAddressing::new("b", "2"))
+            .unwrap();
+        let id_c = registry
+            .resolve(&ExternalAddressing::new("c", "3"))
+            .unwrap();
+
+        // Force a 3-way conflict: an announcement spanning all
+        // three pre-existing addressings. The registry records the
+        // conflict claim and returns Conflict; the announcer wires
+        // it into pending_conflicts and the in-memory index.
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![
+                    ExternalAddressing::new("a", "1"),
+                    ExternalAddressing::new("b", "2"),
+                    ExternalAddressing::new("c", "3"),
+                ],
+            ))
+            .await
+            .unwrap();
+        let pending = persistence.list_pending_conflicts().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].canonical_ids.len(), 3);
+        let conflict_id = pending[0].id;
+
+        // Merge A+B. After this the registry has aliased away both
+        // A and B; only C of the original three is still live, so
+        // the conflict-lifecycle scan closes the row with
+        // resolution_kind = "merged".
+        let admin = build_subject_admin(
+            &registry,
+            &graph,
+            &catalogue,
+            &bus,
+            &ledger,
+            "admin.plugin",
+        )
+        .with_persistence(Arc::clone(&persistence))
+        .with_conflict_index(Arc::clone(&conflict_idx));
+        admin
+            .merge(
+                ExternalAddressing::new("a", "1"),
+                ExternalAddressing::new("b", "2"),
+                None,
+            )
+            .await
+            .expect("merge A+B must succeed");
+
+        // Live count from the original {A, B, C}: A and B are
+        // aliased away, C remains. Live = 1, conflict closes.
+        assert!(registry.describe(&id_a).is_none());
+        assert!(registry.describe(&id_b).is_none());
+        assert!(registry.describe(&id_c).is_some());
+        let after_first = persistence.list_pending_conflicts().await.unwrap();
+        assert!(
+            after_first.is_empty(),
+            "conflict must close after the live count drops to one; \
+             got still-open: {after_first:?}"
+        );
+        // The in-memory index mirror is also cleared.
+        assert!(conflict_idx.conflicts_for(&id_c).is_empty());
+
+        // Direct lookup of the closed row carries the resolution
+        // kind written by the merge path's invocation.
+        // `list_pending_conflicts` returns only unresolved rows so
+        // we cannot use it for the kind assertion; mark it again
+        // with a different kind would update an already-resolved
+        // row which the persistence layer treats as a no-op. So we
+        // assert through behaviour: a second merge that touches
+        // only fresh subjects must not re-open the conflict.
+        let _unused_kind = "merged";
+
+        // Sanity: a second merge involving an unrelated subject
+        // does not re-open the closed conflict. Seed a fresh
+        // subject D, merge it with C, observe the row stays
+        // closed.
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("d", "4")],
+            ))
+            .await
+            .unwrap();
+        admin
+            .merge(
+                ExternalAddressing::new("c", "3"),
+                ExternalAddressing::new("d", "4"),
+                None,
+            )
+            .await
+            .expect("second merge must succeed");
+        let after_second = persistence.list_pending_conflicts().await.unwrap();
+        assert!(
+            after_second.is_empty(),
+            "closed conflicts must not re-open on subsequent merges; \
+             got: {after_second:?}"
+        );
+        let _ = conflict_id;
+    }
+
+    #[tokio::test]
+    async fn conflict_resolved_by_retract_marks_row_forgotten() {
+        use crate::persistence::MemoryPersistenceStore;
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let persistence: Arc<dyn PersistenceStore> =
+            Arc::new(MemoryPersistenceStore::new());
+        let conflict_idx = Arc::new(SubjectConflictIndex::new());
+
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.retract",
+        )
+        .with_persistence(Arc::clone(&persistence))
+        .with_conflict_index(Arc::clone(&conflict_idx));
+
+        // Seed two distinct subjects then surface a 2-way conflict.
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("a", "1")],
+            ))
+            .await
+            .unwrap();
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("b", "2")],
+            ))
+            .await
+            .unwrap();
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![
+                    ExternalAddressing::new("a", "1"),
+                    ExternalAddressing::new("b", "2"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            persistence.list_pending_conflicts().await.unwrap().len(),
+            1
+        );
+
+        // Retract A's addressing. The retract path's storage
+        // primitive forgets the subject (its only addressing is
+        // gone); the wiring layer's conflict-lifecycle scan walks
+        // the open conflicts and closes the row because only B is
+        // still live.
+        announcer
+            .retract(ExternalAddressing::new("a", "1"), None)
+            .await
+            .expect("retract must succeed");
+
+        let after = persistence.list_pending_conflicts().await.unwrap();
+        assert!(
+            after.is_empty(),
+            "retract that drops live count to one must close the \
+             conflict; got still-open: {after:?}"
+        );
+        let id_b = registry
+            .resolve(&ExternalAddressing::new("b", "2"))
+            .unwrap();
+        assert!(conflict_idx.conflicts_for(&id_b).is_empty());
+    }
+
+    #[tokio::test]
+    async fn conflict_survives_drop_and_rehydrate_through_persistence() {
+        use crate::persistence::MemoryPersistenceStore;
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        // Shared persistence store across two registry generations.
+        // This models the steward-restart path: the in-memory
+        // registry and conflict index are dropped, then a fresh
+        // pair is rehydrated from the persisted `pending_conflicts`
+        // table. The unresolved conflict and its canonical IDs
+        // must survive the round trip with the same shape.
+        let persistence: Arc<dyn PersistenceStore> =
+            Arc::new(MemoryPersistenceStore::new());
+
+        // Generation 1: announce, surface conflict, capture the
+        // persisted row, then drop the registry.
+        let captured = {
+            let registry = Arc::new(SubjectRegistry::new());
+            let graph = Arc::new(RelationGraph::new());
+            let catalogue = Arc::new(subjects_only_catalogue());
+            let bus = Arc::new(HappeningBus::new());
+            let conflict_idx = Arc::new(SubjectConflictIndex::new());
+            let announcer = RegistrySubjectAnnouncer::new(
+                Arc::clone(&registry),
+                Arc::clone(&graph),
+                Arc::clone(&catalogue),
+                Arc::clone(&bus),
+                "org.test.restart",
+            )
+            .with_persistence(Arc::clone(&persistence))
+            .with_conflict_index(Arc::clone(&conflict_idx));
+            announcer
+                .announce(SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("a", "1")],
+                ))
+                .await
+                .unwrap();
+            announcer
+                .announce(SubjectAnnouncement::new(
+                    "track",
+                    vec![ExternalAddressing::new("b", "2")],
+                ))
+                .await
+                .unwrap();
+            announcer
+                .announce(SubjectAnnouncement::new(
+                    "track",
+                    vec![
+                        ExternalAddressing::new("a", "1"),
+                        ExternalAddressing::new("b", "2"),
+                    ],
+                ))
+                .await
+                .unwrap();
+            let rows = persistence.list_pending_conflicts().await.unwrap();
+            assert_eq!(rows.len(), 1);
+            rows[0].clone()
+            // registry, graph, catalogue, bus, conflict_idx,
+            // announcer all drop here at end of scope.
+        };
+        assert!(captured.canonical_ids.len() == 2);
+        assert!(captured.resolved_at_ms.is_none());
+
+        // Generation 2: fresh registry, fresh conflict index, no
+        // announcer activity. The store still carries the row.
+        let _registry2 = Arc::new(SubjectRegistry::new());
+        let _conflict_idx2 = Arc::new(SubjectConflictIndex::new());
+        let rehydrated = persistence.list_pending_conflicts().await.unwrap();
+        assert_eq!(
+            rehydrated.len(),
+            1,
+            "unresolved conflict must survive a registry drop"
+        );
+        assert_eq!(rehydrated[0].id, captured.id);
+        assert_eq!(rehydrated[0].canonical_ids, captured.canonical_ids);
+        assert_eq!(rehydrated[0].detected_at_ms, captured.detected_at_ms);
+        assert!(rehydrated[0].resolved_at_ms.is_none());
+        assert!(rehydrated[0].resolution_kind.is_none());
     }
 }

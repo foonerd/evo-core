@@ -702,11 +702,19 @@ pub enum WireFrame {
         cid: u64,
         /// Canonical plugin name.
         plugin: String,
+        /// Structured taxonomy class. Connection-fatality is derived
+        /// from the class via `ErrorClass::is_connection_fatal`; the
+        /// wire frame carries no independent `fatal` field. Consumers
+        /// that observe an unrecognised class MUST degrade to
+        /// `ErrorClass::Internal` rather than crash.
+        class: crate::error_taxonomy::ErrorClass,
         /// Human-readable error message.
         message: String,
-        /// Whether the error is fatal per section 12. Fatal errors
-        /// cause the steward to unload and deregister the plugin.
-        fatal: bool,
+        /// Structured context. Carries `subclass` and any class-
+        /// specific extra fields. Serialised only when populated so
+        /// the on-the-wire shape stays compact in the common case.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        details: Option<serde_json::Value>,
     },
 
     // ---------------------------------------------------------------
@@ -1417,12 +1425,54 @@ mod tests {
             v: PROTOCOL_VERSION,
             cid: 42,
             plugin: sample_plugin(),
+            class: crate::error_taxonomy::ErrorClass::ProtocolViolation,
             message: "shelf shape mismatch".into(),
-            fatal: true,
+            details: None,
         };
         let json = serde_json::to_string(&orig).unwrap();
         let back: WireFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn error_round_trip_with_details() {
+        // The Error frame's `details` field is the on-the-wire
+        // carrier for the documented `subclass` discriminator and
+        // any per-class extras. Round-tripping a non-empty details
+        // value pins the contract that `subclass` and extras
+        // survive serialise/deserialise as serde_json::Value, and
+        // that the `skip_serializing_if = "Option::is_none"` attr
+        // does not fire for `Some(_)`. A regression that drops
+        // the field or that forces it through a stricter shape
+        // would lose the documented subclass taxonomy at the
+        // first hop.
+        let details = serde_json::json!({
+            "subclass": "merge_source_unknown",
+            "addressing": "scheme-x:value-y",
+        });
+        let orig = WireFrame::Error {
+            v: PROTOCOL_VERSION,
+            cid: 99,
+            plugin: sample_plugin(),
+            class: crate::error_taxonomy::ErrorClass::NotFound,
+            message: "merge: source addressing not registered".into(),
+            details: Some(details.clone()),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        // The serialised form retains the field name and shape.
+        assert!(json.contains(r#""details""#));
+        assert!(json.contains(r#""merge_source_unknown""#));
+        assert!(json.contains(r#""scheme-x:value-y""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        if let WireFrame::Error {
+            details: Some(d), ..
+        } = back
+        {
+            assert_eq!(d, details);
+        } else {
+            panic!("decoded frame must carry Some(details) value");
+        }
     }
 
     #[test]
@@ -1780,8 +1830,9 @@ mod tests {
             v: PROTOCOL_VERSION,
             cid: 3,
             plugin: "x".into(),
+            class: crate::error_taxonomy::ErrorClass::ContractViolation,
             message: "boom".into(),
-            fatal: false,
+            details: None,
         };
         assert!(err.is_error());
     }
@@ -1942,5 +1993,178 @@ mod tests {
         let bad = r#"{"op":"describe","v":1,"cid":1}"#; // missing plugin
         let r: Result<WireFrame, _> = serde_json::from_str(bad);
         assert!(r.is_err());
+    }
+
+    // --------------------------------------------------------------
+    // WireFrame fuzz harness via proptest. Generates arbitrary
+    // values across a representative subset of variants, round-trips
+    // them through `encode_json` / `decode_json`, and asserts equality
+    // on the round trip. The strategy is intentionally a `prop_oneof`
+    // over a representative subset (the smaller envelope-style
+    // variants plus payload-carrying ones) rather than every
+    // variant; the property pinned is "JSON encode/decode is
+    // self-inverse" and that holds variant-uniformly because it
+    // derives from `serde::{Serialize, Deserialize}`.
+    // --------------------------------------------------------------
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 256,
+            .. proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn wireframe_json_round_trip(frame in arbitrary_wireframe()) {
+            let bytes = crate::codec::encode_json(&frame).expect("encode");
+            let back = crate::codec::decode_json(&bytes).expect("decode");
+            proptest::prop_assert_eq!(back, frame);
+        }
+
+        /// Malformed-bytes fuzz: arbitrary byte sequences (most of
+        /// which are not valid JSON, and of those that ARE valid JSON
+        /// most do not satisfy any `WireFrame` variant) MUST be
+        /// rejected by `decode_json` cleanly — Result-typed error,
+        /// not a panic, not an infinite loop, not a buffer overrun.
+        /// The handshake is the entry point a malicious peer is most
+        /// motivated to attack, so a malformed-bytes property at the
+        /// codec boundary is the audit's load-bearing fuzz target.
+        /// Generating up to 4 KiB so the strategy can produce
+        /// well-formed JSON envelopes by chance and exercise the
+        /// field-mismatch path as well as the "not even JSON" path.
+        #[test]
+        fn decode_json_rejects_arbitrary_bytes_without_panicking(
+            bytes in proptest::collection::vec(
+                proptest::prelude::any::<u8>(),
+                0..4096,
+            )
+        ) {
+            // The contract is "no panic". Whether a given byte
+            // sequence happens to parse as a valid `WireFrame` is
+            // irrelevant; the property is that the decoder is total
+            // over arbitrary inputs.
+            let _ = crate::codec::decode_json(&bytes);
+        }
+
+        /// Hello-shaped malformed input fuzz: starts from a
+        /// well-formed Hello frame, swaps the codec list and
+        /// version-range bounds for arbitrary garbage, and asserts
+        /// the decoder either rejects cleanly OR produces a
+        /// well-formed `WireFrame` whose envelope is consistent.
+        /// Pinning the path because the Hello handshake's
+        /// `codecs: Vec<String>` and `feature_min`/`feature_max:
+        /// u16` are the largest attack surface a malformed-Hello
+        /// attack would aim at: a Vec of arbitrary strings, two
+        /// integers an attacker controls.
+        #[test]
+        fn decode_json_handles_hello_shaped_garbage(
+            cid in proptest::prelude::any::<u64>(),
+            plugin in "[a-z]{1,32}",
+            feature_min in proptest::prelude::any::<u16>(),
+            feature_max in proptest::prelude::any::<u16>(),
+            codecs in proptest::collection::vec(
+                "[a-zA-Z0-9_.-]{0,32}",
+                0..16,
+            ),
+        ) {
+            // Construct the JSON form by hand so the test exercises
+            // the decoder's tolerance for legitimately-shaped Hello
+            // frames whose field values are otherwise unconstrained.
+            let json = serde_json::json!({
+                "type": "hello",
+                "v": PROTOCOL_VERSION,
+                "cid": cid,
+                "plugin": plugin,
+                "feature_min": feature_min,
+                "feature_max": feature_max,
+                "codecs": codecs,
+            });
+            let bytes = serde_json::to_vec(&json).expect("serialise json");
+            // Either decode succeeds (in which case the envelope
+            // round-trips) or fails (in which case it's a clean
+            // error). No third option.
+            if let Ok(frame) = crate::codec::decode_json(&bytes) {
+                let (v, decoded_cid, _plugin) = frame.envelope();
+                proptest::prop_assert_eq!(v, PROTOCOL_VERSION);
+                proptest::prop_assert_eq!(decoded_cid, cid);
+            }
+        }
+    }
+
+    fn arbitrary_wireframe(
+    ) -> impl proptest::strategy::Strategy<Value = WireFrame> {
+        use proptest::prelude::*;
+        let plugin = "[a-z][a-z0-9._-]{0,32}"
+            .prop_filter("non-empty plugin name", |s: &String| !s.is_empty());
+        let cid = any::<u64>();
+        let v = Just(PROTOCOL_VERSION);
+        // Bytes payload kept small so the property test runs quickly.
+        let payload = prop::collection::vec(any::<u8>(), 0..32);
+        let request_type = "[a-z_]{1,16}";
+        let custody_type = "[a-z_]{1,16}";
+        let dl = prop::option::of(any::<u64>());
+
+        prop_oneof![
+            (v, cid, plugin.clone()).prop_map(|(v, cid, plugin)| {
+                WireFrame::Describe { v, cid, plugin }
+            }),
+            (v, cid, plugin.clone()).prop_map(|(v, cid, plugin)| {
+                WireFrame::Unload { v, cid, plugin }
+            }),
+            (v, cid, plugin.clone()).prop_map(|(v, cid, plugin)| {
+                WireFrame::HealthCheck { v, cid, plugin }
+            }),
+            (v, cid, plugin.clone()).prop_map(|(v, cid, plugin)| {
+                WireFrame::LoadResponse { v, cid, plugin }
+            }),
+            (v, cid, plugin.clone()).prop_map(|(v, cid, plugin)| {
+                WireFrame::UnloadResponse { v, cid, plugin }
+            }),
+            (v, cid, plugin.clone()).prop_map(|(v, cid, plugin)| {
+                WireFrame::CourseCorrectResponse { v, cid, plugin }
+            }),
+            (v, cid, plugin.clone()).prop_map(|(v, cid, plugin)| {
+                WireFrame::ReleaseCustodyResponse { v, cid, plugin }
+            }),
+            (
+                v,
+                cid,
+                plugin.clone(),
+                request_type,
+                payload.clone(),
+                dl.clone(),
+            )
+                .prop_map(
+                    |(v, cid, plugin, request_type, payload, deadline_ms)| {
+                        WireFrame::HandleRequest {
+                            v,
+                            cid,
+                            plugin,
+                            request_type,
+                            payload,
+                            deadline_ms,
+                        }
+                    },
+                ),
+            (v, cid, plugin.clone(), payload.clone()).prop_map(
+                |(v, cid, plugin, payload)| WireFrame::HandleRequestResponse {
+                    v,
+                    cid,
+                    plugin,
+                    payload,
+                },
+            ),
+            (v, cid, plugin, custody_type, payload, dl,).prop_map(
+                |(v, cid, plugin, custody_type, payload, deadline_ms)| {
+                    WireFrame::TakeCustody {
+                        v,
+                        cid,
+                        plugin,
+                        custody_type,
+                        payload,
+                        deadline_ms,
+                    }
+                },
+            ),
+        ]
     }
 }

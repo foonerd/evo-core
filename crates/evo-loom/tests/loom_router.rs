@@ -57,11 +57,37 @@
 //! exhaustive-search cost is paid only when this command is invoked
 //! deliberately.
 
+//! ## Coverage gaps that are deliberate
+//!
+//! Two recent additions do NOT receive direct loom coverage,
+//! and the reasons are recorded here so the absence is intentional:
+//!
+//! - **`HappeningBus::emit_lock`.** The lock is
+//!   `tokio::sync::Mutex`, which loom cannot model — `tokio`'s
+//!   primitives are not loom-instrumented and the `cfg(loom)`
+//!   build cfg disables the tokio surface entirely. The discipline
+//!   the lock enforces (atomic subscribe + seq-sample, serialise
+//!   emit) is covered at the runtime layer by
+//!   `subscribe_with_current_seq_pins_under_emit_lock` and
+//!   `n_subscriber_m_emitter_stress_no_loss_no_reorder` in
+//!   `crates/evo/src/happenings.rs`.
+//! - **`PluginRouter::course_correct` timeout.** The
+//!   timeout is implemented with `tokio::time::timeout`, also out
+//!   of loom's reach for the same reason. Runtime coverage:
+//!   `course_correct_timeout_emits_custody_aborted_with_reason` in
+//!   `crates/evo/src/router.rs`.
+//!
+//! The loom tests below model the synchronous shape that the new
+//! async paths reuse: per-entry mutex acquire under contention. The
+//! `entry_mutex_serialises_concurrent_holders` test exercises that
+//! discipline so the loom permutation surface stays a faithful
+//! mirror of the router's lookup-clone-drop-then-acquire pattern.
+
 #![cfg(loom)]
 
 use std::collections::HashMap;
 
-use loom::sync::{Arc, RwLock};
+use loom::sync::{Arc, Mutex, RwLock};
 
 /// Local mirror of `evo::sync::RouterTable<T>`, but built on top of
 /// loom's instrumented primitives. Shape is identical to the
@@ -195,6 +221,64 @@ fn arc_outlives_table_drop() {
 
         lookup_thread.join().unwrap();
         drop_thread.join().unwrap();
+    });
+}
+
+/// Per-entry mutex acquire under contention: two threads each
+/// lookup the same entry, then serialise on the entry's mutex
+/// while holding the cloned `Arc`.
+///
+/// The discipline mirrors the router's `course_correct` /
+/// `take_custody` / `release_custody` paths: lookup → clone Arc →
+/// drop the table guard → acquire entry mutex → do work → drop
+/// entry mutex. Loom permutes the acquire ordering to confirm that
+/// the two holders never hold the entry mutex simultaneously.
+#[test]
+fn entry_mutex_serialises_concurrent_holders() {
+    loom::model(|| {
+        // Per-entry shape mirrors PluginEntry: an inner Mutex<u32>
+        // standing in for "exclusive access to the warden". The
+        // counter is the witness: incrementing twice from two
+        // threads MUST produce 2 with no torn read of the
+        // intermediate state.
+        struct Entry {
+            inner: Mutex<u32>,
+        }
+        let table: Arc<RouterTable<Entry>> = Arc::new(RouterTable::new());
+        table.insert(
+            "test.zeta".into(),
+            Arc::new(Entry {
+                inner: Mutex::new(0),
+            }),
+        );
+
+        let table_a = Arc::clone(&table);
+        let t1 = loom::thread::spawn(move || {
+            let entry = table_a.lookup("test.zeta").expect("entry");
+            // Drop the table reference to model the dispatch site
+            // releasing its Arc on the table after cloning the entry.
+            drop(table_a);
+            let mut g = entry.inner.lock().expect("entry mutex");
+            *g += 1;
+        });
+
+        let table_b = Arc::clone(&table);
+        let t2 = loom::thread::spawn(move || {
+            let entry = table_b.lookup("test.zeta").expect("entry");
+            drop(table_b);
+            let mut g = entry.inner.lock().expect("entry mutex");
+            *g += 1;
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let entry = table.lookup("test.zeta").expect("entry");
+        let final_v = *entry.inner.lock().expect("entry mutex");
+        assert_eq!(
+            final_v, 2,
+            "per-entry mutex must serialise both increments; saw {final_v}"
+        );
     });
 }
 

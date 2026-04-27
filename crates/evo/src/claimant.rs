@@ -144,6 +144,21 @@ pub fn derive_token(plugin_name: &str, instance_id: &str) -> ClaimantToken {
     ClaimantToken(URL_SAFE_NO_PAD.encode(digest))
 }
 
+/// One row in the issuer's reverse-lookup index, recording the
+/// plain plugin name (and version, when supplied) the issuer
+/// associates with a given [`ClaimantToken`].
+///
+/// The `resolve_claimants` op surfaces this row to consumers that
+/// have negotiated the corresponding capability. Version is
+/// optional because the token derivation deliberately omits the
+/// version (see module docs); a steward that issues a token
+/// before a version is recorded legitimately reports `None` here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IssuanceRecord {
+    plugin_name: String,
+    plugin_version: Option<String>,
+}
+
 /// Mints and caches [`ClaimantToken`]s for the steward's admitted
 /// plugins.
 ///
@@ -160,10 +175,21 @@ pub fn derive_token(plugin_name: &str, instance_id: &str) -> ClaimantToken {
 /// instance; rotation across deployments is provided by the
 /// instance ID input to derivation (per the per-instance
 /// unlinkability property).
+///
+/// The issuer also maintains a reverse-lookup index from token
+/// string to plain plugin name and version, populated whenever a
+/// plugin is admitted with a known version
+/// (see [`ClaimantTokenIssuer::record_version`]). The
+/// `resolve_claimants` op walks the index via
+/// [`ClaimantTokenIssuer::resolve`].
 #[derive(Debug)]
 pub struct ClaimantTokenIssuer {
     instance_id: String,
     cache: RwLock<HashMap<String, ClaimantToken>>,
+    /// Token-string to (plugin_name, plugin_version) for the
+    /// `resolve_claimants` op. Populated lazily on every mint and
+    /// updated explicitly by [`Self::record_version`].
+    reverse: RwLock<HashMap<String, IssuanceRecord>>,
 }
 
 impl ClaimantTokenIssuer {
@@ -177,6 +203,7 @@ impl ClaimantTokenIssuer {
         Self {
             instance_id: instance_id.into(),
             cache: RwLock::new(HashMap::new()),
+            reverse: RwLock::new(HashMap::new()),
         }
     }
 
@@ -214,7 +241,69 @@ impl ClaimantTokenIssuer {
         }
         let token = derive_token(plugin_name, &self.instance_id);
         guard.insert(plugin_name.to_string(), token.clone());
+        // Mirror into the reverse-lookup index so a subsequent
+        // resolve call sees this plugin even when the version was
+        // never recorded. The version stays `None` until a
+        // `record_version` call updates the row.
+        let mut rev = match self.reverse.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        rev.entry(token.as_str().to_string())
+            .or_insert(IssuanceRecord {
+                plugin_name: plugin_name.to_string(),
+                plugin_version: None,
+            });
         token
+    }
+
+    /// Record (or update) the version associated with a plugin's
+    /// claimant token in the reverse-lookup index.
+    ///
+    /// Idempotent: calling with the same `(name, version)` twice is
+    /// a no-op. Calling with a different version overwrites the
+    /// previous record (the index reflects the issuer's current
+    /// view of the plugin's identity; admission of a different
+    /// version replaces, not appends). The token is not affected;
+    /// version is not part of the derivation.
+    pub fn record_version(
+        &self,
+        plugin_name: &str,
+        plugin_version: impl Into<String>,
+    ) {
+        let token = self.token_for(plugin_name);
+        let mut rev = match self.reverse.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        rev.insert(
+            token.as_str().to_string(),
+            IssuanceRecord {
+                plugin_name: plugin_name.to_string(),
+                plugin_version: Some(plugin_version.into()),
+            },
+        );
+    }
+
+    /// Resolve a token string to the issuer's recorded plugin
+    /// identity, when one exists.
+    ///
+    /// Returns `Some((plugin_name, plugin_version))` for tokens the
+    /// issuer has minted; returns `None` for tokens never issued
+    /// by this steward. The version is `None` when the issuer has
+    /// minted the token but no `record_version` call has populated
+    /// it yet.
+    ///
+    /// Tokens that compare equal to a minted token via the issuer's
+    /// stable derivation (i.e. the same byte string) resolve. Token
+    /// strings the issuer has not seen are unknown — even if a
+    /// re-derivation would have produced them — because the issuer
+    /// reports the steward's actual issuance set, not the derivation
+    /// space.
+    pub fn resolve(&self, token: &str) -> Option<(String, Option<String>)> {
+        let rev = self.reverse.read().ok()?;
+        let row = rev.get(token)?;
+        Some((row.plugin_name.clone(), row.plugin_version.clone()))
     }
 }
 
@@ -334,5 +423,53 @@ mod tests {
         let from_issuer = issuer.token_for("com.foo");
         let from_fn = derive_token("com.foo", "instance-X");
         assert_eq!(from_issuer, from_fn);
+    }
+
+    #[test]
+    fn resolve_returns_none_for_never_issued_token() {
+        // Resolution reports the steward's actual issuance set; a
+        // token string the issuer has never seen is unknown even
+        // when its bytes look plausible.
+        let issuer = ClaimantTokenIssuer::new("instance-A");
+        assert!(issuer.resolve("never-issued-xxxxxxxxxx").is_none());
+    }
+
+    #[test]
+    fn resolve_returns_name_after_token_for_mint() {
+        // Once token_for has minted a token, resolve returns the
+        // plugin name. Version is None until record_version runs
+        // (the issuer's reverse index is populated lazily on mint
+        // with no version on hand).
+        let issuer = ClaimantTokenIssuer::new("instance-A");
+        let token = issuer.token_for("com.foo.bar");
+        let (name, version) = issuer.resolve(token.as_str()).expect("resolve");
+        assert_eq!(name, "com.foo.bar");
+        assert!(version.is_none(), "version is unset until recorded");
+    }
+
+    #[test]
+    fn record_version_populates_reverse_index() {
+        let issuer = ClaimantTokenIssuer::new("instance-A");
+        issuer.record_version("com.foo.bar", "1.2.3");
+        let token = issuer.token_for("com.foo.bar");
+        let (name, version) = issuer.resolve(token.as_str()).expect("resolve");
+        assert_eq!(name, "com.foo.bar");
+        assert_eq!(version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn record_version_overwrites_prior_version() {
+        // The reverse index reflects the issuer's current view; a
+        // second record_version call replaces the recorded version
+        // rather than appending another row. Pinned because the
+        // resolve_claimants surface returns a single version per
+        // token, so any append-on-rerecord regression would surface
+        // duplicate or stale rows.
+        let issuer = ClaimantTokenIssuer::new("instance-A");
+        issuer.record_version("com.foo.bar", "1.0.0");
+        issuer.record_version("com.foo.bar", "2.0.0");
+        let token = issuer.token_for("com.foo.bar");
+        let (_, version) = issuer.resolve(token.as_str()).expect("resolve");
+        assert_eq!(version.as_deref(), Some("2.0.0"));
     }
 }

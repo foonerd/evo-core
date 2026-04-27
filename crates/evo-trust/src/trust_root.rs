@@ -1,4 +1,13 @@
 //! Load `*.pem` + `*.meta.toml` from two directories.
+//!
+//! Each loaded key is validated against its sidecar before being
+//! returned: the algorithm is restricted to the accepted set, the
+//! declared fingerprint (if present) must match the public key bytes
+//! in constant time, and the validity-window shape is checked.
+//! Keys whose sidecar fails validation are not silently dropped —
+//! the loader returns an error so a corrupted or tampered trust
+//! root is reported to the operator at startup rather than producing
+//! a smaller, "partially trusted" set at runtime.
 
 use std::path::Path;
 
@@ -6,13 +15,16 @@ use ed25519_dalek::pkcs8::DecodePublicKey;
 use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::error::TrustError;
-use crate::key_meta::KeyMeta;
+use crate::key_meta::{validate as validate_meta, KeyMeta};
 
 /// A single public key with its authorisation metadata.
 #[derive(Debug, Clone)]
 pub struct TrustKey {
     /// File stem, for error messages.
     pub basename: String,
+    /// Effective `key_id`: either the value declared in the
+    /// sidecar or, when absent, the `BLAKE3`-derived default.
+    pub key_id: String,
     /// Ed25519 verify key.
     pub verifying: VerifyingKey,
     /// Parsed `*.meta.toml`.
@@ -21,6 +33,12 @@ pub struct TrustKey {
 
 /// Load all `*.pem` in `opt_trust` and `etc_trust_d` (non-recursive);
 /// for each `foo.pem` require `foo.meta.toml` in the same directory.
+///
+/// Each sidecar is validated via [`crate::key_meta::validate`]
+/// before the key is added to the returned set. A validation
+/// failure aborts the whole load: a partially-trusted trust set
+/// would be a footgun, since chain walks against it would silently
+/// degrade.
 pub fn load_trust_root(
     opt_trust: &Path,
     etc_trust_d: &Path,
@@ -69,8 +87,10 @@ fn load_dir(into: &mut Vec<TrustKey>, dir: &Path) -> Result<(), TrustError> {
         let meta: KeyMeta = toml::from_str(&meta_toml).map_err(|e| {
             TrustError::KeyMetadata(format!("{}: {e}", meta_path.display()))
         })?;
+        let key_id = validate_meta(&meta, &vk)?;
         into.push(TrustKey {
             basename: stem,
+            key_id,
             verifying: vk,
             meta,
         });

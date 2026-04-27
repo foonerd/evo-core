@@ -28,6 +28,7 @@ use crate::claimant::ClaimantTokenIssuer;
 use crate::custody::CustodyLedger;
 use crate::happenings::HappeningBus;
 use crate::persistence::PersistenceStore;
+use crate::projections::SubjectConflictIndex;
 use crate::relations::RelationGraph;
 use crate::subjects::SubjectRegistry;
 
@@ -88,6 +89,13 @@ pub struct StewardState {
     /// requires every wire surface to mint tokens through this same
     /// issuer.
     pub claimant_issuer: Arc<ClaimantTokenIssuer>,
+    /// In-memory conflict index that mirrors the durable
+    /// `pending_conflicts` table. Held centrally so the wiring
+    /// layer (announce path) records into it on detection, the
+    /// admin layer (merge path) clears it on resolution, and the
+    /// projection engine reads from it without an additional
+    /// store query at composition time.
+    pub conflict_index: Arc<SubjectConflictIndex>,
 }
 
 impl StewardState {
@@ -119,6 +127,7 @@ pub struct StewardStateBuilder {
     admin: Option<Arc<AdminLedger>>,
     persistence: Option<Arc<dyn PersistenceStore>>,
     claimant_issuer: Option<Arc<ClaimantTokenIssuer>>,
+    conflict_index: Option<Arc<SubjectConflictIndex>>,
 }
 
 impl StewardStateBuilder {
@@ -173,6 +182,14 @@ impl StewardStateBuilder {
         self
     }
 
+    /// Provide the in-memory conflict index. Optional: if omitted,
+    /// the builder constructs an empty index so callers that do not
+    /// rehydrate from persistence still get a valid handle.
+    pub fn conflict_index(mut self, index: Arc<SubjectConflictIndex>) -> Self {
+        self.conflict_index = Some(index);
+        self
+    }
+
     /// Finalise the builder.
     ///
     /// Returns `Arc<StewardState>` on success. Returns
@@ -200,6 +217,9 @@ impl StewardStateBuilder {
             claimant_issuer: self
                 .claimant_issuer
                 .ok_or(StewardStateBuildError::MissingClaimantIssuer)?,
+            conflict_index: self
+                .conflict_index
+                .unwrap_or_else(|| Arc::new(SubjectConflictIndex::new())),
         }))
     }
 }
@@ -234,6 +254,7 @@ impl StewardState {
             persistence: Arc::new(
                 crate::persistence::MemoryPersistenceStore::new(),
             ),
+            conflict_index: Arc::new(SubjectConflictIndex::new()),
         })
     }
 }

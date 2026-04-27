@@ -64,7 +64,7 @@ Three families, each answering a different question about the rack:
 
 `domain` racks hold the product's actual work: audio, networking, storage, metadata, kiosk, library. These are the racks that make this device that device rather than a different one.
 
-`coordination` racks originate instructions from time (appointments) or observed conditions (watches). They are domain-agnostic infrastructure for wiring up "when X happens, do Y" logic. Both of these racks are reserved in `CONCEPT.md` section 2 but deferred in the v0 steward.
+`coordination` racks originate instructions from time (appointments) or observed conditions (watches). They are domain-agnostic infrastructure for wiring up "when X happens, do Y" logic. Both of these racks are reserved in `CONCEPT.md` section 2; the steward does not yet wire the appointments engine or the watches engine.
 
 `infrastructure` racks hold knowledge about the fabric itself: observability, identity, lifecycle. These change rarely and are typically the same across distributions.
 
@@ -160,6 +160,16 @@ Subject types are part of a catalogue's public contract. Renaming a type or remo
 
 Adding a new subject type is additive.
 
+#### Strongly recommended discipline
+
+The framework provides a boot-time diagnostic (described next) but not yet a structured migration verb or `SubjectGrammarOrphan` happening. Distributions are strongly recommended to follow an **additive-only** discipline on subject types: never remove or rename a type, only add. An operator who upgrades a catalogue that drops a type must accept that subjects of that type will live on as read-only orphans until either the type is reintroduced or the structured re-statement surface ships.
+
+#### Boot-time orphan diagnostic
+
+At every startup the steward groups every persisted subject by its declared `subject_type` and diffs the result against the loaded catalogue's declared types. A type that appears in storage but not in the catalogue is logged as a `catalogue orphan` warning per type with the row count, and a single summary warning enumerates how many orphaned types and rows were detected. The diagnostic does not refuse boot, modify state, or hide queries — orphans continue to be readable via existing query paths and an attempt to announce a new subject of an orphaned type fails at the wiring layer with the same structured error any unknown-type announcement raises.
+
+This gives operators visibility today; the structured migration surface (an operator-callable re-statement verb, a `SubjectGrammarOrphan` happening, and a persistent `pending_grammar_orphans` table) is the next slice of grammar-survival work and is not yet shipped. The warnings let an operator scope the impact of a catalogue change in the meantime.
+
 ### 5.4 Enforcement
 
 Two checks run on subject types:
@@ -235,7 +245,7 @@ Forking shelves - creating `metadata.providers_v2` alongside `metadata.providers
 
 ### 7.4 Add Predicates with the Plugins That Need Them
 
-Predicates are tied to real plugin needs. When a plugin needs to assert an edge the catalogue does not yet declare, the right fix is adding the predicate to the catalogue at the same time as adding the plugin. Predicates declared speculatively tend to drift or get re-declared with slightly different semantics later.
+Predicates are tied to real plugin needs. When a plugin needs to assert an edge the catalogue does not declare, the right fix is adding the predicate to the catalogue at the same time as adding the plugin. Predicates declared speculatively tend to drift or get re-declared with slightly different semantics later.
 
 ### 7.5 Name Well
 
@@ -263,11 +273,11 @@ Validation rules (authoritative list in `SCHEMAS.md` section 3.2.3):
 
 A catalogue that fails validation is a development-time bug: the distribution's catalogue file is broken. Fix the file; there is no graceful degradation.
 
-### 8.1 What the Steward Does NOT Validate (Yet)
+### 8.1 What the Steward Does NOT Validate
 
-One check is planned but not implemented in v0:
+One check is on the roadmap and not part of the current build:
 
-- **Shelf shape support ranges** (multiple admissible shape values on one slot, migration window): the steward today enforces **only** exact equality of `target.shape` with the shelf's single `shape` field. Range data and logic are not yet implemented; see section 4.2 above.
+- **Shelf shape support ranges** (multiple admissible shape values on one slot, migration window): the steward today enforces **only** exact equality of `target.shape` with the shelf's single `shape` field. Range data and logic are not part of the schema yet; see section 4.2 above.
 
 The subject-type references, cardinality enforcement, and inverse-consistency checks previously listed here now run at catalogue load and at assertion time respectively; see sections 5.4, 6.2, and 6.3.
 
@@ -395,7 +405,7 @@ target_cardinality = "at_most_one"
 inverse = "album_of"
 ```
 
-A full working distribution catalogue will be maintained in the `evo-device-volumio` repository when that lands.
+A full working distribution catalogue is maintained in the `evo-device-volumio` repository.
 
 ## 12. Further Reading
 

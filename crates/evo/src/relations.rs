@@ -655,6 +655,26 @@ impl RelationGraph {
             .sum()
     }
 
+    /// Snapshot of every live relation record, cloned out under the
+    /// graph lock. Order is unspecified (the underlying map is a
+    /// `HashMap`); callers that need a stable order sort by the
+    /// `(source_id, predicate, target_id)` triple. Suppressed
+    /// relations are included so the snapshot is symmetrical with
+    /// [`Self::describe_relation`]; consumers filter by the
+    /// `suppression` field if they want only visible edges.
+    ///
+    /// Used by the cursor-paginated `list_relations` op on the
+    /// client API.
+    pub fn snapshot_relations(&self) -> Vec<RelationRecord> {
+        self.inner
+            .lock()
+            .expect("graph mutex poisoned")
+            .relations
+            .values()
+            .cloned()
+            .collect()
+    }
+
     /// Check if a specific relation exists.
     pub fn exists(
         &self,

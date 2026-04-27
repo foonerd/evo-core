@@ -25,14 +25,16 @@ use evo::admin::AdminLedger;
 use evo::admission::AdmissionEngine;
 use evo::catalogue::Catalogue;
 use evo::cli::Args;
+use evo::client_acl::{ClientAcl, StewardIdentity};
 use evo::config::StewardConfig;
 use evo::custody::CustodyLedger;
 use evo::happenings::HappeningBus;
 use evo::persistence::{PersistenceStore, SqlitePersistenceStore};
 use evo::plugin_discovery;
 use evo::plugin_trust::load_plugin_trust_arc;
-use evo::projections::ProjectionEngine;
+use evo::projections::{ProjectionEngine, SubjectConflictIndex};
 use evo::relations::RelationGraph;
+use evo::resolution::ResolutionLedger;
 use evo::server::Server;
 use evo::shutdown::wait_for_signal;
 use evo::state::StewardState;
@@ -113,8 +115,150 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("loading instance_id: {e}"))?;
     tracing::info!(instance_id = %instance_id, "steward instance identified");
+
+    // Catalogue-orphan diagnostic. Boot-time scan of every persisted
+    // subject_type against the loaded catalogue's declared types: a
+    // type that appears in storage but not in the catalogue is an
+    // orphan — a subject persisted under a vocabulary entry the
+    // current catalogue no longer admits. This emits an
+    // operator-visible warning per orphaned type with the row count
+    // so the operator can scope a deliberate migration. The diagnostic
+    // does not refuse boot or modify state; orphans continue to be
+    // readable via existing query paths and announce of new subjects
+    // of the orphaned type fails at the wiring layer with the same
+    // structured error any unknown-type announcement raises.
+    let declared_types: std::collections::HashSet<String> =
+        catalogue.subjects.iter().map(|s| s.name.clone()).collect();
+    match persistence.count_subjects_by_type().await {
+        Ok(persisted) => {
+            let mut orphan_types = 0usize;
+            let mut orphan_rows: u64 = 0;
+            for (subject_type, count) in &persisted {
+                if !declared_types.contains(subject_type) {
+                    tracing::warn!(
+                        subject_type = %subject_type,
+                        count = *count,
+                        "catalogue orphan: persisted subjects of this type \
+                         remain in storage but the loaded catalogue no longer \
+                         declares the type; these subjects are read-only via \
+                         existing queries and cannot be re-announced or \
+                         re-stated until a migration verb lands"
+                    );
+                    orphan_types += 1;
+                    orphan_rows += count;
+                }
+            }
+            if orphan_types == 0 {
+                tracing::info!(
+                    declared_types = declared_types.len(),
+                    persisted_types = persisted.len(),
+                    "catalogue-orphan scan: no orphans"
+                );
+            } else {
+                tracing::warn!(
+                    orphan_types,
+                    orphan_rows,
+                    "catalogue-orphan scan: {} orphaned subject_type(s) \
+                     covering {} row(s); operator action recommended",
+                    orphan_types,
+                    orphan_rows
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "catalogue-orphan scan: persistence accessor failed; orphan \
+                 detection skipped this boot"
+            );
+        }
+    }
     let claimant_issuer =
         Arc::new(evo::claimant::ClaimantTokenIssuer::new(instance_id));
+
+    // Construct the happenings bus with persistence write-through
+    // and operator-tunable retention. The bus seeds its monotonic
+    // seq counter from the on-disk maximum so cursors continue to
+    // grow across restart; the broadcast capacity sets the live
+    // backpressure ceiling and the retention window is advertised
+    // for observability.
+    let bus = Arc::new(
+        HappeningBus::with_persistence_capacity_and_window(
+            Arc::clone(&persistence),
+            config.happenings.retention_capacity,
+            config.happenings.retention_window_secs,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("seeding happenings bus: {e}"))?,
+    );
+
+    // Spawn the happenings_log janitor. It periodically calls the
+    // store's `trim_happenings_log` to evict rows that have aged
+    // past the retention window OR fallen out of the retention
+    // capacity tail. Shutdown notification fires on signal so the
+    // janitor exits cleanly alongside the server.
+    let janitor_shutdown = Arc::new(tokio::sync::Notify::new());
+    let janitor_persistence = Arc::clone(&persistence);
+    let janitor_capacity = config.happenings.retention_capacity as u64;
+    let janitor_window = config.happenings.retention_window_secs;
+    let janitor_interval = config.happenings.janitor_interval_secs;
+    let janitor_shutdown_for_task = Arc::clone(&janitor_shutdown);
+    let janitor_task = tokio::spawn(async move {
+        evo::happenings::run_happenings_janitor(
+            janitor_persistence,
+            janitor_window,
+            janitor_capacity,
+            janitor_interval,
+            janitor_shutdown_for_task,
+        )
+        .await;
+    });
+
+    // Construct the in-memory conflict index. The wiring layer's
+    // announce path records detected multi-subject conflicts into
+    // it, the admin layer's merge path resolves them, and the
+    // projection engine consults it at composition time so a
+    // subject sitting in an unresolved conflict carries the
+    // structured degraded reason. Held centrally on the steward
+    // state so every consumer reads the same instance.
+    let conflict_index = Arc::new(SubjectConflictIndex::new());
+
+    // Construct the subject registry and rehydrate it from the
+    // durable store BEFORE the admission engine is built. Every
+    // successful announce / merge / split / forget writes through
+    // to SQL on the running steward; on restart the registry is
+    // reconstructed from those rows so a consumer querying the
+    // freshly-booted steward sees the same state it had before
+    // the restart, rather than waiting for plugins to re-announce.
+    // Forgotten subjects are excluded from the live maps; their
+    // tombstone alias rows populate the alias chain so a query
+    // for a forgotten canonical id returns the documented
+    // tombstone record rather than a bare not-found.
+    let subjects = Arc::new(SubjectRegistry::new());
+    match subjects.rehydrate_from(persistence.as_ref()).await {
+        Ok(report) => {
+            tracing::info!(
+                live_subjects = report.live_subjects_loaded,
+                live_addressings = report.live_addressings_loaded,
+                forgotten_subjects_skipped = report.forgotten_subjects_seen,
+                merged_aliases = report.merged_aliases_loaded,
+                split_aliases = report.split_aliases_loaded,
+                tombstone_aliases = report.tombstone_aliases_loaded,
+                "subject registry rehydrated from persistence"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "subject registry rehydration failed; aborting boot to \
+                 avoid serving an inconsistent in-memory view of durable \
+                 state"
+            );
+            return Err(anyhow::anyhow!(
+                "subject registry rehydration failed: {e}"
+            ));
+        }
+    }
 
     // Build the shared steward state once: catalogue plus
     // freshly-allocated stores. The same `Arc<StewardState>` is
@@ -122,13 +266,14 @@ async fn main() -> anyhow::Result<()> {
     // does not have to lock the engine to read shared stores.
     let state = StewardState::builder()
         .catalogue(Arc::clone(&catalogue))
-        .subjects(Arc::new(SubjectRegistry::new()))
+        .subjects(subjects)
         .relations(Arc::new(RelationGraph::new()))
         .custody(Arc::new(CustodyLedger::new()))
-        .bus(Arc::new(HappeningBus::new()))
+        .bus(bus)
         .admin(Arc::new(AdminLedger::new()))
         .persistence(Arc::clone(&persistence))
         .claimant_issuer(Arc::clone(&claimant_issuer))
+        .conflict_index(Arc::clone(&conflict_index))
         .build()?;
 
     // Construct the admission engine and run plugin discovery
@@ -144,11 +289,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Construct a projection engine sharing the steward's subject
     // registry and relation graph. Plugins announce into the same
-    // stores the projection engine reads from.
-    let projections = Arc::new(ProjectionEngine::new(
-        Arc::clone(&state.subjects),
-        Arc::clone(&state.relations),
-    ));
+    // stores the projection engine reads from. Attach the shared
+    // conflict index so projections name every unresolved conflict
+    // a subject participates in via a structured degraded entry.
+    let projections = Arc::new(
+        ProjectionEngine::new(
+            Arc::clone(&state.subjects),
+            Arc::clone(&state.relations),
+        )
+        .with_conflict_index(Arc::clone(&conflict_index)),
+    );
 
     // Clone an Arc to the router so the server can dispatch directly
     // through it without acquiring the admission-engine mutex. The
@@ -161,14 +311,45 @@ async fn main() -> anyhow::Result<()> {
     // ledger directly off the steward state bag.
     let engine = Arc::new(Mutex::new(engine));
 
+    // Load the operator-controlled client-API ACL. Missing file
+    // yields the default-deny posture (local steward UID only);
+    // malformed file is a hard boot-time error so the operator
+    // catches the typo before any consumer connects.
+    let client_acl = Arc::new(ClientAcl::load()?);
+    if let Some(src) = client_acl.source() {
+        tracing::info!(
+            path = %src.display(),
+            "client capability ACL loaded"
+        );
+    } else {
+        tracing::info!(
+            "client capability ACL: default policy (no file present)"
+        );
+    }
+
+    // Capture the steward's own identity once at boot. The default
+    // ACL grants the local-UID branch only when the peer's UID
+    // matches this value; resolving it once here avoids a per-
+    // connection metadata read.
+    let steward_identity = StewardIdentity::current();
+
+    // Construct the audit ledger that records every
+    // `resolve_claimants` call (granted or refused). One ledger per
+    // steward instance; held by the server and exposed to operator
+    // tooling via [`Server::resolution_ledger`].
+    let resolution_ledger = Arc::new(ResolutionLedger::new());
+
     // Start the server. The server clones the state Arc directly so
     // it can serve bus subscriptions and ledger snapshots without
     // taking the engine mutex; dispatch flows through the router.
-    let server = Server::new(
+    let server = Server::with_acl(
         socket_path.clone(),
         router,
         Arc::clone(&state),
         Arc::clone(&projections),
+        Arc::clone(&client_acl),
+        steward_identity,
+        Arc::clone(&resolution_ledger),
     );
 
     tracing::warn!(
@@ -215,6 +396,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Notify the happenings_log janitor and join its task. The
+    // janitor's loop observes the notify on its next sleep boundary
+    // and exits cleanly. Joining here keeps the boot/shutdown
+    // symmetry: every spawned task is awaited before drop.
+    janitor_shutdown.notify_waiters();
+    if let Err(e) = janitor_task.await {
+        tracing::warn!(error = %e, "happenings_log janitor task did not join cleanly");
+    }
+
     // Drain: unload every admitted plugin under a global deadline.
     // The report carries which plugins released cleanly and which
     // missed the deadline; stage 4 SIGKILL'd the holdouts before
@@ -251,6 +441,26 @@ async fn main() -> anyhow::Result<()> {
             shelf = ?c.shelf,
             "custody not released cleanly within drain window"
         );
+    }
+
+    // Final WAL checkpoint before the persistence pool drops. Flushes
+    // the write-ahead log into the main database file and truncates
+    // it to zero so an operator backing up the database alone (without
+    // the `-wal`/`-shm` siblings) captures every committed row.
+    // Failure here is non-fatal: the rows are still on disk in the
+    // WAL and recoverable by SQLite on next open; we log a warning
+    // so the operator notices.
+    match persistence.checkpoint_wal().await {
+        Ok(()) => {
+            tracing::info!("WAL checkpoint truncated on shutdown");
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "WAL checkpoint at shutdown failed; rows are still durable in \
+                 the WAL but not yet folded into the main database file"
+            );
+        }
     }
 
     tracing::warn!("evo exited");

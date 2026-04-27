@@ -227,6 +227,34 @@ pub enum ClaimKind {
         /// The distinct canonical IDs they resolved to.
         canonical_ids: Vec<String>,
     },
+    /// An admin merge collapsed two source canonical IDs into one
+    /// new canonical ID. The source IDs are retired into the alias
+    /// index ([`AliasKind::Merged`]); this claim is the audit-log
+    /// entry for the operation, so a consumer reconstructing state
+    /// from the claim log observes the merge here without having
+    /// to scan the alias map. The surrounding [`ClaimRecord`]'s
+    /// `claimant` is the admin plugin that authorised the merge.
+    Merged {
+        /// Source canonical IDs that were collapsed. Order follows
+        /// the merge call's `(source_a, source_b)` order.
+        sources: Vec<String>,
+        /// New canonical ID minted for the merged subject.
+        target: String,
+    },
+    /// An admin split partitioned one source canonical ID into N
+    /// new canonical IDs. The source ID is retired into the alias
+    /// index ([`AliasKind::Split`]); this claim is the audit-log
+    /// entry for the operation, symmetric to [`Self::Merged`]. The
+    /// surrounding [`ClaimRecord`]'s `claimant` is the admin plugin
+    /// that authorised the split.
+    Split {
+        /// Source canonical ID that was split.
+        source: String,
+        /// New canonical IDs minted for the partition groups, in
+        /// partition order (matches
+        /// [`SplitSubjectOutcome::new_ids`]).
+        targets: Vec<String>,
+    },
 }
 
 /// Outcome of an announcement.
@@ -401,6 +429,155 @@ impl SubjectRegistry {
         }
     }
 
+    /// Rebuild the registry's in-memory state from the durable
+    /// store at boot.
+    ///
+    /// The persistence layer is the source of truth across
+    /// restarts: every successful `announce` / `merge` / `split` /
+    /// `forget` writes through to SQL, and on restart this method
+    /// reads every live subject (with its addressings) and every
+    /// alias row, reassembling the in-memory `subjects`,
+    /// `addressings`, and `aliases` maps so a consumer querying
+    /// the registry sees the same state the steward was in before
+    /// the restart.
+    ///
+    /// The method is intended to be called exactly once at boot,
+    /// on a freshly-constructed registry, BEFORE any plugin is
+    /// admitted. Calling it on a non-empty registry refuses with
+    /// [`StewardError::Dispatch`] rather than merging state — the
+    /// caller's expectation of "rehydrated registry" requires the
+    /// boot ordering, and re-entry would silently corrupt
+    /// invariants like the alias-index append-only rule.
+    ///
+    /// Forgotten subjects (rows whose `forgotten_at_ms` is set in
+    /// the persistence layer) are deliberately NOT loaded into
+    /// `subjects` / `addressings`; their tombstone alias rows are
+    /// loaded into `aliases` so a consumer querying a forgotten
+    /// canonical id receives the documented tombstone chain
+    /// rather than a bare not-found.
+    ///
+    /// The claim log is left empty after rehydration. Re-loading
+    /// the durable claim log is downstream work; today the boot
+    /// path produces a registry whose live state matches the
+    /// pre-restart steward and whose audit log starts fresh
+    /// alongside the new boot.
+    pub async fn rehydrate_from(
+        &self,
+        store: &dyn crate::persistence::PersistenceStore,
+    ) -> Result<RehydrateReport, StewardError> {
+        let inner_count = {
+            let guard = self
+                .inner
+                .lock()
+                .expect("registry mutex poisoned at rehydrate_from entry");
+            (
+                guard.subjects.len(),
+                guard.addressings.len(),
+                guard.aliases.len(),
+            )
+        };
+        if inner_count != (0, 0, 0) {
+            return Err(StewardError::Dispatch(format!(
+                "rehydrate_from refuses to merge into a non-empty registry \
+                 (subjects={}, addressings={}, aliases={})",
+                inner_count.0, inner_count.1, inner_count.2,
+            )));
+        }
+
+        let persisted_subjects =
+            store.load_all_subjects().await.map_err(|e| {
+                StewardError::Dispatch(format!(
+                    "rehydrate_from: load_all_subjects failed: {e}"
+                ))
+            })?;
+        let persisted_aliases =
+            store.load_all_aliases().await.map_err(|e| {
+                StewardError::Dispatch(format!(
+                    "rehydrate_from: load_all_aliases failed: {e}"
+                ))
+            })?;
+
+        let mut report = RehydrateReport::default();
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("registry mutex poisoned at rehydrate_from body");
+
+        for ps in persisted_subjects {
+            if ps.forgotten_at_ms.is_some() {
+                report.forgotten_subjects_seen += 1;
+                continue;
+            }
+            let mut addressings: Vec<AddressingRecord> = Vec::new();
+            for pa in &ps.addressings {
+                let addr = ExternalAddressing::new(
+                    pa.scheme.clone(),
+                    pa.value.clone(),
+                );
+                addressings.push(AddressingRecord {
+                    addressing: addr.clone(),
+                    claimant: pa.claimant.clone(),
+                    added_at: ms_to_system_time(pa.asserted_at_ms),
+                });
+                inner.addressings.insert(addr, ps.id.clone());
+                report.live_addressings_loaded += 1;
+            }
+            inner.subjects.insert(
+                ps.id.clone(),
+                SubjectRecord {
+                    id: ps.id.clone(),
+                    subject_type: ps.subject_type.clone(),
+                    addressings,
+                    created_at: ms_to_system_time(ps.created_at_ms),
+                    modified_at: ms_to_system_time(ps.modified_at_ms),
+                },
+            );
+            report.live_subjects_loaded += 1;
+        }
+
+        // Group flat alias rows by `old_id`. Merge yields one row
+        // per source id; split yields N rows under the same
+        // source id (one per partition group); tombstone yields
+        // one row whose stored `new_id` is the empty-string
+        // sentinel and whose in-memory representation has
+        // `new_ids: vec![]`.
+        let mut grouped: HashMap<
+            String,
+            Vec<crate::persistence::PersistedAlias>,
+        > = HashMap::new();
+        for pa in persisted_aliases {
+            grouped.entry(pa.old_id.clone()).or_default().push(pa);
+        }
+        for (old_id, rows) in grouped {
+            let kind = rows[0].kind;
+            let new_ids: Vec<CanonicalSubjectId> = match kind {
+                AliasKind::Tombstone => Vec::new(),
+                _ => rows
+                    .iter()
+                    .map(|r| CanonicalSubjectId::new(r.new_id.as_str()))
+                    .collect(),
+            };
+            let recorded_at_ms = rows[0].recorded_at_ms;
+            let admin_plugin = rows[0].admin_plugin.clone();
+            let reason = rows[0].reason.clone();
+            let record = AliasRecord {
+                old_id: CanonicalSubjectId::new(old_id.as_str()),
+                new_ids,
+                kind,
+                recorded_at_ms,
+                admin_plugin,
+                reason,
+            };
+            inner.aliases.insert(old_id, record);
+            match kind {
+                AliasKind::Merged => report.merged_aliases_loaded += 1,
+                AliasKind::Split => report.split_aliases_loaded += 1,
+                AliasKind::Tombstone => report.tombstone_aliases_loaded += 1,
+            }
+        }
+        Ok(report)
+    }
+
     /// Current number of canonical subjects in the registry.
     pub fn subject_count(&self) -> usize {
         self.inner
@@ -420,13 +597,65 @@ impl SubjectRegistry {
     }
 
     /// Current number of recorded claims (equivalent, distinct,
-    /// conflict).
+    /// conflict, merged, split).
     pub fn claim_count(&self) -> usize {
         self.inner
             .lock()
             .expect("registry mutex poisoned")
             .claims
             .len()
+    }
+
+    /// Snapshot of every recorded claim, in insertion order.
+    ///
+    /// The audit/reconcile read path. Consumers walking the claim
+    /// log iterate this snapshot to reconstruct registry state
+    /// without scanning the alias map: a [`ClaimKind::Merged`] or
+    /// [`ClaimKind::Split`] entry is the audit-log entry for the
+    /// corresponding admin operation. Returned by clone — the
+    /// internal vector is not exposed by reference.
+    pub fn claims_snapshot(&self) -> Vec<ClaimRecord> {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .claims
+            .clone()
+    }
+
+    /// Snapshot of every live subject record, cloned out under the
+    /// registry lock. Order is unspecified (the underlying map is a
+    /// `HashMap`); callers that need a stable order sort by
+    /// canonical ID.
+    ///
+    /// Used by the cursor-paginated `list_subjects` op on the
+    /// client API. The lock is released before returning so the
+    /// snapshot is consistent at one instant but does not block
+    /// concurrent registry mutations.
+    pub fn snapshot_subjects(&self) -> Vec<SubjectRecord> {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .subjects
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Snapshot of every claimed addressing as `(addressing,
+    /// canonical_id)` pairs, cloned out under the registry lock.
+    /// Order is unspecified; callers that need a stable order sort
+    /// by `(scheme, value)`.
+    ///
+    /// Used by the cursor-paginated `enumerate_addressings` op on
+    /// the client API.
+    pub fn snapshot_addressings(&self) -> Vec<(ExternalAddressing, String)> {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .addressings
+            .iter()
+            .map(|(a, id)| (a.clone(), id.clone()))
+            .collect()
     }
 
     /// Resolve an addressing to a canonical subject ID if known.
@@ -697,6 +926,27 @@ impl SubjectRegistry {
                 .map(|r| r.subject_type.clone())
                 .expect("subject record must exist when should_forget is true");
             inner.subjects.remove(&id);
+
+            // Append a tombstone alias entry so chain walkers see
+            // "this canonical ID was forgotten, no successor"
+            // rather than receiving a bare not-found that cannot be
+            // distinguished from "the ID was never minted". The
+            // tombstone uses the same append-only insert path as
+            // merge / split aliases.
+            let now_ms = system_time_to_ms(SystemTime::now());
+            let _ = aliases_try_insert(
+                &mut inner,
+                id.clone(),
+                AliasRecord {
+                    old_id: CanonicalSubjectId::new(&id),
+                    new_ids: Vec::new(),
+                    kind: AliasKind::Tombstone,
+                    recorded_at_ms: now_ms,
+                    admin_plugin: claimant.to_string(),
+                    reason: reason.clone(),
+                },
+            );
+
             tracing::info!(
                 subject_id = %id,
                 subject_type = %subject_type,
@@ -803,6 +1053,28 @@ impl SubjectRegistry {
                 .map(|r| r.subject_type.clone())
                 .expect("subject record must exist when should_forget is true");
             inner.subjects.remove(&id);
+
+            // Tombstone discipline mirrors the regular retract path:
+            // record an alias entry so describe_alias on a forgotten
+            // ID returns a structured "no successor" record. The
+            // admin_plugin owns the tombstone (it caused the forget),
+            // matching the pattern used elsewhere in the
+            // forced-retract surface where the admin's identity is
+            // the operator-visible actor.
+            let now_ms = system_time_to_ms(SystemTime::now());
+            let _ = aliases_try_insert(
+                &mut inner,
+                id.clone(),
+                AliasRecord {
+                    old_id: CanonicalSubjectId::new(&id),
+                    new_ids: Vec::new(),
+                    kind: AliasKind::Tombstone,
+                    recorded_at_ms: now_ms,
+                    admin_plugin: admin_plugin.to_string(),
+                    reason: reason.clone(),
+                },
+            );
+
             tracing::info!(
                 subject_id = %id,
                 subject_type = %subject_type,
@@ -982,7 +1254,7 @@ impl SubjectRegistry {
                 kind: AliasKind::Merged,
                 recorded_at_ms,
                 admin_plugin: admin_plugin.to_string(),
-                reason,
+                reason: reason.clone(),
             },
         )
         .unwrap_or_else(|v| {
@@ -991,6 +1263,22 @@ impl SubjectRegistry {
                  already had an AliasRecord (merge source_b)",
                 v.key
             )
+        });
+
+        // Audit-log entry. Other state-changing operations append
+        // a `ClaimRecord` to `inner.claims`; merge does the same so
+        // a consumer reconstructing state from the claim log
+        // observes the merge without scanning the alias map. The
+        // variant carries both source IDs and the new target so the
+        // operation is self-contained.
+        inner.claims.push(ClaimRecord {
+            kind: ClaimKind::Merged {
+                sources: vec![source_a_id.to_string(), source_b_id.to_string()],
+                target: new_id.clone(),
+            },
+            claimant: admin_plugin.to_string(),
+            asserted_at: now,
+            reason,
         });
 
         tracing::info!(
@@ -1176,7 +1464,7 @@ impl SubjectRegistry {
                 kind: AliasKind::Split,
                 recorded_at_ms: system_time_to_ms(now),
                 admin_plugin: admin_plugin.to_string(),
-                reason,
+                reason: reason.clone(),
             },
         )
         .unwrap_or_else(|v| {
@@ -1185,6 +1473,21 @@ impl SubjectRegistry {
                  already had an AliasRecord (split source)",
                 v.key
             )
+        });
+
+        // Audit-log entry, symmetric to the merge claim. The split
+        // appends a `ClaimRecord::Split` carrying the source ID and
+        // every new ID in partition order so a consumer
+        // reconstructing state from the claim log observes the
+        // split without scanning the alias map.
+        inner.claims.push(ClaimRecord {
+            kind: ClaimKind::Split {
+                source: source_id.to_string(),
+                targets: new_ids.clone(),
+            },
+            claimant: admin_plugin.to_string(),
+            asserted_at: now,
+            reason,
         });
 
         tracing::info!(
@@ -1232,6 +1535,39 @@ fn system_time_to_ms(t: SystemTime) -> u64 {
     t.duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn ms_to_system_time(ms: u64) -> SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)
+}
+
+/// Diagnostic counters returned by [`SubjectRegistry::rehydrate_from`].
+///
+/// Mirrors what was loaded so the boot path can log a single
+/// info line summarising the durable state the registry just
+/// reconstructed; helpful when an operator is diagnosing a
+/// restart that ended up with fewer subjects than expected.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RehydrateReport {
+    /// Live (`forgotten_at_ms IS NULL`) subjects loaded into
+    /// the in-memory `subjects` map.
+    pub live_subjects_loaded: usize,
+    /// Live addressings loaded into the in-memory `addressings`
+    /// hot-path index.
+    pub live_addressings_loaded: usize,
+    /// Forgotten subject rows skipped during the live-subject
+    /// pass; their tombstone alias rows (if present) populated
+    /// `aliases` instead.
+    pub forgotten_subjects_seen: usize,
+    /// `AliasKind::Merged` records reassembled into the
+    /// in-memory alias map.
+    pub merged_aliases_loaded: usize,
+    /// `AliasKind::Split` records reassembled (one record per
+    /// source id, with `new_ids` covering every partition group).
+    pub split_aliases_loaded: usize,
+    /// `AliasKind::Tombstone` records reassembled (one record
+    /// per forgotten id, with empty `new_ids`).
+    pub tombstone_aliases_loaded: usize,
 }
 
 fn claim_to_kind_and_reason(
@@ -1835,6 +2171,46 @@ mod tests {
     }
 
     #[test]
+    fn merge_aliases_appends_synthetic_claim_record() {
+        // Merge appends a `ClaimRecord` of kind `Merged` to the
+        // in-registry claim log so audit/replay consumers see the
+        // operation in the log without scanning the alias map. The
+        // variant carries both source IDs and the new target; the
+        // surrounding record carries the admin plugin as `claimant`
+        // and the operator's `reason`.
+        let r = SubjectRegistry::new();
+        let (id_a, id_b) = seed_two_subjects(&r);
+        let claim_count_before = r.claim_count();
+
+        let new_id = r
+            .merge_aliases(
+                &id_a,
+                &id_b,
+                "admin.plugin",
+                Some("operator confirmed".into()),
+            )
+            .unwrap()
+            .new_id;
+
+        assert_eq!(
+            r.claim_count(),
+            claim_count_before + 1,
+            "merge must append exactly one ClaimRecord"
+        );
+        let claims = r.claims_snapshot();
+        let last = claims.last().expect("claim log not empty");
+        match &last.kind {
+            ClaimKind::Merged { sources, target } => {
+                assert_eq!(sources, &vec![id_a.clone(), id_b.clone()]);
+                assert_eq!(target, &new_id);
+            }
+            other => panic!("expected ClaimKind::Merged, got {other:?}"),
+        }
+        assert_eq!(last.claimant, "admin.plugin");
+        assert_eq!(last.reason.as_deref(), Some("operator confirmed"));
+    }
+
+    #[test]
     fn merge_aliases_rewrites_addressing_index() {
         // Per the merge contract, every addressing the two
         // sources owned must now resolve directly to the new ID.
@@ -2046,6 +2422,208 @@ mod tests {
         assert!(alias.reason.is_none());
     }
 
+    #[tokio::test]
+    async fn rehydrate_from_reconstructs_live_state_and_alias_chain() {
+        // Boot rehydration: a fresh registry consults the
+        // persistence trait, walks every live subject (with its
+        // addressings) plus every alias row, and reassembles the
+        // in-memory hot-path indices. Forgotten rows do not enter
+        // the live `subjects` map but their tombstone alias rows
+        // do enter the alias chain so a query for a forgotten id
+        // returns the documented tombstone record.
+        use crate::persistence::{
+            AnnounceRecord, MemoryPersistenceStore, MergeRecord,
+            PersistenceStore,
+        };
+
+        let store: std::sync::Arc<dyn PersistenceStore> =
+            std::sync::Arc::new(MemoryPersistenceStore::new());
+
+        // Live subject A with two addressings.
+        let a_id = "a-uuid";
+        let a_addrs =
+            [addr("scheme.a", "alpha-1"), addr("scheme.a", "alpha-2")];
+        store
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: a_id,
+                subject_type: "track",
+                addressings: &a_addrs,
+                claimant: "p1",
+                claims: &[],
+                at_ms: 1_000,
+            })
+            .await
+            .unwrap();
+
+        // Two more subjects we will merge so the alias chain has a
+        // pair of `Merged` rows pointing at the same target.
+        let b_id = "b-uuid";
+        let c_id = "c-uuid";
+        store
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: b_id,
+                subject_type: "track",
+                addressings: &[addr("scheme.b", "beta-1")],
+                claimant: "p1",
+                claims: &[],
+                at_ms: 1_100,
+            })
+            .await
+            .unwrap();
+        store
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: c_id,
+                subject_type: "track",
+                addressings: &[addr("scheme.c", "gamma-1")],
+                claimant: "p1",
+                claims: &[],
+                at_ms: 1_200,
+            })
+            .await
+            .unwrap();
+
+        let merged_id = "merged-uuid";
+        store
+            .record_subject_merge(MergeRecord {
+                source_a: b_id,
+                source_b: c_id,
+                new_id: merged_id,
+                subject_type: "track",
+                admin_plugin: "admin.plugin",
+                reason: Some("operator confirmed"),
+                at_ms: 1_300,
+            })
+            .await
+            .unwrap();
+
+        // A standalone subject we will forget so a tombstone alias
+        // row appears.
+        let d_id = "d-uuid";
+        let d_addr = addr("scheme.d", "delta-1");
+        store
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: d_id,
+                subject_type: "track",
+                addressings: std::slice::from_ref(&d_addr),
+                claimant: "p1",
+                claims: &[],
+                at_ms: 1_400,
+            })
+            .await
+            .unwrap();
+        store
+            .record_subject_forget(d_id, "admin.plugin", None, 1_500)
+            .await
+            .unwrap();
+
+        // Boot path: fresh registry, rehydrate from the store.
+        let registry = SubjectRegistry::new();
+        let report = registry.rehydrate_from(store.as_ref()).await.unwrap();
+
+        // Live state: a (still standalone) and merged (carrying
+        // both source addressings) are present; b, c, and d are
+        // not in the live `subjects` map. The forget path deletes
+        // the subject row outright (the persistence layer does
+        // not soft-forget today) and inserts a tombstone alias,
+        // so `forgotten_subjects_seen` from the live-subject scan
+        // is zero while `tombstone_aliases_loaded` is one.
+        assert_eq!(report.live_subjects_loaded, 2);
+        assert_eq!(report.live_addressings_loaded, 4);
+        assert_eq!(report.forgotten_subjects_seen, 0);
+        assert_eq!(report.merged_aliases_loaded, 2);
+        assert_eq!(report.split_aliases_loaded, 0);
+        assert_eq!(report.tombstone_aliases_loaded, 1);
+
+        assert!(registry.describe(a_id).is_some());
+        assert!(registry.describe(merged_id).is_some());
+        assert!(registry.describe(b_id).is_none());
+        assert!(registry.describe(c_id).is_none());
+        assert!(registry.describe(d_id).is_none());
+
+        // The two addressings the merge moved onto `merged_id`
+        // resolve to the merged subject.
+        assert_eq!(
+            registry.resolve(&addr("scheme.b", "beta-1")).as_deref(),
+            Some(merged_id)
+        );
+        assert_eq!(
+            registry.resolve(&addr("scheme.c", "gamma-1")).as_deref(),
+            Some(merged_id)
+        );
+
+        // Alias chain: querying either source of the merge returns
+        // the Merged record pointing at the new id.
+        let alias_b = registry.describe_alias(b_id).unwrap();
+        assert_eq!(alias_b.kind, AliasKind::Merged);
+        assert_eq!(alias_b.new_ids.len(), 1);
+        assert_eq!(alias_b.new_ids[0].as_str(), merged_id);
+
+        // Tombstone for the forgotten id surfaces with empty
+        // `new_ids`.
+        let tomb = registry.describe_alias(d_id).unwrap();
+        assert_eq!(tomb.kind, AliasKind::Tombstone);
+        assert!(tomb.new_ids.is_empty());
+        assert_eq!(tomb.admin_plugin, "admin.plugin");
+
+        // Refusal: re-rehydrating into the now-non-empty registry
+        // returns Dispatch rather than corrupting state.
+        let err = registry
+            .rehydrate_from(store.as_ref())
+            .await
+            .expect_err("re-rehydrate must refuse");
+        assert!(matches!(err, StewardError::Dispatch(_)));
+    }
+
+    #[test]
+    fn split_subject_appends_synthetic_claim_record() {
+        // Symmetric to the merge claim. Split appends a
+        // `ClaimRecord` of kind `Split` carrying the source ID and
+        // every new ID in partition order. The surrounding record
+        // carries the admin plugin as `claimant` and the operator's
+        // `reason`.
+        let r = SubjectRegistry::new();
+        let AnnounceOutcome::Created(source_id) = r
+            .announce(
+                &SubjectAnnouncement::new(
+                    "track",
+                    vec![addr("a", "1"), addr("b", "2")],
+                ),
+                "p1",
+            )
+            .unwrap()
+        else {
+            panic!();
+        };
+        let claim_count_before = r.claim_count();
+
+        let new_ids = r
+            .split_subject(
+                &source_id,
+                vec![vec![addr("a", "1")], vec![addr("b", "2")]],
+                "admin.plugin",
+                Some("operator partitioned".into()),
+            )
+            .unwrap()
+            .new_ids;
+
+        assert_eq!(
+            r.claim_count(),
+            claim_count_before + 1,
+            "split must append exactly one ClaimRecord"
+        );
+        let claims = r.claims_snapshot();
+        let last = claims.last().expect("claim log not empty");
+        match &last.kind {
+            ClaimKind::Split { source, targets } => {
+                assert_eq!(source, &source_id);
+                assert_eq!(targets, &new_ids);
+            }
+            other => panic!("expected ClaimKind::Split, got {other:?}"),
+        }
+        assert_eq!(last.claimant, "admin.plugin");
+        assert_eq!(last.reason.as_deref(), Some("operator partitioned"));
+    }
+
     #[test]
     fn split_subject_refuses_partition_with_one_group() {
         // A split must produce at least two new subjects. A
@@ -2198,5 +2776,74 @@ mod tests {
                 v.key
             )
         });
+    }
+
+    #[test]
+    fn retract_last_addressing_records_tombstone_alias() {
+        // The plain retract path that ends in `SubjectForgotten`
+        // appends a tombstone alias record under the forgotten
+        // canonical ID. A consumer holding the stale ID can call
+        // describe_alias and see "this subject was forgotten" as a
+        // structured AliasKind::Tombstone record rather than
+        // receiving a bare not-found.
+        let r = SubjectRegistry::new();
+        let a = SubjectAnnouncement::new("track", vec![addr("s", "v")]);
+        let AnnounceOutcome::Created(id) =
+            r.announce(&a, "org.test.plugin").unwrap()
+        else {
+            panic!("expected Created outcome");
+        };
+        let outcome = r
+            .retract(
+                &addr("s", "v"),
+                "org.test.plugin",
+                Some("operator cleanup".into()),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            SubjectRetractOutcome::SubjectForgotten { .. }
+        ));
+
+        let alias = r
+            .describe_alias(&id)
+            .expect("tombstone alias must be present");
+        assert_eq!(alias.kind, AliasKind::Tombstone);
+        assert!(alias.new_ids.is_empty());
+        assert_eq!(alias.admin_plugin, "org.test.plugin");
+        assert_eq!(alias.reason.as_deref(), Some("operator cleanup"));
+    }
+
+    #[test]
+    fn forced_retract_last_addressing_records_tombstone_alias() {
+        // The privileged forced-retract path that ends in
+        // `SubjectForgotten` records the tombstone under the
+        // admin_plugin's identity (the operator-visible actor).
+        let r = SubjectRegistry::new();
+        let a = SubjectAnnouncement::new("album", vec![addr("a", "1")]);
+        let AnnounceOutcome::Created(id) = r.announce(&a, "p.target").unwrap()
+        else {
+            panic!("expected Created outcome");
+        };
+        let outcome = r
+            .forced_retract_addressing(
+                &addr("a", "1"),
+                "p.target",
+                "p.admin",
+                Some("admin sweep".into()),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ForcedRetractAddressingOutcome::SubjectForgotten { .. }
+        ));
+
+        let alias = r
+            .describe_alias(&id)
+            .expect("tombstone alias must be present after forced retract");
+        assert_eq!(alias.kind, AliasKind::Tombstone);
+        assert!(alias.new_ids.is_empty());
+        assert_eq!(alias.admin_plugin, "p.admin");
+        assert_eq!(alias.reason.as_deref(), Some("admin sweep"));
     }
 }

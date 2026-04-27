@@ -52,8 +52,8 @@
 
 use crate::relations::{RelationGraph, WalkDirection};
 use crate::subjects::SubjectRegistry;
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 /// Default maximum relation walk depth applied by scope constructors.
@@ -80,6 +80,100 @@ pub const DEFAULT_MAX_VISITS: usize = 1000;
 /// this.
 pub const SUBJECT_PROJECTION_SHAPE_VERSION: u32 = 1;
 
+/// In-memory index of unresolved multi-subject conflicts, keyed by
+/// the canonical IDs the conflicts touch.
+///
+/// Updated by the wiring layer when an announce produces an
+/// [`AnnounceOutcome::Conflict`](crate::subjects::AnnounceOutcome::Conflict)
+/// (`record`) and again when the administration tier resolves the
+/// conflict (`resolve`). The projection engine consults the index
+/// at composition time so a [`SubjectProjection`] for any subject
+/// participating in an open conflict carries a structured
+/// [`DegradedReasonKind::SubjectInConflict`] entry naming the
+/// conflict's id.
+///
+/// The index is intentionally sync: projections are themselves
+/// synchronous and consulting an async store at projection time
+/// would require an `await` boundary the engine does not otherwise
+/// have. The wiring layer is responsible for keeping the index
+/// consistent with the durable `pending_conflicts` table; on boot
+/// the index is rehydrated from
+/// [`crate::persistence::PersistenceStore::list_pending_conflicts`].
+#[derive(Debug, Default)]
+pub struct SubjectConflictIndex {
+    inner: Mutex<ConflictIndexInner>,
+}
+
+#[derive(Debug, Default)]
+struct ConflictIndexInner {
+    /// canonical_id -> set of conflict ids the subject participates
+    /// in. A subject may sit in more than one open conflict at once
+    /// when distinct announcements detect distinct overlaps; each
+    /// conflict id is reported as its own degraded entry.
+    subject_to_conflicts: HashMap<String, HashSet<i64>>,
+    /// conflict id -> the canonical IDs that conflict touches. Used
+    /// to remove the subject -> conflict edges when a conflict is
+    /// resolved.
+    conflict_to_subjects: HashMap<i64, Vec<String>>,
+}
+
+impl SubjectConflictIndex {
+    /// Construct an empty index.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an unresolved conflict spanning the supplied canonical
+    /// IDs. The conflict id is the row id assigned by the durable
+    /// [`crate::persistence::PersistenceStore::record_pending_conflict`]
+    /// call; recording the same id twice is idempotent.
+    pub fn record(&self, conflict_id: i64, canonical_ids: &[String]) {
+        let mut inner = self.inner.lock().expect("conflict index poisoned");
+        inner
+            .conflict_to_subjects
+            .insert(conflict_id, canonical_ids.to_vec());
+        for id in canonical_ids {
+            inner
+                .subject_to_conflicts
+                .entry(id.clone())
+                .or_default()
+                .insert(conflict_id);
+        }
+    }
+
+    /// Mark the conflict resolved, removing every subject -> conflict
+    /// edge for it. A subject that was only in one open conflict
+    /// loses its conflict-degraded status; a subject in multiple
+    /// open conflicts keeps the others.
+    pub fn resolve(&self, conflict_id: i64) {
+        let mut inner = self.inner.lock().expect("conflict index poisoned");
+        if let Some(ids) = inner.conflict_to_subjects.remove(&conflict_id) {
+            for id in &ids {
+                if let Some(set) = inner.subject_to_conflicts.get_mut(id) {
+                    set.remove(&conflict_id);
+                    if set.is_empty() {
+                        inner.subject_to_conflicts.remove(id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return the conflict ids the subject participates in, sorted
+    /// ascending so the projection's degraded-reasons surface is
+    /// deterministic across runs.
+    pub fn conflicts_for(&self, canonical_id: &str) -> Vec<i64> {
+        let inner = self.inner.lock().expect("conflict index poisoned");
+        let mut out: Vec<i64> = inner
+            .subject_to_conflicts
+            .get(canonical_id)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        out.sort_unstable();
+        out
+    }
+}
+
 /// The projection engine.
 ///
 /// Composes projections on demand from the subject registry and
@@ -88,6 +182,7 @@ pub const SUBJECT_PROJECTION_SHAPE_VERSION: u32 = 1;
 pub struct ProjectionEngine {
     registry: Arc<SubjectRegistry>,
     graph: Arc<RelationGraph>,
+    conflicts: Option<Arc<SubjectConflictIndex>>,
 }
 
 impl std::fmt::Debug for ProjectionEngine {
@@ -111,7 +206,22 @@ impl ProjectionEngine {
         registry: Arc<SubjectRegistry>,
         graph: Arc<RelationGraph>,
     ) -> Self {
-        Self { registry, graph }
+        Self {
+            registry,
+            graph,
+            conflicts: None,
+        }
+    }
+
+    /// Attach a [`SubjectConflictIndex`] to this engine. When set,
+    /// projections name every unresolved conflict the subject sits
+    /// in via a [`DegradedReasonKind::SubjectInConflict`] entry.
+    pub fn with_conflict_index(
+        mut self,
+        conflicts: Arc<SubjectConflictIndex>,
+    ) -> Self {
+        self.conflicts = Some(conflicts);
+        self
     }
 
     /// Borrow a handle to the subject registry used by this engine.
@@ -235,6 +345,19 @@ impl ProjectionEngine {
 
         let mut related: Vec<RelatedSubject> = Vec::new();
         let mut degraded_reasons: Vec<DegradedReason> = Vec::new();
+
+        // Conflict-degradation surface: emit one reason per
+        // unresolved conflict the subject participates in. The
+        // engine consults the conflict index synchronously; when
+        // no index is attached the surface is silent.
+        if let Some(idx) = self.conflicts.as_ref() {
+            for conflict_id in idx.conflicts_for(&record.id) {
+                degraded_reasons.push(DegradedReason {
+                    kind: DegradedReasonKind::SubjectInConflict,
+                    detail: Some(format!("conflict_id={conflict_id}")),
+                });
+            }
+        }
 
         if remaining_depth > 0 && !scope.relation_predicates.is_empty() {
             for predicate in &scope.relation_predicates {
@@ -738,6 +861,11 @@ pub enum DegradedReasonKind {
     /// A relation in the graph points at a subject not registered in
     /// the subject registry.
     DanglingRelation,
+    /// The subject participates in an unresolved multi-subject
+    /// conflict. The detail field carries the conflict's durable
+    /// row id so operators can correlate the projection-degradation
+    /// signal with the row in the `pending_conflicts` table.
+    SubjectInConflict,
 }
 
 /// Errors produced by the projection engine.

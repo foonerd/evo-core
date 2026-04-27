@@ -229,13 +229,13 @@ For historical observation use happenings: every ledger-writing event emits a ha
 7. Every `LedgerCustodyStateReporter::report` ends with `record_state` having run before the `CustodyStateReported` happening is emitted.
 8. The ledger's state is consistent with happenings observed on the bus: a subscriber that reacts to any custody happening by querying the ledger sees a state consistent with the happening's semantics.
 
-## 11. Deferred
+## 11. Roadmap
 
 ### 11.1 Persistence
 
-The custody ledger is persisted to `/var/lib/evo/state/evo.db` alongside the subject registry and relation graph. Every `record_custody`, `record_state`, and `release_custody` writes through to the database in the same transaction that updates the in-memory map; a steward restart rehydrates the in-memory ledger from the database before admission resumes. In-flight custodies on wardens that also survive the restart keep their steward-side record. The full contract - schema, transaction semantics, crash recovery, permissions - is in `PERSISTENCE.md`.
+The destination contract: the custody ledger is persisted to `/var/lib/evo/state/evo.db` alongside the subject registry and relation graph. Every `record_custody`, `record_state`, and `release_custody` writes through to the database in the same transaction that updates the in-memory map; a steward restart rehydrates the in-memory ledger from the database before admission resumes. Custodies on wardens that also survive the restart keep their steward-side record. The full contract - schema, transaction semantics, crash recovery, permissions - is in `PERSISTENCE.md`.
 
-Implementation is pending. Until that code lands, the ledger runs entirely in memory and a steward restart yields an empty ledger; in-flight custodies on wardens that survive the restart have no steward-side record in the interim.
+The custody-ledger durability slice has not yet shipped. Today the ledger runs entirely in memory and a steward restart yields an empty ledger; custodies on wardens that survive the restart have no steward-side record across the gap. The subject identity slice and the durable happenings log are persisted today (see `PERSISTENCE.md` section 20); custody durability lands in the same database file under additional migrations.
 
 ### 11.2 Full State-report History
 

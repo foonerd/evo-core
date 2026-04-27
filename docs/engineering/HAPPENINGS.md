@@ -124,9 +124,10 @@ The variant set is open. Categories identified but not yet modelled (aligned wit
 
 - Subject announcement (`SubjectAnnounced`) on first registry insertion (today subscribers infer "new subject" by observing the first projection).
 - Admission events (`PluginAdmitted`, `PluginUnloaded`, `PluginFailed`).
-- Factory instance lifecycle (when factories land; see `STEWARD.md` 12.7).
-- Projection invalidations (when push-style projections land).
-- Fast-path transitions (when the fast path lands; see `STEWARD.md` 12.6 and `FAST_PATH.md`).
+- Factory instance lifecycle (factory admission is reserved; see `STEWARD.md` 12.7).
+- Projection invalidations (push-style projections are reserved; see `STEWARD.md` 12.5).
+- Fast-path transitions (the fast path is reserved; see `STEWARD.md` 12.6 and `FAST_PATH.md`).
+- Catalogue grammar survival (`SubjectGrammarOrphan`, paired with the structured re-statement verb described in `CATALOGUE.md` section 5.3).
 
 Adding a variant requires updating the enum and the relevant emission site; no other source change is required of consumers (thanks to `#[non_exhaustive]`).
 
@@ -296,9 +297,9 @@ Happenings are live-only. Four properties, all deliberate:
 For historical queries:
 
 - **Current state**: consult the ledger (custody), subject registry, relation graph, etc.
-- **Historical trail**: future observability rack, not yet present.
+- **Historical trail**: replay through the bus's `since` cursor and the `happenings_log` table covers the recent durable window (`PERSISTENCE.md` section 20). A long-horizon observability rack remains a distribution choice and is not part of the framework today.
 
-A consumer that needs "did happening X fire in the last hour" cannot answer it from the bus. That is a gap the observability rack (when it lands) is intended to fill. Bridging happenings into a durable log is the consumer's responsibility today, and is one of the straightforward plugin contributions when the architecture grows.
+A consumer that needs "did happening X fire in the last hour" can resume from a known seq through the persisted log; for horizons beyond the configured retention, bridging happenings into a downstream durable store is the consumer's responsibility, and is one of the straightforward plugin contributions when the architecture grows.
 
 ## 9. Integration Points
 
@@ -351,11 +352,11 @@ A future design decision may allow plugins to contribute to a constrained set of
 6. Late subscribers without a `since` do not receive replayed happenings; with a `since` within the durable window they do.
 7. The `Happening` enum is `#[non_exhaustive]`; adding a variant is not a source-compatibility breaking change for consumers that include a catch-all match arm.
 
-## 11. Deferred
+## 11. Roadmap
 
 ### 11.1 Additional Variants
 
-Categories identified for future work (see 3.3). The pattern is mechanically simple: add a variant, add an emission site, add tests. The design work is deciding what belongs on each variant; consumer needs drive that.
+Categories on the roadmap (see 3.3). The pattern is mechanically simple: add a variant, add an emission site, add tests. The design work is deciding what belongs on each variant; consumer needs drive that.
 
 ### 11.2 Per-rack or Per-subject Filtering
 
@@ -367,7 +368,7 @@ A warden that emits state reports at 10 Hz produces 10 happenings per second per
 
 ### 11.4 Persistence / Observability Integration
 
-Bridging happenings into the observability rack (when it lands) for durable historical replay. Design question deferred to the rack itself; the bus is happy to be a data source for such a bridge, and the bridge is a plugin like any other.
+Bridging happenings into a long-horizon observability rack for durable historical replay beyond the bus's configured retention window. The rack itself is a distribution choice; the bus is happy to be a data source for such a bridge, and the bridge is a plugin like any other.
 
 ### 11.5 Plugin-authored Happenings
 

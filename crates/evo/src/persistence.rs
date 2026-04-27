@@ -83,6 +83,29 @@ pub const SCHEMA_VERSION_HAPPENINGS: u32 = 2;
 /// for claimant tokens.
 pub const SCHEMA_VERSION_META: u32 = 3;
 
+/// Schema version: pending multi-subject conflicts.
+///
+/// Adds the `pending_conflicts` table — an operator-facing record of
+/// announcements that resolved to more than one canonical subject.
+/// One row per detected conflict; rows stay unresolved until the
+/// administration tier marks them resolved. The table backs the
+/// projection-degradation surface that names a subject as currently
+/// participating in an unresolved conflict.
+pub const SCHEMA_VERSION_PENDING_CONFLICTS: u32 = 4;
+
+/// Schema version: covering index for ordered live-subject scans.
+///
+/// Adds `idx_subjects_live_by_creation`, a partial index on
+/// `subjects(created_at_ms) WHERE forgotten_at_ms IS NULL`. The
+/// original `idx_subjects_live` (a partial index on
+/// `forgotten_at_ms`) supports liveness filtering but is degenerate
+/// for `ORDER BY created_at_ms`: every row carries the same key
+/// (NULL), so the planner sorts at query time. The new index lets
+/// `load_all_subjects_query`'s ordered scan walk the b-tree directly,
+/// removing the sort step on boot-time rehydration. No data shape
+/// change; pure perf polish.
+pub const SCHEMA_VERSION_SUBJECTS_LIVE_BY_CREATION: u32 = 5;
+
 /// Maximum schema version this build of the steward understands.
 ///
 /// On open, [`SqlitePersistenceStore`] refuses to operate on a
@@ -90,7 +113,8 @@ pub const SCHEMA_VERSION_META: u32 = 3;
 /// than this constant. Downgrades are not supported; an operator
 /// running an older steward against a newer database must restore
 /// from a pre-upgrade backup.
-pub const SUPPORTED_SCHEMA_VERSION: u32 = SCHEMA_VERSION_META;
+pub const SUPPORTED_SCHEMA_VERSION: u32 =
+    SCHEMA_VERSION_SUBJECTS_LIVE_BY_CREATION;
 
 /// Logical keys used in the `meta` table. Constants are kept in one
 /// place so a misspelling produces a compile error rather than a
@@ -114,6 +138,14 @@ const MIGRATION_002_HAPPENINGS: &str =
 
 /// SQL text of the v3 migration: steward meta kv (instance_id).
 const MIGRATION_003_META: &str = include_str!("../migrations/003_meta.sql");
+
+/// SQL text of the v4 migration: pending multi-subject conflicts.
+const MIGRATION_004_PENDING_CONFLICTS: &str =
+    include_str!("../migrations/004_pending_conflicts.sql");
+
+/// SQL text of the v5 migration: ordered live-subject covering index.
+const MIGRATION_005_SUBJECTS_LIVE_BY_CREATION: &str =
+    include_str!("../migrations/005_subjects_live_by_creation.sql");
 
 /// Errors raised by the persistence layer.
 ///
@@ -315,6 +347,39 @@ pub struct PersistedHappening {
     pub payload: serde_json::Value,
     /// Wall-clock millisecond timestamp the bus minted on emit.
     pub at_ms: u64,
+}
+
+/// One row of the `pending_conflicts` table.
+///
+/// Each row captures one detected multi-subject conflict: an
+/// announcement from `plugin` whose addressings spanned more than one
+/// existing canonical subject. Rows are appended on detection and
+/// updated in place once the operator-driven administration tier
+/// resolves the conflict (the same row's `resolved_at_ms` and
+/// `resolution_kind` columns transition from `None` / `None` to
+/// `Some(...)` / `Some(...)`); the row itself is never deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingConflict {
+    /// Auto-incrementing primary key. Stable within one database;
+    /// not portable across backups.
+    pub id: i64,
+    /// Wall-clock millisecond timestamp the conflict was detected.
+    pub detected_at_ms: u64,
+    /// Canonical name of the plugin whose announcement produced the
+    /// conflict.
+    pub plugin: String,
+    /// The announcement's addressings (the ones that spanned multiple
+    /// subjects).
+    pub addressings: Vec<ExternalAddressing>,
+    /// The distinct canonical IDs the announcement touched.
+    pub canonical_ids: Vec<String>,
+    /// Wall-clock millisecond timestamp at which the operator
+    /// resolved the conflict; `None` while the conflict is still
+    /// unresolved.
+    pub resolved_at_ms: Option<u64>,
+    /// Resolution discriminator (`"merged"`, `"split"`, `"forgotten"`,
+    /// `"manual"`); `None` while the conflict is still unresolved.
+    pub resolution_kind: Option<String>,
 }
 
 /// One provenance entry to write into `claim_log` alongside the
@@ -564,12 +629,26 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
 
     /// Record a hard-forget of `canonical_id`.
     ///
-    /// Hard-deletes the `subjects` row (cascading
-    /// `subject_addressings` via the foreign key) and appends a
-    /// `claim_log` entry of kind `subject_forgotten`.
+    /// Within one transaction:
+    /// - Hard-deletes the `subjects` row (cascading
+    ///   `subject_addressings` via the foreign key).
+    /// - Inserts a tombstone row into `aliases` with `kind =
+    ///   'tombstone'`, `old_id = canonical_id`, `new_id = ''`
+    ///   (sentinel: no successor), `admin_plugin =
+    ///   forget_claimant`, and `reason = forget_reason`. The
+    ///   tombstone closes the alias chain so describe-alias on a
+    ///   forgotten ID returns a structured "no successor" record
+    ///   rather than a bare not-found.
+    /// - Appends a `claim_log` entry of kind `subject_forgotten`.
+    ///
+    /// The in-memory backend mirrors this behaviour so tests
+    /// agnostic to the concrete store see the same alias chain
+    /// shape on either backend.
     fn record_subject_forget<'a>(
         &'a self,
         canonical_id: &'a str,
+        forget_claimant: &'a str,
+        forget_reason: Option<&'a str>,
         at_ms: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
 
@@ -591,6 +670,23 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
     fn load_aliases_for<'a>(
         &'a self,
         canonical_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<PersistedAlias>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Load every alias row in the store, ordered by `alias_id`
+    /// ascending.
+    ///
+    /// Used by the boot-time rehydration path to repopulate the
+    /// in-memory alias map without per-id round trips. Cheap by
+    /// design (alias rows are small and per-merge/split/forget
+    /// only); intended to run once at startup.
+    fn load_all_aliases<'a>(
+        &'a self,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<Vec<PersistedAlias>, PersistenceError>>
@@ -640,6 +736,41 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>;
 
+    /// Return the smallest `seq` currently in `happenings_log`, or
+    /// `0` if the table is empty. Drives the structured
+    /// `replay_window_exceeded` response: when a consumer's `since`
+    /// is older than this value, the durable window has rotated
+    /// past their cursor and they MUST fall back to the snapshot-
+    /// style list ops to rebuild a complete picture.
+    fn load_oldest_happening_seq<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>;
+
+    /// Trim `happenings_log` according to a window/capacity policy
+    /// applied as a single transaction; returns the number of rows
+    /// removed.
+    ///
+    /// The policy keeps any row that satisfies BOTH of the following:
+    ///
+    /// - `at_ms >= now - retention_window_secs * 1000` (inside the
+    ///   wall-clock retention window), AND
+    /// - `seq > MAX(seq) - retention_capacity` (inside the most-
+    ///   recent `retention_capacity` rows by seq).
+    ///
+    /// A row failing either condition is removed. The condition is
+    /// the conjunction of the two read-side gates the bus already
+    /// honours for replay; the janitor enforces the same shape
+    /// write-side so the table does not grow unbounded.
+    ///
+    /// Implementations are expected to bound the operation by
+    /// transaction so a partial trim never exposes a torn window. The
+    /// in-memory store is a no-op (returns 0).
+    fn trim_happenings_log<'a>(
+        &'a self,
+        retention_window_secs: u64,
+        retention_capacity: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>;
+
     /// Return the steward instance ID (UUIDv4) minted at first
     /// migration and persisted in the `meta` table (migration 003).
     ///
@@ -656,7 +787,97 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
     ) -> Pin<
         Box<dyn Future<Output = Result<String, PersistenceError>> + Send + 'a>,
     >;
+
+    /// Append a new row to `pending_conflicts` describing a detected
+    /// multi-subject conflict. Returns the row's auto-incremented `id`
+    /// so the wiring layer can include it in the structured
+    /// projection-degradation surface.
+    ///
+    /// The `addressings` and `canonical_ids` payloads are stored as
+    /// JSON arrays so consumers reading the row see the same shape
+    /// the in-memory happening variant carries at the same moment.
+    fn record_pending_conflict<'a>(
+        &'a self,
+        plugin: &'a str,
+        addressings: &'a [ExternalAddressing],
+        canonical_ids: &'a [String],
+        at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<i64, PersistenceError>> + Send + 'a>>;
+
+    /// Mark the row in `pending_conflicts` whose primary key is `id`
+    /// as resolved. The `resolution_kind` discriminator names how the
+    /// conflict was resolved (open-coded; see the migration body for
+    /// the current vocabulary). `at_ms` is the wall-clock instant the
+    /// resolution was observed.
+    ///
+    /// Marking a row that does not exist or is already resolved is a
+    /// silent no-op; callers that need to distinguish must consult
+    /// [`Self::list_pending_conflicts`] before issuing the update.
+    fn mark_conflict_resolved<'a>(
+        &'a self,
+        id: i64,
+        resolution_kind: &'a str,
+        at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Return every `pending_conflicts` row whose `resolved_at_ms` is
+    /// `NULL`, in `detected_at_ms` ascending order so operator
+    /// dashboards see the oldest unresolved conflict first. Resolved
+    /// rows are excluded.
+    fn list_pending_conflicts<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<PendingConflict>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Group every persisted subject by its declared `subject_type`
+    /// and return `(subject_type, count)` pairs in `subject_type`
+    /// ascending order.
+    ///
+    /// Used at boot for the catalogue-orphan diagnostic: a type that
+    /// appears here but not in the loaded catalogue's declared types
+    /// is an orphan — a subject persisted under a vocabulary entry
+    /// the current catalogue no longer admits. The diagnostic emits
+    /// an operator-visible warning per orphaned type with the row
+    /// count so the operator can scope a deliberate migration.
+    /// Cheap by design (the `subjects` table has an index on
+    /// `subject_type`); intended to run at every steward boot.
+    fn count_subjects_by_type<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<SubjectTypeCount>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Run a `PRAGMA wal_checkpoint(TRUNCATE)` (or backend
+    /// equivalent) so the write-ahead log is flushed into the
+    /// main database file and truncated to zero. Called by the
+    /// steward on clean shutdown so an operator backing up the
+    /// database file alone (without the `-wal`/`-shm` siblings)
+    /// captures every committed row.
+    ///
+    /// In-memory backends accept the call as a no-op so the
+    /// shutdown path does not branch on the concrete backend
+    /// type.
+    fn checkpoint_wal<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
 }
+
+/// One row of the boot-time subject-type aggregation: a declared
+/// `subject_type` plus the live row count under it. Returned in
+/// `subject_type` ascending order from
+/// [`PersistenceStore::count_subjects_by_type`] so consumers can
+/// diff a sorted slice against the catalogue's declared set
+/// without re-sorting.
+pub type SubjectTypeCount = (String, u64);
 
 /// Claim-log kind values used by this slice. Strings are stable
 /// on disk and must not be renamed without a migration.
@@ -754,6 +975,22 @@ fn run_migrations(conn: &mut Connection) -> Result<(), PersistenceError> {
                 source: e,
             }
         })?;
+    }
+
+    if current < SCHEMA_VERSION_PENDING_CONFLICTS {
+        conn.execute_batch(MIGRATION_004_PENDING_CONFLICTS)
+            .map_err(|e| PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_PENDING_CONFLICTS,
+                source: e,
+            })?;
+    }
+
+    if current < SCHEMA_VERSION_SUBJECTS_LIVE_BY_CREATION {
+        conn.execute_batch(MIGRATION_005_SUBJECTS_LIVE_BY_CREATION)
+            .map_err(|e| PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_SUBJECTS_LIVE_BY_CREATION,
+                source: e,
+            })?;
     }
 
     Ok(())
@@ -1265,6 +1502,8 @@ fn split_tx(
 fn forget_tx(
     conn: &mut Connection,
     canonical_id: &str,
+    forget_claimant: &str,
+    forget_reason: Option<&str>,
     at_ms: u64,
 ) -> Result<(), PersistenceError> {
     let tx = conn
@@ -1274,17 +1513,34 @@ fn forget_tx(
     tx.execute("DELETE FROM subjects WHERE id = ?1", params![canonical_id])
         .map_err(|e| PersistenceError::sqlite("delete subject row", e))?;
 
+    // Tombstone alias row. Mirrors the in-memory registry's
+    // tombstone insertion (subjects.rs `aliases_try_insert` on the
+    // retract / forced-retract paths) so consumers walking the
+    // alias chain see a structured "no successor" record rather
+    // than a bare absence. `new_id = ''` is the sentinel for
+    // "tombstone with no successor"; the schema stores it as a
+    // plain string column.
+    tx.execute(
+        "INSERT INTO aliases \
+         (old_id, new_id, kind, recorded_at_ms, admin_plugin, reason) \
+         VALUES (?1, '', 'tombstone', ?2, ?3, ?4)",
+        params![canonical_id, at_ms as i64, forget_claimant, forget_reason],
+    )
+    .map_err(|e| PersistenceError::sqlite("insert tombstone alias", e))?;
+
     let payload = serde_json::json!({
         "canonical_id": canonical_id,
     })
     .to_string();
     tx.execute(
         "INSERT INTO claim_log (kind, claimant, asserted_at_ms, payload, reason) \
-         VALUES (?1, '', ?2, ?3, NULL)",
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             claim_kind::SUBJECT_FORGOTTEN,
+            forget_claimant,
             at_ms as i64,
-            payload
+            payload,
+            forget_reason
         ],
     )
     .map_err(|e| {
@@ -1441,32 +1697,7 @@ fn load_aliases_for_query(
         .map_err(|e| PersistenceError::sqlite("prepare aliases query", e))?;
 
     let rows = stmt
-        .query_map(params![canonical_id], |row| {
-            let kind_str: String = row.get(3)?;
-            let kind = match kind_str.as_str() {
-                "merged" => AliasKind::Merged,
-                "split" => AliasKind::Split,
-                other => {
-                    return Err(rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("unknown alias kind: {other}"),
-                        )),
-                    ));
-                }
-            };
-            Ok(PersistedAlias {
-                alias_id: row.get(0)?,
-                old_id: row.get(1)?,
-                new_id: row.get(2)?,
-                kind,
-                recorded_at_ms: row.get::<_, i64>(4)? as u64,
-                admin_plugin: row.get(5)?,
-                reason: row.get(6)?,
-            })
-        })
+        .query_map(params![canonical_id], read_alias_row)
         .map_err(|e| PersistenceError::sqlite("execute aliases query", e))?;
 
     let mut out = Vec::new();
@@ -1474,6 +1705,59 @@ fn load_aliases_for_query(
         out.push(r.map_err(|e| PersistenceError::sqlite("read alias row", e))?);
     }
     Ok(out)
+}
+
+fn load_all_aliases_query(
+    conn: &Connection,
+) -> Result<Vec<PersistedAlias>, PersistenceError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT alias_id, old_id, new_id, kind, recorded_at_ms, \
+             admin_plugin, reason FROM aliases ORDER BY alias_id ASC",
+        )
+        .map_err(|e| {
+            PersistenceError::sqlite("prepare aliases full-scan query", e)
+        })?;
+
+    let rows = stmt.query_map([], read_alias_row).map_err(|e| {
+        PersistenceError::sqlite("execute aliases full-scan query", e)
+    })?;
+
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| PersistenceError::sqlite("read alias row", e))?);
+    }
+    Ok(out)
+}
+
+fn read_alias_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<PersistedAlias, rusqlite::Error> {
+    let kind_str: String = row.get(3)?;
+    let kind = match kind_str.as_str() {
+        "merged" => AliasKind::Merged,
+        "split" => AliasKind::Split,
+        "tombstone" => AliasKind::Tombstone,
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown alias kind: {other}"),
+                )),
+            ));
+        }
+    };
+    Ok(PersistedAlias {
+        alias_id: row.get(0)?,
+        old_id: row.get(1)?,
+        new_id: row.get(2)?,
+        kind,
+        recorded_at_ms: row.get::<_, i64>(4)? as u64,
+        admin_plugin: row.get(5)?,
+        reason: row.get(6)?,
+    })
 }
 
 impl PersistenceStore for SqlitePersistenceStore {
@@ -1590,13 +1874,17 @@ impl PersistenceStore for SqlitePersistenceStore {
     fn record_subject_forget<'a>(
         &'a self,
         canonical_id: &'a str,
+        forget_claimant: &'a str,
+        forget_reason: Option<&'a str>,
         at_ms: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
     {
         let cid = canonical_id.to_string();
+        let claimant = forget_claimant.to_string();
+        let reason = forget_reason.map(|s| s.to_string());
         Box::pin(async move {
             self.interact("subject_forget", move |conn| {
-                forget_tx(conn, &cid, at_ms)
+                forget_tx(conn, &cid, &claimant, reason.as_deref(), at_ms)
             })
             .await
         })
@@ -1638,6 +1926,23 @@ impl PersistenceStore for SqlitePersistenceStore {
         })
     }
 
+    fn load_all_aliases<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<PersistedAlias>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("load_all_aliases", |conn| {
+                load_all_aliases_query(conn)
+            })
+            .await
+        })
+    }
+
     fn record_happening<'a>(
         &'a self,
         seq: u64,
@@ -1650,13 +1955,28 @@ impl PersistenceStore for SqlitePersistenceStore {
         let payload_str = payload.to_string();
         Box::pin(async move {
             self.interact("record_happening", move |conn| {
-                conn.execute(
+                // Wrap the single-row INSERT in an explicit
+                // transaction so the discipline matches the
+                // cross-table operations on this store and the fsync
+                // boundary is named, not implicit. Under
+                // `synchronous = FULL` the transaction commits a
+                // single fsync just as the bare INSERT did, so this
+                // adds no per-call cost; the explicit boundary makes
+                // a future "batch happenings" extension a one-line
+                // change instead of a refactor.
+                let tx = conn.transaction().map_err(|e| {
+                    PersistenceError::sqlite("begin happenings_log tx", e)
+                })?;
+                tx.execute(
                     "INSERT INTO happenings_log (seq, kind, payload, at_ms) \
                      VALUES (?1, ?2, ?3, ?4)",
                     params![seq as i64, kind, payload_str, at_ms as i64],
                 )
                 .map_err(|e| {
                     PersistenceError::sqlite("insert happenings_log", e)
+                })?;
+                tx.commit().map_err(|e| {
+                    PersistenceError::sqlite("commit happenings_log tx", e)
                 })?;
                 Ok(())
             })
@@ -1708,6 +2028,77 @@ impl PersistenceStore for SqlitePersistenceStore {
         })
     }
 
+    fn load_oldest_happening_seq<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.interact("load_oldest_happening_seq", |conn| {
+                let min: Option<i64> = conn
+                    .query_row(
+                        "SELECT MIN(seq) FROM happenings_log",
+                        [],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "select MIN(seq) from happenings_log",
+                            e,
+                        )
+                    })?;
+                Ok(min.unwrap_or(0).max(0) as u64)
+            })
+            .await
+        })
+    }
+
+    fn trim_happenings_log<'a>(
+        &'a self,
+        retention_window_secs: u64,
+        retention_capacity: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.interact("trim_happenings_log", move |conn| {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let window_ms =
+                    retention_window_secs.saturating_mul(1000) as i64;
+                let cutoff_ms = now_ms.saturating_sub(window_ms);
+                let cap = retention_capacity as i64;
+
+                let tx = conn.transaction().map_err(|e| {
+                    PersistenceError::sqlite("begin trim_happenings_log tx", e)
+                })?;
+                // Keep rows that are inside BOTH the wall-clock window
+                // AND the capacity tail. Delete the rest. Using a
+                // single statement so the trim is atomic against any
+                // concurrent reader.
+                let removed = tx
+                    .execute(
+                        "DELETE FROM happenings_log \
+                         WHERE at_ms < ?1 \
+                            OR seq <= COALESCE((SELECT MAX(seq) \
+                                                FROM happenings_log), 0) - ?2",
+                        params![cutoff_ms, cap],
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "delete from happenings_log",
+                            e,
+                        )
+                    })?;
+                tx.commit().map_err(|e| {
+                    PersistenceError::sqlite("commit trim_happenings_log tx", e)
+                })?;
+                Ok(removed as u64)
+            })
+            .await
+        })
+    }
+
     fn load_instance_id<'a>(
         &'a self,
     ) -> Pin<
@@ -1735,6 +2126,233 @@ impl PersistenceStore for SqlitePersistenceStore {
                             .to_string(),
                     )
                 })
+            })
+            .await
+        })
+    }
+
+    fn record_pending_conflict<'a>(
+        &'a self,
+        plugin: &'a str,
+        addressings: &'a [ExternalAddressing],
+        canonical_ids: &'a [String],
+        at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<i64, PersistenceError>> + Send + 'a>>
+    {
+        let plugin = plugin.to_string();
+        let addressings_json =
+            serde_json::to_string(addressings).unwrap_or_else(|_| "[]".into());
+        let canonical_ids_json = serde_json::to_string(canonical_ids)
+            .unwrap_or_else(|_| "[]".into());
+        Box::pin(async move {
+            self.interact("record_pending_conflict", move |conn| {
+                conn.execute(
+                    "INSERT INTO pending_conflicts \
+                     (detected_at_ms, plugin, addressings_json, \
+                      canonical_ids_json, resolved_at_ms, resolution_kind) \
+                     VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
+                    params![
+                        at_ms as i64,
+                        plugin,
+                        addressings_json,
+                        canonical_ids_json
+                    ],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("insert pending_conflicts", e)
+                })?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await
+        })
+    }
+
+    fn mark_conflict_resolved<'a>(
+        &'a self,
+        id: i64,
+        resolution_kind: &'a str,
+        at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let kind = resolution_kind.to_string();
+        Box::pin(async move {
+            self.interact("mark_conflict_resolved", move |conn| {
+                conn.execute(
+                    "UPDATE pending_conflicts SET resolved_at_ms = ?2, \
+                     resolution_kind = ?3 WHERE id = ?1 \
+                     AND resolved_at_ms IS NULL",
+                    params![id, at_ms as i64, kind],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("update pending_conflicts", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn list_pending_conflicts<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<PendingConflict>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("list_pending_conflicts", |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, detected_at_ms, plugin, addressings_json, \
+                         canonical_ids_json, resolved_at_ms, resolution_kind \
+                         FROM pending_conflicts WHERE resolved_at_ms IS NULL \
+                         ORDER BY detected_at_ms ASC",
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "prepare pending_conflicts query",
+                            e,
+                        )
+                    })?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let addressings_json: String = row.get(3)?;
+                        let canonical_ids_json: String = row.get(4)?;
+                        let addressings: Vec<ExternalAddressing> =
+                            serde_json::from_str(&addressings_json).map_err(
+                                |e| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        3,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            format!(
+                                                "addressings_json not JSON: {e}"
+                                            ),
+                                        )),
+                                    )
+                                },
+                            )?;
+                        let canonical_ids: Vec<String> = serde_json::from_str(
+                            &canonical_ids_json,
+                        )
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("canonical_ids_json not JSON: {e}"),
+                                )),
+                            )
+                        })?;
+                        Ok(PendingConflict {
+                            id: row.get(0)?,
+                            detected_at_ms: row.get::<_, i64>(1)? as u64,
+                            plugin: row.get(2)?,
+                            addressings,
+                            canonical_ids,
+                            resolved_at_ms: row
+                                .get::<_, Option<i64>>(5)?
+                                .map(|v| v as u64),
+                            resolution_kind: row.get(6)?,
+                        })
+                    })
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "execute pending_conflicts query",
+                            e,
+                        )
+                    })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r.map_err(|e| {
+                        PersistenceError::sqlite(
+                            "read pending_conflicts row",
+                            e,
+                        )
+                    })?);
+                }
+                Ok(out)
+            })
+            .await
+        })
+    }
+
+    fn count_subjects_by_type<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<SubjectTypeCount>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("count_subjects_by_type", |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT subject_type, COUNT(*) FROM subjects \
+                         WHERE forgotten_at_ms IS NULL \
+                         GROUP BY subject_type ORDER BY subject_type ASC",
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "prepare subject_type aggregation",
+                            e,
+                        )
+                    })?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)? as u64,
+                        ))
+                    })
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "execute subject_type aggregation",
+                            e,
+                        )
+                    })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r.map_err(|e| {
+                        PersistenceError::sqlite(
+                            "read subject_type aggregation row",
+                            e,
+                        )
+                    })?);
+                }
+                Ok(out)
+            })
+            .await
+        })
+    }
+
+    fn checkpoint_wal<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.interact("checkpoint_wal", |conn| {
+                // PRAGMA wal_checkpoint(TRUNCATE) returns a row of
+                // (busy, log, checkpointed). query_row consumes the
+                // row; we discard the values because the steward
+                // only treats SQL-level errors as failure signals.
+                let (_busy, _log, _ckpt): (i64, i64, i64) = conn
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "PRAGMA wal_checkpoint(TRUNCATE)",
+                            e,
+                        )
+                    })?;
+                Ok(())
             })
             .await
         })
@@ -1782,6 +2400,11 @@ struct MemoryState {
     /// Append-only mirror of `happenings_log`. Tests query this
     /// via [`PersistenceStore::load_happenings_since`].
     happenings: Vec<PersistedHappening>,
+    /// Mirror of the `pending_conflicts` table. Updated in place
+    /// when a row's resolution columns transition from NULL to a
+    /// concrete value.
+    pending_conflicts: Vec<PendingConflict>,
+    next_conflict_id: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -2056,15 +2679,33 @@ impl PersistenceStore for MemoryPersistenceStore {
     fn record_subject_forget<'a>(
         &'a self,
         canonical_id: &'a str,
+        forget_claimant: &'a str,
+        forget_reason: Option<&'a str>,
         at_ms: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
     {
+        let claimant = forget_claimant.to_string();
+        let reason = forget_reason.map(|s| s.to_string());
         Box::pin(async move {
             let mut g = self.inner.lock().await;
             g.subjects.remove(canonical_id);
+            // Tombstone alias mirrors the SQLite backend's
+            // forget_tx behaviour: chain walkers see a structured
+            // "forgotten, no successor" record.
+            g.next_alias_id += 1;
+            let id = g.next_alias_id;
+            g.aliases.push(PersistedAlias {
+                alias_id: id,
+                old_id: canonical_id.to_string(),
+                new_id: String::new(),
+                kind: AliasKind::Tombstone,
+                recorded_at_ms: at_ms,
+                admin_plugin: claimant.clone(),
+                reason: reason.clone(),
+            });
             g.claim_log.push(MemoryClaimEntry {
                 kind: claim_kind::SUBJECT_FORGOTTEN,
-                claimant: String::new(),
+                claimant,
                 at_ms,
             });
             Ok(())
@@ -2117,6 +2758,23 @@ impl PersistenceStore for MemoryPersistenceStore {
                 .filter(|a| a.old_id == canonical_id)
                 .cloned()
                 .collect();
+            out.sort_by_key(|a| a.alias_id);
+            Ok(out)
+        })
+    }
+
+    fn load_all_aliases<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<PersistedAlias>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            let mut out: Vec<PersistedAlias> = g.aliases.clone();
             out.sort_by_key(|a| a.alias_id);
             Ok(out)
         })
@@ -2178,12 +2836,139 @@ impl PersistenceStore for MemoryPersistenceStore {
         })
     }
 
+    fn load_oldest_happening_seq<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            Ok(g.happenings.iter().map(|h| h.seq).min().unwrap_or(0))
+        })
+    }
+
+    fn trim_happenings_log<'a>(
+        &'a self,
+        _retention_window_secs: u64,
+        _retention_capacity: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>
+    {
+        // In-memory store is a no-op: tests that exercise the
+        // janitor's trimming behaviour use the SQLite-backed store
+        // where the read-side gates are also enforced.
+        Box::pin(async move { Ok(0) })
+    }
+
     fn load_instance_id<'a>(
         &'a self,
     ) -> Pin<
         Box<dyn Future<Output = Result<String, PersistenceError>> + Send + 'a>,
     > {
         Box::pin(async move { Ok(self.instance_id.clone()) })
+    }
+
+    fn record_pending_conflict<'a>(
+        &'a self,
+        plugin: &'a str,
+        addressings: &'a [ExternalAddressing],
+        canonical_ids: &'a [String],
+        at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<i64, PersistenceError>> + Send + 'a>>
+    {
+        let plugin = plugin.to_string();
+        let addressings = addressings.to_vec();
+        let canonical_ids = canonical_ids.to_vec();
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            g.next_conflict_id += 1;
+            let id = g.next_conflict_id;
+            g.pending_conflicts.push(PendingConflict {
+                id,
+                detected_at_ms: at_ms,
+                plugin,
+                addressings,
+                canonical_ids,
+                resolved_at_ms: None,
+                resolution_kind: None,
+            });
+            Ok(id)
+        })
+    }
+
+    fn mark_conflict_resolved<'a>(
+        &'a self,
+        id: i64,
+        resolution_kind: &'a str,
+        at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let kind = resolution_kind.to_string();
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            if let Some(slot) =
+                g.pending_conflicts.iter_mut().find(|c| c.id == id)
+            {
+                if slot.resolved_at_ms.is_none() {
+                    slot.resolved_at_ms = Some(at_ms);
+                    slot.resolution_kind = Some(kind);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn list_pending_conflicts<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<PendingConflict>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            let mut out: Vec<PendingConflict> = g
+                .pending_conflicts
+                .iter()
+                .filter(|c| c.resolved_at_ms.is_none())
+                .cloned()
+                .collect();
+            out.sort_by_key(|c| c.detected_at_ms);
+            Ok(out)
+        })
+    }
+
+    fn count_subjects_by_type<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<SubjectTypeCount>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            let mut counts: HashMap<String, u64> = HashMap::new();
+            for s in g.subjects.values() {
+                if s.forgotten_at_ms.is_none() {
+                    *counts.entry(s.subject_type.clone()).or_insert(0) += 1;
+                }
+            }
+            let mut out: Vec<(String, u64)> = counts.into_iter().collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(out)
+        })
+    }
+
+    fn checkpoint_wal<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        // The in-memory backend has no WAL; the call is a no-op so
+        // the shutdown path does not branch on the concrete backend
+        // type.
+        Box::pin(async move { Ok(()) })
     }
 }
 
@@ -2204,6 +2989,54 @@ mod tests {
     }
 
     // --- in-memory backend -------------------------------------------------
+
+    #[tokio::test]
+    async fn memory_count_subjects_by_type_groups_and_sorts() {
+        // Boot-time orphan diagnostic helper: persistence groups
+        // every live subject by `subject_type` and the boot path
+        // diffs the result against the loaded catalogue's declared
+        // types. The accessor sorts ascending so warnings emit in a
+        // stable order; forgotten subjects are excluded so historical
+        // types whose subjects all retracted no longer surface.
+        let s = MemoryPersistenceStore::new();
+        for (id, ty) in [
+            ("uuid-1", "track"),
+            ("uuid-2", "track"),
+            ("uuid-3", "track"),
+            ("uuid-4", "album"),
+            ("uuid-5", "album"),
+            ("uuid-6", "podcast_episode"),
+        ] {
+            s.record_subject_announce(AnnounceRecord {
+                canonical_id: id,
+                subject_type: ty,
+                addressings: &[ext("test", id)],
+                claimant: "p1",
+                claims: &[],
+                at_ms: 1000,
+            })
+            .await
+            .unwrap();
+        }
+
+        // Forget one of the tracks so its row no longer counts
+        // toward the live grouping.
+        s.record_subject_forget("uuid-3", "p1", None, 1100)
+            .await
+            .unwrap();
+
+        let counts = s.count_subjects_by_type().await.unwrap();
+        assert_eq!(
+            counts,
+            vec![
+                ("album".to_string(), 2),
+                ("podcast_episode".to_string(), 1),
+                ("track".to_string(), 2),
+            ],
+            "live counts must group by type, exclude forgotten, and \
+             sort ascending; got: {counts:?}"
+        );
+    }
 
     #[tokio::test]
     async fn memory_announce_then_load_returns_subject() {
@@ -2309,7 +3142,9 @@ mod tests {
         })
         .await
         .unwrap();
-        s.record_subject_forget("uuid-a", 1500).await.unwrap();
+        s.record_subject_forget("uuid-a", "p1", None, 1500)
+            .await
+            .unwrap();
         let all = s.load_all_subjects().await.unwrap();
         assert!(all.is_empty());
     }
@@ -2532,7 +3367,10 @@ mod tests {
             })
             .await
             .unwrap();
-        store.record_subject_forget("uuid-a", 20).await.unwrap();
+        store
+            .record_subject_forget("uuid-a", "p1", None, 20)
+            .await
+            .unwrap();
         let all = store.load_all_subjects().await.unwrap();
         assert!(all.is_empty());
         // Side-channel verify: the addressing row was cascaded.
@@ -2543,6 +3381,66 @@ mod tests {
             })
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_forget_inserts_tombstone_alias_row() {
+        // forget_tx must insert a tombstone row into `aliases` in
+        // the same transaction as the subject delete. A consumer
+        // walking the alias chain on the forgotten ID sees a
+        // structured "no successor" record rather than a bare
+        // absence; the in-memory backend mirrors this so tests
+        // agnostic to the concrete store see the same shape.
+        let (_dir, store) = open_temp();
+        store
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: "uuid-a",
+                subject_type: "track",
+                addressings: &[ext("a", "1")],
+                claimant: "p1",
+                claims: &[],
+                at_ms: 10,
+            })
+            .await
+            .unwrap();
+        store
+            .record_subject_forget("uuid-a", "p1", Some("operator cleanup"), 20)
+            .await
+            .unwrap();
+        let aliases = store.load_aliases_for("uuid-a").await.unwrap();
+        assert_eq!(aliases.len(), 1, "exactly one tombstone alias row");
+        let a = &aliases[0];
+        assert_eq!(a.kind, AliasKind::Tombstone);
+        assert_eq!(a.old_id, "uuid-a");
+        assert_eq!(a.new_id, "");
+        assert_eq!(a.admin_plugin, "p1");
+        assert_eq!(a.reason.as_deref(), Some("operator cleanup"));
+    }
+
+    #[tokio::test]
+    async fn memory_forget_inserts_tombstone_alias_row() {
+        let s = MemoryPersistenceStore::new();
+        s.record_subject_announce(AnnounceRecord {
+            canonical_id: "uuid-z",
+            subject_type: "album",
+            addressings: &[ext("a", "z")],
+            claimant: "p2",
+            claims: &[],
+            at_ms: 1,
+        })
+        .await
+        .unwrap();
+        s.record_subject_forget("uuid-z", "p2", Some("admin sweep"), 5)
+            .await
+            .unwrap();
+        let aliases = s.load_aliases_for("uuid-z").await.unwrap();
+        assert_eq!(aliases.len(), 1);
+        let a = &aliases[0];
+        assert_eq!(a.kind, AliasKind::Tombstone);
+        assert_eq!(a.old_id, "uuid-z");
+        assert!(a.new_id.is_empty());
+        assert_eq!(a.admin_plugin, "p2");
+        assert_eq!(a.reason.as_deref(), Some("admin sweep"));
     }
 
     #[tokio::test]
@@ -3148,5 +4046,31 @@ mod tests {
         }
         let max = store.load_max_happening_seq().await.unwrap();
         assert_eq!(max, 9);
+    }
+
+    #[tokio::test]
+    async fn memory_checkpoint_wal_is_noop() {
+        // The in-memory backend has no WAL; the trait method must
+        // exist and return Ok so the steward shutdown path can call
+        // it without branching on the concrete backend.
+        let s = MemoryPersistenceStore::new();
+        s.checkpoint_wal().await.expect("memory checkpoint must Ok");
+    }
+
+    #[tokio::test]
+    async fn sqlite_checkpoint_wal_succeeds_on_open_database() {
+        // PRAGMA wal_checkpoint(TRUNCATE) returns Ok on a fresh
+        // database with WAL mode enabled (the pragma is applied at
+        // every connection acquisition by INIT_PRAGMAS).
+        let (_dir, store) = open_temp();
+        // Force at least one row so the WAL has content to flush.
+        store
+            .record_happening(1, "subject_forgotten", &happening_payload(1), 10)
+            .await
+            .unwrap();
+        store
+            .checkpoint_wal()
+            .await
+            .expect("WAL checkpoint must Ok");
     }
 }

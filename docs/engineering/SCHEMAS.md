@@ -107,7 +107,7 @@ instance_ttl_seconds = <u32>             # required for factories; 0 = no TTL
 | Field | Type | Required | Default | Constraint |
 |-------|------|----------|---------|------------|
 | `shelf` | string | yes | - | Must be a declared shelf in the steward's catalogue. |
-| `shape` | u32 | yes | - | Must **equal** the `shape` of the targeted catalogue shelf. Future range support is not yet in the schema; the slot is a single integer today. |
+| `shape` | u32 | yes | - | Must **equal** the `shape` of the targeted catalogue shelf. Range support is not part of the schema today; the slot is a single integer. |
 
 **[kind]**
 
@@ -246,9 +246,39 @@ response_budget_ms = 5000
 
 A distribution declares its fabric in a catalogue file. The steward reads it at startup and refuses to start if it is malformed.
 
+#### 3.2.0 Schema Versioning
+
+Every catalogue document carries a top-level `schema_version` integer. The field is required at parse time; a document without it is rejected with a structured error pointing at the offending path. The integer indexes a versioned grammar so distributions know which catalogue grammar they author against, and the steward declares the supported range via two compile-time constants:
+
+| Constant               | Current value |
+|------------------------|---------------|
+| `CATALOGUE_SCHEMA_MIN` | `1`           |
+| `CATALOGUE_SCHEMA_MAX` | `1`           |
+
+A document declaring `schema_version = N` is admissible iff `MIN <= N <= MAX`. Out-of-range is a hard startup failure rather than a partial bring-up because the catalogue is essence: a distribution authored against the wrong grammar produces silent feature loss the operator cannot diagnose.
+
+Schema bumps are integer-valued; semver does not apply. A breaking grammar change (removed field, newly-required field, type narrowed, semantic shift) requires incrementing `CATALOGUE_SCHEMA_MAX`. Additive grammar changes (new optional field, new optional section) stay within the current schema version because parsers tolerate unknown fields. Migration is forward-only — the steward never silently rewrites an operator-edited catalogue. Distributions update the field deliberately when adopting a new shape.
+
+Per-shelf `shape: u32` (`#[[racks.shelves]] shape = N`, see §3.2.2) is preserved unchanged: that field versions a shelf's plugin contract; `schema_version` versions the catalogue document. They evolve independently.
+
+The `evo-plugin-tool catalogue lint <path>` tool parses and validates a catalogue and surfaces any violation as a non-zero exit. The optional `--schema-version N` flag additionally pins the document's `schema_version` to N exactly, useful at distribution-author time to catch a fixture-update slip-through.
+
+##### Schema version 1
+
+The shape documented in §3.2.1 (and refined in §3.2.2/§3.2.3) is schema version 1. It comprises:
+
+- `schema_version: u32` (required, must equal 1 for documents authored against this version).
+- `[[racks]]` array (optional; defaults to empty).
+- `[[subjects]]` array (optional; defaults to empty).
+- `[[relation]]` array (optional; defaults to empty).
+
+Every other field is per-table as defined below. Additional schema versions are documented as further `##### Schema version N` subsections, with migration guidance from version N-1.
+
 #### 3.2.1 Full Shape
 
 ```toml
+schema_version = 1                # required; must lie in [CATALOGUE_SCHEMA_MIN, CATALOGUE_SCHEMA_MAX]
+
 [[racks]]
 name = "<lowercase>"              # required; no dots
 family = "<domain|coordination|infrastructure>"    # required
@@ -327,11 +357,10 @@ Enforced by `Catalogue::validate`:
 8. No predicate name is empty or contains `.`.
 9. If `source_type` or `target_type` is an array, it is non-empty.
 
-Not enforced today but expected to land:
+Roadmap items not enforced today:
 
-- Inverse consistency: if `p.inverse = q`, then `q.inverse = p` and their source/target types are swapped.
+- Inverse consistency: if `p.inverse = q`, then `q.inverse = p` and their source/target types are swapped. (Note: subject-type cross-references and inverse symmetry are validated at catalogue load today; the residual gap here is shelf-shape registry coupling described next.)
 - Shelf shape must match some registered shape schema.
-- Subject-type declarations (the types referenced in `source_type` / `target_type` are not yet validated against any declared subject-type registry).
 
 #### 3.2.4 Example
 
@@ -440,6 +469,10 @@ enable = <bool>                    # default false; when false, uid/gid tables i
 # standard = 2011
 [plugins.security.gid]            # optional; if a class is missing, gid = uid for that class
 # sandbox = 2015
+
+[happenings]
+retention_capacity = <usize>      # optional; default 1024
+retention_window_secs = <u64>     # optional; default 1800 (30 minutes)
 ```
 
 #### 3.3.2 Field Reference
@@ -472,6 +505,13 @@ enable = <bool>                    # default false; when false, uid/gid tables i
 | `security.enable` | bool | no | `false` | When `true` (Unix), out-of-process spawns with a `security.uid` entry for the *effective* trust class use that UID; optional per-class GID in `security.gid`, defaulting the GID to the UID. |
 | `security.uid` | table | no | (empty) | Map trust class (string key, same names as the manifest) → UID. Unmapped classes: child runs as the steward. |
 | `security.gid` | table | no | (empty) | Optional per-class GID; if absent for a class, that class’s GID = its UID. |
+
+**[happenings]**
+
+| Field                   | Type  | Required | Default | Constraint                                                                                                                                                                        |
+|-------------------------|-------|----------|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `retention_capacity`    | usize | no       | `1024`  | In-memory broadcast ring capacity, in events. Caps how many unconsumed live happenings the bus buffers per subscriber before a slow consumer receives a structured lagged signal. |
+| `retention_window_secs` | u64   | no       | `1800`  | Minimum durable retention window the steward guarantees for cursor replay. Cursors older than the oldest retained event get a structured `replay_window_exceeded` response.       |
 
 #### 3.3.3 File Location and Override Precedence
 
@@ -551,6 +591,9 @@ Every request carries an `op` discriminator.
 | `"project_subject"` | Sync request/response | No |
 | `"describe_alias"` | Sync request/response | No |
 | `"list_active_custodies"` | Sync request/response | No |
+| `"list_subjects"` | Sync request/response (paginated) | No |
+| `"list_relations"` | Sync request/response (paginated) | No |
+| `"enumerate_addressings"` | Sync request/response (paginated) | No |
 | `"subscribe_happenings"` | Streaming (ack + stream) | Yes |
 
 **`op = "request"`**:
@@ -593,8 +636,8 @@ Every request carries an `op` discriminator.
 | `scope` | object | no | - | Omit for no relation traversal. |
 | `scope.relation_predicates` | array\<string\> | no | `[]` | Predicates to traverse. |
 | `scope.direction` | string | no | `"forward"` | `forward`, `inverse`, or `both`. |
-| `scope.max_depth` | u32 | no | `1` | Traversal depth limit. |
-| `scope.max_visits` | u32 | no | `1000` | Total visit cap across the walk. |
+| `scope.max_depth` | u32 | no | `1` | Traversal depth limit. Caller-supplied values above the steward's hard cap (32) are silently clamped. |
+| `scope.max_visits` | u32 | no | `1000` | Total visit cap across the walk. Caller-supplied values above the steward's hard cap (100 000) are silently clamped. |
 | `follow_aliases` | bool | no | `true` | Auto-follow alias chains for stale canonical IDs. When `false`, a queried ID retired by merge or split returns `subject: null` plus the populated `aliased_from` so the consumer chooses how to follow. |
 
 **`op = "describe_alias"`**:
@@ -619,6 +662,57 @@ Every request carries an `op` discriminator.
 ```
 
 No other fields.
+
+**`op = "list_subjects"`**:
+
+```json
+{
+  "op": "list_subjects",
+  "cursor": "<opaque base64>",
+  "page_size": <usize>
+}
+```
+
+| Field       | Type   | Required | Default | Notes                                                                                       |
+|-------------|--------|----------|---------|---------------------------------------------------------------------------------------------|
+| `cursor`    | string | no       | absent  | Opaque base64 returned in the previous response's `next_cursor`. Absent on the first page.  |
+| `page_size` | u32    | no       | 100     | Maximum subjects in this page. Values above 1000 are clamped to 1000.                       |
+
+The response carries `current_seq` so consumers can pin the snapshot to a happenings position; see §4.1.3.
+
+**`op = "list_relations"`**:
+
+```json
+{
+  "op": "list_relations",
+  "cursor": "<opaque base64>",
+  "page_size": <usize>
+}
+```
+
+| Field       | Type   | Required | Default | Notes                                                                                       |
+|-------------|--------|----------|---------|---------------------------------------------------------------------------------------------|
+| `cursor`    | string | no       | absent  | Opaque base64 returned in the previous response's `next_cursor`. Absent on the first page.  |
+| `page_size` | u32    | no       | 100     | Maximum edges in this page. Values above 1000 are clamped to 1000.                          |
+
+The response carries `current_seq`; see §4.1.3.
+
+**`op = "enumerate_addressings"`**:
+
+```json
+{
+  "op": "enumerate_addressings",
+  "cursor": "<opaque base64>",
+  "page_size": <usize>
+}
+```
+
+| Field       | Type   | Required | Default | Notes                                                                                       |
+|-------------|--------|----------|---------|---------------------------------------------------------------------------------------------|
+| `cursor`    | string | no       | absent  | Opaque base64 returned in the previous response's `next_cursor`. Absent on the first page.  |
+| `page_size` | u32    | no       | 100     | Maximum addressings in this page. Values above 1000 are clamped to 1000.                    |
+
+The response carries `current_seq`; see §4.1.3.
 
 **`op = "subscribe_happenings"`**:
 
@@ -684,6 +778,60 @@ Consumers test for the presence of the `aliased_from` key (not its value) to dis
 
 Where each record has the shape defined in section 5.2.
 
+**Success response to `op = "list_subjects"`**:
+
+```json
+{
+  "subjects": [
+    {
+      "canonical_id": "<uuid>",
+      "subject_type": "<string>",
+      "addressings": [
+        { "scheme": "<string>", "value": "<string>", "claimant_token": "<token>" }
+      ]
+    }
+  ],
+  "next_cursor": "<opaque base64>" | null,
+  "current_seq": <u64>
+}
+```
+
+Pages iterate in canonical-ID order. `next_cursor` is `null` when the snapshot is exhausted; otherwise the consumer passes it back as `cursor` on the next request. `current_seq` is the bus's monotonic cursor sampled at snapshot time and is identical across pages of the same iteration; pin reconcile-style happening replay to it.
+
+**Success response to `op = "list_relations"`**:
+
+```json
+{
+  "relations": [
+    {
+      "source_id": "<uuid>",
+      "predicate": "<string>",
+      "target_id": "<uuid>",
+      "claimant_tokens": ["<token>", ...],
+      "suppressed": <bool>
+    }
+  ],
+  "next_cursor": "<opaque base64>" | null,
+  "current_seq": <u64>
+}
+```
+
+Pages iterate in `(source_id, predicate, target_id)` order. Suppressed edges are included so the snapshot is structurally complete; consumers that want only visible edges filter on `suppressed == false`. Pagination and `current_seq` semantics match `list_subjects`.
+
+**Success response to `op = "enumerate_addressings"`**:
+
+```json
+{
+  "addressings": [
+    { "scheme": "<string>", "value": "<string>", "canonical_id": "<uuid>" }
+  ],
+  "next_cursor": "<opaque base64>" | null,
+  "current_seq": <u64>
+}
+```
+
+Pages iterate in `(scheme, value)` order. Pagination and `current_seq` semantics match `list_subjects`.
+
 **Ack response to `op = "subscribe_happenings"`**:
 
 ```json
@@ -703,24 +851,91 @@ Where `<HappeningVariant>` is one of the shapes in section 5.1.
 **Streamed lagged frame** (when the subscriber has fallen behind):
 
 ```json
-{ "lagged": <u64> }
+{
+  "lagged": {
+    "missed_count": <u64>,
+    "oldest_available_seq": <u64>,
+    "current_seq": <u64>
+  }
+}
 ```
 
-The integer is the number of happenings dropped.
+`missed_count` is the number of happenings dropped from the broadcast ring since the last successful delivery to this subscriber. `oldest_available_seq` is the smallest seq the steward currently retains in `happenings_log`; a consumer whose last observed seq is at or above this value can resume cleanly via a fresh subscribe with `since` set to that seq, while a consumer whose last seq has rotated past the window MUST fall back to the snapshot list ops pinned to `current_seq`. `current_seq` is the bus's cursor at signal time.
 
 **Error response** (to any sync op):
 
 ```json
-{ "error": "<human-readable message>" }
+{
+  "error": {
+    "class": "<class>",
+    "message": "<human-readable message>",
+    "details": { "subclass": "<subclass>", ...class-specific extras }
+  }
+}
 ```
 
-The message text is advisory and not a stable contract. The stable signal is the presence of the `"error"` key.
+The presence of the `"error"` key signals the response is an error. The stable contract is the structured object: `class` is the top-level taxonomy class (one of the eleven snake-case strings below); `message` is operator-readable but advisory and not contractual; `details` is optional and weakly-typed JSON refining the class with a `subclass` discriminator and any class-specific extra fields.
+
+##### Top-level error classes
+
+The class is one of:
+
+| Class                | Connection-fatal | Retryable | Meaning                                                                              |
+|----------------------|------------------|-----------|--------------------------------------------------------------------------------------|
+| `transient`          | no               | yes       | Operation may succeed on retry without state change. Network blip, lock contention.  |
+| `unavailable`        | no               | yes       | Plugin or backend currently down; retry with backoff.                                |
+| `resource_exhausted` | no               | yes       | Quota, memory, disk; retry once pressure relieves.                                   |
+| `contract_violation` | no               | no        | Caller violated the contract (wrong shape, wrong type, cardinality breach).          |
+| `not_found`          | no               | no        | Addressed entity does not exist.                                                     |
+| `permission_denied`  | no               | no        | Caller lacks the capability for the operation. Distinct from `trust_violation`.      |
+| `trust_violation`    | yes              | no        | Verified-identity check failed; trust class, signature, revocation, role.            |
+| `trust_expired`      | yes              | no        | Key in the trust chain is outside its `not_before` / `not_after` window.             |
+| `protocol_violation` | yes              | no        | The wire frame itself is malformed; the version handshake failed; codec disagreement.|
+| `misconfiguration`   | no               | no        | Operator-level configuration error; retrying without operator action is pointless.   |
+| `internal`           | yes              | no        | Steward invariant violated internally. Caller did nothing wrong.                     |
+
+`Connection-fatal` is derived from the class — there is no independent `fatal` flag on the wire. A consumer that observes a class it does not recognise MUST degrade to treating it as `internal` and log a warning rather than crash; this preserves forward-compatibility against future class additions.
+
+##### Subclass taxonomy
+
+`details.subclass` (when present) is a snake_case string refining the class. The taxonomy is additive: existing names are stable across releases; new subclasses are appended without renaming or repurposing earlier names. Documented subclasses:
+
+| Class                | Subclass                           | Meaning                                                                                                                       |
+|----------------------|------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
+| `trust_violation`    | `admin_trust_too_low`              | Effective trust class is below the admin minimum. Extras: `plugin_name`, `effective`, `minimum`.                              |
+| `contract_violation` | `cardinality_violation`            | A relation assertion would violate a declared cardinality. (Reserved; not yet emitted on the wire — surfaced today as a `relation_cardinality_violation` happening because the relation graph is permissive on assert.) |
+| `contract_violation` | `unknown_predicate`                | Relation predicate not declared in the catalogue. Extras: `predicate`.                                                        |
+| `contract_violation` | `unknown_subject_type`             | Subject type not declared in the catalogue. Extras: `subject_type`.                                                           |
+| `contract_violation` | `merge_self_target`                | Operator-supplied addressings resolve to the same canonical subject.                                                          |
+| `contract_violation` | `merge_cross_type`                 | Merge sources have differing subject types. Extras: `a_type`, `b_type`.                                                       |
+| `contract_violation` | `split_target_index_out_of_bounds` | Explicit relation assignment names a partition index outside the operator's `partitions`. Extras: `index`, `partition_count`. |
+| `contract_violation` | `replay_window_exceeded`           | `subscribe_happenings` `since` cursor is older than the oldest retained `seq`. Extras: `oldest_available_seq`, `current_seq`. |
+| `contract_violation` | `invalid_page_cursor`              | A paginated list op was issued with a cursor that did not decode (bad base64 or non-utf8 payload).                            |
+| `contract_violation` | `invalid_base64`                   | Caller-supplied `payload_b64` field did not decode as base64.                                                                 |
+| `contract_violation` | `invalid_request`                  | Caller's request body parsed as JSON but did not satisfy the schema for any documented op (typically a missing required field). |
+| `not_found`          | `merge_source_unknown`             | Merge source addressing is not registered. Extras: `addressing`.                                                              |
+| `not_found`          | `target_plugin_unknown`            | Privileged retract names a plugin not currently admitted. Extras: `plugin`.                                                   |
+| `not_found`          | `unknown_subject`                  | Caller-supplied `canonical_id` is not in the registry and no alias chain resolves it.                                         |
+| `permission_denied`  | `resolve_claimants_not_granted`    | Connected peer did not satisfy the `client_acl.toml` policy for `resolve_claimants` (no UID / GID / local-grant match).       |
+| `protocol_violation` | `invalid_json`                     | Request frame body did not parse as JSON. Wire-level malformation; the connection is closed per `protocol_violation` semantics. |
+| `internal`           | `alias_lookup_failed`              | Storage-layer query for the alias chain failed. Operator-facing diagnostic; consumer should retry or fall back to a snapshot. |
+| `internal`           | `alias_terminal_missing`           | The alias-chain walk reached a terminal `canonical_id` that the registry has no record of. Steward invariant breach.          |
+| `internal`           | `dispatch_misroute`                | Internal dispatch routed a request to the wrong handler. Steward invariant breach.                                            |
+| `internal`           | `replay_decode_failed`             | A persisted `happenings_log` row did not deserialise into a known `Happening` variant. Storage corruption or cross-version drift. |
+| `internal`           | `replay_query_failed`              | Storage-layer query for the replay window failed. Consumer should fall back to a snapshot pinned to a fresh `current_seq`.    |
+| `internal`           | `replay_window_query_failed`       | Storage-layer query for the oldest retained `seq` failed; the steward could not evaluate the replay-window cutoff.            |
+| `internal`           | `unsupported_variant`              | The steward hit a code path that should be unreachable for the validated request shape. Steward invariant breach.             |
+| `misconfiguration`   | `catalogue_invalid`                | Catalogue parse or validation failure (including out-of-range `schema_version`). (Reserved; not yet emitted on the wire — catalogue errors surface only at boot today and reach operator logs, not consumers. Will emit when an operator-callable reload-catalogue verb lands.) |
+| `misconfiguration`   | `manifest_invalid`                 | Plugin manifest parse or validation failure. (Reserved; not yet emitted on the wire — manifest errors surface only at admission today and reach operator logs, not consumers. Will emit when an operator-callable reload-manifest verb lands.) |
+
+Consumers wanting to act on a subclass must agree on the vocabulary out of band; the contract is on top-level `class` and the subclass strings published here. Unknown subclasses fall through to the top-level class semantics with no degradation in behaviour.
 
 #### 4.1.4 Invariants
 
-- Errors do not close the connection; clients may send another request on the same socket.
+- Errors do not close the connection unless their `class` is one of `protocol_violation` / `trust_violation` / `trust_expired` / `internal`; clients may send another request on the same socket for the non-fatal classes.
 - A subscribed connection is output-only from then on; client frames are ignored.
 - One request in flight at a time per connection; pipeline across connections.
+- The wire `Error` frame on the plugin protocol carries the same `class` field; translation between the plugin-wire and the client-API surface is lossless.
 
 ### 4.2 Plugin Wire Protocol
 
@@ -1583,7 +1798,7 @@ Serialises as a snake_case string.
 | `source` | object | yes | `ExternalAddressing` of the relation's source endpoint. See section 5.3 for the shape. |
 | `predicate` | string | yes | Predicate of the relation. |
 | `target` | object | yes | `ExternalAddressing` of the relation's target endpoint. |
-| `target_new_id_index` | integer (>= 0) | yes | Zero-based index into the operator's `partitions` directive on the surrounding split request. Must be strictly less than `partitions.len()`. The framework maps the index to the freshly-minted canonical ID after the split commits, so operators never need to know UUIDs the framework has not yet generated. Validation runs BEFORE any registry mint; out-of-bounds indices are refused with `SplitTargetNewIdIndexOutOfBounds` and the registry remains untouched. |
+| `target_new_id_index` | integer (>= 0) | yes | Zero-based index into the operator's `partitions` directive on the surrounding split request. Must be strictly less than `partitions.len()`. The framework maps the index to the freshly-minted canonical ID after the split commits, so operators never need to know UUIDs the framework has not minted. Validation runs BEFORE any registry mint; out-of-bounds indices are refused with `SplitTargetNewIdIndexOutOfBounds` and the registry remains untouched. |
 
 The triple `(source, predicate, target)` identifies a single relation in the graph at the time of the split.
 

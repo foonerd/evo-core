@@ -12,6 +12,7 @@ name = "evo-plugin-tool"
 path = "src/main.rs"
 
 [dependencies]
+evo = { path = "../evo" }
 evo-plugin-sdk = { path = "../evo-plugin-sdk" }
 evo-trust = { path = "../evo-trust" }
 

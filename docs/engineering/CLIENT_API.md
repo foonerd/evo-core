@@ -56,7 +56,7 @@ A frame carries exactly one JSON object. The object's shape disambiguates whethe
 
 ## 4. Operations Reference
 
-Five operations. Four are synchronous request/response; one is streaming.
+Eleven operations. Ten are synchronous request/response (three of them paginated); one is streaming.
 
 | Op | Shape | Purpose |
 |----|-------|---------|
@@ -64,8 +64,13 @@ Five operations. Four are synchronous request/response; one is streaming.
 | `project_subject` | Request / response | Compose and return a federated subject projection. Auto-follows alias chains by default. |
 | `describe_alias` | Request / response | Resolve a canonical subject ID to its alias record, alias chain, or current subject. |
 | `list_active_custodies` | Request / response | Snapshot the custody ledger. |
+| `list_subjects` | Request / response (paginated) | Page through every live subject; carries `current_seq` for reconcile-pinning. |
+| `list_relations` | Request / response (paginated) | Page through every live relation edge; carries `current_seq`. |
+| `enumerate_addressings` | Request / response (paginated) | Page through every claimed addressing; carries `current_seq`. |
 | `subscribe_happenings` | Streaming | Stream every happening the bus emits. |
 | `describe_capabilities` | Request / response | Discover the steward's supported ops and named features. |
+| `negotiate` | Request / response | Per-connection capability negotiation. SHOULD be the first frame on a new connection. |
+| `resolve_claimants` | Request / response | Exchange opaque `claimant_token` values for plain plugin names. Requires the `resolve_claimants` capability granted via `negotiate`. |
 
 Every request carries an `op` discriminator.
 
@@ -103,9 +108,15 @@ Response on failure:
 
 ```json
 {
-  "error": "no plugin on shelf: example.does.not.exist"
+  "error": {
+    "class": "NotFound",
+    "message": "no plugin on shelf: example.does.not.exist",
+    "details": { "subclass": "shelf_not_found" }
+  }
 }
 ```
+
+The structured envelope is described in §5; `class` and `message` are always present, `details` is present when the steward attaches a subclass or contextual fields. Older callers that string-matched the bare message shape MUST migrate to the structured form.
 
 ### 4.2 `op = "project_subject"`
 
@@ -270,10 +281,16 @@ The `subject` shape is the same `SubjectProjection` returned on the live-subject
 
 The consumer can then issue a second `project_subject` against `terminal_id`, or invoke `describe_alias` (section 4.3) to inspect the chain in more detail.
 
-**Unknown ID.** A `canonical_id` that the registry has never seen returns the existing not-found error shape verbatim, with no `aliased_from` field:
+**Unknown ID.** A `canonical_id` that the registry has never seen returns the structured not-found envelope (§5), with no `aliased_from` field on the result:
 
 ```json
-{ "error": "unknown subject: 00000000-0000-0000-0000-000000000000" }
+{
+  "error": {
+    "class": "NotFound",
+    "message": "unknown subject: 00000000-0000-0000-0000-000000000000",
+    "details": { "subclass": "subject_not_found" }
+  }
+}
 ```
 
 See `SCHEMAS.md` section 4.1 for the JSON schema covering both live and alias-aware response variants.
@@ -409,6 +426,102 @@ Response:
 
 Empty ledger returns `{"active_custodies": []}`. See `CUSTODY.md` for the record model.
 
+#### 4.4.1 `op = "list_subjects"`
+
+Page through every live subject in the registry. Designed for the reconcile pattern (§7.4.2): the response carries `current_seq` so consumers can pin the snapshot to a happenings position.
+
+Request:
+
+```json
+{
+  "op": "list_subjects",
+  "cursor": "<opaque base64>",
+  "page_size": 100
+}
+```
+
+Both fields are optional. Omit `cursor` on the first page; pass the previous response's `next_cursor` back unchanged on subsequent pages. `page_size` defaults to 100; values above 1000 are clamped down to 1000 and a `page_size` of 0 is clamped up to 1 (the steward never returns an empty page in response to a valid cursor that has more rows). Mid-pagination subject deletion is tolerated: a row removed between pages is simply absent from the next page; surviving rows after the cursor key continue to be returned in canonical-id order without duplication or skip.
+
+Response:
+
+```json
+{
+  "subjects": [
+    {
+      "canonical_id": "...",
+      "subject_type": "track",
+      "addressings": [
+        { "scheme": "mpd-path", "value": "/m/a.flac", "claimant_token": "..." }
+      ]
+    }
+  ],
+  "next_cursor": "<opaque base64>" | null,
+  "current_seq": 42
+}
+```
+
+Iterate until `next_cursor` is `null`. `current_seq` is identical across pages of the same iteration; consumers pin reconcile-style happening replay to it.
+
+#### 4.4.2 `op = "list_relations"`
+
+Page through every live relation edge in the graph. Same pagination contract as `list_subjects`; pages iterate in `(source_id, predicate, target_id)` order.
+
+Request:
+
+```json
+{
+  "op": "list_relations",
+  "cursor": "<opaque base64>",
+  "page_size": 100
+}
+```
+
+Response:
+
+```json
+{
+  "relations": [
+    {
+      "source_id": "...",
+      "predicate": "album_of",
+      "target_id": "...",
+      "claimant_tokens": ["..."],
+      "suppressed": false
+    }
+  ],
+  "next_cursor": "<opaque base64>" | null,
+  "current_seq": 42
+}
+```
+
+Suppressed edges are included so the snapshot is structurally complete; consumers wanting only visible edges filter on `suppressed == false`.
+
+#### 4.4.3 `op = "enumerate_addressings"`
+
+Page through every claimed addressing in the registry. Same pagination contract; pages iterate in `(scheme, value)` order.
+
+Request:
+
+```json
+{
+  "op": "enumerate_addressings",
+  "cursor": "<opaque base64>",
+  "page_size": 100
+}
+```
+
+Response:
+
+```json
+{
+  "addressings": [
+    { "scheme": "mpd-path", "value": "/m/a.flac", "canonical_id": "..." }
+  ],
+  "next_cursor": "<opaque base64>" | null,
+  "current_seq": 42
+}
+```
+
 ### 4.5 `op = "subscribe_happenings"`
 
 Promote the connection to streaming mode. Receive every happening the bus emits for the lifetime of the subscription.
@@ -457,7 +570,7 @@ The server writes three kinds of frames after accepting the subscription:
 
 `seq` is the cursor the bus minted for this event. Strictly monotonic across one steward instance and persisted into `happenings_log` for cursor replay. Consumers should record this on every consumed frame so a subsequent reconnect can resume cleanly via `since`.
 
-Plugin identity on the wire is opaque. The `claimant_token` field carries a steward-issued identifier — not the plugin's plain canonical name. Tokens are stable for the lifetime of a steward instance, distinct between deployments, and treat-as-opaque for consumers (compare by exact-string equality only). Variants emitted by admin plugins additionally carry `admin_token`; variants targeting a specific plugin's claim (forced retract, claim reassignment) carry `target_token`. `RelationForgotten` carries `retracting_claimant_token` under `reason` when the forget came from a last-claimant retract. The same scheme applies to the `claimant_token` and `claimant_tokens` fields in `op = "list_active_custodies"` and `op = "project_subject"` responses. Resolution from token to plain plugin name will be available via a separate `resolve_claimants` op gated on a future capability; today consumers see only tokens.
+Plugin identity on the wire is opaque. The `claimant_token` field carries a steward-issued identifier — not the plugin's plain canonical name. Tokens are stable for the lifetime of a steward instance, distinct between deployments, and treat-as-opaque for consumers (compare by exact-string equality only). Variants emitted by admin plugins additionally carry `admin_token`; variants targeting a specific plugin's claim (forced retract, claim reassignment) carry `target_token`. `RelationForgotten` carries `retracting_claimant_token` under `reason` when the forget came from a last-claimant retract. The same scheme applies to the `claimant_token` and `claimant_tokens` fields in `op = "list_active_custodies"` and `op = "project_subject"` responses. Resolution from token to plain plugin name is available through the `op = "resolve_claimants"` request, which returns `[{token, plugin_name, plugin_version}]` for the requested tokens; the op is gated by the steward's `client_acl.toml` policy (default: local Unix-socket clients whose peer UID matches the steward) and silently omits tokens the caller is not authorised to resolve. Resolution calls do not emit happenings and are recorded in a separate `ResolutionLedger` audit log distinct from the privileged-admin ledger.
 
 The `happening` object is internally tagged by `type`. Seventeen variants ship today across five categories:
 
@@ -474,10 +587,16 @@ The `Happening` enum is `#[non_exhaustive]`; consumers MUST tolerate unknown `ty
 **Lagged** (streamed when the subscriber has fallen behind the bus's buffer):
 
 ```json
-{ "lagged": 17 }
+{
+  "lagged": {
+    "missed_count": 17,
+    "oldest_available_seq": 42,
+    "current_seq": 901
+  }
+}
 ```
 
-`lagged` carries the number of happenings dropped. Subscribers recover by re-querying the authoritative store (the ledger for custody) and continuing to consume.
+`missed_count` is the number of happenings dropped from the broadcast ring since the last successful delivery. `oldest_available_seq` is the smallest seq the steward currently retains in the durable window; a consumer whose last observed seq is at or above this value resumes cleanly via a fresh subscribe with `since` set to that seq, while a consumer whose seq has rotated past the window falls back to the subscribe + list-op reconcile pattern (§7.4.2). `current_seq` is the bus's cursor at signal time and is the natural pin for the fallback list ops.
 
 The subscription ends when the client closes the connection. There is no explicit unsubscribe frame.
 
@@ -502,13 +621,20 @@ Response:
     "project_subject",
     "describe_alias",
     "list_active_custodies",
+    "list_subjects",
+    "list_relations",
+    "enumerate_addressings",
     "subscribe_happenings",
-    "describe_capabilities"
+    "describe_capabilities",
+    "negotiate",
+    "resolve_claimants"
   ],
   "features": [
     "subscribe_happenings_cursor",
     "alias_chain_walking",
-    "active_custodies_snapshot"
+    "active_custodies_snapshot",
+    "paginated_state_snapshots",
+    "capability_negotiation"
   ]
 }
 ```
@@ -524,8 +650,83 @@ Response:
 | `subscribe_happenings_cursor` | The `since` parameter on `subscribe_happenings`, `current_seq` on the ack, and `seq` on every streamed `Happening` frame are honoured. |
 | `alias_chain_walking` | `op = "describe_alias"` and the alias-aware variants of `op = "project_subject"` are present. |
 | `active_custodies_snapshot` | `op = "list_active_custodies"` returns the full ledger snapshot. |
+| `paginated_state_snapshots` | `op = "list_subjects"`, `op = "list_relations"`, and `op = "enumerate_addressings"` are present, each returning paginated rows alongside `current_seq` for reconcile-pinning. |
+| `capability_negotiation` | `op = "negotiate"` is present and grants per-connection capabilities consulted by gated ops (`resolve_claimants` today). |
 
 A consumer that requires a feature absent from the response MUST fall back to pre-feature behaviour or fail explicitly; silent assumption that the feature is honoured is a bug.
+
+### 4.7 `op = "negotiate"`
+
+Per-connection capability negotiation. A consumer SHOULD send this as the first frame on a new connection to request named capabilities; subsequent ops gated on a name not in the granted set refuse with `permission_denied`. Connections that never negotiate fall back to the empty granted set.
+
+Request:
+
+```json
+{
+  "op": "negotiate",
+  "capabilities": ["resolve_claimants"]
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `capabilities` | array of strings | Capability names the consumer requests. Unknown names are silently dropped from the response (forward-compatibility). |
+
+Response:
+
+```json
+{
+  "ok": true,
+  "granted": ["resolve_claimants"]
+}
+```
+
+The `granted` array carries the subset the steward grants per the operator-controlled ACL (`/etc/evo/client_acl.toml`; see §6 of `CONFIG.md`). The granted set applies for the lifetime of the connection and cannot be widened by a second `negotiate` (the second call replaces, never widens, but the policy gate is consulted again). Re-negotiating with a smaller request narrows the set.
+
+The default ACL grants `resolve_claimants` only when the connecting peer's effective UID matches the steward's UID; non-local-UID consumers (frontend processes running as a separate service user, bridges) require explicit `allow_uids`/`allow_gids` entries in the ACL file. A consumer that asked for a capability the operator denied will see it absent from `granted`; the steward returns no other diagnostic.
+
+The ACL file parser is strict: unknown fields and unknown sections (e.g. `allow_uds = [0]` instead of `allow_uids = [0]`, or `[capabilities.resolve_claims]` instead of `[capabilities.resolve_claimants]`) abort the steward at boot with an error naming the offending name. A typo no longer silently default-denies.
+
+### 4.8 `op = "resolve_claimants"`
+
+Exchange opaque `claimant_token` values for plain plugin names and (when available) versions. Resolution requires the `resolve_claimants` capability to have been granted on the connection via `op = "negotiate"`; without it the op refuses with `permission_denied` (subclass `resolve_claimants_not_granted`).
+
+Request:
+
+```json
+{
+  "op": "resolve_claimants",
+  "tokens": ["Qx9aN-bk0wUJtH4y6oFCTw", "abcd1234..."]
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `tokens` | array of strings | Tokens to resolve. Tokens not currently issued by this steward are silently omitted from the response (no error). |
+
+Response:
+
+```json
+{
+  "resolutions": [
+    {
+      "token": "Qx9aN-bk0wUJtH4y6oFCTw",
+      "plugin_name": "com.example.alpha",
+      "plugin_version": "1.2.3"
+    }
+  ]
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `token` | string | Echoes the token the consumer supplied. Useful for pipelined responses. |
+| `plugin_name` | string | Plain canonical name of the plugin the steward associates with the token. |
+| `plugin_version` | string \| null | Plugin version on record. The token derivation deliberately omits the version, so a steward that issued a token before the version was recorded MAY return `null`; consumers MUST tolerate the field being absent. |
+
+Resolution is a private query: it does NOT emit on the happenings bus, and a successful or refused call surfaces only in the steward's audit log. Operators consult the audit log to see which connection identities asked to exchange tokens for plain names; the steward records the connecting peer's UID/GID, the request size, the resolved count, and whether the call was granted.
+
+**Token-existence-count side-channel (intentional).** The response shape lets a granted consumer learn whether each requested token is *currently issued by this steward* by observing whether the token appears in the `resolutions` array. Tokens not currently issued are silently omitted (per the request-table note above), which is what allows the count of returned resolutions to differ from the count of supplied tokens. This is a deliberate design trade-off, not a bug: the `resolve_claimants` capability is privileged for exactly this reason — the operator who granted the capability already trusts the consumer with the plain plugin names and versions of currently-admitted plugins, and the additional signal "this token is currently issued vs not" is no stronger than what the consumer already observes by issuing any operation that would target the same plugin. Operators MUST NOT grant `resolve_claimants` to a consumer the operator would not otherwise allow to enumerate the steward's current plugin set; the ACL gate at `client_acl.toml` is the single point of control. Distributions wishing to harden against this signal MUST do so by tightening the ACL, not by parsing or filtering the response.
 
 ## 5. Error Handling
 
@@ -1297,7 +1498,19 @@ A consumer that previously subscribed and persisted the largest `seq` it consume
 { "op": "subscribe_happenings", "since": 137 }
 ```
 
-The server replays every persisted happening with `seq > 137` first, then transitions to live streaming. Replay-vs-live overlap is deduped on the server side; the consumer does not need to track its own dedupe table. If `since` is older than the steward's durable retention window, the replay is partial — the consumer should detect that `current_seq` in the new ack is much larger than `since + replay-frame-count` and fall back to query-then-subscribe to rebuild a complete picture.
+The server replays every persisted happening with `seq > 137` first, then transitions to live streaming. Replay-vs-live overlap is deduped on the server side; the consumer does not need to track its own dedupe table. If `since` is older than the steward's durable retention window, the steward replies with a structured `replay_window_exceeded` error (class `contract_violation`) carrying `oldest_available_seq` and `current_seq` in `details`. The consumer's recovery is the reconcile pattern below: page through the snapshot list ops pinned to `current_seq`, then re-subscribe with `since = current_seq` to pick up the live tail.
+
+### 7.4.2 Reconcile pattern: subscribe → list_X → reconcile_via_seq
+
+The general shape for a consumer that needs a coherent view of an entire store, not just custody. Generalises §7.4 to subjects, relations, and addressings; the steward owns the bus cursor and exposes paginated snapshot ops that all carry `current_seq`.
+
+1. Open a subscription connection. Send `subscribe_happenings`. Read the `{"subscribed": true, "current_seq": N}` ack and record `N`.
+2. On a second connection, page through the relevant list op (`list_subjects`, `list_relations`, `enumerate_addressings`, `list_active_custodies`). Each page carries `current_seq`. Iterate by passing the previous page's `next_cursor` back as `cursor` until `next_cursor` is `null`. The pages collectively describe a snapshot consistent with "everything at or before seq=current_seq" for that page.
+3. Apply happenings with `seq > N` from the subscription stream as deltas on top of the snapshot; ignore happenings with `seq <= N` as redundant (already reflected in the snapshot).
+
+The pattern composes — a consumer that wants subjects, relations, and addressings together pages through all three ops on the same snapshot pin (`N` from the ack) and applies the same happening tail. Pagination cursors are opaque base64 strings; consumers store them as-is and pass them back unchanged. Page sizes default to 100 and are capped at 1000; consumers iterate until `next_cursor` is `null` rather than relying on a per-page count.
+
+If a `Lagged` frame arrives mid-stream, its structured payload carries `missed_count`, `oldest_available_seq`, and `current_seq`. A consumer whose last observed seq is at or above `oldest_available_seq` can resume cleanly via a fresh `subscribe_happenings` with `since` set to that seq; a consumer whose seq has rotated past the window falls back to a fresh subscribe + list-op reconcile pinned to the new `current_seq`.
 
 Python implementation of this pattern:
 

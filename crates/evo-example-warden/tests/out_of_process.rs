@@ -103,6 +103,8 @@ fn test_catalogue() -> Arc<Catalogue> {
     Arc::new(
         Catalogue::from_toml(
             r#"
+schema_version = 1
+
 [[racks]]
 name = "example"
 family = "domain"

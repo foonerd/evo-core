@@ -9,6 +9,8 @@
 # audio, audio-sources, audio-processing, artwork, metadata, networking,
 # storage, library, and other racks from CONCEPT.md.
 
+schema_version = 1
+
 [[racks]]
 name = "example"
 family = "domain"

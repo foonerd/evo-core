@@ -2,6 +2,7 @@
 
 mod archive;
 mod bundle;
+mod catalogue_cmd;
 mod exit_code;
 mod install;
 mod lint;
@@ -33,6 +34,11 @@ struct Cli {
 enum Sub {
     /// Validate `manifest.toml` and the artefact path
     Lint { plugin_dir: PathBuf },
+    /// Operations on catalogue documents.
+    Catalogue {
+        #[command(subcommand)]
+        sub: CatalogueSub,
+    },
     /// Write `manifest.sig` (ed25519 over `signing_message`, per evo_trust)
     Sign {
         plugin_dir: PathBuf,
@@ -106,6 +112,23 @@ enum Sub {
     },
 }
 
+#[derive(Subcommand)]
+enum CatalogueSub {
+    /// Parse and validate a catalogue document. Surfaces parser
+    /// errors (missing required fields, schema_version out of range)
+    /// as a non-zero exit. With `--schema-version N` additionally
+    /// pins the document's `schema_version` to N exactly.
+    Lint {
+        /// Path to the catalogue TOML document.
+        path: PathBuf,
+        /// If set, additionally require the document to declare
+        /// `schema_version = <N>`. Useful at distribution-author
+        /// time to catch a fixture-update slip-through.
+        #[arg(long, value_name = "N")]
+        schema_version: Option<u32>,
+    },
+}
+
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum PackFormatArg {
     TarGz,
@@ -126,6 +149,12 @@ impl From<PackFormatArg> for archive::PackFormat {
 fn run(cli: Cli) -> Result<(), anyhow::Error> {
     match cli.sub {
         Sub::Lint { plugin_dir } => lint::run(&plugin_dir),
+        Sub::Catalogue { sub } => match sub {
+            CatalogueSub::Lint {
+                path,
+                schema_version,
+            } => catalogue_cmd::lint(&path, schema_version),
+        },
         Sub::Sign { plugin_dir, key } => sign::run(&plugin_dir, &key),
         Sub::Verify {
             plugin_dir,

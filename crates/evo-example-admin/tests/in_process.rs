@@ -77,6 +77,8 @@ fn test_catalogue() -> Arc<Catalogue> {
     Arc::new(
         Catalogue::from_toml(
             r#"
+schema_version = 1
+
 [[racks]]
 name = "administration"
 family = "meta"

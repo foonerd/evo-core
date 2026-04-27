@@ -49,11 +49,70 @@ use crate::happenings::{Happening, HappeningBus};
 use evo_plugin_sdk::contract::{
     CustodyHandle, CustodyStateReporter, HealthStatus, ReportError,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
+
+/// Lifecycle state of one [`CustodyRecord`].
+///
+/// The ledger transitions between these on the back of warden
+/// reports and router-observed custody-operation outcomes:
+///
+/// - [`Self::Active`] is the initial state of every record. The
+///   warden owns the custody and may report state freely.
+/// - [`Self::Degraded`] is reached when a custody operation failed
+///   under a `partial_ok` failure-mode declaration. The warden may
+///   keep reporting on the handle; the record stays in the ledger
+///   so consumers can observe and decide. Carries the failure
+///   reason recorded by the steward at transition time.
+/// - [`Self::Aborted`] is reached when a custody operation failed
+///   under an `abort` failure-mode declaration (or a default-Abort
+///   path). The custody is over from the steward's point of view;
+///   the warden is expected to release on the next opportunity.
+///   Carries the failure reason recorded at transition time.
+///
+/// Marked `#[non_exhaustive]` so future passes can add intermediate
+/// states (suspended, fenced, etc.) without breaking existing match
+/// arms. Serialises as an internally-tagged (`"kind"`) JSON object
+/// so consumers see `{"kind":"active"}` / `{"kind":"degraded","reason":"..."}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CustodyStateKind {
+    /// The record's normal state: warden holds custody, no failure
+    /// has been observed.
+    Active,
+    /// A custody operation failed; the record is degraded but
+    /// retained. Used under the `partial_ok` failure-mode
+    /// declaration. Carries the steward-recorded failure reason.
+    Degraded {
+        /// Steward-recorded reason for the degradation. Stable
+        /// snapshot; not mutated by subsequent reports.
+        reason: String,
+    },
+    /// A custody operation failed and the failure-mode declaration
+    /// is `abort`. The warden is expected to release; the record
+    /// is retained until release for observability. Carries the
+    /// steward-recorded failure reason.
+    Aborted {
+        /// Steward-recorded reason for the abort.
+        reason: String,
+    },
+}
+
+impl CustodyStateKind {
+    /// Stable short string for logging and assertions.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Degraded { .. } => "degraded",
+            Self::Aborted { .. } => "aborted",
+        }
+    }
+}
 
 /// The most recent state report observed for a custody.
 #[derive(Debug, Clone)]
@@ -91,6 +150,12 @@ pub struct CustodyRecord {
     /// Most recent state snapshot for this custody, if any reports
     /// have been observed.
     pub last_state: Option<StateSnapshot>,
+    /// Lifecycle state of the record. Defaults to
+    /// [`CustodyStateKind::Active`]; transitions to
+    /// [`CustodyStateKind::Degraded`] or [`CustodyStateKind::Aborted`]
+    /// when the router observes a custody operation failure under the
+    /// matching `custody_failure_mode` declaration.
+    pub state: CustodyStateKind,
     /// When this record was first created in the ledger. Not updated
     /// by subsequent merges; stable across the lifetime of the
     /// record.
@@ -164,6 +229,7 @@ impl CustodyLedger {
                 shelf: Some(shelf.to_string()),
                 custody_type: Some(custody_type.to_string()),
                 last_state: None,
+                state: CustodyStateKind::Active,
                 started_at: now,
                 last_updated: now,
             });
@@ -204,6 +270,7 @@ impl CustodyLedger {
                 shelf: None,
                 custody_type: None,
                 last_state: Some(snapshot),
+                state: CustodyStateKind::Active,
                 started_at: now,
                 last_updated: now,
             });
@@ -219,6 +286,72 @@ impl CustodyLedger {
         let key = (plugin.to_string(), handle_id.to_string());
         let mut guard = self.entries.write().expect("ledger lock poisoned");
         guard.remove(&key)
+    }
+
+    /// Transition the record for `(plugin, handle_id)` to
+    /// [`CustodyStateKind::Aborted`] with the supplied reason.
+    ///
+    /// Used by the router on a custody operation failure when the
+    /// owning plugin's `custody_failure_mode` is `abort` (or the
+    /// default-Abort path when no mode was declared). Returns `true`
+    /// when a record existed and was transitioned, `false` when no
+    /// record exists for the key (in which case the call is a no-op).
+    /// `last_updated` is bumped to the call time on a successful
+    /// transition.
+    ///
+    /// The transition is idempotent in the sense that re-marking an
+    /// already-aborted record overwrites the reason and refreshes
+    /// `last_updated`. The record is NOT removed; release happens
+    /// separately when the warden relinquishes the handle.
+    pub fn mark_aborted(
+        &self,
+        plugin: &str,
+        handle_id: &str,
+        reason: impl Into<String>,
+    ) -> bool {
+        let key = (plugin.to_string(), handle_id.to_string());
+        let now = SystemTime::now();
+        let reason = reason.into();
+        let mut guard = self.entries.write().expect("ledger lock poisoned");
+        if let Some(rec) = guard.get_mut(&key) {
+            rec.state = CustodyStateKind::Aborted { reason };
+            rec.last_updated = now;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Transition the record for `(plugin, handle_id)` to
+    /// [`CustodyStateKind::Degraded`] with the supplied reason.
+    ///
+    /// Used by the router on a custody operation failure when the
+    /// owning plugin's `custody_failure_mode` is `partial_ok`. Returns
+    /// `true` when a record existed and was transitioned, `false`
+    /// when no record exists for the key.
+    ///
+    /// The transition is idempotent in the same way as
+    /// [`Self::mark_aborted`]. The record is retained so the warden
+    /// may continue to report state on the same handle if it chooses;
+    /// consumers observe the degradation via the bus and via this
+    /// field on the record.
+    pub fn mark_degraded(
+        &self,
+        plugin: &str,
+        handle_id: &str,
+        reason: impl Into<String>,
+    ) -> bool {
+        let key = (plugin.to_string(), handle_id.to_string());
+        let now = SystemTime::now();
+        let reason = reason.into();
+        let mut guard = self.entries.write().expect("ledger lock poisoned");
+        if let Some(rec) = guard.get_mut(&key) {
+            rec.state = CustodyStateKind::Degraded { reason };
+            rec.last_updated = now;
+            true
+        } else {
+            false
+        }
     }
 
     /// Look up a record without removing it. Clones the record.
@@ -317,13 +450,20 @@ impl CustodyStateReporter for LedgerCustodyStateReporter {
             );
             // 2. Happening after ledger write. Owned strings are
             //    moved in since they are not used again in this
-            //    scope; health is Copy.
-            bus.emit(Happening::CustodyStateReported {
+            //    scope; health is Copy. The durable emit propagates
+            //    persistence failure to the caller; a silent drop
+            //    would lose the state-report from happenings_log
+            //    and break downstream replay.
+            bus.emit_durable(Happening::CustodyStateReported {
                 plugin,
                 handle_id,
                 health,
                 at: SystemTime::now(),
-            });
+            })
+            .await
+            .map_err(|e| {
+                ReportError::Invalid(format!("persistence write failed: {e}"))
+            })?;
             Ok(())
         })
     }

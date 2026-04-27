@@ -81,7 +81,7 @@ fn ten_megabyte_string_does_not_oom() {
     // the test runner itself.
     let big: String = "a".repeat(10 * 1024 * 1024);
     let toml = format!(
-        "[[racks]]\nname = \"big\"\nfamily = \"domain\"\ncharter = \"{}\"\n",
+        "schema_version = 1\n\n[[racks]]\nname = \"big\"\nfamily = \"domain\"\ncharter = \"{}\"\n",
         big
     );
     let result = Catalogue::from_toml(&toml);
@@ -114,7 +114,7 @@ fn diverse_unicode_input_does_not_panic() {
         \u{FEFF} \
     ";
     let toml = format!(
-        "[[racks]]\nname = \"unicode\"\nfamily = \"domain\"\ncharter = {}\n",
+        "schema_version = 1\n\n[[racks]]\nname = \"unicode\"\nfamily = \"domain\"\ncharter = {}\n",
         toml_quote(charter)
     );
     let result = Catalogue::from_toml(&toml);
@@ -229,6 +229,8 @@ fn toml_datetimes_in_fields_do_not_panic() {
 #[test]
 fn parses_minimal_catalogue_after_battery() {
     let toml = r#"
+        schema_version = 1
+
         [[racks]]
         name = "example"
         family = "domain"

@@ -136,7 +136,7 @@ Logs and happenings are distinct streams with different purposes and different a
 
 An event may produce both. Plugin admission is a happening (subject: the plugin, event type: admitted) and also an `info` log entry. Not every log produces a happening (fine-grained debug/trace lines are log-only). Not every happening produces a log (a busy factory's many announcements produce many happenings but only periodic summary log lines).
 
-The engineering-layer document for the happenings stream is future work (see `CONCEPT.md` section 10).
+The engineering-layer document for the happenings stream is `HAPPENINGS.md`.
 
 ## 8. Plugin Log Integration
 

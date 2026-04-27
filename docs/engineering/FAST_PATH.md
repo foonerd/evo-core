@@ -52,7 +52,7 @@ The fast path is NOT:
 - A relation-modification channel. Relations are asserted by plugins per `RELATIONS.md`, not by consumers.
 - A catalogue-modification channel. The catalogue is authoritative and loaded at startup; consumers cannot mutate it.
 - A fire-and-forget channel. Every command gets a response. A consumer that does not want a response can discard it, but the steward always produces one.
-- A batching channel. One command per round-trip. Multiple commands require multiple round-trips. Batching is deliberately deferred (section 15).
+- A batching channel. One command per round-trip. Multiple commands require multiple round-trips. Batching is intentionally out of scope for the initial fast path (section 15).
 
 ## 4. Commands
 
@@ -147,7 +147,7 @@ command(
 
 The steward resolves to the warden holding custody over that subject. If no custody exists and the command is one that creates custody (e.g. `play` on a track that is not currently loaded), the steward routes to the singleton warden on the shelf and asks it to take custody of the subject via the normal `take_custody` path, then applies the command.
 
-Whether a command creates custody or requires existing custody is declared per command in the catalogue (schema concern, deferred to engineering implementation).
+Whether a command creates custody or requires existing custody is declared per command in the catalogue (schema concern, scheduled with the fast-path implementation).
 
 ### 5.3 Route Resolution Failure
 

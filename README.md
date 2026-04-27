@@ -95,7 +95,9 @@ sequenceDiagram
     S-->>C: { happening: custody_released, ... }
 ```
 
-Any happening emitted after the ack reaches the consumer. The initial list gives a consistent snapshot; each subsequent happening is an incremental update. See [CLIENT_API.md](docs/engineering/CLIENT_API.md) for examples in seven languages.
+Any happening emitted after the ack reaches the consumer. The initial list gives a consistent snapshot; each subsequent happening is an incremental update.
+
+Plugin identity on the wire is opaque: every projection and happening carries an opaque `claimant_token`, never the plugin's plain canonical name. A consumer that needs to display plain names follows the negotiate-then-resolve pattern: send `op = "negotiate"` with `capabilities: ["resolve_claimants"]` as the first frame on the connection, then call `op = "resolve_claimants"` with the tokens to exchange. The default operator policy grants `resolve_claimants` only to local-UID consumers running as the steward's own user; distributions with a frontend or bridge running under a different UID widen the policy through `/etc/evo/client_acl.toml`. See [CLIENT_API.md](docs/engineering/CLIENT_API.md) sections 4.7 and 4.8 for the negotiation and resolution ops, and examples in seven languages.
 
 ## Documentation
 
@@ -131,7 +133,7 @@ The doc set is grouped by what you are trying to do.
 
 | Document | Purpose |
 |----------|---------|
-| [STEWARD.md](docs/engineering/STEWARD.md) | The steward process. Module structure, admission, shared state, concurrency model, configuration, invariants, deferred capabilities. |
+| [STEWARD.md](docs/engineering/STEWARD.md) | The steward process. Module structure, admission, shared state, concurrency model, configuration, invariants, reserved capabilities. |
 | [CATALOGUE.md](docs/engineering/CATALOGUE.md) | Narrative on authoring a `catalogue.toml`. Racks, shelves, predicates, shape versioning, anti-patterns, evolution. Schema in SCHEMAS.md section 3.2. |
 | [CONFIG.md](docs/engineering/CONFIG.md) | Narrative on the steward's runtime configuration. File location, precedence (CLI > env > config > default), operational patterns. Schema in SCHEMAS.md section 3.3. |
 | [SUBJECTS.md](docs/engineering/SUBJECTS.md) | Subject registry. Canonical identity, external addressings, reconciliation. |
@@ -139,7 +141,7 @@ The doc set is grouped by what you are trying to do.
 | [PROJECTIONS.md](docs/engineering/PROJECTIONS.md) | Projection layer. Federated queries, composition rules, degraded states. |
 | [CUSTODY.md](docs/engineering/CUSTODY.md) | Custody ledger. Warden-held work tracked by `(plugin, handle_id)`. |
 | [HAPPENINGS.md](docs/engineering/HAPPENINGS.md) | Live notification bus. Non-exhaustive variant contract, broadcast semantics. |
-| [FAST_PATH.md](docs/engineering/FAST_PATH.md) | Fast-path mutation channel (deferred). |
+| [FAST_PATH.md](docs/engineering/FAST_PATH.md) | Fast-path mutation channel (roadmap). |
 | [LOGGING.md](docs/engineering/LOGGING.md) | Logging contract. Levels, format, structured fields, logs vs happenings. |
 
 ### Operations
@@ -151,11 +153,9 @@ The doc set is grouped by what you are trying to do.
 
 ## Status
 
-v0.1.8. 360 tests passing across the workspace.
+Implemented: the steward runs and admits singleton respondents and wardens (in-process or over a Unix socket), with bundle discovery walking the configured search roots and admitting out-of-process singletons automatically. Subject registry and relation graph maintained. Projections composed on demand with federated subject queries and relation walks. Custody ledger tracks active warden-held work. Happenings bus emits every custody, subject, and relation transition with strictly monotonic `seq` numbers, and supports replay through a `since` cursor backed by the durable `happenings_log` table. Subject identity, addressings, aliases, the claim log, the durable happenings log, and the pending-conflicts table are persisted to SQLite at `/var/lib/evo/state/evo.db`. Catalogue documents carry a required `schema_version`; `evo-plugin-tool catalogue lint` validates against the supported range. The wire protocol carries a unified `ErrorClass` taxonomy with `class.is_connection_fatal()` derivation. Trust verification walks chains via `signed_by` with a configured maximum depth, supports rotation overlap, and verifies the trust-root fingerprint at load. Client-socket ops include `request`, `project_subject`, `describe_alias`, `describe_subject_with_aliases`, `describe_capabilities`, `list_subjects`, `list_relations`, `enumerate_addressings`, `list_active_custodies`, `subscribe_happenings`, `negotiate`, and `resolve_claimants` (gated by `client_acl.toml`). Wire protocol end-to-end tested with in-process and out-of-process plugins.
 
-Implemented: the steward runs and admits singleton respondents and wardens (in-process or over a Unix socket). Subject registry and relation graph maintained. Projections composed on demand with federated subject queries and relation walks. Custody ledger tracks active warden-held work. Happenings bus emits every custody transition. Client socket protocol with four ops (`request`, `project_subject`, `list_active_custodies`, `subscribe_happenings`). Wire protocol end-to-end tested with in-process and out-of-process plugins. The shipped binary has no hardcoded plugin admissions; distributions drive admission via their own harnesses until plugin discovery lands.
-
-Deferred (see `STEWARD.md` section 12 for the full list): appointments and watches, persistence across restart, factory plugins, fast-path mutation channel, shape-version enforcement, rack-keyed projections, plugin discovery.
+Roadmap (see `STEWARD.md` section 12 for the full list): appointments and watches, durable persistence for the relation graph and custody and admin ledgers (the subject identity slice and durable happenings log are persisted today), factory admission, fast-path mutation channel, shape-version range support, rack-keyed projections, hot-reload supervision, restart supervision, structured catalogue grammar survival surface, auto-merge heuristics.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 

@@ -53,6 +53,8 @@ use evo_plugin_sdk::Manifest;
 /// hosts one slow respondent so the test can address them
 /// independently from the client side.
 const CONCURRENCY_CATALOGUE_TOML: &str = r#"
+schema_version = 1
+
 [[racks]]
 name = "parallel"
 family = "domain"
@@ -461,4 +463,144 @@ async fn wait_for_socket(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+// ---------------------------------------------------------------------
+// Same-shelf serialisation pin.
+//
+// Two requests on the SAME shelf MUST serialise on the
+// `entry.handle: AsyncMutex` because the underlying `&mut self`
+// shape on `Respondent::handle_request` cannot accept overlapping
+// invocations. The cross-shelf overlap is covered by the existing
+// concurrent_requests_to_different_plugins_run_in_parallel test
+// above; this complementary case pins the negative side: same-shelf
+// requests must NOT overlap.
+//
+// The proof is symmetric to the cross-shelf case: with handler
+// sleep S, sequential dispatch produces wall time >= 2*S; concurrent
+// dispatch produces wall time near S. We assert wall time is at
+// least the sequential floor for two same-shelf requests, which is
+// only possible if the per-entry mutex prevented overlap.
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_requests_to_same_shelf_serialise_on_entry_mutex() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let catalogue = Arc::new(
+        Catalogue::from_toml(CONCURRENCY_CATALOGUE_TOML)
+            .expect("two-shelf catalogue parses"),
+    );
+    let state = StewardState::builder()
+        .catalogue(catalogue)
+        .subjects(Arc::new(SubjectRegistry::new()))
+        .relations(Arc::new(RelationGraph::new()))
+        .custody(Arc::new(CustodyLedger::new()))
+        .bus(Arc::new(HappeningBus::new()))
+        .admin(Arc::new(AdminLedger::new()))
+        .persistence(Arc::new(MemoryPersistenceStore::new()))
+        .claimant_issuer(Arc::new(evo::claimant::ClaimantTokenIssuer::new(
+            "test-instance",
+        )))
+        .build()
+        .expect("steward state must build");
+
+    let mut engine = AdmissionEngine::new(
+        Arc::clone(&state),
+        std::path::PathBuf::from("/tmp/evo-concurrency-same-shelf"),
+        None,
+        PluginsSecurityConfig::default(),
+    );
+
+    let tracker = OverlapTracker::new();
+    // Single plugin on shelf "a"; both requests target it.
+    let plugin_a = SlowRespondent {
+        name: "org.test.slow.a".into(),
+        which: 'a',
+        tracker: Arc::clone(&tracker),
+        loaded: false,
+    };
+    engine
+        .admit_singleton_respondent(
+            plugin_a,
+            slow_manifest("org.test.slow.a", "a"),
+        )
+        .await
+        .expect("admit slow respondent a");
+
+    let projections = Arc::new(evo::projections::ProjectionEngine::new(
+        Arc::clone(&state.subjects),
+        Arc::clone(&state.relations),
+    ));
+    let router = Arc::clone(engine.router());
+    let server = Server::new(
+        socket_path.clone(),
+        router,
+        Arc::clone(&state),
+        Arc::clone(&projections),
+    );
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("server socket must become available");
+
+    // Two independent connections, both targeting shelf "parallel.a".
+    let mut s1 = UnixStream::connect(&socket_path).await.expect("connect 1");
+    let mut s2 = UnixStream::connect(&socket_path).await.expect("connect 2");
+    let req = r#"{"op":"request","shelf":"parallel.a","request_type":"slow","payload_b64":""}"#;
+
+    let wall_start = Instant::now();
+    let (r1, r2) = tokio::join!(
+        async {
+            write_frame(&mut s1, req.as_bytes()).await;
+            read_frame(&mut s1).await
+        },
+        async {
+            write_frame(&mut s2, req.as_bytes()).await;
+            read_frame(&mut s2).await
+        }
+    );
+    let wall_elapsed = wall_start.elapsed();
+
+    // Both must succeed.
+    let v1: serde_json::Value = serde_json::from_slice(&r1).expect("json 1");
+    let v2: serde_json::Value = serde_json::from_slice(&r2).expect("json 2");
+    assert!(
+        v1.get("payload_b64").is_some(),
+        "response 1 missing payload_b64: {v1}"
+    );
+    assert!(
+        v2.get("payload_b64").is_some(),
+        "response 2 missing payload_b64: {v2}"
+    );
+
+    // Sequential floor: 2 handlers x 100ms each = 200ms minimum
+    // when serialised on the per-entry mutex. The overlap test above
+    // proved wall time can be << 200ms when two distinct entries are
+    // hit; here we want the opposite — wall time must be at or above
+    // the sequential floor, with slack for scheduler/IO jitter.
+    assert!(
+        wall_elapsed >= Duration::from_millis(190),
+        "two same-shelf requests took {wall_elapsed:?}; expected at \
+         least ~200ms (the per-entry mutex must serialise them). If \
+         this fires, the entry handle: AsyncMutex no longer enforces \
+         the &mut self contract on Respondent::handle_request"
+    );
+
+    drop(s1);
+    drop(s2);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task join");
+    engine.shutdown().await.expect("drain");
 }

@@ -29,9 +29,10 @@
 //! [`WireClientError`] covers the host-to-plugin failure modes. When
 //! the remote plugin returns an `Error` wire frame,
 //! [`WireClientError::PluginReturnedError`] carries the message and
-//! fatal bit. The [`WireRespondent`] adapter maps this cleanly to the
-//! SDK's [`PluginError`] variants so the steward's admission engine
-//! can classify failures uniformly.
+//! the structured [`ErrorClass`]; connection-fatality is derived via
+//! [`ErrorClass::is_connection_fatal`]. The [`WireRespondent`]
+//! adapter maps this cleanly to the SDK's [`PluginError`] variants
+//! so the steward's admission engine can classify failures uniformly.
 //!
 //! ## Warden support
 //!
@@ -74,6 +75,7 @@ use evo_plugin_sdk::wire::{
     WireFrame, FEATURE_VERSION_MAX, FEATURE_VERSION_MIN, PROTOCOL_VERSION,
     SUPPORTED_CODECS,
 };
+use evo_plugin_sdk::ErrorClass;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
@@ -137,13 +139,24 @@ pub enum WireClientError {
     },
 
     /// The remote plugin returned a structured error frame.
-    #[error("plugin returned error (fatal={fatal}): {message}")]
+    #[error("plugin returned error (class={class}): {message}")]
     PluginReturnedError {
         /// Human-readable message from the plugin.
         message: String,
-        /// Fatal bit from the plugin. If true the steward should
-        /// deregister the plugin.
-        fatal: bool,
+        /// Structured taxonomy class from the plugin's error frame.
+        /// Connection-fatality is derived via
+        /// [`ErrorClass::is_connection_fatal`]; the steward should
+        /// deregister the plugin when that returns true.
+        class: ErrorClass,
+        /// Per-variant `details` envelope from the plugin's error
+        /// frame, when present. Carries the documented subclass
+        /// string and any class-specific extras per
+        /// `SCHEMAS.md` §4.1.2. `None` for variants that do not
+        /// publish a subclass on the wire. Operator-facing logs and
+        /// downstream callers translating to `PluginError` /
+        /// `ReportError` consult this field for the structured
+        /// signal beyond the human message.
+        details: Option<serde_json::Value>,
     },
 
     /// Config conversion failed (TOML values not representable in JSON,
@@ -440,9 +453,16 @@ impl WireClient {
         };
         match self.request(cid, frame).await? {
             WireFrame::DescribeResponse { description, .. } => Ok(description),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected describe_response, got {}",
                 variant_name(&other)
@@ -470,9 +490,16 @@ impl WireClient {
         };
         match self.request(cid, frame).await? {
             WireFrame::LoadResponse { .. } => Ok(()),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected load_response, got {}",
                 variant_name(&other)
@@ -490,9 +517,16 @@ impl WireClient {
         };
         match self.request(cid, frame).await? {
             WireFrame::UnloadResponse { .. } => Ok(()),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected unload_response, got {}",
                 variant_name(&other)
@@ -510,9 +544,16 @@ impl WireClient {
         };
         match self.request(cid, frame).await? {
             WireFrame::HealthCheckResponse { report, .. } => Ok(report),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected health_check_response, got {}",
                 variant_name(&other)
@@ -546,9 +587,16 @@ impl WireClient {
                 payload,
                 correlation_id: cid,
             }),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected handle_request_response, got {}",
                 variant_name(&other)
@@ -578,9 +626,16 @@ impl WireClient {
         };
         match self.request(correlation_id, frame).await? {
             WireFrame::TakeCustodyResponse { handle, .. } => Ok(handle),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected take_custody_response, got {}",
                 variant_name(&other)
@@ -608,9 +663,16 @@ impl WireClient {
         };
         match self.request(correlation_id, frame).await? {
             WireFrame::CourseCorrectResponse { .. } => Ok(()),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected course_correct_response, got {}",
                 variant_name(&other)
@@ -632,9 +694,16 @@ impl WireClient {
         };
         match self.request(correlation_id, frame).await? {
             WireFrame::ReleaseCustodyResponse { .. } => Ok(()),
-            WireFrame::Error { message, fatal, .. } => {
-                Err(WireClientError::PluginReturnedError { message, fatal })
-            }
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
             other => Err(WireClientError::Protocol(format!(
                 "expected release_custody_response, got {}",
                 variant_name(&other)
@@ -722,11 +791,24 @@ where
             }
             Ok(())
         }
-        WireFrame::Error { message, fatal, .. } => {
+        WireFrame::Error {
+            message,
+            class,
+            details,
+            ..
+        } => {
             Err(WireClientError::HandshakeFailed {
-                reason: format!(
-                    "plugin refused handshake (fatal={fatal}): {message}"
-                ),
+                reason: match details {
+                    Some(d) => {
+                        format!(
+                        "plugin refused handshake (class={class}): {message} \
+                         (details={d})"
+                    )
+                    }
+                    None => {
+                        format!("plugin refused handshake (class={class}): {message}")
+                    }
+                },
             })
         }
         other => Err(WireClientError::Protocol(format!(
@@ -773,7 +855,7 @@ async fn reader_loop<R>(
     loop {
         match read_frame_json(&mut reader).await {
             Ok(frame) => {
-                handle_inbound_frame(
+                let keep_going = handle_inbound_frame(
                     frame,
                     &pending,
                     &event_sink,
@@ -781,6 +863,15 @@ async fn reader_loop<R>(
                     &out_tx,
                 )
                 .await;
+                if !keep_going {
+                    // Protocol-violation tear-down: the structured
+                    // Error frame was already enqueued on out_tx so
+                    // the peer observes the rejection before the
+                    // socket closes. Drop the writer's input by
+                    // letting `out_tx` drop with the loop frame.
+                    drain_and_disable(&pending, &alive);
+                    return;
+                }
             }
             Err(WireError::PeerClosed) => {
                 drain_and_disable(&pending, &alive);
@@ -795,31 +886,62 @@ async fn reader_loop<R>(
     }
 }
 
+/// Process one inbound wire frame.
+///
+/// Returns `true` to continue the reader loop, `false` to tear
+/// down the connection. The tear-down path emits a structured
+/// `WireFrame::Error{ProtocolViolation}` on `out_tx` so the peer
+/// observes the rejection before the socket closes; the reader
+/// loop then drains pending requests and exits.
 async fn handle_inbound_frame(
     frame: WireFrame,
     pending: &Arc<Mutex<PendingMap>>,
     event_sink: &Arc<Mutex<Option<Arc<EventSink>>>>,
     expected_plugin: &str,
     out_tx: &mpsc::Sender<WireFrame>,
-) {
+) -> bool {
     let (v, cid, peer_plugin) = frame.envelope();
 
     if v != PROTOCOL_VERSION {
-        tracing::warn!(
-            cid = cid,
-            version = v,
-            "peer frame carries unexpected protocol version; dropping"
+        let msg = format!(
+            "peer frame carries protocol version {v}; expected \
+             {PROTOCOL_VERSION}"
         );
-        return;
+        tracing::warn!(cid = cid, version = v, "{msg}; tearing down");
+        let _ = out_tx
+            .send(WireFrame::Error {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin: expected_plugin.to_string(),
+                class: ErrorClass::ProtocolViolation,
+                message: msg,
+                details: None,
+            })
+            .await;
+        return false;
     }
     if peer_plugin != expected_plugin {
+        let msg = format!(
+            "peer frame carries plugin name {peer_plugin:?}; expected \
+             {expected_plugin:?}"
+        );
         tracing::warn!(
             cid = cid,
             expected = %expected_plugin,
             got = %peer_plugin,
-            "peer frame carries unexpected plugin name; dropping"
+            "{msg}; tearing down"
         );
-        return;
+        let _ = out_tx
+            .send(WireFrame::Error {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin: expected_plugin.to_string(),
+                class: ErrorClass::ProtocolViolation,
+                message: msg,
+                details: None,
+            })
+            .await;
+        return false;
     }
 
     if frame.is_response() || frame.is_error() {
@@ -855,9 +977,10 @@ async fn handle_inbound_frame(
                         v: PROTOCOL_VERSION,
                         cid,
                         plugin,
+                        class: ErrorClass::ContractViolation,
                         message: "event sink unavailable: plugin not loaded"
                             .into(),
-                        fatal: false,
+                        details: None,
                     })
                     .await;
             }
@@ -888,23 +1011,37 @@ async fn handle_inbound_frame(
                         v: PROTOCOL_VERSION,
                         cid,
                         plugin,
+                        class: ErrorClass::ContractViolation,
                         message:
                             "subject querier unavailable: plugin not loaded"
                                 .into(),
-                        fatal: false,
+                        details: None,
                     })
                     .await;
             }
         }
     } else {
         // Steward-initiated request from a plugin is a protocol
-        // violation; log and drop.
-        tracing::warn!(
-            cid = cid,
-            frame = variant_name(&frame),
-            "request frame arrived from peer; plugin side should not send requests"
+        // violation; emit a structured error and tear down so the
+        // peer observes the rejection.
+        let msg = format!(
+            "peer sent steward-only request frame {}; tearing down",
+            variant_name(&frame)
         );
+        tracing::warn!(cid = cid, "{msg}");
+        let _ = out_tx
+            .send(WireFrame::Error {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin: expected_plugin.to_string(),
+                class: ErrorClass::ProtocolViolation,
+                message: msg,
+                details: None,
+            })
+            .await;
+        return false;
     }
+    true
 }
 
 /// Dispatch a plugin-initiated request (describe_alias /
@@ -935,8 +1072,16 @@ async fn forward_plugin_request(
                 v,
                 cid,
                 plugin,
+                // Preserve the originating ReportError's class
+                // (NotFound, Unavailable, ResourceExhausted, etc.)
+                // rather than collapsing every refusal to
+                // ContractViolation. Per-variant subclass strings
+                // and class-specific extras populate `details` via
+                // [`report_error_details`]; variants without a
+                // documented subclass leave `details` unset.
+                class: e.class(),
                 message: format!("describe_alias: {e}"),
-                fatal: false,
+                details: report_error_details(&e),
             },
         },
         WireFrame::DescribeSubject {
@@ -959,8 +1104,9 @@ async fn forward_plugin_request(
                 v,
                 cid,
                 plugin,
+                class: e.class(),
                 message: format!("describe_subject: {e}"),
-                fatal: false,
+                details: report_error_details(&e),
             },
         },
 
@@ -986,8 +1132,9 @@ async fn forward_plugin_request(
                     v,
                     cid,
                     plugin,
+                    class: e.class(),
                     message: format!("forced_retract_addressing: {e}"),
-                    fatal: false,
+                    details: report_error_details(&e),
                 },
             },
             None => admin_capability_denied_error(v, cid, plugin),
@@ -1009,8 +1156,9 @@ async fn forward_plugin_request(
                         v,
                         cid,
                         plugin,
+                        class: e.class(),
                         message: format!("merge_subjects: {e}"),
-                        fatal: false,
+                        details: report_error_details(&e),
                     },
                 }
             }
@@ -1041,8 +1189,9 @@ async fn forward_plugin_request(
                     v,
                     cid,
                     plugin,
+                    class: e.class(),
                     message: format!("split_subject: {e}"),
-                    fatal: false,
+                    details: report_error_details(&e),
                 },
             },
             None => admin_capability_denied_error(v, cid, plugin),
@@ -1076,8 +1225,9 @@ async fn forward_plugin_request(
                     v,
                     cid,
                     plugin,
+                    class: e.class(),
                     message: format!("forced_retract_claim: {e}"),
-                    fatal: false,
+                    details: report_error_details(&e),
                 },
             },
             None => admin_capability_denied_error(v, cid, plugin),
@@ -1100,8 +1250,9 @@ async fn forward_plugin_request(
                         v,
                         cid,
                         plugin,
+                        class: e.class(),
                         message: format!("suppress_relation: {e}"),
-                        fatal: false,
+                        details: report_error_details(&e),
                     },
                 }
             }
@@ -1124,8 +1275,9 @@ async fn forward_plugin_request(
                         v,
                         cid,
                         plugin,
+                        class: e.class(),
                         message: format!("unsuppress_relation: {e}"),
-                        fatal: false,
+                        details: report_error_details(&e),
                     },
                 }
             }
@@ -1149,6 +1301,77 @@ async fn forward_plugin_request(
     }
 }
 
+/// Map a [`ReportError`] to the structured `details` payload that
+/// rides on a wire `Error` frame.
+///
+/// Returns `Some(json)` when the variant has a documented subclass
+/// in `SCHEMAS.md` §4.1.2, populating both the `subclass` discriminator
+/// and any class-specific extras the doc publishes. Returns `None` for
+/// variants that have no documented subclass today (`RateLimited`,
+/// `ShuttingDown`, `Deregistered`, `Invalid`, `MergeInternal`); the
+/// top-level [`ErrorClass`] alone carries the contract for these.
+///
+/// Subclass strings are stable across releases per the additive
+/// taxonomy contract: existing names are never renamed or repurposed,
+/// only appended.
+///
+/// [`ReportError`]: evo_plugin_sdk::contract::ReportError
+fn report_error_details(
+    err: &evo_plugin_sdk::contract::ReportError,
+) -> Option<serde_json::Value> {
+    use evo_plugin_sdk::contract::ReportError;
+    match err {
+        ReportError::TargetPluginUnknown { plugin } => {
+            Some(serde_json::json!({
+                "subclass": "target_plugin_unknown",
+                "plugin": plugin,
+            }))
+        }
+        ReportError::MergeSelfTarget => Some(serde_json::json!({
+            "subclass": "merge_self_target",
+        })),
+        ReportError::MergeSourceUnknown { addressing } => {
+            Some(serde_json::json!({
+                "subclass": "merge_source_unknown",
+                "addressing": addressing,
+            }))
+        }
+        ReportError::MergeCrossType { a_type, b_type } => {
+            Some(serde_json::json!({
+                "subclass": "merge_cross_type",
+                "a_type": a_type,
+                "b_type": b_type,
+            }))
+        }
+        ReportError::SplitTargetNewIdIndexOutOfBounds {
+            index,
+            partition_count,
+        } => Some(serde_json::json!({
+            "subclass": "split_target_index_out_of_bounds",
+            "index": index,
+            "partition_count": partition_count,
+        })),
+        ReportError::UnknownPredicate { predicate } => {
+            Some(serde_json::json!({
+                "subclass": "unknown_predicate",
+                "predicate": predicate,
+            }))
+        }
+        ReportError::UnknownSubjectType { subject_type } => {
+            Some(serde_json::json!({
+                "subclass": "unknown_subject_type",
+                "subject_type": subject_type,
+            }))
+        }
+        // `RateLimited`, `ShuttingDown`, `Deregistered`, `Invalid`,
+        // `MergeInternal` and any future variant SCHEMAS.md has not
+        // yet published a subclass for: leave `details` unset. The
+        // wire class is the contract; consumers acting on subclass
+        // see `None` and degrade to class-only behaviour.
+        _ => None,
+    }
+}
+
 /// Build the structured `Error` frame returned when a plugin
 /// invokes an admin verb but its load context did not carry an
 /// admin handle (the plugin's trust class did not grant the
@@ -1163,8 +1386,9 @@ fn admin_capability_denied_error(
         v,
         cid,
         plugin,
+        class: ErrorClass::PermissionDenied,
         message: "admin capability not granted to this plugin".to_string(),
-        fatal: false,
+        details: None,
     }
 }
 
@@ -1277,20 +1501,31 @@ async fn forward_event(
                 error = %err,
                 "event rejected by sink; replying with Error frame"
             );
+            // Defer the wire class to ReportError::class(), the
+            // single source of truth for the
+            // [`ReportError`]→[`ErrorClass`] mapping. Each
+            // ReportError variant has a deterministic class
+            // (Invalid → ContractViolation, ShuttingDown /
+            // Deregistered → Unavailable, RateLimited →
+            // ResourceExhausted, MergeSourceUnknown /
+            // TargetPluginUnknown → NotFound, MergeInternal →
+            // Internal, etc.); collapsing every refusal to
+            // ContractViolation or every shutdown to Internal
+            // erased information consumers need to drive retry,
+            // backoff, and circuit-breaker decisions.
+            //
+            // `details` carries the per-variant subclass string
+            // and any class-specific extras documented in
+            // SCHEMAS.md §4.1.2; variants without a documented
+            // subclass leave `details` unset.
+            let details = report_error_details(&err);
             WireFrame::Error {
                 v: PROTOCOL_VERSION,
                 cid,
                 plugin,
+                class: err.class(),
                 message: err.to_string(),
-                // Per the SDK contract, only ShuttingDown and
-                // Deregistered are session-fatal for the plugin's
-                // event surface. The other variants reject this one
-                // event without tearing the connection down.
-                fatal: matches!(
-                    err,
-                    evo_plugin_sdk::contract::ReportError::ShuttingDown
-                        | evo_plugin_sdk::contract::ReportError::Deregistered
-                ),
+                details,
             }
         }
     };
@@ -1474,6 +1709,14 @@ impl StdError for RemoteErrorSource {}
 
 /// Map a wire-client error to a plugin error for reporting back
 /// through the admission engine.
+///
+/// The `details` envelope carried by `PluginReturnedError` (and
+/// originally by the wire `Error` frame) is preserved on the resulting
+/// `PluginError`'s message: when present, the structured subclass and
+/// extras append after the human message. The downstream taxonomy
+/// translation in `error.rs` parses neither shape; this preserves the
+/// signal in the operator-facing log without changing the
+/// `PluginError` enum shape.
 fn wire_error_to_plugin_error(
     err: WireClientError,
     context: &'static str,
@@ -1481,12 +1724,19 @@ fn wire_error_to_plugin_error(
     match err {
         WireClientError::PluginReturnedError {
             message,
-            fatal: true,
-        } => PluginError::fatal(context, RemoteErrorSource(message)),
-        WireClientError::PluginReturnedError {
-            message,
-            fatal: false,
-        } => PluginError::Permanent(message),
+            class,
+            details,
+        } => {
+            let composed = match details {
+                Some(d) => format!("{message} (details={d})"),
+                None => message,
+            };
+            if class.is_connection_fatal() {
+                PluginError::fatal(context, RemoteErrorSource(composed))
+            } else {
+                PluginError::Permanent(composed)
+            }
+        }
         WireClientError::Disconnected => PluginError::fatal(
             format!("{context}: wire disconnected"),
             RemoteErrorSource("wire connection closed".into()),
@@ -2498,6 +2748,8 @@ mod tests {
         let catalogue = Arc::new(
             Catalogue::from_toml(
                 r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -3153,6 +3405,8 @@ target_type = "album"
         let catalogue = Arc::new(
             Catalogue::from_toml(
                 r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 
@@ -3218,6 +3472,8 @@ name = "album"
         let catalogue = Arc::new(
             Catalogue::from_toml(
                 r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 "#,
@@ -3392,6 +3648,8 @@ name = "track"
         let catalogue = Arc::new(
             Catalogue::from_toml(
                 r#"
+schema_version = 1
+
 [[subjects]]
 name = "track"
 "#,
@@ -3667,7 +3925,7 @@ name = "track"
                 cid,
                 plugin,
                 message,
-                fatal,
+                class,
                 ..
             } => {
                 assert_eq!(cid, 456);
@@ -3676,14 +3934,24 @@ name = "track"
                     message.contains("shelf shape rejected"),
                     "wire message must carry the rejection text"
                 );
-                assert!(!fatal, "Invalid is per-call, not session-fatal");
+                // ReportError::Invalid → ErrorClass::ContractViolation
+                // per ReportError::class(); not connection-fatal.
+                assert_eq!(class, ErrorClass::ContractViolation);
+                assert!(!class.is_connection_fatal());
             }
             other => panic!("expected Error, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn forward_event_marks_shutting_down_as_fatal() {
+    async fn forward_event_emits_unavailable_on_shutting_down() {
+        // ReportError::ShuttingDown → ErrorClass::Unavailable per
+        // ReportError::class(). The previous behaviour mapped this
+        // to ErrorClass::Internal (connection-fatal) on the wire,
+        // which collapsed the per-event refusal taxonomy.
+        // Unavailable correctly signals "transient at the
+        // operational layer; retry once the steward is back" while
+        // leaving connection lifecycle decisions to the consumer.
         let sink = sink_with_announcer(Arc::new(AlwaysErrAnnouncer {
             which: ScriptedErr::ShuttingDown,
         }));
@@ -3693,20 +3961,19 @@ name = "track"
 
         let response = out_rx.recv().await.expect("response frame");
         match response {
-            WireFrame::Error { cid, fatal, .. } => {
+            WireFrame::Error { cid, class, .. } => {
                 assert_eq!(cid, 789);
-                assert!(
-                    fatal,
-                    "ShuttingDown is session-fatal: signals the plugin to \
-                     stop emitting and tear down"
-                );
+                assert_eq!(class, ErrorClass::Unavailable);
             }
             other => panic!("expected Error, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn forward_event_marks_deregistered_as_fatal() {
+    async fn forward_event_emits_unavailable_on_deregistered() {
+        // ReportError::Deregistered → ErrorClass::Unavailable per
+        // ReportError::class(). Same rationale as the ShuttingDown
+        // test above.
         let sink = sink_with_announcer(Arc::new(AlwaysErrAnnouncer {
             which: ScriptedErr::Deregistered,
         }));
@@ -3716,7 +3983,9 @@ name = "track"
 
         let response = out_rx.recv().await.expect("response frame");
         match response {
-            WireFrame::Error { fatal, .. } => assert!(fatal),
+            WireFrame::Error { class, .. } => {
+                assert_eq!(class, ErrorClass::Unavailable);
+            }
             other => panic!("expected Error, got {other:?}"),
         }
     }
@@ -3867,13 +4136,13 @@ name = "track"
         match response {
             WireFrame::Error {
                 cid,
-                fatal,
+                class,
                 message,
                 ..
             } => {
                 assert_eq!(cid, 78);
                 assert!(
-                    !fatal,
+                    !class.is_connection_fatal(),
                     "non-fatal: per-call rejection, not session-level"
                 );
                 assert!(
@@ -3904,13 +4173,13 @@ name = "track"
         match response {
             WireFrame::Error {
                 cid,
-                fatal,
+                class,
                 message,
                 ..
             } => {
                 assert_eq!(cid, 79);
                 assert!(
-                    !fatal,
+                    !class.is_connection_fatal(),
                     "capability-denied is non-fatal: plugin may continue \
                      with non-admin verbs"
                 );
@@ -3969,8 +4238,9 @@ name = "track"
                     v: PROTOCOL_VERSION,
                     cid: 0,
                     plugin: "org.test.x".into(),
+                    class: ErrorClass::ProtocolViolation,
                     message: "no codec overlap".into(),
-                    fatal: true,
+                    details: None,
                 },
             )
             .await
@@ -4077,5 +4347,838 @@ name = "track"
             other => panic!("expected HandshakeFailed, got {other:?}"),
         }
         peer.await.unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // Error-class translation in forward_plugin_request (admin verbs
+    // and plugin-initiated requests). The class on the wire `Error`
+    // frame must derive from the originating ReportError's class, not
+    // collapse to ContractViolation.
+    // ---------------------------------------------------------------------
+
+    /// SubjectAdmin stub that returns a configurable [`ReportError`]
+    /// from `forced_retract_addressing`. Mirrors `CapturingSubjectAdmin`
+    /// but parameterised on the error variant rather than a bool.
+    struct ScriptedSubjectAdmin {
+        // Boxed so we can hand any ReportError variant to the stub
+        // without requiring ReportError: Clone (it deliberately is
+        // not, mirroring real plugin error semantics).
+        next: std::sync::Mutex<Option<ReportError>>,
+    }
+
+    impl ScriptedSubjectAdmin {
+        fn new(err: ReportError) -> Self {
+            Self {
+                next: std::sync::Mutex::new(Some(err)),
+            }
+        }
+    }
+
+    impl evo_plugin_sdk::contract::SubjectAdmin for ScriptedSubjectAdmin {
+        fn forced_retract_addressing<'a>(
+            &'a self,
+            _target_plugin: String,
+            _addressing: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            let err = self
+                .next
+                .lock()
+                .unwrap()
+                .take()
+                .expect("scripted admin called more than once");
+            Box::pin(async move { Err(err) })
+        }
+
+        fn merge<'a>(
+            &'a self,
+            _target_a: ExternalAddressing,
+            _target_b: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            let err = self
+                .next
+                .lock()
+                .unwrap()
+                .take()
+                .expect("scripted admin called more than once");
+            Box::pin(async move { Err(err) })
+        }
+
+        fn split<'a>(
+            &'a self,
+            _source: ExternalAddressing,
+            _partition: Vec<Vec<ExternalAddressing>>,
+            _strategy: evo_plugin_sdk::contract::SplitRelationStrategy,
+            _explicit_assignments: Vec<
+                evo_plugin_sdk::contract::ExplicitRelationAssignment,
+            >,
+            _reason: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            unreachable!("split not exercised by these admin error tests")
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_forced_retract_addressing_target_plugin_unknown_maps_to_not_found(
+    ) {
+        // ReportError::TargetPluginUnknown → ErrorClass::NotFound.
+        // Without per-class derivation every admin error would
+        // collapse to ContractViolation, leaving consumers unable
+        // to distinguish "your target plugin name is wrong" from
+        // "your retract payload is malformed".
+        let admin = Arc::new(ScriptedSubjectAdmin::new(
+            ReportError::TargetPluginUnknown {
+                plugin: "org.does-not-exist".into(),
+            },
+        ));
+        let admin_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> = admin;
+        let sink = sink_with_subject_admin(Some(admin_dyn));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::ForcedRetractAddressing {
+            v: PROTOCOL_VERSION,
+            cid: 200,
+            plugin: "org.admin".into(),
+            target_plugin: "org.does-not-exist".into(),
+            addressing: ExternalAddressing::new("mpd-path", "/m/x.flac"),
+            reason: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { cid, class, .. } => {
+                assert_eq!(cid, 200);
+                assert_eq!(class, ErrorClass::NotFound);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_merge_source_unknown_maps_to_not_found() {
+        let admin = Arc::new(ScriptedSubjectAdmin::new(
+            ReportError::MergeSourceUnknown {
+                addressing: "mpd-album:bogus".into(),
+            },
+        ));
+        let admin_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> = admin;
+        let sink = sink_with_subject_admin(Some(admin_dyn));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::MergeSubjects {
+            v: PROTOCOL_VERSION,
+            cid: 201,
+            plugin: "org.admin".into(),
+            target_a: ExternalAddressing::new("mpd-album", "a"),
+            target_b: ExternalAddressing::new("mpd-album", "b"),
+            reason: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { cid, class, .. } => {
+                assert_eq!(cid, 201);
+                assert_eq!(class, ErrorClass::NotFound);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_merge_internal_maps_to_internal() {
+        // ReportError::MergeInternal → ErrorClass::Internal.
+        // Without per-class derivation this would collapse to
+        // ContractViolation, telling consumers "you sent a bad
+        // request" when the truth is "the steward's internal merge
+        // primitive failed".
+        let admin =
+            Arc::new(ScriptedSubjectAdmin::new(ReportError::MergeInternal {
+                detail: "graph rewrite primitive failed".into(),
+            }));
+        let admin_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> = admin;
+        let sink = sink_with_subject_admin(Some(admin_dyn));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::MergeSubjects {
+            v: PROTOCOL_VERSION,
+            cid: 202,
+            plugin: "org.admin".into(),
+            target_a: ExternalAddressing::new("mpd-album", "a"),
+            target_b: ExternalAddressing::new("mpd-album", "b"),
+            reason: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { cid, class, .. } => {
+                assert_eq!(cid, 202);
+                assert_eq!(class, ErrorClass::Internal);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_rate_limited_maps_to_resource_exhausted() {
+        let admin =
+            Arc::new(ScriptedSubjectAdmin::new(ReportError::RateLimited));
+        let admin_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> = admin;
+        let sink = sink_with_subject_admin(Some(admin_dyn));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::ForcedRetractAddressing {
+            v: PROTOCOL_VERSION,
+            cid: 203,
+            plugin: "org.admin".into(),
+            target_plugin: "org.target".into(),
+            addressing: ExternalAddressing::new("mpd-path", "/x"),
+            reason: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { cid, class, .. } => {
+                assert_eq!(cid, 203);
+                assert_eq!(class, ErrorClass::ResourceExhausted);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// SubjectQuerier stub that returns a configurable [`ReportError`]
+    /// from `describe_alias`. Mirrors `NotFoundSubjectQuerier` but
+    /// returns Err instead of Ok(None).
+    struct ScriptedSubjectQuerier {
+        next: std::sync::Mutex<Option<ReportError>>,
+    }
+
+    impl ScriptedSubjectQuerier {
+        fn new(err: ReportError) -> Self {
+            Self {
+                next: std::sync::Mutex::new(Some(err)),
+            }
+        }
+    }
+
+    impl evo_plugin_sdk::contract::SubjectQuerier for ScriptedSubjectQuerier {
+        fn describe_alias<'a>(
+            &'a self,
+            _subject_id: String,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Option<evo_plugin_sdk::contract::AliasRecord>,
+                            ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let err = self
+                .next
+                .lock()
+                .unwrap()
+                .take()
+                .expect("scripted querier called more than once");
+            Box::pin(async move { Err(err) })
+        }
+
+        fn describe_subject_with_aliases<'a>(
+            &'a self,
+            _subject_id: String,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            evo_plugin_sdk::contract::SubjectQueryResult,
+                            ReportError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let err = self
+                .next
+                .lock()
+                .unwrap()
+                .take()
+                .expect("scripted querier called more than once");
+            Box::pin(async move { Err(err) })
+        }
+    }
+
+    fn sink_with_subject_querier(
+        querier: Arc<dyn evo_plugin_sdk::contract::SubjectQuerier>,
+    ) -> EventSink {
+        use crate::context::LoggingStateReporter as LSR;
+        EventSink {
+            state_reporter: Arc::new(LSR::new("org.test")),
+            subject_announcer: Arc::new(AlwaysOkAnnouncer),
+            relation_announcer: Arc::new(UnreachableRelationAnnouncer),
+            custody_state_reporter: None,
+            subject_querier: querier,
+            subject_admin: None,
+            relation_admin: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_request_describe_alias_rate_limited_maps_to_resource_exhausted(
+    ) {
+        // Plugin-initiated request path: when a plugin asks the
+        // steward to resolve an alias and the steward's querier
+        // refuses with RateLimited, the wire `Error` frame must
+        // surface ResourceExhausted, not ContractViolation. The
+        // distinction lets the plugin back off rather than treat
+        // the request as malformed.
+        let querier =
+            Arc::new(ScriptedSubjectQuerier::new(ReportError::RateLimited));
+        let querier_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectQuerier> =
+            querier;
+        let sink = sink_with_subject_querier(querier_dyn);
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::DescribeAlias {
+            v: PROTOCOL_VERSION,
+            cid: 300,
+            plugin: "org.consumer".into(),
+            subject_id: "subj-123".into(),
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { cid, class, .. } => {
+                assert_eq!(cid, 300);
+                assert_eq!(class, ErrorClass::ResourceExhausted);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_request_describe_subject_shutting_down_maps_to_unavailable()
+    {
+        let querier =
+            Arc::new(ScriptedSubjectQuerier::new(ReportError::ShuttingDown));
+        let querier_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectQuerier> =
+            querier;
+        let sink = sink_with_subject_querier(querier_dyn);
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::DescribeSubject {
+            v: PROTOCOL_VERSION,
+            cid: 301,
+            plugin: "org.consumer".into(),
+            subject_id: "subj-456".into(),
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { cid, class, .. } => {
+                assert_eq!(cid, 301);
+                assert_eq!(class, ErrorClass::Unavailable);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // wire_error_to_plugin_error derives fatality from
+    // class.is_connection_fatal(). Pin that contract.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn wire_error_to_plugin_error_derives_fatality_from_class() {
+        // Internal class is connection-fatal → maps to Fatal.
+        let pe = wire_error_to_plugin_error(
+            WireClientError::PluginReturnedError {
+                message: "internal blew up".into(),
+                class: ErrorClass::Internal,
+                details: None,
+            },
+            "ctx",
+        );
+        assert!(pe.is_fatal(), "Internal class must map to Fatal");
+
+        // ContractViolation is not connection-fatal → maps to Permanent.
+        let pe = wire_error_to_plugin_error(
+            WireClientError::PluginReturnedError {
+                message: "bad input".into(),
+                class: ErrorClass::ContractViolation,
+                details: None,
+            },
+            "ctx",
+        );
+        assert!(
+            pe.is_permanent(),
+            "ContractViolation class must map to Permanent"
+        );
+
+        // NotFound is not connection-fatal → maps to Permanent.
+        let pe = wire_error_to_plugin_error(
+            WireClientError::PluginReturnedError {
+                message: "missing".into(),
+                class: ErrorClass::NotFound,
+                details: None,
+            },
+            "ctx",
+        );
+        assert!(pe.is_permanent());
+
+        // ProtocolViolation is connection-fatal → maps to Fatal.
+        let pe = wire_error_to_plugin_error(
+            WireClientError::PluginReturnedError {
+                message: "bad frame".into(),
+                class: ErrorClass::ProtocolViolation,
+                details: None,
+            },
+            "ctx",
+        );
+        assert!(pe.is_fatal());
+    }
+
+    /// `details` from the wire `Error` frame are preserved on the
+    /// resulting `PluginError`'s message text. The translation layer
+    /// composes the human message and the structured envelope into a
+    /// single string so an operator reading the log sees both the
+    /// summary and the subclass / extras without having to plumb a
+    /// new field through every error site.
+    #[test]
+    fn wire_error_to_plugin_error_preserves_details_in_message() {
+        let pe = wire_error_to_plugin_error(
+            WireClientError::PluginReturnedError {
+                message: "merge source unknown".into(),
+                class: ErrorClass::NotFound,
+                details: Some(serde_json::json!({
+                    "subclass": "merge_source_unknown",
+                    "subject_id": "abc-123",
+                })),
+            },
+            "ctx",
+        );
+        let msg = format!("{pe}");
+        assert!(
+            msg.contains("merge source unknown"),
+            "human message must survive: {msg}"
+        );
+        assert!(
+            msg.contains("merge_source_unknown") && msg.contains("abc-123"),
+            "details envelope must surface in the composed message: {msg}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Wire `Error` frames carry per-variant `details.subclass` and
+    // class-specific extras for every documented subclass in
+    // SCHEMAS.md §4.1.2. Variants without a documented subclass continue
+    // to ship `details = None`; the top-level class remains the contract.
+    // ---------------------------------------------------------------------
+
+    /// SubjectAnnouncer that returns a fresh, configurable
+    /// [`ReportError`] from `announce`. Mirrors `AlwaysErrAnnouncer`
+    /// but parameterised on the full enum so the per-variant subclass
+    /// tests can exercise every variant without the [`ScriptedErr`]
+    /// wrapper.
+    struct ScriptedAnnouncer {
+        next: std::sync::Mutex<Option<ReportError>>,
+    }
+
+    impl ScriptedAnnouncer {
+        fn new(err: ReportError) -> Self {
+            Self {
+                next: std::sync::Mutex::new(Some(err)),
+            }
+        }
+    }
+
+    impl evo_plugin_sdk::contract::SubjectAnnouncer for ScriptedAnnouncer {
+        fn announce<'a>(
+            &'a self,
+            _announcement: SubjectAnnouncement,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            let err = self
+                .next
+                .lock()
+                .unwrap()
+                .take()
+                .expect("scripted announcer called more than once");
+            Box::pin(async move { Err(err) })
+        }
+
+        fn retract<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _reason: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            unreachable!("per-variant subclass tests only exercise announce")
+        }
+    }
+
+    /// Drive `forward_event` against an `AnnounceSubject` frame and
+    /// extract the resulting `Error` frame's `class` and `details`.
+    /// Helper folds the dispatch boilerplate so each subclass test
+    /// reads as a single class+subclass+extras assertion.
+    async fn drive_event_and_capture_error(
+        err: ReportError,
+    ) -> (ErrorClass, Option<serde_json::Value>) {
+        let sink = sink_with_announcer(Arc::new(ScriptedAnnouncer::new(err)));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+        forward_event(announce_frame(1), &sink, &out_tx).await;
+        match out_rx.recv().await.expect("response frame") {
+            WireFrame::Error { class, details, .. } => (class, details),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn details_carry_unknown_subject_type_subclass_and_extras() {
+        let (class, details) =
+            drive_event_and_capture_error(ReportError::UnknownSubjectType {
+                subject_type: "podcast_episode".into(),
+            })
+            .await;
+        assert_eq!(class, ErrorClass::ContractViolation);
+        let details = details.expect("details payload populated");
+        assert_eq!(details["subclass"].as_str(), Some("unknown_subject_type"));
+        assert_eq!(
+            details["subject_type"].as_str(),
+            Some("podcast_episode"),
+            "extras carry the offending subject type"
+        );
+    }
+
+    #[tokio::test]
+    async fn details_carry_unknown_predicate_subclass_and_extras() {
+        let (class, details) =
+            drive_event_and_capture_error(ReportError::UnknownPredicate {
+                predicate: "bogus_predicate".into(),
+            })
+            .await;
+        assert_eq!(class, ErrorClass::ContractViolation);
+        let details = details.expect("details payload populated");
+        assert_eq!(details["subclass"].as_str(), Some("unknown_predicate"));
+        assert_eq!(
+            details["predicate"].as_str(),
+            Some("bogus_predicate"),
+            "extras carry the offending predicate name"
+        );
+    }
+
+    /// Drive `forward_plugin_request` against a merge admin frame and
+    /// extract the resulting `Error` frame's `class` and `details`.
+    async fn drive_merge_admin_and_capture_error(
+        err: ReportError,
+    ) -> (ErrorClass, Option<serde_json::Value>) {
+        let admin = Arc::new(ScriptedSubjectAdmin::new(err));
+        let admin_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> = admin;
+        let sink = sink_with_subject_admin(Some(admin_dyn));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+        let request = WireFrame::MergeSubjects {
+            v: PROTOCOL_VERSION,
+            cid: 400,
+            plugin: "org.admin".into(),
+            target_a: ExternalAddressing::new("mpd-album", "a"),
+            target_b: ExternalAddressing::new("mpd-album", "b"),
+            reason: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+        match out_rx.recv().await.expect("response frame") {
+            WireFrame::Error { class, details, .. } => (class, details),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn details_carry_merge_self_target_subclass() {
+        let (class, details) =
+            drive_merge_admin_and_capture_error(ReportError::MergeSelfTarget)
+                .await;
+        assert_eq!(class, ErrorClass::ContractViolation);
+        let details = details.expect("details payload populated");
+        assert_eq!(details["subclass"].as_str(), Some("merge_self_target"));
+    }
+
+    #[tokio::test]
+    async fn details_carry_merge_cross_type_subclass_and_extras() {
+        let (class, details) =
+            drive_merge_admin_and_capture_error(ReportError::MergeCrossType {
+                a_type: "track".into(),
+                b_type: "album".into(),
+            })
+            .await;
+        assert_eq!(class, ErrorClass::ContractViolation);
+        let details = details.expect("details payload populated");
+        assert_eq!(details["subclass"].as_str(), Some("merge_cross_type"));
+        assert_eq!(details["a_type"].as_str(), Some("track"));
+        assert_eq!(details["b_type"].as_str(), Some("album"));
+    }
+
+    #[tokio::test]
+    async fn details_carry_merge_source_unknown_subclass_and_extras() {
+        let (class, details) = drive_merge_admin_and_capture_error(
+            ReportError::MergeSourceUnknown {
+                addressing: "mpd-album:bogus".into(),
+            },
+        )
+        .await;
+        assert_eq!(class, ErrorClass::NotFound);
+        let details = details.expect("details payload populated");
+        assert_eq!(details["subclass"].as_str(), Some("merge_source_unknown"));
+        assert_eq!(
+            details["addressing"].as_str(),
+            Some("mpd-album:bogus"),
+            "extras carry the unresolvable addressing"
+        );
+    }
+
+    #[tokio::test]
+    async fn details_carry_target_plugin_unknown_subclass_and_extras() {
+        // Drives the `ForcedRetractAddressing` admin frame so the
+        // dispatch lands on `forced_retract_addressing` rather than
+        // `merge`; both share the `report_error_details` helper but
+        // exercising the second admin entry point pins both wirings.
+        let admin = Arc::new(ScriptedSubjectAdmin::new(
+            ReportError::TargetPluginUnknown {
+                plugin: "org.does-not-exist".into(),
+            },
+        ));
+        let admin_dyn: Arc<dyn evo_plugin_sdk::contract::SubjectAdmin> = admin;
+        let sink = sink_with_subject_admin(Some(admin_dyn));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::ForcedRetractAddressing {
+            v: PROTOCOL_VERSION,
+            cid: 401,
+            plugin: "org.admin".into(),
+            target_plugin: "org.does-not-exist".into(),
+            addressing: ExternalAddressing::new("mpd-path", "/x"),
+            reason: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error { class, details, .. } => {
+                assert_eq!(class, ErrorClass::NotFound);
+                let details = details.expect("details payload populated");
+                assert_eq!(
+                    details["subclass"].as_str(),
+                    Some("target_plugin_unknown")
+                );
+                assert_eq!(
+                    details["plugin"].as_str(),
+                    Some("org.does-not-exist"),
+                    "extras carry the unknown plugin name"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn details_carry_split_target_index_out_of_bounds_subclass_and_extras(
+    ) {
+        let (class, details) = drive_merge_admin_and_capture_error(
+            ReportError::SplitTargetNewIdIndexOutOfBounds {
+                index: 7,
+                partition_count: 3,
+            },
+        )
+        .await;
+        assert_eq!(class, ErrorClass::ContractViolation);
+        let details = details.expect("details payload populated");
+        assert_eq!(
+            details["subclass"].as_str(),
+            Some("split_target_index_out_of_bounds")
+        );
+        assert_eq!(details["index"].as_u64(), Some(7));
+        assert_eq!(details["partition_count"].as_u64(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn details_remain_unset_for_undocumented_subclass_variants() {
+        // RateLimited, ShuttingDown, Deregistered, Invalid and
+        // MergeInternal have no published subclass in SCHEMAS.md
+        // §4.1.2; the wire frame must continue to ship `details =
+        // None` so consumers fall back to top-level class semantics
+        // rather than scrape a partial subclass string.
+        for err in [
+            ReportError::RateLimited,
+            ReportError::ShuttingDown,
+            ReportError::Deregistered,
+            ReportError::Invalid("free-form rejection".into()),
+            ReportError::MergeInternal {
+                detail: "rewrite primitive failed".into(),
+            },
+        ] {
+            let (_class, details) = drive_event_and_capture_error(err).await;
+            assert!(
+                details.is_none(),
+                "undocumented subclass variants must leave details \
+                 unset; got {details:?}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Wire-frame strictness — protocol-violation tear-down
+    // ---------------------------------------------------------------
+
+    /// `handle_inbound_frame` test fixture: build a fresh
+    /// `pending` map and `event_sink` slot, plus an mpsc channel
+    /// the function writes outbound frames onto. The receiver is
+    /// returned so the test can drain whatever the function
+    /// emitted (the structured ProtocolViolation Error frame, in
+    /// the strictness path).
+    #[allow(clippy::type_complexity)]
+    fn fresh_inbound_handler_state() -> (
+        Arc<Mutex<PendingMap>>,
+        Arc<Mutex<Option<Arc<EventSink>>>>,
+        mpsc::Sender<WireFrame>,
+        mpsc::Receiver<WireFrame>,
+    ) {
+        let pending: Arc<Mutex<PendingMap>> =
+            Arc::new(Mutex::new(PendingMap::new()));
+        let event_sink: Arc<Mutex<Option<Arc<EventSink>>>> =
+            Arc::new(Mutex::new(None));
+        let (out_tx, out_rx) = mpsc::channel::<WireFrame>(8);
+        (pending, event_sink, out_tx, out_rx)
+    }
+
+    #[tokio::test]
+    async fn protocol_version_mismatch_emits_protocol_violation_and_tears_down()
+    {
+        let (pending, sink, out_tx, mut out_rx) = fresh_inbound_handler_state();
+        // Construct a frame whose envelope claims a protocol
+        // version the steward does not speak. `is_response` is
+        // not relevant; envelope() reads only `v`, `cid`, and
+        // `plugin`, so a Hello frame with the wrong `v` is the
+        // simplest reproducer.
+        let bad_v: u16 = PROTOCOL_VERSION + 99;
+        let frame = WireFrame::Hello {
+            v: bad_v,
+            cid: 0,
+            plugin: "org.test.peer".into(),
+            feature_min: 1,
+            feature_max: 1,
+            codecs: vec!["json".into()],
+        };
+
+        let keep_going = handle_inbound_frame(
+            frame,
+            &pending,
+            &sink,
+            "org.test.peer",
+            &out_tx,
+        )
+        .await;
+        assert!(!keep_going, "tear-down requires reader-loop exit");
+
+        let emitted = out_rx
+            .recv()
+            .await
+            .expect("a structured Error frame must be emitted on tear-down");
+        match emitted {
+            WireFrame::Error { class, message, .. } => {
+                assert_eq!(
+                    class,
+                    ErrorClass::ProtocolViolation,
+                    "version-mismatch tear-down must classify as \
+                     ProtocolViolation"
+                );
+                assert!(
+                    message.contains(&format!("{bad_v}")),
+                    "operator-readable message should name the offending \
+                     version, got: {message}"
+                );
+            }
+            other => {
+                panic!("expected Error frame, got {other:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_plugin_mismatch_emits_protocol_violation_and_tears_down() {
+        let (pending, sink, out_tx, mut out_rx) = fresh_inbound_handler_state();
+        // EventAck is a plugin-side frame whose envelope carries
+        // the peer's plugin name. A frame whose `plugin` field
+        // does not match the expected name is a tear-down case.
+        let frame = WireFrame::EventAck {
+            v: PROTOCOL_VERSION,
+            cid: 7,
+            plugin: "org.test.imposter".into(),
+        };
+
+        let keep_going = handle_inbound_frame(
+            frame,
+            &pending,
+            &sink,
+            "org.test.expected",
+            &out_tx,
+        )
+        .await;
+        assert!(!keep_going, "tear-down requires reader-loop exit");
+
+        let emitted = out_rx
+            .recv()
+            .await
+            .expect("a structured Error frame must be emitted on tear-down");
+        match emitted {
+            WireFrame::Error { class, message, .. } => {
+                assert_eq!(class, ErrorClass::ProtocolViolation);
+                assert!(
+                    message.contains("imposter")
+                        && message.contains("expected"),
+                    "operator-readable message should name both peer and \
+                     expected plugin, got: {message}"
+                );
+            }
+            other => {
+                panic!("expected Error frame, got {other:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn well_formed_event_frame_does_not_tear_down() {
+        // Sanity: a well-formed frame (matching version + plugin)
+        // returns `true` so the reader loop continues. Without an
+        // event sink installed the handler emits a contract-
+        // violation Error frame, but it does NOT tear down — the
+        // reader stays alive for subsequent frames.
+        let (pending, sink, out_tx, _out_rx) = fresh_inbound_handler_state();
+        let frame = WireFrame::ReportState {
+            v: PROTOCOL_VERSION,
+            cid: 0,
+            plugin: "org.test.peer".into(),
+            payload: Vec::new(),
+            priority: evo_plugin_sdk::contract::ReportPriority::Normal,
+        };
+        let keep_going = handle_inbound_frame(
+            frame,
+            &pending,
+            &sink,
+            "org.test.peer",
+            &out_tx,
+        )
+        .await;
+        assert!(
+            keep_going,
+            "well-formed event frame must not trigger tear-down"
+        );
     }
 }
