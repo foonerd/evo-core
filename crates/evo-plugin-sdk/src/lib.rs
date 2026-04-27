@@ -21,7 +21,6 @@
 //!   [`host::serve_warden`], each over a single async I/O connection,
 //!   per `PLUGIN_CONTRACT.md` sections 6 through 11. Feature-gated on
 //!   `wire`.
-//! - [`testing`]: (placeholder) Mock steward harness for plugin authors.
 //!
 //! The plugin runtime contract, artefact contract, vendor contract, and
 //! logging contract are authoritative specifications; this crate is the
@@ -86,8 +85,6 @@ pub mod codec;
 pub mod host;
 #[cfg(feature = "wire")]
 pub mod wire;
-
-pub mod testing;
 
 pub use error::ManifestError;
 pub use error_taxonomy::ErrorClass;

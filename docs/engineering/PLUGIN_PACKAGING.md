@@ -447,7 +447,6 @@ At plugin admission, the steward:
 [[revoke]]
 digest = "sha256:..."                  # Install digest.
 reason = "CVE-2026-1234"
-effective_after = "2026-04-01T00:00:00Z"
 
 # Revoke a trust key by its public-key fingerprint. Any bundle
 # signed by a chain that walks through this key — leaf, ancestor,

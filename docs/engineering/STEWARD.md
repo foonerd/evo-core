@@ -419,7 +419,13 @@ Structural queries (`get_projection(rack = "audio")`) are documented in `PROJECT
 
 ### 12.6 Fast Path
 
-The real-time mutation channel for parameter changes, transport commands, and volume - see `FAST_PATH.md`. The v0 client-facing socket serves everything through the same slow path; the dedicated low-latency channel remains on the roadmap.
+The real-time mutation channel for parameter changes, transport commands, and volume - see `FAST_PATH.md`. Two halves:
+
+**Plugin-wire half (steward → warden):** implemented today. `PluginRouter::course_correct(handle, CourseCorrection)` dispatches a budget-bounded course-correction to the warden holding the relevant custody, with the budget drawn from the manifest's `capabilities.warden.course_correction_budget_ms`. Custody-failure-mode honoured (`abort` vs `partial_ok`) with differential ledger transitions and `Happening::CustodyAborted` / `CustodyDegraded` audit. This is the steward-side mechanism `FAST_PATH.md` §3 maps to: a fast-path command IS a warden course-correction.
+
+**Client-wire half (consumer → steward):** on the roadmap. Today's client-facing socket exposes only the slow path: a consumer sending "play" or "set volume" to a warden issues `op = "request"` against the warden's shelf, which the steward dispatches via `forward_plugin_request`. A dedicated client-side fast-path verb (consumer issues a single low-latency frame, steward routes directly to the warden's `course_correct` rather than `handle_request`) lands in a later release.
+
+Until the client-side verb lands, consumers wanting course-correction semantics issue the warden-defined slow-path request. The latency profile is single-millisecond range for an in-process plugin and low-ms for an out-of-process plugin via Unix socket — adequate for typical UI control surfaces, not adequate for the audio-frame-deadline shape `FAST_PATH.md` §1 names.
 
 ### 12.7 Factory Plugins
 

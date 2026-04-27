@@ -50,10 +50,6 @@ struct RevokeLine {
     #[serde(default)]
     #[allow(dead_code)]
     reason: String,
-    /// Optional; reserved for time-gated policy in a future pass.
-    #[serde(default)]
-    #[allow(dead_code)]
-    effective_after: Option<String>,
 }
 
 /// Loaded set of revoked install digests and key fingerprints.
