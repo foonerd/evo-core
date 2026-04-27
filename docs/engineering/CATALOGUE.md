@@ -160,6 +160,16 @@ Subject types are part of a catalogue's public contract. Renaming a type or remo
 
 Adding a new subject type is additive.
 
+#### Strongly recommended discipline
+
+Until a structured grammar-survival surface lands (operator-callable re-statement verb plus orphan-detected happenings), distributions are strongly recommended to follow an **additive-only** discipline on subject types: never remove or rename a type, only add. The framework today does not provide a migration path for orphaned subjects beyond the boot-time diagnostic described next; an operator who upgrades a catalogue that drops a type must accept that subjects of that type will live on as read-only orphans until either the type is reintroduced or a future migration verb lands.
+
+#### Boot-time orphan diagnostic
+
+At every startup the steward groups every persisted subject by its declared `subject_type` and diffs the result against the loaded catalogue's declared types. A type that appears in storage but not in the catalogue is logged as a `catalogue orphan` warning per type with the row count, and a single summary warning enumerates how many orphaned types and rows were detected. The diagnostic does not refuse boot, modify state, or hide queries — orphans continue to be readable via existing query paths and an attempt to announce a new subject of an orphaned type fails at the wiring layer with the same structured error any unknown-type announcement raises.
+
+This gives operators visibility from day one even though a structured migration verb is not yet available; the warnings let an operator scope the impact of a catalogue change before a structured re-statement surface lands.
+
 ### 5.4 Enforcement
 
 Two checks run on subject types:

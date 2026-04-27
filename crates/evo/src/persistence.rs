@@ -759,7 +759,37 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
                 + 'a,
         >,
     >;
+
+    /// Group every persisted subject by its declared `subject_type`
+    /// and return `(subject_type, count)` pairs in `subject_type`
+    /// ascending order.
+    ///
+    /// Used at boot for the catalogue-orphan diagnostic: a type that
+    /// appears here but not in the loaded catalogue's declared types
+    /// is an orphan — a subject persisted under a vocabulary entry
+    /// the current catalogue no longer admits. The diagnostic emits
+    /// an operator-visible warning per orphaned type with the row
+    /// count so the operator can scope a deliberate migration.
+    /// Cheap by design (the `subjects` table has an index on
+    /// `subject_type`); intended to run at every steward boot.
+    fn count_subjects_by_type<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<SubjectTypeCount>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    >;
 }
+
+/// One row of the boot-time subject-type aggregation: a declared
+/// `subject_type` plus the live row count under it. Returned in
+/// `subject_type` ascending order from
+/// [`PersistenceStore::count_subjects_by_type`] so consumers can
+/// diff a sorted slice against the catalogue's declared set
+/// without re-sorting.
+pub type SubjectTypeCount = (String, u64);
 
 /// Claim-log kind values used by this slice. Strings are stable
 /// on disk and must not be renamed without a migration.
@@ -2025,6 +2055,57 @@ impl PersistenceStore for SqlitePersistenceStore {
             .await
         })
     }
+
+    fn count_subjects_by_type<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<SubjectTypeCount>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("count_subjects_by_type", |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT subject_type, COUNT(*) FROM subjects \
+                         WHERE forgotten_at_ms IS NULL \
+                         GROUP BY subject_type ORDER BY subject_type ASC",
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "prepare subject_type aggregation",
+                            e,
+                        )
+                    })?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)? as u64,
+                        ))
+                    })
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "execute subject_type aggregation",
+                            e,
+                        )
+                    })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r.map_err(|e| {
+                        PersistenceError::sqlite(
+                            "read subject_type aggregation row",
+                            e,
+                        )
+                    })?);
+                }
+                Ok(out)
+            })
+            .await
+        })
+    }
 }
 
 /// In-memory mock implementation of [`PersistenceStore`].
@@ -2558,6 +2639,29 @@ impl PersistenceStore for MemoryPersistenceStore {
             Ok(out)
         })
     }
+
+    fn count_subjects_by_type<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<SubjectTypeCount>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            let mut counts: HashMap<String, u64> = HashMap::new();
+            for s in g.subjects.values() {
+                if s.forgotten_at_ms.is_none() {
+                    *counts.entry(s.subject_type.clone()).or_insert(0) += 1;
+                }
+            }
+            let mut out: Vec<(String, u64)> = counts.into_iter().collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(out)
+        })
+    }
 }
 
 /// Convenience: test fixture builder for code that needs an
@@ -2577,6 +2681,52 @@ mod tests {
     }
 
     // --- in-memory backend -------------------------------------------------
+
+    #[tokio::test]
+    async fn memory_count_subjects_by_type_groups_and_sorts() {
+        // Boot-time orphan diagnostic helper: persistence groups
+        // every live subject by `subject_type` and the boot path
+        // diffs the result against the loaded catalogue's declared
+        // types. The accessor sorts ascending so warnings emit in a
+        // stable order; forgotten subjects are excluded so historical
+        // types whose subjects all retracted no longer surface.
+        let s = MemoryPersistenceStore::new();
+        for (id, ty) in [
+            ("uuid-1", "track"),
+            ("uuid-2", "track"),
+            ("uuid-3", "track"),
+            ("uuid-4", "album"),
+            ("uuid-5", "album"),
+            ("uuid-6", "podcast_episode"),
+        ] {
+            s.record_subject_announce(AnnounceRecord {
+                canonical_id: id,
+                subject_type: ty,
+                addressings: &[ext("test", id)],
+                claimant: "p1",
+                claims: &[],
+                at_ms: 1000,
+            })
+            .await
+            .unwrap();
+        }
+
+        // Forget one of the tracks so its row no longer counts
+        // toward the live grouping.
+        s.record_subject_forget("uuid-3", 1100).await.unwrap();
+
+        let counts = s.count_subjects_by_type().await.unwrap();
+        assert_eq!(
+            counts,
+            vec![
+                ("album".to_string(), 2),
+                ("podcast_episode".to_string(), 1),
+                ("track".to_string(), 2),
+            ],
+            "live counts must group by type, exclude forgotten, and \
+             sort ascending; got: {counts:?}"
+        );
+    }
 
     #[tokio::test]
     async fn memory_announce_then_load_returns_subject() {

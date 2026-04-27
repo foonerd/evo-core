@@ -115,6 +115,64 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("loading instance_id: {e}"))?;
     tracing::info!(instance_id = %instance_id, "steward instance identified");
+
+    // Catalogue-orphan diagnostic. Boot-time scan of every persisted
+    // subject_type against the loaded catalogue's declared types: a
+    // type that appears in storage but not in the catalogue is an
+    // orphan — a subject persisted under a vocabulary entry the
+    // current catalogue no longer admits. This emits an
+    // operator-visible warning per orphaned type with the row count
+    // so the operator can scope a deliberate migration. The diagnostic
+    // does not refuse boot or modify state; orphans continue to be
+    // readable via existing query paths and announce of new subjects
+    // of the orphaned type fails at the wiring layer with the same
+    // structured error any unknown-type announcement raises.
+    let declared_types: std::collections::HashSet<String> =
+        catalogue.subjects.iter().map(|s| s.name.clone()).collect();
+    match persistence.count_subjects_by_type().await {
+        Ok(persisted) => {
+            let mut orphan_types = 0usize;
+            let mut orphan_rows: u64 = 0;
+            for (subject_type, count) in &persisted {
+                if !declared_types.contains(subject_type) {
+                    tracing::warn!(
+                        subject_type = %subject_type,
+                        count = *count,
+                        "catalogue orphan: persisted subjects of this type \
+                         remain in storage but the loaded catalogue no longer \
+                         declares the type; these subjects are read-only via \
+                         existing queries and cannot be re-announced or \
+                         re-stated until a migration verb lands"
+                    );
+                    orphan_types += 1;
+                    orphan_rows += count;
+                }
+            }
+            if orphan_types == 0 {
+                tracing::info!(
+                    declared_types = declared_types.len(),
+                    persisted_types = persisted.len(),
+                    "catalogue-orphan scan: no orphans"
+                );
+            } else {
+                tracing::warn!(
+                    orphan_types,
+                    orphan_rows,
+                    "catalogue-orphan scan: {} orphaned subject_type(s) \
+                     covering {} row(s); operator action recommended",
+                    orphan_types,
+                    orphan_rows
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "catalogue-orphan scan: persistence accessor failed; orphan \
+                 detection skipped this boot"
+            );
+        }
+    }
     let claimant_issuer =
         Arc::new(evo::claimant::ClaimantTokenIssuer::new(instance_id));
 
