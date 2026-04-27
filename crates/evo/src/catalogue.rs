@@ -1494,4 +1494,70 @@ target_type = "album"
         let c = Catalogue::from_toml(toml).unwrap();
         assert!(c.find_predicate("album_of").unwrap().inverse.is_none());
     }
+
+    /// A catalogue file missing the required `schema_version`
+    /// field MUST cause boot to fail with an error that names the
+    /// missing field. The path is the operator-facing surface, so
+    /// the error MUST be loud enough to point at the cause without
+    /// further investigation.
+    #[test]
+    fn missing_schema_version_refuses_with_clear_error() {
+        // No `schema_version` line at all. `serde` reports this as
+        // a missing-field error on the parse step (the field is
+        // non-Optional in the catalogue type).
+        let bad = r#"
+[[racks]]
+name = "r"
+family = "domain"
+charter = "missing schema_version"
+"#;
+        let err = Catalogue::from_toml(bad).unwrap_err();
+        match err {
+            StewardError::Toml { source, .. } => {
+                let msg = source.to_string();
+                assert!(
+                    msg.contains("schema_version"),
+                    "missing-field error must name `schema_version`, got: \
+                     {msg}"
+                );
+            }
+            other => panic!("expected Toml parse error, got {other:?}"),
+        }
+    }
+
+    /// Same scenario routed through `Catalogue::load` from a real
+    /// file on disk. Pins the boot-time refusal: a malformed
+    /// catalogue at the configured path MUST stop the steward
+    /// before it serves any client.
+    #[test]
+    fn load_from_path_refuses_malformed_catalogue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("catalogue.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[racks]]
+name = "r"
+family = "domain"
+charter = "missing schema_version"
+"#,
+        )
+        .unwrap();
+        let err = Catalogue::load(&path).unwrap_err();
+        match err {
+            StewardError::Toml { context, source } => {
+                assert!(
+                    context.contains(&path.display().to_string()),
+                    "context must name the offending file path, got: \
+                     {context}"
+                );
+                assert!(
+                    source.to_string().contains("schema_version"),
+                    "underlying error must name the missing field, got: \
+                     {source}"
+                );
+            }
+            other => panic!("expected Toml error, got {other:?}"),
+        }
+    }
 }

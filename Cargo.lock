@@ -549,6 +549,7 @@ version = "0.1.9"
 dependencies = [
  "base64",
  "once_cell",
+ "proptest",
  "regex",
  "semver",
  "serde",

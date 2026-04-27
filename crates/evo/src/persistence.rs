@@ -728,6 +728,31 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>;
 
+    /// Trim `happenings_log` according to a window/capacity policy
+    /// applied as a single transaction; returns the number of rows
+    /// removed.
+    ///
+    /// The policy keeps any row that satisfies BOTH of the following:
+    ///
+    /// - `at_ms >= now - retention_window_secs * 1000` (inside the
+    ///   wall-clock retention window), AND
+    /// - `seq > MAX(seq) - retention_capacity` (inside the most-
+    ///   recent `retention_capacity` rows by seq).
+    ///
+    /// A row failing either condition is removed. The condition is
+    /// the conjunction of the two read-side gates the bus already
+    /// honours for replay; the janitor enforces the same shape
+    /// write-side so the table does not grow unbounded.
+    ///
+    /// Implementations are expected to bound the operation by
+    /// transaction so a partial trim never exposes a torn window. The
+    /// in-memory store is a no-op (returns 0).
+    fn trim_happenings_log<'a>(
+        &'a self,
+        retention_window_secs: u64,
+        retention_capacity: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>;
+
     /// Return the steward instance ID (UUIDv4) minted at first
     /// migration and persisted in the `meta` table (migration 003).
     ///
@@ -1904,13 +1929,28 @@ impl PersistenceStore for SqlitePersistenceStore {
         let payload_str = payload.to_string();
         Box::pin(async move {
             self.interact("record_happening", move |conn| {
-                conn.execute(
+                // Wrap the single-row INSERT in an explicit
+                // transaction so the discipline matches the
+                // cross-table operations on this store and the fsync
+                // boundary is named, not implicit. Under
+                // `synchronous = FULL` the transaction commits a
+                // single fsync just as the bare INSERT did, so this
+                // adds no per-call cost; the explicit boundary makes
+                // a future "batch happenings" extension a one-line
+                // change instead of a refactor.
+                let tx = conn.transaction().map_err(|e| {
+                    PersistenceError::sqlite("begin happenings_log tx", e)
+                })?;
+                tx.execute(
                     "INSERT INTO happenings_log (seq, kind, payload, at_ms) \
                      VALUES (?1, ?2, ?3, ?4)",
                     params![seq as i64, kind, payload_str, at_ms as i64],
                 )
                 .map_err(|e| {
                     PersistenceError::sqlite("insert happenings_log", e)
+                })?;
+                tx.commit().map_err(|e| {
+                    PersistenceError::sqlite("commit happenings_log tx", e)
                 })?;
                 Ok(())
             })
@@ -1981,6 +2021,53 @@ impl PersistenceStore for SqlitePersistenceStore {
                         )
                     })?;
                 Ok(min.unwrap_or(0).max(0) as u64)
+            })
+            .await
+        })
+    }
+
+    fn trim_happenings_log<'a>(
+        &'a self,
+        retention_window_secs: u64,
+        retention_capacity: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.interact("trim_happenings_log", move |conn| {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let window_ms =
+                    retention_window_secs.saturating_mul(1000) as i64;
+                let cutoff_ms = now_ms.saturating_sub(window_ms);
+                let cap = retention_capacity as i64;
+
+                let tx = conn.transaction().map_err(|e| {
+                    PersistenceError::sqlite("begin trim_happenings_log tx", e)
+                })?;
+                // Keep rows that are inside BOTH the wall-clock window
+                // AND the capacity tail. Delete the rest. Using a
+                // single statement so the trim is atomic against any
+                // concurrent reader.
+                let removed = tx
+                    .execute(
+                        "DELETE FROM happenings_log \
+                         WHERE at_ms < ?1 \
+                            OR seq <= COALESCE((SELECT MAX(seq) \
+                                                FROM happenings_log), 0) - ?2",
+                        params![cutoff_ms, cap],
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "delete from happenings_log",
+                            e,
+                        )
+                    })?;
+                tx.commit().map_err(|e| {
+                    PersistenceError::sqlite("commit trim_happenings_log tx", e)
+                })?;
+                Ok(removed as u64)
             })
             .await
         })
@@ -2731,6 +2818,18 @@ impl PersistenceStore for MemoryPersistenceStore {
             let g = self.inner.lock().await;
             Ok(g.happenings.iter().map(|h| h.seq).min().unwrap_or(0))
         })
+    }
+
+    fn trim_happenings_log<'a>(
+        &'a self,
+        _retention_window_secs: u64,
+        _retention_capacity: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, PersistenceError>> + Send + 'a>>
+    {
+        // In-memory store is a no-op: tests that exercise the
+        // janitor's trimming behaviour use the SQLite-backed store
+        // where the read-side gates are also enforced.
+        Box::pin(async move { Ok(0) })
     }
 
     fn load_instance_id<'a>(

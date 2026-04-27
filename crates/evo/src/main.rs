@@ -192,6 +192,28 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("seeding happenings bus: {e}"))?,
     );
 
+    // Spawn the happenings_log janitor. It periodically calls the
+    // store's `trim_happenings_log` to evict rows that have aged
+    // past the retention window OR fallen out of the retention
+    // capacity tail. Shutdown notification fires on signal so the
+    // janitor exits cleanly alongside the server.
+    let janitor_shutdown = Arc::new(tokio::sync::Notify::new());
+    let janitor_persistence = Arc::clone(&persistence);
+    let janitor_capacity = config.happenings.retention_capacity as u64;
+    let janitor_window = config.happenings.retention_window_secs;
+    let janitor_interval = config.happenings.janitor_interval_secs;
+    let janitor_shutdown_for_task = Arc::clone(&janitor_shutdown);
+    let janitor_task = tokio::spawn(async move {
+        evo::happenings::run_happenings_janitor(
+            janitor_persistence,
+            janitor_window,
+            janitor_capacity,
+            janitor_interval,
+            janitor_shutdown_for_task,
+        )
+        .await;
+    });
+
     // Construct the in-memory conflict index. The wiring layer's
     // announce path records detected multi-subject conflicts into
     // it, the admin layer's merge path resolves them, and the
@@ -372,6 +394,15 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => {
             tracing::error!(error = %e, "server task panicked or was cancelled");
         }
+    }
+
+    // Notify the happenings_log janitor and join its task. The
+    // janitor's loop observes the notify on its next sleep boundary
+    // and exits cleanly. Joining here keeps the boot/shutdown
+    // symmetry: every spawned task is awaited before drop.
+    janitor_shutdown.notify_waiters();
+    if let Err(e) = janitor_task.await {
+        tracing::warn!(error = %e, "happenings_log janitor task did not join cleanly");
     }
 
     // Drain: unload every admitted plugin under a global deadline.

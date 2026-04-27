@@ -90,6 +90,12 @@ pub const DEFAULT_HAPPENINGS_RETENTION_CAPACITY: usize = 1024;
 /// disproportionately.
 pub const DEFAULT_HAPPENINGS_RETENTION_WINDOW_SECS: u64 = 30 * 60;
 
+/// Default interval between write-side janitor passes that trim
+/// `happenings_log` according to the retention policy. Sized so the
+/// trim work is amortised across operator-visible time but the table
+/// never grows uncontrolled between passes.
+pub const DEFAULT_HAPPENINGS_JANITOR_INTERVAL_SECS: u64 = 60;
+
 /// Root of the steward's configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct StewardConfig {
@@ -248,6 +254,14 @@ pub struct HappeningsSection {
     /// [`DEFAULT_HAPPENINGS_RETENTION_WINDOW_SECS`].
     #[serde(default = "default_retention_window_secs")]
     pub retention_window_secs: u64,
+    /// Interval between write-side janitor passes that trim
+    /// `happenings_log` according to the retention policy. Default:
+    /// [`DEFAULT_HAPPENINGS_JANITOR_INTERVAL_SECS`]. Operators with
+    /// very high happening throughput may shorten this; idle
+    /// stewards can lengthen it. The minimum effective interval is
+    /// one second.
+    #[serde(default = "default_janitor_interval_secs")]
+    pub janitor_interval_secs: u64,
 }
 
 impl Default for HappeningsSection {
@@ -255,6 +269,7 @@ impl Default for HappeningsSection {
         Self {
             retention_capacity: default_retention_capacity(),
             retention_window_secs: default_retention_window_secs(),
+            janitor_interval_secs: default_janitor_interval_secs(),
         }
     }
 }
@@ -265,6 +280,10 @@ fn default_retention_capacity() -> usize {
 
 fn default_retention_window_secs() -> u64 {
     DEFAULT_HAPPENINGS_RETENTION_WINDOW_SECS
+}
+
+fn default_janitor_interval_secs() -> u64 {
+    DEFAULT_HAPPENINGS_JANITOR_INTERVAL_SECS
 }
 
 /// `[catalogue]` section.
@@ -515,6 +534,10 @@ allow_unsigned = true
             cfg.happenings.retention_window_secs,
             DEFAULT_HAPPENINGS_RETENTION_WINDOW_SECS
         );
+        assert_eq!(
+            cfg.happenings.janitor_interval_secs,
+            DEFAULT_HAPPENINGS_JANITOR_INTERVAL_SECS
+        );
     }
 
     #[test]
@@ -524,11 +547,13 @@ allow_unsigned = true
 [happenings]
 retention_capacity = 4096
 retention_window_secs = 7200
+janitor_interval_secs = 30
 "#,
         )
         .unwrap();
         assert_eq!(cfg.happenings.retention_capacity, 4096);
         assert_eq!(cfg.happenings.retention_window_secs, 7200);
+        assert_eq!(cfg.happenings.janitor_interval_secs, 30);
     }
 
     #[test]

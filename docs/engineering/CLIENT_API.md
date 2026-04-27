@@ -108,9 +108,15 @@ Response on failure:
 
 ```json
 {
-  "error": "no plugin on shelf: example.does.not.exist"
+  "error": {
+    "class": "NotFound",
+    "message": "no plugin on shelf: example.does.not.exist",
+    "details": { "subclass": "shelf_not_found" }
+  }
 }
 ```
+
+The structured envelope is described in §5; `class` and `message` are always present, `details` is present when the steward attaches a subclass or contextual fields. Older callers that string-matched the bare message shape MUST migrate to the structured form.
 
 ### 4.2 `op = "project_subject"`
 
@@ -275,10 +281,16 @@ The `subject` shape is the same `SubjectProjection` returned on the live-subject
 
 The consumer can then issue a second `project_subject` against `terminal_id`, or invoke `describe_alias` (section 4.3) to inspect the chain in more detail.
 
-**Unknown ID.** A `canonical_id` that the registry has never seen returns the existing not-found error shape verbatim, with no `aliased_from` field:
+**Unknown ID.** A `canonical_id` that the registry has never seen returns the structured not-found envelope (§5), with no `aliased_from` field on the result:
 
 ```json
-{ "error": "unknown subject: 00000000-0000-0000-0000-000000000000" }
+{
+  "error": {
+    "class": "NotFound",
+    "message": "unknown subject: 00000000-0000-0000-0000-000000000000",
+    "details": { "subclass": "subject_not_found" }
+  }
+}
 ```
 
 See `SCHEMAS.md` section 4.1 for the JSON schema covering both live and alias-aware response variants.
@@ -428,7 +440,7 @@ Request:
 }
 ```
 
-Both fields are optional. Omit `cursor` on the first page; pass the previous response's `next_cursor` back unchanged on subsequent pages. `page_size` defaults to 100; values above 1000 are clamped.
+Both fields are optional. Omit `cursor` on the first page; pass the previous response's `next_cursor` back unchanged on subsequent pages. `page_size` defaults to 100; values above 1000 are clamped down to 1000 and a `page_size` of 0 is clamped up to 1 (the steward never returns an empty page in response to a valid cursor that has more rows). Mid-pagination subject deletion is tolerated: a row removed between pages is simply absent from the next page; surviving rows after the cursor key continue to be returned in canonical-id order without duplication or skip.
 
 Response:
 

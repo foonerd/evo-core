@@ -1233,3 +1233,283 @@ fn rotation_override_clamps_max_trust_class_to_old_keys_ceiling() {
         other => panic!("expected TrustClassNotAuthorised, got {other:?}"),
     }
 }
+
+// ------------------------------------------------------------------
+// Trust chain edge-case coverage: cycle, role mismatch, malformed
+// sidecar, mid-chain revocation.
+// ------------------------------------------------------------------
+
+const KEY_C_SEED: [u8; 32] = [0xC1; 32];
+const KEY_D_SEED: [u8; 32] = [0xD1; 32];
+
+/// A chain where every key declares `signed_by` with no
+/// reachable root MUST bail with `ChainBroken` after at most
+/// `MAX_CHAIN_DEPTH` (8) walked steps; the walker MUST NOT loop
+/// indefinitely.
+///
+/// The fixture wires four keys into a cycle A → B → C → D → A. The
+/// leaf key signing the bundle is one of them. The walker climbs
+/// `signed_by` references and is bounded by `MAX_CHAIN_DEPTH`; the
+/// cycle never reaches a `signed_by = None` root, so the depth
+/// cap fires.
+#[test]
+fn chain_walk_cycle_terminates_at_max_chain_depth() {
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+    let a = sign_key(KEY_A_SEED);
+    let b = sign_key(KEY_B_SEED);
+    let c = sign_key(KEY_C_SEED);
+    let d = sign_key(KEY_D_SEED);
+
+    write_bundle(plugin_dir.path(), b"artefact-bytes");
+    // Bundle is signed by A.
+    write_signature(plugin_dir.path(), &a);
+
+    // A → B → C → D → A: every key cites a parent and the cycle
+    // never reaches a root.
+    // All four keys are `operator_root` so the role pairing check
+    // passes (operator_root may be signed by anything, including
+    // operator_root) and only the cycle's depth-limit failure
+    // remains as the surfacing condition.
+    install_key_full(
+        trust_opt.path(),
+        "a",
+        &a,
+        &["org.example.*"],
+        "platform",
+        Some("a"),
+        Some("b"),
+        None,
+        Some("operator_root"),
+        None,
+        None,
+    );
+    install_key_full(
+        trust_opt.path(),
+        "b",
+        &b,
+        &["*"],
+        "platform",
+        Some("b"),
+        Some("c"),
+        None,
+        Some("operator_root"),
+        None,
+        None,
+    );
+    install_key_full(
+        trust_opt.path(),
+        "c",
+        &c,
+        &["*"],
+        "platform",
+        Some("c"),
+        Some("d"),
+        None,
+        Some("operator_root"),
+        None,
+        None,
+    );
+    install_key_full(
+        trust_opt.path(),
+        "d",
+        &d,
+        &["*"],
+        "platform",
+        Some("d"),
+        Some("a"),
+        None,
+        Some("operator_root"),
+        None,
+        None,
+    );
+
+    let keys = load_trust_root(trust_opt.path(), trust_etc.path()).unwrap();
+    let paths = BundlePaths::for_dir(plugin_dir.path());
+    let bundle = paths.bundle("org.example.echo", TrustClass::Standard);
+
+    // Use a tight wall-clock to guard against any infinite-loop
+    // bug regressing past MAX_CHAIN_DEPTH: this whole test must
+    // complete promptly. If the bound is removed, we fail-fast
+    // here on the timer rather than hanging the test runner.
+    let start = std::time::Instant::now();
+    let res = verify_out_of_process_bundle(
+        &bundle,
+        &keys,
+        &RevocationSet::default(),
+        permissive_opts(),
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "chain walk took too long; depth cap may not be enforced"
+    );
+    match res {
+        Err(TrustError::ChainBroken { detail }) => {
+            assert!(
+                detail.contains("MAX_CHAIN_DEPTH")
+                    || detail.contains("exceeded"),
+                "ChainBroken message must name the depth cap, got: {detail}"
+            );
+        }
+        other => panic!("expected ChainBroken from cycle, got {other:?}"),
+    }
+}
+
+/// A child key of role `vendor` whose declared `signed_by`
+/// names another `vendor` key MUST be rejected with `RoleMismatch`.
+/// The fixture installs V1 (vendor, root) and V2 (vendor, signed_by
+/// = V1). A bundle signed by V2 verifies the signature, but the
+/// chain walk MUST refuse the role pairing.
+#[test]
+fn chain_walk_rejects_vendor_signing_vendor_with_role_mismatch() {
+    let plugin_dir = tempfile::tempdir().unwrap();
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+    let v1 = sign_key(KEY_A_SEED);
+    let v2 = sign_key(KEY_B_SEED);
+
+    write_bundle(plugin_dir.path(), b"artefact-bytes");
+    // Bundle is signed by V2 (the child).
+    write_signature(plugin_dir.path(), &v2);
+
+    // V1 is a vendor with no parent (a malformed root for its role,
+    // but parseable by the loader).
+    install_key_full(
+        trust_opt.path(),
+        "v1",
+        &v1,
+        &["*"],
+        "platform",
+        Some("vendor_one"),
+        None,
+        None,
+        Some("vendor"),
+        None,
+        None,
+    );
+    // V2 is a vendor signed_by V1 — vendor cannot sign vendor.
+    install_key_full(
+        trust_opt.path(),
+        "v2",
+        &v2,
+        &["org.example.*"],
+        "platform",
+        Some("vendor_two"),
+        Some("vendor_one"),
+        None,
+        Some("vendor"),
+        None,
+        None,
+    );
+
+    let keys = load_trust_root(trust_opt.path(), trust_etc.path()).unwrap();
+    let paths = BundlePaths::for_dir(plugin_dir.path());
+    let bundle = paths.bundle("org.example.echo", TrustClass::Standard);
+
+    match verify_out_of_process_bundle(
+        &bundle,
+        &keys,
+        &RevocationSet::default(),
+        permissive_opts(),
+    ) {
+        Err(TrustError::RoleMismatch {
+            child,
+            parent,
+            child_role,
+            parent_role,
+        }) => {
+            assert_eq!(child, "vendor_two");
+            assert_eq!(parent, "vendor_one");
+            assert_eq!(format!("{child_role:?}"), "Vendor");
+            assert_eq!(format!("{parent_role:?}"), "Vendor");
+        }
+        other => panic!("expected RoleMismatch, got {other:?}"),
+    }
+}
+
+/// A `*.meta.toml` sidecar with a malformed `not_after`
+/// timestamp MUST cause `load_trust_root` to fail loudly. The
+/// returned error MUST name the offending file path so the
+/// operator can find it. The valid sidecar in the same directory
+/// MUST NOT be silently accepted (reject-on-doubt: any malformed
+/// entry fails the whole load).
+#[test]
+fn load_trust_root_partial_load_fails_loud_naming_offending_file() {
+    let trust_opt = tempfile::tempdir().unwrap();
+    let trust_etc = tempfile::tempdir().unwrap();
+    let good = sign_key(KEY_A_SEED);
+    let bad = sign_key(KEY_B_SEED);
+
+    // Good key with a clean meta sidecar.
+    install_key_full(
+        trust_opt.path(),
+        "good",
+        &good,
+        &["org.example.*"],
+        "platform",
+        Some("good_key"),
+        None,
+        None,
+        Some("vendor"),
+        None,
+        None,
+    );
+
+    // Bad key: write the PEM normally but a malformed sidecar
+    // (`not_after` is not RFC3339).
+    let pem = bad
+        .verifying_key()
+        .to_public_key_pem(LineEnding::LF)
+        .unwrap();
+    std::fs::write(trust_opt.path().join("bad.pem"), pem).unwrap();
+    let bad_meta = "[key]\n\
+        key_id = \"bad_key\"\n\
+        role = \"vendor\"\n\
+        not_after = \"definitely-not-a-timestamp\"\n\
+        \n\
+        [authorisation]\n\
+        name_prefixes = [\"org.example.*\"]\n\
+        max_trust_class = \"platform\"\n";
+    std::fs::write(trust_opt.path().join("bad.meta.toml"), bad_meta).unwrap();
+
+    match load_trust_root(trust_opt.path(), trust_etc.path()) {
+        Err(TrustError::KeyMetadata(detail)) => {
+            assert!(
+                detail.contains("bad.meta.toml"),
+                "error must name the offending file, got: {detail}"
+            );
+        }
+        Ok(keys) => panic!(
+            "load_trust_root must fail-loud on a malformed sidecar; \
+             instead it accepted {} keys",
+            keys.len()
+        ),
+        other => panic!(
+            "expected KeyMetadata error naming bad.meta.toml, got {other:?}"
+        ),
+    }
+}
+
+/// Revoking a key in the middle of a chain MUST cause a bundle
+/// signed by a leaf below the revoked key to fail verification.
+///
+/// The current revocation surface (`RevocationSet`) only carries
+/// install digests, NOT key revocations. Implementing key
+/// revocation requires a new revocation entry kind (or an extended
+/// schema for the existing file). That work is out of scope here;
+/// the test is recorded so the gap is visible, and is `#[ignore]`'d
+/// so CI does not fail until the surface lands.
+#[test]
+#[ignore = "key-revocation surface not implemented; install-digest \
+            revocation only (RevocationSet::digests). Re-enable when \
+            a key-revocation entry kind is added."]
+fn revoked_distribution_key_invalidates_descendant_chain() {
+    // Placeholder body so the harness still compiles; when key
+    // revocation lands the body becomes:
+    //   1. Install root → distribution → vendor chain.
+    //   2. Sign a bundle with vendor.
+    //   3. Add `distribution.key_id` to the revocation set.
+    //   4. Verify must fail with the appropriate error.
+    panic!("key-revocation surface not implemented yet");
+}

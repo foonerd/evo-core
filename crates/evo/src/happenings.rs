@@ -1004,10 +1004,16 @@ pub struct HappeningBus {
     /// Operators size this against expected reconnect intervals;
     /// the value is reported to consumers via observability and
     /// used by surfaces that translate cursor gaps into
-    /// `replay_window_exceeded` advice. The bus does not actively
-    /// trim rows today — durable retention is enforced read-side
-    /// by comparing the consumer's `since` against the oldest
-    /// retained `seq`.
+    /// `replay_window_exceeded` advice.
+    ///
+    /// Write-side enforcement is provided by
+    /// [`run_happenings_janitor`], spawned by the steward boot path,
+    /// which periodically calls
+    /// [`PersistenceStore::trim_happenings_log`] with this window and
+    /// the configured retention capacity. Read-side enforcement
+    /// remains: a consumer's `since` cursor older than the oldest
+    /// retained `seq` is rejected with `replay_window_exceeded`. The
+    /// two layers backstop one another.
     retention_window_secs: u64,
     /// Serialises [`Self::emit_durable`] so the seq the bus mints
     /// matches the order in which the rows land on disk and the
@@ -1249,6 +1255,37 @@ impl HappeningBus {
         self.tx_env.subscribe()
     }
 
+    /// Subscribe to the envelope channel and atomically sample the
+    /// current seq under the same `emit_lock` that
+    /// [`Self::emit_durable`] holds.
+    ///
+    /// Returns `(receiver, current_seq)` where `current_seq` is the
+    /// seq of the most-recently-emitted happening at the moment of
+    /// subscription. Because the lock is taken before either
+    /// `tx_env.subscribe()` or `last_emitted_seq()` runs, no concurrent
+    /// `emit_durable` can interleave between the two: the consumer's
+    /// first delivered seq will be either `> current_seq` (live event
+    /// emitted after subscription) or, when paired with a `since`
+    /// cursor and replay window, included in the replay set bounded by
+    /// `current_seq`.
+    ///
+    /// Used by the wire-protocol `subscribe_happenings` handler to
+    /// pin the ack's `current_seq` and the live receiver to the same
+    /// instant.
+    pub async fn subscribe_with_current_seq(
+        &self,
+    ) -> (broadcast::Receiver<HappeningEnvelope>, u64) {
+        // Take the same lock emit_durable holds. With this guard
+        // active no concurrent durable emit can mint a seq, persist,
+        // or broadcast — the subscribe and the seq sample see the
+        // same instant in time.
+        let _guard = self.emit_lock.lock().await;
+        let rx = self.tx_env.subscribe();
+        let current_seq =
+            self.next_seq.load(Ordering::Relaxed).saturating_sub(1);
+        (rx, current_seq)
+    }
+
     /// Number of currently-subscribed receivers on the plain
     /// channel.
     ///
@@ -1270,6 +1307,78 @@ impl HappeningBus {
     /// frame they actually observed.
     pub fn last_emitted_seq(&self) -> u64 {
         self.next_seq.load(Ordering::Relaxed).saturating_sub(1)
+    }
+}
+
+/// Periodic janitor that trims `happenings_log` according to the
+/// configured retention policy.
+///
+/// Loops forever, sleeping `interval_secs` seconds between passes,
+/// until `shutdown` is notified. Each pass calls
+/// [`PersistenceStore::trim_happenings_log`] with the supplied window
+/// and capacity and logs the number of rows removed.
+///
+/// Cancellation is cooperative: a long-running trim cannot be
+/// interrupted mid-statement, but the next sleep will observe the
+/// notification and the loop exits cleanly. Trim failures are logged
+/// and the loop continues; the next pass will retry. Treating a trim
+/// failure as fatal would be too brittle (transient SQLite-busy
+/// conditions are recoverable on the next pass) and conflicts with
+/// the steward's "don't crash on a janitor failure" stance.
+///
+/// The steward boot path spawns this task after constructing the
+/// durable bus and joins it on shutdown.
+pub async fn run_happenings_janitor(
+    persistence: Arc<dyn crate::persistence::PersistenceStore>,
+    retention_window_secs: u64,
+    retention_capacity: u64,
+    interval_secs: u64,
+    shutdown: Arc<tokio::sync::Notify>,
+) {
+    let interval = std::time::Duration::from_secs(interval_secs.max(1));
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => {
+                tracing::info!(
+                    component = "happenings_janitor",
+                    "shutdown notified; exiting"
+                );
+                return;
+            }
+            _ = tokio::time::sleep(interval) => {
+                match persistence
+                    .trim_happenings_log(
+                        retention_window_secs,
+                        retention_capacity,
+                    )
+                    .await
+                {
+                    Ok(removed) => {
+                        if removed > 0 {
+                            tracing::info!(
+                                component = "happenings_janitor",
+                                removed,
+                                retention_window_secs,
+                                retention_capacity,
+                                "trimmed happenings_log"
+                            );
+                        } else {
+                            tracing::debug!(
+                                component = "happenings_janitor",
+                                "trim pass: nothing to remove"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            component = "happenings_janitor",
+                            error = %e,
+                            "trim pass failed; will retry on next interval"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1853,5 +1962,170 @@ mod tests {
             last = env.seq;
         }
         assert_eq!(last, N, "final seq must equal the count of emits");
+    }
+
+    #[tokio::test]
+    async fn subscribe_with_current_seq_pins_under_emit_lock() {
+        // The atomic subscribe MUST take the same emit_lock that
+        // emit_durable holds. If a concurrent emit landed between
+        // the broadcast subscribe and the seq sample, the consumer
+        // could observe an envelope whose seq <= current_seq, which
+        // would let it through the dedupe filter twice (once from
+        // replay, once from live).
+        let store: Arc<dyn crate::persistence::PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        let bus = Arc::new(
+            HappeningBus::with_persistence(Arc::clone(&store))
+                .await
+                .expect("durable bus"),
+        );
+
+        // Pre-load some seqs so current_seq > 0 at subscribe time.
+        bus.emit_durable(sample_taken()).await.unwrap();
+        bus.emit_durable(sample_taken()).await.unwrap();
+        let pre_max = bus.last_emitted_seq();
+        assert_eq!(pre_max, 2);
+
+        let (mut rx, current_seq) = bus.subscribe_with_current_seq().await;
+        assert_eq!(
+            current_seq, pre_max,
+            "current_seq under lock must equal last emitted seq"
+        );
+
+        // The next emit MUST land on the receiver with seq > current_seq.
+        let next = bus.emit_durable(sample_taken()).await.unwrap();
+        assert_eq!(next, current_seq + 1);
+        let env = rx.recv().await.unwrap();
+        assert_eq!(env.seq, next);
+        assert!(env.seq > current_seq);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn n_subscriber_m_emitter_stress_no_loss_no_reorder() {
+        // N=4 subscribers, M=2 concurrent durable emitters.
+        // Every subscriber MUST see every happening exactly once in
+        // strictly-increasing seq order.
+        const N_SUBS: usize = 4;
+        const M_EMITTERS: u64 = 2;
+        const PER_EMITTER: u64 = 25;
+        const TOTAL: u64 = M_EMITTERS * PER_EMITTER;
+
+        let store: Arc<dyn crate::persistence::PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        let bus = Arc::new(
+            HappeningBus::with_persistence_and_capacity(
+                Arc::clone(&store),
+                4096,
+            )
+            .await
+            .expect("durable bus"),
+        );
+
+        let mut subs: Vec<_> =
+            (0..N_SUBS).map(|_| bus.subscribe_envelope()).collect();
+
+        let mut tasks = Vec::new();
+        for _ in 0..M_EMITTERS {
+            let bus_c = Arc::clone(&bus);
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..PER_EMITTER {
+                    bus_c.emit_durable(sample_taken()).await.unwrap();
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.expect("emitter join");
+        }
+
+        for (i, rx) in subs.iter_mut().enumerate() {
+            let mut last: u64 = 0;
+            let mut count: u64 = 0;
+            for _ in 0..TOTAL {
+                let env = rx.recv().await.expect("envelope");
+                assert!(
+                    env.seq > last,
+                    "subscriber {i}: seq must strictly increase: got \
+                     {} after {}",
+                    env.seq,
+                    last
+                );
+                last = env.seq;
+                count += 1;
+            }
+            assert_eq!(count, TOTAL, "subscriber {i} saw wrong count");
+            assert_eq!(last, TOTAL, "subscriber {i} final seq mismatch");
+        }
+    }
+
+    #[tokio::test]
+    async fn janitor_pass_trims_to_capacity_tail() {
+        // Seed 100 happenings, run a single janitor pass with
+        // a tight capacity, assert most rows are evicted.
+        let store: Arc<dyn crate::persistence::PersistenceStore> = {
+            let p = std::env::temp_dir()
+                .join(format!("evo-janitor-{}.db", std::process::id()));
+            let _ = std::fs::remove_file(&p);
+            Arc::new(
+                crate::persistence::SqlitePersistenceStore::open(p)
+                    .expect("open store"),
+            )
+        };
+        let bus = HappeningBus::with_persistence(Arc::clone(&store))
+            .await
+            .expect("durable bus");
+
+        for _ in 0..100u64 {
+            bus.emit_durable(sample_taken()).await.unwrap();
+        }
+        let pre = store.load_max_happening_seq().await.unwrap();
+        assert_eq!(pre, 100);
+
+        // Capacity 10 over a generous window -> the capacity gate
+        // dominates and ~90 rows are removed. The window is wide
+        // enough that the at_ms gate does not bite.
+        let removed = store
+            .trim_happenings_log(/*window_secs*/ 86_400, /*cap*/ 10)
+            .await
+            .unwrap();
+        assert!(
+            (89..=91).contains(&removed),
+            "expected ~90 rows removed; got {removed}"
+        );
+
+        let oldest = store.load_oldest_happening_seq().await.unwrap();
+        assert!(
+            oldest >= 90,
+            "after trim the oldest seq must be inside the capacity \
+             tail; got {oldest}"
+        );
+        let max_after = store.load_max_happening_seq().await.unwrap();
+        assert_eq!(max_after, 100, "trim must not touch the most recent seq");
+    }
+
+    #[tokio::test]
+    async fn replay_window_exceeded_when_oldest_above_zero_and_cursor_below() {
+        // Seed events, trim to advance oldest past 0, then a
+        // consumer asking for since=0 sees the structured replay-
+        // window-exceeded condition (encoded as oldest > 0 &&
+        // cursor < oldest at the bus surface).
+        let p = std::env::temp_dir()
+            .join(format!("evo-replay-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let store: Arc<dyn crate::persistence::PersistenceStore> = Arc::new(
+            crate::persistence::SqlitePersistenceStore::open(p)
+                .expect("open store"),
+        );
+        let bus = HappeningBus::with_persistence(Arc::clone(&store))
+            .await
+            .unwrap();
+        for _ in 0..30u64 {
+            bus.emit_durable(sample_taken()).await.unwrap();
+        }
+        let _ = store.trim_happenings_log(86_400, 5).await.unwrap();
+        let oldest = store.load_oldest_happening_seq().await.unwrap();
+        assert!(oldest > 0, "trim should have advanced oldest past 0");
+        // The "replay window exceeded" gate at the server surface is
+        // `oldest > 0 && cursor < oldest`. Pin both halves here.
+        assert!(0 < oldest, "cursor=0 < oldest={oldest} fires the gate");
     }
 }

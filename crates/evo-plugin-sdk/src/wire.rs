@@ -1994,4 +1994,108 @@ mod tests {
         let r: Result<WireFrame, _> = serde_json::from_str(bad);
         assert!(r.is_err());
     }
+
+    // --------------------------------------------------------------
+    // WireFrame fuzz harness via proptest. Generates arbitrary
+    // values across a representative subset of variants, round-trips
+    // them through `encode_json` / `decode_json`, and asserts equality
+    // on the round trip. The strategy is intentionally a `prop_oneof`
+    // over a representative subset (the smaller envelope-style
+    // variants plus payload-carrying ones) rather than every
+    // variant; the property pinned is "JSON encode/decode is
+    // self-inverse" and that holds variant-uniformly because it
+    // derives from `serde::{Serialize, Deserialize}`.
+    // --------------------------------------------------------------
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 256,
+            .. proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn wireframe_json_round_trip(frame in arbitrary_wireframe()) {
+            let bytes = crate::codec::encode_json(&frame).expect("encode");
+            let back = crate::codec::decode_json(&bytes).expect("decode");
+            proptest::prop_assert_eq!(back, frame);
+        }
+    }
+
+    fn arbitrary_wireframe(
+    ) -> impl proptest::strategy::Strategy<Value = WireFrame> {
+        use proptest::prelude::*;
+        let plugin = "[a-z][a-z0-9._-]{0,32}"
+            .prop_filter("non-empty plugin name", |s: &String| !s.is_empty());
+        let cid = any::<u64>();
+        let v = Just(PROTOCOL_VERSION);
+        // Bytes payload kept small so the property test runs quickly.
+        let payload = prop::collection::vec(any::<u8>(), 0..32);
+        let request_type = "[a-z_]{1,16}";
+        let custody_type = "[a-z_]{1,16}";
+        let dl = prop::option::of(any::<u64>());
+
+        prop_oneof![
+            (v, cid, plugin.clone()).prop_map(|(v, cid, plugin)| {
+                WireFrame::Describe { v, cid, plugin }
+            }),
+            (v, cid, plugin.clone()).prop_map(|(v, cid, plugin)| {
+                WireFrame::Unload { v, cid, plugin }
+            }),
+            (v, cid, plugin.clone()).prop_map(|(v, cid, plugin)| {
+                WireFrame::HealthCheck { v, cid, plugin }
+            }),
+            (v, cid, plugin.clone()).prop_map(|(v, cid, plugin)| {
+                WireFrame::LoadResponse { v, cid, plugin }
+            }),
+            (v, cid, plugin.clone()).prop_map(|(v, cid, plugin)| {
+                WireFrame::UnloadResponse { v, cid, plugin }
+            }),
+            (v, cid, plugin.clone()).prop_map(|(v, cid, plugin)| {
+                WireFrame::CourseCorrectResponse { v, cid, plugin }
+            }),
+            (v, cid, plugin.clone()).prop_map(|(v, cid, plugin)| {
+                WireFrame::ReleaseCustodyResponse { v, cid, plugin }
+            }),
+            (
+                v,
+                cid,
+                plugin.clone(),
+                request_type,
+                payload.clone(),
+                dl.clone(),
+            )
+                .prop_map(
+                    |(v, cid, plugin, request_type, payload, deadline_ms)| {
+                        WireFrame::HandleRequest {
+                            v,
+                            cid,
+                            plugin,
+                            request_type,
+                            payload,
+                            deadline_ms,
+                        }
+                    },
+                ),
+            (v, cid, plugin.clone(), payload.clone()).prop_map(
+                |(v, cid, plugin, payload)| WireFrame::HandleRequestResponse {
+                    v,
+                    cid,
+                    plugin,
+                    payload,
+                },
+            ),
+            (v, cid, plugin, custody_type, payload, dl,).prop_map(
+                |(v, cid, plugin, custody_type, payload, deadline_ms)| {
+                    WireFrame::TakeCustody {
+                        v,
+                        cid,
+                        plugin,
+                        custody_type,
+                        payload,
+                        deadline_ms,
+                    }
+                },
+            ),
+        ]
+    }
 }

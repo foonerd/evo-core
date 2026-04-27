@@ -42,13 +42,20 @@ CREATE TABLE meta (
 -- need to mint UUIDs in Rust before the persistence layer is up.
 -- The format mirrors RFC 4122 v4: 8-4-4-4-12 lowercase hex with
 -- the version (4) and variant (8|9|a|b) bits set per spec.
+--
+-- Variant byte selection uses `(random() & 3) + 1` (a bitwise mask
+-- against the bottom two bits, never negative, plus one for SQLite's
+-- 1-based `substr` index). The earlier shape `1 + (abs(random()) % 4)`
+-- has a once-in-2^63 underflow on `abs(INT64_MIN)` which collapses
+-- the substr to an empty string and yields a 31-character UUID.
+-- The bitwise mask is safe across all i64.
 INSERT INTO meta (key, value, written_at_ms) VALUES (
     'instance_id',
     lower(
         substr(hex(randomblob(4)), 1, 8) || '-' ||
         substr(hex(randomblob(2)), 1, 4) || '-' ||
         '4' || substr(hex(randomblob(2)), 2, 3) || '-' ||
-        substr('89ab', 1 + (abs(random()) % 4), 1) ||
+        substr('89ab', (random() & 3) + 1, 1) ||
         substr(hex(randomblob(2)), 2, 3) || '-' ||
         substr(hex(randomblob(6)), 1, 12)
     ),

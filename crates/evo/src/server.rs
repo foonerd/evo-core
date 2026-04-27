@@ -2506,12 +2506,15 @@ fn handle_resolve_claimants(
 ///
 /// ## Sequence
 ///
-/// 1. `bus.subscribe_envelope()` is called BEFORE anything is
-///    written so that any happening emitted between the subscribe
-///    and the ack is buffered on the receiver and delivered on a
-///    later recv. This order is load-bearing for the live path.
-/// 2. The bus's `last_emitted_seq` is sampled — this is the
-///    `current_seq` written into the ack so the consumer can pin
+/// 1. `bus.subscribe_with_current_seq()` is called BEFORE anything
+///    is written. The call holds the bus's `emit_lock` across both
+///    the broadcast subscribe and the seq sample, so no concurrent
+///    durable emit can interleave between them. Any happening
+///    emitted after the subscribe is buffered on the receiver and
+///    delivered on a later recv.
+/// 2. The `current_seq` returned by step 1 is the seq of the
+///    most-recently-emitted happening at the moment the lock was
+///    held; it is written into the ack so the consumer can pin
 ///    reconcile queries to it.
 /// 3. The ack is written, carrying `subscribed: true` and
 ///    `current_seq`. If writing fails the client has disconnected
@@ -2542,9 +2545,13 @@ async fn run_subscription(
     since: Option<u64>,
 ) -> Result<(), StewardError> {
     // Subscribe first so events emitted concurrently with the
-    // persistence read are buffered, not lost.
-    let mut rx = state.bus.subscribe_envelope();
-    let current_seq = state.bus.last_emitted_seq();
+    // persistence read are buffered, not lost. The subscribe and the
+    // current_seq sample are taken under the same emit_lock the bus
+    // uses to serialise durable emits, so no concurrent emit can
+    // produce a current_seq that is not on either side of the
+    // consumer's first delivered seq. See
+    // `HappeningBus::subscribe_with_current_seq` for the invariant.
+    let (mut rx, current_seq) = state.bus.subscribe_with_current_seq().await;
 
     // Replay-window check: if the consumer asked for a cursor older
     // than the oldest retained `seq`, fail fast with a structured
@@ -4280,6 +4287,151 @@ mod tests {
         assert!(v["error"]["details"]["current_seq"].is_u64());
     }
 
+    /// A subscriber that asks for `since = current_seq + 1`
+    /// (i.e. one past the last emitted seq) MUST receive an empty
+    /// replay window (no `Happening` frames between the ack and the
+    /// next live event). Subsequent live emits MUST then arrive in
+    /// seq order, with the dedupe filter excluding any envelope
+    /// whose `seq <= since`.
+    ///
+    /// The mechanism: `run_subscription` queries
+    /// `load_happenings_since(since, MAX)`; with `since = current_seq
+    /// + 1` the persistence query returns empty, so the dedupe
+    /// boundary is set to `since`. The first live emit lands at
+    /// `seq = current_seq + 1` which is `<= dedupe_boundary` and is
+    /// dropped; the second live emit lands at `seq = current_seq + 2`
+    /// which passes the gate and is forwarded to the consumer.
+    ///
+    /// The cursor-edge property is also exercised under the
+    /// happenings module's tests (notably
+    /// `subscribe_with_current_seq_pins_under_emit_lock` and the
+    /// stress harness); the wire-protocol edge is documented here
+    /// for completeness even though the in-process tests cover the
+    /// underlying invariants.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_subscription_with_since_at_current_emits_no_replay() {
+        let store: Arc<dyn crate::persistence::PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        // Seed two happenings so the bus's max seq is 2.
+        store
+            .record_happening(
+                1,
+                "custody_taken",
+                &serde_json::json!({"type": "custody_taken"}),
+                1_700_000_000_000,
+            )
+            .await
+            .unwrap();
+        store
+            .record_happening(
+                2,
+                "custody_released",
+                &serde_json::json!({"type": "custody_released"}),
+                1_700_000_001_000,
+            )
+            .await
+            .unwrap();
+
+        let bus = Arc::new(
+            crate::happenings::HappeningBus::with_persistence(Arc::clone(
+                &store,
+            ))
+            .await
+            .unwrap(),
+        );
+        // Sanity: bus seeded its counter past the on-disk max; the
+        // next emit will be 3.
+        assert_eq!(bus.last_emitted_seq(), 2);
+
+        let state = StewardState::builder()
+            .catalogue(Arc::new(crate::catalogue::Catalogue::default()))
+            .subjects(Arc::new(crate::subjects::SubjectRegistry::new()))
+            .relations(Arc::new(crate::relations::RelationGraph::new()))
+            .custody(Arc::new(crate::custody::CustodyLedger::new()))
+            .bus(Arc::clone(&bus))
+            .admin(Arc::new(crate::admin::AdminLedger::new()))
+            .persistence(Arc::clone(&store))
+            .claimant_issuer(Arc::new(ClaimantTokenIssuer::new(
+                "test-instance",
+            )))
+            .build()
+            .unwrap();
+
+        let (server_end, mut client_end) = UnixStream::pair().unwrap();
+        // Subscribe with since = current_seq + 1 = 3.
+        let state_for_task = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            run_subscription(server_end, state_for_task, Some(3)).await
+        });
+
+        // First frame on the client end MUST be the Subscribed ack.
+        let mut len = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_end.read_exact(&mut len),
+        )
+        .await
+        .expect("ack length read timed out")
+        .unwrap();
+        let n = u32::from_be_bytes(len) as usize;
+        let mut body = vec![0u8; n];
+        client_end.read_exact(&mut body).await.unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(ack["subscribed"].as_bool(), Some(true));
+        assert_eq!(ack["current_seq"].as_u64(), Some(2));
+
+        // Emit two more happenings on the bus. The bus's next_seq is
+        // 3 (max=2 + 1), so these mint as seq 3 then seq 4. The
+        // subscriber asked for `since=3`, meaning events with
+        // `seq > 3`; the seq=3 emit is filtered by the dedupe gate
+        // and the seq=4 emit is forwarded.
+        use crate::happenings::Happening;
+        bus.emit_durable(Happening::CustodyTaken {
+            plugin: "org.test".into(),
+            handle_id: "h-1".into(),
+            shelf: "x.y".into(),
+            custody_type: "playback".into(),
+            at: std::time::SystemTime::UNIX_EPOCH,
+        })
+        .await
+        .unwrap();
+        bus.emit_durable(Happening::CustodyTaken {
+            plugin: "org.test".into(),
+            handle_id: "h-2".into(),
+            shelf: "x.y".into(),
+            custody_type: "playback".into(),
+            at: std::time::SystemTime::UNIX_EPOCH,
+        })
+        .await
+        .unwrap();
+
+        // Expect exactly one frame on the wire: the live happening
+        // at seq 4. seq 3 was suppressed by the dedupe boundary.
+        let mut len2 = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_end.read_exact(&mut len2),
+        )
+        .await
+        .expect("live frame length read timed out")
+        .unwrap();
+        let n2 = u32::from_be_bytes(len2) as usize;
+        let mut body2 = vec![0u8; n2];
+        client_end.read_exact(&mut body2).await.unwrap();
+        let frame: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(frame["seq"].as_u64(), Some(4));
+
+        // The subscription task is in a recv loop with no
+        // shutdown signal beyond the wire closing. Closing the
+        // client end and aborting the handle gives the runtime
+        // a clean exit path so the test does not hang at
+        // teardown if the rx.recv() future cannot observe the
+        // peer half-close before the test moves on.
+        drop(client_end);
+        handle.abort();
+        let _ = handle.await;
+    }
+
     // -----------------------------------------------------------------
     // Paginated list ops: every seeded row appears exactly once across
     // pages, and current_seq is a stable bus pin.
@@ -4443,6 +4595,140 @@ mod tests {
         assert_eq!(unique.len(), total);
         for s in &seqs {
             assert_eq!(*s, seqs[0]);
+        }
+    }
+
+    #[test]
+    fn list_subjects_page_size_zero_clamps_up_to_one() {
+        // page_size = 0 is interpreted as "no caller preference"
+        // and clamped up to 1 by `clamp_page_size`. The contract is
+        // documented in CLIENT_API.md; this test pins the behaviour
+        // so a future refactor cannot silently flip it to "errors
+        // with ContractViolation" without also updating the doc.
+        let state = seeded_state_for_lists(3);
+        let resp = handle_list_subjects(&state, None, Some(0));
+        match resp {
+            ClientResponse::SubjectsPage {
+                subjects,
+                next_cursor,
+                ..
+            } => {
+                assert_eq!(
+                    subjects.len(),
+                    1,
+                    "page_size=0 must clamp up to 1, not produce an empty \
+                     page",
+                );
+                assert!(
+                    next_cursor.is_some(),
+                    "with 3 subjects and page_size clamped to 1, the next \
+                     cursor must be set",
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_subjects_mid_pagination_subject_delete_resilience() {
+        // Page through subjects with size 10. After page 1,
+        // retract one of the subjects whose canonical_id is on
+        // page 1. Page 2 must return the next 10 subjects in
+        // canonical-id order with no duplication and no skip.
+        use evo_plugin_sdk::contract::{
+            ExternalAddressing, SubjectAnnouncement,
+        };
+        let state = StewardState::for_tests();
+        // Seed exactly 25 subjects so we have enough for 3 pages of
+        // 10. Each subject is announced with a single addressing so
+        // retract on its sole addressing forgets the subject.
+        let mut announcements: Vec<(String, ExternalAddressing)> =
+            Vec::with_capacity(25);
+        for i in 0..25 {
+            let addr = ExternalAddressing::new("test", format!("v-{i:04}"));
+            let ann = SubjectAnnouncement::new("track", vec![addr.clone()]);
+            let outcome =
+                state.subjects.announce(&ann, "org.test.plugin").unwrap();
+            let id = match outcome {
+                crate::subjects::AnnounceOutcome::Created(id) => id,
+                other => panic!("expected Created on fresh seed: {other:?}"),
+            };
+            announcements.push((id, addr));
+        }
+
+        // Page 1.
+        let p1 = handle_list_subjects(&state, None, Some(10));
+        let (page1_ids, cursor1) = match p1 {
+            ClientResponse::SubjectsPage {
+                subjects,
+                next_cursor,
+                ..
+            } => (
+                subjects
+                    .into_iter()
+                    .map(|s| s.canonical_id)
+                    .collect::<Vec<_>>(),
+                next_cursor,
+            ),
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(page1_ids.len(), 10);
+        assert!(cursor1.is_some(), "more pages expected");
+
+        // Forget one subject whose id is on page 1.
+        let target_id = page1_ids[5].clone();
+        let target_addr = announcements
+            .iter()
+            .find(|(id, _)| id == &target_id)
+            .map(|(_, a)| a.clone())
+            .expect("target addressing");
+        let outcome = state
+            .subjects
+            .retract(&target_addr, "org.test.plugin", None)
+            .expect("retract");
+        // Sanity: this was the subject's last addressing, so it
+        // should have been forgotten.
+        match outcome {
+            crate::subjects::SubjectRetractOutcome::SubjectForgotten {
+                ..
+            } => {}
+            other => panic!("expected SubjectForgotten, got: {other:?}"),
+        }
+
+        // Page 2 against the cursor returned by page 1. The cursor
+        // is the canonical_id of page 1's last entry; the registry
+        // returns ids strictly greater than it.
+        let p2 = handle_list_subjects(&state, cursor1, Some(10));
+        let (page2_ids, _) = match p2 {
+            ClientResponse::SubjectsPage {
+                subjects,
+                next_cursor,
+                ..
+            } => (
+                subjects
+                    .into_iter()
+                    .map(|s| s.canonical_id)
+                    .collect::<Vec<_>>(),
+                next_cursor,
+            ),
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(
+            page2_ids.len(),
+            10,
+            "page 2 must still return 10 surviving subjects after a \
+             mid-pagination delete"
+        );
+
+        // The deleted id MUST NOT appear on either page after the
+        // retract; the page 2 contents MUST be strictly greater than
+        // the page 1 cursor and MUST NOT overlap page 1.
+        for id in &page2_ids {
+            assert_ne!(*id, target_id, "deleted subject must not reappear");
+            assert!(
+                page1_ids.iter().all(|p| p != id),
+                "page 2 must not duplicate page 1 entries"
+            );
         }
     }
 

@@ -1761,4 +1761,165 @@ mod tests {
             }
         }
     }
+
+    /// A slow warden whose `course_correct` sleeps past the
+    /// configured `course_correction_budget_ms` MUST cause the
+    /// dispatch path to surface a `CustodyAborted` happening (the
+    /// default `Abort` semantic when no policy is declared) whose
+    /// reason names the budget timeout.
+    struct SlowWarden {
+        name: String,
+        sleep: Duration,
+    }
+    impl Plugin for SlowWarden {
+        fn describe(
+            &self,
+        ) -> impl Future<Output = PluginDescription> + Send + '_ {
+            async move {
+                PluginDescription {
+                    identity: PluginIdentity {
+                        name: self.name.clone(),
+                        version: semver::Version::new(0, 1, 0),
+                        contract: 1,
+                    },
+                    runtime_capabilities: RuntimeCapabilities {
+                        request_types: vec![],
+                        accepts_custody: true,
+                        flags: Default::default(),
+                    },
+                    build_info: BuildInfo {
+                        plugin_build: "test".into(),
+                        sdk_version: "0.1.0".into(),
+                        rustc_version: None,
+                        built_at: None,
+                    },
+                }
+            }
+        }
+        fn load<'a>(
+            &'a mut self,
+            _ctx: &'a LoadContext,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+            async move { Ok(()) }
+        }
+        fn unload(
+            &mut self,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
+            async move { Ok(()) }
+        }
+        fn health_check(
+            &self,
+        ) -> impl Future<Output = HealthReport> + Send + '_ {
+            async move { HealthReport::healthy() }
+        }
+    }
+    impl Warden for SlowWarden {
+        fn take_custody(
+            &mut self,
+            _assignment: Assignment,
+        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + '_
+        {
+            let id = self.name.clone();
+            async move { Ok(CustodyHandle::new(id)) }
+        }
+        fn course_correct<'a>(
+            &'a mut self,
+            _handle: &'a CustodyHandle,
+            _correction: CourseCorrection,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+            let dur = self.sleep;
+            async move {
+                tokio::time::sleep(dur).await;
+                Ok(())
+            }
+        }
+        fn release_custody(
+            &mut self,
+            _handle: CustodyHandle,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
+            async move { Ok(()) }
+        }
+    }
+
+    fn slow_warden_entry_with_policy(
+        name: &str,
+        shelf: &str,
+        plugin_name: &str,
+        sleep: Duration,
+        policy: EnforcementPolicy,
+    ) -> Arc<PluginEntry> {
+        let w: Box<dyn ErasedWarden> =
+            Box::new(WardenAdapter::new(SlowWarden {
+                name: plugin_name.into(),
+                sleep,
+            }));
+        let handle = AdmittedHandle::Warden(w);
+        Arc::new(PluginEntry::new_with_policy(
+            name.into(),
+            shelf.into(),
+            handle,
+            policy,
+        ))
+    }
+
+    #[tokio::test]
+    async fn course_correct_timeout_emits_custody_aborted_with_reason() {
+        use crate::happenings::Happening;
+
+        let r = fresh_router();
+        // Budget 50ms; warden sleeps 250ms. With no
+        // custody_failure_mode declared the default Abort applies.
+        let policy = EnforcementPolicy {
+            allowed_request_types: None,
+            default_request_deadline_ms: None,
+            course_correction_deadline_ms: Some(50),
+            custody_failure_mode: None,
+        };
+        r.insert(slow_warden_entry_with_policy(
+            "w",
+            "test.custody",
+            "w",
+            Duration::from_millis(250),
+            policy,
+        ))
+        .unwrap();
+
+        let h = r
+            .take_custody("test.custody", "playback".into(), vec![], None)
+            .await
+            .expect("take_custody");
+
+        let mut rx = r.state().bus.subscribe();
+
+        let res = r
+            .course_correct("test.custody", &h, "go".into(), b"x".to_vec())
+            .await;
+        assert!(
+            matches!(res, Err(StewardError::Dispatch(_))),
+            "course_correct must surface a Dispatch error on timeout, \
+             got {res:?}"
+        );
+
+        let happening = rx.recv().await.expect("recv");
+        match happening {
+            Happening::CustodyAborted {
+                plugin,
+                handle_id,
+                shelf,
+                reason,
+                ..
+            } => {
+                assert_eq!(plugin, "w");
+                assert_eq!(handle_id, "w");
+                assert_eq!(shelf, "test.custody");
+                assert!(
+                    reason.contains("exceeded budget"),
+                    "abort reason must name the timeout, got: {reason}"
+                );
+            }
+            other => panic!(
+                "expected CustodyAborted (default Abort), got: {other:?}"
+            ),
+        }
+    }
 }
