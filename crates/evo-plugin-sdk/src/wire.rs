@@ -1435,6 +1435,47 @@ mod tests {
     }
 
     #[test]
+    fn error_round_trip_with_details() {
+        // The Error frame's `details` field is the on-the-wire
+        // carrier for the documented `subclass` discriminator and
+        // any per-class extras. Round-tripping a non-empty details
+        // value pins the contract that `subclass` and extras
+        // survive serialise/deserialise as serde_json::Value, and
+        // that the `skip_serializing_if = "Option::is_none"` attr
+        // does not fire for `Some(_)`. A regression that drops
+        // the field or that forces it through a stricter shape
+        // would lose the documented subclass taxonomy at the
+        // first hop.
+        let details = serde_json::json!({
+            "subclass": "merge_source_unknown",
+            "addressing": "scheme-x:value-y",
+        });
+        let orig = WireFrame::Error {
+            v: PROTOCOL_VERSION,
+            cid: 99,
+            plugin: sample_plugin(),
+            class: crate::error_taxonomy::ErrorClass::NotFound,
+            message: "merge: source addressing not registered".into(),
+            details: Some(details.clone()),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        // The serialised form retains the field name and shape.
+        assert!(json.contains(r#""details""#));
+        assert!(json.contains(r#""merge_source_unknown""#));
+        assert!(json.contains(r#""scheme-x:value-y""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        if let WireFrame::Error {
+            details: Some(d), ..
+        } = back
+        {
+            assert_eq!(d, details);
+        } else {
+            panic!("decoded frame must carry Some(details) value");
+        }
+    }
+
+    #[test]
     fn event_ack_round_trip() {
         let orig = WireFrame::EventAck {
             v: PROTOCOL_VERSION,

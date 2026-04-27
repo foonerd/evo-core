@@ -777,7 +777,7 @@ async fn reader_loop<R>(
     loop {
         match read_frame_json(&mut reader).await {
             Ok(frame) => {
-                handle_inbound_frame(
+                let keep_going = handle_inbound_frame(
                     frame,
                     &pending,
                     &event_sink,
@@ -785,6 +785,15 @@ async fn reader_loop<R>(
                     &out_tx,
                 )
                 .await;
+                if !keep_going {
+                    // Protocol-violation tear-down: the structured
+                    // Error frame was already enqueued on out_tx so
+                    // the peer observes the rejection before the
+                    // socket closes. Drop the writer's input by
+                    // letting `out_tx` drop with the loop frame.
+                    drain_and_disable(&pending, &alive);
+                    return;
+                }
             }
             Err(WireError::PeerClosed) => {
                 drain_and_disable(&pending, &alive);
@@ -799,31 +808,62 @@ async fn reader_loop<R>(
     }
 }
 
+/// Process one inbound wire frame.
+///
+/// Returns `true` to continue the reader loop, `false` to tear
+/// down the connection. The tear-down path emits a structured
+/// `WireFrame::Error{ProtocolViolation}` on `out_tx` so the peer
+/// observes the rejection before the socket closes; the reader
+/// loop then drains pending requests and exits.
 async fn handle_inbound_frame(
     frame: WireFrame,
     pending: &Arc<Mutex<PendingMap>>,
     event_sink: &Arc<Mutex<Option<Arc<EventSink>>>>,
     expected_plugin: &str,
     out_tx: &mpsc::Sender<WireFrame>,
-) {
+) -> bool {
     let (v, cid, peer_plugin) = frame.envelope();
 
     if v != PROTOCOL_VERSION {
-        tracing::warn!(
-            cid = cid,
-            version = v,
-            "peer frame carries unexpected protocol version; dropping"
+        let msg = format!(
+            "peer frame carries protocol version {v}; expected \
+             {PROTOCOL_VERSION}"
         );
-        return;
+        tracing::warn!(cid = cid, version = v, "{msg}; tearing down");
+        let _ = out_tx
+            .send(WireFrame::Error {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin: expected_plugin.to_string(),
+                class: ErrorClass::ProtocolViolation,
+                message: msg,
+                details: None,
+            })
+            .await;
+        return false;
     }
     if peer_plugin != expected_plugin {
+        let msg = format!(
+            "peer frame carries plugin name {peer_plugin:?}; expected \
+             {expected_plugin:?}"
+        );
         tracing::warn!(
             cid = cid,
             expected = %expected_plugin,
             got = %peer_plugin,
-            "peer frame carries unexpected plugin name; dropping"
+            "{msg}; tearing down"
         );
-        return;
+        let _ = out_tx
+            .send(WireFrame::Error {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin: expected_plugin.to_string(),
+                class: ErrorClass::ProtocolViolation,
+                message: msg,
+                details: None,
+            })
+            .await;
+        return false;
     }
 
     if frame.is_response() || frame.is_error() {
@@ -904,13 +944,26 @@ async fn handle_inbound_frame(
         }
     } else {
         // Steward-initiated request from a plugin is a protocol
-        // violation; log and drop.
-        tracing::warn!(
-            cid = cid,
-            frame = variant_name(&frame),
-            "request frame arrived from peer; plugin side should not send requests"
+        // violation; emit a structured error and tear down so the
+        // peer observes the rejection.
+        let msg = format!(
+            "peer sent steward-only request frame {}; tearing down",
+            variant_name(&frame)
         );
+        tracing::warn!(cid = cid, "{msg}");
+        let _ = out_tx
+            .send(WireFrame::Error {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin: expected_plugin.to_string(),
+                class: ErrorClass::ProtocolViolation,
+                message: msg,
+                details: None,
+            })
+            .await;
+        return false;
     }
+    true
 }
 
 /// Dispatch a plugin-initiated request (describe_alias /
@@ -4850,5 +4903,154 @@ name = "track"
                  unset; got {details:?}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Wire-frame strictness — protocol-violation tear-down
+    // ---------------------------------------------------------------
+
+    /// `handle_inbound_frame` test fixture: build a fresh
+    /// `pending` map and `event_sink` slot, plus an mpsc channel
+    /// the function writes outbound frames onto. The receiver is
+    /// returned so the test can drain whatever the function
+    /// emitted (the structured ProtocolViolation Error frame, in
+    /// the strictness path).
+    #[allow(clippy::type_complexity)]
+    fn fresh_inbound_handler_state() -> (
+        Arc<Mutex<PendingMap>>,
+        Arc<Mutex<Option<Arc<EventSink>>>>,
+        mpsc::Sender<WireFrame>,
+        mpsc::Receiver<WireFrame>,
+    ) {
+        let pending: Arc<Mutex<PendingMap>> =
+            Arc::new(Mutex::new(PendingMap::new()));
+        let event_sink: Arc<Mutex<Option<Arc<EventSink>>>> =
+            Arc::new(Mutex::new(None));
+        let (out_tx, out_rx) = mpsc::channel::<WireFrame>(8);
+        (pending, event_sink, out_tx, out_rx)
+    }
+
+    #[tokio::test]
+    async fn protocol_version_mismatch_emits_protocol_violation_and_tears_down()
+    {
+        let (pending, sink, out_tx, mut out_rx) = fresh_inbound_handler_state();
+        // Construct a frame whose envelope claims a protocol
+        // version the steward does not speak. `is_response` is
+        // not relevant; envelope() reads only `v`, `cid`, and
+        // `plugin`, so a Hello frame with the wrong `v` is the
+        // simplest reproducer.
+        let bad_v: u16 = PROTOCOL_VERSION + 99;
+        let frame = WireFrame::Hello {
+            v: bad_v,
+            cid: 0,
+            plugin: "org.test.peer".into(),
+            feature_min: 1,
+            feature_max: 1,
+            codecs: vec!["json".into()],
+        };
+
+        let keep_going = handle_inbound_frame(
+            frame,
+            &pending,
+            &sink,
+            "org.test.peer",
+            &out_tx,
+        )
+        .await;
+        assert!(!keep_going, "tear-down requires reader-loop exit");
+
+        let emitted = out_rx
+            .recv()
+            .await
+            .expect("a structured Error frame must be emitted on tear-down");
+        match emitted {
+            WireFrame::Error { class, message, .. } => {
+                assert_eq!(
+                    class,
+                    ErrorClass::ProtocolViolation,
+                    "version-mismatch tear-down must classify as \
+                     ProtocolViolation"
+                );
+                assert!(
+                    message.contains(&format!("{bad_v}")),
+                    "operator-readable message should name the offending \
+                     version, got: {message}"
+                );
+            }
+            other => {
+                panic!("expected Error frame, got {other:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_plugin_mismatch_emits_protocol_violation_and_tears_down() {
+        let (pending, sink, out_tx, mut out_rx) = fresh_inbound_handler_state();
+        // EventAck is a plugin-side frame whose envelope carries
+        // the peer's plugin name. A frame whose `plugin` field
+        // does not match the expected name is a tear-down case.
+        let frame = WireFrame::EventAck {
+            v: PROTOCOL_VERSION,
+            cid: 7,
+            plugin: "org.test.imposter".into(),
+        };
+
+        let keep_going = handle_inbound_frame(
+            frame,
+            &pending,
+            &sink,
+            "org.test.expected",
+            &out_tx,
+        )
+        .await;
+        assert!(!keep_going, "tear-down requires reader-loop exit");
+
+        let emitted = out_rx
+            .recv()
+            .await
+            .expect("a structured Error frame must be emitted on tear-down");
+        match emitted {
+            WireFrame::Error { class, message, .. } => {
+                assert_eq!(class, ErrorClass::ProtocolViolation);
+                assert!(
+                    message.contains("imposter")
+                        && message.contains("expected"),
+                    "operator-readable message should name both peer and \
+                     expected plugin, got: {message}"
+                );
+            }
+            other => {
+                panic!("expected Error frame, got {other:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn well_formed_event_frame_does_not_tear_down() {
+        // Sanity: a well-formed frame (matching version + plugin)
+        // returns `true` so the reader loop continues. Without an
+        // event sink installed the handler emits a contract-
+        // violation Error frame, but it does NOT tear down — the
+        // reader stays alive for subsequent frames.
+        let (pending, sink, out_tx, _out_rx) = fresh_inbound_handler_state();
+        let frame = WireFrame::ReportState {
+            v: PROTOCOL_VERSION,
+            cid: 0,
+            plugin: "org.test.peer".into(),
+            payload: Vec::new(),
+            priority: evo_plugin_sdk::contract::ReportPriority::Normal,
+        };
+        let keep_going = handle_inbound_frame(
+            frame,
+            &pending,
+            &sink,
+            "org.test.peer",
+            &out_tx,
+        )
+        .await;
+        assert!(
+            keep_going,
+            "well-formed event frame must not trigger tear-down"
+        );
     }
 }
