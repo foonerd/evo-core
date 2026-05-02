@@ -1,0 +1,35 @@
+# Sidecar for evo-core-release-signing-public.pem
+# (see PLUGIN_PACKAGING.md / evo_trust::KeyMeta).
+#
+# Public key fingerprint (SHA256 of the DER-encoded
+# SubjectPublicKeyInfo bytes):
+#   d1ca8766233a448aa551f75f63c7554760d9a8a95dc31893fb580ca74adc1eea
+# Verify with:
+#   openssl pkey -pubin -in keys/evo-core-release-signing-public.pem \
+#     -outform DER | sha256sum
+
+[authorisation]
+# Releases of the evo-core framework itself: the `evo` steward
+# binary, the `evo-plugin-tool` CLI, and any other artefacts the
+# evo-core repository publishes through its release plane.
+#
+# `name_prefixes` matches the artefact-manifest `publisher` field
+# the workflow stamps on every published bundle. Operators
+# verifying a fetched binary against this trust root see the
+# manifest's publisher equal one of these prefixes; verification
+# fails otherwise.
+#
+# `org.evo.example.*` covers the in-tree reference example plugins
+# (`evo-example-echo`, `evo-example-warden`) shipped through this
+# same release plane as production-shaped OOP bundles. They use the
+# legacy `org.evo.*` namespace pending a separate naming-migration
+# pass; semantically they are framework-tier reference artefacts.
+name_prefixes = ["org.evoframework.core.*", "org.evo.example.*"]
+
+# `framework_release_root` per `RELEASE_PLANE.md` is the trust
+# class for releases of the framework itself. Distributions
+# composing their own steward binaries through `evo::run` derive
+# from this trust root; vendors publishing closed-source builds
+# layer their own roots on top per
+# `PLUGIN_PACKAGING.md` §5 Trust root layering.
+max_trust_class = "platform"

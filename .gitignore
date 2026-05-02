@@ -1,0 +1,92 @@
+# Rust build artefacts
+/target/
+**/target/
+
+# Cargo.lock IS committed.
+#
+# This workspace produces a binary (the evo steward); reproducible builds
+# require the lockfile to be under version control so every developer,
+# every CI run, and every release build resolves to the same dependency
+# graph. Library crates (no binaries) conventionally omit the lockfile;
+# workspaces that ship any binary include it. See:
+#   https://doc.rust-lang.org/cargo/faq.html#why-have-cargolock-in-version-control
+
+# Editor and OS junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# Environment and local config
+.env
+.env.local
+
+# Generated documentation
+/book/
+/docs/_build/
+
+# Signing keys - never commit
+*.key
+*.pem
+!docs/**/*.pem.example
+# Public halves of release-signing and trust-root keys live under
+# keys/ and ARE committed: an operator verifying a fetched
+# artefact needs the public key in the source clone. Names follow
+# the convention <role>-public.pem so the rule is purely
+# suffix-based.
+!keys/*-public.pem
+
+# Archived artefacts
+.archive/
+
+# AI tooling — never committed.
+#
+# This block excludes per-machine settings, project memories,
+# caches, and rule files for every coding-assistant tool. The
+# concern is two-fold: (1) per-user / per-machine settings
+# (allowlists, model preferences, auth state) leaking into the
+# public repo, and (2) project-memory files containing internal
+# context that the `evo-internal/` partition is meant to hold
+# instead. JetBrains AI assistant subdirectories are already
+# covered by the `.idea/` rule above. When in doubt, keep
+# AI-tool artefacts out of this repo.
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.cursor/
+.cursorrules
+.cursorignore
+.aider*
+.aiderignore
+.continue/
+.windsurf/
+.windsurfrules
+.codeium/
+.zed/
+.junie/
+# GitHub Copilot project-instructions file lives under .github/
+# (which is otherwise CI configuration that IS committed); name
+# it explicitly so it shares this section's discipline.
+.github/copilot-instructions.md
+
+# Private maintainer workspace.
+#
+# This directory holds internal-only material: design notes,
+# decision records with deliberation context, working drafts of
+# documents that have not yet graduated to the public docs/ tree,
+# session bootstraps for collaborators, and anything else that is
+# part of how evo-core gets made rather than what evo-core is.
+#
+# Public repository documentation (README.md, DEVELOPING.md,
+# CHANGELOG.md, GAPS.md, the docs/ tree) is for vendors adopting
+# the framework. Internal deliberation lives here, never
+# committed.
+#
+# The trailing slash is deliberate: it excludes the directory and
+# everything below it without affecting an unrelated file that
+# might happen to share the basename.
+.evo-internal/

@@ -1,0 +1,34 @@
+[package]
+name = "evo-example-distribution"
+description = "Reference skeleton for an `evo-device-<vendor>` distribution. Composes the evo steward with two example plugins via `evo::run`."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "evo-example-distribution"
+path = "src/main.rs"
+
+[dependencies]
+# The framework. A distribution depends on `evo` to call
+# `evo::run(...)` from its own `main`. The library boot function
+# encapsulates the full steward lifecycle (config, persistence,
+# admission engine, server, drain, shutdown) so this distribution's
+# `main.rs` is a tiny composition step on top.
+evo = { path = "../evo" }
+# The plugin SDK. A distribution that admits in-process plugins
+# (this one) needs the manifest and contract types directly.
+evo-plugin-sdk = { path = "../evo-plugin-sdk" }
+# In-process plugins this skeleton admits. A real distribution
+# substitutes its own plugin set here; the shape is the same.
+evo-example-echo = { path = "../evo-example-echo" }
+evo-example-warden = { path = "../evo-example-warden" }
+
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true

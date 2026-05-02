@@ -1,0 +1,31 @@
+# Evo skeleton catalogue.
+#
+# Minimal catalogue shipped with the in-tree reference distribution
+# (`crates/evo-example-distribution`). Declares one rack (`example`)
+# with two shelves: `echo` for the example respondent and `custody`
+# for the example warden. The shipped echo plugin
+# (org.evo.example.echo) targets the first; the shipped warden plugin
+# (org.evo.example.warden) targets the second.
+#
+# Real distributions replace this with their domain's catalogue. For
+# an audio-player distribution, that catalogue declares the audio,
+# audio-sources, audio-processing, artwork, metadata, networking,
+# storage, library, and other racks from CONCEPT.md.
+
+schema_version = 1
+
+[[racks]]
+name = "example"
+family = "domain"
+kinds = ["registrar"]
+charter = "Example rack for the in-tree reference distribution."
+
+[[racks.shelves]]
+name = "echo"
+shape = 1
+description = "Echoes whatever payload is sent to it."
+
+[[racks.shelves]]
+name = "custody"
+shape = 1
+description = "Example warden custody slot used by the reference distribution."

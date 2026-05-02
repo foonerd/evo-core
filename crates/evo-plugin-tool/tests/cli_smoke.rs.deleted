@@ -1,0 +1,23 @@
+//! Smoke test: built binary handles `--help`.
+use std::path::PathBuf;
+use std::process::Command;
+
+fn evo_plugin_tool() -> PathBuf {
+    let p = std::env::current_exe().expect("current_exe");
+    // current_exe: target/<profile>/deps/<this_test>-<hash>
+    p.parent()
+        .and_then(|d| d.parent())
+        .expect("target/deps path")
+        .join("evo-plugin-tool")
+}
+
+#[test]
+fn help_exits_zero() {
+    let exe = evo_plugin_tool();
+    assert!(exe.is_file(), "expected {}", exe.display());
+    let s = Command::new(&exe)
+        .arg("--help")
+        .output()
+        .unwrap_or_else(|e| panic!("run {}: {e}", exe.display()));
+    assert!(s.status.success(), "stderr={}", String::from_utf8_lossy(&s.stderr));
+}

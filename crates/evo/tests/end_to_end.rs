@@ -1,0 +1,1910 @@
+//! End-to-end integration tests for the steward skeleton.
+//!
+//! Start a steward in the same process, connect a client to its Unix
+//! socket, send requests, verify the responses. Proves the config ->
+//! catalogue -> admission -> server -> plugin -> response and
+//! config -> catalogue -> admission -> server -> projection-engine ->
+//! registry chains work end-to-end.
+
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+use tokio::sync::Mutex;
+
+use evo::admin::AdminLedger;
+use evo::admission::AdmissionEngine;
+use evo::catalogue::Catalogue;
+use evo::config::PluginsSecurityConfig;
+use evo::custody::CustodyLedger;
+use evo::happenings::{Happening, HappeningBus};
+use evo::persistence::MemoryPersistenceStore;
+use evo::projections::ProjectionEngine;
+use evo::relations::RelationGraph;
+use evo::server::Server;
+use evo::state::StewardState;
+use evo::subjects::SubjectRegistry;
+use evo_plugin_sdk::contract::{
+    CustodyHandle, ExternalAddressing, HealthStatus, SubjectAnnouncement,
+};
+
+const CATALOGUE_TOML: &str = r#"
+schema_version = 1
+
+[[racks]]
+name = "example"
+family = "domain"
+kinds = ["registrar"]
+charter = "Example rack for the v0 skeleton test."
+
+[[racks.shelves]]
+name = "echo"
+shape = 1
+description = "Echoes inputs back."
+"#;
+
+/// Build a steward harness: admission engine with the echo plugin
+/// admitted, a projection engine over its stores, and a ready-to-run
+/// server. The caller drives the server and is responsible for
+/// teardown.
+async fn build_harness(
+    socket_path: std::path::PathBuf,
+    catalogue_toml: &str,
+) -> (Arc<Mutex<AdmissionEngine>>, Arc<ProjectionEngine>, Server) {
+    let tmp_parent = socket_path.parent().unwrap().to_path_buf();
+    let catalogue_path = tmp_parent.join("catalogue.toml");
+    std::fs::write(&catalogue_path, catalogue_toml).expect("write catalogue");
+    // Wrap in Arc: the catalogue is held by the steward state bag and
+    // by every admitted plugin's RegistryRelationAnnouncer.
+    let catalogue =
+        Arc::new(Catalogue::load(&catalogue_path).expect("catalogue"));
+
+    let state = StewardState::builder()
+        .catalogue(catalogue)
+        .subjects(Arc::new(SubjectRegistry::new()))
+        .relations(Arc::new(RelationGraph::new()))
+        .custody(Arc::new(CustodyLedger::new()))
+        .bus(Arc::new(HappeningBus::new()))
+        .admin(Arc::new(AdminLedger::new()))
+        .persistence(Arc::new(MemoryPersistenceStore::new()))
+        .claimant_issuer(Arc::new(evo::claimant::ClaimantTokenIssuer::new(
+            "test-instance",
+        )))
+        .build()
+        .expect("steward state must build");
+
+    let mut engine = AdmissionEngine::new(
+        Arc::clone(&state),
+        std::path::PathBuf::from("/tmp/evo-end-to-end-tests-data-root"),
+        std::path::PathBuf::new(),
+        None,
+        PluginsSecurityConfig::default(),
+    );
+    let echo_plugin = evo_example_echo::EchoPlugin::new();
+    let echo_manifest = evo_example_echo::manifest();
+    engine
+        .admit_singleton_respondent(echo_plugin, echo_manifest)
+        .await
+        .expect("admit echo plugin");
+
+    let projections = Arc::new(ProjectionEngine::new(
+        Arc::clone(&state.subjects),
+        Arc::clone(&state.relations),
+    ));
+    let router = Arc::clone(engine.router());
+    let engine = Arc::new(Mutex::new(engine));
+    let server = Server::new(
+        socket_path,
+        router,
+        Arc::clone(&state),
+        Arc::clone(&projections),
+    );
+
+    (engine, projections, server)
+}
+
+#[tokio::test]
+async fn echo_roundtrip_through_socket() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_socket = socket_path.clone();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+        drop(server_socket);
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("server socket became available");
+
+    let mut stream = UnixStream::connect(&socket_path)
+        .await
+        .expect("connect to steward socket");
+
+    // Echo request in the new tagged shape.
+    let payload = b"hello, evo";
+    let request_json = format!(
+        r#"{{"op":"request","shelf":"example.echo","request_type":"echo","payload_b64":"{}"}}"#,
+        B64.encode(payload)
+    );
+    write_frame(&mut stream, request_json.as_bytes()).await;
+
+    let response_body = read_frame(&mut stream).await;
+    let response_value: serde_json::Value =
+        serde_json::from_slice(&response_body).expect("response JSON");
+    let returned_b64 = response_value
+        .get("payload_b64")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "response did not contain payload_b64: {}",
+                String::from_utf8_lossy(&response_body)
+            )
+        });
+    let returned_payload = B64.decode(returned_b64).expect("base64 decode");
+    assert_eq!(&returned_payload, payload);
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task join");
+
+    engine
+        .lock()
+        .await
+        .shutdown()
+        .await
+        .expect("drain admission engine");
+}
+
+#[tokio::test]
+async fn unknown_shelf_returns_structured_error() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+
+    let request_json = r#"{"op":"request","shelf":"does.not.exist","request_type":"echo","payload_b64":""}"#;
+    write_frame(&mut stream, request_json.as_bytes()).await;
+
+    let response_body = read_frame(&mut stream).await;
+    let response_value: serde_json::Value =
+        serde_json::from_slice(&response_body).expect("JSON");
+    let err = response_value.get("error").expect("structured error");
+    assert!(
+        err.get("class").and_then(|v| v.as_str()).is_some(),
+        "expected structured error envelope, got: {}",
+        String::from_utf8_lossy(&response_body)
+    );
+    assert!(
+        err.get("message").and_then(|v| v.as_str()).is_some(),
+        "structured error must carry a message"
+    );
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn project_subject_roundtrips_through_socket() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    // Pre-populate a subject and a relation via the engine's shared
+    // registry and graph, standing in for a plugin contribution. This
+    // exercises the read path without requiring a plugin that
+    // announces subjects (the echo plugin does not).
+    let (track_id, album_id) = {
+        let guard = engine.lock().await;
+        let registry = guard.registry();
+        let graph = guard.relation_graph();
+
+        let track_ann = SubjectAnnouncement::new(
+            "track",
+            vec![ExternalAddressing::new("mpd-path", "/x.flac")],
+        );
+        let track_outcome =
+            registry.announce(&track_ann, "com.test.fixture").unwrap();
+        let track_id = match track_outcome {
+            evo::subjects::AnnounceOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        let album_ann = SubjectAnnouncement::new(
+            "album",
+            vec![ExternalAddressing::new("mbid", "album-123")],
+        );
+        let album_outcome =
+            registry.announce(&album_ann, "com.test.fixture").unwrap();
+        let album_id = match album_outcome {
+            evo::subjects::AnnounceOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        graph
+            .assert(&track_id, "album_of", &album_id, "com.test.fixture", None)
+            .unwrap();
+
+        (track_id, album_id)
+    };
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+
+    // Minimal project request: no scope (no relation traversal).
+    let minimal_req =
+        format!(r#"{{"op":"project_subject","canonical_id":"{track_id}"}}"#);
+    write_frame(&mut stream, minimal_req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["canonical_id"].as_str(), Some(track_id.as_str()));
+    assert_eq!(v["subject_type"].as_str(), Some("track"));
+    assert_eq!(v["shape_version"].as_u64(), Some(1));
+    assert_eq!(v["degraded"].as_bool(), Some(false));
+    assert_eq!(v["addressings"].as_array().map(|a| a.len()), Some(1));
+    assert_eq!(v["addressings"][0]["scheme"].as_str(), Some("mpd-path"));
+    // No scope means no related subjects even though album_of exists.
+    assert_eq!(v["related"].as_array().map(|a| a.len()), Some(0));
+
+    // Scoped project request: include album_of forward.
+    let scoped_req = format!(
+        r#"{{
+            "op": "project_subject",
+            "canonical_id": "{track_id}",
+            "scope": {{
+                "relation_predicates": ["album_of"],
+                "direction": "forward"
+            }}
+        }}"#
+    );
+    write_frame(&mut stream, scoped_req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    let related = v["related"].as_array().expect("related array");
+    assert_eq!(related.len(), 1);
+    assert_eq!(related[0]["predicate"].as_str(), Some("album_of"));
+    assert_eq!(related[0]["direction"].as_str(), Some("forward"));
+    assert_eq!(related[0]["target_id"].as_str(), Some(album_id.as_str()));
+    assert_eq!(related[0]["target_type"].as_str(), Some("album"));
+
+    // Unknown subject yields a structured error response.
+    let bad_req = r#"{"op":"project_subject","canonical_id":"not-a-real-id"}"#;
+    write_frame(&mut stream, bad_req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(
+        v["error"]["class"].as_str(),
+        Some("not_found"),
+        "expected NotFound class, got: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        v["error"]["details"]["subclass"].as_str(),
+        Some("unknown_subject")
+    );
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("unknown subject"));
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn project_subject_multi_hop_roundtrips_through_socket() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    // Build a 3-chain: track -> album -> artist.
+    let (track_id, album_id, artist_id) = {
+        let guard = engine.lock().await;
+        let registry = guard.registry();
+        let graph = guard.relation_graph();
+
+        let track_ann = SubjectAnnouncement::new(
+            "track",
+            vec![ExternalAddressing::new("mpd-path", "/x.flac")],
+        );
+        let album_ann = SubjectAnnouncement::new(
+            "album",
+            vec![ExternalAddressing::new("mbid", "album-123")],
+        );
+        let artist_ann = SubjectAnnouncement::new(
+            "artist",
+            vec![ExternalAddressing::new("mbid", "artist-456")],
+        );
+
+        let t = match registry.announce(&track_ann, "com.test.fixture").unwrap()
+        {
+            evo::subjects::AnnounceOutcome::Created(id) => id,
+            other => panic!("expected Created for track, got {other:?}"),
+        };
+        let a = match registry.announce(&album_ann, "com.test.fixture").unwrap()
+        {
+            evo::subjects::AnnounceOutcome::Created(id) => id,
+            other => panic!("expected Created for album, got {other:?}"),
+        };
+        let r =
+            match registry.announce(&artist_ann, "com.test.fixture").unwrap() {
+                evo::subjects::AnnounceOutcome::Created(id) => id,
+                other => panic!("expected Created for artist, got {other:?}"),
+            };
+
+        graph
+            .assert(&t, "rel", &a, "com.test.fixture", None)
+            .unwrap();
+        graph
+            .assert(&a, "rel", &r, "com.test.fixture", None)
+            .unwrap();
+
+        (t, a, r)
+    };
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+
+    // Request with max_depth=3: expect track -> album (nested) ->
+    // artist (nested, leaf).
+    let req = format!(
+        r#"{{
+            "op": "project_subject",
+            "canonical_id": "{track_id}",
+            "scope": {{
+                "relation_predicates": ["rel"],
+                "direction": "forward",
+                "max_depth": 3
+            }}
+        }}"#
+    );
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    // Root: track.
+    assert_eq!(v["canonical_id"].as_str(), Some(track_id.as_str()));
+    assert_eq!(v["subject_type"].as_str(), Some("track"));
+    assert_eq!(v["walk_truncated"].as_bool(), Some(false));
+
+    // Level 1: album, nested.
+    let album_rel = &v["related"][0];
+    assert_eq!(album_rel["target_id"].as_str(), Some(album_id.as_str()));
+    assert_eq!(album_rel["target_type"].as_str(), Some("album"));
+    let album_nested = &album_rel["nested"];
+    assert!(
+        !album_nested.is_null(),
+        "album should carry nested projection at depth=3"
+    );
+    assert_eq!(
+        album_nested["canonical_id"].as_str(),
+        Some(album_id.as_str())
+    );
+
+    // Level 2: artist, nested, leaf (no further edges).
+    let artist_rel = &album_nested["related"][0];
+    assert_eq!(artist_rel["target_id"].as_str(), Some(artist_id.as_str()));
+    assert_eq!(artist_rel["target_type"].as_str(), Some("artist"));
+    let artist_nested = &artist_rel["nested"];
+    assert!(
+        !artist_nested.is_null(),
+        "artist should carry nested projection at depth=3"
+    );
+    assert_eq!(
+        artist_nested["related"].as_array().map(|a| a.len()),
+        Some(0),
+        "artist is a leaf: no outgoing relations"
+    );
+
+    // Follow-up request on the same connection: depth=1 should
+    // emit a reference without nesting (no recursive expansion).
+    let shallow_req = format!(
+        r#"{{
+            "op": "project_subject",
+            "canonical_id": "{track_id}",
+            "scope": {{
+                "relation_predicates": ["rel"],
+                "direction": "forward",
+                "max_depth": 1
+            }}
+        }}"#
+    );
+    write_frame(&mut stream, shallow_req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    let shallow_rel = &v["related"][0];
+    assert_eq!(shallow_rel["target_id"].as_str(), Some(album_id.as_str()));
+    assert!(
+        shallow_rel["nested"].is_null(),
+        "depth=1 should not nest, got: {}",
+        shallow_rel["nested"]
+    );
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn invalid_op_returns_structured_error() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+
+    let bad_req = r#"{"op":"who_knows","x":"y"}"#;
+    write_frame(&mut stream, bad_req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(
+        v["error"]["class"].as_str(),
+        Some("protocol_violation"),
+        "expected ProtocolViolation for unknown op, got: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        v["error"]["details"]["subclass"].as_str(),
+        Some("invalid_json")
+    );
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn list_active_custodies_empty_when_none_taken() {
+    // End-to-end exercise of the list_active_custodies socket
+    // surface with an empty ledger. Verifies the op parses, the
+    // handler runs, and the response shape is
+    // `{"active_custodies": []}`.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+
+    let req = r#"{"op":"list_active_custodies"}"#;
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    let arr = v["active_custodies"].as_array().unwrap_or_else(|| {
+        panic!(
+            "expected active_custodies array, got: {}",
+            String::from_utf8_lossy(&body)
+        )
+    });
+    assert_eq!(arr.len(), 0);
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn list_active_custodies_returns_populated_ledger() {
+    // Pre-populate the ledger from the test side (bypassing the
+    // take_custody path, which is covered by admission tests and
+    // wire_client tests), then query via the socket. Proves the
+    // list_active_custodies surface end-to-end: record -> ledger
+    // -> wire serialisation -> client JSON.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    // Populate the ledger directly. Release the engine lock before
+    // spawning the server so the server task is free to acquire it
+    // during handle_list_active_custodies.
+    {
+        let guard = engine.lock().await;
+        let ledger = guard.custody_ledger();
+        ledger.record_custody(
+            "org.test.warden",
+            "example.custody",
+            &CustodyHandle::new("custody-1"),
+            "playback",
+        );
+        ledger.record_state(
+            "org.test.warden",
+            "custody-1",
+            b"state=playing".to_vec(),
+            HealthStatus::Healthy,
+        );
+    }
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+
+    let req = r#"{"op":"list_active_custodies"}"#;
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    let arr = v["active_custodies"].as_array().unwrap_or_else(|| {
+        panic!(
+            "expected active_custodies array, got: {}",
+            String::from_utf8_lossy(&body)
+        )
+    });
+    assert_eq!(arr.len(), 1);
+
+    let first = &arr[0];
+    // Plugin name is replaced by an opaque token on the wire.
+    assert!(
+        first["plugin"].is_null(),
+        "plain plugin field must be absent on the wire"
+    );
+    assert!(
+        first["claimant_token"].as_str().is_some(),
+        "claimant_token must be present on every wire custody record"
+    );
+    assert_eq!(first["handle_id"].as_str(), Some("custody-1"));
+    assert_eq!(first["shelf"].as_str(), Some("example.custody"));
+    assert_eq!(first["custody_type"].as_str(), Some("playback"));
+    assert_eq!(first["last_state"]["health"].as_str(), Some("healthy"));
+    let decoded = B64
+        .decode(
+            first["last_state"]["payload_b64"]
+                .as_str()
+                .expect("payload_b64 string"),
+        )
+        .expect("base64 decode");
+    assert_eq!(decoded, b"state=playing");
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn subscribe_happenings_delivers_ack_and_events() {
+    // End-to-end exercise of the subscribe_happenings socket
+    // surface. Subscribe, read the ack, emit happenings on the
+    // bus from the test side,
+    // verify the happening frames arrive correctly. Uses direct bus
+    // emission rather than take_custody/release_custody because the
+    // engine's custody verbs require a warden admitted on the shelf;
+    // the subscription flow is independent of which source emits to
+    // the bus, so a direct emit is a cleaner test fixture.
+    //
+    // The ack is load-bearing for this test: because the server's
+    // bus.subscribe() runs before the ack is written, once the client
+    // has read the ack any subsequent emit on the bus is guaranteed
+    // to reach the subscriber. Without the ack the test would be
+    // timing-coupled (emit might land before subscribe registers).
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+
+    // Grab a handle to the bus so we can emit from the test side.
+    // Taken BEFORE sending the subscribe op so the Arc clone is
+    // ready to use as soon as the ack is read.
+    let bus: std::sync::Arc<HappeningBus> = {
+        let guard = engine.lock().await;
+        guard.happening_bus()
+    };
+
+    // Send subscribe_happenings.
+    write_frame(&mut stream, br#"{"op":"subscribe_happenings"}"#).await;
+
+    // Read the ack. The ack is written AFTER the server's
+    // bus.subscribe() call, so any emit after this point reaches the
+    // subscriber.
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(
+        v["subscribed"].as_bool(),
+        Some(true),
+        "expected subscribed ack, got: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Emit CustodyTaken on the bus.
+    bus.emit(Happening::CustodyTaken {
+        plugin: "org.test.warden".into(),
+        handle_id: "c-1".into(),
+        shelf: "example.custody".into(),
+        custody_type: "playback".into(),
+        at: std::time::SystemTime::now(),
+    });
+
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(
+        v["happening"]["type"].as_str(),
+        Some("custody_taken"),
+        "got: {}",
+        String::from_utf8_lossy(&body)
+    );
+    // Plugin name is replaced by an opaque token on the wire; the
+    // plain `plugin` key MUST NOT appear.
+    assert!(
+        v["happening"]["plugin"].is_null(),
+        "plain plugin field must be absent on the wire"
+    );
+    assert!(
+        v["happening"]["claimant_token"].as_str().is_some(),
+        "claimant_token must be present on every wire happening"
+    );
+    assert_eq!(v["happening"]["handle_id"].as_str(), Some("c-1"));
+    assert_eq!(v["happening"]["shelf"].as_str(), Some("example.custody"));
+    assert_eq!(v["happening"]["custody_type"].as_str(), Some("playback"));
+    assert!(
+        v["happening"]["at_ms"].as_u64().is_some(),
+        "at_ms must be present"
+    );
+
+    // Emit a second happening of a different variant to verify the
+    // stream stays open and delivers subsequent events.
+    bus.emit(Happening::CustodyReleased {
+        plugin: "org.test.warden".into(),
+        handle_id: "c-1".into(),
+        at: std::time::SystemTime::now(),
+    });
+
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["happening"]["type"].as_str(), Some("custody_released"));
+    assert_eq!(v["happening"]["handle_id"].as_str(), Some("c-1"));
+
+    // Client disconnects; subscription task exits cleanly.
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn describe_capabilities_returns_stable_op_and_feature_lists() {
+    // Wave 2.2: capability discovery surface. Consumers SHOULD call
+    // this once on connect and feature-probe before invoking ops
+    // that may not be present on older steward builds. The op set
+    // and feature names are stable (additive only); this test pins
+    // the contract so a refactor that drops a name fails loud.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+    write_frame(&mut stream, br#"{"op":"describe_capabilities"}"#).await;
+
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["capabilities"].as_bool(), Some(true));
+    assert_eq!(v["wire_version"].as_u64(), Some(1));
+
+    let ops: Vec<&str> = v["ops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    for expected in [
+        "request",
+        "project_subject",
+        "describe_alias",
+        "list_active_custodies",
+        "subscribe_happenings",
+        "describe_capabilities",
+    ] {
+        assert!(
+            ops.contains(&expected),
+            "op {expected:?} missing from capabilities response"
+        );
+    }
+
+    let features: Vec<&str> = v["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert!(
+        features.contains(&"subscribe_happenings_cursor"),
+        "subscribe_happenings_cursor must be advertised since the \
+         cursor surface is implemented"
+    );
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn subscribe_happenings_ack_carries_current_seq() {
+    // Verifies the cursor surface: the subscribe ack exposes
+    // `current_seq` (the bus cursor at subscribe time), and
+    // every streamed `Happening` frame carries the seq the bus
+    // minted at emit time. Consumers persist that seq to resume
+    // across reconnect or steward restart.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let bus = {
+        let guard = engine.lock().await;
+        guard.happening_bus()
+    };
+
+    // Pre-emit two events so the bus has a non-zero current_seq at
+    // subscribe time. These predate the subscribe and are therefore
+    // not delivered on the live stream (consumers wanting them must
+    // pass `since`).
+    bus.emit(Happening::CustodyTaken {
+        plugin: "org.test.warden".into(),
+        handle_id: "c-pre-1".into(),
+        shelf: "example.custody".into(),
+        custody_type: "playback".into(),
+        at: std::time::SystemTime::now(),
+    });
+    bus.emit(Happening::CustodyTaken {
+        plugin: "org.test.warden".into(),
+        handle_id: "c-pre-2".into(),
+        shelf: "example.custody".into(),
+        custody_type: "playback".into(),
+        at: std::time::SystemTime::now(),
+    });
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+    write_frame(&mut stream, br#"{"op":"subscribe_happenings"}"#).await;
+
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["subscribed"].as_bool(), Some(true));
+    assert_eq!(
+        v["current_seq"].as_u64(),
+        Some(2),
+        "ack must report the bus's current cursor; got: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Emit one live event and verify it carries seq=3 on the wire.
+    bus.emit(Happening::CustodyReleased {
+        plugin: "org.test.warden".into(),
+        handle_id: "c-pre-1".into(),
+        at: std::time::SystemTime::now(),
+    });
+
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["seq"].as_u64(), Some(3));
+    assert_eq!(v["happening"]["type"].as_str(), Some("custody_released"));
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn subscribe_happenings_replays_from_since_then_streams_live() {
+    // Replay path: a consumer reconnecting with a `since` cursor
+    // receives every persisted happening with seq > since
+    // before transitioning to live streaming. Live events whose seq
+    // is at or below the largest replayed seq are deduped so the
+    // consumer never sees the same event twice across the boundary.
+    //
+    // Builds a custom harness with a durable bus so emit_durable
+    // writes to happenings_log; the wire-level replay path queries
+    // that table.
+    use evo::admin::AdminLedger;
+    use evo::admission::AdmissionEngine;
+    use evo::catalogue::Catalogue;
+    use evo::config::PluginsSecurityConfig;
+    use evo::custody::CustodyLedger;
+    use evo::persistence::{MemoryPersistenceStore, PersistenceStore};
+    use evo::relations::RelationGraph;
+    use evo::server::Server;
+    use evo::state::StewardState;
+    use evo::subjects::SubjectRegistry;
+
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+    let catalogue_path = tmp.path().join("catalogue.toml");
+    std::fs::write(&catalogue_path, CATALOGUE_TOML).expect("write catalogue");
+    let catalogue =
+        Arc::new(Catalogue::load(&catalogue_path).expect("catalogue"));
+
+    let store: Arc<dyn PersistenceStore> =
+        Arc::new(MemoryPersistenceStore::new());
+    let bus = Arc::new(
+        HappeningBus::with_persistence(Arc::clone(&store))
+            .await
+            .expect("durable bus"),
+    );
+
+    let state = StewardState::builder()
+        .catalogue(catalogue)
+        .subjects(Arc::new(SubjectRegistry::new()))
+        .relations(Arc::new(RelationGraph::new()))
+        .custody(Arc::new(CustodyLedger::new()))
+        .bus(Arc::clone(&bus))
+        .admin(Arc::new(AdminLedger::new()))
+        .persistence(Arc::clone(&store))
+        .claimant_issuer(Arc::new(evo::claimant::ClaimantTokenIssuer::new(
+            "test-instance",
+        )))
+        .build()
+        .expect("steward state must build");
+
+    let mut engine = AdmissionEngine::new(
+        Arc::clone(&state),
+        std::path::PathBuf::from("/tmp/evo-end-to-end-tests-data-root"),
+        std::path::PathBuf::new(),
+        None,
+        PluginsSecurityConfig::default(),
+    );
+    let echo_plugin = evo_example_echo::EchoPlugin::new();
+    let echo_manifest = evo_example_echo::manifest();
+    engine
+        .admit_singleton_respondent(echo_plugin, echo_manifest)
+        .await
+        .expect("admit echo plugin");
+
+    let projections = Arc::new(ProjectionEngine::new(
+        Arc::clone(&state.subjects),
+        Arc::clone(&state.relations),
+    ));
+    let router = Arc::clone(engine.router());
+    let engine = Arc::new(Mutex::new(engine));
+    let server = Server::new(
+        socket_path.clone(),
+        router,
+        Arc::clone(&state),
+        Arc::clone(&projections),
+    );
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    // Persist three events durably. Each gets seq 1, 2, 3 written
+    // through to happenings_log.
+    for handle in ["c-1", "c-2", "c-3"] {
+        bus.emit_durable(Happening::CustodyTaken {
+            plugin: "org.test.warden".into(),
+            handle_id: handle.into(),
+            shelf: "example.custody".into(),
+            custody_type: "playback".into(),
+            at: std::time::SystemTime::now(),
+        })
+        .await
+        .expect("emit_durable");
+    }
+    assert_eq!(bus.last_emitted_seq(), 3);
+
+    // Subscribe with since=1: replay must deliver seq=2 and seq=3,
+    // then transition to live.
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+    write_frame(&mut stream, br#"{"op":"subscribe_happenings","since":1}"#)
+        .await;
+
+    // Ack carries the cursor sampled at subscribe time (3).
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["subscribed"].as_bool(), Some(true));
+    assert_eq!(v["current_seq"].as_u64(), Some(3));
+
+    // First replay frame: seq=2.
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["seq"].as_u64(), Some(2));
+    assert_eq!(v["happening"]["type"].as_str(), Some("custody_taken"));
+    assert_eq!(v["happening"]["handle_id"].as_str(), Some("c-2"));
+
+    // Second replay frame: seq=3.
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["seq"].as_u64(), Some(3));
+    assert_eq!(v["happening"]["handle_id"].as_str(), Some("c-3"));
+
+    // Live event must follow the replay window with seq=4 and bypass
+    // the dedupe boundary cleanly.
+    bus.emit_durable(Happening::CustodyReleased {
+        plugin: "org.test.warden".into(),
+        handle_id: "c-3".into(),
+        at: std::time::SystemTime::now(),
+    })
+    .await
+    .expect("live emit_durable");
+
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["seq"].as_u64(), Some(4));
+    assert_eq!(v["happening"]["type"].as_str(), Some("custody_released"));
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+// ---------------------------------------------------------------------
+// project_subject + describe_alias: alias-aware client API surface.
+//
+// Each test below builds a fresh harness, mutates the registry to
+// produce a known alias topology (merge or split), and exercises the
+// client-socket op surface end-to-end. The shared
+// `setup_alias_harness` helper owns the boilerplate around server
+// startup, socket connection, and shutdown so each test reads as a
+// linear story of "produce alias state -> hit op -> assert shape".
+// ---------------------------------------------------------------------
+
+/// Common setup for alias-aware client-API tests. Returns a harness
+/// the test mutates (registry, optional graph) plus a connected
+/// client stream and shutdown plumbing. Caller arranges alias state
+/// via the returned engine, then issues ops over the stream.
+async fn setup_alias_harness() -> (
+    Arc<Mutex<AdmissionEngine>>,
+    UnixStream,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+) {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+
+    let (engine, _projections, server) =
+        build_harness(socket_path.clone(), CATALOGUE_TOML).await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let stream = UnixStream::connect(&socket_path).await.expect("connect");
+
+    (engine, stream, shutdown_tx, server_task, tmp)
+}
+
+/// Announce two subjects of the same type and merge them via the
+/// registry's `merge_aliases` storage primitive. Returns the two
+/// retired source IDs and the new terminal ID. The engine lock is
+/// released before running merge_aliases so the registry's internal
+/// mutex stays uncontended with the server task.
+async fn merge_two_subjects(
+    engine: &Arc<Mutex<AdmissionEngine>>,
+) -> (String, String, String) {
+    let registry = {
+        let guard = engine.lock().await;
+        guard.registry()
+    };
+
+    let a = SubjectAnnouncement::new(
+        "track",
+        vec![ExternalAddressing::new("mpd-path", "/a.flac")],
+    );
+    let b = SubjectAnnouncement::new(
+        "track",
+        vec![ExternalAddressing::new("mpd-path", "/b.flac")],
+    );
+    let id_a = match registry.announce(&a, "com.test.fixture").unwrap() {
+        evo::subjects::AnnounceOutcome::Created(id) => id,
+        other => panic!("expected Created for a, got {other:?}"),
+    };
+    let id_b = match registry.announce(&b, "com.test.fixture").unwrap() {
+        evo::subjects::AnnounceOutcome::Created(id) => id,
+        other => panic!("expected Created for b, got {other:?}"),
+    };
+
+    let outcome = registry
+        .merge_aliases(&id_a, &id_b, "admin.plugin", Some("dedup".into()))
+        .expect("merge_aliases");
+    let new_id = outcome.new_id;
+
+    (id_a, id_b, new_id)
+}
+
+/// Announce one subject with two addressings and split it across
+/// the partition. Returns the retired source ID and the two new
+/// canonical IDs.
+async fn split_one_subject(
+    engine: &Arc<Mutex<AdmissionEngine>>,
+) -> (String, Vec<String>) {
+    let registry = {
+        let guard = engine.lock().await;
+        guard.registry()
+    };
+
+    let subj = SubjectAnnouncement::new(
+        "track",
+        vec![
+            ExternalAddressing::new("mpd-path", "/x.flac"),
+            ExternalAddressing::new("mpd-path", "/y.flac"),
+        ],
+    );
+    let source_id = match registry.announce(&subj, "com.test.fixture").unwrap()
+    {
+        evo::subjects::AnnounceOutcome::Created(id) => id,
+        other => panic!("expected Created for split source, got {other:?}"),
+    };
+
+    let outcome = registry
+        .split_subject(
+            &source_id,
+            vec![
+                vec![ExternalAddressing::new("mpd-path", "/x.flac")],
+                vec![ExternalAddressing::new("mpd-path", "/y.flac")],
+            ],
+            "admin.plugin",
+            Some("audit".into()),
+        )
+        .expect("split_subject");
+
+    (source_id, outcome.new_ids)
+}
+
+#[tokio::test]
+async fn project_subject_with_aliased_from_when_id_was_merged() {
+    let (engine, mut stream, shutdown_tx, server_task, _tmp) =
+        setup_alias_harness().await;
+    let (id_a, _id_b, new_id) = merge_two_subjects(&engine).await;
+
+    // Query the merged-away ID. Default follow_aliases:true means
+    // the steward auto-follows to the terminal and projects it.
+    let req = format!(r#"{{"op":"project_subject","canonical_id":"{id_a}"}}"#);
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    // subject is populated and is the terminal projection.
+    assert!(
+        !v["subject"].is_null(),
+        "subject must be populated, got: {v}"
+    );
+    assert_eq!(v["subject"]["canonical_id"].as_str(), Some(new_id.as_str()));
+    assert_eq!(v["subject"]["subject_type"].as_str(), Some("track"));
+
+    // aliased_from carries the chain (length 1: single merge hop)
+    // and the terminal_id.
+    let af = &v["aliased_from"];
+    assert_eq!(af["queried_id"].as_str(), Some(id_a.as_str()));
+    assert_eq!(af["terminal_id"].as_str(), Some(new_id.as_str()));
+    let chain = af["chain"].as_array().expect("chain array");
+    assert_eq!(chain.len(), 1, "chain should be length 1, got: {chain:?}");
+    assert_eq!(chain[0]["kind"].as_str(), Some("merged"));
+    assert_eq!(chain[0]["old_id"].as_str(), Some(id_a.as_str()));
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn project_subject_with_aliased_from_when_id_was_split() {
+    let (engine, mut stream, shutdown_tx, server_task, _tmp) =
+        setup_alias_harness().await;
+    let (source_id, new_ids) = split_one_subject(&engine).await;
+
+    let req =
+        format!(r#"{{"op":"project_subject","canonical_id":"{source_id}"}}"#);
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    // subject is null because the chain forked.
+    assert!(
+        v["subject"].is_null(),
+        "subject must be null on split fork, got: {v}"
+    );
+
+    // aliased_from has the split record with terminal_id null.
+    let af = &v["aliased_from"];
+    assert_eq!(af["queried_id"].as_str(), Some(source_id.as_str()));
+    assert!(
+        af["terminal_id"].is_null(),
+        "terminal_id must be null on a split fork, got: {af}"
+    );
+    let chain = af["chain"].as_array().expect("chain array");
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0]["kind"].as_str(), Some("split"));
+    let chain_new_ids: Vec<&str> = chain[0]["new_ids"]
+        .as_array()
+        .expect("new_ids array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    for new_id in &new_ids {
+        assert!(
+            chain_new_ids.contains(&new_id.as_str()),
+            "new_id {new_id} should appear in chain[0].new_ids"
+        );
+    }
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn project_subject_returns_not_found_for_unknown_id_no_alias() {
+    let (engine, mut stream, shutdown_tx, server_task, _tmp) =
+        setup_alias_harness().await;
+
+    let req = r#"{"op":"project_subject","canonical_id":"never-existed"}"#;
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    // NotFound shape: structured error envelope, no aliased_from
+    // key.
+    assert_eq!(
+        v["error"]["class"].as_str(),
+        Some("not_found"),
+        "expected NotFound class, got: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        v["error"]["details"]["subclass"].as_str(),
+        Some("unknown_subject")
+    );
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("unknown subject"));
+    assert!(
+        v.get("aliased_from").is_none(),
+        "aliased_from must be absent when the queried ID is genuinely \
+         unknown, got: {v}"
+    );
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn project_subject_with_follow_aliases_false_does_not_auto_follow() {
+    let (engine, mut stream, shutdown_tx, server_task, _tmp) =
+        setup_alias_harness().await;
+    let (id_a, _id_b, new_id) = merge_two_subjects(&engine).await;
+
+    // Same merge as the auto-follow test, but the request opts out.
+    let req = format!(
+        r#"{{"op":"project_subject","canonical_id":"{id_a}","follow_aliases":false}}"#
+    );
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    assert!(
+        v["subject"].is_null(),
+        "subject must be null when follow_aliases is false, got: {v}"
+    );
+    let af = &v["aliased_from"];
+    assert_eq!(af["queried_id"].as_str(), Some(id_a.as_str()));
+    // terminal_id is still populated: opting out of auto-follow does
+    // not erase the steward's knowledge of where the chain ends, so
+    // the consumer can issue a follow-up project against new_id if
+    // they choose.
+    assert_eq!(af["terminal_id"].as_str(), Some(new_id.as_str()));
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn describe_alias_returns_full_chain_with_include_chain_true_default() {
+    let (engine, mut stream, shutdown_tx, server_task, _tmp) =
+        setup_alias_harness().await;
+    let (id_a, _id_b, new_id) = merge_two_subjects(&engine).await;
+
+    // No include_chain field: default-true walks the chain.
+    let req = format!(r#"{{"op":"describe_alias","subject_id":"{id_a}"}}"#);
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    assert_eq!(v["ok"].as_bool(), Some(true));
+    assert_eq!(v["subject_id"].as_str(), Some(id_a.as_str()));
+    assert_eq!(v["result"]["kind"].as_str(), Some("aliased"));
+    let chain = v["result"]["chain"].as_array().expect("chain");
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0]["kind"].as_str(), Some("merged"));
+    // Terminal is populated because the chain resolves to a live
+    // subject.
+    assert!(!v["result"]["terminal"].is_null());
+    assert_eq!(
+        v["result"]["terminal"]["id"].as_str(),
+        Some(new_id.as_str())
+    );
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn describe_alias_returns_immediate_record_with_include_chain_false() {
+    let (engine, mut stream, shutdown_tx, server_task, _tmp) =
+        setup_alias_harness().await;
+    let (id_a, _id_b, _new_id) = merge_two_subjects(&engine).await;
+
+    let req = format!(
+        r#"{{"op":"describe_alias","subject_id":"{id_a}","include_chain":false}}"#
+    );
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    assert_eq!(v["ok"].as_bool(), Some(true));
+    assert_eq!(v["result"]["kind"].as_str(), Some("aliased"));
+    let chain = v["result"]["chain"].as_array().expect("chain");
+    assert_eq!(
+        chain.len(),
+        1,
+        "single-hop view must carry exactly one record, got: {chain:?}"
+    );
+    // Single-hop view never carries a terminal; the caller decides
+    // whether to chase the new_ids themselves.
+    assert!(
+        v["result"]["terminal"].is_null(),
+        "single-hop must not project a terminal, got: {v}"
+    );
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn describe_alias_returns_not_found_for_unknown_id() {
+    let (engine, mut stream, shutdown_tx, server_task, _tmp) =
+        setup_alias_harness().await;
+
+    let req = r#"{"op":"describe_alias","subject_id":"never-existed"}"#;
+    write_frame(&mut stream, req.as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+
+    assert_eq!(v["ok"].as_bool(), Some(true));
+    assert_eq!(v["result"]["kind"].as_str(), Some("not_found"));
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+// ---------------------------------------------------------------------
+// Capability negotiation + resolve_claimants
+// ---------------------------------------------------------------------
+//
+// The harness constructs the server through `Server::with_acl` so the
+// tests can vary the ACL independently of the steward identity. Each
+// test exercises one slice of the negotiate / resolve pipeline:
+//
+//   - negotiate granted set under a permissive ACL
+//   - negotiate granted set under the default-deny ACL
+//   - resolve refuses without negotiate
+//   - resolve returns rows under a granted capability
+//   - resolve emits no happening (privacy-preserving regression)
+//   - audit ledger records both granted and refused calls
+
+async fn build_negotiation_harness(
+    socket_path: std::path::PathBuf,
+    acl: Arc<evo::client_acl::ClientAcl>,
+    steward_identity: evo::client_acl::StewardIdentity,
+) -> (
+    Arc<Mutex<AdmissionEngine>>,
+    Arc<HappeningBus>,
+    Arc<evo::resolution::ResolutionLedger>,
+    Server,
+) {
+    let tmp_parent = socket_path.parent().unwrap().to_path_buf();
+    let catalogue_path = tmp_parent.join("catalogue.toml");
+    std::fs::write(&catalogue_path, CATALOGUE_TOML).expect("write catalogue");
+    let catalogue =
+        Arc::new(Catalogue::load(&catalogue_path).expect("catalogue"));
+
+    let bus = Arc::new(HappeningBus::new());
+    let state = StewardState::builder()
+        .catalogue(catalogue)
+        .subjects(Arc::new(SubjectRegistry::new()))
+        .relations(Arc::new(RelationGraph::new()))
+        .custody(Arc::new(CustodyLedger::new()))
+        .bus(Arc::clone(&bus))
+        .admin(Arc::new(AdminLedger::new()))
+        .persistence(Arc::new(MemoryPersistenceStore::new()))
+        .claimant_issuer(Arc::new(evo::claimant::ClaimantTokenIssuer::new(
+            "test-instance",
+        )))
+        .build()
+        .expect("steward state must build");
+
+    // Pre-record a couple of plugin identities the resolve op can
+    // exchange tokens for. No need to admit a plugin: token issuance
+    // is the issuer's responsibility, and `record_version` is the
+    // public surface for that side of the contract.
+    state
+        .claimant_issuer
+        .record_version("com.example.alpha", "1.0.0");
+    state
+        .claimant_issuer
+        .record_version("com.example.beta", "2.3.4");
+
+    let mut engine = AdmissionEngine::new(
+        Arc::clone(&state),
+        std::path::PathBuf::from("/tmp/evo-end-to-end-tests-data-root"),
+        std::path::PathBuf::new(),
+        None,
+        PluginsSecurityConfig::default(),
+    );
+    let echo_plugin = evo_example_echo::EchoPlugin::new();
+    let echo_manifest = evo_example_echo::manifest();
+    engine
+        .admit_singleton_respondent(echo_plugin, echo_manifest)
+        .await
+        .expect("admit echo plugin");
+
+    let projections = Arc::new(ProjectionEngine::new(
+        Arc::clone(&state.subjects),
+        Arc::clone(&state.relations),
+    ));
+    let router = Arc::clone(engine.router());
+    let engine = Arc::new(Mutex::new(engine));
+    let resolution_ledger = Arc::new(evo::resolution::ResolutionLedger::new());
+    let server = Server::with_acl(
+        socket_path,
+        router,
+        Arc::clone(&state),
+        Arc::clone(&projections),
+        acl,
+        steward_identity,
+        Arc::clone(&resolution_ledger),
+    );
+
+    (engine, bus, resolution_ledger, server)
+}
+
+#[tokio::test]
+async fn negotiate_grants_resolve_claimants_under_permissive_acl() {
+    // A wide-open ACL grants `resolve_claimants` to any peer; the
+    // negotiate response echoes the granted name back.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+    let acl = Arc::new(
+        evo::client_acl::ClientAcl::parse(
+            r#"
+            [capabilities.resolve_claimants]
+            allow_local = true
+            allow_uids = [0, 1, 1000]
+            allow_gids = [0, 1, 1000]
+            "#,
+            None,
+        )
+        .expect("parse permissive ACL"),
+    );
+    // Match every plausible UID/GID by listing the test process's
+    // own credentials in the ACL. Steward identity needn't match;
+    // the explicit list grants regardless.
+    let steward_identity = evo::client_acl::StewardIdentity::current();
+    let (engine, _bus, _ledger, server) =
+        build_negotiation_harness(socket_path.clone(), acl, steward_identity)
+            .await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+    write_frame(
+        &mut stream,
+        br#"{"op":"negotiate","capabilities":["resolve_claimants"]}"#,
+    )
+    .await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(v["ok"].as_bool(), Some(true));
+    let granted: Vec<&str> = v["granted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect();
+    assert!(granted.contains(&"resolve_claimants"));
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn resolve_claimants_refuses_without_prior_negotiate() {
+    // Without a negotiate frame the connection's granted set is
+    // empty, so resolve_claimants refuses with the documented
+    // class+subclass.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+    let acl = Arc::new(evo::client_acl::ClientAcl::default());
+    let steward_identity = evo::client_acl::StewardIdentity::current();
+    let (engine, _bus, ledger, server) =
+        build_negotiation_harness(socket_path.clone(), acl, steward_identity)
+            .await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+    write_frame(
+        &mut stream,
+        br#"{"op":"resolve_claimants","tokens":["aaaa"]}"#,
+    )
+    .await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    assert_eq!(
+        v["error"]["class"].as_str(),
+        Some("permission_denied"),
+        "got: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        v["error"]["details"]["subclass"].as_str(),
+        Some("resolve_claimants_not_granted")
+    );
+
+    // Audit ledger records the refusal.
+    assert_eq!(ledger.count(), 1);
+    let entry = &ledger.entries()[0];
+    assert!(!entry.granted);
+    assert_eq!(entry.tokens_requested, 1);
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn resolve_claimants_returns_resolutions_after_negotiate() {
+    // Permissive ACL, negotiate then resolve. Pre-recorded plugin
+    // identities surface as plain name + version; an unknown token
+    // is silently dropped from the response.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+    let acl = Arc::new(
+        evo::client_acl::ClientAcl::parse(
+            r#"
+            [capabilities.resolve_claimants]
+            allow_local = true
+            allow_uids = [0, 1, 1000]
+            allow_gids = [0, 1, 1000]
+            "#,
+            None,
+        )
+        .expect("parse permissive ACL"),
+    );
+    let steward_identity = evo::client_acl::StewardIdentity::current();
+    let (engine, _bus, ledger, server) =
+        build_negotiation_harness(socket_path.clone(), acl, steward_identity)
+            .await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    // Look up the tokens the issuer minted for the pre-recorded
+    // plugins. Tokens are deterministic on instance_id, so we can
+    // recompute them client-side.
+    let alpha_token =
+        evo::claimant::derive_token("com.example.alpha", "test-instance");
+    let beta_token =
+        evo::claimant::derive_token("com.example.beta", "test-instance");
+
+    let mut stream = UnixStream::connect(&socket_path).await.expect("connect");
+    write_frame(
+        &mut stream,
+        br#"{"op":"negotiate","capabilities":["resolve_claimants"]}"#,
+    )
+    .await;
+    let _ack = read_frame(&mut stream).await;
+
+    let req = serde_json::json!({
+        "op": "resolve_claimants",
+        "tokens": [
+            alpha_token.as_str(),
+            "never-issued-zzzz",
+            beta_token.as_str(),
+        ]
+    });
+    write_frame(&mut stream, req.to_string().as_bytes()).await;
+    let body = read_frame(&mut stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+    let rows = v["resolutions"].as_array().unwrap_or_else(|| {
+        panic!(
+            "expected resolutions array, got: {}",
+            String::from_utf8_lossy(&body)
+        )
+    });
+    // Two known + one unknown -> two rows.
+    assert_eq!(rows.len(), 2);
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| r["plugin_name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"com.example.alpha"));
+    assert!(names.contains(&"com.example.beta"));
+    for row in rows {
+        if row["plugin_name"].as_str() == Some("com.example.alpha") {
+            assert_eq!(row["plugin_version"].as_str(), Some("1.0.0"));
+        }
+        if row["plugin_name"].as_str() == Some("com.example.beta") {
+            assert_eq!(row["plugin_version"].as_str(), Some("2.3.4"));
+        }
+    }
+
+    // Audit ledger records the granted call.
+    assert_eq!(ledger.count(), 1);
+    let entry = &ledger.entries()[0];
+    assert!(entry.granted);
+    assert_eq!(entry.tokens_requested, 3);
+    assert_eq!(entry.tokens_resolved, 2);
+
+    drop(stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+#[tokio::test]
+async fn resolve_claimants_does_not_emit_a_happening() {
+    // Privacy regression: resolve_claimants is a private query that
+    // MUST NOT broadcast on the happenings bus. A second connection
+    // subscribes; the test issues several resolve calls on the first
+    // connection and verifies the subscriber sees nothing in a
+    // bounded wait.
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let socket_path = tmp.path().join("evo.sock");
+    let acl = Arc::new(
+        evo::client_acl::ClientAcl::parse(
+            r#"
+            [capabilities.resolve_claimants]
+            allow_local = true
+            allow_uids = [0, 1, 1000]
+            allow_gids = [0, 1, 1000]
+            "#,
+            None,
+        )
+        .expect("parse permissive ACL"),
+    );
+    let steward_identity = evo::client_acl::StewardIdentity::current();
+    let (engine, _bus, _ledger, server) =
+        build_negotiation_harness(socket_path.clone(), acl, steward_identity)
+            .await;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        server
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("server run");
+    });
+    wait_for_socket(&socket_path, Duration::from_secs(2))
+        .await
+        .expect("socket available");
+
+    // Subscriber connection: subscribe, then never read again until
+    // we deliberately try to. Any frame past the ack is a happening.
+    let mut sub_stream = UnixStream::connect(&socket_path)
+        .await
+        .expect("subscribe connect");
+    write_frame(&mut sub_stream, br#"{"op":"subscribe_happenings"}"#).await;
+    let ack = read_frame(&mut sub_stream).await;
+    let v: serde_json::Value = serde_json::from_slice(&ack).expect("JSON");
+    assert_eq!(v["subscribed"].as_bool(), Some(true));
+
+    // Resolver connection: negotiate then issue several resolve
+    // calls.
+    let alpha_token =
+        evo::claimant::derive_token("com.example.alpha", "test-instance");
+    let beta_token =
+        evo::claimant::derive_token("com.example.beta", "test-instance");
+    let mut res_stream = UnixStream::connect(&socket_path)
+        .await
+        .expect("resolve connect");
+    write_frame(
+        &mut res_stream,
+        br#"{"op":"negotiate","capabilities":["resolve_claimants"]}"#,
+    )
+    .await;
+    let _ = read_frame(&mut res_stream).await;
+    for _ in 0..3 {
+        let req = serde_json::json!({
+            "op": "resolve_claimants",
+            "tokens": [alpha_token.as_str(), beta_token.as_str()],
+        });
+        write_frame(&mut res_stream, req.to_string().as_bytes()).await;
+        let _ = read_frame(&mut res_stream).await;
+    }
+
+    // Try to read one happening with a short timeout. A timeout
+    // here is the success condition: the subscriber heard nothing.
+    let next_frame = tokio::time::timeout(
+        Duration::from_millis(250),
+        read_frame(&mut sub_stream),
+    )
+    .await;
+    assert!(
+        next_frame.is_err(),
+        "resolve_claimants must NOT emit a happening; got frame: {}",
+        next_frame
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    );
+
+    drop(sub_stream);
+    drop(res_stream);
+    let _ = shutdown_tx.send(());
+    server_task.await.expect("server task");
+    engine.lock().await.shutdown().await.expect("drain");
+}
+
+// ---------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------
+
+async fn write_frame(stream: &mut UnixStream, body: &[u8]) {
+    let len = (body.len() as u32).to_be_bytes();
+    stream.write_all(&len).await.expect("write len");
+    stream.write_all(body).await.expect("write body");
+    stream.flush().await.expect("flush");
+}
+
+async fn read_frame(stream: &mut UnixStream) -> Vec<u8> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await.expect("read len");
+    let len = u32::from_be_bytes(len_buf) as usize;
+    assert!(len > 0, "response length must be non-zero");
+    assert!(
+        len < 1024 * 1024,
+        "response length suspiciously large: {len}"
+    );
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body).await.expect("read body");
+    body
+}
+
+/// Wait up to `timeout` for a Unix socket file to appear and accept
+/// connections.
+async fn wait_for_socket(
+    path: &std::path::Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if path.exists() && UnixStream::connect(path).await.is_ok() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "socket {} did not become available within {:?}",
+                path.display(),
+                timeout
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

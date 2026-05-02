@@ -1,0 +1,329 @@
+# Publish evo-core release binaries.
+#
+# Triggered by a tag push matching `v*.*.*` (e.g. `v0.1.10`,
+# `v0.2.0-rc.1`). For each tag:
+#
+# 1. Cross-builds `evo` (the steward) and `evo-plugin-tool` for
+#    every supported target architecture.
+# 2. Signs each binary with the framework release signing key
+#    (`EVO_CORE_RELEASE_SIGNING_KEY`); the public half lives in
+#    `keys/evo-core-release-signing-public.pem` so consumers can
+#    verify offline.
+# 3. Stamps a per-arch `build-info.toml` with the tag, target,
+#    binary set, build timestamp, and publisher prefix; signs that
+#    too.
+# 4. Pushes the per-arch staging directory into
+#    `foonerd/evo-core-artefacts` under `binaries/<target>/`.
+#
+# The destination repo is the canonical source of evo-core release
+# binaries. Operators and distributions fetch from it; the
+# verification protocol is documented in
+# `docs/engineering/RELEASE_PLANE.md`.
+#
+# This workflow supersedes the stop-gap
+# `evo-device-audio/.github/workflows/publish-core-binaries.yml`
+# per ADR-0032 and ADR-0033.
+
+name: publish
+
+"on":
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must already exist on origin; defaults to the current ref)"
+        type: string
+        required: false
+
+env:
+  ARTEFACTS_REPO_SSH: git@github.com:foonerd/evo-core-artefacts.git
+  ARTEFACTS_REPO_NAME: foonerd/evo-core-artefacts
+  COMMIT_USER: evo-core CI
+  COMMIT_EMAIL: ci@evoframework.org
+  PUBLISHER: org.evoframework.core
+  RUST_TOOLCHAIN: "1.85"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+    steps:
+      - name: Determine build tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -e
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            tag="$REF_NAME"
+          else
+            echo "::error::publish.yml requires a tag (push trigger or workflow_dispatch input)"
+            exit 1
+          fi
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag '$tag' does not match v<MAJOR>.<MINOR>.<PATCH>[-<pre>]"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check out evo-core at the tag
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Set up Docker / Buildx (for cross)
+        uses: docker/setup-buildx-action@v4
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Cross-build evo, evo-plugin-tool, and example wire bins for ${{ matrix.target }}
+        run: |
+          set -e
+          cross build --release --target ${{ matrix.target }} -p evo --bin evo
+          cross build --release --target ${{ matrix.target }} -p evo-plugin-tool --bin evo-plugin-tool
+          cross build --release --target ${{ matrix.target }} -p evo-example-echo --bin echo-wire
+
+      - name: Host-build evo-plugin-tool (used to sign and pack bundles)
+        run: |
+          set -e
+          # The cross-built evo-plugin-tool may be a foreign-arch binary
+          # (e.g. aarch64) and therefore not runnable on the x86_64 runner.
+          # Build a host-native copy explicitly so signing and packing
+          # always run on something the runner can execute.
+          cargo build --release -p evo-plugin-tool --bin evo-plugin-tool
+          cp target/release/evo-plugin-tool /tmp/host-evo-plugin-tool
+          chmod +x /tmp/host-evo-plugin-tool
+
+      - name: Stage and sign binaries for ${{ matrix.target }}
+        env:
+          EVO_CORE_RELEASE_SIGNING_KEY: ${{ secrets.EVO_CORE_RELEASE_SIGNING_KEY }}
+          TARGET: ${{ matrix.target }}
+          BUILD_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -e
+          if [ -z "$EVO_CORE_RELEASE_SIGNING_KEY" ]; then
+            echo "::error::EVO_CORE_RELEASE_SIGNING_KEY is empty or unset"
+            exit 1
+          fi
+          umask 077
+          printenv EVO_CORE_RELEASE_SIGNING_KEY > /tmp/key.pem
+
+          STAGE=/tmp/stage
+          STAGE_DIR="$STAGE/binaries/$TARGET"
+          mkdir -p "$STAGE_DIR"
+
+          BUILD_ROOT="target/$TARGET/release"
+          for binary in evo evo-plugin-tool; do
+            src="$BUILD_ROOT/$binary"
+            dst="$STAGE_DIR/$binary"
+            cp "$src" "$dst"
+            chmod 755 "$dst"
+            openssl pkeyutl -sign \
+                -inkey /tmp/key.pem -rawin \
+                -in "$dst" \
+                -out "$dst.sig"
+            sha256sum "$dst" | awk '{print $1}' > "$dst.sha256"
+          done
+
+          {
+            echo "schema_version = 0"
+            echo "kind = \"core-binaries\""
+            echo "evo_core_tag = \"${BUILD_TAG}\""
+            echo "target = \"${TARGET}\""
+            echo "binaries = [\"evo\", \"evo-plugin-tool\"]"
+            echo "built_at = \"$(date -u +%FT%TZ)\""
+            echo "publisher = \"${PUBLISHER}\""
+          } > "$STAGE_DIR/build-info.toml"
+
+          openssl pkeyutl -sign \
+              -inkey /tmp/key.pem -rawin \
+              -in "$STAGE_DIR/build-info.toml" \
+              -out "$STAGE_DIR/build-info.sig"
+
+          ls -la "$STAGE_DIR"
+
+      - name: Stage, sign, and pack the echo OOP bundle for ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -e
+          # Production-shaped OOP plugin bundle reference (ADR-0033 D25).
+          # Per-arch bundle directory: manifest.toml + plugin.bin + manifest.sig
+          # then packed as <name>-<version>-<target>.tar.gz.
+          STAGE=/tmp/stage
+          BUNDLE_NAME="org.evo.example.echo"
+          BUNDLE_VERSION="0.1.1"
+          BUNDLE_DIR_NAME="${BUNDLE_NAME}-${BUNDLE_VERSION}-${TARGET}"
+          BUNDLE_DIR="${STAGE}/bundles-work/${BUNDLE_DIR_NAME}"
+          mkdir -p "${BUNDLE_DIR}"
+
+          cp crates/evo-example-echo/manifest.oop.toml "${BUNDLE_DIR}/manifest.toml"
+          cp "target/${TARGET}/release/echo-wire" "${BUNDLE_DIR}/plugin.bin"
+          chmod 755 "${BUNDLE_DIR}/plugin.bin"
+
+          /tmp/host-evo-plugin-tool sign "${BUNDLE_DIR}" --key /tmp/key.pem
+
+          BUNDLE_OUT_DIR="${STAGE}/bundles/${BUNDLE_NAME}/${TARGET}"
+          mkdir -p "${BUNDLE_OUT_DIR}"
+          /tmp/host-evo-plugin-tool pack "${BUNDLE_DIR}" \
+              --out "${BUNDLE_OUT_DIR}/${BUNDLE_DIR_NAME}.tar.gz"
+
+          ls -la "${BUNDLE_OUT_DIR}"
+
+      - name: Wipe signing key from runner
+        if: always()
+        run: |
+          rm -f /tmp/key.pem || true
+
+      - name: Upload binaries as run artefact (matrix-shared)
+        uses: actions/upload-artifact@v7
+        with:
+          name: core-binaries-${{ matrix.target }}
+          path: /tmp/stage/binaries/${{ matrix.target }}/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload OOP bundles as run artefact (matrix-shared)
+        uses: actions/upload-artifact@v7
+        with:
+          name: oop-bundles-${{ matrix.target }}
+          path: /tmp/stage/bundles/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve build tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -e
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            tag="$REF_NAME"
+          else
+            echo "::error::publish.yml requires a tag (push trigger or workflow_dispatch input)"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Download core-binaries matrix artefacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: core-binaries-*
+          path: /tmp/stage/binaries/
+
+      - name: Download oop-bundles matrix artefacts (merge-multiple)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: oop-bundles-*
+          path: /tmp/stage/bundles/
+          merge-multiple: true
+
+      - name: Restore matrix directory layout
+        run: |
+          set -e
+          # Each artifact downloaded into its own directory; flatten so
+          # the resulting layout is binaries/<target>/{evo,evo-plugin-tool,...}
+          cd /tmp/stage/binaries
+          for d in core-binaries-*; do
+            target="${d#core-binaries-}"
+            mv "$d" "$target"
+          done
+          ls -la /tmp/stage/binaries/
+
+          # The bundles upload paths are already <plugin>/<target>/<archive>.tar.gz
+          # under each per-arch artefact root. merge-multiple=true unions them,
+          # so /tmp/stage/bundles/<plugin>/<target>/<archive>.tar.gz is final.
+          ls -laR /tmp/stage/bundles/
+
+      - name: Configure SSH for the artefacts repo
+        env:
+          DEPLOY_KEY: ${{ secrets.EVO_CORE_ARTEFACTS_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.EVO_CORE_ARTEFACTS_KNOWN_HOSTS }}
+        run: |
+          set -e
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "::error::EVO_CORE_ARTEFACTS_DEPLOY_KEY is empty or unset"
+            exit 1
+          fi
+          if [ -z "$KNOWN_HOSTS" ]; then
+            echo "::error::EVO_CORE_ARTEFACTS_KNOWN_HOSTS is empty or unset"
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printenv DEPLOY_KEY > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printenv KNOWN_HOSTS > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Push to artefacts repo
+        env:
+          BUILD_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -e
+          STAGE=/tmp/stage
+
+          git config --global user.name "${COMMIT_USER}"
+          git config --global user.email "${COMMIT_EMAIL}"
+
+          ART=/tmp/artefacts
+          git clone "${ARTEFACTS_REPO_SSH}" "$ART"
+          cd "$ART"
+
+          mkdir -p binaries
+          # Per-arch binaries are not append-only the way pieces/
+          # entries are; the binaries reflect the most recent build
+          # of the named tag for that arch. Replace any prior copy.
+          for arch_dir in "$STAGE/binaries"/*/; do
+            arch=$(basename "$arch_dir")
+            target_dir="binaries/$arch"
+            mkdir -p "$target_dir"
+            cp -r "$arch_dir"* "$target_dir/"
+          done
+
+          # OOP plugin bundles. Layout in artefacts repo:
+          # bundles/<plugin>/<arch>/<plugin>-<version>-<arch>.tar.gz
+          if [ -d "$STAGE/bundles" ]; then
+            mkdir -p bundles
+            cp -r "$STAGE/bundles"/* bundles/
+          fi
+
+          if git status --porcelain | grep -q .; then
+            git add binaries/ bundles/ 2>/dev/null || git add binaries/
+            git commit -m "publish: evo-core binaries and OOP bundles for ${BUILD_TAG} (per arch)"
+            git push origin main
+            echo "Pushed core-binaries and OOP bundles (${BUILD_TAG}) for: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, armv7-unknown-linux-gnueabihf"
+          else
+            echo "No changes to publish."
+          fi
+
+      - name: Wipe SSH key from runner
+        if: always()
+        run: |
+          rm -f ~/.ssh/id_ed25519 ~/.ssh/known_hosts || true

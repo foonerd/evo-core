@@ -1,0 +1,53 @@
+# Manifest for the example admin plugin.
+#
+# This plugin demonstrates how an administration plugin declares itself
+# on the catalogue's `administration.subjects` shelf and receives the
+# SubjectAdmin + RelationAdmin callbacks by setting capabilities.admin
+# = true in its manifest. The steward's admission path refuses any
+# plugin whose effective trust class is weaker than
+# evo_trust::ADMIN_MINIMUM_TRUST when this flag is set.
+
+[plugin]
+name = "org.evo.example.admin"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "administration.subjects"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "privileged"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+
+[capabilities]
+admin = true
+
+[capabilities.respondent]
+request_types = [
+    "admin.subject.retract_addressing",
+    "admin.relation.retract_claim",
+    "admin.subject.merge",
+    "admin.subject.split",
+    "admin.relation.suppress",
+    "admin.relation.unsuppress",
+]
+response_budget_ms = 1000
