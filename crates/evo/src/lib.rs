@@ -80,13 +80,12 @@
 //!   by the property tests in `tests/router_proptest.rs`. Mirrored
 //!   one-to-one (against loom's instrumented primitives) by the
 //!   stand-alone `evo-loom` crate's loom model-checking test.
-//! - [`persistence`]: durable storage for the subject-identity slice
-//!   of the steward's fabric. Defines the schema-aware
-//!   [`persistence::PersistenceStore`] trait and ships an
-//!   SQLite-backed implementation alongside an in-memory mock for
-//!   tests. The trait is unintegrated in Phase 1; subsequent phases
-//!   wire it into the subject registry write path and the boot-time
-//!   replay.
+//! - [`persistence`]: durable storage for the steward's fabric.
+//!   Defines the schema-aware [`persistence::PersistenceStore`]
+//!   trait and ships an SQLite-backed implementation alongside an
+//!   in-memory mock for tests. Subject registry, custody ledger,
+//!   relation graph, admin ledger, and happenings cursor all write
+//!   through this trait; boot-time replay rehydrates each store.
 //! - [`logging`]: tracing subscriber setup per the LOGGING contract.
 //! - [`wire_client`]: steward-side client for out-of-process plugins
 //!   speaking the wire protocol from `PLUGIN_CONTRACT.md` sections 6
@@ -123,6 +122,7 @@ pub mod context;
 pub mod custody;
 pub mod error;
 pub mod error_taxonomy;
+pub mod factory;
 pub mod happenings;
 pub mod logging;
 pub mod persistence;
@@ -418,14 +418,66 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         }
     }
 
+    // Construct the admin ledger with persistence write-through and
+    // rehydrate the in-memory mirror from the `admin_log` table so a
+    // restarting steward presents the same audit trail it had before.
+    // Boot aborts on rehydrate failure for the same reason subject
+    // registry rehydration aborts: serving an inconsistent view of
+    // durable state is more dangerous than refusing to boot.
+    let admin_ledger =
+        Arc::new(admin::AdminLedger::with_persistence(Arc::clone(&persistence)));
+    if let Err(e) = admin_ledger.rehydrate_from(persistence.as_ref()).await {
+        tracing::error!(
+            error = %e,
+            "admin ledger rehydration failed; aborting boot to avoid \
+             serving an inconsistent in-memory view of durable state"
+        );
+        return Err(anyhow::anyhow!(
+            "admin ledger rehydration failed: {e}"
+        ));
+    }
+
+    // Same shape for the custody ledger: durable write-through plus
+    // boot rehydration so active custodies survive restart.
+    let custody_ledger = Arc::new(custody::CustodyLedger::with_persistence(
+        Arc::clone(&persistence),
+    ));
+    if let Err(e) = custody_ledger.rehydrate_from(persistence.as_ref()).await {
+        tracing::error!(
+            error = %e,
+            "custody ledger rehydration failed; aborting boot to avoid \
+             serving an inconsistent in-memory view of durable state"
+        );
+        return Err(anyhow::anyhow!(
+            "custody ledger rehydration failed: {e}"
+        ));
+    }
+
+    // Relation graph rehydration: load every (relation, claimants)
+    // pair the persistence layer has and rebuild the in-memory
+    // graph (relations, claimants, suppression markers, forward /
+    // inverse indices). Aborts boot on rehydrate failure for the
+    // same reason the other ledgers do.
+    let relations_graph = Arc::new(relations::RelationGraph::new());
+    if let Err(e) = relations_graph.rehydrate_from(persistence.as_ref()).await {
+        tracing::error!(
+            error = %e,
+            "relation graph rehydration failed; aborting boot to avoid \
+             serving an inconsistent in-memory view of durable state"
+        );
+        return Err(anyhow::anyhow!(
+            "relation graph rehydration failed: {e}"
+        ));
+    }
+
     // Build the shared steward state once.
     let state = StewardState::builder()
         .catalogue(Arc::clone(&catalogue))
         .subjects(subjects)
-        .relations(Arc::new(relations::RelationGraph::new()))
-        .custody(Arc::new(custody::CustodyLedger::new()))
+        .relations(relations_graph)
+        .custody(custody_ledger)
         .bus(bus)
-        .admin(Arc::new(admin::AdminLedger::new()))
+        .admin(admin_ledger)
         .persistence(Arc::clone(&persistence))
         .claimant_issuer(Arc::clone(&claimant_issuer))
         .conflict_index(Arc::clone(&conflict_index))
@@ -459,6 +511,32 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     // Wrap engine for shared access between any future admission-side
     // mutations and the final drain.
     let engine = Arc::new(Mutex::new(engine));
+
+    // Spawn the factory-orphan scrub task. After the operator-
+    // configured grace window expires, the task walks every persisted
+    // factory-instance subject and forgets any whose owning plugin
+    // has not re-announced it since boot. Disabled when
+    // `factory_orphan_grace_secs = 0`.
+    let factory_orphan_grace_secs = config.plugins.factory_orphan_grace_secs;
+    if factory_orphan_grace_secs > 0 {
+        let engine_for_scrub = Arc::clone(&engine);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                factory_orphan_grace_secs,
+            ))
+            .await;
+            let report =
+                engine_for_scrub.lock().await.scrub_factory_orphans().await;
+            if report.forgotten > 0 || report.errored > 0 {
+                tracing::info!(
+                    forgotten = report.forgotten,
+                    errored = report.errored,
+                    grace_secs = factory_orphan_grace_secs,
+                    "factory orphan scrub complete"
+                );
+            }
+        });
+    }
 
     // Load the operator-controlled client-API ACL.
     let client_acl = Arc::new(client_acl::ClientAcl::load()?);

@@ -64,20 +64,35 @@ binaries/<target>/build-info.toml
 ```toml
 schema_version = 0                       # u32, monotonic
 kind           = "core-binaries"         # bundle kind, fixed per file
-evo_core_tag   = "v0.1.10"               # source tag the build came from
+evo_core_tag   = "v0.1.11"               # source tag the build came from
 target         = "x86_64-unknown-linux-gnu"  # rustc target triple
 binaries       = ["evo", "evo-plugin-tool"]  # files in this directory
 built_at       = "2026-04-28T12:34:56Z"  # UTC ISO 8601, build timestamp
 publisher      = "org.evoframework.core" # publisher namespace
+
+# Optional. Architecture-independent reference files shipped
+# alongside the binaries (systemd unit example, README, etc.).
+# Each entry carries the file's path relative to this directory and
+# the sha256 of its content. The manifest's own signature
+# transitively covers these digests, so consumers do not need
+# per-file signatures.
+[[auxiliary]]
+path   = "dist/systemd/evo.service.example"
+sha256 = "<64 hex chars>"
+
+[[auxiliary]]
+path   = "dist/systemd/README.md"
+sha256 = "<64 hex chars>"
 ```
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `schema_version` | `u32` | Bumps on additive changes. Consumers MUST tolerate higher versions for fields they recognise (forward compat). `0` is the v0.1.10 line. |
-| `kind` | string | Bundle taxonomy. v0.1.10 publishes `"core-binaries"` (the steward + tooling) and `"plugin-bundle"` (signed OOP plugin bundles, see §2.3); future releases add `"image"`, `"toolchain"`. |
+| `schema_version` | `u32` | Bumps on additive changes. Consumers MUST tolerate higher versions for fields they recognise (forward compat). `0` is the v0.1.10 / v0.1.11 line. |
+| `kind` | string | Bundle taxonomy. v0.1.10 / v0.1.11 publish `"core-binaries"` (the steward + tooling) and `"plugin-bundle"` (signed OOP plugin bundles, see §2.3); future releases add `"image"`, `"toolchain"`. |
 | `evo_core_tag` | string | Source tag the binaries were built from. Format: `v<MAJOR>.<MINOR>.<PATCH>[-<pre>]`. The tag is in the evo-core repository; consumers can clone evo-core at this tag for full reproducibility. |
 | `target` | string | rustc target triple. Consumers match this against their device's triple. |
 | `binaries` | array of strings | Files in this directory. Each file `<name>` has a sibling `<name>.sig` (signature) and `<name>.sha256` (digest). |
+| `auxiliary` | array of tables | Optional. Non-binary reference files shipped alongside the binaries. Each table carries `path` (relative to this directory) and `sha256` (hex digest of the file's content). Architecture-independent; included verbatim from the framework source tree so consumers do not need to re-fetch. The reference systemd unit (`dist/systemd/evo.service.example`) and its README are included by default; distributions copy these into their own packaging tree per BOUNDARY.md. Auxiliary files are not signed individually because the manifest's own signature (`build-info.sig`) transitively covers their digests — a consumer that verifies the manifest signature and then re-hashes each auxiliary path detects tampering. |
 | `built_at` | string | UTC timestamp in ISO 8601. Diagnostic; not used for promotion ordering (channel pointers carry that). |
 | `publisher` | string | Publisher's `name_prefixes`-compatible identifier. evo-core's framework key authorises `org.evoframework.core.*`. Vendor publishers use their own namespace. |
 

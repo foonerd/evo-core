@@ -43,36 +43,6 @@ Thumbs.db
 # Archived artefacts
 .archive/
 
-# AI tooling — never committed.
-#
-# This block excludes per-machine settings, project memories,
-# caches, and rule files for every coding-assistant tool. The
-# concern is two-fold: (1) per-user / per-machine settings
-# (allowlists, model preferences, auth state) leaking into the
-# public repo, and (2) project-memory files containing internal
-# context that the `evo-internal/` partition is meant to hold
-# instead. JetBrains AI assistant subdirectories are already
-# covered by the `.idea/` rule above. When in doubt, keep
-# AI-tool artefacts out of this repo.
-.claude/
-CLAUDE.md
-CLAUDE.local.md
-.cursor/
-.cursorrules
-.cursorignore
-.aider*
-.aiderignore
-.continue/
-.windsurf/
-.windsurfrules
-.codeium/
-.zed/
-.junie/
-# GitHub Copilot project-instructions file lives under .github/
-# (which is otherwise CI configuration that IS committed); name
-# it explicitly so it shares this section's discipline.
-.github/copilot-instructions.md
-
 # Private maintainer workspace.
 #
 # This directory holds internal-only material: design notes,

@@ -1,6 +1,6 @@
 -- migrations/001_initial.sql
 --
--- Phase 1: subject-identity slice of the steward's persistent state.
+-- Subject-identity slice of the steward's persistent state.
 --
 -- Creates the four tables that cover subject lifecycle and provenance:
 -- `subjects`, `subject_addressings`, `aliases`, `claim_log`. Subsequent

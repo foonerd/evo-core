@@ -1,6 +1,6 @@
 -- migrations/002_happenings.sql
 --
--- Phase 2: durable happenings audit stream.
+-- Durable happenings audit stream.
 --
 -- Adds the `happenings_log` table — a monotonically-keyed record of
 -- every fabric transition the steward emits. The bus writes through

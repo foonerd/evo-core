@@ -29,6 +29,23 @@ pub fn run(
     chown: Option<&str>,
     max_url_bytes: u64,
 ) -> Result<(), anyhow::Error> {
+    // Refuse a privileged install with no ownership story. Without
+    // `--chown`, the bundle ends up root-owned 0600 and a steward
+    // running as a non-root service user cannot read it. The
+    // failure mode is silent at install time but loud and confusing
+    // at admission. Force the operator to opt in explicitly: pass
+    // `--chown user:group` for the runtime account, or
+    // `--chown root:root` if the steward really runs as root.
+    if chown.is_none() && running_as_root() {
+        anyhow::bail!(
+            "refusing to install as root without --chown: the bundle \
+             would be created root-owned 0600 and a non-root steward \
+             service user could not read it. Pass \
+             `--chown <user>:<group>` to set the owning identity (use \
+             `--chown root:root` only if the steward runs as root)"
+        );
+    }
+
     let work = tempfile::tempdir()?;
     let bundle = obtain_bundle(source, work.path(), max_url_bytes)
         .with_context(|| "resolve install source")?;
@@ -177,6 +194,26 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// True if this process's effective UID is root (Unix). Used by
+/// the install path to reject a privileged install that would
+/// produce root-owned plugin bundles unreadable by a non-root
+/// steward. Backed by `rustix::process::geteuid` which wraps the
+/// syscall with a safe API (the workspace forbids `unsafe_code`).
+fn running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        rustix::process::geteuid().is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        // Non-Unix targets do not have the same root concept; the
+        // chown path itself is also Unix-only, so the guard is
+        // moot. Return false so the install path proceeds as
+        // before.
+        false
+    }
 }
 
 /// Recursively `chown` via the system `chown(1)` (supports `user:group` the same as the OS).

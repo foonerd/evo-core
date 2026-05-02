@@ -40,9 +40,9 @@
 //! validates, dispatches to plugin trait methods, formats responses, and
 //! sends them to the channel.
 //!
-//! Callback implementations ([`WireStateReporter`],
-//! [`WireSubjectAnnouncer`], [`WireRelationAnnouncer`],
-//! [`WireCustodyStateReporter`]) hold cloned `Sender` handles. When
+//! Callback implementations (`WireStateReporter`,
+//! `WireSubjectAnnouncer`, `WireRelationAnnouncer`,
+//! `WireCustodyStateReporter`) hold cloned `Sender` handles. When
 //! the plugin calls a callback, the implementation pushes a frame to
 //! the channel and the writer task forwards it.
 //!
@@ -50,8 +50,8 @@
 //!
 //! Factory verbs (`announce_instance`, `retract_instance`) and
 //! user-interaction requests have no wire representation in this SDK
-//! version. Their callback implementations ([`WireInstanceAnnouncer`],
-//! [`WireUserInteractionRequester`]) return `ReportError::Invalid` so
+//! version. Their callback implementations (`WireInstanceAnnouncer`,
+//! `WireUserInteractionRequester`) return `ReportError::Invalid` so
 //! plugins that try to use them on a wire transport get a clear
 //! error.
 //!
@@ -726,6 +726,7 @@ where
             request_type,
             payload,
             deadline_ms,
+            instance_id,
         } => {
             let deadline = deadline_ms
                 .map(|ms| Instant::now() + Duration::from_millis(ms));
@@ -734,6 +735,7 @@ where
                 payload,
                 correlation_id: cid,
                 deadline,
+                instance_id,
             };
             match plugin.handle_request(&req).await {
                 Ok(resp) => WireFrame::HandleRequestResponse {
@@ -864,6 +866,8 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::UnsuppressRelationResponse { .. } => {
             "unsuppress_relation_response"
         }
+        WireFrame::AnnounceInstance { .. } => "announce_instance",
+        WireFrame::RetractInstance { .. } => "retract_instance",
     }
 }
 
@@ -913,7 +917,12 @@ fn build_load_context(
         plugin_name: plugin_name.to_string(),
     });
     let instance_announcer: Arc<dyn InstanceAnnouncer> =
-        Arc::new(WireInstanceAnnouncer);
+        Arc::new(WireInstanceAnnouncer {
+            tx: tx.clone(),
+            event_cid: event_cid.clone(),
+            pending: Arc::clone(&pending),
+            plugin_name: plugin_name.to_string(),
+        });
     let user_interaction_requester: Arc<dyn UserInteractionRequester> =
         Arc::new(WireUserInteractionRequester);
     let subject_announcer: Arc<dyn SubjectAnnouncer> =
@@ -1637,31 +1646,61 @@ fn remove_pending(pending: &Arc<Mutex<PendingMap>>, cid: u64) {
 /// Placeholder instance announcer. Factory-on-wire is not yet
 /// implemented; this stub returns `ReportError::Invalid` so plugins
 /// that try to use factory semantics on a wire transport get a clear
-/// error.
+/// Instance announcer that pushes frames into the wire event channel
+/// and awaits the steward's matching ack/error response.
+///
+/// Used by out-of-process factory plugins; placed in the plugin's
+/// `LoadContext::instance_announcer` slot when the host helpers
+/// build the load context. Each `announce` / `retract` call mints a
+/// fresh correlation ID, registers a pending entry, sends the
+/// corresponding wire frame, and awaits the steward's `EventAck`
+/// (success) or `Error` (rejection) on a oneshot.
 #[derive(Debug)]
-struct WireInstanceAnnouncer;
-
-const FACTORY_NOT_SUPPORTED: &str =
-    "factory instance announcements are not yet supported on the wire transport";
+struct WireInstanceAnnouncer {
+    tx: mpsc::Sender<WireFrame>,
+    event_cid: Arc<AtomicU64>,
+    pending: Arc<Mutex<PendingMap>>,
+    plugin_name: String,
+}
 
 impl InstanceAnnouncer for WireInstanceAnnouncer {
     fn announce<'a>(
         &'a self,
-        _announcement: InstanceAnnouncement,
+        announcement: InstanceAnnouncement,
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
     {
-        Box::pin(async {
-            Err(ReportError::Invalid(FACTORY_NOT_SUPPORTED.into()))
+        let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
+        let plugin = self.plugin_name.clone();
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let frame = WireFrame::AnnounceInstance {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                announcement,
+            };
+            await_event_response(&tx, &pending, cid, frame).await
         })
     }
 
     fn retract<'a>(
         &'a self,
-        _instance_id: InstanceId,
+        instance_id: InstanceId,
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
     {
-        Box::pin(async {
-            Err(ReportError::Invalid(FACTORY_NOT_SUPPORTED.into()))
+        let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
+        let plugin = self.plugin_name.clone();
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let frame = WireFrame::RetractInstance {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                instance_id,
+            };
+            await_event_response(&tx, &pending, cid, frame).await
         })
     }
 }
@@ -2505,6 +2544,7 @@ mod tests {
                 request_type: "echo".into(),
                 payload: b"hello".to_vec(),
                 deadline_ms: None,
+                instance_id: None,
             },
         )
         .await
@@ -2768,11 +2808,11 @@ mod tests {
         .unwrap();
 
         // The announce_subject event arrives first (the plugin emits
-        // it before returning from load()). Per Wave 2.1, the
-        // wire-side announcer awaits an `EventAck` before the
-        // announce future resolves; without that ack, the plugin's
-        // load() would hang on the announcer call. Send the ack
-        // immediately so load() can proceed and emit LoadResponse.
+        // it before returning from load()). The wire-side announcer
+        // awaits an `EventAck` before the announce future resolves;
+        // without that ack, the plugin's load() would hang on the
+        // announcer call. Send the ack immediately so load() can
+        // proceed and emit LoadResponse.
         let announce = read_frame_json(&mut client_r).await.unwrap();
         match &announce {
             WireFrame::AnnounceSubject {
@@ -3259,10 +3299,10 @@ mod tests {
 
         // Two frames are expected: the event frame emitted by the
         // plugin during take_custody, then the TakeCustodyResponse.
-        // Per Wave 2.1, the wire-side reporter awaits an `EventAck`
-        // before the report future resolves, so the test must ack
-        // the event before take_custody can return. The event frame
-        // arrives first because the plugin emits it before returning.
+        // The wire-side reporter awaits an `EventAck` before the
+        // report future resolves, so the test must ack the event
+        // before take_custody can return. The event frame arrives
+        // first because the plugin emits it before returning.
         let event = read_frame_json(&mut client_r).await.unwrap();
         match &event {
             WireFrame::ReportCustodyState {
@@ -3335,6 +3375,7 @@ mod tests {
                 request_type: "ping".into(),
                 payload: vec![],
                 deadline_ms: None,
+                instance_id: None,
             },
         )
         .await
@@ -3458,9 +3499,9 @@ mod tests {
         }
 
         // Take custody. The plugin emits one state report during
-        // take_custody; per Wave 2.1 the wire-side reporter awaits an
-        // EventAck, so the test must ack it before the take_custody
-        // response can arrive.
+        // take_custody; the wire-side reporter awaits an EventAck,
+        // so the test must ack it before the take_custody response
+        // can arrive.
         write_frame_json(
             &mut client_w,
             &WireFrame::TakeCustody {
@@ -3554,9 +3595,9 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Wave 2.1: WireSubjectAnnouncer / WireRelationAnnouncer /
-    // WireStateReporter / WireCustodyStateReporter — direct unit tests
-    // pinning the request/response semantics over the wire.
+    // WireSubjectAnnouncer / WireRelationAnnouncer / WireStateReporter /
+    // WireCustodyStateReporter — direct unit tests pinning the
+    // request/response semantics over the wire.
     // ---------------------------------------------------------------------
 
     /// Drive `WireSubjectAnnouncer.announce` end-to-end against a
@@ -3681,7 +3722,161 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Wave 2.2: plugin-side handshake (perform_plugin_handshake) tests.
+    // WireInstanceAnnouncer — factory instance announce/retract over
+    // the wire. Mirrors the subject-announcer test pattern: a scripted
+    // response simulates the steward, asserts what the future returns.
+    // ---------------------------------------------------------------------
+
+    /// Drive a `WireInstanceAnnouncer` operation end-to-end against a
+    /// scripted response. `op` chooses announce (`true`) or retract
+    /// (`false`). The expected outgoing frame variant is asserted.
+    async fn drive_instance_op_with_response(
+        announce: bool,
+        response: Option<WireFrame>,
+    ) -> Result<(), ReportError> {
+        let (tx, mut rx) = mpsc::channel::<WireFrame>(8);
+        let event_cid = Arc::new(AtomicU64::new(1));
+        let pending: Arc<Mutex<PendingMap>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let announcer = WireInstanceAnnouncer {
+            tx,
+            event_cid: event_cid.clone(),
+            pending: Arc::clone(&pending),
+            plugin_name: "org.test.factory".into(),
+        };
+        let pending_for_responder = Arc::clone(&pending);
+        let join = tokio::spawn(async move {
+            if announce {
+                let announcement = InstanceAnnouncement::new(
+                    "dac-001",
+                    b"capability-payload".to_vec(),
+                );
+                announcer.announce(announcement).await
+            } else {
+                announcer.retract(InstanceId::from("dac-001")).await
+            }
+        });
+
+        let frame = rx.recv().await.expect("event frame");
+        let cid = frame.envelope().1;
+        if announce {
+            assert!(matches!(frame, WireFrame::AnnounceInstance { .. }));
+        } else {
+            assert!(matches!(frame, WireFrame::RetractInstance { .. }));
+        }
+
+        if let Some(resp) = response {
+            let routed = match resp {
+                WireFrame::EventAck { v, plugin, .. } => {
+                    WireFrame::EventAck { v, cid, plugin }
+                }
+                WireFrame::Error {
+                    v,
+                    plugin,
+                    message,
+                    class,
+                    details,
+                    ..
+                } => WireFrame::Error {
+                    v,
+                    cid,
+                    plugin,
+                    class,
+                    message,
+                    details,
+                },
+                other => other,
+            };
+            assert!(route_pending_response(&pending_for_responder, routed));
+        } else {
+            drain_pending(&pending_for_responder);
+        }
+        drop(rx);
+
+        join.await.expect("instance op task")
+    }
+
+    #[tokio::test]
+    async fn wire_instance_announcer_announce_returns_ok_on_event_ack() {
+        let result = drive_instance_op_with_response(
+            true,
+            Some(WireFrame::EventAck {
+                v: PROTOCOL_VERSION,
+                cid: 0,
+                plugin: "org.test.factory".into(),
+            }),
+        )
+        .await;
+        assert!(matches!(result, Ok(())));
+    }
+
+    #[tokio::test]
+    async fn wire_instance_announcer_announce_returns_invalid_on_error() {
+        let result = drive_instance_op_with_response(
+            true,
+            Some(WireFrame::Error {
+                v: PROTOCOL_VERSION,
+                cid: 0,
+                plugin: "org.test.factory".into(),
+                class: ErrorClass::ContractViolation,
+                message: "shelf shape rejected payload".into(),
+                details: None,
+            }),
+        )
+        .await;
+        match result {
+            Err(ReportError::Invalid(msg)) => {
+                assert_eq!(msg, "shelf shape rejected payload");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wire_instance_announcer_retract_returns_ok_on_event_ack() {
+        let result = drive_instance_op_with_response(
+            false,
+            Some(WireFrame::EventAck {
+                v: PROTOCOL_VERSION,
+                cid: 0,
+                plugin: "org.test.factory".into(),
+            }),
+        )
+        .await;
+        assert!(matches!(result, Ok(())));
+    }
+
+    #[tokio::test]
+    async fn wire_instance_announcer_retract_returns_invalid_on_error() {
+        let result = drive_instance_op_with_response(
+            false,
+            Some(WireFrame::Error {
+                v: PROTOCOL_VERSION,
+                cid: 0,
+                plugin: "org.test.factory".into(),
+                class: ErrorClass::ContractViolation,
+                message: "unknown instance_id=dac-001".into(),
+                details: None,
+            }),
+        )
+        .await;
+        match result {
+            Err(ReportError::Invalid(msg)) => {
+                assert_eq!(msg, "unknown instance_id=dac-001");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wire_instance_announcer_returns_shutting_down_when_steward_disappears(
+    ) {
+        let result = drive_instance_op_with_response(true, None).await;
+        assert!(matches!(result, Err(ReportError::ShuttingDown)));
+    }
+
+    // ---------------------------------------------------------------------
+    // Plugin-side handshake (perform_plugin_handshake) tests.
     // ---------------------------------------------------------------------
 
     #[tokio::test]
@@ -3850,7 +4045,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Wave 2.3: WireSubjectAdmin / WireRelationAdmin direct unit tests.
+    // WireSubjectAdmin / WireRelationAdmin direct unit tests.
     // ---------------------------------------------------------------------
 
     /// Drive `WireSubjectAdmin.forced_retract_addressing` against a

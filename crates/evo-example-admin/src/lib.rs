@@ -26,19 +26,19 @@
 //!
 //! - `admin.subject.retract_addressing`: JSON payload of shape
 //!   [`AdminRetractAddressingRequest`]. Dispatches to
-//!   [`SubjectAdmin::forced_retract_addressing`](evo_plugin_sdk::contract::SubjectAdmin::forced_retract_addressing).
+//!   [`SubjectAdmin::forced_retract_addressing`].
 //!
 //! - `admin.relation.retract_claim`: JSON payload of shape
 //!   [`AdminRetractClaimRequest`]. Dispatches to
-//!   [`RelationAdmin::forced_retract_claim`](evo_plugin_sdk::contract::RelationAdmin::forced_retract_claim).
+//!   [`RelationAdmin::forced_retract_claim`].
 //!
 //! - `admin.subject.merge`: JSON payload of shape
 //!   [`AdminMergeRequest`]. Dispatches to
-//!   [`SubjectAdmin::merge`](evo_plugin_sdk::contract::SubjectAdmin::merge).
+//!   [`SubjectAdmin::merge`].
 //!
 //! - `admin.subject.split`: JSON payload of shape
 //!   [`AdminSplitRequest`]. Dispatches to
-//!   [`SubjectAdmin::split`](evo_plugin_sdk::contract::SubjectAdmin::split).
+//!   [`SubjectAdmin::split`].
 //!   The [`SplitStrategyPayload::Explicit`] strategy specifies
 //!   per-relation routing using
 //!   [`ExplicitRelationAssignmentPayload::target_new_id_index`], a
@@ -50,11 +50,11 @@
 //!
 //! - `admin.relation.suppress`: JSON payload of shape
 //!   [`AdminSuppressRequest`]. Dispatches to
-//!   [`RelationAdmin::suppress`](evo_plugin_sdk::contract::RelationAdmin::suppress).
+//!   [`RelationAdmin::suppress`].
 //!
 //! - `admin.relation.unsuppress`: JSON payload of shape
 //!   [`AdminUnsuppressRequest`]. Dispatches to
-//!   [`RelationAdmin::unsuppress`](evo_plugin_sdk::contract::RelationAdmin::unsuppress).
+//!   [`RelationAdmin::unsuppress`].
 //!   The unsuppress trait method does not carry a `reason`
 //!   parameter, so neither does the request body.
 //!
@@ -271,7 +271,7 @@ pub struct AdminSuppressRequest {
 /// JSON shape of an [`REQ_UNSUPPRESS`] request body.
 ///
 /// The SDK trait method
-/// [`RelationAdmin::unsuppress`](evo_plugin_sdk::contract::RelationAdmin::unsuppress)
+/// [`RelationAdmin::unsuppress`]
 /// does not carry a `reason` parameter, so neither does this body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminUnsuppressRequest {
@@ -673,6 +673,8 @@ mod tests {
             payload: b"{}".to_vec(),
             correlation_id: 1,
             deadline: None,
+
+            instance_id: None,
         };
         let e = p.handle_request(&req).await.unwrap_err();
         assert!(matches!(e, PluginError::Permanent(_)));

@@ -1,0 +1,65 @@
+# Schema for the `example.echo` shelf at shape version 1.
+#
+# Defines the request types and payload shape a plugin
+# satisfying `example.echo` shape 1 contract is expected to
+# implement. The framework's admission gate validates the
+# plugin's manifest `target.{shelf,shape}` against the
+# catalogue declaration; this file is what a plugin author
+# reads to know what code contract that admission gate
+# translates to.
+#
+# This is the worked example for the in-tree skeleton at
+# dist/catalogue/schemas/. Real distributions ship their own
+# per-shelf schemas under their own catalogue-schemas
+# directory or sibling repo (see ../README.md).
+
+schema_version = 1
+rack = "example"
+shelf = "echo"
+shape = 1
+
+description = """
+Echoes whatever payload is sent to it. The reference contract
+for plugin authors learning the framework's request /
+response shape; consumers asking the shelf "echo this" receive
+the supplied payload back unchanged plus a header naming the
+plugin that handled the request.
+"""
+
+# Request types this shelf accepts. The plugin's
+# Plugin::handle_request matches on req.request_type; an
+# undeclared request_type is refused by the manifest's
+# request_types allowlist at admission, so this declared set
+# is the canonical authority on what the shelf admits.
+[[requests]]
+request_type = "echo"
+description = """
+Returns the supplied payload bytes verbatim, prefixed with a
+plugin-identity header. The plugin holds no state between
+requests; two echo calls with the same payload return
+byte-identical responses.
+"""
+payload_in = "opaque-bytes"
+payload_out = "opaque-bytes"
+
+# Acceptance criteria a plugin claiming to satisfy this shape
+# MUST meet. The framework does not enforce these at
+# admission today (no runtime assertion harness yet); they
+# document what a future shape-conformance test would check.
+[[acceptance]]
+name = "echo-roundtrips-bytes"
+detail = "echo(payload).await.unwrap().payload == payload"
+
+[[acceptance]]
+name = "echo-handles-empty-payload"
+detail = "echo with payload = [] returns the empty-payload response without error"
+
+[[acceptance]]
+name = "echo-survives-empty-request-types"
+detail = """
+The plugin manifest's request_types list MUST contain
+\"echo\". The plugin handler MUST refuse any request_type
+other than \"echo\" with PluginError::Permanent (the
+admission allowlist already filters those out, but the
+handler's match arm is the second line of defence).
+"""

@@ -2,10 +2,11 @@
 //!
 //! The [`AdminLedger`] records every privileged administration
 //! action a plugin takes through the `SubjectAdmin` or
-//! `RelationAdmin` callbacks. It parallels
-//! [`crate::custody::CustodyLedger`]: an in-memory store today,
-//! shaped to fit the `admin_log` table documented in
-//! `docs/engineering/PERSISTENCE.md` for when persistence lands.
+//! `RelationAdmin` callbacks. The ledger keeps an in-memory
+//! mirror for fast read access and writes through to the
+//! `admin_log` SQLite table when a [`PersistenceStore`] is
+//! attached, so a restarting steward rehydrates the audit trail
+//! from disk without loss.
 //!
 //! ## Scope
 //!
@@ -30,7 +31,11 @@
 //! ([`crate::context::RegistrySubjectAdmin`] and
 //! [`crate::context::RegistryRelationAdmin`]) call
 //! [`AdminLedger::record`] after the storage primitive succeeds and
-//! the happening has been emitted.
+//! the happening has been emitted. The call is async because the
+//! durability write through to `admin_log` happens before the
+//! in-memory append: a crash between the disk write and the memory
+//! append loses an in-memory record we can rehydrate, never a
+//! durable record without an in-memory peer.
 //!
 //! Readers: there is no runtime reader today. A future
 //! client-socket op (a dedicated admin audit op or part of the
@@ -44,13 +49,17 @@
 //! The ledger is `Send + Sync` via an internal
 //! `std::sync::Mutex`. Concurrent writes serialise on the mutex;
 //! readers clone a snapshot under the lock and then release it.
-//! No lock is held across an await boundary.
+//! No lock is held across an await boundary: the persistence write
+//! happens before the lock is taken, the in-memory append happens
+//! while the lock is held, and the lock is released before
+//! [`AdminLedger::record`] returns.
 
 use evo_plugin_sdk::contract::ExternalAddressing;
 use serde::Serialize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use crate::persistence::{PersistedAdminEntry, PersistenceError, PersistenceStore};
 use crate::relations::RelationKey;
 
 /// Kind of an admin action recorded in the ledger.
@@ -173,14 +182,22 @@ pub struct AdminLogEntry {
     pub at: SystemTime,
 }
 
-/// In-memory append-only log of admin actions.
+/// Append-only log of admin actions with optional durable
+/// write-through.
 ///
 /// Cheap to share via `Arc<AdminLedger>`. Internally backed by a
-/// `Mutex<Vec<AdminLogEntry>>`. Cloning the ledger is not
-/// supported directly (the ledger owns its storage); callers
-/// share it via `Arc`.
+/// `Mutex<Vec<AdminLogEntry>>` for fast in-memory reads. When a
+/// [`PersistenceStore`] is attached via
+/// [`AdminLedger::with_persistence`], every [`AdminLedger::record`]
+/// call writes to the `admin_log` table before the in-memory
+/// append; the boot path uses [`AdminLedger::rehydrate_from`] to
+/// reload the in-memory mirror from the table at startup.
+///
+/// Cloning the ledger is not supported directly (the ledger owns
+/// its storage); callers share it via `Arc`.
 pub struct AdminLedger {
     entries: Mutex<Vec<AdminLogEntry>>,
+    persistence: Option<Arc<dyn PersistenceStore>>,
 }
 
 impl std::fmt::Debug for AdminLedger {
@@ -189,6 +206,7 @@ impl std::fmt::Debug for AdminLedger {
             Ok(g) => f
                 .debug_struct("AdminLedger")
                 .field("count", &g.len())
+                .field("persistence", &self.persistence.is_some())
                 .finish(),
             Err(_) => f
                 .debug_struct("AdminLedger")
@@ -205,24 +223,91 @@ impl Default for AdminLedger {
 }
 
 impl AdminLedger {
-    /// Construct an empty ledger.
+    /// Construct an empty ledger with no persistence backing.
+    ///
+    /// Suitable for tests that do not exercise durability or for
+    /// embedded callers that opt out of disk writes entirely. Use
+    /// [`AdminLedger::with_persistence`] to attach a
+    /// [`PersistenceStore`] for the production path.
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(Vec::new()),
+            persistence: None,
         }
+    }
+
+    /// Construct a ledger that writes through every recorded
+    /// entry to the `admin_log` table on the supplied
+    /// [`PersistenceStore`] before mirroring it in memory.
+    pub fn with_persistence(persistence: Arc<dyn PersistenceStore>) -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+            persistence: Some(persistence),
+        }
+    }
+
+    /// Replace the in-memory mirror with the rows the supplied
+    /// store returns from
+    /// [`PersistenceStore::load_all_admin_entries`]. Called once
+    /// on boot so the freshly constructed ledger presents the same
+    /// audit trail the steward had before the restart.
+    ///
+    /// Rehydration is non-mutating from the persistence layer's
+    /// perspective: the `admin_id` field on the persisted row is
+    /// discarded (the in-memory entry is keyed by insertion
+    /// order, not by surrogate ID) and rows that fail to parse
+    /// (e.g. an unknown `kind` from a future steward writing back
+    /// to an older one) are skipped with a debug log so a
+    /// downgrade does not crash the boot path.
+    pub async fn rehydrate_from(
+        &self,
+        store: &dyn PersistenceStore,
+    ) -> Result<(), PersistenceError> {
+        let rows = store.load_all_admin_entries().await?;
+        let mut rehydrated = Vec::with_capacity(rows.len());
+        for row in rows {
+            match admin_log_entry_from_persisted(&row) {
+                Ok(entry) => rehydrated.push(entry),
+                Err(reason) => {
+                    tracing::debug!(
+                        admin_id = row.admin_id,
+                        kind = %row.kind,
+                        %reason,
+                        "skipping admin_log row during rehydrate"
+                    );
+                }
+            }
+        }
+        let mut g =
+            self.entries.lock().expect("admin ledger mutex poisoned");
+        g.clear();
+        g.extend(rehydrated);
+        Ok(())
     }
 
     /// Append one entry to the ledger.
     ///
-    /// Always succeeds: the ledger is in-memory, append-only, and
-    /// does not enforce schema constraints beyond what the entry's
-    /// types already capture. Future persistence passes may surface
-    /// write errors here; callers should not panic on success.
-    pub fn record(&self, entry: AdminLogEntry) {
+    /// When persistence is attached, the row is written to the
+    /// `admin_log` table first; the in-memory append happens only
+    /// after the durable write commits. The two-phase ordering
+    /// matches the
+    /// [`bus.emit_durable`](crate::happenings::HappeningBus::emit_durable)
+    /// pattern: a crash between the storage primitive and the
+    /// audit write loses an audit row, but the audit row is never
+    /// lost without losing the storage primitive that produced it.
+    pub async fn record(
+        &self,
+        entry: AdminLogEntry,
+    ) -> Result<(), PersistenceError> {
+        if let Some(store) = self.persistence.as_ref() {
+            let persisted = persisted_admin_entry_from(&entry);
+            store.record_admin_entry(&persisted).await?;
+        }
         self.entries
             .lock()
             .expect("admin ledger mutex poisoned")
             .push(entry);
+        Ok(())
     }
 
     /// Return a cloned snapshot of every entry in the ledger, in
@@ -261,11 +346,171 @@ impl AdminLedger {
     }
 }
 
+fn kind_to_str(kind: AdminLogKind) -> &'static str {
+    match kind {
+        AdminLogKind::SubjectAddressingForcedRetract => {
+            "subject_addressing_forced_retract"
+        }
+        AdminLogKind::RelationClaimForcedRetract => {
+            "relation_claim_forced_retract"
+        }
+        AdminLogKind::SubjectMerge => "subject_merge",
+        AdminLogKind::SubjectSplit => "subject_split",
+        AdminLogKind::RelationSuppress => "relation_suppress",
+        AdminLogKind::RelationSuppressionReasonUpdated => {
+            "relation_suppression_reason_updated"
+        }
+        AdminLogKind::RelationUnsuppress => "relation_unsuppress",
+    }
+}
+
+fn kind_from_str(s: &str) -> Option<AdminLogKind> {
+    Some(match s {
+        "subject_addressing_forced_retract" => {
+            AdminLogKind::SubjectAddressingForcedRetract
+        }
+        "relation_claim_forced_retract" => {
+            AdminLogKind::RelationClaimForcedRetract
+        }
+        "subject_merge" => AdminLogKind::SubjectMerge,
+        "subject_split" => AdminLogKind::SubjectSplit,
+        "relation_suppress" => AdminLogKind::RelationSuppress,
+        "relation_suppression_reason_updated" => {
+            AdminLogKind::RelationSuppressionReasonUpdated
+        }
+        "relation_unsuppress" => AdminLogKind::RelationUnsuppress,
+        _ => return None,
+    })
+}
+
+fn system_time_to_ms(at: SystemTime) -> u64 {
+    at.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn ms_to_system_time(ms: u64) -> SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)
+}
+
+/// Project an in-memory [`AdminLogEntry`] into the on-disk row
+/// shape: split out the indexed columns (`kind`, `admin_plugin`,
+/// `target_claimant`, `asserted_at_ms`, `reason`) and fold the
+/// variant-specific fields into a JSON `payload`.
+fn persisted_admin_entry_from(entry: &AdminLogEntry) -> PersistedAdminEntry {
+    let mut payload = serde_json::Map::new();
+    if let Some(s) = entry.target_subject.as_ref() {
+        payload.insert("target_subject".into(), serde_json::Value::String(s.clone()));
+    }
+    if let Some(addr) = entry.target_addressing.as_ref() {
+        payload.insert(
+            "target_addressing".into(),
+            serde_json::json!({
+                "scheme": addr.scheme,
+                "value": addr.value,
+            }),
+        );
+    }
+    if let Some(rel) = entry.target_relation.as_ref() {
+        payload.insert(
+            "target_relation".into(),
+            serde_json::json!({
+                "source_id": rel.source_id,
+                "predicate": rel.predicate,
+                "target_id": rel.target_id,
+            }),
+        );
+    }
+    if !entry.additional_subjects.is_empty() {
+        payload.insert(
+            "additional_subjects".into(),
+            serde_json::Value::Array(
+                entry
+                    .additional_subjects
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(prior) = entry.prior_reason.as_ref() {
+        payload.insert(
+            "prior_reason".into(),
+            serde_json::Value::String(prior.clone()),
+        );
+    }
+    PersistedAdminEntry {
+        admin_id: 0,
+        kind: kind_to_str(entry.kind).to_string(),
+        admin_plugin: entry.admin_plugin.clone(),
+        target_claimant: entry.target_plugin.clone(),
+        payload: serde_json::Value::Object(payload),
+        asserted_at_ms: system_time_to_ms(entry.at),
+        reason: entry.reason.clone(),
+        reverses_admin_id: None,
+    }
+}
+
+/// Inverse of [`persisted_admin_entry_from`]. Returns an error
+/// string if the row's `kind` discriminant is unknown to this
+/// build (e.g. a future variant); callers skip such rows on
+/// rehydrate so a downgrade boots cleanly.
+fn admin_log_entry_from_persisted(
+    row: &PersistedAdminEntry,
+) -> Result<AdminLogEntry, String> {
+    let kind = kind_from_str(&row.kind)
+        .ok_or_else(|| format!("unknown admin_log kind {:?}", row.kind))?;
+    let payload = match &row.payload {
+        serde_json::Value::Object(map) => map,
+        _ => return Err("admin_log payload is not a JSON object".into()),
+    };
+    let target_subject = payload
+        .get("target_subject")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let target_addressing = payload.get("target_addressing").and_then(|v| {
+        let scheme = v.get("scheme")?.as_str()?;
+        let value = v.get("value")?.as_str()?;
+        Some(ExternalAddressing::new(scheme, value))
+    });
+    let target_relation = payload.get("target_relation").and_then(|v| {
+        let source_id = v.get("source_id")?.as_str()?;
+        let predicate = v.get("predicate")?.as_str()?;
+        let target_id = v.get("target_id")?.as_str()?;
+        Some(RelationKey::new(source_id, predicate, target_id))
+    });
+    let additional_subjects = payload
+        .get("additional_subjects")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let prior_reason = payload
+        .get("prior_reason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    Ok(AdminLogEntry {
+        kind,
+        admin_plugin: row.admin_plugin.clone(),
+        target_plugin: row.target_claimant.clone(),
+        target_subject,
+        target_addressing,
+        target_relation,
+        additional_subjects,
+        reason: row.reason.clone(),
+        prior_reason,
+        at: ms_to_system_time(row.asserted_at_ms),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::MemoryPersistenceStore;
     use std::sync::Arc;
-    use std::thread;
 
     fn sample_entry(
         kind: AdminLogKind,
@@ -286,8 +531,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ledger_records_entries_in_order() {
+    #[tokio::test]
+    async fn ledger_records_entries_in_order() {
         // Append several entries; the entries() snapshot returns
         // them in insertion order. This is the single load-bearing
         // invariant of an append-only log.
@@ -298,17 +543,23 @@ mod tests {
             AdminLogKind::SubjectAddressingForcedRetract,
             "admin.plugin",
             "p1",
-        ));
+        ))
+        .await
+        .unwrap();
         l.record(sample_entry(
             AdminLogKind::RelationClaimForcedRetract,
             "admin.plugin",
             "p2",
-        ));
+        ))
+        .await
+        .unwrap();
         l.record(sample_entry(
             AdminLogKind::SubjectAddressingForcedRetract,
             "admin.plugin",
             "p3",
-        ));
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(l.count(), 3);
         let entries = l.entries();
@@ -318,33 +569,35 @@ mod tests {
         assert_eq!(entries[2].target_plugin.as_deref(), Some("p3"));
     }
 
-    #[test]
-    fn ledger_survives_concurrent_writes() {
-        // Four threads each write 25 entries. After all threads
-        // join, the ledger has exactly 100 entries. Pins the
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ledger_survives_concurrent_writes() {
+        // Four tasks each write 25 entries. After all tasks join,
+        // the ledger has exactly 100 entries. Pins the
         // thread-safety of the internal Mutex.
         let l = Arc::new(AdminLedger::new());
         let mut handles = Vec::new();
-        for thread_id in 0..4 {
+        for task_id in 0..4 {
             let l = Arc::clone(&l);
-            handles.push(thread::spawn(move || {
+            handles.push(tokio::spawn(async move {
                 for i in 0..25 {
                     l.record(sample_entry(
                         AdminLogKind::SubjectAddressingForcedRetract,
-                        &format!("admin.{thread_id}"),
+                        &format!("admin.{task_id}"),
                         &format!("p{i}"),
-                    ));
+                    ))
+                    .await
+                    .unwrap();
                 }
             }));
         }
         for h in handles {
-            h.join().unwrap();
+            h.await.unwrap();
         }
         assert_eq!(l.count(), 100);
     }
 
-    #[test]
-    fn entries_by_admin_plugin_filters_correctly() {
+    #[tokio::test]
+    async fn entries_by_admin_plugin_filters_correctly() {
         // Two admin plugins write entries. The filter returns only
         // the requested admin's entries, preserving insertion order
         // among them.
@@ -353,17 +606,23 @@ mod tests {
             AdminLogKind::SubjectAddressingForcedRetract,
             "admin.a",
             "p1",
-        ));
+        ))
+        .await
+        .unwrap();
         l.record(sample_entry(
             AdminLogKind::RelationClaimForcedRetract,
             "admin.b",
             "p2",
-        ));
+        ))
+        .await
+        .unwrap();
         l.record(sample_entry(
             AdminLogKind::SubjectAddressingForcedRetract,
             "admin.a",
             "p3",
-        ));
+        ))
+        .await
+        .unwrap();
 
         let a_entries = l.entries_by_admin_plugin("admin.a");
         assert_eq!(a_entries.len(), 2);
@@ -378,8 +637,8 @@ mod tests {
         assert!(l.entries_by_admin_plugin("admin.never").is_empty());
     }
 
-    #[test]
-    fn count_reflects_recorded_entries() {
+    #[tokio::test]
+    async fn count_reflects_recorded_entries() {
         // count() matches entries().len() at each step. Pinned
         // separately because count() is a fast path for callers
         // that do not need the snapshot.
@@ -391,7 +650,9 @@ mod tests {
             AdminLogKind::SubjectAddressingForcedRetract,
             "admin.plugin",
             "p1",
-        ));
+        ))
+        .await
+        .unwrap();
         assert_eq!(l.count(), 1);
         assert_eq!(l.entries().len(), 1);
 
@@ -399,9 +660,88 @@ mod tests {
             AdminLogKind::RelationClaimForcedRetract,
             "admin.plugin",
             "p1",
-        ));
+        ))
+        .await
+        .unwrap();
         assert_eq!(l.count(), 2);
         assert_eq!(l.entries().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn record_persists_through_to_store() {
+        // When constructed with a PersistenceStore, every record()
+        // call writes to admin_log first, then mirrors in memory.
+        // The store's load_all_admin_entries() returns the same
+        // shape we wrote.
+        let store: Arc<dyn PersistenceStore> =
+            Arc::new(MemoryPersistenceStore::new());
+        let l = AdminLedger::with_persistence(Arc::clone(&store));
+        let entry = AdminLogEntry {
+            kind: AdminLogKind::SubjectMerge,
+            admin_plugin: "admin.plugin".into(),
+            target_plugin: None,
+            target_subject: Some("new-id".into()),
+            target_addressing: None,
+            target_relation: None,
+            additional_subjects: vec!["old-a".into(), "old-b".into()],
+            reason: Some("operator confirmed identity".into()),
+            prior_reason: None,
+            at: SystemTime::now(),
+        };
+        l.record(entry.clone()).await.unwrap();
+
+        let rows = store.load_all_admin_entries().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "subject_merge");
+        assert_eq!(rows[0].admin_plugin, "admin.plugin");
+        assert!(rows[0].target_claimant.is_none());
+        assert_eq!(rows[0].reason.as_deref(), Some("operator confirmed identity"));
+        assert_eq!(
+            rows[0].payload.get("target_subject").and_then(|v| v.as_str()),
+            Some("new-id")
+        );
+        assert_eq!(
+            rows[0]
+                .payload
+                .get("additional_subjects")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(2)
+        );
+
+        // In-memory mirror is also populated and round-trips back.
+        let mirror = l.entries();
+        assert_eq!(mirror.len(), 1);
+        assert_eq!(mirror[0].kind, AdminLogKind::SubjectMerge);
+    }
+
+    #[tokio::test]
+    async fn rehydrate_replays_persisted_rows_in_order() {
+        // Boot path: a fresh AdminLedger seeded from a populated
+        // store presents the same audit trail. Pins the rehydrate
+        // round-trip and the insertion-order property.
+        let store: Arc<dyn PersistenceStore> =
+            Arc::new(MemoryPersistenceStore::new());
+        let writer = AdminLedger::with_persistence(Arc::clone(&store));
+        for tag in ["p1", "p2", "p3"] {
+            writer
+                .record(sample_entry(
+                    AdminLogKind::SubjectAddressingForcedRetract,
+                    "admin.plugin",
+                    tag,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let reader = AdminLedger::with_persistence(Arc::clone(&store));
+        assert_eq!(reader.count(), 0);
+        reader.rehydrate_from(store.as_ref()).await.unwrap();
+        let entries = reader.entries();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].target_plugin.as_deref(), Some("p1"));
+        assert_eq!(entries[1].target_plugin.as_deref(), Some("p2"));
+        assert_eq!(entries[2].target_plugin.as_deref(), Some("p3"));
     }
 
     #[test]
@@ -444,8 +784,8 @@ mod tests {
         assert_eq!(json, "\"relation_unsuppress\"");
     }
 
-    #[test]
-    fn merge_entry_carries_new_id_and_sources() {
+    #[tokio::test]
+    async fn merge_entry_carries_new_id_and_sources() {
         // SubjectMerge entry shape: target_subject = NEW id;
         // additional_subjects = [old_a, old_b]; target_plugin =
         // None. Pinning the field placement here so a future
@@ -463,7 +803,9 @@ mod tests {
             reason: Some("operator confirmed identity".into()),
             prior_reason: None,
             at: SystemTime::now(),
-        });
+        })
+        .await
+        .unwrap();
         let entries = l.entries();
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
@@ -473,8 +815,8 @@ mod tests {
         assert_eq!(e.additional_subjects, vec!["old-a", "old-b"]);
     }
 
-    #[test]
-    fn split_entry_carries_source_id_and_new_ids() {
+    #[tokio::test]
+    async fn split_entry_carries_source_id_and_new_ids() {
         // SubjectSplit entry shape: target_subject = SOURCE
         // (old) id; additional_subjects = new ids (length at
         // least 2); target_plugin = None. The orientation is
@@ -497,7 +839,9 @@ mod tests {
             reason: None,
             prior_reason: None,
             at: SystemTime::now(),
-        });
+        })
+        .await
+        .unwrap();
         let entries = l.entries();
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
@@ -509,8 +853,8 @@ mod tests {
         assert_eq!(e.additional_subjects[2], "new-3");
     }
 
-    #[test]
-    fn suppress_entry_carries_relation_key_and_no_target_plugin() {
+    #[tokio::test]
+    async fn suppress_entry_carries_relation_key_and_no_target_plugin() {
         // RelationSuppress entry shape: target_relation =
         // suppressed relation key; target_plugin = None
         // (suppression hides the relation regardless of which
@@ -528,7 +872,9 @@ mod tests {
             reason: Some("disputed claim".into()),
             prior_reason: None,
             at: SystemTime::now(),
-        });
+        })
+        .await
+        .unwrap();
         let entries = l.entries();
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
@@ -539,8 +885,8 @@ mod tests {
         assert!(e.additional_subjects.is_empty());
     }
 
-    #[test]
-    fn unsuppress_entry_carries_relation_key_and_no_target_plugin() {
+    #[tokio::test]
+    async fn unsuppress_entry_carries_relation_key_and_no_target_plugin() {
         // RelationUnsuppress entry shape: same as suppress
         // (relation key, no target_plugin, no additional_subjects);
         // the kind discriminant is what distinguishes a suppress
@@ -558,7 +904,9 @@ mod tests {
             reason: None,
             prior_reason: None,
             at: SystemTime::now(),
-        });
+        })
+        .await
+        .unwrap();
         let entries = l.entries();
         assert_eq!(entries.len(), 1);
         let e = &entries[0];

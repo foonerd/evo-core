@@ -78,11 +78,10 @@ pub async fn discover_and_admit(
         let (dir, manifest) =
             by_name.get(&name).expect("name came from by_name keys");
 
-        // Factory admission gating moved to the admission engine
-        // per the engineering-excellence pass (Wave 6.a). Discovery
-        // surfaces every parseable manifest; admission produces the
-        // structured refusal so operators see a consistent error
-        // shape regardless of the entry point.
+        // Factory admission gating lives in the admission engine.
+        // Discovery surfaces every parseable manifest; admission
+        // produces the structured refusal so operators see a
+        // consistent error shape regardless of the entry point.
         if manifest.transport.kind != TransportKind::OutOfProcess {
             tracing::warn!(
                 plugin = %name,

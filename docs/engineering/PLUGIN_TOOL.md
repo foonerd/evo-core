@@ -34,7 +34,8 @@ Failing operations **must not** leave a **partial** or half-valid tree inside an
 
 ## 4. Ownership and mode (`--chown`)
 
-- **`chown` / owner metadata** on the final plugin directory: **optional**. Expose a flag such as `--chown user:group` (exact spelling in clap) when the operator runs the tool with sufficient privilege; if omitted, the tool does **not** change ownership (unpack/promote runs with the process’s effective user).
+- **`chown` / owner metadata** on the final plugin directory: **optional in non-root invocations, required when running as root**. Expose a flag such as `--chown user:group` (exact spelling in clap) when the operator runs the tool with sufficient privilege; if omitted under a non-privileged invocation, the tool does **not** change ownership (unpack/promote runs with the process’s effective user).
+- **Root-invocation guard.** When the tool's effective UID is `0` (the typical `sudo evo-plugin-tool install ...` shape) and `--chown` is **not** supplied, `install` refuses with a structured error before any filesystem mutation. Without the guard, the bundle ends up `root:root 0600` and a steward running as a non-root service user cannot read its own plugin manifest. Operators pass `--chown <user>:<group>` to set the runtime account that will own the bundle, or `--chown root:root` if the steward really runs as root. `install` from a non-root account proceeds without the guard (it cannot write outside the operator's own permissions anyway).
 
 ---
 

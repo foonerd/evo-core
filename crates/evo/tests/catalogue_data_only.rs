@@ -167,7 +167,7 @@ fn unknown_fields_terminate_without_executing() {
     // returns; reaching the assertion below is the property.
     //
     // The field name and value are deliberately suspicious-looking
-    // ("exec_command", "rm -rf /tmp/evo-adr-0002-canary") so a
+    // ("exec_command", "rm -rf /tmp/evo-no-exec-canary") so a
     // future refactor that mistakenly grew an interpreter would
     // surface immediately. The canary path is NEVER created by the
     // steward; if a regression caused `from_toml` to act on this
@@ -176,7 +176,7 @@ fn unknown_fields_terminate_without_executing() {
     // erroring with an unrelated I/O reason. We sanity-check that
     // the canary path does not exist after the call.
     let toml = r#"
-        exec_command = "rm -rf /tmp/evo-adr-0002-canary"
+        exec_command = "rm -rf /tmp/evo-no-exec-canary"
         eval = "1 + 1"
         [[racks]]
         name = "good"
@@ -184,7 +184,7 @@ fn unknown_fields_terminate_without_executing() {
         kinds = ["registrar"]
         charter = "Schema-conformant rack alongside foreign fields."
     "#;
-    let canary = std::path::Path::new("/tmp/evo-adr-0002-canary");
+    let canary = std::path::Path::new("/tmp/evo-no-exec-canary");
     // Pre-condition: the canary path does not exist. The steward
     // does not create it under any input.
     assert!(

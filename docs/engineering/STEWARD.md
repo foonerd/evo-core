@@ -34,7 +34,7 @@ The steward's charter, in order of foundational-to-operational:
 8. Emit happenings for custody transitions on a bus any interested party can subscribe to.
 9. On shutdown: drive every admitted plugin through unload. Release resources. Remove the socket.
 
-These nine are fully implemented. The subject identity slice (subjects, addressings, aliases, the claim log), the durable happenings log, and the pending-conflicts table are persisted to SQLite at `/var/lib/evo/state/evo.db` via write-through on every state-changing operation; the persisted rows serve the boot-time orphan diagnostic, the replay-window check on `subscribe_happenings`, and forensic queries. Boot-time rehydration of the in-memory subject registry from those rows is the next slice of persistence work; until it ships, a steward restart re-discovers subjects through normal plugin announcement. Relation, custody, and admin durability also remain on the roadmap (section 12.3). Concepts from `CONCEPT.md` section 2 not part of the current build: appointments and watches, factory plugins.
+These nine are fully implemented. The subject identity slice (subjects, addressings, aliases, the claim log), the durable happenings log, and the pending-conflicts table are persisted to SQLite at `/var/lib/evo/state/evo.db` via write-through on every state-changing operation; the persisted rows serve the boot-time orphan diagnostic, the replay-window check on `subscribe_happenings`, and forensic queries. Boot-time rehydration of the in-memory subject registry from those rows is the next slice of persistence work; until it ships, a steward restart re-discovers subjects through normal plugin announcement. Relation, custody, and admin durability also remain on the roadmap (section 12.3). Concepts from `CONCEPT.md` section 2 not part of the current build: appointments and watches.
 
 ## 3. Process Model
 
@@ -69,7 +69,7 @@ The `evo` crate is the steward. Its modules, and their responsibilities:
 | `custody` | Custody ledger. Records active custodies keyed by `(plugin, handle_id)`. Updated on `take_custody`, every state report, and `release_custody`. Exposes `CustodyLedger`, `CustodyRecord`, `StateSnapshot`, `LedgerCustodyStateReporter`. Full treatment in `CUSTODY.md`. |
 | `projections` | Projection engine. Composes subject projections on demand, including recursive relation walks with cycle guards and visit caps. Exposes `ProjectionEngine`, `ProjectionScope`, `SubjectProjection`. |
 | `admission` | Admission engine. Accepts plugins (singleton respondents and wardens, in-process or out-of-process). Routes plugin requests, custody verbs, and emits custody happenings on the bus. Exposes `AdmissionEngine`. |
-| `plugin_discovery` | Walks `plugins.search_roots` from config, creates per-plugin `state/` and `credentials/` under the data root, and admits out-of-process singletons. Skips factory and in-process bundles with warnings. |
+| `plugin_discovery` | Walks `plugins.search_roots` from config, creates per-plugin `state/` and `credentials/` under the data root, and admits out-of-process plugins (singleton and factory, respondent and warden). Skips in-process bundles with warnings. |
 | `context` | The `LoadContext` handed to each plugin at load time. Carries the announcers and state reporters the plugin uses to push data back into the steward. |
 | `wire_client` | Wire-level client for out-of-process plugins. Wraps a connected socket; speaks the plugin-facing protocol. Exposes `WireClient`, `WireRespondent`, `WireWarden` (the adapters that make a wire-backed plugin look like an in-process plugin to the admission engine). |
 | `happenings` | Happenings bus. Streamed notifications for fabric transitions; carries custody variants in this version. Exposes `Happening` (`#[non_exhaustive]`) and `HappeningBus`. Full treatment in `HAPPENINGS.md`. |
@@ -112,7 +112,7 @@ AdmissionEngine::admit_out_of_process_from_directory(plugin_dir, runtime_dir, ca
 
 The in-process variants take a constructed plugin instance directly. The low-level out-of-process variants take the reader and writer halves of a pre-established connection and are primarily used by tests that inject in-memory transports. Production callers go through `admit_out_of_process_from_directory`, which reads a manifest from a directory, spawns the plugin binary as a child process, waits for its Unix socket to appear, connects, and branches on `manifest.kind.interaction` to select the respondent or warden path.
 
-Factory admission (`Instance::Factory`) is reserved; the steward refuses `kind.instance = "factory"` at validation. Singleton instances are the only supported instance shape today.
+Factory admission (`Instance::Factory`) is supported alongside the singleton path. The steward provides `admit_factory_respondent`, `admit_factory_warden`, and the OOP equivalents (the existing `admit_out_of_process_respondent` / `admit_out_of_process_warden` accept both singleton and factory manifests, branching on `manifest.kind.instance`). Each factory plugin's `LoadContext.instance_announcer` is wired to a registry-backed implementation that mints a subject per announced instance under the `evo-factory-instance` addressing scheme; the steward's shutdown drain stage retracts every announced instance before the per-plugin unload tasks fire. See `PLUGIN_AUTHORING.md` §6b for the plugin-author surface.
 
 ### 5.2 Validation
 
@@ -126,7 +126,7 @@ Every admission validates the plugin's manifest against the catalogue:
 | No plugin is already admitted on this shelf (singletons enforce this) | `StewardError::DuplicateShelf` |
 | `manifest.kind.interaction` matches the admission path (respondent vs warden) | `StewardError::Admission` with a message naming the mismatch |
 | `manifest.target.shape` equals the shelf's `shape` | `StewardError::Admission` (shape mismatch) |
-| Shelf accepts a **range** of shape values (migration window) | Not implemented; see section 12.4 and `GAPS.md` gap [9] |
+| Shelf accepts a **list** of older shape values (`shape_supports`, migration window) | `Shelf::accepts_shape(candidate)`; see section 12.4 and `CATALOGUE.md` §4.2 |
 
 A validation failure during out-of-process admission is handled by tearing down the child process cleanly before returning the error (section 5.4).
 
@@ -289,7 +289,7 @@ At load time, each plugin receives a `LoadContext`:
 
 | Field | Role |
 |-------|------|
-| `instance_announcer` | Announce factory instances (unused today; factory admission is refused at validation and the field is reserved). |
+| `instance_announcer` | Announce factory instances. For factory plugins, populated with a registry-backed announcer that mints a subject per instance under the `evo-factory-instance` addressing scheme. For singleton plugins, populated with a logging placeholder; calls have no effect on the registry. |
 | `subject_announcer` | Announce and retract subjects. Goes to the shared `SubjectRegistry`. |
 | `relation_announcer` | Assert and retract relations. Goes to the shared `RelationGraph`. |
 | `state_reporter` | Push state reports (logged today; folded into rack projections when those land). |
@@ -345,7 +345,7 @@ Every plugin manifest declares a trust class:
 | `Unprivileged` | Third-party; runs under seccomp and with no filesystem capability beyond its own plugin directory. |
 | `Sandbox` | Experimental; full isolation, strictest enforcement. |
 
-v0 records the *effective* trust class from the manifest and admission. **Optional** (default off) `[plugins.security]` in the steward config maps effective trust class to a Unix **UID and GID** for out-of-process spawns. When disabled or a class is unmapped, OOP plugins run as the same user as the steward. Seccomp, capability bounding sets, and namespace isolation are **not** set by the core steward; a distribution layers those via systemd, OCI, LSM, or product-specific integration (`CONCEPT.md` section 9, `GAPS.md` [12]).
+v0 records the *effective* trust class from the manifest and admission. **Optional** (default off) `[plugins.security]` in the steward config maps effective trust class to a Unix **UID and GID** for out-of-process spawns. When disabled or a class is unmapped, OOP plugins run as the same user as the steward. Seccomp, capability bounding sets, and namespace isolation are **not** set by the core steward; a distribution layers those via systemd, OCI, LSM, or product-specific integration (`CONCEPT.md` section 9).
 
 ## 11. Configuration and Catalogue
 
@@ -429,7 +429,7 @@ Until the client-side verb lands, consumers wanting course-correction semantics 
 
 ### 12.7 Factory Plugins
 
-Factory plugins produce variable instances over time (USB drives appearing, peers being discovered). The plugin contract defines `announce_instance` and `retract_instance` verbs. The steward has an `instance_announcer` in `LoadContext` but admission refuses factory-kind plugins at validation; the `[capabilities.factory]` block in `PLUGIN_PACKAGING.md` is reserved with a documented promotion plan. Instances would register as separate occupants of their target shelves once admission lands.
+Factory plugins produce variable instances over time (USB drives appearing, peers being discovered, accounts authenticating). The plugin contract defines `announce_instance` and `retract_instance` verbs through `LoadContext.instance_announcer`. The admission engine accepts `kind.instance = "factory"` manifests on the in-process and out-of-process paths; each announced instance becomes a subject under the `evo-factory-instance` addressing scheme keyed by `<plugin>/<instance_id>`. The shutdown drain stage walks every registered factory and retracts its instances before per-plugin unload. See `PLUGIN_AUTHORING.md` §6b for plugin-author surface and `PLUGIN_PACKAGING.md` for the manifest schema.
 
 ### 12.8 User Interaction Routing
 
@@ -437,7 +437,7 @@ Plugins can request user-facing prompts through `LoadContext::user_interaction_r
 
 ### 12.9 Plugin Discovery
 
-The shipped binary runs a discovery pass after the catalogue loads and before the server is constructed. It walks each path in `plugins.search_roots` (default: `/opt/evo/plugins` then `/var/lib/evo/plugins`; a plugin name in a later root overrides the same name in an earlier root). Staged directory layout under `evo` / `distribution` / `vendor` (per `PLUGIN_PACKAGING.md`) and flat “each child directory is a bundle” layout are both supported. Each bundle must contain a `manifest.toml`. Only out-of-process singletons are admitted; factory plugins and in-process transport are skipped with a warning.
+The shipped binary runs a discovery pass after the catalogue loads and before the server is constructed. It walks each path in `plugins.search_roots` (default: `/opt/evo/plugins` then `/var/lib/evo/plugins`; a plugin name in a later root overrides the same name in an earlier root). Staged directory layout under `evo` / `distribution` / `vendor` (per `PLUGIN_PACKAGING.md`) and flat “each child directory is a bundle” layout are both supported. Each bundle must contain a `manifest.toml`. Out-of-process plugins of every interaction shape (respondent or warden) and instance shape (singleton or factory) are admitted; in-process transport is skipped with a warning (in-process plugins are admitted programmatically by the distribution's main, not by discovery).
 
 Per-plugin `state/` and `credentials/` directories are created under `plugins.plugin_data_root` (default `/var/lib/evo/plugins`) before each admission. Sockets for out-of-process plugins live in `plugins.runtime_dir` (default: same as the data root).
 

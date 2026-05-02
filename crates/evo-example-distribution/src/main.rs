@@ -15,7 +15,7 @@
 //!    (a respondent) and `evo-example-warden` (a warden) in-process.
 //!    A real distribution substitutes its own plugins here.
 //! 2. **The manifests.** Every admitted plugin needs a
-//!    [`Manifest`](evo_plugin_sdk::Manifest). This skeleton embeds
+//!    [`Manifest`]. This skeleton embeds
 //!    the manifests as TOML constants for self-containedness; a
 //!    larger distribution typically loads them from on-disk
 //!    `manifest.toml` files inside its bundle directory.

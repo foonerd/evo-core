@@ -21,8 +21,10 @@ they are for, and the contract each carries.
 
 - **Repository:** `https://github.com/foonerd/evo-core`
 - **Default branch:** `main`
-- **Engineering-excellence branch:** `eng-excel` (PR-shaped staging
-  for adversarial review; lands back to `main` per release cycle)
+- **Release-staging branch:** PR-shaped staging branch for
+  adversarial review; lands back to `main` per release cycle.
+  Branch name is internal to maintainer workflow; consumers track
+  `main` and tags only.
 - **License:** see the `LICENSE` file at the repository root.
 
 The source is the canonical evo-core. Every other surface (tagged
@@ -109,7 +111,7 @@ A single delivery surface would not serve every consumer:
   before they can run a steward at all is the friction that
   killed the v0.1.9 plugin-developer-testing claim.
 - **Binary-only** would hide the engineering substance. evo-core's
-  source is the engineering-excellence story; consumers reading
+  source carries the architectural substance; consumers reading
   the code is a feature, not a tax. Distributions building from
   source for full reproducibility need the source. Source visibility
   is non-negotiable.

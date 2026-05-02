@@ -97,17 +97,26 @@ A shelf has:
 
 - A **name** (lowercase, no dots, unique within the rack).
 - A **shape version** (an integer): what version of the shelf's contract this shelf presents. Plugins declare which shape version they satisfy.
+- An optional **shape_supports** list (vector of integers): older shape values this shelf still admits in addition to the current shape. Empty by default.
 - An optional **description**.
 
 A plugin's manifest targets `<rack>.<shelf>` as its slot. The shape version lets shelves evolve: a shelf at shape version 2 has different request types or payload conventions than shape version 1, and plugins declare which they speak.
 
 ### 4.2 Shelf Shape Versioning
 
-Shape versioning is the hinge that lets a catalogue evolve without forking shelf names. The end-state workflow (supported **ranges** on a slot, negotiation windows) is specified in `CONCEPT.md` section 10, but the **catalogue type today carries a single integer per shelf**, not a range.
+Shape versioning is the hinge that lets a catalogue evolve without forking shelf names. A shelf carries a single current `shape` integer plus an optional `shape_supports` list of older values it still admits during a migration window.
 
-**What the steward enforces today.** At admission, the steward requires **strict equality**: the plugin manifest's `target.shape` must equal the catalogue shelf's `shape` for the targeted slot. If the catalogue bumps a shelf from `shape = 1` to `shape = 2`, a plugin that still declares `shape = 1` is **refused** until its manifest is updated. There is no silent mismatch and no "old plugin keeps running" during a shape bump on the same shelf name.
+**Admission gate.** A plugin's `target.shape` admits when it equals the catalogue shelf's current `shape` OR appears in the shelf's `shape_supports` list. The default `shape_supports = []` reduces this to strict equality, the legacy behaviour.
 
-**What is not implemented yet.** A shelf that accepts **more than one** shape value during a migration (for example "plugins at shape 1 or 2 may admit"), SemVer-style negotiation, and the corresponding catalogue schema—see `STEWARD.md` section 12.4. Until that lands, shape evolution on a slot is **lockstep**: catalogue and every plugin on that slot move together.
+**Migration workflow.** When a shelf's contract changes in a non-backwards-compatible way:
+
+1. The catalogue maintainer bumps `shape` from N to N+1 and adds N to `shape_supports`. Both old and new plugins admit during the migration window.
+2. Plugin authors update their manifests to declare `shape = N+1` at their own pace; the new manifest admits because the shelf's current `shape` matches.
+3. Once every plugin on the slot has migrated, the catalogue maintainer drops N from `shape_supports`. Stale plugins still declaring `shape = N` are then refused.
+
+The list is intentionally explicit rather than a half-open range: a shelf may skip a generation (current `shape = 4`, `shape_supports = [1, 3]` if a v2 was withdrawn) and the catalogue grammar reads exactly. The catalogue parser refuses two cases: listing the current `shape` in `shape_supports` (meaningless), and duplicate entries in the list. Order is unspecified; admission checks set membership.
+
+**Wire-protocol negotiation.** Shape-version negotiation on the wire (a plugin querying a shelf for its supported set before connect) is out of scope here; this section covers only admission-time gating. The wire-protocol negotiation is tracked under `STEWARD.md` section 12.4.
 
 ### 4.3 Choosing Shelf Boundaries
 

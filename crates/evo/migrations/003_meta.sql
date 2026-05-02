@@ -1,6 +1,6 @@
 -- migrations/003_meta.sql
 --
--- Phase 3: steward instance identity.
+-- Steward instance identity.
 --
 -- Adds the `meta` key/value table — a single source of truth for
 -- steward-level singleton facts that span schema versions and need

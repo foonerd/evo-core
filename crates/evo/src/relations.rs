@@ -73,7 +73,7 @@
 //!   and refuses with `Invalid` on mismatch. The check depends on
 //!   subject types themselves being catalogue-validated.
 //! - Cardinality check: after a successful assert the announcer
-//!   consults [`Self::forward_count`] and [`Self::inverse_count`]
+//!   consults [`RelationGraph::forward_count`] and [`RelationGraph::inverse_count`]
 //!   and emits a
 //!   [`Happening::RelationCardinalityViolation`](crate::happenings::Happening::RelationCardinalityViolation)
 //!   plus a warn log when a declared `AtMostOne` or `ExactlyOne`
@@ -111,7 +111,12 @@ use evo_plugin_sdk::contract::SplitRelationStrategy;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn ms_to_system_time(ms: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(ms)
+}
+
 
 /// The relation graph.
 ///
@@ -633,6 +638,79 @@ impl RelationGraph {
                 inverse: HashMap::new(),
             }),
         }
+    }
+
+    /// Replace the in-memory graph with the rows the supplied store
+    /// returns from
+    /// [`PersistenceStore::load_all_relations`](crate::persistence::PersistenceStore::load_all_relations).
+    /// Called once on boot so the freshly constructed graph
+    /// presents the same edges, claimants, and suppression markers
+    /// the steward had before the restart.
+    ///
+    /// Forward and inverse indices are rebuilt from the relation
+    /// set; suppressed relations are excluded from the indices to
+    /// preserve the in-memory invariant that suppressed edges do
+    /// not surface in neighbour queries, walks, or cardinality
+    /// counts.
+    pub async fn rehydrate_from(
+        &self,
+        store: &dyn crate::persistence::PersistenceStore,
+    ) -> Result<(), crate::persistence::PersistenceError> {
+        let rows = store.load_all_relations().await?;
+        let mut relations: HashMap<RelationKey, RelationRecord> =
+            HashMap::with_capacity(rows.len());
+        let mut forward: HashMap<(String, String), HashSet<String>> =
+            HashMap::new();
+        let mut inverse: HashMap<(String, String), HashSet<String>> =
+            HashMap::new();
+        for (rel, claims) in rows {
+            let key = RelationKey::new(
+                rel.source_id.clone(),
+                rel.predicate.clone(),
+                rel.target_id.clone(),
+            );
+            let suppression = match (
+                rel.suppressed_admin_plugin,
+                rel.suppressed_at_ms,
+            ) {
+                (Some(admin_plugin), Some(at_ms)) => Some(SuppressionRecord {
+                    admin_plugin,
+                    suppressed_at: ms_to_system_time(at_ms),
+                    reason: rel.suppression_reason,
+                }),
+                _ => None,
+            };
+            let record = RelationRecord {
+                key: key.clone(),
+                created_at: ms_to_system_time(rel.created_at_ms),
+                modified_at: ms_to_system_time(rel.modified_at_ms),
+                claims: claims
+                    .into_iter()
+                    .map(|c| RelationClaim {
+                        claimant: c.claimant,
+                        asserted_at: ms_to_system_time(c.asserted_at_ms),
+                        reason: c.reason,
+                    })
+                    .collect(),
+                suppression,
+            };
+            if record.suppression.is_none() {
+                forward
+                    .entry((key.source_id.clone(), key.predicate.clone()))
+                    .or_default()
+                    .insert(key.target_id.clone());
+                inverse
+                    .entry((key.target_id.clone(), key.predicate.clone()))
+                    .or_default()
+                    .insert(key.source_id.clone());
+            }
+            relations.insert(key, record);
+        }
+        let mut g = self.inner.lock().expect("graph mutex poisoned");
+        g.relations = relations;
+        g.forward = forward;
+        g.inverse = inverse;
+        Ok(())
     }
 
     /// Current number of distinct relations in the graph.
@@ -3023,5 +3101,135 @@ mod tests {
                 vec!["n1".to_string(), "n2".to_string()]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rehydrate_loads_relations_claims_and_indices() {
+        // Populate a persistence store with two relations (one
+        // suppressed, one visible) and confirm rehydrate_from
+        // rebuilds the in-memory graph: relations map, forward
+        // and inverse indices (suppressed edges excluded), and
+        // claim provenance with multiple claimants.
+        use crate::persistence::{
+            MemoryPersistenceStore, PersistedRelation, PersistedRelationClaim,
+            PersistenceStore,
+        };
+        use std::sync::Arc;
+        let store: Arc<dyn PersistenceStore> =
+            Arc::new(MemoryPersistenceStore::new());
+        store
+            .record_relation_assert(
+                &PersistedRelation {
+                    source_id: "a".into(),
+                    predicate: "edge".into(),
+                    target_id: "b".into(),
+                    created_at_ms: 100,
+                    modified_at_ms: 100,
+                    suppressed_admin_plugin: None,
+                    suppressed_at_ms: None,
+                    suppression_reason: None,
+                },
+                &PersistedRelationClaim {
+                    source_id: "a".into(),
+                    predicate: "edge".into(),
+                    target_id: "b".into(),
+                    claimant: "p1".into(),
+                    asserted_at_ms: 100,
+                    reason: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .record_relation_assert(
+                &PersistedRelation {
+                    source_id: "a".into(),
+                    predicate: "edge".into(),
+                    target_id: "b".into(),
+                    created_at_ms: 200,
+                    modified_at_ms: 200,
+                    suppressed_admin_plugin: None,
+                    suppressed_at_ms: None,
+                    suppression_reason: None,
+                },
+                &PersistedRelationClaim {
+                    source_id: "a".into(),
+                    predicate: "edge".into(),
+                    target_id: "b".into(),
+                    claimant: "p2".into(),
+                    asserted_at_ms: 200,
+                    reason: Some("p2 reason".into()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .record_relation_assert(
+                &PersistedRelation {
+                    source_id: "c".into(),
+                    predicate: "edge".into(),
+                    target_id: "d".into(),
+                    created_at_ms: 300,
+                    modified_at_ms: 300,
+                    suppressed_admin_plugin: None,
+                    suppressed_at_ms: None,
+                    suppression_reason: None,
+                },
+                &PersistedRelationClaim {
+                    source_id: "c".into(),
+                    predicate: "edge".into(),
+                    target_id: "d".into(),
+                    claimant: "p1".into(),
+                    asserted_at_ms: 300,
+                    reason: None,
+                },
+            )
+            .await
+            .unwrap();
+        // Suppress the second relation.
+        store
+            .record_relation_suppress(
+                "c",
+                "edge",
+                "d",
+                "admin.plugin",
+                400,
+                Some("disputed"),
+                400,
+            )
+            .await
+            .unwrap();
+
+        let graph = RelationGraph::new();
+        graph.rehydrate_from(store.as_ref()).await.unwrap();
+
+        assert_eq!(graph.relation_count(), 2);
+        assert_eq!(graph.claim_count(), 3);
+
+        // Visible edge: in the indices.
+        assert!(graph.exists("a", "edge", "b"));
+        assert_eq!(graph.forward_count("a", "edge"), 1);
+        assert_eq!(graph.inverse_count("b", "edge"), 1);
+
+        // Suppressed edge: NOT in indices, but describe still
+        // returns the record with suppression marker.
+        assert_eq!(graph.forward_count("c", "edge"), 0);
+        assert_eq!(graph.inverse_count("d", "edge"), 0);
+        let cd = graph
+            .describe_relation("c", "edge", "d")
+            .expect("c-edge-d record");
+        assert!(cd.suppression.is_some());
+        let suppression = cd.suppression.as_ref().unwrap();
+        assert_eq!(suppression.admin_plugin, "admin.plugin");
+        assert_eq!(suppression.reason.as_deref(), Some("disputed"));
+
+        // Claims provenance round-trips.
+        let ab = graph
+            .describe_relation("a", "edge", "b")
+            .expect("a-edge-b record");
+        let mut claimants: Vec<&str> =
+            ab.claims.iter().map(|c| c.claimant.as_str()).collect();
+        claimants.sort();
+        assert_eq!(claimants, vec!["p1", "p2"]);
     }
 }

@@ -250,6 +250,8 @@ async fn out_of_process_echo_admission_and_request() {
         payload: b"hello from out of process".to_vec(),
         correlation_id: 42,
         deadline: None,
+
+        instance_id: None,
     };
     let resp = tokio::time::timeout(
         REQUEST_TIMEOUT,
@@ -301,6 +303,8 @@ async fn out_of_process_echo_handles_multiple_requests() {
             payload: format!("payload {i}").into_bytes(),
             correlation_id: i,
             deadline: None,
+
+            instance_id: None,
         };
         let resp = tokio::time::timeout(
             REQUEST_TIMEOUT,

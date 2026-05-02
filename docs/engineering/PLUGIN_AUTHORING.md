@@ -579,6 +579,153 @@ The two retract primitives (`forced_retract_addressing`, `forced_retract_claim`)
 
 Reference implementation: `crates/evo-example-admin`. That crate ships the manifest, the plugin struct, the request-body types (`AdminRetractAddressingRequest`, `AdminRetractClaimRequest`), and five in-process integration tests covering the full admission + dispatch flow (cross-plugin addressing removal, cross-plugin claim removal, admission refused without `capabilities.admin`, admission refused at Standard trust, admission admitted at Platform trust). Fork it for product-specific admin tooling, or use it verbatim as a starting-point proof that the callback surface is correctly wired on the target distribution.
 
+## 6b. Authoring a Factory
+
+A factory plugin owns a variable-cardinality set of entities ("instances") it announces and retracts at runtime. Each instance becomes an addressable subject on the factory's target shelf; consumers route requests to a specific instance via the `instance_id` field on the request.
+
+Use a factory when the plugin is the **sole authority** on whether the entity exists — a USB DAC enumerator owning USB DACs, a Bluetooth pair manager owning paired peers, a streaming-service integration owning per-account sessions. Do not use a factory for entities multiple plugins might claim (catalogue items, metadata records); those are subjects with full provenance via `SubjectAdmin`.
+
+### 6b.1 Trait surface
+
+A factory plugin implements the `Factory` trait alongside `Plugin` and either `Respondent` (for request-response interaction) or `Warden` (for custody-bearing interaction):
+
+```rust
+use evo_plugin_sdk::contract::factory::{Factory, RetractionPolicy};
+use evo_plugin_sdk::contract::{Plugin, Respondent, /* ... */};
+
+pub struct MyFactory { /* per-plugin state */ }
+
+impl Plugin for MyFactory { /* describe / load / unload / health_check */ }
+impl Factory for MyFactory {
+    fn retraction_policy(&self) -> RetractionPolicy {
+        RetractionPolicy::Dynamic
+    }
+}
+impl Respondent for MyFactory {
+    fn handle_request<'a>(&'a mut self, req: &'a Request) -> /* ... */ {
+        async move {
+            // Dispatch to the right instance by req.instance_id.
+            let id = req.instance_id.as_deref().ok_or_else(|| {
+                PluginError::Permanent("instance_id required".into())
+            })?;
+            self.dispatch_per_instance(id, req).await
+        }
+    }
+}
+```
+
+### 6b.2 Announcing instances
+
+The plugin's `LoadContext` carries an `instance_announcer: Arc<dyn InstanceAnnouncer>`. Inside `load` (or any later async context), the plugin calls `instance_announcer.announce(InstanceAnnouncement::new(id, payload))` for each instance it owns. The `id` is the plugin's stable identifier for the entity; the steward uses it as the addressing under the synthetic `evo-factory-instance` scheme. The `payload` is opaque bytes whose schema is defined by the target shelf.
+
+Stable instance IDs are the plugin's responsibility. A factory MUST emit the same `instance_id` for the same logical entity across restarts. Plugins whose external entity has no stable identifier (a Bluetooth device with a randomised MAC, a USB drive without a serial number) derive a stable ID locally — pair-key fingerprint, partition UUID, etc. The steward does not mint instance IDs.
+
+### 6b.3 Retraction policies
+
+The `RetractionPolicy` declares when the plugin will call `instance_announcer.retract(instance_id)` during its lifetime:
+
+- **`Dynamic`** — instances come and go at any time. The plugin emits both announces and retracts. A USB hot-plug enumerator: a drive plugged in fires `announce`; a drive removed fires `retract`.
+- **`StartupOnly`** — every instance is announced during the `load` callback; nothing is retracted while the plugin runs. The steward retracts every instance during shutdown's drain stage. A one-shot board enumerator that scans `/proc/cpuinfo` once at startup.
+- **`ShutdownOnly`** — instances are announced over the plugin's lifetime; nothing is retracted while the plugin runs. The steward retracts every instance during shutdown's drain stage. A connection pool that announces each acquired connection as an instance and lets the steward release them all at unload.
+
+The steward enforces the policy. Calling `retract` outside its allowed window returns a structured `ReportError::Invalid`. The steward's drain path bypasses these gates — every announced instance is retracted on plugin unload regardless of declared policy, so no instance outlives its owning plugin.
+
+### 6b.4 Manifest
+
+Factory plugins declare `kind.instance = "factory"` in the manifest plus the `[capabilities.factory]` block:
+
+```toml
+[plugin]
+name = "org.example.usb.dacs"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "audio.outputs"
+shape = 1
+
+[kind]
+instance = "factory"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "standard"
+
+[prerequisites]
+evo_min_version = "0.1.10"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 32
+max_cpu_percent = 5
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = ["play", "stop", "set_volume"]
+response_budget_ms = 1000
+
+[capabilities.factory]
+max_instances = 16
+instance_ttl_seconds = 0
+```
+
+### 6b.5 Multiple factories on one shelf
+
+Many real shelves are stocked by several factories simultaneously. `audio.outputs` will host I²S, USB Audio, HDMI, Bluetooth A2DP, AirPlay, and Chromecast factories — each enumerating its own slice of the world. The framework supports this transparently: each factory's instance IDs are namespaced under `<plugin>/<instance_id>` in the synthetic addressing scheme, so collisions are structurally impossible. Each factory is a separate plugin; each binds its manifest to the same `target.shelf`.
+
+### 6b.6 Multi-layer entities
+
+A factory instance can announce its own subjects (via `SubjectAdmin`) keyed off its instance ID. A DTV tuner plugin announces tuner instances; while a tuner is locked to a multiplex, that tuner instance announces programme subjects scoped to itself. When the tuner switches multiplex, the programme subjects retract. The relation graph ties parent (tuner) to child (programmes) so consumers walking the graph see the hierarchy. The framework does not enforce this pattern; it composes naturally because factory instances are subjects.
+
+### 6b.7 Routing and the `instance_id` field
+
+A client request to a factory-stocked shelf includes `instance_id` to disambiguate which instance handles the request:
+
+```json
+{
+  "op": "request",
+  "shelf": "audio.outputs",
+  "request_type": "play",
+  "payload_b64": "...",
+  "instance_id": "usb-1234:5678"
+}
+```
+
+The field is optional at the wire-protocol level (older clients that omit it parse cleanly; the plugin receives `None`). Factory plugins MAY treat a missing `instance_id` as an error and refuse the request; singleton plugins always receive `None` and ignore the field.
+
+### 6b.8 Out-of-process factories
+
+Out-of-process factory plugins use the same `evo_plugin_sdk::host::run_oop` helper as singleton respondents:
+
+```rust
+#[tokio::main]
+async fn main() -> Result<()> {
+    let socket_path = parse_args()?;
+    let plugin = MyFactory::new();
+    let config = HostConfig::new("org.example.usb.dacs");
+    run_oop(plugin, config, &socket_path).await
+}
+```
+
+The SDK's wire-backed `InstanceAnnouncer` translates `announce` and `retract` calls into wire frames the steward routes through its registry-backed announcer. The plugin author writes the same code as for in-process; the transport is invisible.
+
+OOP factories currently default to `RetractionPolicy::Dynamic` regardless of what `Factory::retraction_policy()` returns; a future enhancement carries the declared policy across the wire.
+
+### 6b.9 Reference implementation
+
+`crates/evo-example-factory` ships a minimal factory respondent: announces three instances (`instance-a`, `instance-b`, `instance-c`) at load time, declares `RetractionPolicy::StartupOnly`, and answers any `echo` request by mirroring the payload back. The crate produces both an in-process library and an OOP wire bin (`factory-wire`); copy its shape for new factory plugins.
+
 ## 7. Packaging
 
 A plugin ships as:

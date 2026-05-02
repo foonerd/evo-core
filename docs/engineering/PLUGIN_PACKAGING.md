@@ -515,6 +515,8 @@ The steward's own plugin administration is expressed as a rack in the infrastruc
 
 Administration is performed by consumers projecting the `plugins` rack and issuing instructions to the operator shelf. This is the full admin surface. No parallel admin API exists.
 
+The reachable read-only inventory surface today is `op = "list_plugins"` (`CLIENT_API.md` §4.11), which returns one entry per admitted plugin (name, fully-qualified shelf, interaction kind) in router admission order. The writable verbs of the operator shelf (enable / disable / uninstall / purge-state) and the admission-origin / reloadable telemetry are deferred to a follow-up; the single-plugin lifecycle verb that is reachable today is the admission engine's `reload_plugin` entry point honouring the manifest's `lifecycle.hot_reload` policy (None / Restart).
+
 ## 7. Installation Lifecycle
 
 Two **complementary** ways to get a plugin onto a device; product lines use one or both. What follows is normative for how the **artefact** reaches the path the steward actually scans.
@@ -656,11 +658,12 @@ Each example is a complete buildable crate with its own manifest and a README po
 
 ## 10. Catalogue Schemas Repository
 
-Shelf shapes are published, versioned, and consumed independently. The evo project maintains `evo-catalogue-schemas` as a sibling repository containing:
+Shelf shapes are published, versioned, and consumed independently of the steward release cycle. Two surfaces:
 
-- One TOML file per shelf, per major version.
-- Validation tooling usable without a running device.
-- Change history per shelf, with deprecation notices.
+- **In-tree skeleton** at `dist/catalogue/schemas/` in the framework source tree. One file per `(rack, shelf, shape)` tuple, naming convention `<rack>/<shelf>.v<N>.toml`. Carries the request types, payload shape, and acceptance criteria for the shape. The framework's admission gate validates a plugin's manifest `target.{shelf,shape}` against the catalogue at admission time (`CATALOGUE.md` §4.2); the schema files in this directory are what a plugin author reads to know what code contract that admission gate translates to. The skeleton today ships the schema for `example.echo` shape 1, the slot the in-tree reference distribution uses.
+- **Future sibling repository** `foonerd/evo-catalogue-schemas` for the brand-neutral framework-tier shelves (the `org.evoframework.*` namespace). Spin-out is a follow-on action; until it lands the in-tree skeleton remains the canonical reference for the on-disk shape and per-domain catalogue-schemas live under each distribution's own publication.
+
+Validation tooling: `evo-plugin-tool catalogue lint` already validates the catalogue document grammar (racks, shelves, subject types, predicates, inverses, the `shape_supports` discipline). A `validate-shelf-schema` subcommand consuming the per-shelf TOML in this directory ships on the same follow-on cycle as the sibling-repo spin-out.
 
 Distributions may publish their own schema repositories for domain-specific shelves. A plugin targeting a Volumio-specific shelf reads its schema from the Volumio distribution's schema publication, validates locally, then packages.
 

@@ -20,6 +20,7 @@ mod digest;
 mod error;
 mod key_meta;
 mod matchers;
+mod release_root;
 mod revocation;
 mod trust_root;
 mod verify;
@@ -31,6 +32,10 @@ pub use digest::{
 };
 pub use error::TrustError;
 pub use key_meta::{Authorisation, KeyMeta, KeyRole, KeySection};
+pub use release_root::{
+    role_for_artefact_kind, verify_release_signature, ReleaseKeyMeta,
+    ReleaseKeySection, ReleaseRole, ReleaseTrustKey,
+};
 pub use matchers::effective_trust_class;
 pub use matchers::name_matches_prefixes;
 pub use revocation::RevocationSet;

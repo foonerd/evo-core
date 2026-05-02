@@ -11,7 +11,7 @@
 //! - Implementing `Plugin` (describe, load, unload, health_check).
 //! - Implementing `Warden` (take_custody, course_correct,
 //!   release_custody).
-//! - Using the [`CustodyStateReporter`] handed to the plugin on the
+//! - Using the [`CustodyStateReporter`](evo_plugin_sdk::contract::CustodyStateReporter) handed to the plugin on the
 //!   [`Assignment`] to emit a state report from within
 //!   `take_custody`. Because the reporter is invoked from within
 //!   the plugin's own trait method (the same task the SDK's host

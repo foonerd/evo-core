@@ -19,7 +19,7 @@
 //! frame from within its own `take_custody` trait method, before the
 //! response frame is written back. The steward's reader task drives
 //! event frames through the installed
-//! [`CustodyStateReporter`](evo_plugin_sdk::contract::CustodyStateReporter)
+//! [`CustodyStateReporter`]
 //! before the `TakeCustodyResponse` resolves the engine's pending
 //! oneshot - so the ledger may see the first state report *before*
 //! the engine has a chance to call [`CustodyLedger::record_custody`]
@@ -46,6 +46,9 @@
 //! of this module does not foreclose that.
 
 use crate::happenings::{Happening, HappeningBus};
+use crate::persistence::{
+    PersistedCustody, PersistedCustodyState, PersistenceError, PersistenceStore,
+};
 use evo_plugin_sdk::contract::{
     CustodyHandle, CustodyStateReporter, HealthStatus, ReportError,
 };
@@ -54,7 +57,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Lifecycle state of one [`CustodyRecord`].
 ///
@@ -165,12 +168,21 @@ pub struct CustodyRecord {
     pub last_updated: SystemTime,
 }
 
-/// The custody ledger.
+/// The custody ledger with optional durable write-through.
 ///
-/// Owns a map from `(plugin, handle_id)` to [`CustodyRecord`]. Shared
-/// across the steward via `Arc`.
+/// Owns a map from `(plugin, handle_id)` to [`CustodyRecord`] for fast
+/// in-memory reads. When a [`PersistenceStore`] is attached via
+/// [`CustodyLedger::with_persistence`], every mutation
+/// (`record_custody`, `record_state`, `mark_aborted`, `mark_degraded`,
+/// `release_custody`) writes through to the `custodies` /
+/// `custody_state` tables before updating the in-memory mirror; the
+/// boot path uses [`CustodyLedger::rehydrate_from`] to reload the
+/// mirror from disk at startup.
+///
+/// Shared across the steward via `Arc`.
 pub struct CustodyLedger {
     entries: RwLock<HashMap<(String, String), CustodyRecord>>,
+    persistence: Option<Arc<dyn PersistenceStore>>,
 }
 
 impl std::fmt::Debug for CustodyLedger {
@@ -180,6 +192,7 @@ impl std::fmt::Debug for CustodyLedger {
                 "entries",
                 &self.entries.read().map(|g| g.len()).unwrap_or(0),
             )
+            .field("persistence", &self.persistence.is_some())
             .finish()
     }
 }
@@ -191,11 +204,67 @@ impl Default for CustodyLedger {
 }
 
 impl CustodyLedger {
-    /// Construct an empty ledger.
+    /// Construct an empty ledger with no persistence backing.
+    ///
+    /// Suitable for tests that do not exercise durability or for
+    /// embedded callers that opt out of disk writes entirely. Use
+    /// [`CustodyLedger::with_persistence`] to attach a
+    /// [`PersistenceStore`] for the production path.
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
+            persistence: None,
         }
+    }
+
+    /// Construct a ledger that writes through every mutation to the
+    /// `custodies` / `custody_state` tables on the supplied
+    /// [`PersistenceStore`] before mirroring it in memory.
+    pub fn with_persistence(persistence: Arc<dyn PersistenceStore>) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            persistence: Some(persistence),
+        }
+    }
+
+    /// Replace the in-memory mirror with the rows the supplied
+    /// store returns from
+    /// [`PersistenceStore::load_all_custodies`]. Called once on
+    /// boot so the freshly constructed ledger presents the same
+    /// active-custody set the steward had before the restart.
+    ///
+    /// Rows whose `state_kind` or `health` column carries an
+    /// unknown discriminant (e.g. a future steward writing back
+    /// to an older one) are skipped with a debug log so a
+    /// downgrade does not crash the boot path.
+    pub async fn rehydrate_from(
+        &self,
+        store: &dyn PersistenceStore,
+    ) -> Result<(), PersistenceError> {
+        let rows = store.load_all_custodies().await?;
+        let mut rehydrated: HashMap<(String, String), CustodyRecord> =
+            HashMap::with_capacity(rows.len());
+        for (custody, snapshot) in rows {
+            match custody_record_from_persisted(&custody, snapshot.as_ref()) {
+                Ok(record) => {
+                    rehydrated.insert(
+                        (custody.plugin, custody.handle_id),
+                        record,
+                    );
+                }
+                Err(reason) => {
+                    tracing::debug!(
+                        plugin = %custody.plugin,
+                        handle_id = %custody.handle_id,
+                        %reason,
+                        "skipping custodies row during rehydrate"
+                    );
+                }
+            }
+        }
+        let mut g = self.entries.write().expect("ledger lock poisoned");
+        *g = rehydrated;
+        Ok(())
     }
 
     /// Record that a warden has accepted a custody, or merge
@@ -206,15 +275,44 @@ impl CustodyLedger {
     /// If a record already exists (typically because an early state
     /// report arrived first), merges `shelf` and `custody_type` in,
     /// preserving the existing `started_at` and `last_state`.
-    pub fn record_custody(
+    ///
+    /// When persistence is attached, the row is upserted to the
+    /// `custodies` table before the in-memory mirror is updated.
+    pub async fn record_custody(
         &self,
         plugin: &str,
         shelf: &str,
         handle: &CustodyHandle,
         custody_type: &str,
-    ) {
+    ) -> Result<(), PersistenceError> {
         let key = (plugin.to_string(), handle.id.clone());
         let now = SystemTime::now();
+        let now_ms = system_time_to_ms(now);
+        let started_at_ms = {
+            let guard = self.entries.read().expect("ledger lock poisoned");
+            guard.get(&key).map(|r| system_time_to_ms(r.started_at))
+        }
+        .unwrap_or(now_ms);
+        let state_kind = {
+            let guard = self.entries.read().expect("ledger lock poisoned");
+            guard
+                .get(&key)
+                .map(|r| r.state.clone())
+                .unwrap_or(CustodyStateKind::Active)
+        };
+        if let Some(store) = self.persistence.as_ref() {
+            let row = PersistedCustody {
+                plugin: plugin.to_string(),
+                handle_id: handle.id.clone(),
+                shelf: Some(shelf.to_string()),
+                custody_type: Some(custody_type.to_string()),
+                state_kind: state_kind_to_str(&state_kind).to_string(),
+                state_reason: state_kind_reason(&state_kind),
+                started_at_ms,
+                last_updated_at_ms: now_ms,
+            };
+            store.upsert_custody(&row).await?;
+        }
         let mut guard = self.entries.write().expect("ledger lock poisoned");
         guard
             .entry(key)
@@ -233,6 +331,7 @@ impl CustodyLedger {
                 started_at: now,
                 last_updated: now,
             });
+        Ok(())
     }
 
     /// Record a state snapshot for a custody, creating a partial
@@ -243,20 +342,58 @@ impl CustodyLedger {
     /// [`CustodyLedger::record_custody`] call will fill those in. If a
     /// record already exists, replaces its `last_state` with the new
     /// snapshot.
-    pub fn record_state(
+    ///
+    /// When persistence is attached, the parent custody row is
+    /// upserted before the state snapshot so the FK invariant is
+    /// preserved across the lazy-UPSERT race.
+    pub async fn record_state(
         &self,
         plugin: &str,
         handle_id: &str,
         payload: Vec<u8>,
         health: HealthStatus,
-    ) {
+    ) -> Result<(), PersistenceError> {
         let key = (plugin.to_string(), handle_id.to_string());
         let now = SystemTime::now();
+        let now_ms = system_time_to_ms(now);
         let snapshot = StateSnapshot {
-            payload,
+            payload: payload.clone(),
             health,
             reported_at: now,
         };
+        let (started_at_ms, state_kind, shelf, custody_type) = {
+            let guard = self.entries.read().expect("ledger lock poisoned");
+            match guard.get(&key) {
+                Some(rec) => (
+                    system_time_to_ms(rec.started_at),
+                    rec.state.clone(),
+                    rec.shelf.clone(),
+                    rec.custody_type.clone(),
+                ),
+                None => (now_ms, CustodyStateKind::Active, None, None),
+            }
+        };
+        if let Some(store) = self.persistence.as_ref() {
+            let parent = PersistedCustody {
+                plugin: plugin.to_string(),
+                handle_id: handle_id.to_string(),
+                shelf,
+                custody_type,
+                state_kind: state_kind_to_str(&state_kind).to_string(),
+                state_reason: state_kind_reason(&state_kind),
+                started_at_ms,
+                last_updated_at_ms: now_ms,
+            };
+            store.upsert_custody(&parent).await?;
+            let row = PersistedCustodyState {
+                plugin: plugin.to_string(),
+                handle_id: handle_id.to_string(),
+                payload,
+                health: health_to_str(health).to_string(),
+                reported_at_ms: now_ms,
+            };
+            store.upsert_custody_state(&row).await?;
+        }
         let mut guard = self.entries.write().expect("ledger lock poisoned");
         guard
             .entry(key)
@@ -274,18 +411,26 @@ impl CustodyLedger {
                 started_at: now,
                 last_updated: now,
             });
+        Ok(())
     }
 
     /// Remove the record for `(plugin, handle_id)`, returning it if
     /// it existed.
-    pub fn release_custody(
+    ///
+    /// When persistence is attached, the row is deleted from
+    /// `custodies` (cascading the `custody_state` row) before the
+    /// in-memory mirror is mutated.
+    pub async fn release_custody(
         &self,
         plugin: &str,
         handle_id: &str,
-    ) -> Option<CustodyRecord> {
+    ) -> Result<Option<CustodyRecord>, PersistenceError> {
+        if let Some(store) = self.persistence.as_ref() {
+            store.delete_custody(plugin, handle_id).await?;
+        }
         let key = (plugin.to_string(), handle_id.to_string());
         let mut guard = self.entries.write().expect("ledger lock poisoned");
-        guard.remove(&key)
+        Ok(guard.remove(&key))
     }
 
     /// Transition the record for `(plugin, handle_id)` to
@@ -303,22 +448,34 @@ impl CustodyLedger {
     /// already-aborted record overwrites the reason and refreshes
     /// `last_updated`. The record is NOT removed; release happens
     /// separately when the warden relinquishes the handle.
-    pub fn mark_aborted(
+    pub async fn mark_aborted(
         &self,
         plugin: &str,
         handle_id: &str,
         reason: impl Into<String>,
-    ) -> bool {
-        let key = (plugin.to_string(), handle_id.to_string());
-        let now = SystemTime::now();
+    ) -> Result<bool, PersistenceError> {
         let reason = reason.into();
+        let now = SystemTime::now();
+        let now_ms = system_time_to_ms(now);
+        if let Some(store) = self.persistence.as_ref() {
+            store
+                .mark_custody_state(
+                    plugin,
+                    handle_id,
+                    "aborted",
+                    Some(&reason),
+                    now_ms,
+                )
+                .await?;
+        }
+        let key = (plugin.to_string(), handle_id.to_string());
         let mut guard = self.entries.write().expect("ledger lock poisoned");
         if let Some(rec) = guard.get_mut(&key) {
             rec.state = CustodyStateKind::Aborted { reason };
             rec.last_updated = now;
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -335,22 +492,34 @@ impl CustodyLedger {
     /// may continue to report state on the same handle if it chooses;
     /// consumers observe the degradation via the bus and via this
     /// field on the record.
-    pub fn mark_degraded(
+    pub async fn mark_degraded(
         &self,
         plugin: &str,
         handle_id: &str,
         reason: impl Into<String>,
-    ) -> bool {
-        let key = (plugin.to_string(), handle_id.to_string());
-        let now = SystemTime::now();
+    ) -> Result<bool, PersistenceError> {
         let reason = reason.into();
+        let now = SystemTime::now();
+        let now_ms = system_time_to_ms(now);
+        if let Some(store) = self.persistence.as_ref() {
+            store
+                .mark_custody_state(
+                    plugin,
+                    handle_id,
+                    "degraded",
+                    Some(&reason),
+                    now_ms,
+                )
+                .await?;
+        }
+        let key = (plugin.to_string(), handle_id.to_string());
         let mut guard = self.entries.write().expect("ledger lock poisoned");
         if let Some(rec) = guard.get_mut(&key) {
             rec.state = CustodyStateKind::Degraded { reason };
             rec.last_updated = now;
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -380,6 +549,93 @@ impl CustodyLedger {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+fn state_kind_to_str(kind: &CustodyStateKind) -> &'static str {
+    match kind {
+        CustodyStateKind::Active => "active",
+        CustodyStateKind::Degraded { .. } => "degraded",
+        CustodyStateKind::Aborted { .. } => "aborted",
+    }
+}
+
+fn state_kind_reason(kind: &CustodyStateKind) -> Option<String> {
+    match kind {
+        CustodyStateKind::Active => None,
+        CustodyStateKind::Degraded { reason }
+        | CustodyStateKind::Aborted { reason } => Some(reason.clone()),
+    }
+}
+
+fn health_to_str(health: HealthStatus) -> &'static str {
+    match health {
+        HealthStatus::Healthy => "healthy",
+        HealthStatus::Degraded => "degraded",
+        HealthStatus::Unhealthy => "unhealthy",
+    }
+}
+
+fn health_from_str(s: &str) -> Option<HealthStatus> {
+    Some(match s {
+        "healthy" => HealthStatus::Healthy,
+        "degraded" => HealthStatus::Degraded,
+        "unhealthy" => HealthStatus::Unhealthy,
+        _ => return None,
+    })
+}
+
+fn system_time_to_ms(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn ms_to_system_time(ms: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(ms)
+}
+
+/// Reconstruct an in-memory [`CustodyRecord`] from the persisted
+/// projection. Returns an error string if the row's discriminants
+/// (state_kind / health) are unknown to this build.
+fn custody_record_from_persisted(
+    custody: &PersistedCustody,
+    snapshot: Option<&PersistedCustodyState>,
+) -> Result<CustodyRecord, String> {
+    let state = match custody.state_kind.as_str() {
+        "active" => CustodyStateKind::Active,
+        "degraded" => CustodyStateKind::Degraded {
+            reason: custody.state_reason.clone().unwrap_or_default(),
+        },
+        "aborted" => CustodyStateKind::Aborted {
+            reason: custody.state_reason.clone().unwrap_or_default(),
+        },
+        other => {
+            return Err(format!("unknown custodies.state_kind {other:?}"))
+        }
+    };
+    let last_state = match snapshot {
+        Some(s) => {
+            let health = health_from_str(&s.health).ok_or_else(|| {
+                format!("unknown custody_state.health {:?}", s.health)
+            })?;
+            Some(StateSnapshot {
+                payload: s.payload.clone(),
+                health,
+                reported_at: ms_to_system_time(s.reported_at_ms),
+            })
+        }
+        None => None,
+    };
+    Ok(CustodyRecord {
+        plugin: custody.plugin.clone(),
+        handle_id: custody.handle_id.clone(),
+        shelf: custody.shelf.clone(),
+        custody_type: custody.custody_type.clone(),
+        last_state,
+        state,
+        started_at: ms_to_system_time(custody.started_at_ms),
+        last_updated: ms_to_system_time(custody.last_updated_at_ms),
+    })
 }
 
 /// Custody state reporter backed by a [`CustodyLedger`] and a
@@ -441,8 +697,17 @@ impl CustodyStateReporter for LedgerCustodyStateReporter {
         let handle_id = handle.id.clone();
         Box::pin(async move {
             // 1. Ledger first. UPSERTs the state snapshot into the
-            //    record keyed by (plugin, handle_id).
-            ledger.record_state(&plugin, &handle_id, payload, health);
+            //    record keyed by (plugin, handle_id) and writes
+            //    through to durable storage when persistence is
+            //    attached.
+            ledger
+                .record_state(&plugin, &handle_id, payload, health)
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "custody ledger state write failed: {e}"
+                    ))
+                })?;
             tracing::debug!(
                 plugin = %plugin,
                 custody = %handle_id,
@@ -477,23 +742,23 @@ mod tests {
         CustodyHandle::new(id)
     }
 
-    #[test]
-    fn new_ledger_is_empty() {
+    #[tokio::test]
+    async fn new_ledger_is_empty() {
         let ledger = CustodyLedger::new();
         assert_eq!(ledger.len(), 0);
         assert!(ledger.is_empty());
         assert!(ledger.list_active().is_empty());
     }
 
-    #[test]
-    fn record_custody_creates_entry() {
+    #[tokio::test]
+    async fn record_custody_creates_entry() {
         let ledger = CustodyLedger::new();
         ledger.record_custody(
             "org.test.warden",
             "example.custody",
             &handle("c-1"),
             "playback",
-        );
+        ).await.unwrap();
         assert_eq!(ledger.len(), 1);
 
         let rec = ledger.describe("org.test.warden", "c-1").unwrap();
@@ -505,15 +770,15 @@ mod tests {
         assert_eq!(rec.started_at, rec.last_updated);
     }
 
-    #[test]
-    fn record_custody_second_call_preserves_started_at() {
+    #[tokio::test]
+    async fn record_custody_second_call_preserves_started_at() {
         let ledger = CustodyLedger::new();
         ledger.record_custody(
             "org.test.warden",
             "example.custody",
             &handle("c-1"),
             "playback",
-        );
+        ).await.unwrap();
         let first = ledger.describe("org.test.warden", "c-1").unwrap();
 
         // Second call with different metadata. Simulates a shelf
@@ -525,7 +790,7 @@ mod tests {
             "example.replacement",
             &handle("c-1"),
             "ingest",
-        );
+        ).await.unwrap();
         let second = ledger.describe("org.test.warden", "c-1").unwrap();
 
         assert_eq!(first.started_at, second.started_at);
@@ -534,15 +799,15 @@ mod tests {
         assert_eq!(second.custody_type.as_deref(), Some("ingest"));
     }
 
-    #[test]
-    fn record_state_creates_partial_entry() {
+    #[tokio::test]
+    async fn record_state_creates_partial_entry() {
         let ledger = CustodyLedger::new();
         ledger.record_state(
             "org.test.warden",
             "c-1",
             b"state=playing".to_vec(),
             HealthStatus::Healthy,
-        );
+        ).await.unwrap();
         assert_eq!(ledger.len(), 1);
 
         let rec = ledger.describe("org.test.warden", "c-1").unwrap();
@@ -555,29 +820,29 @@ mod tests {
         assert_eq!(state.health, HealthStatus::Healthy);
     }
 
-    #[test]
-    fn record_state_replaces_previous_snapshot() {
+    #[tokio::test]
+    async fn record_state_replaces_previous_snapshot() {
         let ledger = CustodyLedger::new();
         ledger.record_state(
             "org.test.warden",
             "c-1",
             b"state=starting".to_vec(),
             HealthStatus::Degraded,
-        );
+        ).await.unwrap();
         ledger.record_state(
             "org.test.warden",
             "c-1",
             b"state=playing".to_vec(),
             HealthStatus::Healthy,
-        );
+        ).await.unwrap();
         let rec = ledger.describe("org.test.warden", "c-1").unwrap();
         let state = rec.last_state.expect("last_state");
         assert_eq!(state.payload, b"state=playing");
         assert_eq!(state.health, HealthStatus::Healthy);
     }
 
-    #[test]
-    fn record_state_then_record_custody_merges() {
+    #[tokio::test]
+    async fn record_state_then_record_custody_merges() {
         // Simulates the wire-warden race: state report arrives first,
         // then record_custody finalises the metadata.
         let ledger = CustodyLedger::new();
@@ -586,13 +851,13 @@ mod tests {
             "c-1",
             b"state=accepted".to_vec(),
             HealthStatus::Healthy,
-        );
+        ).await.unwrap();
         ledger.record_custody(
             "org.test.warden",
             "example.custody",
             &handle("c-1"),
             "playback",
-        );
+        ).await.unwrap();
         let rec = ledger.describe("org.test.warden", "c-1").unwrap();
         assert_eq!(rec.shelf.as_deref(), Some("example.custody"));
         assert_eq!(rec.custody_type.as_deref(), Some("playback"));
@@ -600,8 +865,8 @@ mod tests {
         assert_eq!(state.payload, b"state=accepted");
     }
 
-    #[test]
-    fn record_custody_then_record_state_merges() {
+    #[tokio::test]
+    async fn record_custody_then_record_state_merges() {
         // In-process warden path: record_custody first, then state.
         let ledger = CustodyLedger::new();
         ledger.record_custody(
@@ -609,13 +874,13 @@ mod tests {
             "example.custody",
             &handle("c-1"),
             "playback",
-        );
+        ).await.unwrap();
         ledger.record_state(
             "org.test.warden",
             "c-1",
             b"state=playing".to_vec(),
             HealthStatus::Healthy,
-        );
+        ).await.unwrap();
         let rec = ledger.describe("org.test.warden", "c-1").unwrap();
         assert_eq!(rec.shelf.as_deref(), Some("example.custody"));
         assert_eq!(rec.custody_type.as_deref(), Some("playback"));
@@ -623,25 +888,27 @@ mod tests {
         assert_eq!(state.payload, b"state=playing");
     }
 
-    #[test]
-    fn release_custody_removes_and_returns_record() {
+    #[tokio::test]
+    async fn release_custody_removes_and_returns_record() {
         let ledger = CustodyLedger::new();
         ledger.record_custody(
             "org.test.warden",
             "example.custody",
             &handle("c-1"),
             "playback",
-        );
+        ).await.unwrap();
         ledger.record_state(
             "org.test.warden",
             "c-1",
             b"final".to_vec(),
             HealthStatus::Healthy,
-        );
+        ).await.unwrap();
         assert_eq!(ledger.len(), 1);
 
         let removed = ledger
             .release_custody("org.test.warden", "c-1")
+            .await
+            .unwrap()
             .expect("should return removed record");
         assert_eq!(removed.handle_id, "c-1");
         assert_eq!(removed.shelf.as_deref(), Some("example.custody"));
@@ -651,16 +918,18 @@ mod tests {
         assert!(ledger.describe("org.test.warden", "c-1").is_none());
     }
 
-    #[test]
-    fn release_custody_returns_none_for_unknown_key() {
+    #[tokio::test]
+    async fn release_custody_returns_none_for_unknown_key() {
         let ledger = CustodyLedger::new();
         assert!(ledger
             .release_custody("org.test.warden", "never-existed")
+            .await
+            .unwrap()
             .is_none());
     }
 
-    #[test]
-    fn ledger_scopes_by_plugin() {
+    #[tokio::test]
+    async fn ledger_scopes_by_plugin() {
         // Two different wardens use the same internal handle id
         // scheme. The ledger must keep them separate.
         let ledger = CustodyLedger::new();
@@ -669,13 +938,13 @@ mod tests {
             "example.a",
             &handle("c-1"),
             "playback",
-        );
+        ).await.unwrap();
         ledger.record_custody(
             "org.test.beta",
             "example.b",
             &handle("c-1"),
             "ingest",
-        );
+        ).await.unwrap();
         assert_eq!(ledger.len(), 2);
 
         let alpha = ledger.describe("org.test.alpha", "c-1").unwrap();
@@ -686,27 +955,27 @@ mod tests {
         assert_eq!(beta.custody_type.as_deref(), Some("ingest"));
     }
 
-    #[test]
-    fn list_active_returns_every_record() {
+    #[tokio::test]
+    async fn list_active_returns_every_record() {
         let ledger = CustodyLedger::new();
         ledger.record_custody(
             "org.test.warden",
             "example.custody",
             &handle("c-1"),
             "playback",
-        );
+        ).await.unwrap();
         ledger.record_custody(
             "org.test.warden",
             "example.custody",
             &handle("c-2"),
             "playback",
-        );
+        ).await.unwrap();
         ledger.record_custody(
             "org.test.other",
             "example.other",
             &handle("c-3"),
             "ingest",
-        );
+        ).await.unwrap();
 
         let all = ledger.list_active();
         assert_eq!(all.len(), 3);
@@ -869,5 +1138,116 @@ mod tests {
         let state = rec.last_state.expect("state must be populated");
         assert_eq!(state.payload, b"state=x");
         assert_eq!(state.health, HealthStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn ledger_persists_through_to_store() {
+        // When constructed with persistence, every ledger mutation
+        // writes through to custodies / custody_state before
+        // mirroring in memory. Round-trip via load_all_custodies
+        // confirms the on-disk shape matches the in-memory record.
+        use crate::persistence::MemoryPersistenceStore;
+        let store: Arc<dyn PersistenceStore> =
+            Arc::new(MemoryPersistenceStore::new());
+        let ledger = CustodyLedger::with_persistence(Arc::clone(&store));
+        ledger
+            .record_custody(
+                "org.test.warden",
+                "example.custody",
+                &handle("c-1"),
+                "playback",
+            )
+            .await
+            .unwrap();
+        ledger
+            .record_state(
+                "org.test.warden",
+                "c-1",
+                b"state=playing".to_vec(),
+                HealthStatus::Healthy,
+            )
+            .await
+            .unwrap();
+
+        let rows = store.load_all_custodies().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let (custody, snap) = &rows[0];
+        assert_eq!(custody.plugin, "org.test.warden");
+        assert_eq!(custody.handle_id, "c-1");
+        assert_eq!(custody.shelf.as_deref(), Some("example.custody"));
+        assert_eq!(custody.custody_type.as_deref(), Some("playback"));
+        assert_eq!(custody.state_kind, "active");
+        let snap = snap.as_ref().unwrap();
+        assert_eq!(snap.payload, b"state=playing");
+        assert_eq!(snap.health, "healthy");
+
+        // mark_aborted writes through.
+        let hit = ledger
+            .mark_aborted("org.test.warden", "c-1", "transport failed")
+            .await
+            .unwrap();
+        assert!(hit);
+        let rows = store.load_all_custodies().await.unwrap();
+        assert_eq!(rows[0].0.state_kind, "aborted");
+        assert_eq!(rows[0].0.state_reason.as_deref(), Some("transport failed"));
+
+        // release_custody removes both rows.
+        ledger
+            .release_custody("org.test.warden", "c-1")
+            .await
+            .unwrap();
+        let rows = store.load_all_custodies().await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rehydrate_replays_persisted_custodies() {
+        // Boot path: a fresh ledger seeded from a populated store
+        // presents the same active-custody set, including the
+        // last_state snapshot. Pins the rehydrate round-trip.
+        use crate::persistence::MemoryPersistenceStore;
+        let store: Arc<dyn PersistenceStore> =
+            Arc::new(MemoryPersistenceStore::new());
+        let writer = CustodyLedger::with_persistence(Arc::clone(&store));
+        writer
+            .record_custody(
+                "org.test.warden",
+                "example.custody",
+                &handle("c-1"),
+                "playback",
+            )
+            .await
+            .unwrap();
+        writer
+            .record_state(
+                "org.test.warden",
+                "c-1",
+                b"state=playing".to_vec(),
+                HealthStatus::Healthy,
+            )
+            .await
+            .unwrap();
+        writer
+            .mark_degraded("org.test.warden", "c-1", "cache cold")
+            .await
+            .unwrap();
+
+        let reader = CustodyLedger::with_persistence(Arc::clone(&store));
+        assert_eq!(reader.len(), 0);
+        reader.rehydrate_from(store.as_ref()).await.unwrap();
+        let rec = reader
+            .describe("org.test.warden", "c-1")
+            .expect("rehydrated record");
+        assert_eq!(rec.shelf.as_deref(), Some("example.custody"));
+        assert_eq!(rec.custody_type.as_deref(), Some("playback"));
+        match &rec.state {
+            CustodyStateKind::Degraded { reason } => {
+                assert_eq!(reason, "cache cold");
+            }
+            other => panic!("unexpected state {other:?}"),
+        }
+        let snap = rec.last_state.as_ref().expect("snapshot");
+        assert_eq!(snap.payload, b"state=playing");
+        assert_eq!(snap.health, HealthStatus::Healthy);
     }
 }

@@ -15,7 +15,7 @@
 //!
 //! Every dispatch method on this type:
 //!
-//! 1. Acquires a read lock on [`RouterInner`] (synchronous
+//! 1. Acquires a read lock on the inner table (synchronous
 //!    `RwLock`; held only across the table lookup, never across an
 //!    await point).
 //! 2. Looks up the plugin by fully-qualified shelf name.
@@ -55,7 +55,7 @@
 //!
 //! 3. **Cloning `Arc<PluginEntry>` out of the read guard is the
 //!    discipline; the `Arc` lives independent of the router's
-//!    lifetime.** Dispatch obtains its `Arc` via [`Self::lookup`] (or
+//!    lifetime.** Dispatch obtains its `Arc` via [`PluginRouter::lookup`] (or
 //!    a public helper that calls it), drops the read guard inside
 //!    that call, and proceeds with the cloned `Arc`. The cloned `Arc`
 //!    keeps the entry alive even if the router is concurrently
@@ -310,7 +310,7 @@ impl std::fmt::Debug for PluginRouter {
 
 impl PluginRouter {
     /// Construct an empty router over the supplied
-    /// [`StewardState`](StewardState) handle bag. Tests and the
+    /// [`StewardState`] handle bag. Tests and the
     /// engine call this; production wiring is via
     /// [`AdmissionEngine::new`](crate::admission::AdmissionEngine::new),
     /// which constructs a router internally and exposes it through an
@@ -323,7 +323,7 @@ impl PluginRouter {
         }
     }
 
-    /// Borrow the shared [`StewardState`](StewardState) handle this
+    /// Borrow the shared [`StewardState`] handle this
     /// router was constructed over.
     pub fn state(&self) -> &Arc<StewardState> {
         &self.state
@@ -453,6 +453,37 @@ impl PluginRouter {
             .collect()
     }
 
+    /// Look up the entry by canonical plugin name. Returns
+    /// `None` if no plugin with that name is admitted.
+    /// O(n) over admitted plugins; the routing table is keyed
+    /// by shelf, not by plugin name, so a name-based lookup
+    /// walks the admission_order. Used by the hot-reload path
+    /// where the operator names the plugin rather than the
+    /// shelf.
+    pub fn lookup_by_name(&self, name: &str) -> Option<Arc<PluginEntry>> {
+        let inner = self.inner.read().expect("router inner poisoned");
+        inner
+            .by_shelf
+            .values()
+            .find(|e| e.name == name)
+            .map(Arc::clone)
+    }
+
+    /// Remove the entry on the given shelf and return it, or
+    /// `None` if no plugin is admitted there. Used by the
+    /// hot-reload path to evict a single plugin without
+    /// draining the rest of the routing table.
+    ///
+    /// The caller is responsible for unloading the returned
+    /// entry's handle and reaping its child process; this method
+    /// only updates the routing table.
+    pub fn remove(&self, shelf: &str) -> Option<Arc<PluginEntry>> {
+        let mut inner = self.inner.write().expect("router inner poisoned");
+        let entry = inner.by_shelf.remove(shelf)?;
+        inner.admission_order.retain(|s| s != shelf);
+        Some(entry)
+    }
+
     /// Drain the routing table, returning every admitted plugin
     /// entry in **reverse** admission order (LIFO). Used by
     /// [`AdmissionEngine::shutdown`](crate::admission::AdmissionEngine::shutdown)
@@ -484,7 +515,7 @@ impl PluginRouter {
             StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
         })?;
 
-        // Enforce manifest-declared `request_types` (Wave 6.b).
+        // Enforce manifest-declared `request_types`.
         // A respondent with a declared list refuses every request
         // whose `request_type` is not in the list. Wardens have no
         // list (the field is respondent-specific); their handler
@@ -593,12 +624,19 @@ impl PluginRouter {
                 .map_err(StewardError::from)?
         };
 
-        ledger.record_custody(
-            &plugin_name,
-            &shelf_qualified,
-            &handle,
-            &custody_type_for_ledger,
-        );
+        ledger
+            .record_custody(
+                &plugin_name,
+                &shelf_qualified,
+                &handle,
+                &custody_type_for_ledger,
+            )
+            .await
+            .map_err(|e| {
+                StewardError::Dispatch(format!(
+                    "custody ledger write failed: {e}"
+                ))
+            })?;
 
         bus.emit_durable(Happening::CustodyTaken {
             plugin: plugin_name,
@@ -629,9 +667,10 @@ impl PluginRouter {
     /// `policy.custody_failure_mode` to:
     ///
     /// - mark the matching custody record on the shared ledger:
-    ///   [`CustodyLedger::mark_aborted`] for `Abort` (and the
-    ///   `None` default, treated as Abort), and
-    ///   [`CustodyLedger::mark_degraded`] for `PartialOk`;
+    ///   [`CustodyLedger::mark_aborted`](crate::custody::CustodyLedger::mark_aborted)
+    ///   for `Abort` (and the `None` default, treated as Abort), and
+    ///   [`CustodyLedger::mark_degraded`](crate::custody::CustodyLedger::mark_degraded)
+    ///   for `PartialOk`;
     /// - emit a matching durable happening
     ///   ([`Happening::CustodyAborted`] or
     ///   [`Happening::CustodyDegraded`]) so consumers reading the
@@ -733,11 +772,18 @@ impl PluginRouter {
             use evo_plugin_sdk::manifest::CustodyFailureMode;
             let happening = match failure_mode {
                 Some(CustodyFailureMode::PartialOk) => {
-                    ledger.mark_degraded(
-                        &plugin_name,
-                        &handle.id,
-                        reason.clone(),
-                    );
+                    ledger
+                        .mark_degraded(
+                            &plugin_name,
+                            &handle.id,
+                            reason.clone(),
+                        )
+                        .await
+                        .map_err(|e| {
+                            StewardError::Dispatch(format!(
+                                "custody ledger mark_degraded failed: {e}"
+                            ))
+                        })?;
                     Happening::CustodyDegraded {
                         plugin: plugin_name.clone(),
                         handle_id: handle.id.clone(),
@@ -747,11 +793,18 @@ impl PluginRouter {
                     }
                 }
                 Some(CustodyFailureMode::Abort) | None => {
-                    ledger.mark_aborted(
-                        &plugin_name,
-                        &handle.id,
-                        reason.clone(),
-                    );
+                    ledger
+                        .mark_aborted(
+                            &plugin_name,
+                            &handle.id,
+                            reason.clone(),
+                        )
+                        .await
+                        .map_err(|e| {
+                            StewardError::Dispatch(format!(
+                                "custody ledger mark_aborted failed: {e}"
+                            ))
+                        })?;
                     Happening::CustodyAborted {
                         plugin: plugin_name.clone(),
                         handle_id: handle.id.clone(),
@@ -818,7 +871,14 @@ impl PluginRouter {
                 .map_err(StewardError::from)?;
         }
 
-        ledger.release_custody(&plugin_name, &handle_id);
+        ledger
+            .release_custody(&plugin_name, &handle_id)
+            .await
+            .map_err(|e| {
+                StewardError::Dispatch(format!(
+                    "custody ledger release write failed: {e}"
+                ))
+            })?;
 
         bus.emit_durable(Happening::CustodyReleased {
             plugin: plugin_name,
@@ -1152,6 +1212,8 @@ mod tests {
             payload: b"hi".to_vec(),
             correlation_id: 1,
             deadline: None,
+
+            instance_id: None,
         };
         let resp = r.handle_request("test.ping", req).await.unwrap();
         assert_eq!(resp.payload, b"hi");
@@ -1174,6 +1236,8 @@ mod tests {
             payload: vec![],
             correlation_id: 1,
             deadline: None,
+
+            instance_id: None,
         };
         let res = r.handle_request("test.ping", req).await;
         match res {
@@ -1205,6 +1269,8 @@ mod tests {
             payload: b"hi".to_vec(),
             correlation_id: 1,
             deadline: None,
+
+            instance_id: None,
         };
         let resp = r.handle_request("test.ping", req).await.unwrap();
         assert_eq!(resp.payload, b"hi");
@@ -1307,6 +1373,8 @@ mod tests {
                 payload: vec![],
                 correlation_id: 1,
                 deadline: None,
+
+                instance_id: None,
             },
         )
         .await
@@ -1346,6 +1414,8 @@ mod tests {
             payload: b"x".to_vec(),
             correlation_id: 1,
             deadline: Some(explicit),
+
+            instance_id: None,
         };
         // EchoRespondent doesn't observe deadlines but still serves
         // OK — this test asserts the dispatch succeeds without
@@ -1362,6 +1432,8 @@ mod tests {
             payload: vec![],
             correlation_id: 1,
             deadline: None,
+
+            instance_id: None,
         };
         let res = r.handle_request("missing", req).await;
         assert!(matches!(res, Err(StewardError::Dispatch(_))));
@@ -1376,6 +1448,8 @@ mod tests {
             payload: vec![],
             correlation_id: 1,
             deadline: None,
+
+            instance_id: None,
         };
         let res = r.handle_request("test.custody", req).await;
         assert!(matches!(res, Err(StewardError::Dispatch(_))));

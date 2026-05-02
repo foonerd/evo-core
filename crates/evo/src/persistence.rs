@@ -1,9 +1,8 @@
-//! Durable storage for the steward's subject-identity surface.
+//! Durable storage for the steward's persistent fabric.
 //!
-//! This module is the foundation laid in Phase 1: a single trait
-//! ([`PersistenceStore`]) describing the schema-aware writes the
-//! steward performs against its persistent fabric, plus two
-//! implementations:
+//! A single trait ([`PersistenceStore`]) describes the schema-aware
+//! writes the steward performs against its persistent state, plus
+//! two implementations:
 //!
 //! - [`SqlitePersistenceStore`]: the production backend, an SQLite
 //!   database accessed through `rusqlite` with the connection pooled
@@ -21,14 +20,16 @@
 //! atomicity contract from the durability discussion in
 //! `docs/engineering/PERSISTENCE.md` section 4.3.
 //!
-//! Phase 1 covers the subject-identity slice of the schema: the
-//! `subjects`, `subject_addressings`, `aliases`, and `claim_log`
-//! tables. Subsequent phases extend the schema with the relation
-//! graph, the custody ledger, and the admin ledger; the migration
-//! version slots are reserved (the initial migration is `v1` and
-//! later migrations append rather than renumber). See the schema
-//! discussion in `docs/engineering/PERSISTENCE.md` section 7 for the
-//! full contract.
+//! The schema covers subject identity (`subjects`,
+//! `subject_addressings`, `aliases`, `claim_log`), the durable
+//! happenings cursor (`happenings_log`), the steward instance
+//! identity (`meta`), the custody ledger (`custodies`,
+//! `custody_state`), the relation graph (`relations`,
+//! `relation_claimants`), and the admin ledger (`admin_log`).
+//! Migrations append rather than renumber; the initial migration
+//! is `v1`. See the schema discussion in
+//! `docs/engineering/PERSISTENCE.md` section 7 for the full
+//! contract.
 //!
 //! ## Async wrapper choice
 //!
@@ -37,7 +38,7 @@
 //! each call to a dedicated blocking thread per pool connection via
 //! `tokio::task::spawn_blocking`. The pool size is configurable; the
 //! default suits the steward's modest write rate while leaving room
-//! for parallel reads once Phase 3 wires the subject-replay path.
+//! for parallel reads alongside the boot-time replay path.
 //! The boundary is documented in `docs/engineering/PERSISTENCE.md`
 //! section 10.4.
 
@@ -106,6 +107,42 @@ pub const SCHEMA_VERSION_PENDING_CONFLICTS: u32 = 4;
 /// change; pure perf polish.
 pub const SCHEMA_VERSION_SUBJECTS_LIVE_BY_CREATION: u32 = 5;
 
+/// Schema version: admin audit log durability.
+///
+/// Adds the `admin_log` table mirroring the in-memory
+/// [`AdminLedger`](crate::admin::AdminLedger) — one row per admin
+/// action with `kind`, `admin_plugin`, `target_claimant`, JSON
+/// `payload` carrying variant-specific fields, `asserted_at_ms`,
+/// `reason`, and a reserved `reverses_admin_id` for future
+/// reversibility primitives.
+pub const SCHEMA_VERSION_ADMIN_LOG: u32 = 6;
+
+/// Schema version: custody ledger durability.
+///
+/// Adds the `custodies` and `custody_state` tables mirroring the
+/// in-memory [`CustodyLedger`](crate::custody::CustodyLedger).
+/// `custodies` carries one row per active custody keyed by
+/// `(plugin, handle_id)` with shelf, custody type, lifecycle state
+/// (active / degraded / aborted with optional reason), and
+/// timestamps. `custody_state` carries the most recent state
+/// snapshot per custody, FK-cascade-deleted when its parent
+/// custody is released.
+pub const SCHEMA_VERSION_CUSTODY_LEDGER: u32 = 7;
+
+/// Schema version: relation graph durability.
+///
+/// Adds the `relations` and `relation_claimants` tables mirroring
+/// the in-memory [`RelationGraph`](crate::relations::RelationGraph).
+/// `relations` carries one row per `(source_id, predicate,
+/// target_id)` triple with timestamps and the per-relation
+/// suppression marker (admin plugin, suppressed_at, reason).
+/// `relation_claimants` carries multi-claimant provenance (claimant,
+/// asserted_at, reason), FK-cascade-deleted with the parent
+/// relation. Both source/target reference `subjects(id)` with
+/// ON DELETE CASCADE so a subject forget cascades to relations at
+/// the durable layer.
+pub const SCHEMA_VERSION_RELATION_GRAPH: u32 = 8;
+
 /// Maximum schema version this build of the steward understands.
 ///
 /// On open, [`SqlitePersistenceStore`] refuses to operate on a
@@ -113,8 +150,7 @@ pub const SCHEMA_VERSION_SUBJECTS_LIVE_BY_CREATION: u32 = 5;
 /// than this constant. Downgrades are not supported; an operator
 /// running an older steward against a newer database must restore
 /// from a pre-upgrade backup.
-pub const SUPPORTED_SCHEMA_VERSION: u32 =
-    SCHEMA_VERSION_SUBJECTS_LIVE_BY_CREATION;
+pub const SUPPORTED_SCHEMA_VERSION: u32 = SCHEMA_VERSION_RELATION_GRAPH;
 
 /// Logical keys used in the `meta` table. Constants are kept in one
 /// place so a misspelling produces a compile error rather than a
@@ -146,6 +182,18 @@ const MIGRATION_004_PENDING_CONFLICTS: &str =
 /// SQL text of the v5 migration: ordered live-subject covering index.
 const MIGRATION_005_SUBJECTS_LIVE_BY_CREATION: &str =
     include_str!("../migrations/005_subjects_live_by_creation.sql");
+
+/// SQL text of the v6 migration: admin audit log durability.
+const MIGRATION_006_ADMIN_LOG: &str =
+    include_str!("../migrations/006_admin_log.sql");
+
+/// SQL text of the v7 migration: custody ledger durability.
+const MIGRATION_007_CUSTODY_LEDGER: &str =
+    include_str!("../migrations/007_custody_ledger.sql");
+
+/// SQL text of the v8 migration: relation graph durability.
+const MIGRATION_008_RELATION_GRAPH: &str =
+    include_str!("../migrations/008_relation_graph.sql");
 
 /// Errors raised by the persistence layer.
 ///
@@ -248,9 +296,9 @@ impl PersistenceError {
 
 /// One subject's persisted identity-slice projection.
 ///
-/// Returned by [`PersistenceStore::load_all_subjects`] for the boot
-/// replay path Phase 3 will wire. Field names mirror the schema's
-/// columns so a reader can correlate a row with the table without
+/// Returned by [`PersistenceStore::load_all_subjects`] for the
+/// boot-time replay path. Field names mirror the schema's columns
+/// so a reader can correlate a row with the table without
 /// translation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedSubject {
@@ -380,6 +428,180 @@ pub struct PendingConflict {
     /// Resolution discriminator (`"merged"`, `"split"`, `"forgotten"`,
     /// `"manual"`); `None` while the conflict is still unresolved.
     pub resolution_kind: Option<String>,
+}
+
+/// One row of the `admin_log` table.
+///
+/// Mirrors a single in-memory
+/// [`AdminLogEntry`](crate::admin::AdminLogEntry) flattened to the
+/// table's column shape. Variant-specific fields the entry carries
+/// (target subject, addressing, relation, additional subjects,
+/// prior reason) are folded into the JSON `payload`; the columns
+/// that have first-class indexes (`kind`, `admin_plugin`,
+/// `target_claimant`, `asserted_at_ms`) are split out so a future
+/// reader can query without parsing every payload.
+///
+/// The shape is a faithful round-trip of the on-disk row: writers
+/// build one to write, readers receive one to rehydrate the
+/// in-memory ledger on boot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedAdminEntry {
+    /// Auto-incrementing primary key. Stable within one database;
+    /// not portable across backups.
+    pub admin_id: i64,
+    /// Snake_case form of the
+    /// [`AdminLogKind`](crate::admin::AdminLogKind) variant.
+    pub kind: String,
+    /// Canonical name of the admin plugin that performed the
+    /// action.
+    pub admin_plugin: String,
+    /// Canonical name of the plugin whose claim was modified.
+    /// `None` for variants that do not target a specific plugin
+    /// (merge, split, suppress, unsuppress).
+    pub target_claimant: Option<String>,
+    /// JSON document carrying every variant-specific field the
+    /// entry supplied: `target_subject`, `target_addressing`
+    /// (object with `scheme`/`value`), `target_relation` (object
+    /// with `source_id`/`predicate`/`target_id`),
+    /// `additional_subjects` (array of canonical IDs),
+    /// `prior_reason`. Absent fields are omitted from the JSON.
+    pub payload: serde_json::Value,
+    /// Wall-clock millisecond timestamp the action was recorded
+    /// (the `at` field on the in-memory entry).
+    pub asserted_at_ms: u64,
+    /// Free-form operator-supplied reason. `None` if the primitive
+    /// did not carry one or the variant does not surface a reason
+    /// (unsuppress).
+    pub reason: Option<String>,
+    /// Reserved for future un-merge / un-split / unsuppress
+    /// reversibility primitives. Always `None` today; the column
+    /// is present so a future writer can populate it without
+    /// schema migration.
+    pub reverses_admin_id: Option<i64>,
+}
+
+/// One row of the `relations` table.
+///
+/// Mirrors the non-claimant fields of an in-memory
+/// [`RelationRecord`](crate::relations::RelationRecord). The
+/// claimant set lives in [`PersistedRelationClaim`] rows;
+/// readers join the two via `(source_id, predicate, target_id)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedRelation {
+    /// Source subject canonical ID.
+    pub source_id: String,
+    /// Predicate name.
+    pub predicate: String,
+    /// Target subject canonical ID.
+    pub target_id: String,
+    /// Wall-clock millisecond timestamp of first claim.
+    pub created_at_ms: u64,
+    /// Wall-clock millisecond timestamp of the most recent claim
+    /// or retraction or suppression transition.
+    pub modified_at_ms: u64,
+    /// Canonical name of the admin plugin that suppressed this
+    /// relation, or `None` while visible.
+    pub suppressed_admin_plugin: Option<String>,
+    /// Wall-clock millisecond timestamp of the suppression. Paired
+    /// with [`Self::suppressed_admin_plugin`].
+    pub suppressed_at_ms: Option<u64>,
+    /// Operator-supplied reason for the suppression, if any.
+    pub suppression_reason: Option<String>,
+}
+
+/// One row of the `relation_claimants` table.
+///
+/// Mirrors one element of an in-memory
+/// [`RelationClaim`](crate::relations::RelationClaim) bound to its
+/// parent relation triple.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedRelationClaim {
+    /// Source subject canonical ID of the parent relation.
+    pub source_id: String,
+    /// Predicate name of the parent relation.
+    pub predicate: String,
+    /// Target subject canonical ID of the parent relation.
+    pub target_id: String,
+    /// Plugin that asserted the claim.
+    pub claimant: String,
+    /// Wall-clock millisecond timestamp the claim was recorded.
+    pub asserted_at_ms: u64,
+    /// Operator-supplied reason for the claim, if any.
+    pub reason: Option<String>,
+}
+
+/// One element returned by [`PersistenceStore::load_all_relations`]:
+/// a relation row paired with its full claimant list.
+///
+/// Defined as a type alias to keep the trait signature readable.
+pub type RelationLoadRow = (PersistedRelation, Vec<PersistedRelationClaim>);
+
+/// One row of the `custodies` table.
+///
+/// Mirrors the non-state-snapshot fields of an in-memory
+/// [`CustodyRecord`](crate::custody::CustodyRecord). The most
+/// recent state snapshot (payload, health, reported_at) lives in
+/// the `custody_state` child row and is carried by
+/// [`PersistedCustodyState`]; readers join the two via
+/// `(plugin, handle_id)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedCustody {
+    /// Canonical name of the warden plugin holding the custody.
+    pub plugin: String,
+    /// Warden-chosen handle id; opaque to the steward.
+    pub handle_id: String,
+    /// Fully-qualified shelf the warden occupies. `None` if the
+    /// ledger has only seen a state report and not the
+    /// `record_custody` call yet (the lazy-UPSERT race).
+    pub shelf: Option<String>,
+    /// Custody type the assignment was tagged with. `None` for
+    /// the same lazy-UPSERT race as `shelf`.
+    pub custody_type: Option<String>,
+    /// Lifecycle state discriminator: `"active"`, `"degraded"`,
+    /// or `"aborted"`. Stable on disk; renames require a
+    /// migration.
+    pub state_kind: String,
+    /// Steward-recorded reason for the non-active states. `None`
+    /// when `state_kind == "active"`; `Some(...)` for
+    /// `"degraded"` and `"aborted"`.
+    pub state_reason: Option<String>,
+    /// Wall-clock millisecond timestamp of first creation. Stable
+    /// across the lifetime of the record.
+    pub started_at_ms: u64,
+    /// Wall-clock millisecond timestamp of the most recent merge
+    /// or transition. Updated on every write.
+    pub last_updated_at_ms: u64,
+}
+
+/// One element returned by [`PersistenceStore::load_all_custodies`]:
+/// a custody row paired with its optional state snapshot.
+///
+/// Defined as a type alias to keep the trait signature readable
+/// and to give callers a single name for the pair shape.
+pub type CustodyLoadRow = (PersistedCustody, Option<PersistedCustodyState>);
+
+/// One row of the `custody_state` table.
+///
+/// Mirrors the in-memory `last_state` snapshot on a
+/// [`CustodyRecord`](crate::custody::CustodyRecord). At most one
+/// row exists per `(plugin, handle_id)` — subsequent state reports
+/// overwrite the previous row, matching the in-memory "no state
+/// history" invariant. The row is FK-cascade-deleted when its
+/// parent custody is released.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedCustodyState {
+    /// Canonical name of the warden plugin holding the custody.
+    pub plugin: String,
+    /// Warden-chosen handle id; opaque to the steward.
+    pub handle_id: String,
+    /// Opaque payload bytes from the warden's state report.
+    pub payload: Vec<u8>,
+    /// Health discriminator: `"healthy"`, `"degraded"`, or
+    /// `"unhealthy"`. Stable on disk.
+    pub health: String,
+    /// Wall-clock millisecond timestamp the steward recorded the
+    /// report.
+    pub reported_at_ms: u64,
 }
 
 /// One provenance entry to write into `claim_log` alongside the
@@ -532,8 +754,8 @@ pub struct SplitRecord<'a> {
 /// operation affects (`subjects`, `subject_addressings`,
 /// `aliases`, `claim_log`) atomically: either the whole logical
 /// change is durable, or none of it is. Callers that need
-/// multi-operation atomicity sit above this trait and compose
-/// (Phase 2 wires the subject registry write path through it).
+/// multi-operation atomicity sit above this trait and compose; the
+/// subject registry write path is the canonical caller.
 ///
 /// Methods return boxed futures rather than `async fn` because
 /// the trait is held as `Arc<dyn PersistenceStore>` across the
@@ -653,8 +875,8 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
 
     /// Load every persisted subject (with its addressings) for the
-    /// boot-time replay path. Used by Phase 3 to rehydrate the
-    /// subject registry from durable state.
+    /// boot-time replay path. Rehydrates the subject registry from
+    /// durable state.
     fn load_all_subjects<'a>(
         &'a self,
     ) -> Pin<
@@ -834,6 +1056,217 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
         >,
     >;
 
+    /// Append one row to the `admin_log` table.
+    ///
+    /// Called from the in-memory
+    /// [`AdminLedger::record`](crate::admin::AdminLedger::record)
+    /// path after the storage primitive succeeded and the admin
+    /// happening was emitted. The persistence write completes
+    /// before the in-memory append so a crash between the two
+    /// loses an in-memory record we can rehydrate, never a
+    /// persistent record without an in-memory peer.
+    ///
+    /// `entry.admin_id` is ignored on insert; the database mints
+    /// the auto-incrementing primary key. The returned future
+    /// resolves once the row is committed.
+    fn record_admin_entry<'a>(
+        &'a self,
+        entry: &'a PersistedAdminEntry,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Return every row of the `admin_log` table in ascending
+    /// `admin_id` order (i.e. insertion order).
+    ///
+    /// Called once at boot to rehydrate the in-memory
+    /// [`AdminLedger`](crate::admin::AdminLedger) so a restarting
+    /// steward presents the same audit trail it had before the
+    /// restart. The full-table scan is acceptable: the admin_log
+    /// is bounded by the rate of operator-driven admin actions
+    /// (merges / splits / forced retracts / suppressions), which
+    /// is many orders of magnitude lower than the happenings
+    /// stream.
+    fn load_all_admin_entries<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Vec<PersistedAdminEntry>, PersistenceError>,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+    /// Record one relation assert: upsert the parent `relations`
+    /// row with the supplied timestamps and INSERT OR IGNORE the
+    /// claimant row.
+    ///
+    /// `created_at_ms` is honoured only on first insert; the
+    /// ON CONFLICT clause preserves the existing creation
+    /// timestamp on subsequent calls. `modified_at_ms` always
+    /// overwrites. The relation's suppression columns are not
+    /// touched by an assert; they have their own
+    /// suppress / unsuppress methods.
+    ///
+    /// Reasserting a claim by the same `(claimant)` is a silent
+    /// no-op at the table level (INSERT OR IGNORE) — the
+    /// in-memory layer already returns `NoChange` in that case
+    /// and skips the persistence write, so this is a defence in
+    /// depth, not the primary control.
+    fn record_relation_assert<'a>(
+        &'a self,
+        relation: &'a PersistedRelation,
+        claim: &'a PersistedRelationClaim,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Remove one claim from a relation. If the supplied claimant
+    /// is the last claim and `relation_forgotten` is `true`, the
+    /// parent `relations` row is removed too (cascading any
+    /// remaining claimant rows). Otherwise only the claimant row
+    /// is removed and `modified_at_ms` is bumped on the parent.
+    ///
+    /// Returns `Ok(true)` if at least one claimant row was
+    /// removed, `Ok(false)` if no row matched the supplied key
+    /// (idempotent).
+    fn record_relation_retract<'a>(
+        &'a self,
+        source_id: &'a str,
+        predicate: &'a str,
+        target_id: &'a str,
+        claimant: &'a str,
+        modified_at_ms: u64,
+        relation_forgotten: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>;
+
+    /// Remove the relation identified by the triple from
+    /// `relations`. The FK CASCADE on `relation_claimants`
+    /// removes provenance atomically. Returns `Ok(true)` if a row
+    /// was removed.
+    ///
+    /// Used by the admin forced-retract path (when the retract
+    /// removes the last claim) and by the subject-forget cascade
+    /// (`forget_all_touching`) for relations that did not already
+    /// disappear via the subjects-FK cascade.
+    fn record_relation_forget<'a>(
+        &'a self,
+        source_id: &'a str,
+        predicate: &'a str,
+        target_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>;
+
+    /// Set or update the `suppressed_admin_plugin`,
+    /// `suppressed_at_ms`, and `suppression_reason` columns on the
+    /// relation row identified by the triple. Used by the admin
+    /// suppress path.
+    ///
+    /// Returns `Ok(true)` if the row exists and was updated.
+    #[allow(clippy::too_many_arguments)]
+    fn record_relation_suppress<'a>(
+        &'a self,
+        source_id: &'a str,
+        predicate: &'a str,
+        target_id: &'a str,
+        admin_plugin: &'a str,
+        suppressed_at_ms: u64,
+        reason: Option<&'a str>,
+        modified_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>;
+
+    /// Clear the suppression columns on the relation row
+    /// identified by the triple. Used by the admin unsuppress
+    /// path.
+    ///
+    /// Returns `Ok(true)` if the row exists and was updated.
+    fn record_relation_unsuppress<'a>(
+        &'a self,
+        source_id: &'a str,
+        predicate: &'a str,
+        target_id: &'a str,
+        modified_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>;
+
+    /// Return every row of the `relations` table joined with its
+    /// `relation_claimants` rows, in deterministic
+    /// `(source_id, predicate, target_id)` ascending order.
+    /// Each element pairs a relation with its full claimant list
+    /// (also sorted ascending by `claimant` for determinism).
+    /// Used at boot to rehydrate the in-memory graph.
+    fn load_all_relations<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<RelationLoadRow>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// UPSERT a row into the `custodies` table.
+    ///
+    /// Mirrors the lazy-UPSERT semantics of the in-memory
+    /// [`CustodyLedger::record_custody`](crate::custody::CustodyLedger::record_custody)
+    /// and [`CustodyLedger::record_state`](crate::custody::CustodyLedger::record_state)
+    /// paths: the row is keyed by `(plugin, handle_id)`. If absent,
+    /// it is inserted with the supplied fields; if present, every
+    /// non-null supplied field overwrites and `last_updated_at_ms`
+    /// bumps. The `started_at_ms` column is preserved on update.
+    fn upsert_custody<'a>(
+        &'a self,
+        record: &'a PersistedCustody,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// UPSERT a row into the `custody_state` table.
+    ///
+    /// One row per custody at most; subsequent reports overwrite
+    /// the previous payload, health, and timestamp. The parent
+    /// custody must already exist in `custodies`; a violated
+    /// foreign key surfaces as
+    /// [`PersistenceError::Sqlite`].
+    fn upsert_custody_state<'a>(
+        &'a self,
+        snapshot: &'a PersistedCustodyState,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Update the `state_kind` and `state_reason` columns of an
+    /// existing custody row without touching its other fields.
+    ///
+    /// Used by the router on a custody-operation failure: the
+    /// matching record transitions to `degraded` or `aborted` and
+    /// `last_updated_at_ms` bumps. Returns `Ok(false)` if no row
+    /// exists for the supplied key (mirrors the in-memory
+    /// `mark_*` methods, which are no-ops on missing keys).
+    fn mark_custody_state<'a>(
+        &'a self,
+        plugin: &'a str,
+        handle_id: &'a str,
+        state_kind: &'a str,
+        state_reason: Option<&'a str>,
+        last_updated_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>;
+
+    /// Delete the row identified by `(plugin, handle_id)` from
+    /// `custodies`; the FK CASCADE deletes the matching
+    /// `custody_state` row. Returns `Ok(true)` if a row was
+    /// removed, `Ok(false)` if no row existed.
+    fn delete_custody<'a>(
+        &'a self,
+        plugin: &'a str,
+        handle_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>;
+
+    /// Return every row of the `custodies` table joined with its
+    /// `custody_state` row (where present), in ascending
+    /// `(plugin, handle_id)` order. Used at boot to rehydrate
+    /// the in-memory ledger.
+    fn load_all_custodies<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<CustodyLoadRow>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
     /// Group every persisted subject by its declared `subject_type`
     /// and return `(subject_type, count)` pairs in `subject_type`
     /// ascending order.
@@ -878,6 +1311,20 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
 /// diff a sorted slice against the catalogue's declared set
 /// without re-sorting.
 pub type SubjectTypeCount = (String, u64);
+
+/// Wall-clock milliseconds since the UNIX epoch, computed from
+/// `SystemTime::now()`. Returns 0 if the system clock predates the
+/// epoch (which the steward never produces in practice; the
+/// fallback exists so the function is total).
+///
+/// Convenience for wiring-layer call sites that need to stamp a
+/// persistence-record `at_ms` field at the moment of writing.
+pub fn system_time_to_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Claim-log kind values used by this slice. Strings are stable
 /// on disk and must not be renamed without a migration.
@@ -993,20 +1440,47 @@ fn run_migrations(conn: &mut Connection) -> Result<(), PersistenceError> {
             })?;
     }
 
+    if current < SCHEMA_VERSION_ADMIN_LOG {
+        conn.execute_batch(MIGRATION_006_ADMIN_LOG).map_err(|e| {
+            PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_ADMIN_LOG,
+                source: e,
+            }
+        })?;
+    }
+
+    if current < SCHEMA_VERSION_CUSTODY_LEDGER {
+        conn.execute_batch(MIGRATION_007_CUSTODY_LEDGER).map_err(
+            |e| PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_CUSTODY_LEDGER,
+                source: e,
+            },
+        )?;
+    }
+
+    if current < SCHEMA_VERSION_RELATION_GRAPH {
+        conn.execute_batch(MIGRATION_008_RELATION_GRAPH).map_err(
+            |e| PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_RELATION_GRAPH,
+                source: e,
+            },
+        )?;
+    }
+
     Ok(())
 }
 
 /// SQLite-backed [`PersistenceStore`].
 ///
 /// Holds a `deadpool-sqlite` connection pool whose connections are
-/// initialised with the pragma set declared in [`INIT_PRAGMAS`].
+/// initialised with the pragma set declared in `INIT_PRAGMAS`.
 /// Constructed via [`Self::open`], which creates the database file
 /// if absent and applies pending migrations before returning.
 pub struct SqlitePersistenceStore {
     pool: Pool,
     /// Path of the underlying database file. Retained for
-    /// diagnostic spans (Phase 2) and for tests that want to
-    /// inspect the file directly.
+    /// diagnostic spans and for tests that want to inspect the file
+    /// directly.
     path: PathBuf,
 }
 
@@ -2281,6 +2755,679 @@ impl PersistenceStore for SqlitePersistenceStore {
         })
     }
 
+    fn record_admin_entry<'a>(
+        &'a self,
+        entry: &'a PersistedAdminEntry,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let kind = entry.kind.clone();
+        let admin_plugin = entry.admin_plugin.clone();
+        let target_claimant = entry.target_claimant.clone();
+        let payload_json =
+            serde_json::to_string(&entry.payload).unwrap_or_else(|_| "{}".into());
+        let asserted_at_ms = entry.asserted_at_ms;
+        let reason = entry.reason.clone();
+        let reverses_admin_id = entry.reverses_admin_id;
+        Box::pin(async move {
+            self.interact("record_admin_entry", move |conn| {
+                conn.execute(
+                    "INSERT INTO admin_log \
+                     (kind, admin_plugin, target_claimant, payload, \
+                      asserted_at_ms, reason, reverses_admin_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        kind,
+                        admin_plugin,
+                        target_claimant,
+                        payload_json,
+                        asserted_at_ms as i64,
+                        reason,
+                        reverses_admin_id,
+                    ],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("insert admin_log", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn load_all_admin_entries<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Vec<PersistedAdminEntry>, PersistenceError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("load_all_admin_entries", |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT admin_id, kind, admin_plugin, target_claimant, \
+                         payload, asserted_at_ms, reason, reverses_admin_id \
+                         FROM admin_log ORDER BY admin_id ASC",
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite("prepare admin_log query", e)
+                    })?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let payload_json: String = row.get(4)?;
+                        let payload: serde_json::Value =
+                            serde_json::from_str(&payload_json).map_err(|e| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    4,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!("payload not JSON: {e}"),
+                                    )),
+                                )
+                            })?;
+                        Ok(PersistedAdminEntry {
+                            admin_id: row.get(0)?,
+                            kind: row.get(1)?,
+                            admin_plugin: row.get(2)?,
+                            target_claimant: row.get(3)?,
+                            payload,
+                            asserted_at_ms: row.get::<_, i64>(5)? as u64,
+                            reason: row.get(6)?,
+                            reverses_admin_id: row.get(7)?,
+                        })
+                    })
+                    .map_err(|e| {
+                        PersistenceError::sqlite("execute admin_log query", e)
+                    })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r.map_err(|e| {
+                        PersistenceError::sqlite("read admin_log row", e)
+                    })?);
+                }
+                Ok(out)
+            })
+            .await
+        })
+    }
+
+    fn record_relation_assert<'a>(
+        &'a self,
+        relation: &'a PersistedRelation,
+        claim: &'a PersistedRelationClaim,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let rel = relation.clone();
+        let cl = claim.clone();
+        Box::pin(async move {
+            self.interact("record_relation_assert", move |conn| {
+                let tx = conn.transaction().map_err(|e| {
+                    PersistenceError::sqlite("begin assert tx", e)
+                })?;
+                tx.execute(
+                    "INSERT INTO relations \
+                     (source_id, predicate, target_id, \
+                      created_at_ms, modified_at_ms, \
+                      suppressed_admin_plugin, suppressed_at_ms, \
+                      suppression_reason) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL) \
+                     ON CONFLICT(source_id, predicate, target_id) \
+                     DO UPDATE SET modified_at_ms = excluded.modified_at_ms",
+                    params![
+                        rel.source_id,
+                        rel.predicate,
+                        rel.target_id,
+                        rel.created_at_ms as i64,
+                        rel.modified_at_ms as i64,
+                    ],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("upsert relations", e)
+                })?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO relation_claimants \
+                     (source_id, predicate, target_id, claimant, \
+                      asserted_at_ms, reason) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        cl.source_id,
+                        cl.predicate,
+                        cl.target_id,
+                        cl.claimant,
+                        cl.asserted_at_ms as i64,
+                        cl.reason,
+                    ],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("insert relation_claimant", e)
+                })?;
+                tx.commit().map_err(|e| {
+                    PersistenceError::sqlite("commit assert tx", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn record_relation_retract<'a>(
+        &'a self,
+        source_id: &'a str,
+        predicate: &'a str,
+        target_id: &'a str,
+        claimant: &'a str,
+        modified_at_ms: u64,
+        relation_forgotten: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>
+    {
+        let source_id = source_id.to_string();
+        let predicate = predicate.to_string();
+        let target_id = target_id.to_string();
+        let claimant = claimant.to_string();
+        Box::pin(async move {
+            self.interact("record_relation_retract", move |conn| {
+                let tx = conn.transaction().map_err(|e| {
+                    PersistenceError::sqlite("begin retract tx", e)
+                })?;
+                let removed = tx
+                    .execute(
+                        "DELETE FROM relation_claimants \
+                         WHERE source_id = ?1 AND predicate = ?2 \
+                           AND target_id = ?3 AND claimant = ?4",
+                        params![source_id, predicate, target_id, claimant],
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "delete relation_claimant",
+                            e,
+                        )
+                    })?;
+                if relation_forgotten {
+                    tx.execute(
+                        "DELETE FROM relations \
+                         WHERE source_id = ?1 AND predicate = ?2 \
+                           AND target_id = ?3",
+                        params![source_id, predicate, target_id],
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite("delete relation", e)
+                    })?;
+                } else if removed > 0 {
+                    tx.execute(
+                        "UPDATE relations SET modified_at_ms = ?4 \
+                         WHERE source_id = ?1 AND predicate = ?2 \
+                           AND target_id = ?3",
+                        params![
+                            source_id,
+                            predicate,
+                            target_id,
+                            modified_at_ms as i64,
+                        ],
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "update relation modified_at_ms",
+                            e,
+                        )
+                    })?;
+                }
+                tx.commit().map_err(|e| {
+                    PersistenceError::sqlite("commit retract tx", e)
+                })?;
+                Ok(removed > 0)
+            })
+            .await
+        })
+    }
+
+    fn record_relation_forget<'a>(
+        &'a self,
+        source_id: &'a str,
+        predicate: &'a str,
+        target_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>
+    {
+        let source_id = source_id.to_string();
+        let predicate = predicate.to_string();
+        let target_id = target_id.to_string();
+        Box::pin(async move {
+            self.interact("record_relation_forget", move |conn| {
+                let n = conn
+                    .execute(
+                        "DELETE FROM relations \
+                         WHERE source_id = ?1 AND predicate = ?2 \
+                           AND target_id = ?3",
+                        params![source_id, predicate, target_id],
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite("delete relation", e)
+                    })?;
+                Ok(n > 0)
+            })
+            .await
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_relation_suppress<'a>(
+        &'a self,
+        source_id: &'a str,
+        predicate: &'a str,
+        target_id: &'a str,
+        admin_plugin: &'a str,
+        suppressed_at_ms: u64,
+        reason: Option<&'a str>,
+        modified_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>
+    {
+        let source_id = source_id.to_string();
+        let predicate = predicate.to_string();
+        let target_id = target_id.to_string();
+        let admin_plugin = admin_plugin.to_string();
+        let reason = reason.map(|s| s.to_string());
+        Box::pin(async move {
+            self.interact("record_relation_suppress", move |conn| {
+                let n = conn
+                    .execute(
+                        "UPDATE relations SET \
+                           suppressed_admin_plugin = ?4, \
+                           suppressed_at_ms = ?5, \
+                           suppression_reason = ?6, \
+                           modified_at_ms = ?7 \
+                         WHERE source_id = ?1 AND predicate = ?2 \
+                           AND target_id = ?3",
+                        params![
+                            source_id,
+                            predicate,
+                            target_id,
+                            admin_plugin,
+                            suppressed_at_ms as i64,
+                            reason,
+                            modified_at_ms as i64,
+                        ],
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "update relation suppress",
+                            e,
+                        )
+                    })?;
+                Ok(n > 0)
+            })
+            .await
+        })
+    }
+
+    fn record_relation_unsuppress<'a>(
+        &'a self,
+        source_id: &'a str,
+        predicate: &'a str,
+        target_id: &'a str,
+        modified_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>
+    {
+        let source_id = source_id.to_string();
+        let predicate = predicate.to_string();
+        let target_id = target_id.to_string();
+        Box::pin(async move {
+            self.interact("record_relation_unsuppress", move |conn| {
+                let n = conn
+                    .execute(
+                        "UPDATE relations SET \
+                           suppressed_admin_plugin = NULL, \
+                           suppressed_at_ms = NULL, \
+                           suppression_reason = NULL, \
+                           modified_at_ms = ?4 \
+                         WHERE source_id = ?1 AND predicate = ?2 \
+                           AND target_id = ?3",
+                        params![
+                            source_id,
+                            predicate,
+                            target_id,
+                            modified_at_ms as i64,
+                        ],
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "update relation unsuppress",
+                            e,
+                        )
+                    })?;
+                Ok(n > 0)
+            })
+            .await
+        })
+    }
+
+    fn load_all_relations<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<RelationLoadRow>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("load_all_relations", |conn| {
+                let mut rel_stmt = conn
+                    .prepare(
+                        "SELECT source_id, predicate, target_id, \
+                                created_at_ms, modified_at_ms, \
+                                suppressed_admin_plugin, suppressed_at_ms, \
+                                suppression_reason \
+                         FROM relations \
+                         ORDER BY source_id ASC, predicate ASC, target_id ASC",
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite("prepare relations query", e)
+                    })?;
+                let rel_rows = rel_stmt
+                    .query_map([], |row| {
+                        Ok(PersistedRelation {
+                            source_id: row.get(0)?,
+                            predicate: row.get(1)?,
+                            target_id: row.get(2)?,
+                            created_at_ms: row.get::<_, i64>(3)? as u64,
+                            modified_at_ms: row.get::<_, i64>(4)? as u64,
+                            suppressed_admin_plugin: row.get(5)?,
+                            suppressed_at_ms: row
+                                .get::<_, Option<i64>>(6)?
+                                .map(|v| v as u64),
+                            suppression_reason: row.get(7)?,
+                        })
+                    })
+                    .map_err(|e| {
+                        PersistenceError::sqlite("execute relations query", e)
+                    })?;
+                let mut out: Vec<RelationLoadRow> = Vec::new();
+                for r in rel_rows {
+                    let rel = r.map_err(|e| {
+                        PersistenceError::sqlite("read relation row", e)
+                    })?;
+                    out.push((rel, Vec::new()));
+                }
+
+                let mut claim_stmt = conn
+                    .prepare(
+                        "SELECT source_id, predicate, target_id, claimant, \
+                                asserted_at_ms, reason \
+                         FROM relation_claimants \
+                         ORDER BY source_id ASC, predicate ASC, \
+                                  target_id ASC, claimant ASC",
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "prepare relation_claimants query",
+                            e,
+                        )
+                    })?;
+                let claim_rows = claim_stmt
+                    .query_map([], |row| {
+                        Ok(PersistedRelationClaim {
+                            source_id: row.get(0)?,
+                            predicate: row.get(1)?,
+                            target_id: row.get(2)?,
+                            claimant: row.get(3)?,
+                            asserted_at_ms: row.get::<_, i64>(4)? as u64,
+                            reason: row.get(5)?,
+                        })
+                    })
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "execute relation_claimants query",
+                            e,
+                        )
+                    })?;
+                for r in claim_rows {
+                    let cl = r.map_err(|e| {
+                        PersistenceError::sqlite(
+                            "read relation_claimant row",
+                            e,
+                        )
+                    })?;
+                    let key = (
+                        cl.source_id.clone(),
+                        cl.predicate.clone(),
+                        cl.target_id.clone(),
+                    );
+                    if let Some(slot) = out.iter_mut().find(|(r, _)| {
+                        (
+                            r.source_id.clone(),
+                            r.predicate.clone(),
+                            r.target_id.clone(),
+                        ) == key
+                    }) {
+                        slot.1.push(cl);
+                    }
+                }
+                Ok(out)
+            })
+            .await
+        })
+    }
+
+    fn upsert_custody<'a>(
+        &'a self,
+        record: &'a PersistedCustody,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let plugin = record.plugin.clone();
+        let handle_id = record.handle_id.clone();
+        let shelf = record.shelf.clone();
+        let custody_type = record.custody_type.clone();
+        let state_kind = record.state_kind.clone();
+        let state_reason = record.state_reason.clone();
+        let started_at_ms = record.started_at_ms;
+        let last_updated_at_ms = record.last_updated_at_ms;
+        Box::pin(async move {
+            self.interact("upsert_custody", move |conn| {
+                conn.execute(
+                    "INSERT INTO custodies \
+                     (plugin, handle_id, shelf, custody_type, \
+                      state_kind, state_reason, started_at_ms, \
+                      last_updated_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                     ON CONFLICT(plugin, handle_id) DO UPDATE SET \
+                       shelf = COALESCE(excluded.shelf, custodies.shelf), \
+                       custody_type = COALESCE(excluded.custody_type, \
+                                               custodies.custody_type), \
+                       state_kind = excluded.state_kind, \
+                       state_reason = excluded.state_reason, \
+                       last_updated_at_ms = excluded.last_updated_at_ms",
+                    params![
+                        plugin,
+                        handle_id,
+                        shelf,
+                        custody_type,
+                        state_kind,
+                        state_reason,
+                        started_at_ms as i64,
+                        last_updated_at_ms as i64,
+                    ],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("upsert custodies", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn upsert_custody_state<'a>(
+        &'a self,
+        snapshot: &'a PersistedCustodyState,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let plugin = snapshot.plugin.clone();
+        let handle_id = snapshot.handle_id.clone();
+        let payload = snapshot.payload.clone();
+        let health = snapshot.health.clone();
+        let reported_at_ms = snapshot.reported_at_ms;
+        Box::pin(async move {
+            self.interact("upsert_custody_state", move |conn| {
+                conn.execute(
+                    "INSERT INTO custody_state \
+                     (plugin, handle_id, payload, health, reported_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5) \
+                     ON CONFLICT(plugin, handle_id) DO UPDATE SET \
+                       payload = excluded.payload, \
+                       health = excluded.health, \
+                       reported_at_ms = excluded.reported_at_ms",
+                    params![
+                        plugin,
+                        handle_id,
+                        payload,
+                        health,
+                        reported_at_ms as i64,
+                    ],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("upsert custody_state", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn mark_custody_state<'a>(
+        &'a self,
+        plugin: &'a str,
+        handle_id: &'a str,
+        state_kind: &'a str,
+        state_reason: Option<&'a str>,
+        last_updated_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>
+    {
+        let plugin = plugin.to_string();
+        let handle_id = handle_id.to_string();
+        let state_kind = state_kind.to_string();
+        let state_reason = state_reason.map(|s| s.to_string());
+        Box::pin(async move {
+            self.interact("mark_custody_state", move |conn| {
+                let n = conn
+                    .execute(
+                        "UPDATE custodies SET \
+                           state_kind = ?3, \
+                           state_reason = ?4, \
+                           last_updated_at_ms = ?5 \
+                         WHERE plugin = ?1 AND handle_id = ?2",
+                        params![
+                            plugin,
+                            handle_id,
+                            state_kind,
+                            state_reason,
+                            last_updated_at_ms as i64,
+                        ],
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite("update custodies state", e)
+                    })?;
+                Ok(n > 0)
+            })
+            .await
+        })
+    }
+
+    fn delete_custody<'a>(
+        &'a self,
+        plugin: &'a str,
+        handle_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>
+    {
+        let plugin = plugin.to_string();
+        let handle_id = handle_id.to_string();
+        Box::pin(async move {
+            self.interact("delete_custody", move |conn| {
+                let n = conn
+                    .execute(
+                        "DELETE FROM custodies \
+                         WHERE plugin = ?1 AND handle_id = ?2",
+                        params![plugin, handle_id],
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite("delete custodies", e)
+                    })?;
+                Ok(n > 0)
+            })
+            .await
+        })
+    }
+
+    fn load_all_custodies<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<CustodyLoadRow>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("load_all_custodies", |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT \
+                           c.plugin, c.handle_id, c.shelf, c.custody_type, \
+                           c.state_kind, c.state_reason, \
+                           c.started_at_ms, c.last_updated_at_ms, \
+                           s.payload, s.health, s.reported_at_ms \
+                         FROM custodies c \
+                         LEFT JOIN custody_state s \
+                           ON s.plugin = c.plugin AND s.handle_id = c.handle_id \
+                         ORDER BY c.plugin ASC, c.handle_id ASC",
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite("prepare custodies query", e)
+                    })?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let plugin: String = row.get(0)?;
+                        let handle_id: String = row.get(1)?;
+                        let custody = PersistedCustody {
+                            plugin: plugin.clone(),
+                            handle_id: handle_id.clone(),
+                            shelf: row.get(2)?,
+                            custody_type: row.get(3)?,
+                            state_kind: row.get(4)?,
+                            state_reason: row.get(5)?,
+                            started_at_ms: row.get::<_, i64>(6)? as u64,
+                            last_updated_at_ms: row.get::<_, i64>(7)? as u64,
+                        };
+                        let payload: Option<Vec<u8>> = row.get(8)?;
+                        let snapshot = match payload {
+                            Some(payload) => Some(PersistedCustodyState {
+                                plugin,
+                                handle_id,
+                                payload,
+                                health: row.get(9)?,
+                                reported_at_ms: row.get::<_, i64>(10)? as u64,
+                            }),
+                            None => None,
+                        };
+                        Ok((custody, snapshot))
+                    })
+                    .map_err(|e| {
+                        PersistenceError::sqlite("execute custodies query", e)
+                    })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r.map_err(|e| {
+                        PersistenceError::sqlite("read custodies row", e)
+                    })?);
+                }
+                Ok(out)
+            })
+            .await
+        })
+    }
+
     fn count_subjects_by_type<'a>(
         &'a self,
     ) -> Pin<
@@ -2393,9 +3540,9 @@ struct MemoryState {
     aliases: Vec<PersistedAlias>,
     next_alias_id: i64,
     /// Append-only mirror of `claim_log` for tests that want to
-    /// inspect provenance after a sequence of operations. Phase 1
-    /// callers do not query this; it exists so the mock stays
-    /// faithful to the trait's "every operation appends" promise.
+    /// inspect provenance after a sequence of operations. The mock
+    /// stays faithful to the trait's "every operation appends"
+    /// promise.
     claim_log: Vec<MemoryClaimEntry>,
     /// Append-only mirror of `happenings_log`. Tests query this
     /// via [`PersistenceStore::load_happenings_since`].
@@ -2405,6 +3552,27 @@ struct MemoryState {
     /// concrete value.
     pending_conflicts: Vec<PendingConflict>,
     next_conflict_id: i64,
+    /// Append-only mirror of `admin_log`. Rows are minted with
+    /// monotonic `admin_id`s starting at 1 to mirror the SQLite
+    /// `INTEGER PRIMARY KEY AUTOINCREMENT` column.
+    admin_log: Vec<PersistedAdminEntry>,
+    next_admin_id: i64,
+    /// Mirror of `custodies` keyed by `(plugin, handle_id)`.
+    custodies: HashMap<(String, String), PersistedCustody>,
+    /// Mirror of `custody_state` keyed by `(plugin, handle_id)`.
+    /// FK CASCADE is enforced by the trait impl: `delete_custody`
+    /// removes the matching entry from this map alongside the
+    /// parent.
+    custody_state: HashMap<(String, String), PersistedCustodyState>,
+    /// Mirror of `relations` keyed by `(source_id, predicate,
+    /// target_id)`. Cascade with `relation_claimants` is enforced
+    /// in `record_relation_forget` and the
+    /// `record_relation_retract` last-claim path.
+    relations: HashMap<(String, String, String), PersistedRelation>,
+    /// Mirror of `relation_claimants` keyed by
+    /// `(source_id, predicate, target_id, claimant)`.
+    relation_claimants:
+        HashMap<(String, String, String, String), PersistedRelationClaim>,
 }
 
 #[derive(Debug, Clone)]
@@ -2934,6 +4102,337 @@ impl PersistenceStore for MemoryPersistenceStore {
                 .cloned()
                 .collect();
             out.sort_by_key(|c| c.detected_at_ms);
+            Ok(out)
+        })
+    }
+
+    fn record_admin_entry<'a>(
+        &'a self,
+        entry: &'a PersistedAdminEntry,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            if g.next_admin_id == 0 {
+                g.next_admin_id = 1;
+            }
+            let admin_id = g.next_admin_id;
+            g.next_admin_id += 1;
+            let mut row = entry.clone();
+            row.admin_id = admin_id;
+            g.admin_log.push(row);
+            Ok(())
+        })
+    }
+
+    fn load_all_admin_entries<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Vec<PersistedAdminEntry>, PersistenceError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            Ok(g.admin_log.clone())
+        })
+    }
+
+    fn record_relation_assert<'a>(
+        &'a self,
+        relation: &'a PersistedRelation,
+        claim: &'a PersistedRelationClaim,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            let rel_key = (
+                relation.source_id.clone(),
+                relation.predicate.clone(),
+                relation.target_id.clone(),
+            );
+            match g.relations.get_mut(&rel_key) {
+                Some(existing) => {
+                    existing.modified_at_ms = relation.modified_at_ms;
+                }
+                None => {
+                    g.relations.insert(rel_key.clone(), relation.clone());
+                }
+            }
+            let claim_key = (
+                claim.source_id.clone(),
+                claim.predicate.clone(),
+                claim.target_id.clone(),
+                claim.claimant.clone(),
+            );
+            g.relation_claimants
+                .entry(claim_key)
+                .or_insert_with(|| claim.clone());
+            Ok(())
+        })
+    }
+
+    fn record_relation_retract<'a>(
+        &'a self,
+        source_id: &'a str,
+        predicate: &'a str,
+        target_id: &'a str,
+        claimant: &'a str,
+        modified_at_ms: u64,
+        relation_forgotten: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            let claim_key = (
+                source_id.to_string(),
+                predicate.to_string(),
+                target_id.to_string(),
+                claimant.to_string(),
+            );
+            let removed = g.relation_claimants.remove(&claim_key).is_some();
+            let rel_key = (
+                source_id.to_string(),
+                predicate.to_string(),
+                target_id.to_string(),
+            );
+            if relation_forgotten {
+                g.relations.remove(&rel_key);
+                g.relation_claimants.retain(|k, _| {
+                    !(k.0 == source_id
+                        && k.1 == predicate
+                        && k.2 == target_id)
+                });
+            } else if removed {
+                if let Some(rel) = g.relations.get_mut(&rel_key) {
+                    rel.modified_at_ms = modified_at_ms;
+                }
+            }
+            Ok(removed)
+        })
+    }
+
+    fn record_relation_forget<'a>(
+        &'a self,
+        source_id: &'a str,
+        predicate: &'a str,
+        target_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            let rel_key = (
+                source_id.to_string(),
+                predicate.to_string(),
+                target_id.to_string(),
+            );
+            let removed = g.relations.remove(&rel_key).is_some();
+            g.relation_claimants.retain(|k, _| {
+                !(k.0 == source_id
+                    && k.1 == predicate
+                    && k.2 == target_id)
+            });
+            Ok(removed)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_relation_suppress<'a>(
+        &'a self,
+        source_id: &'a str,
+        predicate: &'a str,
+        target_id: &'a str,
+        admin_plugin: &'a str,
+        suppressed_at_ms: u64,
+        reason: Option<&'a str>,
+        modified_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            let rel_key = (
+                source_id.to_string(),
+                predicate.to_string(),
+                target_id.to_string(),
+            );
+            if let Some(rel) = g.relations.get_mut(&rel_key) {
+                rel.suppressed_admin_plugin = Some(admin_plugin.to_string());
+                rel.suppressed_at_ms = Some(suppressed_at_ms);
+                rel.suppression_reason = reason.map(|s| s.to_string());
+                rel.modified_at_ms = modified_at_ms;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })
+    }
+
+    fn record_relation_unsuppress<'a>(
+        &'a self,
+        source_id: &'a str,
+        predicate: &'a str,
+        target_id: &'a str,
+        modified_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            let rel_key = (
+                source_id.to_string(),
+                predicate.to_string(),
+                target_id.to_string(),
+            );
+            if let Some(rel) = g.relations.get_mut(&rel_key) {
+                rel.suppressed_admin_plugin = None;
+                rel.suppressed_at_ms = None;
+                rel.suppression_reason = None;
+                rel.modified_at_ms = modified_at_ms;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })
+    }
+
+    fn load_all_relations<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<RelationLoadRow>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            let mut rel_keys: Vec<&(String, String, String)> =
+                g.relations.keys().collect();
+            rel_keys.sort();
+            let mut out: Vec<RelationLoadRow> = Vec::with_capacity(rel_keys.len());
+            for k in rel_keys {
+                let rel = g.relations.get(k).cloned().expect("key present");
+                let mut claims: Vec<PersistedRelationClaim> = g
+                    .relation_claimants
+                    .iter()
+                    .filter(|(ck, _)| {
+                        ck.0 == k.0 && ck.1 == k.1 && ck.2 == k.2
+                    })
+                    .map(|(_, v)| v.clone())
+                    .collect();
+                claims.sort_by(|a, b| a.claimant.cmp(&b.claimant));
+                out.push((rel, claims));
+            }
+            Ok(out)
+        })
+    }
+
+    fn upsert_custody<'a>(
+        &'a self,
+        record: &'a PersistedCustody,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            let key = (record.plugin.clone(), record.handle_id.clone());
+            match g.custodies.get_mut(&key) {
+                Some(existing) => {
+                    if record.shelf.is_some() {
+                        existing.shelf = record.shelf.clone();
+                    }
+                    if record.custody_type.is_some() {
+                        existing.custody_type = record.custody_type.clone();
+                    }
+                    existing.state_kind = record.state_kind.clone();
+                    existing.state_reason = record.state_reason.clone();
+                    existing.last_updated_at_ms = record.last_updated_at_ms;
+                }
+                None => {
+                    g.custodies.insert(key, record.clone());
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn upsert_custody_state<'a>(
+        &'a self,
+        snapshot: &'a PersistedCustodyState,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            let key = (snapshot.plugin.clone(), snapshot.handle_id.clone());
+            if !g.custodies.contains_key(&key) {
+                return Err(PersistenceError::Invalid(format!(
+                    "custody_state insert for missing custody \
+                     ({}, {}): FK violated",
+                    snapshot.plugin, snapshot.handle_id
+                )));
+            }
+            g.custody_state.insert(key, snapshot.clone());
+            Ok(())
+        })
+    }
+
+    fn mark_custody_state<'a>(
+        &'a self,
+        plugin: &'a str,
+        handle_id: &'a str,
+        state_kind: &'a str,
+        state_reason: Option<&'a str>,
+        last_updated_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            let key = (plugin.to_string(), handle_id.to_string());
+            if let Some(rec) = g.custodies.get_mut(&key) {
+                rec.state_kind = state_kind.to_string();
+                rec.state_reason = state_reason.map(|s| s.to_string());
+                rec.last_updated_at_ms = last_updated_at_ms;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })
+    }
+
+    fn delete_custody<'a>(
+        &'a self,
+        plugin: &'a str,
+        handle_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            let key = (plugin.to_string(), handle_id.to_string());
+            g.custody_state.remove(&key);
+            Ok(g.custodies.remove(&key).is_some())
+        })
+    }
+
+    fn load_all_custodies<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<CustodyLoadRow>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            let mut keys: Vec<&(String, String)> = g.custodies.keys().collect();
+            keys.sort();
+            let mut out = Vec::with_capacity(keys.len());
+            for k in keys {
+                let custody = g.custodies.get(k).cloned().expect("key present");
+                let snapshot = g.custody_state.get(k).cloned();
+                out.push((custody, snapshot));
+            }
             Ok(out)
         })
     }
@@ -3557,7 +5056,7 @@ mod tests {
         assert!(shm.exists() || shm_alt.exists(), "expected -shm sidecar");
     }
 
-    // --- Wave 1: per-claim claim_log entries on announce ------------------
+    // --- Per-claim claim_log entries on announce -------------------------
 
     #[tokio::test]
     async fn memory_announce_records_per_claim_log_entries() {
@@ -3663,7 +5162,7 @@ mod tests {
         assert_eq!(reasons, vec![Some("matched on hash".to_string()), None]);
     }
 
-    // --- Wave 1: merge mirrors subjects-table mutations -------------------
+    // --- Merge mirrors subjects-table mutations --------------------------
 
     #[tokio::test]
     async fn memory_merge_creates_new_subject_and_drops_sources() {
@@ -3795,7 +5294,7 @@ mod tests {
         assert_eq!(n_addr_orphan, 0);
     }
 
-    // --- Wave 1: split mirrors subjects-table mutations -------------------
+    // --- Split mirrors subjects-table mutations --------------------------
 
     #[tokio::test]
     async fn memory_split_partitions_addressings_and_drops_source() {
@@ -4072,5 +5571,781 @@ mod tests {
             .checkpoint_wal()
             .await
             .expect("WAL checkpoint must Ok");
+    }
+
+    fn sample_persisted_admin_entry(
+        kind: &str,
+        admin_plugin: &str,
+        target_claimant: Option<&str>,
+        target_subject: Option<&str>,
+        asserted_at_ms: u64,
+        reason: Option<&str>,
+    ) -> PersistedAdminEntry {
+        let mut payload = serde_json::Map::new();
+        if let Some(s) = target_subject {
+            payload.insert(
+                "target_subject".into(),
+                serde_json::Value::String(s.to_string()),
+            );
+        }
+        PersistedAdminEntry {
+            admin_id: 0,
+            kind: kind.to_string(),
+            admin_plugin: admin_plugin.to_string(),
+            target_claimant: target_claimant.map(|s| s.to_string()),
+            payload: serde_json::Value::Object(payload),
+            asserted_at_ms,
+            reason: reason.map(|s| s.to_string()),
+            reverses_admin_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_admin_log_round_trip_preserves_columns_and_payload() {
+        // Pin the on-disk shape of admin_log: every column the
+        // schema declares round-trips, the JSON payload preserves
+        // its object structure, and load returns rows in
+        // ascending admin_id order (insertion order).
+        let (_dir, store) = open_temp();
+        for (i, target) in ["p1", "p2", "p3"].iter().enumerate() {
+            let entry = sample_persisted_admin_entry(
+                "subject_addressing_forced_retract",
+                "admin.plugin",
+                Some(target),
+                Some(&format!("subj-{i}")),
+                100 + i as u64,
+                Some("test"),
+            );
+            store.record_admin_entry(&entry).await.unwrap();
+        }
+
+        let rows = store.load_all_admin_entries().await.unwrap();
+        assert_eq!(rows.len(), 3);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.kind, "subject_addressing_forced_retract");
+            assert_eq!(row.admin_plugin, "admin.plugin");
+            assert_eq!(
+                row.target_claimant.as_deref(),
+                Some(["p1", "p2", "p3"][i])
+            );
+            assert_eq!(row.asserted_at_ms, 100 + i as u64);
+            assert_eq!(row.reason.as_deref(), Some("test"));
+            assert!(row.reverses_admin_id.is_none());
+            // admin_id is auto-assigned, monotonic, and unique.
+            if i > 0 {
+                assert!(row.admin_id > rows[i - 1].admin_id);
+            }
+            // payload preserves the JSON object shape.
+            let subject =
+                row.payload.get("target_subject").and_then(|v| v.as_str());
+            assert_eq!(subject, Some(format!("subj-{i}").as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_admin_log_survives_reopen() {
+        // Open a database, write admin_log rows, close, reopen,
+        // and confirm load returns the same rows. Pins the
+        // durability promise: a steward restart sees the same
+        // audit trail.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("admin.db");
+        {
+            let store = SqlitePersistenceStore::open(path.clone()).unwrap();
+            store
+                .record_admin_entry(&sample_persisted_admin_entry(
+                    "subject_merge",
+                    "admin.plugin",
+                    None,
+                    Some("new-id"),
+                    1000,
+                    Some("operator confirmed identity"),
+                ))
+                .await
+                .unwrap();
+            store.checkpoint_wal().await.unwrap();
+        }
+        let store = SqlitePersistenceStore::open(path).unwrap();
+        let rows = store.load_all_admin_entries().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "subject_merge");
+        assert!(rows[0].target_claimant.is_none());
+        assert_eq!(rows[0].asserted_at_ms, 1000);
+        assert_eq!(
+            rows[0].reason.as_deref(),
+            Some("operator confirmed identity")
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_admin_log_load_returns_empty_on_fresh_database() {
+        // A freshly migrated database has no admin_log rows.
+        // Pinning this so the boot path's rehydrate cannot
+        // surprise-load stale rows from a concurrent test
+        // fixture.
+        let (_dir, store) = open_temp();
+        let rows = store.load_all_admin_entries().await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sample_persisted_custody(
+        plugin: &str,
+        handle_id: &str,
+        shelf: Option<&str>,
+        custody_type: Option<&str>,
+        state_kind: &str,
+        state_reason: Option<&str>,
+        started_at_ms: u64,
+        last_updated_at_ms: u64,
+    ) -> PersistedCustody {
+        PersistedCustody {
+            plugin: plugin.to_string(),
+            handle_id: handle_id.to_string(),
+            shelf: shelf.map(|s| s.to_string()),
+            custody_type: custody_type.map(|s| s.to_string()),
+            state_kind: state_kind.to_string(),
+            state_reason: state_reason.map(|s| s.to_string()),
+            started_at_ms,
+            last_updated_at_ms,
+        }
+    }
+
+    fn sample_persisted_custody_state(
+        plugin: &str,
+        handle_id: &str,
+        payload: &[u8],
+        health: &str,
+        reported_at_ms: u64,
+    ) -> PersistedCustodyState {
+        PersistedCustodyState {
+            plugin: plugin.to_string(),
+            handle_id: handle_id.to_string(),
+            payload: payload.to_vec(),
+            health: health.to_string(),
+            reported_at_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_custody_round_trip_with_state_snapshot() {
+        // Pin the on-disk shape: upserting a custody plus a state
+        // snapshot round-trips every column, and load returns the
+        // pair joined.
+        let (_dir, store) = open_temp();
+        let custody = sample_persisted_custody(
+            "org.test.warden",
+            "c-1",
+            Some("example.custody"),
+            Some("playback"),
+            "active",
+            None,
+            1_000,
+            1_500,
+        );
+        store.upsert_custody(&custody).await.unwrap();
+        let snapshot = sample_persisted_custody_state(
+            "org.test.warden",
+            "c-1",
+            b"state=playing",
+            "healthy",
+            1_500,
+        );
+        store.upsert_custody_state(&snapshot).await.unwrap();
+
+        let rows = store.load_all_custodies().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let (loaded, snap) = &rows[0];
+        assert_eq!(loaded, &custody);
+        assert_eq!(snap.as_ref(), Some(&snapshot));
+    }
+
+    #[tokio::test]
+    async fn sqlite_custody_upsert_merges_partial_columns() {
+        // The lazy-UPSERT race: an early state report inserts a
+        // custody row with shelf=NULL/custody_type=NULL; the
+        // subsequent record_custody call fills those in. The
+        // ON CONFLICT clause must COALESCE so the second upsert
+        // does not blank the freshly-populated fields the next
+        // time a state report races back in.
+        let (_dir, store) = open_temp();
+        let bare = sample_persisted_custody(
+            "org.test.warden",
+            "c-1",
+            None,
+            None,
+            "active",
+            None,
+            1_000,
+            1_000,
+        );
+        store.upsert_custody(&bare).await.unwrap();
+
+        let filled = sample_persisted_custody(
+            "org.test.warden",
+            "c-1",
+            Some("example.custody"),
+            Some("playback"),
+            "active",
+            None,
+            1_000,
+            1_500,
+        );
+        store.upsert_custody(&filled).await.unwrap();
+
+        // Second state report races back in, again without shelf
+        // / custody_type. COALESCE preserves the filled values.
+        let bare2 = sample_persisted_custody(
+            "org.test.warden",
+            "c-1",
+            None,
+            None,
+            "active",
+            None,
+            1_000,
+            2_000,
+        );
+        store.upsert_custody(&bare2).await.unwrap();
+
+        let rows = store.load_all_custodies().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let (loaded, _) = &rows[0];
+        assert_eq!(loaded.shelf.as_deref(), Some("example.custody"));
+        assert_eq!(loaded.custody_type.as_deref(), Some("playback"));
+        assert_eq!(loaded.last_updated_at_ms, 2_000);
+        assert_eq!(loaded.started_at_ms, 1_000);
+    }
+
+    #[tokio::test]
+    async fn sqlite_mark_custody_state_updates_kind_and_reason() {
+        // Lifecycle transition: an active record marked aborted
+        // updates state_kind, state_reason, and last_updated_at_ms.
+        // Returns true on a hit, false when no row matches.
+        let (_dir, store) = open_temp();
+        store
+            .upsert_custody(&sample_persisted_custody(
+                "org.test.warden",
+                "c-1",
+                Some("example.custody"),
+                Some("playback"),
+                "active",
+                None,
+                1_000,
+                1_000,
+            ))
+            .await
+            .unwrap();
+
+        let hit = store
+            .mark_custody_state(
+                "org.test.warden",
+                "c-1",
+                "aborted",
+                Some("transport failed"),
+                2_000,
+            )
+            .await
+            .unwrap();
+        assert!(hit);
+
+        let rows = store.load_all_custodies().await.unwrap();
+        let (loaded, _) = &rows[0];
+        assert_eq!(loaded.state_kind, "aborted");
+        assert_eq!(loaded.state_reason.as_deref(), Some("transport failed"));
+        assert_eq!(loaded.last_updated_at_ms, 2_000);
+
+        let miss = store
+            .mark_custody_state(
+                "org.test.warden",
+                "c-never-existed",
+                "aborted",
+                Some("nope"),
+                2_500,
+            )
+            .await
+            .unwrap();
+        assert!(!miss);
+    }
+
+    #[tokio::test]
+    async fn sqlite_delete_custody_cascades_state() {
+        // Deleting a custody also removes its custody_state row
+        // (FK CASCADE). Round-trip via load to confirm both
+        // tables are emptied.
+        let (_dir, store) = open_temp();
+        store
+            .upsert_custody(&sample_persisted_custody(
+                "org.test.warden",
+                "c-1",
+                Some("example.custody"),
+                Some("playback"),
+                "active",
+                None,
+                1_000,
+                1_000,
+            ))
+            .await
+            .unwrap();
+        store
+            .upsert_custody_state(&sample_persisted_custody_state(
+                "org.test.warden",
+                "c-1",
+                b"final",
+                "healthy",
+                1_500,
+            ))
+            .await
+            .unwrap();
+
+        let removed = store
+            .delete_custody("org.test.warden", "c-1")
+            .await
+            .unwrap();
+        assert!(removed);
+
+        let rows = store.load_all_custodies().await.unwrap();
+        assert!(rows.is_empty());
+
+        // Idempotent: deleting again returns false.
+        let removed2 = store
+            .delete_custody("org.test.warden", "c-1")
+            .await
+            .unwrap();
+        assert!(!removed2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_custody_upsert_state_without_parent_errors() {
+        // Inserting custody_state for a missing custody row
+        // violates the FK and surfaces as a Sqlite error. Pins
+        // the FK invariant against accidental relaxation.
+        let (_dir, store) = open_temp();
+        let err = store
+            .upsert_custody_state(&sample_persisted_custody_state(
+                "org.test.warden",
+                "c-1",
+                b"state",
+                "healthy",
+                1_000,
+            ))
+            .await
+            .expect_err("FK violation");
+        assert!(matches!(err, PersistenceError::Sqlite { .. }));
+    }
+
+    #[tokio::test]
+    async fn sqlite_custody_load_returns_sorted_by_plugin_handle() {
+        // load_all_custodies returns rows in (plugin, handle_id)
+        // ascending order so boot rehydration is deterministic.
+        let (_dir, store) = open_temp();
+        for (plugin, handle_id) in [
+            ("org.test.warden", "c-2"),
+            ("org.test.alpha", "c-1"),
+            ("org.test.warden", "c-1"),
+        ] {
+            store
+                .upsert_custody(&sample_persisted_custody(
+                    plugin,
+                    handle_id,
+                    Some("example.custody"),
+                    Some("playback"),
+                    "active",
+                    None,
+                    1_000,
+                    1_000,
+                ))
+                .await
+                .unwrap();
+        }
+        let rows = store.load_all_custodies().await.unwrap();
+        let keys: Vec<(String, String)> = rows
+            .iter()
+            .map(|(c, _)| (c.plugin.clone(), c.handle_id.clone()))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("org.test.alpha".into(), "c-1".into()),
+                ("org.test.warden".into(), "c-1".into()),
+                ("org.test.warden".into(), "c-2".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_custody_survives_reopen() {
+        // Open a database, upsert a custody and a state snapshot,
+        // close, reopen, confirm both round-trip. Pins durability
+        // across restart for the custody slice.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("custody.db");
+        {
+            let store = SqlitePersistenceStore::open(path.clone()).unwrap();
+            store
+                .upsert_custody(&sample_persisted_custody(
+                    "org.test.warden",
+                    "c-1",
+                    Some("example.custody"),
+                    Some("playback"),
+                    "active",
+                    None,
+                    1_000,
+                    1_000,
+                ))
+                .await
+                .unwrap();
+            store
+                .upsert_custody_state(&sample_persisted_custody_state(
+                    "org.test.warden",
+                    "c-1",
+                    b"state=playing",
+                    "healthy",
+                    1_500,
+                ))
+                .await
+                .unwrap();
+            store.checkpoint_wal().await.unwrap();
+        }
+        let store = SqlitePersistenceStore::open(path).unwrap();
+        let rows = store.load_all_custodies().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let (custody, snap) = &rows[0];
+        assert_eq!(custody.shelf.as_deref(), Some("example.custody"));
+        assert_eq!(custody.custody_type.as_deref(), Some("playback"));
+        assert_eq!(snap.as_ref().map(|s| s.payload.as_slice()), Some(b"state=playing".as_ref()));
+        assert_eq!(snap.as_ref().map(|s| s.health.as_str()), Some("healthy"));
+    }
+
+    fn sample_persisted_relation(
+        source_id: &str,
+        predicate: &str,
+        target_id: &str,
+        created_at_ms: u64,
+        modified_at_ms: u64,
+    ) -> PersistedRelation {
+        PersistedRelation {
+            source_id: source_id.to_string(),
+            predicate: predicate.to_string(),
+            target_id: target_id.to_string(),
+            created_at_ms,
+            modified_at_ms,
+            suppressed_admin_plugin: None,
+            suppressed_at_ms: None,
+            suppression_reason: None,
+        }
+    }
+
+    fn sample_persisted_relation_claim(
+        source_id: &str,
+        predicate: &str,
+        target_id: &str,
+        claimant: &str,
+        asserted_at_ms: u64,
+        reason: Option<&str>,
+    ) -> PersistedRelationClaim {
+        PersistedRelationClaim {
+            source_id: source_id.to_string(),
+            predicate: predicate.to_string(),
+            target_id: target_id.to_string(),
+            claimant: claimant.to_string(),
+            asserted_at_ms,
+            reason: reason.map(|s| s.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_relation_assert_round_trips_relation_and_claim() {
+        // Pin the on-disk shape: a single assert produces one
+        // relation row and one relation_claimants row that
+        // round-trip through load_all_relations exactly.
+        let (_dir, store) = open_temp();
+        let rel = sample_persisted_relation("a", "edge", "b", 100, 100);
+        let claim = sample_persisted_relation_claim(
+            "a",
+            "edge",
+            "b",
+            "p1",
+            100,
+            Some("first claim"),
+        );
+        store.record_relation_assert(&rel, &claim).await.unwrap();
+
+        let rows = store.load_all_relations().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, rel);
+        assert_eq!(rows[0].1.len(), 1);
+        assert_eq!(rows[0].1[0], claim);
+    }
+
+    #[tokio::test]
+    async fn sqlite_relation_assert_preserves_created_at_on_update() {
+        // The ON CONFLICT clause preserves created_at_ms on
+        // re-assert and bumps modified_at_ms; INSERT OR IGNORE
+        // on the claim makes a same-claimant re-assert idempotent.
+        let (_dir, store) = open_temp();
+        store
+            .record_relation_assert(
+                &sample_persisted_relation("a", "edge", "b", 100, 100),
+                &sample_persisted_relation_claim(
+                    "a", "edge", "b", "p1", 100, None,
+                ),
+            )
+            .await
+            .unwrap();
+        // Different claimant — shares the relation, adds a row.
+        store
+            .record_relation_assert(
+                &sample_persisted_relation("a", "edge", "b", 200, 200),
+                &sample_persisted_relation_claim(
+                    "a", "edge", "b", "p2", 200, None,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let rows = store.load_all_relations().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.created_at_ms, 100);
+        assert_eq!(rows[0].0.modified_at_ms, 200);
+        assert_eq!(rows[0].1.len(), 2);
+        let claimants: Vec<&str> =
+            rows[0].1.iter().map(|c| c.claimant.as_str()).collect();
+        assert_eq!(claimants, vec!["p1", "p2"]);
+    }
+
+    #[tokio::test]
+    async fn sqlite_relation_retract_removes_claim_and_optionally_relation() {
+        // record_relation_retract removes one claim row. When
+        // relation_forgotten=false and other claimants remain, the
+        // parent relation row stays and modified_at_ms bumps. When
+        // relation_forgotten=true, the parent is removed too,
+        // cascading any remaining claimants.
+        let (_dir, store) = open_temp();
+        store
+            .record_relation_assert(
+                &sample_persisted_relation("a", "edge", "b", 100, 100),
+                &sample_persisted_relation_claim(
+                    "a", "edge", "b", "p1", 100, None,
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .record_relation_assert(
+                &sample_persisted_relation("a", "edge", "b", 200, 200),
+                &sample_persisted_relation_claim(
+                    "a", "edge", "b", "p2", 200, None,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let removed = store
+            .record_relation_retract("a", "edge", "b", "p1", 300, false)
+            .await
+            .unwrap();
+        assert!(removed);
+
+        let rows = store.load_all_relations().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.modified_at_ms, 300);
+        assert_eq!(rows[0].1.len(), 1);
+        assert_eq!(rows[0].1[0].claimant, "p2");
+
+        let removed = store
+            .record_relation_retract("a", "edge", "b", "p2", 400, true)
+            .await
+            .unwrap();
+        assert!(removed);
+        let rows = store.load_all_relations().await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_relation_forget_removes_relation_and_cascades_claims() {
+        // record_relation_forget deletes the relation row; the FK
+        // CASCADE on relation_claimants removes every claim
+        // atomically.
+        let (_dir, store) = open_temp();
+        store
+            .record_relation_assert(
+                &sample_persisted_relation("a", "edge", "b", 100, 100),
+                &sample_persisted_relation_claim(
+                    "a", "edge", "b", "p1", 100, None,
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .record_relation_assert(
+                &sample_persisted_relation("a", "edge", "b", 200, 200),
+                &sample_persisted_relation_claim(
+                    "a", "edge", "b", "p2", 200, None,
+                ),
+            )
+            .await
+            .unwrap();
+        let removed = store
+            .record_relation_forget("a", "edge", "b")
+            .await
+            .unwrap();
+        assert!(removed);
+        let rows = store.load_all_relations().await.unwrap();
+        assert!(rows.is_empty());
+
+        // Idempotent: forgetting again returns false.
+        let removed = store
+            .record_relation_forget("a", "edge", "b")
+            .await
+            .unwrap();
+        assert!(!removed);
+    }
+
+    #[tokio::test]
+    async fn sqlite_relation_suppress_and_unsuppress_round_trip() {
+        // Suppress sets the three suppression columns and bumps
+        // modified_at_ms; unsuppress clears them and bumps again.
+        let (_dir, store) = open_temp();
+        store
+            .record_relation_assert(
+                &sample_persisted_relation("a", "edge", "b", 100, 100),
+                &sample_persisted_relation_claim(
+                    "a", "edge", "b", "p1", 100, None,
+                ),
+            )
+            .await
+            .unwrap();
+        let hit = store
+            .record_relation_suppress(
+                "a",
+                "edge",
+                "b",
+                "admin.plugin",
+                500,
+                Some("disputed"),
+                500,
+            )
+            .await
+            .unwrap();
+        assert!(hit);
+        let rows = store.load_all_relations().await.unwrap();
+        let rel = &rows[0].0;
+        assert_eq!(rel.suppressed_admin_plugin.as_deref(), Some("admin.plugin"));
+        assert_eq!(rel.suppressed_at_ms, Some(500));
+        assert_eq!(rel.suppression_reason.as_deref(), Some("disputed"));
+        assert_eq!(rel.modified_at_ms, 500);
+
+        let hit = store
+            .record_relation_unsuppress("a", "edge", "b", 600)
+            .await
+            .unwrap();
+        assert!(hit);
+        let rows = store.load_all_relations().await.unwrap();
+        let rel = &rows[0].0;
+        assert!(rel.suppressed_admin_plugin.is_none());
+        assert!(rel.suppressed_at_ms.is_none());
+        assert!(rel.suppression_reason.is_none());
+        assert_eq!(rel.modified_at_ms, 600);
+    }
+
+    #[tokio::test]
+    async fn sqlite_relation_load_sorted_by_triple_then_claimant() {
+        // load_all_relations returns rows in deterministic
+        // (source_id, predicate, target_id) ascending order with
+        // claims sorted by claimant ascending. Pins the boot
+        // rehydration order for reproducible state.
+        let (_dir, store) = open_temp();
+        for (s, p, t, c) in [
+            ("b", "edge", "c", "p1"),
+            ("a", "edge", "z", "p2"),
+            ("a", "edge", "z", "p1"),
+            ("a", "edge", "b", "p1"),
+        ] {
+            store
+                .record_relation_assert(
+                    &sample_persisted_relation(s, p, t, 100, 100),
+                    &sample_persisted_relation_claim(s, p, t, c, 100, None),
+                )
+                .await
+                .unwrap();
+        }
+        let rows = store.load_all_relations().await.unwrap();
+        let triples: Vec<(String, String, String)> = rows
+            .iter()
+            .map(|(r, _)| {
+                (r.source_id.clone(), r.predicate.clone(), r.target_id.clone())
+            })
+            .collect();
+        assert_eq!(
+            triples,
+            vec![
+                ("a".into(), "edge".into(), "b".into()),
+                ("a".into(), "edge".into(), "z".into()),
+                ("b".into(), "edge".into(), "c".into()),
+            ]
+        );
+        let az_claimants: Vec<&str> = rows[1]
+            .1
+            .iter()
+            .map(|c| c.claimant.as_str())
+            .collect();
+        assert_eq!(az_claimants, vec!["p1", "p2"]);
+    }
+
+    #[tokio::test]
+    async fn sqlite_relations_survive_reopen() {
+        // Open, write a relation with two claimants and a
+        // suppression marker, close, reopen, confirm round-trip.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("relations.db");
+        {
+            let store = SqlitePersistenceStore::open(path.clone()).unwrap();
+            store
+                .record_relation_assert(
+                    &sample_persisted_relation("a", "edge", "b", 100, 100),
+                    &sample_persisted_relation_claim(
+                        "a",
+                        "edge",
+                        "b",
+                        "p1",
+                        100,
+                        Some("first"),
+                    ),
+                )
+                .await
+                .unwrap();
+            store
+                .record_relation_assert(
+                    &sample_persisted_relation("a", "edge", "b", 200, 200),
+                    &sample_persisted_relation_claim(
+                        "a", "edge", "b", "p2", 200, None,
+                    ),
+                )
+                .await
+                .unwrap();
+            store
+                .record_relation_suppress(
+                    "a",
+                    "edge",
+                    "b",
+                    "admin.plugin",
+                    500,
+                    Some("under review"),
+                    500,
+                )
+                .await
+                .unwrap();
+            store.checkpoint_wal().await.unwrap();
+        }
+        let store = SqlitePersistenceStore::open(path).unwrap();
+        let rows = store.load_all_relations().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let (rel, claims) = &rows[0];
+        assert_eq!(rel.created_at_ms, 100);
+        assert_eq!(rel.modified_at_ms, 500);
+        assert_eq!(rel.suppressed_admin_plugin.as_deref(), Some("admin.plugin"));
+        assert_eq!(rel.suppression_reason.as_deref(), Some("under review"));
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0].reason.as_deref(), Some("first"));
     }
 }

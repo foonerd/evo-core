@@ -56,18 +56,21 @@ A frame carries exactly one JSON object. The object's shape disambiguates whethe
 
 ## 4. Operations Reference
 
-Eleven operations. Ten are synchronous request/response (three of them paginated); one is streaming.
+Fourteen operations. Twelve are synchronous request/response (three of them paginated); two are streaming.
 
 | Op | Shape | Purpose |
 |----|-------|---------|
 | `request` | Request / response | Dispatch a plugin request on a specific shelf. |
 | `project_subject` | Request / response | Compose and return a federated subject projection. Auto-follows alias chains by default. |
+| `project_rack` | Request / response | Structural projection of a rack: declared shelves plus admitted occupants. |
 | `describe_alias` | Request / response | Resolve a canonical subject ID to its alias record, alias chain, or current subject. |
 | `list_active_custodies` | Request / response | Snapshot the custody ledger. |
 | `list_subjects` | Request / response (paginated) | Page through every live subject; carries `current_seq` for reconcile-pinning. |
 | `list_relations` | Request / response (paginated) | Page through every live relation edge; carries `current_seq`. |
 | `enumerate_addressings` | Request / response (paginated) | Page through every claimed addressing; carries `current_seq`. |
+| `list_plugins` | Request / response | Read-only inventory of admitted plugins. |
 | `subscribe_happenings` | Streaming | Stream every happening the bus emits. |
+| `subscribe_subject` | Streaming | Per-subject push subscription: re-projects the subject on every `Happening` that affects it. |
 | `describe_capabilities` | Request / response | Discover the steward's supported ops and named features. |
 | `negotiate` | Request / response | Per-connection capability negotiation. SHOULD be the first frame on a new connection. |
 | `resolve_claimants` | Request / response | Exchange opaque `claimant_token` values for plain plugin names. Requires the `resolve_claimants` capability granted via `negotiate`. |
@@ -89,12 +92,25 @@ Request:
 }
 ```
 
+For factory-stocked shelves, include `instance_id` to route the request to a specific announced instance:
+
+```json
+{
+  "op": "request",
+  "shelf": "audio.outputs",
+  "request_type": "play",
+  "payload_b64": "...",
+  "instance_id": "usb-1234:5678"
+}
+```
+
 | Field | Type | Notes |
 |-------|------|-------|
 | `op` | string | Must be `"request"`. |
 | `shelf` | string | Fully-qualified shelf name `<rack>.<shelf>`. |
 | `request_type` | string | One of the request types the target plugin declared in its manifest. |
 | `payload_b64` | string | Base64-encoded bytes. May be empty. |
+| `instance_id` | string \| null | Optional. Names a specific factory-announced instance. Singleton-stocked shelves ignore the field; factory-stocked shelves MAY refuse the request when the field is absent. |
 
 Response on success:
 
@@ -645,12 +661,15 @@ Response:
   "ops": [
     "request",
     "project_subject",
+    "project_rack",
+    "list_plugins",
     "describe_alias",
     "list_active_custodies",
     "list_subjects",
     "list_relations",
     "enumerate_addressings",
     "subscribe_happenings",
+    "subscribe_subject",
     "describe_capabilities",
     "negotiate",
     "resolve_claimants"
@@ -660,7 +679,10 @@ Response:
     "alias_chain_walking",
     "active_custodies_snapshot",
     "paginated_state_snapshots",
-    "capability_negotiation"
+    "capability_negotiation",
+    "subscribe_subject_push",
+    "rack_structural_projection",
+    "plugin_inventory"
   ]
 }
 ```
@@ -678,6 +700,9 @@ Response:
 | `active_custodies_snapshot` | `op = "list_active_custodies"` returns the full ledger snapshot. |
 | `paginated_state_snapshots` | `op = "list_subjects"`, `op = "list_relations"`, and `op = "enumerate_addressings"` are present, each returning paginated rows alongside `current_seq` for reconcile-pinning. |
 | `capability_negotiation` | `op = "negotiate"` is present and grants per-connection capabilities consulted by gated ops (`resolve_claimants` today). |
+| `subscribe_subject_push` | `op = "subscribe_subject"` is present — a per-subject push stream with optional alias following and scope projection. |
+| `rack_structural_projection` | `op = "project_rack"` returns a structural census of the rack's declared shelves and their admitted occupants. |
+| `plugin_inventory` | `op = "list_plugins"` returns a read-only inventory of admitted plugins (name, fully-qualified shelf, interaction kind). |
 
 A consumer that requires a feature absent from the response MUST fall back to pre-feature behaviour or fail explicitly; silent assumption that the feature is honoured is a bug.
 
@@ -753,6 +778,133 @@ Response:
 Resolution is a private query: it does NOT emit on the happenings bus, and a successful or refused call surfaces only in the steward's audit log. Operators consult the audit log to see which connection identities asked to exchange tokens for plain names; the steward records the connecting peer's UID/GID, the request size, the resolved count, and whether the call was granted.
 
 **Token-existence-count side-channel (intentional).** The response shape lets a granted consumer learn whether each requested token is *currently issued by this steward* by observing whether the token appears in the `resolutions` array. Tokens not currently issued are silently omitted (per the request-table note above), which is what allows the count of returned resolutions to differ from the count of supplied tokens. This is a deliberate design trade-off, not a bug: the `resolve_claimants` capability is privileged for exactly this reason — the operator who granted the capability already trusts the consumer with the plain plugin names and versions of currently-admitted plugins, and the additional signal "this token is currently issued vs not" is no stronger than what the consumer already observes by issuing any operation that would target the same plugin. Operators MUST NOT grant `resolve_claimants` to a consumer the operator would not otherwise allow to enumerate the steward's current plugin set; the ACL gate at `client_acl.toml` is the single point of control. Distributions wishing to harden against this signal MUST do so by tightening the ACL, not by parsing or filtering the response.
+
+### 4.9 `op = "project_rack"`
+
+Structural projection of a rack: a census of every shelf the rack declares plus the plugin currently admitted on each (or `null` when the shelf is empty). Answers the "what does this rack look like, and who lives where?" question without enumerating plugins individually.
+
+Request:
+
+```json
+{ "op": "project_rack", "rack": "audio" }
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `rack` | string | Rack name as declared in the catalogue. An unknown name surfaces as a structured `not_found / unknown_rack`. |
+
+Response:
+
+```json
+{
+  "rack_projection": true,
+  "rack": "audio",
+  "charter": "Audio playback and capture pipeline.",
+  "current_seq": 142,
+  "shelves": [
+    {
+      "name": "playback",
+      "fully_qualified": "audio.playback",
+      "shape": 1,
+      "shape_supports": [],
+      "description": "Audio output respondent.",
+      "occupant": {
+        "plugin": "org.example.playback.mpd",
+        "interaction_kind": "respondent"
+      }
+    },
+    {
+      "name": "delivery",
+      "fully_qualified": "audio.delivery",
+      "shape": 1,
+      "shape_supports": [],
+      "description": "Audio output warden.",
+      "occupant": null
+    }
+  ]
+}
+```
+
+Catalogue is the authority on which racks exist. The `shelves` array is in the order the catalogue declares; each entry carries the shelf's declared `shape`, the optional `shape_supports` migration window, the description if any, and the admitted occupant (or `null`). The `interaction_kind` field is `respondent` or `warden`; mid-transition entries (concurrent reload) surface as `unknown` rather than blocking the projection. `current_seq` is the bus cursor at projection time so consumers can pin a `subscribe_happenings` subscription to the same position and apply admit / unload events as deltas.
+
+### 4.10 `op = "subscribe_subject"`
+
+Per-subject push subscription. Emits a `SubscribedSubject` ack frame followed by `ProjectionUpdate` frames as the bus advances. Each `Happening` on the bus is filtered through a per-subject `affects_subject(canonical_id)` predicate; when the predicate hits, the steward re-projects the subject and sends the update.
+
+Request:
+
+```json
+{
+  "op": "subscribe_subject",
+  "canonical_id": "uuid-of-subject",
+  "scope": {
+    "relation_predicates": ["next", "prev"],
+    "max_depth": 2
+  },
+  "follow_aliases": true,
+  "since": 1234
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `canonical_id` | string | Required. Subject ID to subscribe to. |
+| `scope` | object | Optional. Same shape as `op = "project_subject"`'s scope: `relation_predicates`, `max_depth`, `max_visits`. |
+| `follow_aliases` | boolean | Optional, default `false`. When `true`, the subscription follows alias hops (subject merge / split) and re-targets the projection at the new canonical ID. |
+| `since` | integer | Optional. Same semantics as `subscribe_happenings.since`: replay-then-live across `happenings_log`. |
+
+Ack frame:
+
+```json
+{ "subscribed_subject": true, "current_seq": 42 }
+```
+
+Update frame (one per affecting happening):
+
+```json
+{
+  "projection_update": true,
+  "seq": 43,
+  "subject": { /* same shape as op = "project_subject" response */ }
+}
+```
+
+When `follow_aliases` is `true` and the subject is merged or split, the next update carries the projection of the new canonical ID; the consumer reads the new ID from the projection's `canonical_id` field. When `follow_aliases` is `false` and the subject becomes an alias, the stream emits one final update for the alias record then ends.
+
+The subscription ends when the client closes the connection or the subject is forgotten. There is no explicit unsubscribe frame.
+
+### 4.11 `op = "list_plugins"`
+
+Read-only inventory of every admitted plugin. The op is the inventory surface PLUGIN_PACKAGING.md §6 names; the operator-instruction half of the administration rack (writable verbs) ships in a follow-up.
+
+Request:
+
+```json
+{ "op": "list_plugins" }
+```
+
+Response:
+
+```json
+{
+  "plugins_inventory": true,
+  "current_seq": 142,
+  "plugins": [
+    {
+      "name": "org.example.echo",
+      "shelf": "example.echo",
+      "interaction_kind": "respondent"
+    },
+    {
+      "name": "org.example.warden",
+      "shelf": "example.warden",
+      "interaction_kind": "warden"
+    }
+  ]
+}
+```
+
+Entries are in router admission order. `interaction_kind` is `respondent` or `warden`; mid-transition entries (concurrent reload) surface as `unknown` rather than blocking the projection. `current_seq` is the bus cursor at projection time so consumers can pin a `subscribe_happenings` subscription to the same position and apply admit / unload events as deltas. An empty router is a valid census; the response carries `plugins: []` rather than an error.
 
 ## 5. Error Handling
 

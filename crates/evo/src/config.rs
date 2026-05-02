@@ -374,6 +374,20 @@ pub struct PluginsSection {
     /// plugins run as the steward user.
     #[serde(default)]
     pub security: PluginsSecurityConfig,
+    /// Grace window in seconds before persisted factory-instance
+    /// subjects whose owning plugin has not re-announced are forgotten.
+    /// At boot, persisted subjects under the
+    /// `evo-factory-instance` addressing scheme that were minted by a
+    /// factory plugin in a previous run carry over in the durable
+    /// store; if the plugin re-admits and re-announces them, they
+    /// remain. If the plugin does not re-admit, or admits but does
+    /// not re-announce a particular instance, the steward retracts
+    /// the orphan after this grace window expires. Default:
+    /// [`DEFAULT_FACTORY_ORPHAN_GRACE_SECS`] (30 seconds). Set to `0`
+    /// to disable the scrub entirely (orphans then accumulate
+    /// indefinitely).
+    #[serde(default = "default_factory_orphan_grace_secs")]
+    pub factory_orphan_grace_secs: u64,
 }
 
 fn default_plugin_data_root_path() -> PathBuf {
@@ -393,6 +407,13 @@ fn default_plugin_search_roots() -> Vec<PathBuf> {
         .iter()
         .map(|s| PathBuf::from(*s))
         .collect()
+}
+
+/// Default factory-orphan grace window in seconds.
+pub const DEFAULT_FACTORY_ORPHAN_GRACE_SECS: u64 = 30;
+
+fn default_factory_orphan_grace_secs() -> u64 {
+    DEFAULT_FACTORY_ORPHAN_GRACE_SECS
 }
 
 fn default_trust_dir_opt() -> PathBuf {
@@ -424,6 +445,7 @@ impl Default for PluginsSection {
             revocations_path: default_revocations_path(),
             degrade_trust: default_degrade_trust(),
             security: PluginsSecurityConfig::default(),
+            factory_orphan_grace_secs: default_factory_orphan_grace_secs(),
         }
     }
 }

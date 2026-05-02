@@ -21,8 +21,10 @@
 # `docs/engineering/RELEASE_PLANE.md`.
 #
 # This workflow supersedes the stop-gap
-# `evo-device-audio/.github/workflows/publish-core-binaries.yml`
-# per ADR-0032 and ADR-0033.
+# `evo-device-audio/.github/workflows/publish-core-binaries.yml`:
+# evo-core publishes its own binaries from this workflow, signed
+# with the framework release signing key, so distributions no
+# longer cross-build the framework binaries on their own behalf.
 
 name: publish
 
@@ -100,6 +102,7 @@ jobs:
           cross build --release --target ${{ matrix.target }} -p evo --bin evo
           cross build --release --target ${{ matrix.target }} -p evo-plugin-tool --bin evo-plugin-tool
           cross build --release --target ${{ matrix.target }} -p evo-example-echo --bin echo-wire
+          cross build --release --target ${{ matrix.target }} -p evo-example-factory --bin factory-wire
 
       - name: Host-build evo-plugin-tool (used to sign and pack bundles)
         run: |
@@ -143,6 +146,28 @@ jobs:
             sha256sum "$dst" | awk '{print $1}' > "$dst.sha256"
           done
 
+          # Reference systemd unit. Architecture-independent file
+          # shipped alongside the binaries so operators / packaging
+          # tooling can locate it from the same release directory the
+          # binary came from. The framework does not install it; per
+          # BOUNDARY.md packaging is distribution-owned. This is the
+          # canonical baseline a distribution copies into its own
+          # tree.
+          DIST_DIR="$STAGE_DIR/dist/systemd"
+          mkdir -p "$DIST_DIR"
+          cp dist/systemd/evo.service.example "$DIST_DIR/evo.service.example"
+          cp dist/systemd/README.md "$DIST_DIR/README.md"
+          AUX_SERVICE_SHA=$(sha256sum "$DIST_DIR/evo.service.example" \
+                            | awk '{print $1}')
+          AUX_README_SHA=$(sha256sum "$DIST_DIR/README.md" \
+                           | awk '{print $1}')
+
+          # The manifest carries each auxiliary file's path AND its
+          # sha256 digest. The manifest's own signature
+          # (`build-info.sig`) transitively covers the auxiliary
+          # file integrity: a consumer that verifies the manifest
+          # signature and then re-hashes each auxiliary path can
+          # detect tampering without per-file signatures.
           {
             echo "schema_version = 0"
             echo "kind = \"core-binaries\""
@@ -151,6 +176,14 @@ jobs:
             echo "binaries = [\"evo\", \"evo-plugin-tool\"]"
             echo "built_at = \"$(date -u +%FT%TZ)\""
             echo "publisher = \"${PUBLISHER}\""
+            echo
+            echo "[[auxiliary]]"
+            echo "path = \"dist/systemd/evo.service.example\""
+            echo "sha256 = \"${AUX_SERVICE_SHA}\""
+            echo
+            echo "[[auxiliary]]"
+            echo "path = \"dist/systemd/README.md\""
+            echo "sha256 = \"${AUX_README_SHA}\""
           } > "$STAGE_DIR/build-info.toml"
 
           openssl pkeyutl -sign \
@@ -165,7 +198,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -e
-          # Production-shaped OOP plugin bundle reference (ADR-0033 D25).
+          # Production-shaped OOP plugin bundle reference.
           # Per-arch bundle directory: manifest.toml + plugin.bin + manifest.sig
           # then packed as <name>-<version>-<target>.tar.gz.
           STAGE=/tmp/stage
@@ -177,6 +210,37 @@ jobs:
 
           cp crates/evo-example-echo/manifest.oop.toml "${BUNDLE_DIR}/manifest.toml"
           cp "target/${TARGET}/release/echo-wire" "${BUNDLE_DIR}/plugin.bin"
+          chmod 755 "${BUNDLE_DIR}/plugin.bin"
+
+          /tmp/host-evo-plugin-tool sign "${BUNDLE_DIR}" --key /tmp/key.pem
+
+          BUNDLE_OUT_DIR="${STAGE}/bundles/${BUNDLE_NAME}/${TARGET}"
+          mkdir -p "${BUNDLE_OUT_DIR}"
+          /tmp/host-evo-plugin-tool pack "${BUNDLE_DIR}" \
+              --out "${BUNDLE_OUT_DIR}/${BUNDLE_DIR_NAME}.tar.gz"
+
+          ls -la "${BUNDLE_OUT_DIR}"
+
+      - name: Stage, sign, and pack the factory OOP bundle for ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -e
+          # Reference factory plugin bundle. Mirrors the echo-bundle
+          # stanza above; bundle layout is identical
+          # (manifest.toml + plugin.bin + manifest.sig packed as
+          # <name>-<version>-<target>.tar.gz). Acceptance tests
+          # admit this bundle to validate the factory-instance
+          # codepath end-to-end on real hardware.
+          STAGE=/tmp/stage
+          BUNDLE_NAME="org.evo.example.factory"
+          BUNDLE_VERSION="0.1.0"
+          BUNDLE_DIR_NAME="${BUNDLE_NAME}-${BUNDLE_VERSION}-${TARGET}"
+          BUNDLE_DIR="${STAGE}/bundles-work/${BUNDLE_DIR_NAME}"
+          mkdir -p "${BUNDLE_DIR}"
+
+          cp crates/evo-example-factory/manifest.oop.toml "${BUNDLE_DIR}/manifest.toml"
+          cp "target/${TARGET}/release/factory-wire" "${BUNDLE_DIR}/plugin.bin"
           chmod 755 "${BUNDLE_DIR}/plugin.bin"
 
           /tmp/host-evo-plugin-tool sign "${BUNDLE_DIR}" --key /tmp/key.pem

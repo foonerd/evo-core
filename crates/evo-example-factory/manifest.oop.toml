@@ -1,0 +1,56 @@
+# Out-of-process bundle manifest for the example factory plugin.
+#
+# Production-shaped variant. The publish workflow stages a bundle
+# directory containing this file (renamed to `manifest.toml`) plus
+# the cross-compiled `factory-wire` binary as `plugin.bin`, signs
+# with the framework release signing key, packs as `.tar.gz`, and
+# pushes to the framework's artefacts repository.
+#
+# The companion in-process variant (`manifest.toml` in this same
+# directory) is what an in-process distribution embeds inline. Both
+# manifests describe the same plugin at the same version; only the
+# transport differs.
+
+[plugin]
+name = "org.evo.example.factory"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "example.factory"
+shape = 1
+
+[kind]
+instance = "factory"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.10"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.respondent]
+request_types = ["echo"]
+response_budget_ms = 1000
+
+[capabilities.factory]
+max_instances = 8
+instance_ttl_seconds = 0

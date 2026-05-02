@@ -61,6 +61,8 @@ Structural queries answer questions like:
 - What outputs does the storage rack see?
 - What is the network rack's current connectivity?
 
+The reachable wire op today is `project_rack` (`CLIENT_API.md` §4.9), which returns the rack's declared shelves plus the plugin currently admitted on each. The full plugin-contributed projection composition described in §5 of this doc remains the design target; the v0 wire op covers the structural-census half.
+
 ### 3.2 Federated Queries
 
 A federated query asks for everything the fabric knows about a subject:
@@ -81,6 +83,8 @@ Federated queries answer questions like:
 - Tell me about this track (title, duration, artwork, performer, album, playback state).
 - Tell me about this storage root (mount state, contents summary, reachability).
 - Tell me about this network endpoint (address, protocols, availability).
+
+The reachable wire ops today are `project_subject` (one-shot snapshot, `CLIENT_API.md` §4.2) and `subscribe_subject` (push subscription, `CLIENT_API.md` §4.10). The push subscription emits a `ProjectionUpdate` frame whenever a `Happening` on the bus affects the subject (`affects_subject(canonical_id)` predicate on every variant).
 
 ### 3.3 Interplay
 

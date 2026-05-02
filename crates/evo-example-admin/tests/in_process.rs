@@ -314,6 +314,8 @@ async fn admin_forced_retract_addressing_removes_stale_entry() {
         payload: serde_json::to_vec(&body).unwrap(),
         correlation_id: 1,
         deadline: None,
+
+        instance_id: None,
     };
     let resp = engine
         .router()
@@ -371,6 +373,8 @@ async fn admin_forced_retract_claim_removes_other_plugin_claim() {
         payload: serde_json::to_vec(&body).unwrap(),
         correlation_id: 2,
         deadline: None,
+
+        instance_id: None,
     };
     engine
         .router()
@@ -577,6 +581,8 @@ async fn admin_merge_collapses_two_tracks() {
         payload: serde_json::to_vec(&body).unwrap(),
         correlation_id: 3,
         deadline: None,
+
+        instance_id: None,
     };
     engine
         .router()
@@ -647,6 +653,8 @@ async fn admin_split_creates_new_subjects() {
         payload: serde_json::to_vec(&body).unwrap(),
         correlation_id: 4,
         deadline: None,
+
+        instance_id: None,
     };
     engine
         .router()
@@ -698,6 +706,8 @@ async fn admin_suppress_hides_relation() {
         payload: serde_json::to_vec(&body).unwrap(),
         correlation_id: 5,
         deadline: None,
+
+        instance_id: None,
     };
     engine
         .router()
@@ -763,6 +773,8 @@ async fn admin_unsuppress_restores_relation() {
                 payload: serde_json::to_vec(&suppress).unwrap(),
                 correlation_id: 6,
                 deadline: None,
+
+                instance_id: None,
             },
         )
         .await
@@ -800,6 +812,8 @@ async fn admin_unsuppress_restores_relation() {
                 payload: serde_json::to_vec(&unsuppress).unwrap(),
                 correlation_id: 7,
                 deadline: None,
+
+                instance_id: None,
             },
         )
         .await

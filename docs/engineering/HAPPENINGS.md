@@ -58,7 +58,7 @@ pub enum Happening {
 
 ### 3.1 Current Variants
 
-Eighteen variants ship today across five categories. All variants carry an `at: SystemTime` field (the steward's clock when the happening was emitted) - omitted from the per-variant tables below to keep them readable. JSON shapes are in `SCHEMAS.md` section 5.1.
+Twenty variants ship today across six categories. All variants carry an `at: SystemTime` field (the steward's clock when the happening was emitted) - omitted from the per-variant tables below to keep them readable. JSON shapes are in `SCHEMAS.md` section 5.1.
 
 **Custody transitions**
 
@@ -83,6 +83,13 @@ Eighteen variants ship today across five categories. All variants carry an `at: 
 | Variant | Trigger | Carries (besides `at`) |
 |---------|---------|------------------------|
 | `SubjectForgotten` | A subject's last addressing was retracted and the registry record was removed. Emitted BEFORE any cascade `RelationForgotten` events for the same forget. | `plugin`, `canonical_id`, `subject_type` |
+
+**Factory instance lifecycle**
+
+| Variant | Trigger | Carries (besides `at`) |
+|---------|---------|------------------------|
+| `FactoryInstanceAnnounced` | A factory plugin called `instance_announcer.announce(...)` and the wiring layer minted the corresponding subject. The `<plugin>/<instance_id>` pair is the stable external identity; `canonical_id` is the registry-minted UUID consumers use to address the instance. | `plugin`, `instance_id`, `canonical_id`, `shelf`, `payload_bytes` |
+| `FactoryInstanceRetracted` | A factory plugin retracted an instance, OR the steward's drain stage retracted on the plugin's behalf at unload time. Emitted after the underlying subject's addressing is removed. | `plugin`, `instance_id`, `canonical_id`, `shelf` |
 
 **Admin (privileged) operations**
 
@@ -124,7 +131,6 @@ The variant set is open. Categories identified but not yet modelled (aligned wit
 
 - Subject announcement (`SubjectAnnounced`) on first registry insertion (today subscribers infer "new subject" by observing the first projection).
 - Admission events (`PluginAdmitted`, `PluginUnloaded`, `PluginFailed`).
-- Factory instance lifecycle (factory admission is reserved; see `STEWARD.md` 12.7).
 - Projection invalidations (push-style projections are reserved; see `STEWARD.md` 12.5).
 - Fast-path transitions (the fast path is reserved; see `STEWARD.md` 12.6 and `FAST_PATH.md`).
 - Catalogue grammar survival (`SubjectGrammarOrphan`, paired with the structured re-statement verb described in `CATALOGUE.md` section 5.3).
@@ -360,7 +366,7 @@ Categories on the roadmap (see 3.3). The pattern is mechanically simple: add a v
 
 ### 11.2 Per-rack or Per-subject Filtering
 
-Today a subscriber receives every happening on the bus and filters client-side. If variant count grows, a server-side filtered subscription (subscribe only to `CustodyStateReported` for `plugin = X`, or only to transitions on a specific subject) becomes attractive. Adds complexity to the bus; not justified yet.
+Server-side filtering ships today as the `filter` field on `op = "subscribe_happenings"`: variants / plugins / shelves dimensions, AND'd, applied on both replay and live paths (`CLIENT_API.md` §4.5). Per-subject push subscription ships as `op = "subscribe_subject"` (`CLIENT_API.md` §4.10), which uses an `affects_subject(canonical_id)` predicate over every `Happening` variant to decide when to re-project. Per-rack subscription is the remaining design space; not justified yet.
 
 ### 11.3 Aggregation / Coalescing
 

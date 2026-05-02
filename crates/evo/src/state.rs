@@ -13,10 +13,9 @@
 //! handle bag so concurrent client requests on different plugins no
 //! longer serialise on a single mutex.
 //!
-//! Phase 1 introduces the type alongside the engine without
-//! integrating it; nothing in the steward consumes `StewardState`
-//! yet. The type and its builder are public so downstream phases can
-//! wire them in.
+//! The handle bag is shared by every store + engine in the steward;
+//! `StewardState::builder` constructs it from the per-store
+//! components admission and dispatch consume.
 
 use std::sync::Arc;
 
@@ -74,11 +73,12 @@ pub struct StewardState {
     /// administration action an admitted admin plugin performs via
     /// the `SubjectAdmin` / `RelationAdmin` callbacks.
     pub admin: Arc<AdminLedger>,
-    /// Durable backing store for the subject-identity slice of the
-    /// fabric. Phase 1 attaches the handle without integrating it;
-    /// subsequent phases route the subject registry write path and
-    /// the boot-time replay through it. The trait is held as a
-    /// `dyn` reference so tests can substitute the in-memory mock.
+    /// Durable backing store for the persistent slice of the
+    /// fabric. The subject registry, custody ledger, relation graph,
+    /// admin ledger, and happenings cursor all write through here;
+    /// boot-time replay rehydrates each store from the persisted
+    /// rows. The trait is held as a `dyn` reference so tests can
+    /// substitute the in-memory mock.
     pub persistence: Arc<dyn PersistenceStore>,
     /// Issuer for claimant tokens. Held by every wire-emission site
     /// that needs to translate a plugin name into the consumer-

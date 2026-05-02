@@ -2,7 +2,7 @@
 //!
 //! Carries the data types plugins use to assert and retract relations
 //! between subjects, per `docs/engineering/RELATIONS.md`. The
-//! [`RelationAnnouncer`] trait itself lives in
+//! [`RelationAnnouncer`](super::context::RelationAnnouncer) trait itself lives in
 //! [`context`](super::context) alongside the other callback traits.
 //!
 //! ## The shape of a relation

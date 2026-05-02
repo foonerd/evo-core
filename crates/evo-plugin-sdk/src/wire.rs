@@ -37,13 +37,15 @@
 //! types; breaking changes to them require bumping
 //! [`PROTOCOL_VERSION`].
 //!
-//! ## Types deliberately excluded from v0
+//! ## Types deliberately excluded from v1
 //!
-//! - Factory verbs (`announce_instance`, `retract_instance`): not
-//!   yet covered.
 //! - User-interaction requests: deferred.
 //! - Hot reload (`reload_in_place`): deferred.
-//! - Cancellation frames: the v0 protocol relies on deadline expiry.
+//! - Cancellation frames: the v1 protocol relies on deadline expiry.
+//!
+//! Factory verbs (`announce_instance`, `retract_instance`) are
+//! covered as `AnnounceInstance` / `RetractInstance` frames; see
+//! the variants under the "factory verbs" comments below.
 //!
 //! ## Warden verbs
 //!
@@ -56,6 +58,7 @@
 //! `CourseCorrect` frame to match the pattern used by
 //! `HandleRequest`.
 
+use crate::contract::factory::{InstanceAnnouncement, InstanceId};
 use crate::contract::{
     AliasRecord, CustodyHandle, ExplicitRelationAssignment, ExternalAddressing,
     HealthReport, HealthStatus, PluginDescription, RelationAssertion,
@@ -178,6 +181,14 @@ pub enum WireFrame {
         payload: Vec<u8>,
         /// Optional call deadline in milliseconds from now.
         deadline_ms: Option<u64>,
+        /// Target instance for factory-stocked shelves. `None` for
+        /// singleton shelves and for legacy clients that omit the
+        /// field. Plugins receiving a non-None value dispatch to the
+        /// named instance internally; plugins receiving None on a
+        /// factory-stocked shelf MAY return an error explaining the
+        /// requirement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<String>,
     },
 
     // ---------------------------------------------------------------
@@ -405,6 +416,35 @@ pub enum WireFrame {
         plugin: String,
         /// The retraction.
         retraction: RelationRetraction,
+    },
+
+    /// Factory instance announcement event. Sent by an out-of-process
+    /// factory plugin when its `InstanceAnnouncer::announce` callback
+    /// fires; the steward responds with `EventAck` (success) or
+    /// `Error` (rejection) using the same correlation ID.
+    AnnounceInstance {
+        /// Protocol version.
+        v: u16,
+        /// Event's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The announcement.
+        announcement: InstanceAnnouncement,
+    },
+
+    /// Factory instance retraction event. Sent by an out-of-process
+    /// factory plugin when its `InstanceAnnouncer::retract` callback
+    /// fires.
+    RetractInstance {
+        /// Protocol version.
+        v: u16,
+        /// Event's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The instance ID being retracted.
+        instance_id: InstanceId,
     },
 
     /// Custody state report event. Warden publishes a state change for
@@ -826,6 +866,8 @@ impl WireFrame {
             | Self::RetractSubject { v, cid, plugin, .. }
             | Self::AssertRelation { v, cid, plugin, .. }
             | Self::RetractRelation { v, cid, plugin, .. }
+            | Self::AnnounceInstance { v, cid, plugin, .. }
+            | Self::RetractInstance { v, cid, plugin, .. }
             | Self::ReportCustodyState { v, cid, plugin, .. }
             | Self::DescribeAlias { v, cid, plugin, .. }
             | Self::DescribeAliasResponse { v, cid, plugin, .. }
@@ -924,6 +966,8 @@ impl WireFrame {
                 | Self::RetractSubject { .. }
                 | Self::AssertRelation { .. }
                 | Self::RetractRelation { .. }
+                | Self::AnnounceInstance { .. }
+                | Self::RetractInstance { .. }
                 | Self::ReportCustodyState { .. }
         )
     }
@@ -1280,6 +1324,7 @@ mod tests {
             request_type: "ping".into(),
             payload: b"hello".to_vec(),
             deadline_ms: Some(1000),
+            instance_id: None,
         };
         let json = serde_json::to_string(&orig).unwrap();
         let back: WireFrame = serde_json::from_str(&json).unwrap();
@@ -1295,6 +1340,7 @@ mod tests {
             request_type: "ping".into(),
             payload: b"hello".to_vec(),
             deadline_ms: None,
+            instance_id: None,
         };
         let json = serde_json::to_string(&orig).unwrap();
         // "hello" -> base64 "aGVsbG8=". Assert on the exact string form
@@ -1564,13 +1610,14 @@ mod tests {
 
     #[test]
     fn supported_codecs_include_json_first() {
-        // Wave 2.2 only supports JSON; leaving this assertion in
-        // place ensures a future codec addition has to update the
-        // test rather than silently changing the on-wire default.
+        // The codec-negotiation default ships with JSON only;
+        // leaving this assertion in place ensures a future codec
+        // addition has to update the test rather than silently
+        // changing the on-wire default.
         assert_eq!(SUPPORTED_CODECS.first().copied(), Some("json"));
     }
 
-    // ---- Wave 2.3 admin-verb wire frames ----
+    // ---- Admin-verb wire frames ----
 
     #[test]
     fn forced_retract_addressing_round_trip() {
@@ -2142,6 +2189,7 @@ mod tests {
                             request_type,
                             payload,
                             deadline_ms,
+                            instance_id: None,
                         }
                     },
                 ),

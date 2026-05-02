@@ -11,7 +11,7 @@
 //! ```
 //!
 //! The length is a `u32` in network byte order. The payload is the
-//! codec-encoded [`WireFrame`](crate::wire::WireFrame) body.
+//! codec-encoded [`WireFrame`] body.
 //!
 //! ## Codec
 //!

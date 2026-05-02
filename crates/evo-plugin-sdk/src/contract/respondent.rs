@@ -63,6 +63,17 @@ pub struct Request {
     /// Optional deadline. If set, the steward expects the response before
     /// this time; after the deadline the steward may cancel the request.
     pub deadline: Option<Instant>,
+    /// Target instance, set by the client when dispatching to a
+    /// factory-stocked shelf.
+    ///
+    /// Singleton plugins always receive `None` and ignore the field.
+    /// Factory plugins receive the client-supplied
+    /// [`InstanceId`](crate::contract::factory::InstanceId) string and
+    /// dispatch internally to the right instance state. The framework
+    /// does not validate that the id is currently announced; that is
+    /// the plugin's responsibility (the plugin's own announce/retract
+    /// bookkeeping is the source of truth for live instances).
+    pub instance_id: Option<String>,
 }
 
 impl Request {
@@ -126,6 +137,8 @@ mod tests {
             payload: vec![],
             correlation_id: 42,
             deadline: None,
+
+            instance_id: None,
         };
         let resp = Response::for_request(&req, vec![1, 2, 3]);
         assert_eq!(resp.correlation_id, 42);
@@ -139,6 +152,8 @@ mod tests {
             payload: vec![],
             correlation_id: 1,
             deadline: None,
+
+            instance_id: None,
         };
         assert!(req.remaining().is_none());
         assert!(!req.is_past_deadline());
@@ -151,6 +166,7 @@ mod tests {
             payload: vec![],
             correlation_id: 1,
             deadline: Some(Instant::now() + Duration::from_secs(10)),
+            instance_id: None,
         };
         let remaining = req.remaining().unwrap();
         assert!(remaining > Duration::from_secs(5));
@@ -164,6 +180,7 @@ mod tests {
             payload: vec![],
             correlation_id: 1,
             deadline: Some(Instant::now() - Duration::from_secs(1)),
+            instance_id: None,
         };
         assert_eq!(req.remaining().unwrap(), Duration::ZERO);
         assert!(req.is_past_deadline());

@@ -234,6 +234,12 @@ enum ClientRequest {
         /// Base64-encoded request payload.
         #[serde(default)]
         payload_b64: String,
+        /// Target instance for factory-stocked shelves. `None` for
+        /// singleton shelves and for legacy clients that omit the
+        /// field; the steward forwards the value to the plugin
+        /// unchanged.
+        #[serde(default)]
+        instance_id: Option<String>,
     },
     /// Compose a federated projection for a canonical subject.
     ProjectSubject {
@@ -301,6 +307,70 @@ enum ClientRequest {
         /// preserves pre-filter behaviour exactly.
         #[serde(default)]
         filter: HappeningFilterWire,
+    },
+    /// List every admitted plugin: the read-only inspection
+    /// surface PLUGIN_PACKAGING.md §6 names as the
+    /// `plugins.installed` shelf of the administration rack.
+    /// Returns one entry per admitted plugin with name, shelf,
+    /// and interaction kind. Answers the "what plugins are
+    /// running" question without requiring a full
+    /// administration-rack subsystem.
+    ///
+    /// The operator-instruction half of the rack
+    /// (`plugins.operator` shelf: enable / disable / uninstall /
+    /// purge verbs) and the admission-origin / reloadable
+    /// telemetry land alongside the writable verbs in a
+    /// follow-up; the reachable single-plugin lifecycle
+    /// operation today (`reload_plugin`) lives on the admission
+    /// engine, not on this op.
+    ListPlugins,
+    /// Structural projection of a rack: a census of every shelf
+    /// the rack declares plus the plugin currently admitted on
+    /// each (or `null` when the shelf is empty). Answers the
+    /// "what plugins / sources / mounts exist on this rack"
+    /// shape PROJECTIONS.md §3.1 names.
+    ///
+    /// Lightweight by design: walks the catalogue's
+    /// rack-declaration plus the router's admission table.
+    /// Plugin-side state-report contributions composed into a
+    /// shelf's declared structural shape are out of scope
+    /// today; PROJECTIONS.md §4 discusses that surface as a
+    /// later release-window concern.
+    ProjectRack {
+        /// Rack name as declared in the catalogue (e.g.
+        /// `"audio"`, `"storage"`, `"example"`).
+        rack: String,
+    },
+    /// Subscribe to projection updates for a single subject.
+    ///
+    /// Promotes the connection to streaming mode parallel to
+    /// `SubscribeHappenings` but scoped to one canonical id. The
+    /// server emits one `SubscribedSubject` ack with
+    /// `current_seq`, then one `ProjectionUpdate` carrying the
+    /// initial projection of the subject, then one further
+    /// `ProjectionUpdate` for every subsequent happening that
+    /// affects the subject (per `Happening::affects_subject`).
+    ///
+    /// Filtering criteria — same `scope` and `follow_aliases`
+    /// shape as the `project_subject` pull op so a consumer
+    /// switching from poll to push uses the same projection
+    /// definition. Live-only at v0.1.11: no `since` cursor, no
+    /// durable replay; consumers reconnecting fetch a fresh
+    /// initial projection.
+    SubscribeSubject {
+        /// Canonical subject id to project.
+        canonical_id: String,
+        /// Projection scope (which predicates to walk and the
+        /// neighbour radius). Same shape as
+        /// [`ClientRequest::ProjectSubject`].
+        #[serde(default)]
+        scope: ProjectionScopeWire,
+        /// If `true` and `canonical_id` resolves to a forgotten
+        /// subject via the alias chain, the server walks to the
+        /// successor canonical id and projects that instead.
+        /// Subscription remains bound to the resolved id.
+        #[serde(default)]
+        follow_aliases: bool,
     },
     /// Paginated list of every live subject in the registry.
     ///
@@ -637,6 +707,71 @@ enum ClientResponse {
         /// The happening itself, shaped per [`HappeningWire`].
         happening: HappeningWire,
     },
+    /// Plugin inventory — one entry per admitted plugin, in
+    /// admission order. Distinguished by the `plugins` key.
+    Plugins {
+        /// Always `true`; key disambiguates the variant.
+        plugins_inventory: bool,
+        /// Bus cursor at projection time; consumers reconcile
+        /// with the happenings stream by pinning to this and
+        /// applying admit / unload events as deltas.
+        current_seq: u64,
+        /// One entry per admitted plugin in admission order.
+        plugins: Vec<PluginInventoryEntry>,
+    },
+    /// Structural projection of a rack: census of declared
+    /// shelves plus admitted occupants. Returned by the
+    /// `op = "project_rack"` request. Distinguished by the
+    /// `rack_projection` key.
+    RackProjection {
+        /// Always `true`; key disambiguates the variant.
+        rack_projection: bool,
+        /// Rack name (echoed from the request).
+        rack: String,
+        /// Rack charter from the catalogue.
+        charter: String,
+        /// Bus cursor at projection time. Consumers reconcile
+        /// the snapshot with the happenings stream by pinning
+        /// to this cursor, then consuming `seq > current_seq`
+        /// happenings as deltas (admissions / unloads).
+        current_seq: u64,
+        /// One entry per shelf the rack declares, in catalogue
+        /// order. `occupant` is `None` when no plugin is
+        /// admitted on that shelf.
+        shelves: Vec<RackShelfEntry>,
+    },
+    /// Subject-subscription ack (sent once at the start of a
+    /// `SubscribeSubject` stream). Distinguished by the
+    /// `subscribed_subject` key.
+    SubscribedSubject {
+        /// Always `true`; key disambiguates the variant.
+        subscribed_subject: bool,
+        /// Canonical id the server actually bound to. May
+        /// differ from the requested id if `follow_aliases`
+        /// was set and the requested id resolved to a
+        /// successor via the alias chain.
+        canonical_id: String,
+        /// Bus cursor at subscribe time. `0` if no happenings
+        /// have been emitted on this steward instance yet.
+        current_seq: u64,
+    },
+    /// One projection update from a `SubscribeSubject` stream.
+    /// The first update is the initial projection; subsequent
+    /// updates fire whenever a happening affecting the subject
+    /// (per `Happening::affects_subject`) is emitted on the bus.
+    ProjectionUpdate {
+        /// Bus cursor of the happening that triggered this
+        /// update. The initial update carries `seq = 0` to
+        /// mark "snapshot, not driven by a specific event."
+        seq: u64,
+        /// Canonical id the projection is for.
+        canonical_id: String,
+        /// Projection payload — same shape as the
+        /// [`ClientResponse::Projection`] variant returned by
+        /// the pull op so a client switching from poll to push
+        /// uses the same parser.
+        projection: serde_json::Value,
+    },
     /// Notification that the subscriber fell behind the bus's buffer
     /// and missed events. Carries enough context for the consumer
     /// to choose between a durable replay (when the gap is within
@@ -767,6 +902,71 @@ struct LaggedSignal {
     /// snapshot reconcile pin the list ops to this value and apply
     /// happenings with `seq > current_seq` as deltas on top.
     current_seq: u64,
+}
+
+/// One row in a [`ClientResponse::Plugins`] inventory listing.
+///
+/// Carries the admission identity (name, shelf) plus the
+/// interaction shape (respondent / warden). The
+/// admission-origin / reloadable telemetry is intentionally
+/// absent in this build: the wire layer holds a router handle
+/// only, not the admission engine, and surfacing a synthetic
+/// flag here would lie about state the steward cannot
+/// authoritatively project. The follow-up that adds the
+/// operator-instruction shelf (`plugins.operator`: enable /
+/// disable / uninstall / purge / reload) carries those fields
+/// alongside the writable verbs.
+#[derive(Debug, Serialize)]
+struct PluginInventoryEntry {
+    /// Canonical plugin name.
+    name: String,
+    /// Fully-qualified shelf the plugin occupies
+    /// (`<rack>.<shelf>`).
+    shelf: String,
+    /// `respondent` or `warden`; matches the manifest's
+    /// `kind.interaction`. Falls back to `unknown` when the
+    /// plugin handle is in mid-transition (e.g. concurrent
+    /// reload).
+    interaction_kind: String,
+}
+
+/// One shelf entry in a [`ClientResponse::RackProjection`]: the
+/// shelf's declared shape plus the occupant plugin (when any).
+#[derive(Debug, Serialize)]
+struct RackShelfEntry {
+    /// Shelf name within the rack (e.g. `"transport"`).
+    name: String,
+    /// Fully-qualified shelf name (`<rack>.<shelf>`), the same
+    /// form a manifest's `target.shelf` carries.
+    fully_qualified: String,
+    /// Current shape version the shelf declares.
+    shape: u32,
+    /// Older shapes the shelf still admits (the
+    /// `Shelf.shape_supports` migration window). Empty by
+    /// default; when populated, plugins targeting any of these
+    /// shapes admit alongside the current one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    shape_supports: Vec<u32>,
+    /// One-line shelf description from the catalogue.
+    description: String,
+    /// The plugin currently admitted on this shelf, or `None`
+    /// when the shelf is empty. Empty shelves are still
+    /// reported so consumers see the rack's structural
+    /// surface regardless of what is admitted; an empty
+    /// occupant is itself information.
+    occupant: Option<RackShelfOccupant>,
+}
+
+/// Description of the plugin admitted on a rack shelf, returned
+/// inside a [`RackShelfEntry`].
+#[derive(Debug, Serialize)]
+struct RackShelfOccupant {
+    /// Canonical plugin name.
+    plugin: String,
+    /// `respondent` or `warden`, matching the manifest's
+    /// `kind.interaction`. Distinguishes request-response
+    /// plugins from custody-holding ones at a glance.
+    interaction_kind: String,
 }
 
 /// One subject row in a [`ClientResponse::SubjectsPage`].
@@ -1523,6 +1723,35 @@ enum HappeningWire {
         /// When the happening was recorded, ms since UNIX epoch.
         at_ms: u64,
     },
+    /// Wire form of [`Happening::FactoryInstanceAnnounced`].
+    FactoryInstanceAnnounced {
+        /// Opaque token identifying the announcing factory plugin.
+        claimant_token: ClaimantToken,
+        /// Plugin-owned instance identifier.
+        instance_id: String,
+        /// Registry-minted canonical ID for the instance subject.
+        canonical_id: String,
+        /// Factory's `target.shelf`.
+        shelf: String,
+        /// Length of the announcement payload in bytes.
+        payload_bytes: usize,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::FactoryInstanceRetracted`].
+    FactoryInstanceRetracted {
+        /// Opaque token identifying the factory plugin.
+        claimant_token: ClaimantToken,
+        /// Plugin-owned instance identifier.
+        instance_id: String,
+        /// Registry canonical ID that addressed the instance prior
+        /// to retraction.
+        canonical_id: String,
+        /// Factory's `target.shelf`.
+        shelf: String,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
 }
 
 /// Wire form of
@@ -1921,6 +2150,34 @@ impl HappeningWire {
                 canonical_ids,
                 at_ms: system_time_to_ms(at),
             },
+            Happening::FactoryInstanceAnnounced {
+                plugin,
+                instance_id,
+                canonical_id,
+                shelf,
+                payload_bytes,
+                at,
+            } => HappeningWire::FactoryInstanceAnnounced {
+                claimant_token: issuer.token_for(&plugin),
+                instance_id,
+                canonical_id,
+                shelf,
+                payload_bytes,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::FactoryInstanceRetracted {
+                plugin,
+                instance_id,
+                canonical_id,
+                shelf,
+                at,
+            } => HappeningWire::FactoryInstanceRetracted {
+                claimant_token: issuer.token_for(&plugin),
+                instance_id,
+                canonical_id,
+                shelf,
+                at_ms: system_time_to_ms(at),
+            },
         }
     }
 }
@@ -2287,6 +2544,23 @@ async fn handle_connection(
             .await;
         }
 
+        if let ClientRequest::SubscribeSubject {
+            canonical_id,
+            scope,
+            follow_aliases,
+        } = req
+        {
+            return run_subject_subscription(
+                stream,
+                Arc::clone(&state),
+                Arc::clone(&projections),
+                canonical_id,
+                scope.into(),
+                follow_aliases,
+            )
+            .await;
+        }
+
         let response = dispatch_request(
             req,
             &router,
@@ -2389,9 +2663,16 @@ async fn dispatch_request(
             shelf,
             request_type,
             payload_b64,
+            instance_id,
         } => {
-            handle_plugin_request(router, shelf, request_type, payload_b64)
-                .await
+            handle_plugin_request(
+                router,
+                shelf,
+                request_type,
+                payload_b64,
+                instance_id,
+            )
+            .await
         }
         ClientRequest::ProjectSubject {
             canonical_id,
@@ -2406,6 +2687,12 @@ async fn dispatch_request(
                 follow_aliases,
             )
             .await
+        }
+        ClientRequest::ProjectRack { rack } => {
+            handle_project_rack(state, router, rack)
+        }
+        ClientRequest::ListPlugins => {
+            handle_list_plugins(state, router).await
         }
         ClientRequest::DescribeAlias {
             subject_id,
@@ -2440,6 +2727,16 @@ async fn dispatch_request(
                 error: ApiError::new(
                     ErrorClass::Internal,
                     "internal: subscribe_happenings reached dispatch path",
+                )
+                .with_subclass("dispatch_misroute"),
+            }
+        }
+        ClientRequest::SubscribeSubject { .. } => {
+            // Same intercept as subscribe_happenings; defensive.
+            ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    "internal: subscribe_subject reached dispatch path",
                 )
                 .with_subclass("dispatch_misroute"),
             }
@@ -2795,6 +3092,232 @@ async fn run_subscription(
     }
 }
 
+/// Project a subject and send the result as a `ProjectionUpdate`
+/// frame. Returns `true` on successful write, `false` if the
+/// client disconnected.
+///
+/// Forgotten subjects produce a frame whose `projection` is
+/// JSON `null` so the consumer sees the lifecycle transition
+/// instead of silently stopping.
+async fn project_and_send_subject(
+    stream: &mut UnixStream,
+    projections: &ProjectionEngine,
+    issuer: &ClaimantTokenIssuer,
+    scope: &ProjectionScope,
+    canonical_id: &str,
+    seq: u64,
+) -> bool {
+    match projections.project_subject(canonical_id, scope) {
+        Ok(p) => {
+            let wire = SubjectProjectionWire::from_projection(p, issuer);
+            let payload = serde_json::to_value(&wire)
+                .unwrap_or(serde_json::Value::Null);
+            let frame = ClientResponse::ProjectionUpdate {
+                seq,
+                canonical_id: canonical_id.to_string(),
+                projection: payload,
+            };
+            write_response_frame(stream, &frame).await.is_ok()
+        }
+        Err(ProjectionError::UnknownSubject(_)) => {
+            let frame = ClientResponse::ProjectionUpdate {
+                seq,
+                canonical_id: canonical_id.to_string(),
+                projection: serde_json::Value::Null,
+            };
+            write_response_frame(stream, &frame).await.is_ok()
+        }
+    }
+}
+
+/// Run a `subscribe_subject` push subscription.
+///
+/// Promotes the connection to streaming mode parallel to
+/// [`run_subscription`] but scoped to one canonical subject id.
+/// The first frame is a `SubscribedSubject` ack; the second is
+/// the initial `ProjectionUpdate` carrying a fresh projection
+/// of the subject; subsequent updates fire whenever a happening
+/// affecting the subject (per
+/// [`Happening::affects_subject`]) is emitted on the bus.
+///
+/// Live-only at v0.1.11: no `since` cursor, no durable replay.
+/// Consumers reconnecting always fetch a fresh initial
+/// projection.
+async fn run_subject_subscription(
+    mut stream: UnixStream,
+    state: Arc<StewardState>,
+    projections: Arc<ProjectionEngine>,
+    canonical_id: String,
+    scope: ProjectionScope,
+    follow_aliases: bool,
+) -> Result<(), StewardError> {
+    // Resolve the alias chain so the subscription binds to the
+    // terminal id when follow_aliases is set. Without
+    // resolution the subscriber would observe the requested id
+    // (now an alias) and never see updates; the bus broadcasts
+    // happenings against the canonical successor.
+    let querier = RegistrySubjectQuerier::new(projections.registry());
+    let effective_id = match querier
+        .describe_subject_with_aliases(canonical_id.clone())
+        .await
+    {
+        Ok(SubjectQueryResult::Found { .. }) => canonical_id.clone(),
+        Ok(SubjectQueryResult::Aliased { terminal, .. })
+            if follow_aliases =>
+        {
+            match terminal {
+                Some(t) => t.id.as_str().to_string(),
+                None => {
+                    let frame = ClientResponse::Error {
+                        error: ApiError::new(
+                            ErrorClass::NotFound,
+                            format!(
+                                "subject {canonical_id} aliased through a \
+                                 forked chain; cannot bind subscription"
+                            ),
+                        )
+                        .with_subclass("alias_chain_forked"),
+                    };
+                    let _ = write_response_frame(&mut stream, &frame).await;
+                    return Ok(());
+                }
+            }
+        }
+        Ok(SubjectQueryResult::Aliased { .. }) => {
+            // follow_aliases = false on an aliased subject: the
+            // request is structurally well-formed but the
+            // server cannot deliver updates because the
+            // requested id no longer resolves and the consumer
+            // chose not to follow. Refuse with a clear error.
+            let frame = ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::NotFound,
+                    format!(
+                        "subject {canonical_id} is an alias; pass \
+                         follow_aliases = true to bind to the terminal id"
+                    ),
+                )
+                .with_subclass("alias_chain_unresolved"),
+            };
+            let _ = write_response_frame(&mut stream, &frame).await;
+            return Ok(());
+        }
+        Ok(SubjectQueryResult::NotFound) => {
+            let frame = ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::NotFound,
+                    format!("unknown subject: {canonical_id}"),
+                )
+                .with_subclass("unknown_subject"),
+            };
+            let _ = write_response_frame(&mut stream, &frame).await;
+            return Ok(());
+        }
+        Ok(_) => {
+            // Forward-compat hedge against
+            // `SubjectQueryResult` gaining a future variant.
+            let frame = ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    "unsupported SubjectQueryResult variant",
+                )
+                .with_subclass("unsupported_variant"),
+            };
+            let _ = write_response_frame(&mut stream, &frame).await;
+            return Ok(());
+        }
+        Err(e) => {
+            let frame = ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("describe_subject_with_aliases: {e}"),
+                )
+                .with_subclass("alias_lookup_failed"),
+            };
+            let _ = write_response_frame(&mut stream, &frame).await;
+            return Ok(());
+        }
+    };
+
+    // Subscribe before sampling current_seq so events emitted
+    // concurrently with the initial projection are buffered, not
+    // lost. Same invariant as `run_subscription`.
+    let (mut rx, current_seq) = state.bus.subscribe_with_current_seq().await;
+
+    let ack = ClientResponse::SubscribedSubject {
+        subscribed_subject: true,
+        canonical_id: effective_id.clone(),
+        current_seq,
+    };
+    if write_response_frame(&mut stream, &ack).await.is_err() {
+        return Ok(());
+    }
+
+    // Initial snapshot. Marked with seq = 0 to signal "snapshot,
+    // not driven by a specific event"; subsequent updates carry
+    // the bus seq of the triggering happening.
+    if !project_and_send_subject(
+        &mut stream,
+        &projections,
+        &state.claimant_issuer,
+        &scope,
+        &effective_id,
+        0,
+    )
+    .await
+    {
+        return Ok(());
+    }
+
+    // Live phase. Forward a fresh projection on every happening
+    // that affects the subject. The bus subscription is dropped
+    // when this function returns.
+    loop {
+        match rx.recv().await {
+            Ok(env) => {
+                if !env.happening.affects_subject(&effective_id) {
+                    continue;
+                }
+                if !project_and_send_subject(
+                    &mut stream,
+                    &projections,
+                    &state.claimant_issuer,
+                    &scope,
+                    &effective_id,
+                    env.seq,
+                )
+                .await
+                {
+                    return Ok(());
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(missed_count)) => {
+                // Subscriber fell behind. Surface a structured
+                // signal mirroring the happenings-stream Lagged
+                // shape and exit. Consumers reconnect to get a
+                // fresh subscription.
+                let oldest_available_seq = state
+                    .persistence
+                    .load_oldest_happening_seq()
+                    .await
+                    .unwrap_or(0);
+                let frame = ClientResponse::Lagged {
+                    lagged: LaggedSignal {
+                        missed_count,
+                        oldest_available_seq,
+                        current_seq: state.bus.last_emitted_seq(),
+                    },
+                };
+                let _ = write_response_frame(&mut stream, &frame).await;
+                return Ok(());
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                return Ok(());
+            }
+        }
+    }
+}
+
 /// Dispatch a plugin request (`op = "request"`).
 ///
 /// Routes through the [`PluginRouter`] directly: no admission-engine
@@ -2806,6 +3329,7 @@ async fn handle_plugin_request(
     shelf: String,
     request_type: String,
     payload_b64: String,
+    instance_id: Option<String>,
 ) -> ClientResponse {
     let payload = match B64.decode(&payload_b64) {
         Ok(p) => p,
@@ -2826,6 +3350,7 @@ async fn handle_plugin_request(
         payload,
         correlation_id: cid,
         deadline: None,
+        instance_id,
     };
 
     let result = router.handle_request(&shelf, sdk_request).await;
@@ -2984,6 +3509,148 @@ async fn handle_project_subject(
             )
             .with_subclass("unsupported_variant"),
         },
+    }
+}
+
+/// Build a structural projection of a rack
+/// (`op = "project_rack"`).
+///
+/// Walks the catalogue's rack declaration and the router's
+/// admission table to produce a census of every shelf in the
+/// rack alongside its current occupant (or `None` for an empty
+/// shelf). Empty shelves are reported so a consumer sees the
+/// rack's structural shape regardless of what is admitted.
+///
+/// Returns `NotFound` when the rack is not declared in the
+/// catalogue. The check runs against the catalogue, not against
+/// admission state, so a rack with zero plugins still returns a
+/// valid (but plugin-free) projection.
+fn handle_project_rack(
+    state: &Arc<StewardState>,
+    router: &Arc<PluginRouter>,
+    rack_name: String,
+) -> ClientResponse {
+    // Catalogue is the authority on which racks exist; admission
+    // state never adds new racks. Look up the declaration first
+    // so an unknown name surfaces as a structured NotFound.
+    let rack = match state
+        .catalogue
+        .racks
+        .iter()
+        .find(|r| r.name == rack_name)
+    {
+        Some(r) => r,
+        None => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::NotFound,
+                    format!("unknown rack: {rack_name}"),
+                )
+                .with_subclass("unknown_rack"),
+            };
+        }
+    };
+
+    // Snapshot the router so the lookup loop doesn't re-acquire
+    // the read lock per shelf.
+    let entries = router.entries_in_order();
+    let by_shelf: std::collections::HashMap<
+        String,
+        Arc<crate::router::PluginEntry>,
+    > = entries
+        .into_iter()
+        .map(|e| (e.shelf.clone(), e))
+        .collect();
+
+    let mut shelves = Vec::with_capacity(rack.shelves.len());
+    for shelf in &rack.shelves {
+        let fully_qualified = format!("{}.{}", rack.name, shelf.name);
+        let occupant = match by_shelf.get(&fully_qualified) {
+            Some(entry) => {
+                // The interaction shape (respondent / warden) lives on
+                // the typed handle, not on the policy. The handle is
+                // behind an async mutex; tokio::sync::Mutex::try_lock
+                // returns immediately when the dispatch path isn't
+                // active and the handle is None when the entry is
+                // mid-unload. Both paths gracefully fall back to
+                // `unknown` rather than blocking the projection
+                // call.
+                let interaction_kind = match entry.handle.try_lock() {
+                    Ok(guard) => guard
+                        .as_ref()
+                        .map(|h| h.kind_name().to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    Err(_) => "unknown".into(),
+                };
+                Some(RackShelfOccupant {
+                    plugin: entry.name.clone(),
+                    interaction_kind,
+                })
+            }
+            None => None,
+        };
+        shelves.push(RackShelfEntry {
+            name: shelf.name.clone(),
+            fully_qualified,
+            shape: shelf.shape,
+            shape_supports: shelf.shape_supports.clone(),
+            description: shelf.description.clone(),
+            occupant,
+        });
+    }
+
+    let current_seq = state.bus.last_emitted_seq();
+
+    ClientResponse::RackProjection {
+        rack_projection: true,
+        rack: rack.name.clone(),
+        charter: rack.charter.clone(),
+        current_seq,
+        shelves,
+    }
+}
+
+/// Project the read-only inventory half of the plugins
+/// administration rack (`op = "list_plugins"`).
+///
+/// Walks the router in admission order and emits one
+/// [`PluginInventoryEntry`] per admitted plugin. The
+/// interaction-kind read mirrors the discipline used by
+/// [`handle_project_rack`]: take the per-entry async lock with
+/// `try_lock`, surface the handle's `kind_name()` when
+/// reachable, fall back to `unknown` when the entry is
+/// mid-transition.
+///
+/// `current_seq` is the bus cursor at projection time so
+/// consumers can pin a happenings subscription to the same
+/// position and apply admit / unload events as deltas.
+async fn handle_list_plugins(
+    state: &Arc<StewardState>,
+    router: &Arc<PluginRouter>,
+) -> ClientResponse {
+    let entries = router.entries_in_order();
+    let mut plugins = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let interaction_kind = match entry.handle.try_lock() {
+            Ok(guard) => guard
+                .as_ref()
+                .map(|h| h.kind_name().to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            Err(_) => "unknown".into(),
+        };
+        plugins.push(PluginInventoryEntry {
+            name: entry.name.clone(),
+            shelf: entry.shelf.clone(),
+            interaction_kind,
+        });
+    }
+
+    let current_seq = state.bus.last_emitted_seq();
+
+    ClientResponse::Plugins {
+        plugins_inventory: true,
+        current_seq,
+        plugins,
     }
 }
 
@@ -3375,12 +4042,15 @@ const CLIENT_WIRE_VERSION: u16 = 1;
 const SUPPORTED_OPS: &[&str] = &[
     "request",
     "project_subject",
+    "project_rack",
+    "list_plugins",
     "describe_alias",
     "list_active_custodies",
     "list_subjects",
     "list_relations",
     "enumerate_addressings",
     "subscribe_happenings",
+    "subscribe_subject",
     "describe_capabilities",
     "negotiate",
     "resolve_claimants",
@@ -3404,6 +4074,19 @@ const SUPPORTED_OPS: &[&str] = &[
 ///   available, each returning paginated rows alongside
 ///   `current_seq` so consumers can pin reconcile-style queries to
 ///   a happenings position.
+/// - `capability_negotiation`: the `op = "negotiate"` frame is
+///   available; consumers may request optional capabilities and
+///   the steward returns the granted subset.
+/// - `subscribe_subject_push`: `op = "subscribe_subject"` is
+///   available — a per-subject push stream with optional alias
+///   following.
+/// - `rack_structural_projection`: `op = "project_rack"` returns
+///   a census of the rack's declared shelves and their
+///   admitted occupants.
+/// - `plugin_inventory`: `op = "list_plugins"` returns the
+///   read-only inventory half of the plugins administration
+///   rack — one entry per admitted plugin (name, shelf,
+///   interaction kind).
 ///
 /// Names are stable; new features are appended.
 const SUPPORTED_FEATURES: &[&str] = &[
@@ -3412,6 +4095,9 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "active_custodies_snapshot",
     "paginated_state_snapshots",
     "capability_negotiation",
+    "subscribe_subject_push",
+    "rack_structural_projection",
+    "plugin_inventory",
 ];
 
 /// Build the capability discovery response.
@@ -3442,10 +4128,24 @@ mod tests {
                 shelf,
                 request_type,
                 payload_b64,
+                instance_id,
             } => {
                 assert_eq!(shelf, "a.b");
                 assert_eq!(request_type, "t");
                 assert_eq!(B64.decode(payload_b64).unwrap(), b"hello");
+                assert!(instance_id.is_none());
+            }
+            other => panic!("expected Request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_request_parses_request_op_with_instance_id() {
+        let json = r#"{"op":"request","shelf":"a.b","request_type":"t","payload_b64":"aGVsbG8=","instance_id":"dac-001"}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::Request { instance_id, .. } => {
+                assert_eq!(instance_id.as_deref(), Some("dac-001"));
             }
             other => panic!("expected Request, got {other:?}"),
         }
@@ -4139,6 +4839,169 @@ mod tests {
                 assert!(filter.shelves.is_empty());
             }
             other => panic!("expected SubscribeHappenings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_request_parses_project_rack() {
+        let json = r#"{"op":"project_rack","rack":"audio"}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::ProjectRack { rack } => {
+                assert_eq!(rack, "audio");
+            }
+            other => panic!("expected ProjectRack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn describe_capabilities_includes_project_rack() {
+        match describe_capabilities() {
+            ClientResponse::Capabilities { ops, features, .. } => {
+                assert!(
+                    ops.contains(&"project_rack"),
+                    "project_rack missing from advertised ops: {ops:?}"
+                );
+                assert!(
+                    features.contains(&"rack_structural_projection"),
+                    "rack_structural_projection missing from advertised \
+                     features: {features:?}"
+                );
+            }
+            other => {
+                panic!("describe_capabilities returned {other:?}, not Capabilities")
+            }
+        }
+    }
+
+    #[test]
+    fn client_request_parses_list_plugins() {
+        // Pin the wire shape: the read-only inventory op is a
+        // bare verb with no parameters. A future refactor that
+        // adds optional filters must not silently change the
+        // parse contract — this test fails loud if the variant
+        // grows required fields.
+        let json = r#"{"op":"list_plugins"}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::ListPlugins => {}
+            other => panic!("expected ListPlugins, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn describe_capabilities_includes_list_plugins() {
+        // Pin the new op + feature so a future refactor that
+        // accidentally drops them fails loud here.
+        match describe_capabilities() {
+            ClientResponse::Capabilities { ops, features, .. } => {
+                assert!(
+                    ops.contains(&"list_plugins"),
+                    "list_plugins missing from advertised ops: {ops:?}"
+                );
+                assert!(
+                    features.contains(&"plugin_inventory"),
+                    "plugin_inventory missing from advertised features: \
+                     {features:?}"
+                );
+            }
+            other => {
+                panic!("describe_capabilities returned {other:?}, not Capabilities")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_plugins_returns_empty_inventory_for_fresh_router() {
+        // Behaviour pin: with no plugins admitted, the response
+        // is a well-formed `Plugins` frame with an empty
+        // `plugins` vector and `current_seq == 0` (fresh bus).
+        // The test guards against accidental "no plugins ->
+        // error" regressions; the rack inventory op is a
+        // census, not a lookup, and an empty census is a valid
+        // answer.
+        let state = StewardState::for_tests();
+        let router = Arc::new(PluginRouter::new(Arc::clone(&state)));
+        let resp = handle_list_plugins(&state, &router).await;
+        match resp {
+            ClientResponse::Plugins {
+                plugins_inventory,
+                current_seq,
+                plugins,
+            } => {
+                assert!(plugins_inventory);
+                assert_eq!(current_seq, 0);
+                assert!(plugins.is_empty(), "expected empty inventory");
+            }
+            other => panic!("expected Plugins response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_request_parses_subscribe_subject_minimal() {
+        let json = r#"{
+            "op": "subscribe_subject",
+            "canonical_id": "test-uuid"
+        }"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::SubscribeSubject {
+                canonical_id,
+                follow_aliases,
+                ..
+            } => {
+                assert_eq!(canonical_id, "test-uuid");
+                assert!(!follow_aliases);
+            }
+            other => panic!("expected SubscribeSubject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_request_parses_subscribe_subject_with_scope() {
+        let json = r#"{
+            "op": "subscribe_subject",
+            "canonical_id": "uuid-x",
+            "scope": {"relation_predicates": ["next", "prev"]},
+            "follow_aliases": true
+        }"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::SubscribeSubject {
+                canonical_id,
+                scope,
+                follow_aliases,
+            } => {
+                assert_eq!(canonical_id, "uuid-x");
+                assert!(follow_aliases);
+                let s: ProjectionScope = scope.into();
+                // Scope round-trips through the wire shape.
+                assert!(s.relation_predicates.contains(&"next".to_string()));
+                assert!(s.relation_predicates.contains(&"prev".to_string()));
+            }
+            other => panic!("expected SubscribeSubject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn describe_capabilities_includes_subscribe_subject() {
+        // Pin the new op + feature so a future refactor that
+        // accidentally drops them fails loud here.
+        match describe_capabilities() {
+            ClientResponse::Capabilities { ops, features, .. } => {
+                assert!(
+                    ops.contains(&"subscribe_subject"),
+                    "subscribe_subject missing from advertised ops: {ops:?}"
+                );
+                assert!(
+                    features.contains(&"subscribe_subject_push"),
+                    "subscribe_subject_push missing from advertised features: \
+                     {features:?}"
+                );
+            }
+            other => {
+                panic!("describe_capabilities returned {other:?}, not Capabilities")
+            }
         }
     }
 

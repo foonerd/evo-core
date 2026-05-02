@@ -191,6 +191,8 @@ mod tests {
             payload: b"hi".to_vec(),
             correlation_id: 1,
             deadline: None,
+
+            instance_id: None,
         };
         let e = p.handle_request(&req).await.unwrap_err();
         assert!(matches!(e, PluginError::Permanent(_)));
@@ -205,6 +207,8 @@ mod tests {
             payload: b"hi".to_vec(),
             correlation_id: 1,
             deadline: None,
+
+            instance_id: None,
         };
         let e = p.handle_request(&req).await.unwrap_err();
         assert!(matches!(e, PluginError::Permanent(_)));
@@ -219,6 +223,8 @@ mod tests {
             payload: b"hello, evo".to_vec(),
             correlation_id: 42,
             deadline: None,
+
+            instance_id: None,
         };
         let resp = p.handle_request(&req).await.unwrap();
         assert_eq!(resp.payload, b"hello, evo");

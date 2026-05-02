@@ -603,18 +603,24 @@ async fn list_active_custodies_returns_populated_ledger() {
     {
         let guard = engine.lock().await;
         let ledger = guard.custody_ledger();
-        ledger.record_custody(
-            "org.test.warden",
-            "example.custody",
-            &CustodyHandle::new("custody-1"),
-            "playback",
-        );
-        ledger.record_state(
-            "org.test.warden",
-            "custody-1",
-            b"state=playing".to_vec(),
-            HealthStatus::Healthy,
-        );
+        ledger
+            .record_custody(
+                "org.test.warden",
+                "example.custody",
+                &CustodyHandle::new("custody-1"),
+                "playback",
+            )
+            .await
+            .unwrap();
+        ledger
+            .record_state(
+                "org.test.warden",
+                "custody-1",
+                b"state=playing".to_vec(),
+                HealthStatus::Healthy,
+            )
+            .await
+            .unwrap();
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -792,11 +798,11 @@ async fn subscribe_happenings_delivers_ack_and_events() {
 
 #[tokio::test]
 async fn describe_capabilities_returns_stable_op_and_feature_lists() {
-    // Wave 2.2: capability discovery surface. Consumers SHOULD call
-    // this once on connect and feature-probe before invoking ops
-    // that may not be present on older steward builds. The op set
-    // and feature names are stable (additive only); this test pins
-    // the contract so a refactor that drops a name fails loud.
+    // Capability discovery surface. Consumers SHOULD call this once
+    // on connect and feature-probe before invoking ops that may not
+    // be present on older steward builds. The op set and feature
+    // names are stable (additive only); this test pins the contract
+    // so a refactor that drops a name fails loud.
     let tmp = tempfile::tempdir().expect("create temp dir");
     let socket_path = tmp.path().join("evo.sock");
     let (engine, _projections, server) =

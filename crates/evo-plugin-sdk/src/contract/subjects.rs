@@ -1,7 +1,7 @@
 //! Subject identity types.
 //!
 //! Carries the data types plugins use to address and announce subjects,
-//! per `docs/engineering/SUBJECTS.md`. The [`SubjectAnnouncer`] trait
+//! per `docs/engineering/SUBJECTS.md`. The [`SubjectAnnouncer`](super::context::SubjectAnnouncer) trait
 //! itself lives in [`context`](super::context) alongside the other
 //! callback traits.
 //!

@@ -43,7 +43,7 @@
 //! adapter, parallel to [`WireRespondent`], implementing
 //! [`ErasedWarden`](crate::admission::ErasedWarden). Custody state
 //! reports (`ReportCustodyState`) emitted by the remote warden are
-//! routed by [`forward_event`] to an optional
+//! routed by `forward_event` to an optional
 //! [`CustodyStateReporter`] in the [`EventSink`]; when absent the
 //! frame is logged and dropped.
 //!
@@ -67,9 +67,9 @@ use crate::subjects::SubjectRegistry;
 use evo_plugin_sdk::codec::{read_frame_json, write_frame_json, WireError};
 use evo_plugin_sdk::contract::{
     Assignment, CourseCorrection, CustodyHandle, CustodyStateReporter,
-    HealthReport, LoadContext, PluginDescription, PluginError, RelationAdmin,
-    RelationAnnouncer, Request, Response, StateReporter, SubjectAdmin,
-    SubjectAnnouncer, SubjectQuerier,
+    HealthReport, InstanceAnnouncer, LoadContext, PluginDescription,
+    PluginError, RelationAdmin, RelationAnnouncer, Request, Response,
+    StateReporter, SubjectAdmin, SubjectAnnouncer, SubjectQuerier,
 };
 use evo_plugin_sdk::wire::{
     WireFrame, FEATURE_VERSION_MAX, FEATURE_VERSION_MIN, PROTOCOL_VERSION,
@@ -177,13 +177,13 @@ pub enum WireClientError {
 /// Callbacks the wire client invokes when events arrive from the
 /// remote plugin.
 ///
-/// Populated by [`WireRespondent::load`] or [`WireWarden::load`] from
-/// the `LoadContext`'s announcers; cleared after `unload` completes.
+/// Populated by the `load` impls on [`WireRespondent`] / [`WireWarden`]
+/// from the `LoadContext`'s announcers; cleared after `unload` completes.
 ///
 /// The `custody_state_reporter` slot is `None` for respondent
 /// connections (respondents never emit `ReportCustodyState` frames)
 /// and `Some` for warden connections. When a `ReportCustodyState`
-/// frame arrives and the slot is `None` [`forward_event`] logs and
+/// frame arrives and the slot is `None` `forward_event` logs and
 /// drops it.
 pub struct EventSink {
     /// Where to route `report_state` frames.
@@ -192,6 +192,13 @@ pub struct EventSink {
     pub subject_announcer: Arc<dyn SubjectAnnouncer>,
     /// Where to route `assert_relation` / `retract_relation` frames.
     pub relation_announcer: Arc<dyn RelationAnnouncer>,
+    /// Where to route `announce_instance` / `retract_instance` frames
+    /// from out-of-process factory plugins. Always populated from the
+    /// LoadContext; for plugins whose manifest declares `kind.instance
+    /// = "singleton"` the slot holds a logging placeholder that
+    /// accepts but discards the frames, so a misbehaving singleton
+    /// emitting factory events does not crash the steward.
+    pub instance_announcer: Arc<dyn InstanceAnnouncer>,
     /// Where to route `report_custody_state` frames. `None` for
     /// respondent-backed sinks.
     pub custody_state_reporter: Option<Arc<dyn CustodyStateReporter>>,
@@ -217,6 +224,7 @@ impl fmt::Debug for EventSink {
             .field("state_reporter", &"<Arc<dyn StateReporter>>")
             .field("subject_announcer", &"<Arc<dyn SubjectAnnouncer>>")
             .field("relation_announcer", &"<Arc<dyn RelationAnnouncer>>")
+            .field("instance_announcer", &"<Arc<dyn InstanceAnnouncer>>")
             .field(
                 "custody_state_reporter",
                 &self
@@ -245,7 +253,7 @@ type PendingMap =
 /// - Either background task, on exit for any reason, atomically clears
 ///   `alive` AND drains the pending map (under the pending mutex),
 ///   sending `Disconnected` to any in-flight request.
-/// - [`WireClient::request`] checks `alive` while holding the pending
+/// - `WireClient::request` checks `alive` while holding the pending
 ///   mutex before inserting its oneshot sender. A request arriving
 ///   after either task has exited gets `Disconnected` without touching
 ///   the wire.
@@ -581,6 +589,7 @@ impl WireClient {
             request_type: req.request_type.clone(),
             payload: req.payload.clone(),
             deadline_ms,
+            instance_id: req.instance_id.clone(),
         };
         match self.request(cid, frame).await? {
             WireFrame::HandleRequestResponse { payload, .. } => Ok(Response {
@@ -605,8 +614,8 @@ impl WireClient {
     }
 
     /// Send the `take_custody` verb. Uses the supplied correlation ID
-    /// as the wire frame's cid; the caller (typically
-    /// [`WireWarden::take_custody`]) sources it from the
+    /// as the wire frame's cid; the caller (the `take_custody` impl
+    /// on [`WireWarden`]) sources it from the
     /// [`Assignment::correlation_id`] so the custody handshake uses
     /// the same id the steward allocated.
     pub async fn take_custody(
@@ -1464,6 +1473,12 @@ async fn forward_event(
         WireFrame::RetractRelation { retraction, .. } => {
             sink.relation_announcer.retract(retraction).await
         }
+        WireFrame::AnnounceInstance { announcement, .. } => {
+            sink.instance_announcer.announce(announcement).await
+        }
+        WireFrame::RetractInstance { instance_id, .. } => {
+            sink.instance_announcer.retract(instance_id).await
+        }
         WireFrame::ReportCustodyState {
             handle,
             payload,
@@ -1611,6 +1626,8 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::UnsuppressRelationResponse { .. } => {
             "unsuppress_relation_response"
         }
+        WireFrame::AnnounceInstance { .. } => "announce_instance",
+        WireFrame::RetractInstance { .. } => "retract_instance",
     }
 }
 
@@ -1658,7 +1675,7 @@ impl WireRespondent {
     ///
     /// Spawns the client's background tasks, sends a `describe` request,
     /// and caches the response. The cached description satisfies
-    /// subsequent calls to [`ErasedRespondent::describe`].
+    /// subsequent calls to [`ErasedRespondent::describe`](crate::admission::ErasedRespondent::describe).
     pub async fn connect<R, W>(
         reader: R,
         writer: W,
@@ -1780,6 +1797,7 @@ impl crate::admission::ErasedRespondent for WireRespondent {
                 state_reporter: Arc::clone(&ctx.state_reporter),
                 subject_announcer: Arc::clone(&ctx.subject_announcer),
                 relation_announcer: Arc::clone(&ctx.relation_announcer),
+                instance_announcer: Arc::clone(&ctx.instance_announcer),
                 custody_state_reporter: None,
                 subject_querier,
                 subject_admin: ctx.subject_admin.clone(),
@@ -1867,6 +1885,7 @@ impl crate::admission::ErasedRespondent for WireRespondent {
                 payload: req.payload.clone(),
                 correlation_id: req.correlation_id,
                 deadline: req.deadline,
+                instance_id: req.instance_id.clone(),
             };
             match self.client.handle_request(owned).await {
                 Ok(r) => Ok(r),
@@ -1905,7 +1924,7 @@ impl crate::admission::ErasedRespondent for WireRespondent {
 /// reporter, which on every report does two things, in order:
 ///
 /// 1. UPSERTs the state snapshot into the shared
-///    [`CustodyLedger`](crate::custody::CustodyLedger).
+///    [`CustodyLedger`].
 /// 2. Emits a
 ///    [`Happening::CustodyStateReported`](crate::happenings::Happening::CustodyStateReported)
 ///    on the shared [`HappeningBus`].
@@ -1948,8 +1967,8 @@ impl WireWarden {
     ///
     /// Spawns the client's background tasks, sends a `describe`
     /// request, and caches the response. The supplied `ledger` and
-    /// `bus` are used by [`WireWarden::load`] to construct a
-    /// [`LedgerCustodyStateReporter`] in the event sink; both are
+    /// `bus` are used by the `load` impl on [`WireWarden`] to construct
+    /// a [`LedgerCustodyStateReporter`] in the event sink; both are
     /// typically the admission engine's shared handles.
     pub async fn connect<R, W>(
         reader: R,
@@ -2023,6 +2042,7 @@ impl crate::admission::ErasedWarden for WireWarden {
                 state_reporter: Arc::clone(&ctx.state_reporter),
                 subject_announcer: Arc::clone(&ctx.subject_announcer),
                 relation_announcer: Arc::clone(&ctx.relation_announcer),
+                instance_announcer: Arc::clone(&ctx.instance_announcer),
                 custody_state_reporter: Some(custody_reporter),
                 subject_querier,
                 subject_admin: ctx.subject_admin.clone(),
@@ -2542,6 +2562,8 @@ mod tests {
             payload: b"x".to_vec(),
             correlation_id: 42,
             deadline: None,
+
+            instance_id: None,
         };
         let err = respondent.handle_request(&req).await.unwrap_err();
         assert!(err.is_fatal(), "expected fatal error, got {err:?}");
@@ -2657,6 +2679,8 @@ mod tests {
             payload: b"hello".to_vec(),
             correlation_id: 100,
             deadline: None,
+
+            instance_id: None,
         };
         let resp = respondent.handle_request(&req).await.unwrap();
         assert_eq!(resp.payload, b"hello");
@@ -3246,6 +3270,7 @@ target_type = "album"
             state_reporter: Arc::clone(&ctx.state_reporter),
             subject_announcer: Arc::clone(&ctx.subject_announcer),
             relation_announcer: Arc::clone(&ctx.relation_announcer),
+            instance_announcer: Arc::clone(&ctx.instance_announcer),
             custody_state_reporter: Some(Arc::new(
                 CapturingCustodyStateReporter {
                     captured: Arc::clone(&captured),
@@ -3772,8 +3797,8 @@ name = "track"
     }
 
     // ---------------------------------------------------------------------
-    // Wave 2.1: forward_event must emit `EventAck` on success and a
-    // structured `Error` frame on failure, never silently drop.
+    // Event forwarding: forward_event must emit `EventAck` on success
+    // and a structured `Error` frame on failure, never silently drop.
     // ---------------------------------------------------------------------
 
     /// Discriminator for the SubjectAnnouncer test stub. Mirrors the
@@ -3869,9 +3894,12 @@ name = "track"
     fn sink_with_announcer(
         announcer: Arc<dyn evo_plugin_sdk::contract::SubjectAnnouncer>,
     ) -> EventSink {
-        use crate::context::LoggingStateReporter as LSR;
+        use crate::context::{
+            LoggingInstanceAnnouncer as LIA, LoggingStateReporter as LSR,
+        };
         EventSink {
             state_reporter: Arc::new(LSR::new("org.test")),
+            instance_announcer: Arc::new(LIA::new("org.test")),
             subject_announcer: announcer,
             relation_announcer: Arc::new(UnreachableRelationAnnouncer),
             custody_state_reporter: None,
@@ -3991,11 +4019,204 @@ name = "track"
     }
 
     // ---------------------------------------------------------------------
-    // Wave 2.2: steward-side handshake (perform_steward_handshake) tests.
+    // forward_event routes AnnounceInstance / RetractInstance through
+    // the EventSink's instance_announcer slot. The new frames follow the
+    // same envelope discipline as AnnounceSubject / RetractSubject;
+    // these tests verify the routing path exists and that the response
+    // (EventAck or Error) tracks the announcer's outcome.
+    // ---------------------------------------------------------------------
+
+    /// Capturing instance announcer that records what it received and
+    /// returns the configured outcome on each call.
+    struct CapturingInstanceAnnouncer {
+        last_announce: std::sync::Mutex<
+            Option<evo_plugin_sdk::contract::factory::InstanceAnnouncement>,
+        >,
+        last_retract: std::sync::Mutex<
+            Option<evo_plugin_sdk::contract::factory::InstanceId>,
+        >,
+        outcome: std::sync::Mutex<Result<(), ReportError>>,
+    }
+
+    impl CapturingInstanceAnnouncer {
+        fn ok() -> Self {
+            Self {
+                last_announce: std::sync::Mutex::new(None),
+                last_retract: std::sync::Mutex::new(None),
+                outcome: std::sync::Mutex::new(Ok(())),
+            }
+        }
+
+        fn err(err: ReportError) -> Self {
+            Self {
+                last_announce: std::sync::Mutex::new(None),
+                last_retract: std::sync::Mutex::new(None),
+                outcome: std::sync::Mutex::new(Err(err)),
+            }
+        }
+    }
+
+    impl evo_plugin_sdk::contract::InstanceAnnouncer
+        for CapturingInstanceAnnouncer
+    {
+        fn announce<'a>(
+            &'a self,
+            announcement: evo_plugin_sdk::contract::factory::InstanceAnnouncement,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            *self.last_announce.lock().unwrap() = Some(announcement);
+            let outcome = match &*self.outcome.lock().unwrap() {
+                Ok(()) => Ok(()),
+                Err(ReportError::Invalid(s)) => {
+                    Err(ReportError::Invalid(s.clone()))
+                }
+                Err(_) => Err(ReportError::ShuttingDown),
+            };
+            Box::pin(async move { outcome })
+        }
+
+        fn retract<'a>(
+            &'a self,
+            instance_id: evo_plugin_sdk::contract::factory::InstanceId,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            *self.last_retract.lock().unwrap() = Some(instance_id);
+            let outcome = match &*self.outcome.lock().unwrap() {
+                Ok(()) => Ok(()),
+                Err(ReportError::Invalid(s)) => {
+                    Err(ReportError::Invalid(s.clone()))
+                }
+                Err(_) => Err(ReportError::ShuttingDown),
+            };
+            Box::pin(async move { outcome })
+        }
+    }
+
+    fn sink_with_instance_announcer(
+        announcer: Arc<dyn evo_plugin_sdk::contract::InstanceAnnouncer>,
+    ) -> EventSink {
+        use crate::context::LoggingStateReporter as LSR;
+        EventSink {
+            state_reporter: Arc::new(LSR::new("org.test")),
+            instance_announcer: announcer,
+            subject_announcer: Arc::new(AlwaysOkAnnouncer),
+            relation_announcer: Arc::new(UnreachableRelationAnnouncer),
+            custody_state_reporter: None,
+            subject_querier: Arc::new(NotFoundSubjectQuerier),
+            subject_admin: None,
+            relation_admin: None,
+        }
+    }
+
+    fn announce_instance_frame(cid: u64, instance_id: &str) -> WireFrame {
+        WireFrame::AnnounceInstance {
+            v: PROTOCOL_VERSION,
+            cid,
+            plugin: "org.test".into(),
+            announcement:
+                evo_plugin_sdk::contract::factory::InstanceAnnouncement::new(
+                    instance_id,
+                    b"payload".to_vec(),
+                ),
+        }
+    }
+
+    fn retract_instance_frame(cid: u64, instance_id: &str) -> WireFrame {
+        WireFrame::RetractInstance {
+            v: PROTOCOL_VERSION,
+            cid,
+            plugin: "org.test".into(),
+            instance_id: evo_plugin_sdk::contract::factory::InstanceId::from(
+                instance_id,
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_event_routes_announce_instance_through_instance_announcer()
+    {
+        let announcer = Arc::new(CapturingInstanceAnnouncer::ok());
+        let sink = sink_with_instance_announcer(announcer.clone());
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        forward_event(announce_instance_frame(7, "dac-001"), &sink, &out_tx)
+            .await;
+
+        // Announcer received the announcement.
+        let captured = announcer.last_announce.lock().unwrap().clone();
+        let captured = captured.expect("announce captured");
+        assert_eq!(captured.instance_id.as_str(), "dac-001");
+        assert_eq!(captured.payload, b"payload");
+
+        // Response is EventAck on Ok outcome.
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::EventAck { cid, plugin, .. } => {
+                assert_eq!(cid, 7);
+                assert_eq!(plugin, "org.test");
+            }
+            other => panic!("expected EventAck, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_event_routes_retract_instance_through_instance_announcer()
+    {
+        let announcer = Arc::new(CapturingInstanceAnnouncer::ok());
+        let sink = sink_with_instance_announcer(announcer.clone());
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        forward_event(retract_instance_frame(11, "dac-001"), &sink, &out_tx)
+            .await;
+
+        let captured = announcer.last_retract.lock().unwrap().clone();
+        let captured = captured.expect("retract captured");
+        assert_eq!(captured.as_str(), "dac-001");
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::EventAck { cid, .. } => assert_eq!(cid, 11),
+            other => panic!("expected EventAck, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_event_emits_error_when_instance_announcer_returns_invalid()
+    {
+        let announcer = Arc::new(CapturingInstanceAnnouncer::err(
+            ReportError::Invalid("policy violation: StartupOnly".into()),
+        ));
+        let sink = sink_with_instance_announcer(announcer);
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        forward_event(announce_instance_frame(13, "dac-002"), &sink, &out_tx)
+            .await;
+
+        let response = out_rx.recv().await.expect("response frame");
+        match response {
+            WireFrame::Error {
+                cid,
+                class,
+                message,
+                ..
+            } => {
+                assert_eq!(cid, 13);
+                assert_eq!(class, ErrorClass::ContractViolation);
+                assert!(
+                    message.contains("StartupOnly"),
+                    "error message must surface the policy reason: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Steward-side handshake (perform_steward_handshake) tests.
     // ---------------------------------------------------------------------
 
     // ---------------------------------------------------------------------
-    // Wave 2.3: steward-side admin dispatch (forward_plugin_request)
+    // Steward-side admin dispatch (forward_plugin_request) tests.
     // ---------------------------------------------------------------------
 
     /// `SubjectAdmin` stub recording the last call so the test can
@@ -4056,9 +4277,12 @@ name = "track"
     fn sink_with_subject_admin(
         admin: Option<Arc<dyn evo_plugin_sdk::contract::SubjectAdmin>>,
     ) -> EventSink {
-        use crate::context::LoggingStateReporter as LSR;
+        use crate::context::{
+            LoggingInstanceAnnouncer as LIA, LoggingStateReporter as LSR,
+        };
         EventSink {
             state_reporter: Arc::new(LSR::new("org.test")),
+            instance_announcer: Arc::new(LIA::new("org.test")),
             subject_announcer: Arc::new(AlwaysOkAnnouncer),
             relation_announcer: Arc::new(UnreachableRelationAnnouncer),
             custody_state_reporter: None,
@@ -4619,9 +4843,12 @@ name = "track"
     fn sink_with_subject_querier(
         querier: Arc<dyn evo_plugin_sdk::contract::SubjectQuerier>,
     ) -> EventSink {
-        use crate::context::LoggingStateReporter as LSR;
+        use crate::context::{
+            LoggingInstanceAnnouncer as LIA, LoggingStateReporter as LSR,
+        };
         EventSink {
             state_reporter: Arc::new(LSR::new("org.test")),
+            instance_announcer: Arc::new(LIA::new("org.test")),
             subject_announcer: Arc::new(AlwaysOkAnnouncer),
             relation_announcer: Arc::new(UnreachableRelationAnnouncer),
             custody_state_reporter: None,

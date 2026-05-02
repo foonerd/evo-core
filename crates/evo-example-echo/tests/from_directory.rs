@@ -202,6 +202,8 @@ async fn admit_from_directory_full_lifecycle() {
         payload: b"steward-managed echo".to_vec(),
         correlation_id: 7,
         deadline: None,
+
+        instance_id: None,
     };
     let resp = tokio::time::timeout(
         REQUEST_TIMEOUT,

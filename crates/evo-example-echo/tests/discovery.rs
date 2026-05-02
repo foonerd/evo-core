@@ -257,6 +257,8 @@ async fn discover_and_admit_staged_layout() {
         payload: b"discovery-staged".to_vec(),
         correlation_id: 1,
         deadline: None,
+
+        instance_id: None,
     };
     let resp = tokio::time::timeout(
         REQUEST_TIMEOUT,
@@ -307,6 +309,8 @@ async fn discover_and_admit_flat_layout() {
         payload: b"discovery-flat".to_vec(),
         correlation_id: 2,
         deadline: None,
+
+        instance_id: None,
     };
     let resp = tokio::time::timeout(
         REQUEST_TIMEOUT,

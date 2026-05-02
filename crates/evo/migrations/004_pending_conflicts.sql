@@ -1,6 +1,6 @@
 -- migrations/004_pending_conflicts.sql
 --
--- Phase 4: pending multi-subject conflicts.
+-- Pending multi-subject conflicts.
 --
 -- Adds the `pending_conflicts` table — an operator-facing record of
 -- announcements that resolved to more than one canonical subject. The

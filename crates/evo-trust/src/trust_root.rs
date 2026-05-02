@@ -34,7 +34,7 @@ pub struct TrustKey {
 /// Load all `*.pem` in `opt_trust` and `etc_trust_d` (non-recursive);
 /// for each `foo.pem` require `foo.meta.toml` in the same directory.
 ///
-/// Each sidecar is validated via [`crate::key_meta::validate`]
+/// Each sidecar is validated via the crate's `key_meta::validate`
 /// before the key is added to the returned set. A validation
 /// failure aborts the whole load: a partially-trusted trust set
 /// would be a footgun, since chain walks against it would silently

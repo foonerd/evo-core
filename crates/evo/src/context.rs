@@ -229,14 +229,14 @@ impl CustodyStateReporter for LoggingCustodyStateReporter {
 /// retracted addressing was the subject's last), the announcer:
 ///
 /// 1. Emits
-///    [`Happening::SubjectForgotten`](crate::happenings::Happening::SubjectForgotten).
+///    [`Happening::SubjectForgotten`].
 /// 2. Calls
-///    [`RelationGraph::forget_all_touching`](crate::relations::RelationGraph::forget_all_touching)
+///    [`RelationGraph::forget_all_touching`]
 ///    to cascade-remove every edge the forgotten subject
 ///    participates in (as source or target), irrespective of
 ///    remaining claimants per `RELATIONS.md` section 8.3.
 /// 3. Emits one
-///    [`Happening::RelationForgotten`](crate::happenings::Happening::RelationForgotten)
+///    [`Happening::RelationForgotten`]
 ///    per cascaded edge with
 ///    [`RelationForgottenReason::SubjectCascade`].
 ///
@@ -273,11 +273,11 @@ impl RegistrySubjectAnnouncer {
     /// The `graph` and `bus` Arcs are used by the retract path's
     /// cascade: on subject-forget the announcer cascades the
     /// removal into the graph via
-    /// [`RelationGraph::forget_all_touching`](crate::relations::RelationGraph::forget_all_touching)
+    /// [`RelationGraph::forget_all_touching`]
     /// and emits structured
-    /// [`Happening::SubjectForgotten`](crate::happenings::Happening::SubjectForgotten)
+    /// [`Happening::SubjectForgotten`]
     /// and
-    /// [`Happening::RelationForgotten`](crate::happenings::Happening::RelationForgotten)
+    /// [`Happening::RelationForgotten`]
     /// events on the bus.
     pub fn new(
         registry: Arc<SubjectRegistry>,
@@ -361,6 +361,54 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                 }
             };
 
+            // Durable mirror of the announcement. The registry has
+            // accepted (or recorded a conflict against) the in-memory
+            // state; the persistence layer mirrors the outcome so the
+            // subject identity slice survives a steward restart.
+            //
+            // - Created / Updated / NoChange share the same canonical
+            //   id and the announcement's addressing set; an UPSERT-
+            //   shaped record_subject_announce keeps the row store
+            //   idempotent across the three.
+            // - Conflict already produces a separate
+            //   pending_conflicts row below; no subjects-table write
+            //   is appropriate because the registry deliberately did
+            //   not merge.
+            if let Some(store) = persistence.as_ref() {
+                let canonical_id_opt: Option<&str> = match &outcome {
+                    AnnounceOutcome::Created(id)
+                    | AnnounceOutcome::Updated(id)
+                    | AnnounceOutcome::NoChange(id) => Some(id.as_str()),
+                    AnnounceOutcome::Conflict { .. } => None,
+                };
+                if let Some(canonical_id) = canonical_id_opt {
+                    let at_ms = system_time_to_ms(SystemTime::now());
+                    let persisted_claims: Vec<crate::persistence::PersistedClaim> =
+                        announcement
+                            .claims
+                            .iter()
+                            .map(persisted_claim_from_subject_claim)
+                            .collect();
+                    store
+                        .record_subject_announce(
+                            crate::persistence::AnnounceRecord {
+                                canonical_id,
+                                subject_type: &announcement.subject_type,
+                                addressings: &announcement.addressings,
+                                claimant: &plugin_name,
+                                claims: &persisted_claims,
+                                at_ms,
+                            },
+                        )
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "subject announce persist failed: {e}"
+                            ))
+                        })?;
+                }
+            }
+
             // Multi-subject conflict surface. The registry recorded
             // the conflict claim and returned without merging; the
             // wiring layer is the one that turns "detection" into
@@ -437,6 +485,14 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
         let persistence = self.persistence.clone();
         let conflicts = self.conflicts.clone();
         Box::pin(async move {
+            // Resolve the addressing BEFORE retracting so the
+            // persistence write knows which canonical_id to bind
+            // the claim_log entry to. After retract the addressing
+            // may have been removed (and the subject forgotten),
+            // at which point a post-hoc resolve would return None.
+            let pre_retract_canonical_id =
+                registry.resolve(&addressing).map(|s| s.to_string());
+
             let outcome =
                 match registry.retract(&addressing, &plugin_name, reason) {
                     Ok(outcome) => outcome,
@@ -451,8 +507,30 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                 // Subject survives: no cascade, no happenings
                 // at this layer. The addressing-level events
                 // remain tracing-only pending the broader
-                // happenings expansion.
-                SubjectRetractOutcome::AddressingRemoved => Ok(()),
+                // happenings expansion. Mirror the addressing
+                // removal to the persistence layer so a restart
+                // does not bring the addressing back from disk.
+                SubjectRetractOutcome::AddressingRemoved => {
+                    if let (Some(store), Some(canonical_id)) =
+                        (persistence.as_ref(), pre_retract_canonical_id.as_ref())
+                    {
+                        let at_ms = system_time_to_ms(SystemTime::now());
+                        store
+                            .record_subject_retract(
+                                canonical_id,
+                                &addressing,
+                                &plugin_name,
+                                at_ms,
+                            )
+                            .await
+                            .map_err(|e| {
+                                ReportError::Invalid(format!(
+                                    "subject retract persist failed: {e}"
+                                ))
+                            })?;
+                    }
+                    Ok(())
+                }
                 // Subject forgotten: fire the subject happening
                 // first, then cascade into the relation graph and
                 // fire one relation happening per removed edge.
@@ -468,6 +546,29 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                     subject_type,
                 } => {
                     let at = SystemTime::now();
+                    let at_ms = system_time_to_ms(at);
+
+                    // 0. Persistence: hard-delete the subject row
+                    //    and append the tombstone alias plus
+                    //    claim_log entry. Runs before the happening
+                    //    emission so a subscriber reacting by
+                    //    querying `describe_alias` always sees the
+                    //    tombstone in place.
+                    if let Some(store) = persistence.as_ref() {
+                        store
+                            .record_subject_forget(
+                                &canonical_id,
+                                &plugin_name,
+                                None,
+                                at_ms,
+                            )
+                            .await
+                            .map_err(|e| {
+                                ReportError::Invalid(format!(
+                                    "subject forget persist failed: {e}"
+                                ))
+                            })?;
+                    }
 
                     // 1. Subject happening.
                     bus.emit_durable(Happening::SubjectForgotten {
@@ -485,7 +586,10 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
 
                     // 2. Storage cascade. The graph returns the
                     // keys of every removed edge; we iterate them
-                    // to fire the per-edge happenings.
+                    // to fire the per-edge happenings and to
+                    // mirror the cascade through to the relations
+                    // table so the durable graph stays in lockstep
+                    // with the in-memory walk.
                     let removed = graph.forget_all_touching(&canonical_id);
 
                     // 3. One happening per removed edge. Uses the
@@ -496,6 +600,20 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                     // broadcast channel is the authoritative order
                     // for tie-breaking).
                     for key in removed {
+                        if let Some(store) = persistence.as_ref() {
+                            store
+                                .record_relation_forget(
+                                    &key.source_id,
+                                    &key.predicate,
+                                    &key.target_id,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    ReportError::Invalid(format!(
+                                        "relation forget persist failed: {e}"
+                                    ))
+                                })?;
+                        }
                         bus.emit_durable(Happening::RelationForgotten {
                             plugin: plugin_name.clone(),
                             source_id: key.source_id,
@@ -579,6 +697,7 @@ pub struct RegistryRelationAnnouncer {
     catalogue: Arc<Catalogue>,
     bus: Arc<HappeningBus>,
     plugin_name: String,
+    persistence: Option<Arc<dyn PersistenceStore>>,
 }
 
 impl RegistryRelationAnnouncer {
@@ -601,7 +720,23 @@ impl RegistryRelationAnnouncer {
             catalogue,
             bus,
             plugin_name: plugin_name.into(),
+            persistence: None,
         }
+    }
+
+    /// Attach a durable backing store to this announcer.
+    ///
+    /// When set, every successful assert or retract is mirrored into
+    /// the `relations` / `relation_claimants` tables so the relation
+    /// graph survives a steward restart. Construction without a
+    /// store keeps existing call sites working unchanged; the wiring
+    /// layer attaches a real store via this setter at boot.
+    pub fn with_persistence(
+        mut self,
+        persistence: Arc<dyn PersistenceStore>,
+    ) -> Self {
+        self.persistence = Some(persistence);
+        self
     }
 }
 
@@ -830,6 +965,7 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
         let catalogue = Arc::clone(&self.catalogue);
         let bus = Arc::clone(&self.bus);
         let plugin_name = self.plugin_name.clone();
+        let persistence = self.persistence.clone();
         Box::pin(async move {
             // Predicate existence validation at assertion. The
             // predicate name on every assertion must correspond
@@ -890,7 +1026,8 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
             }
 
             // All gates passed; store the relation.
-            graph
+            let assert_reason = assertion.reason.clone();
+            let outcome = graph
                 .assert(
                     &source_id,
                     &assertion.predicate,
@@ -899,6 +1036,72 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
                     assertion.reason,
                 )
                 .map_err(|e| ReportError::Invalid(format!("assert: {e}")))?;
+
+            // Durable write-through. The graph mutation is the
+            // primary effect; the persistence layer mirrors the
+            // resulting (relation, claim) pair so the edge
+            // survives a steward restart. NoChange (the calling
+            // plugin already claimed) skips the write because the
+            // claim row already exists on disk.
+            if let (Some(store), false) = (
+                persistence.as_ref(),
+                matches!(outcome, crate::relations::AssertOutcome::NoChange),
+            ) {
+                let record = graph
+                    .describe_relation(
+                        &source_id,
+                        &assertion.predicate,
+                        &target_id,
+                    )
+                    .ok_or_else(|| {
+                        ReportError::Invalid(
+                            "post-assert relation describe missing".into(),
+                        )
+                    })?;
+                let created_at_ms = system_time_to_ms(record.created_at);
+                let modified_at_ms = system_time_to_ms(record.modified_at);
+                let asserted_at_ms = record
+                    .claims
+                    .iter()
+                    .find(|c| c.claimant == plugin_name)
+                    .map(|c| system_time_to_ms(c.asserted_at))
+                    .unwrap_or(modified_at_ms);
+                let persisted_relation = crate::persistence::PersistedRelation {
+                    source_id: source_id.clone(),
+                    predicate: assertion.predicate.clone(),
+                    target_id: target_id.clone(),
+                    created_at_ms,
+                    modified_at_ms,
+                    suppressed_admin_plugin: record
+                        .suppression
+                        .as_ref()
+                        .map(|s| s.admin_plugin.clone()),
+                    suppressed_at_ms: record
+                        .suppression
+                        .as_ref()
+                        .map(|s| system_time_to_ms(s.suppressed_at)),
+                    suppression_reason: record
+                        .suppression
+                        .as_ref()
+                        .and_then(|s| s.reason.clone()),
+                };
+                let persisted_claim = crate::persistence::PersistedRelationClaim {
+                    source_id: source_id.clone(),
+                    predicate: assertion.predicate.clone(),
+                    target_id: target_id.clone(),
+                    claimant: plugin_name.clone(),
+                    asserted_at_ms,
+                    reason: assert_reason,
+                };
+                store
+                    .record_relation_assert(&persisted_relation, &persisted_claim)
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "relation persist failed: {e}"
+                        ))
+                    })?;
+            }
 
             // Cardinality-violation detection. Runs AFTER the
             // graph accepts the assert so the counts reflect the
@@ -984,6 +1187,7 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
         let catalogue = Arc::clone(&self.catalogue);
         let bus = Arc::clone(&self.bus);
         let plugin_name = self.plugin_name.clone();
+        let persistence = self.persistence.clone();
         Box::pin(async move {
             // Predicate existence validation, applied symmetrically
             // to retraction. An undeclared predicate on retract is
@@ -1024,6 +1228,35 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
                     retraction.reason,
                 )
                 .map_err(|e| ReportError::Invalid(format!("retract: {e}")))?;
+
+            // Durable write-through. The graph mutation is the
+            // primary effect; the persistence layer mirrors the
+            // resulting claim removal (and the parent relation
+            // when the last claim went away). The wall-clock for
+            // modified_at_ms comes from this point in the call so
+            // it matches the in-memory record's `last_updated`.
+            if let Some(store) = persistence.as_ref() {
+                let modified_at_ms = system_time_to_ms(SystemTime::now());
+                let relation_forgotten = matches!(
+                    outcome,
+                    crate::relations::RelationRetractOutcome::RelationForgotten
+                );
+                store
+                    .record_relation_retract(
+                        &source_id,
+                        &predicate,
+                        &target_id,
+                        &plugin_name,
+                        modified_at_ms,
+                        relation_forgotten,
+                    )
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "relation retract persist failed: {e}"
+                        ))
+                    })?;
+            }
 
             // Fire RelationForgotten with reason ClaimsRetracted
             // when the last claimant retracted and the graph
@@ -1264,6 +1497,28 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                     canonical_id,
                 } => {
                     let at = SystemTime::now();
+                    let at_ms = system_time_to_ms(at);
+
+                    // Mirror the addressing removal through to
+                    // persistence: the wiring layer holds the
+                    // canonical_id from the registry's outcome, so
+                    // the claim_log record carries the right
+                    // subject binding.
+                    if let Some(store) = persistence.as_ref() {
+                        store
+                            .record_subject_retract(
+                                &canonical_id,
+                                &addressing,
+                                &target_plugin,
+                                at_ms,
+                            )
+                            .await
+                            .map_err(|e| {
+                                ReportError::Invalid(format!(
+                                    "subject retract persist failed: {e}"
+                                ))
+                            })?;
+                    }
 
                     bus.emit_durable(
                         Happening::SubjectAddressingForcedRetract {
@@ -1294,7 +1549,13 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                         reason,
                         prior_reason: None,
                         at,
-                    });
+                    })
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "admin ledger write failed: {e}"
+                            ))
+                        })?;
                     Ok(())
                 }
 
@@ -1307,6 +1568,31 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                     subject_type,
                 } => {
                     let at = SystemTime::now();
+                    let at_ms = system_time_to_ms(at);
+
+                    // 0. Persistence: the admin's force-retract
+                    //    removed the last addressing, so the
+                    //    subject row hard-deletes (with cascade
+                    //    over subject_addressings, plus tombstone
+                    //    alias + claim_log entry). The admin
+                    //    plugin is recorded as the
+                    //    forget_claimant; the target plugin is
+                    //    not the actor here.
+                    if let Some(store) = persistence.as_ref() {
+                        store
+                            .record_subject_forget(
+                                &canonical_id,
+                                &admin_plugin,
+                                reason.as_deref(),
+                                at_ms,
+                            )
+                            .await
+                            .map_err(|e| {
+                                ReportError::Invalid(format!(
+                                    "subject forget persist failed: {e}"
+                                ))
+                            })?;
+                    }
 
                     // 1. Admin happening with the forgotten
                     //    subject's canonical ID.
@@ -1346,9 +1632,26 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                     })?;
 
                     // 3. Cascade into the relation graph and fire
-                    //    one RelationForgotten per removed edge.
+                    //    one RelationForgotten per removed edge,
+                    //    mirroring each cascade through the
+                    //    persistence layer so the durable graph
+                    //    stays in lockstep.
                     let removed = graph.forget_all_touching(&canonical_id);
                     for key in removed {
+                        if let Some(store) = persistence.as_ref() {
+                            store
+                                .record_relation_forget(
+                                    &key.source_id,
+                                    &key.predicate,
+                                    &key.target_id,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    ReportError::Invalid(format!(
+                                        "relation forget persist failed: {e}"
+                                    ))
+                                })?;
+                        }
                         bus.emit_durable(Happening::RelationForgotten {
                             plugin: admin_plugin.clone(),
                             source_id: key.source_id,
@@ -1381,7 +1684,13 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                         reason,
                         prior_reason: None,
                         at,
-                    });
+                    })
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "admin ledger write failed: {e}"
+                            ))
+                        })?;
 
                     // 5. Conflict-lifecycle scan. The forgotten id is
                     //    no longer in `registry.describe(...)`'s
@@ -1471,17 +1780,25 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             if source_a_id == source_b_id {
                 return Err(ReportError::MergeSelfTarget);
             }
-            if let (Some(rec_a), Some(rec_b)) = (
+            // Capture subject_type from the pre-validation so the
+            // post-merge persistence write can pin the durable
+            // subject row's type without re-querying the registry
+            // (which has already moved on to the new canonical ID).
+            let merge_subject_type: Option<String> = match (
                 registry.describe(&source_a_id),
                 registry.describe(&source_b_id),
             ) {
-                if rec_a.subject_type != rec_b.subject_type {
-                    return Err(ReportError::MergeCrossType {
-                        a_type: rec_a.subject_type,
-                        b_type: rec_b.subject_type,
-                    });
+                (Some(rec_a), Some(rec_b)) => {
+                    if rec_a.subject_type != rec_b.subject_type {
+                        return Err(ReportError::MergeCrossType {
+                            a_type: rec_a.subject_type,
+                            b_type: rec_b.subject_type,
+                        });
+                    }
+                    Some(rec_a.subject_type)
                 }
-            }
+                _ => None,
+            };
 
             // Storage primitive: produces a new canonical ID and
             // installs alias records. Pre-validation above covers
@@ -1502,6 +1819,41 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 .map_err(|e| ReportError::MergeInternal {
                     detail: e.to_string(),
                 })?;
+
+            // Mirror the merge through to durable storage. The
+            // record collapses both source rows into the new id,
+            // installs alias rows pointing the old ids at the new
+            // one, and appends a single `subject_merge` claim_log
+            // entry — all in one transaction. Skipped if we could
+            // not capture the subject type during pre-validation
+            // (e.g. one source vanished between resolve and
+            // describe — registry.merge_aliases would not have
+            // succeeded in that case so this branch is unreachable
+            // in practice, but the persistence write is gated to
+            // be safe rather than panic).
+            if let (Some(store), Some(subject_type)) =
+                (persistence.as_ref(), merge_subject_type.as_deref())
+            {
+                let at_ms = system_time_to_ms(SystemTime::now());
+                store
+                    .record_subject_merge(
+                        crate::persistence::MergeRecord {
+                            source_a: &source_a_id,
+                            source_b: &source_b_id,
+                            new_id: &new_id,
+                            subject_type,
+                            admin_plugin: &admin_plugin,
+                            reason: reason.as_deref(),
+                            at_ms,
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "subject merge persist failed: {e}"
+                        ))
+                    })?;
+            }
 
             // Admin happening fires BEFORE the structural cascade.
             // Emit SubjectMerged before the graph rewrite so
@@ -1724,7 +2076,13 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 reason,
                 prior_reason: None,
                 at,
-            });
+            })
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "admin ledger write failed: {e}"
+                            ))
+                        })?;
 
             // Conflict-lifecycle scan. When persistence and the
             // in-memory conflict index are both attached, walk the
@@ -1874,6 +2232,18 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                     })
                     .collect();
 
+            // Capture subject_type and a clone of the partition
+            // BEFORE the registry consumes the partition, so the
+            // post-split persistence write can pin the durable
+            // subjects-table mutation without re-querying the
+            // registry (which has already moved on to the new
+            // canonical IDs).
+            let split_subject_type: Option<String> = registry
+                .describe(&source_id)
+                .map(|rec| rec.subject_type);
+            let partition_for_persistence: Vec<Vec<ExternalAddressing>> =
+                partition.clone();
+
             // Storage primitive: registers N new subjects and
             // retires the source ID with an alias record carrying
             // every new ID. The addressing-transfer records drive
@@ -1891,6 +2261,36 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                     reason.clone(),
                 )
                 .map_err(|e| ReportError::Invalid(format!("split: {e}")))?;
+
+            // Mirror the split through to durable storage. The
+            // record collapses the source row into N new ids,
+            // moves the per-partition addressings, installs alias
+            // rows pointing the old id at each new id, and
+            // appends a single `subject_split` claim_log entry —
+            // all in one transaction.
+            if let (Some(store), Some(subject_type)) =
+                (persistence.as_ref(), split_subject_type.as_deref())
+            {
+                let at_ms = system_time_to_ms(SystemTime::now());
+                store
+                    .record_subject_split(
+                        crate::persistence::SplitRecord {
+                            source: &source_id,
+                            new_ids: &new_ids,
+                            subject_type,
+                            partition: &partition_for_persistence,
+                            admin_plugin: &admin_plugin,
+                            reason: reason.as_deref(),
+                            at_ms,
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        ReportError::Invalid(format!(
+                            "subject split persist failed: {e}"
+                        ))
+                    })?;
+            }
 
             // Map each operator-supplied target_new_id_index to
             // the corresponding minted canonical ID. Pre-mint
@@ -2102,7 +2502,13 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 reason,
                 prior_reason: None,
                 at,
-            });
+            })
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "admin ledger write failed: {e}"
+                            ))
+                        })?;
 
             // Conflict-lifecycle scan. Symmetric with the merge
             // path: a split takes one live id and produces N live
@@ -2169,6 +2575,7 @@ pub struct RegistryRelationAdmin {
     ledger: Arc<AdminLedger>,
     router: Arc<PluginRouter>,
     admin_plugin: String,
+    persistence: Option<Arc<dyn PersistenceStore>>,
 }
 
 impl RegistryRelationAdmin {
@@ -2198,7 +2605,20 @@ impl RegistryRelationAdmin {
             ledger,
             router,
             admin_plugin: admin_plugin.into(),
+            persistence: None,
         }
+    }
+
+    /// Attach a durable backing store. When set, every successful
+    /// admin mutation (forced_retract_claim, suppress, unsuppress)
+    /// is mirrored to the relation tables so the resulting
+    /// graph state survives a steward restart.
+    pub fn with_persistence(
+        mut self,
+        persistence: Arc<dyn PersistenceStore>,
+    ) -> Self {
+        self.persistence = Some(persistence);
+        self
     }
 }
 
@@ -2219,6 +2639,7 @@ impl RelationAdmin for RegistryRelationAdmin {
         let router = Arc::clone(&self.router);
         let admin_plugin = self.admin_plugin.clone();
         let _catalogue = Arc::clone(&self.catalogue);
+        let persistence = self.persistence.clone();
         Box::pin(async move {
             // Existence guard: refuse a target_plugin that is not
             // currently admitted. Without this check a typoed
@@ -2270,6 +2691,23 @@ impl RelationAdmin for RegistryRelationAdmin {
 
                 ForcedRetractClaimOutcome::ClaimRemoved => {
                     let at = SystemTime::now();
+                    if let Some(store) = persistence.as_ref() {
+                        store
+                            .record_relation_retract(
+                                &source_id,
+                                &predicate,
+                                &target_id,
+                                &target_plugin,
+                                system_time_to_ms(at),
+                                false,
+                            )
+                            .await
+                            .map_err(|e| {
+                                ReportError::Invalid(format!(
+                                    "relation retract persist failed: {e}"
+                                ))
+                            })?;
+                    }
                     bus.emit_durable(Happening::RelationClaimForcedRetract {
                         admin_plugin: admin_plugin.clone(),
                         target_plugin: target_plugin.clone(),
@@ -2298,12 +2736,35 @@ impl RelationAdmin for RegistryRelationAdmin {
                         reason,
                         prior_reason: None,
                         at,
-                    });
+                    })
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "admin ledger write failed: {e}"
+                            ))
+                        })?;
                     Ok(())
                 }
 
                 ForcedRetractClaimOutcome::RelationForgotten => {
                     let at = SystemTime::now();
+                    if let Some(store) = persistence.as_ref() {
+                        store
+                            .record_relation_retract(
+                                &source_id,
+                                &predicate,
+                                &target_id,
+                                &target_plugin,
+                                system_time_to_ms(at),
+                                true,
+                            )
+                            .await
+                            .map_err(|e| {
+                                ReportError::Invalid(format!(
+                                    "relation retract persist failed: {e}"
+                                ))
+                            })?;
+                    }
 
                     // 1. Admin happening FIRST.
                     bus.emit_durable(Happening::RelationClaimForcedRetract {
@@ -2355,7 +2816,13 @@ impl RelationAdmin for RegistryRelationAdmin {
                         reason,
                         prior_reason: None,
                         at,
-                    });
+                    })
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "admin ledger write failed: {e}"
+                            ))
+                        })?;
                     Ok(())
                 }
             }
@@ -2405,6 +2872,7 @@ impl RelationAdmin for RegistryRelationAdmin {
         let ledger = Arc::clone(&self.ledger);
         let admin_plugin = self.admin_plugin.clone();
         let _catalogue = Arc::clone(&self.catalogue);
+        let persistence = self.persistence.clone();
         Box::pin(async move {
             let source_id = match registry.resolve(&source) {
                 Some(id) => id,
@@ -2431,6 +2899,25 @@ impl RelationAdmin for RegistryRelationAdmin {
 
                 SuppressOutcome::NewlySuppressed => {
                     let at = SystemTime::now();
+                    if let Some(store) = persistence.as_ref() {
+                        let at_ms = system_time_to_ms(at);
+                        store
+                            .record_relation_suppress(
+                                &source_id,
+                                &predicate,
+                                &target_id,
+                                &admin_plugin,
+                                at_ms,
+                                reason.as_deref(),
+                                at_ms,
+                            )
+                            .await
+                            .map_err(|e| {
+                                ReportError::Invalid(format!(
+                                    "relation suppress persist failed: {e}"
+                                ))
+                            })?;
+                    }
                     bus.emit_durable(Happening::RelationSuppressed {
                         admin_plugin: admin_plugin.clone(),
                         source_id: source_id.clone(),
@@ -2458,7 +2945,13 @@ impl RelationAdmin for RegistryRelationAdmin {
                         reason,
                         prior_reason: None,
                         at,
-                    });
+                    })
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "admin ledger write failed: {e}"
+                            ))
+                        })?;
                     Ok(())
                 }
 
@@ -2467,6 +2960,25 @@ impl RelationAdmin for RegistryRelationAdmin {
                     new_reason,
                 } => {
                     let at = SystemTime::now();
+                    if let Some(store) = persistence.as_ref() {
+                        let at_ms = system_time_to_ms(at);
+                        store
+                            .record_relation_suppress(
+                                &source_id,
+                                &predicate,
+                                &target_id,
+                                &admin_plugin,
+                                at_ms,
+                                new_reason.as_deref(),
+                                at_ms,
+                            )
+                            .await
+                            .map_err(|e| {
+                                ReportError::Invalid(format!(
+                                    "relation suppress reason persist failed: {e}"
+                                ))
+                            })?;
+                    }
                     bus.emit_durable(
                         Happening::RelationSuppressionReasonUpdated {
                             admin_plugin: admin_plugin.clone(),
@@ -2497,7 +3009,13 @@ impl RelationAdmin for RegistryRelationAdmin {
                         reason: new_reason,
                         prior_reason: old_reason,
                         at,
-                    });
+                    })
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "admin ledger write failed: {e}"
+                            ))
+                        })?;
                     Ok(())
                 }
             }
@@ -2532,6 +3050,7 @@ impl RelationAdmin for RegistryRelationAdmin {
         let ledger = Arc::clone(&self.ledger);
         let admin_plugin = self.admin_plugin.clone();
         let _catalogue = Arc::clone(&self.catalogue);
+        let persistence = self.persistence.clone();
         Box::pin(async move {
             let source_id = match registry.resolve(&source) {
                 Some(id) => id,
@@ -2554,6 +3073,21 @@ impl RelationAdmin for RegistryRelationAdmin {
 
                 UnsuppressOutcome::Unsuppressed => {
                     let at = SystemTime::now();
+                    if let Some(store) = persistence.as_ref() {
+                        store
+                            .record_relation_unsuppress(
+                                &source_id,
+                                &predicate,
+                                &target_id,
+                                system_time_to_ms(at),
+                            )
+                            .await
+                            .map_err(|e| {
+                                ReportError::Invalid(format!(
+                                    "relation unsuppress persist failed: {e}"
+                                ))
+                            })?;
+                    }
                     bus.emit_durable(Happening::RelationUnsuppressed {
                         admin_plugin: admin_plugin.clone(),
                         source_id: source_id.clone(),
@@ -2580,7 +3114,13 @@ impl RelationAdmin for RegistryRelationAdmin {
                         reason: None,
                         prior_reason: None,
                         at,
-                    });
+                    })
+                        .await
+                        .map_err(|e| {
+                            ReportError::Invalid(format!(
+                                "admin ledger write failed: {e}"
+                            ))
+                        })?;
                     Ok(())
                 }
             }
@@ -2608,6 +3148,39 @@ fn system_time_to_ms(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Translate an SDK [`SubjectClaim`] into the persistence-side
+/// [`PersistedClaim`](crate::persistence::PersistedClaim) shape.
+///
+/// `Equivalent` and `Distinct` align between the two enums; the
+/// persistence layer additionally has a `MultiSubjectConflict`
+/// variant that the registry mints on conflict detection (recorded
+/// via `record_pending_conflict` separately, not via this path).
+fn persisted_claim_from_subject_claim(
+    claim: &evo_plugin_sdk::contract::SubjectClaim,
+) -> crate::persistence::PersistedClaim {
+    use evo_plugin_sdk::contract::SubjectClaim;
+    match claim {
+        SubjectClaim::Equivalent {
+            a,
+            b,
+            confidence,
+            reason,
+        } => crate::persistence::PersistedClaim::Equivalent {
+            a: a.clone(),
+            b: b.clone(),
+            confidence: *confidence,
+            reason: reason.clone(),
+        },
+        SubjectClaim::Distinct { a, b, reason } => {
+            crate::persistence::PersistedClaim::Distinct {
+                a: a.clone(),
+                b: b.clone(),
+                reason: reason.clone(),
+            }
+        }
+    }
 }
 
 /// Project a steward-internal subject record onto the SDK shape

@@ -15,12 +15,99 @@ artefacts. Consult the git log for pre-0.1.8 history.
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-04-29
+
+### Release
+
+- **Workspace** `version` in the root `Cargo.toml` is **0.1.11**; published as git tag **`v0.1.11`**.
+- Cross-architecture binaries (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf`) published to `foonerd/evo-core-artefacts` under `binaries/<target>/`. Each carries its `evo` and `evo-plugin-tool` binaries plus `build-info.toml`, an ed25519 detached signature, and a SHA-256 digest sidecar. The reference factory plugin bundle (`org.evo.example.factory`) is published alongside under `bundles/<plugin>/<target>/`.
+
+### Added — wire protocol
+
+- **`subscribe_subject` push subscription op.** A per-subject push stream over the existing client wire transport. Each `Happening` on the bus is filtered through a per-subject `affects_subject(canonical_id)` predicate and re-projected when the predicate hits. Subscribers may pin a `since` cursor and request a `scope` projection plus optional alias following. The stream emits a `SubscribedSubject` ack frame followed by `ProjectionUpdate` frames as the bus advances. Capabilities advertise `subscribe_subject` and `subscribe_subject_push`. The `affects_subject` taxonomy across every `Happening` variant is pinned by 10 unit tests in `happenings.rs`.
+- **`project_rack` structural projection op.** Returns the rack's declared shape — name, charter, current_seq, and one entry per declared shelf — joined with the router's admitted-occupants table so consumers see both the shape and the live state in one frame. Capabilities advertise `project_rack` and `rack_structural_projection`. Catalogue is the authority on which racks exist; an unknown rack name surfaces as a structured `not_found / unknown_rack`. Per-entry interaction-kind reads use a `try_lock` discipline; mid-transition entries fall back to `unknown` rather than blocking the projection call.
+- **`list_plugins` read-only inventory op.** Returns one entry per admitted plugin with name, fully-qualified shelf, and interaction kind (respondent / warden) in router admission order. Capabilities advertise `list_plugins` and `plugin_inventory`. The op is the read-only inventory surface PLUGIN_PACKAGING.md §6 names; the operator-instruction half (writable verbs) is documented but not yet wired.
+
+### Added — admission
+
+- **Factory plugin admission.** Manifests with `kind.instance = "factory"` are now admitted. In-process factory respondent + warden methods land alongside an out-of-process factory wire frame contract: SDK exposes `WireInstanceAnnouncer` and the new instance-announce / instance-retract wire frames; steward-side admission spawns the factory binary, receives instance announcements, and routes the per-instance subjects through the synthetic `evo-factory-instance` addressing scheme. The reference factory plugin (`crates/evo-example-factory`) ships as both an in-process example and a published OOP bundle. Plugin requests now carry an `instance_id: Option<String>` field that selects which factory-managed instance receives the request. Drain stage on shutdown retracts every announced instance; orphan scrub on boot retracts subjects that have no live announcer.
+- **`reload_plugin` honours `lifecycle.hot_reload` policy.** `AdmissionEngine::reload_plugin(plugin_name, runtime_dir)` reads the plugin's manifest policy: `None` is refused with a structured error, `Restart` drains the existing entry then re-admits from the recorded directory, `Live` is wired but not yet exercised — refused with a structured error pending a per-plugin live-reload protocol. The engine tracks admission origins in `plugin_origins: Mutex<HashMap<String, PathBuf>>` populated by `admit_out_of_process_from_directory`; programmatic admissions remain non-reloadable and are refused with a distinct subclass.
+- **Shelf shape range admission via `shape_supports`.** Catalogue shelves accept an optional `shape_supports: Vec<u32>` listing older shape values still admitted during a migration window. The admission gate switches from strict equality to `Shelf::accepts_shape`. Catalogue parser refuses listing the current shape in `shape_supports` and refuses duplicates. Six admission call sites surface the supports list in their refusal messages so an operator investigating a refused plugin sees what shapes the shelf would have accepted.
+
+### Added — persistence
+
+- **Custody ledger durability.** Every custody handoff (`take_custody`, `course_correct`, `release_custody`, `mark_aborted`, `mark_degraded`) writes through to the SQLite `custodies` and `custody_state` tables in the same transaction that mutates the in-memory ledger. Boot rehydrates the ledger from the persisted rows so a steward restart preserves every active custody for live wardens to reason about.
+- **Relation graph durability.** Relation `assert`, `retract`, `forget`, `suppress`, and `unsuppress` paths write through to the SQLite `relations` and `relation_claimants` tables. Boot rehydrates the in-memory graph from the persisted rows.
+- **Admin ledger durability.** Every entry recorded into `AdminLedger` (forced-retract, merge, split, suppress, unsuppress) writes through to the SQLite `admin_log` table. Boot rehydrates the in-memory ledger so the audit surface survives restart.
+- **Subject identity write-through wired in production paths.** The wiring layer (`RegistrySubjectAnnouncer.{announce, retract}`, `RegistryInstanceAnnouncer.{announce, retract, retract_all_for_drain}`, `RegistrySubjectAdmin.{forced_retract_addressing, merge, split}`) now calls the matching `record_subject_*` trait methods after every in-memory mutation. Production construction sites attach the persistence handle via the `with_persistence` builders so the bus, the announcers, and the admin path share one handle. Closes the gap surfaced by hardware acceptance against `v0.1.10-rc.2` where in-memory state was correct but the SQLite tables were empty.
+- **Factory happenings durability.** The factory plugin's three happening sites (`announce` success, `retract` success, drain retract) now use `bus.emit_durable(...).await` instead of fire-and-forget `bus.emit(...)`. Drain treats persistence failure as non-fatal so a failed write does not leak subjects on plugin unload. `happenings_log.MAX(seq)` now matches the wire `current_seq` after factory admission.
+
+### Added — trust
+
+- **Release-tier trust roots.** `evo-trust::release_root` ships a four-role taxonomy (`framework_release`, `reference_device_release`, `vendor_release`, `commons_release`). Each role binds to a per-key sidecar (`<key>.meta.toml`) declaring the role authoritatively; the verification helper walks a release-tier trust set and admits an artefact only when a key whose role matches the artefact kind verifies the raw ed25519 signature. Cross-role admissions are refused with a structured error. Per `PLUGIN_PACKAGING.md` §5.
+
+### Added — distribution and CI
+
+- **Reference factory plugin bundle published.** The `org.evo.example.factory` bundle is staged and published per-arch alongside the existing `org.evo.example.echo` bundle. The publish workflow's bundle-staging stanza now covers both reference plugins.
+- **CI workflow modernisation.** `actions/checkout` v4 → v5, `actions/download-artifact` v6 → v8, `docker/setup-buildx-action` v3 → v4 across the publish workflow; manual repo-secrets smoke test added. Re-validated against the `v0.1.11-rc.3` publish run with zero workflow annotations across every matrix job.
+
+### Added — documentation and tooling
+
+- **Catalogue schemas in-tree skeleton.** `dist/catalogue/schemas/` ships the canonical `<rack>/<shelf>.v<N>.toml` naming convention and seeds one example schema (`example/echo.v1.toml`). `PLUGIN_PACKAGING.md` §10 amended to reference both the in-tree skeleton and the future sibling repository `foonerd/evo-catalogue-schemas`. The standalone repo spin-out is a follow-on org-level action.
+- **Public-facing rustdoc cleanup.** Every workspace intra-doc-link warning resolved; `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` is now clean.
+
+### Changed
+
+- **Wire protocol capability advertisement** gains four new entries. Ops: `project_rack`, `subscribe_subject`, `list_plugins`. Features: `rack_structural_projection`, `subscribe_subject_push`, `plugin_inventory`. Names are stable; consumers MUST tolerate unknown ops/features (additive evolution).
+- **Plugin request payload** carries `instance_id: Option<String>` for factory-routed dispatch. Consumers that issue a factory-routed request without naming an instance receive a structured admission error pointing at the missing field. Singleton plugins ignore the field; existing consumers that omit it continue to work unchanged against singleton plugins.
+
+### Acceptance
+
+- Validated end-to-end on the Pi 5 prototype (aarch64-unknown-linux-gnu, Debian 13.4 trixie). Offline binary signature verification, OOP bundle install via `evo-plugin-tool install`, plugin discovery + admission of the reference factory plugin and the audio-domain `org.evoframework.artwork.local` bundle, wire-protocol round-trips for every shipped op (`request`, `project_subject`, `project_rack`, `subscribe_subject`, `list_plugins`, `subscribe_happenings`, `list_active_custodies`), durability cross-check (`subjects` / `subject_addressings` / `claim_log` / `happenings_log` populated; `MAX(seq)` matches wire `current_seq`), restart-cycle verification (subjects re-announce; tombstones produced; durable cursor advances), clean SIGTERM shutdown.
+
+## [0.1.10] - 2026-04-28
+
+### Release
+
+- **Workspace** `version` in the root `Cargo.toml` is **0.1.10**; published as git tag **`v0.1.10`**.
+- Cross-architecture binaries (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf`) published to `foonerd/evo-core-artefacts` under `binaries/<target>/{evo, evo-plugin-tool, build-info.toml, .sig, .sha256}`. The reference echo plugin bundle (`org.evo.example.echo`) is published alongside under `bundles/org.evo.example.echo/<target>/<bundle>.tar.gz`.
+
+### Added — distribution and release plane
+
+- **`evo::run` library boot function.** The 12-line `main.rs` now invokes `evo::run(...)` from the `evo` library crate. Distributions embedding the framework as a library use the same boot path the binary uses; they no longer duplicate the 468-line boot sequence.
+- **Cross-arch publish workflow.** `.github/workflows/publish.yml` cross-builds `evo` and `evo-plugin-tool` for the three published targets, signs each binary with the framework release signing key, and pushes the result to `foonerd/evo-core-artefacts`. The workflow is the single source of truth for what gets published; nothing is hand-uploaded.
+- **Framework release signing key + meta sidecar.** The public half of the framework release signing key is pinned in source at `keys/evo-core-release-signing-public.{pem,meta.toml}`. The meta sidecar declares the key's role (`framework_release`) so consumers can refuse cross-role artefacts with a clean error. The private half lives outside source, consulted only by the publish workflow.
+- **Trust root layering for releases.** `PLUGIN_PACKAGING.md` §5 documents the four-role taxonomy (`framework_release_root`, `reference_device_release_root`, `vendor_release_root`, `commons_release_root`) that distinguishes who is trusted to sign which artefacts. The framework signs framework binaries; reference-device signs reference-device images; vendors sign vendor distributions. The complete machinery (parser, verification helper, role-mismatch refusal) ships in v0.1.11.
+- **Production-shaped OOP plugin bundle reference.** `org.evo.example.echo` is published as a signed OOP bundle through the release plane, exercising every step of the publish path: cross-build, sign with the framework release signing key, pack as tarball, push to artefacts repo. Plugin developers fetching the artefacts and admitting the bundle observe the same end-to-end flow they will use for their own plugins.
+- **In-tree reference distribution skeleton.** `crates/evo-example-distribution` is the canonical example of a distribution embedding evo-core as a library. The crate's `main.rs` calls `evo::run(...)` end-to-end and admits the reference echo plugin in-process. First-time vendors no longer need to infer the embedding pattern from external repositories.
+- **Per-plugin operator config wiring.** `LoadContext.config` now reads `/etc/evo/plugins.d/<name>.toml` as documented in `PLUGIN_PACKAGING.md` §3. The previously-hardcoded `toml::Table::new()` is replaced; operators can configure plugins per the documented contract.
+- **`RELEASE_PLANE.md` contract.** New engineering doc captures the artefact manifest schema, channel pointers, signing envelope, verification protocol, and publish protocol that govern release-plane behaviour. The publish workflow implements §6; consumer tooling (`evo-plugin-tool verify`) implements §5.
+- **`BOUNDARY.md` three-tier amendment.** Documents the framework / reference generic device / vendor distribution architecture: evo-core ships the framework, `evo-device-audio` is the first reference generic device, third-party vendors ship distributions on top.
+- **`SHOWCASE.md` distribution policy.** Documents the binary-distribution policy v0.1.10 introduces: framework signs its own binaries, reference generic device signs its own, vendor signs vendor distributions. Replaces the implicit "evo-core ships source only" policy of earlier versions.
+
+### Added — wire protocol
+
+- **Server-side filtering on `subscribe_happenings`.** The op accepts an optional `filter` field with three dimensions (variants / plugins / shelves; AND semantics). The dispatcher applies `filter.accepts(...)` on both replay and live paths so subscribers see only events matching their interest. Empty dimensions match-all; absent filter is equivalent to all-empty.
+
+### Added — SDK
+
+- **Plugin-side server helper (`run_oop` / `run_oop_warden`).** `evo-plugin-sdk` ships the OOP plugin bootstrap helpers so plugin authors no longer hand-stitch the wire-server scaffolding. The reference echo plugin's `bin/echo-wire.rs` and the audio-domain `org.evoframework.artwork.local`'s `bin/artwork-local-wire.rs` both use the helpers; downstream plugins inherit the pattern with one call.
+
+### Added — admission
+
+- **`evo-plugin-tool install` `--chown` discipline.** The tool now defaults to chowning bundle files to the configured `[plugins.security.runtime_user]` when invoked under `sudo`, with an opt-out flag for the legacy root-owned path. Closes the friction the v0.1.10-rc.2 acceptance test surfaced where the steward (running as a non-root service user) could not read its own root-owned plugin bundles.
+- **Default `runtime_dir` creation.** The steward creates `/run/evo` on boot when missing rather than refusing to start. systemd's `RuntimeDirectory=evo` (per `dist/systemd/evo.service.example`) handles this for service deployments; foreground/manual runs no longer require the operator to create the directory by hand.
+
+### Acceptance
+
+- Validated end-to-end on the Pi 5 prototype (aarch64-unknown-linux-gnu, Debian 13.4 trixie). Offline binary signature verification against the source-pinned framework release signing key, OOP bundle install via `evo-plugin-tool install`, plugin discovery + admission of the reference echo plugin and the audio-domain `org.evoframework.artwork.local` plugin, wire-protocol round-trips for both shipped reference plugins, clean SIGTERM shutdown. Per-architecture acceptance: aarch64 carries a hardware-validated deployable mark; x86_64 and armv7 inherit the workflow-validated provenance and are deployable subject to whichever plugin developer first runs them on real hardware of those architectures.
+
 ## [0.1.9] - 2026-04-26
 
 ### Release
 - **Workspace** `version` in the root `Cargo.toml` is **0.1.9**; published as git tag **`v0.1.9`**.
 
-### Added — wire protocol (eng-excel)
+### Added — wire protocol
 - **`subscribe_happenings` cursor surface.** The op accepts an optional `since: u64` cursor; when supplied, the server replays every persisted happening with `seq > since` from the durable `happenings_log` window before transitioning to live streaming. The subscription ack now carries `current_seq: u64` so consumers pin reconcile-style queries to it. Each streamed `Happening` frame carries `seq: u64`, strictly monotonic per steward instance and durable across restart for events written via `emit_durable`. Live events at or below the largest replayed seq are deduped server-side. The `HappeningBus` gains a parallel envelope channel (`subscribe_envelope`) carrying `HappeningEnvelope { seq, happening }` for cursor-aware consumers; the plain `subscribe` channel is retained for in-process consumers and tests. New end-to-end tests exercise the replay-then-live transition and the `current_seq` ack contract.
 - **`describe_capabilities` op for runtime feature discovery.** Returns `{ wire_version: u16, ops: [...], features: [...] }` so consumers can probe behaviour at runtime instead of hardcoding compatibility against a steward build. The op set and feature names are stable; new entries are appended (never renamed or removed without bumping `wire_version`). Initial features advertised: `subscribe_happenings_cursor`, `alias_chain_walking`, `active_custodies_snapshot`. Consumers MUST tolerate unknown classes/features (additive evolution) and MUST fall back when a required feature is absent.
 - **Structured error envelope on the client API.** Replaces the flat `{"error": "<string>"}` shape with `{"error": {"class": "...", "message": "...", "details": {...}}}`. `class` is one of eleven structured taxonomy values: `transient`, `unavailable`, `resource_exhausted`, `contract_violation`, `not_found`, `permission_denied`, `trust_violation`, `trust_expired`, `protocol_violation`, `misconfiguration`, `internal`. Connection-fatal status and retry-eligibility are derived from the class — the wire layer no longer carries an independent `fatal: bool` field. `details.subclass` refines semantics within a class without forcing new top-level variants. Consumers that observe an unrecognised class MUST degrade to treating it as `internal` rather than crash. The `ErrorClass` enum is `#[non_exhaustive]`; new classes are added only with a wire-version bump. Documented in `CLIENT_API.md` §5 with the canonical class taxonomy table and stable subclass names.

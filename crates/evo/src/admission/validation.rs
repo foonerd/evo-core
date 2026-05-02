@@ -1,6 +1,6 @@
 //! Pre-admission manifest validation.
 //!
-//! Three checks every admit path runs before constructing a
+//! Two checks every admit path runs before constructing a
 //! [`LoadContext`](evo_plugin_sdk::contract::LoadContext) or
 //! spawning a child process:
 //!
@@ -9,9 +9,6 @@
 //! - [`check_admin_trust`]: a plugin declaring
 //!   `capabilities.admin = true` carries an effective trust class at
 //!   or above [`evo_trust::ADMIN_MINIMUM_TRUST`].
-//! - [`reject_factory_for_v0`]: factory plugins (`kind.instance =
-//!   "factory"`) are refused at admission time until the framework
-//!   gains an instance-emission path.
 //!
 //! The four `admit_*` entry points in the parent module call all
 //! three in the same order. Centralising them here gives each check
@@ -20,7 +17,6 @@
 //! auditable in code review.
 
 use crate::error::StewardError;
-use evo_plugin_sdk::manifest::InstanceShape;
 use evo_plugin_sdk::Manifest;
 use evo_trust::ADMIN_MINIMUM_TRUST;
 
@@ -99,33 +95,6 @@ pub(super) fn check_admin_trust(
     Ok(())
 }
 
-/// Refuse Factory admission until the framework supports it.
-///
-/// Factory plugins (`kind.instance = "factory"`) emit instances at
-/// runtime; the steward has no live admission path for instance
-/// emission yet (GAP [4] is open). Until that lands, every admit
-/// path rejects Factory at admission time with a structured
-/// `StewardError::Admission`. Previously the gate sat in
-/// `plugin_discovery::discover` and silently skipped Factory
-/// manifests; that surface only covered the directory-scan path
-/// and operators got a `tracing::warn!` rather than a structured
-/// admission refusal. Moving the gate here closes both holes:
-/// every admit_* entry point now refuses, and every Rust caller
-/// observes the refusal as `Err`.
-pub(super) fn reject_factory_for_v0(
-    manifest: &Manifest,
-) -> Result<(), StewardError> {
-    if manifest.kind.instance != InstanceShape::Singleton {
-        return Err(StewardError::Admission(format!(
-            "{}: factory plugins are not yet supported \
-             (kind.instance = {:?}); only Singleton is admissible \
-             in v0",
-            manifest.plugin.name, manifest.kind.instance
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,66 +169,5 @@ response_budget_ms = 1000
         let m = manifest_for(true, "standard", "singleton");
         let err = check_admin_trust(&m).expect_err("must reject");
         assert!(matches!(err, StewardError::AdminTrustTooLow { .. }));
-    }
-
-    #[test]
-    fn factory_gate_passes_for_singleton() {
-        let m = manifest_for(false, "standard", "singleton");
-        assert!(reject_factory_for_v0(&m).is_ok());
-    }
-
-    #[test]
-    fn factory_gate_refuses_factory() {
-        // Factory manifests need a [capabilities.factory] block,
-        // unlike the singleton form built by manifest_for. Inline
-        // the TOML so this single test exercises the rejection path
-        // without polluting the helper.
-        let toml = r#"
-[plugin]
-name = "org.test.plugin"
-version = "0.1.0"
-contract = 1
-
-[target]
-shelf = "test.shelf"
-shape = 1
-
-[kind]
-instance = "factory"
-interaction = "respondent"
-
-[transport]
-type = "in-process"
-exec = "<compiled-in>"
-
-[trust]
-class = "standard"
-
-[prerequisites]
-evo_min_version = "0.1.0"
-os_family = "any"
-
-[resources]
-max_memory_mb = 16
-max_cpu_percent = 1
-
-[lifecycle]
-hot_reload = "restart"
-
-[capabilities]
-admin = false
-
-[capabilities.respondent]
-request_types = ["echo"]
-response_budget_ms = 1000
-
-[capabilities.factory]
-emits = "test.shelf"
-max_instances = 1
-instance_ttl_seconds = 60
-"#;
-        let m = Manifest::from_toml(toml).expect("manifest should parse");
-        let err = reject_factory_for_v0(&m).expect_err("must refuse");
-        assert!(matches!(err, StewardError::Admission(_)));
     }
 }

@@ -954,6 +954,58 @@ pub enum Happening {
         /// When the happening was recorded.
         at: SystemTime,
     },
+    /// A factory plugin announced an instance through its
+    /// [`InstanceAnnouncer`](evo_plugin_sdk::contract::InstanceAnnouncer)
+    /// callback. Emitted by
+    /// [`RegistryInstanceAnnouncer`](crate::factory::RegistryInstanceAnnouncer)
+    /// after the underlying subject mint succeeds.
+    ///
+    /// The factory's `<plugin>/<instance_id>` pair is the stable
+    /// external identity; `canonical_id` is the registry-minted UUID
+    /// the steward and other plugins use to address the instance.
+    /// Subscribers needing to react to factory-instance arrivals
+    /// (router updates, projection invalidation, audit) use this
+    /// happening; the existing subject-grammar happenings continue
+    /// to carry the registry-side view.
+    FactoryInstanceAnnounced {
+        /// Canonical name of the announcing factory plugin.
+        plugin: String,
+        /// The plugin-owned instance identifier (stable across
+        /// plugin restart by contract).
+        instance_id: String,
+        /// Registry-minted canonical ID for the subject that
+        /// represents this instance.
+        canonical_id: String,
+        /// The factory's `target.shelf` from its manifest.
+        shelf: String,
+        /// Length of the announcement payload in bytes. The payload
+        /// itself is opaque to the steward; consumer plugins on the
+        /// shelf interpret it per the shelf-shape contract.
+        payload_bytes: usize,
+        /// When the happening was recorded.
+        at: SystemTime,
+    },
+    /// A factory plugin retracted an instance it had previously
+    /// announced (or the steward retracted on the plugin's behalf
+    /// during the lifecycle-drain on plugin unload). Emitted by
+    /// [`RegistryInstanceAnnouncer`](crate::factory::RegistryInstanceAnnouncer)
+    /// after the underlying subject's addressing has been dropped.
+    FactoryInstanceRetracted {
+        /// Canonical name of the factory plugin that owned the
+        /// instance.
+        plugin: String,
+        /// The plugin-owned instance identifier.
+        instance_id: String,
+        /// Registry canonical ID that addressed the instance prior
+        /// to retraction. May no longer resolve in the registry
+        /// after this happening fires (the subject collapses if
+        /// this addressing was its only claimant).
+        canonical_id: String,
+        /// The factory's `target.shelf` from its manifest.
+        shelf: String,
+        /// When the happening was recorded.
+        at: SystemTime,
+    },
 }
 
 /// The happenings bus.
@@ -964,7 +1016,7 @@ pub enum Happening {
 ///
 /// ## Cursor durability
 ///
-/// The bus carries a monotonic [`Self::next_seq`] counter. Every
+/// The bus carries a monotonic `next_seq` counter. Every
 /// happening emitted via [`Self::emit_durable`] is written through
 /// to the [`PersistenceStore`]'s `happenings_log` table tagged with
 /// its seq, then broadcast live. Consumers reconnecting after a
@@ -1465,6 +1517,13 @@ impl Happening {
                 admin_plugin,
                 ..
             } => Some(admin_plugin.as_str()),
+            // Factory-instance lifecycle variants name the factory
+            // plugin in `plugin`; the affected entity is the instance
+            // (a subject), not another plugin.
+            Happening::FactoryInstanceAnnounced { plugin, .. }
+            | Happening::FactoryInstanceRetracted { plugin, .. } => {
+                Some(plugin.as_str())
+            }
         }
     }
 
@@ -1479,7 +1538,182 @@ impl Happening {
             Happening::CustodyTaken { shelf, .. }
             | Happening::CustodyAborted { shelf, .. }
             | Happening::CustodyDegraded { shelf, .. } => Some(shelf.as_str()),
+            // Factory-instance lifecycle events carry the factory's
+            // target shelf so subscribers filtering by shelf
+            // (`HappeningFilter.shelves`) see them under the same
+            // routing key as custody events on the same shelf.
+            Happening::FactoryInstanceAnnounced { shelf, .. }
+            | Happening::FactoryInstanceRetracted { shelf, .. } => {
+                Some(shelf.as_str())
+            }
             _ => None,
+        }
+    }
+
+    /// `true` if this happening is observable on the projection
+    /// for the given canonical subject id.
+    ///
+    /// Used by the `subscribe_subject` push-subscription path:
+    /// a happening matching this predicate triggers a fresh
+    /// projection of the subject and a new
+    /// `ProjectionUpdate` frame on the subscriber's stream.
+    /// The match set is the union of: events that name the
+    /// subject directly (subject-forget, conflict, merge / split
+    /// involving the subject as source or new id, custody
+    /// touching the subject's claim), and events that mutate
+    /// any relation whose source or target is the subject
+    /// (relation-forget, suppress / unsuppress, cardinality
+    /// violation, rewrite, claim reassignment).
+    ///
+    /// Custody-touching variants (`CustodyTaken`,
+    /// `CustodyReleased`, `CustodyStateReported`,
+    /// `CustodyAborted`, `CustodyDegraded`) are not included
+    /// because they are keyed by `(plugin, handle_id)`, not
+    /// by canonical subject id; a custody change does not
+    /// affect the projection of any specific subject. The
+    /// factory-instance lifecycle variants ARE included
+    /// because every factory instance is itself a subject
+    /// (under the `evo-factory-instance` synthetic
+    /// addressing scheme), and the `canonical_id` field on
+    /// those variants is the subject id the wiring layer
+    /// minted.
+    pub fn affects_subject(&self, canonical_id: &str) -> bool {
+        match self {
+            // Direct subject events.
+            Happening::SubjectForgotten {
+                canonical_id: id, ..
+            }
+            | Happening::SubjectAddressingForcedRetract {
+                canonical_id: id,
+                ..
+            } => id == canonical_id,
+            Happening::SubjectMerged {
+                source_ids, new_id, ..
+            } => {
+                new_id == canonical_id
+                    || source_ids.iter().any(|s| s == canonical_id)
+            }
+            Happening::SubjectSplit {
+                source_id, new_ids, ..
+            } => {
+                source_id == canonical_id
+                    || new_ids.iter().any(|s| s == canonical_id)
+            }
+            Happening::SubjectConflictDetected {
+                canonical_ids, ..
+            } => canonical_ids.iter().any(|id| id == canonical_id),
+            Happening::FactoryInstanceAnnounced {
+                canonical_id: id, ..
+            }
+            | Happening::FactoryInstanceRetracted {
+                canonical_id: id,
+                ..
+            } => id == canonical_id,
+
+            // Relation events whose `source_id` and `target_id`
+            // fields name the affected edge endpoints. The subject's
+            // projection changes when either endpoint matches.
+            Happening::RelationForgotten {
+                source_id,
+                target_id,
+                ..
+            }
+            | Happening::RelationCardinalityViolation {
+                source_id,
+                target_id,
+                ..
+            }
+            | Happening::RelationClaimForcedRetract {
+                source_id,
+                target_id,
+                ..
+            }
+            | Happening::RelationSuppressed {
+                source_id,
+                target_id,
+                ..
+            }
+            | Happening::RelationUnsuppressed {
+                source_id,
+                target_id,
+                ..
+            }
+            | Happening::RelationSuppressionReasonUpdated {
+                source_id,
+                target_id,
+                ..
+            } => source_id == canonical_id || target_id == canonical_id,
+
+            // RelationSplitAmbiguous names the OLD source subject
+            // (`source_subject`, the split source) and the OTHER
+            // endpoint (`other_endpoint_id`); the relation is
+            // replicated to every entry in `candidate_new_ids`.
+            // The projection of any subject mentioned changes.
+            Happening::RelationSplitAmbiguous {
+                source_subject,
+                other_endpoint_id,
+                candidate_new_ids,
+                ..
+            } => {
+                source_subject == canonical_id
+                    || other_endpoint_id == canonical_id
+                    || candidate_new_ids.iter().any(|id| id == canonical_id)
+            }
+
+            // RelationCardinalityViolatedPostRewrite carries a
+            // single subject_id whose count exceeded the bound.
+            Happening::RelationCardinalityViolatedPostRewrite {
+                subject_id,
+                ..
+            } => subject_id == canonical_id,
+
+            // RelationClaimSuppressionCollapsed names the
+            // surviving relation's source (`subject_id`) and
+            // target.
+            Happening::RelationClaimSuppressionCollapsed {
+                subject_id,
+                target_id,
+                ..
+            } => subject_id == canonical_id || target_id == canonical_id,
+
+            // RelationRewritten changes one endpoint while the
+            // other (`target_id`) stays fixed. The projection of
+            // any of the three named ids changes.
+            Happening::RelationRewritten {
+                old_subject_id,
+                new_subject_id,
+                target_id,
+                ..
+            } => {
+                old_subject_id == canonical_id
+                    || new_subject_id == canonical_id
+                    || target_id == canonical_id
+            }
+
+            // ClaimReassigned moves a claim from one subject to
+            // another. Both subjects are affected. The optional
+            // target_id (Some when kind = Relation) is the other
+            // endpoint of the moved relation claim and its
+            // projection also changes.
+            Happening::ClaimReassigned {
+                old_subject_id,
+                new_subject_id,
+                target_id,
+                ..
+            } => {
+                old_subject_id == canonical_id
+                    || new_subject_id == canonical_id
+                    || target_id.as_deref() == Some(canonical_id)
+            }
+
+            // Custody-touching variants are keyed by (plugin,
+            // handle_id), not by subject; they do not affect
+            // any specific subject's projection.
+            Happening::CustodyTaken { .. }
+            | Happening::CustodyReleased { .. }
+            | Happening::CustodyStateReported { .. }
+            | Happening::CustodyAborted { .. }
+            | Happening::CustodyDegraded { .. } => false,
         }
     }
 }
@@ -1587,6 +1821,12 @@ fn happening_kind_str(h: &Happening) -> &'static str {
         Happening::SubjectConflictDetected { .. } => {
             "subject_conflict_detected"
         }
+        Happening::FactoryInstanceAnnounced { .. } => {
+            "factory_instance_announced"
+        }
+        Happening::FactoryInstanceRetracted { .. } => {
+            "factory_instance_retracted"
+        }
     }
 }
 
@@ -1680,6 +1920,176 @@ mod filter_tests {
         // `released_for` doesn't carry a shelf either, so it
         // fails on the shelves dimension regardless.
         assert!(!f.accepts(&released_for("org.target")));
+    }
+}
+
+#[cfg(test)]
+mod affects_subject_tests {
+    use super::*;
+    use crate::relations::SuppressionRecord;
+
+    fn at_zero() -> SystemTime {
+        SystemTime::UNIX_EPOCH
+    }
+
+    #[test]
+    fn subject_forgotten_matches_canonical_id() {
+        let h = Happening::SubjectForgotten {
+            plugin: "p".into(),
+            canonical_id: "S".into(),
+            subject_type: "track".into(),
+            at: at_zero(),
+        };
+        assert!(h.affects_subject("S"));
+        assert!(!h.affects_subject("T"));
+    }
+
+    #[test]
+    fn relation_forgotten_matches_either_endpoint() {
+        let h = Happening::RelationForgotten {
+            plugin: "p".into(),
+            source_id: "A".into(),
+            predicate: "next".into(),
+            target_id: "B".into(),
+            reason: RelationForgottenReason::ClaimsRetracted {
+                retracting_plugin: "p".into(),
+            },
+            at: at_zero(),
+        };
+        assert!(h.affects_subject("A"));
+        assert!(h.affects_subject("B"));
+        assert!(!h.affects_subject("C"));
+    }
+
+    #[test]
+    fn subject_merged_matches_sources_and_new_id() {
+        let h = Happening::SubjectMerged {
+            admin_plugin: "admin".into(),
+            source_ids: vec!["A".into(), "B".into()],
+            new_id: "N".into(),
+            reason: None,
+            at: at_zero(),
+        };
+        assert!(h.affects_subject("A"));
+        assert!(h.affects_subject("B"));
+        assert!(h.affects_subject("N"));
+        assert!(!h.affects_subject("X"));
+    }
+
+    #[test]
+    fn subject_split_matches_source_and_new_ids() {
+        let h = Happening::SubjectSplit {
+            admin_plugin: "admin".into(),
+            source_id: "S".into(),
+            new_ids: vec!["N1".into(), "N2".into()],
+            strategy: evo_plugin_sdk::contract::SplitRelationStrategy::ToBoth,
+            reason: None,
+            at: at_zero(),
+        };
+        assert!(h.affects_subject("S"));
+        assert!(h.affects_subject("N1"));
+        assert!(h.affects_subject("N2"));
+        assert!(!h.affects_subject("Z"));
+    }
+
+    #[test]
+    fn relation_rewritten_matches_old_new_and_unchanged_endpoint() {
+        let h = Happening::RelationRewritten {
+            admin_plugin: "admin".into(),
+            predicate: "next".into(),
+            old_subject_id: "OLD".into(),
+            new_subject_id: "NEW".into(),
+            target_id: "OTHER".into(),
+            at: at_zero(),
+        };
+        assert!(h.affects_subject("OLD"));
+        assert!(h.affects_subject("NEW"));
+        assert!(h.affects_subject("OTHER"));
+        assert!(!h.affects_subject("Z"));
+    }
+
+    #[test]
+    fn factory_instance_announced_matches_canonical_id() {
+        let h = Happening::FactoryInstanceAnnounced {
+            plugin: "factory".into(),
+            instance_id: "i-a".into(),
+            canonical_id: "F-INSTANCE-A".into(),
+            shelf: "example.factory".into(),
+            payload_bytes: 0,
+            at: at_zero(),
+        };
+        assert!(h.affects_subject("F-INSTANCE-A"));
+        assert!(!h.affects_subject("F-INSTANCE-B"));
+    }
+
+    #[test]
+    fn custody_taken_does_not_affect_any_subject() {
+        let h = Happening::CustodyTaken {
+            plugin: "p".into(),
+            handle_id: "h-1".into(),
+            shelf: "x.y".into(),
+            custody_type: "playback".into(),
+            at: at_zero(),
+        };
+        // Custody is keyed by (plugin, handle_id), not by subject.
+        assert!(!h.affects_subject("anything"));
+    }
+
+    #[test]
+    fn relation_suppressed_matches_either_endpoint() {
+        let h = Happening::RelationSuppressed {
+            admin_plugin: "admin".into(),
+            source_id: "A".into(),
+            predicate: "next".into(),
+            target_id: "B".into(),
+            reason: None,
+            at: at_zero(),
+        };
+        assert!(h.affects_subject("A"));
+        assert!(h.affects_subject("B"));
+        assert!(!h.affects_subject("C"));
+        let _ = SuppressionRecord {
+            admin_plugin: "x".into(),
+            suppressed_at: at_zero(),
+            reason: None,
+        };
+    }
+
+    #[test]
+    fn relation_split_ambiguous_matches_source_other_and_candidates() {
+        let h = Happening::RelationSplitAmbiguous {
+            admin_plugin: "admin".into(),
+            source_subject: "OLD".into(),
+            predicate: "next".into(),
+            other_endpoint_id: "OTHER".into(),
+            candidate_new_ids: vec!["N1".into(), "N2".into()],
+            at: at_zero(),
+        };
+        assert!(h.affects_subject("OLD"));
+        assert!(h.affects_subject("OTHER"));
+        assert!(h.affects_subject("N1"));
+        assert!(h.affects_subject("N2"));
+        assert!(!h.affects_subject("Z"));
+    }
+
+    #[test]
+    fn claim_reassigned_matches_old_new_and_optional_target() {
+        let h = Happening::ClaimReassigned {
+            admin_plugin: "admin".into(),
+            plugin: "p".into(),
+            kind: ReassignedClaimKind::Relation,
+            old_subject_id: "OLD".into(),
+            new_subject_id: "NEW".into(),
+            scheme: None,
+            value: None,
+            predicate: Some("next".into()),
+            target_id: Some("OTHER".into()),
+            at: at_zero(),
+        };
+        assert!(h.affects_subject("OLD"));
+        assert!(h.affects_subject("NEW"));
+        assert!(h.affects_subject("OTHER"));
+        assert!(!h.affects_subject("Z"));
     }
 }
 

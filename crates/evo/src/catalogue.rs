@@ -134,11 +134,38 @@ pub struct Shelf {
     /// Name of the shelf within its rack (e.g. `echo`, `providers`).
     /// Lowercase, no dots.
     pub name: String,
-    /// Shelf shape version. Plugins declare which shape they satisfy.
+    /// Current shelf shape version. Plugins targeting this exact
+    /// version always admit; plugins targeting an older version
+    /// admit only if the value appears in
+    /// [`Self::shape_supports`].
     pub shape: u32,
+    /// Older shape versions this shelf still accepts in addition
+    /// to its current [`Self::shape`]. Empty by default; the
+    /// admission gate then enforces strict equality, the legacy
+    /// behaviour. A shelf evolving from shape 1 to shape 2 keeps
+    /// compatibility with plugins targeting shape 1 by listing
+    /// `shape = 2` and `shape_supports = [1]`; later, when no
+    /// shape-1 plugins remain, the entry drops and admission
+    /// refuses old plugins again.
+    ///
+    /// The current `shape` value MUST NOT appear in
+    /// `shape_supports` (the catalogue parser refuses the
+    /// duplicate). The list is unordered; admission checks
+    /// membership.
+    #[serde(default)]
+    pub shape_supports: Vec<u32>,
     /// One-sentence description.
     #[serde(default)]
     pub description: String,
+}
+
+impl Shelf {
+    /// True if a plugin declaring `target.shape = candidate`
+    /// would admit on this shelf. Equivalent to "candidate ==
+    /// `self.shape` OR candidate appears in `shape_supports`".
+    pub fn accepts_shape(&self, candidate: u32) -> bool {
+        candidate == self.shape || self.shape_supports.contains(&candidate)
+    }
 }
 
 /// A subject type: a catalogue-declared kind-of-thing the fabric
@@ -393,6 +420,25 @@ impl Catalogue {
                         "duplicate shelf name {} in rack {}",
                         shelf.name, rack.name
                     )));
+                }
+                if shelf.shape_supports.contains(&shelf.shape) {
+                    return Err(StewardError::Catalogue(format!(
+                        "shelf {}.{}: shape_supports must not contain the \
+                         current shape {}; only OLDER shapes belong in this \
+                         list",
+                        rack.name, shelf.name, shelf.shape
+                    )));
+                }
+                let mut seen_supports =
+                    std::collections::HashSet::new();
+                for v in &shelf.shape_supports {
+                    if !seen_supports.insert(v) {
+                        return Err(StewardError::Catalogue(format!(
+                            "shelf {}.{}: shape_supports has duplicate \
+                             entry {}",
+                            rack.name, shelf.name, v
+                        )));
+                    }
                 }
             }
         }
@@ -1580,5 +1626,95 @@ charter = "missing schema_version"
             }
             other => panic!("expected Toml error, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Shelf shape range semantics (gap [9])
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn accepts_shape_strict_equality_when_supports_empty() {
+        let c = Catalogue::from_toml(MINIMAL).unwrap();
+        let shelf = &c.racks[0].shelves[0];
+        assert!(shelf.shape_supports.is_empty());
+        assert!(shelf.accepts_shape(1));
+        assert!(!shelf.accepts_shape(0));
+        assert!(!shelf.accepts_shape(2));
+    }
+
+    #[test]
+    fn accepts_shape_admits_listed_older_shapes() {
+        let toml_text = r#"
+schema_version = 1
+
+[[racks]]
+name = "example"
+family = "domain"
+kinds = ["registrar"]
+charter = "Example rack."
+
+[[racks.shelves]]
+name = "evolving"
+shape = 3
+shape_supports = [1, 2]
+description = "Shelf currently at shape 3, still admitting shapes 1 and 2."
+"#;
+        let c = Catalogue::from_toml(toml_text).unwrap();
+        let shelf = &c.racks[0].shelves[0];
+        assert!(shelf.accepts_shape(3));
+        assert!(shelf.accepts_shape(2));
+        assert!(shelf.accepts_shape(1));
+        assert!(!shelf.accepts_shape(0));
+        assert!(!shelf.accepts_shape(4));
+    }
+
+    #[test]
+    fn shape_supports_listing_current_shape_refused() {
+        let toml_text = r#"
+schema_version = 1
+
+[[racks]]
+name = "example"
+family = "domain"
+kinds = ["registrar"]
+charter = "Example rack."
+
+[[racks.shelves]]
+name = "bogus"
+shape = 2
+shape_supports = [2]
+description = "Listing the current shape in shape_supports is meaningless."
+"#;
+        let err = Catalogue::from_toml(toml_text).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must not contain the current shape"),
+            "expected current-shape refusal, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn shape_supports_duplicate_entries_refused() {
+        let toml_text = r#"
+schema_version = 1
+
+[[racks]]
+name = "example"
+family = "domain"
+kinds = ["registrar"]
+charter = "Example rack."
+
+[[racks.shelves]]
+name = "bogus"
+shape = 3
+shape_supports = [1, 1]
+description = "Duplicate entry."
+"#;
+        let err = Catalogue::from_toml(toml_text).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate entry"),
+            "expected duplicate refusal, got: {msg}"
+        );
     }
 }

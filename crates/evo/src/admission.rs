@@ -46,6 +46,7 @@ use crate::context::{
 };
 use crate::custody::CustodyLedger;
 use crate::error::StewardError;
+use crate::factory::RegistryInstanceAnnouncer;
 use crate::happenings::HappeningBus;
 use crate::persistence::PersistenceStore;
 use crate::plugin_trust::PluginTrustState;
@@ -54,9 +55,15 @@ use crate::relations::RelationGraph;
 use crate::router::{EnforcementPolicy, PluginEntry, PluginRouter};
 use crate::state::StewardState;
 use crate::subjects::SubjectRegistry;
-use evo_plugin_sdk::contract::{HealthReport, LoadContext, Respondent, Warden};
-use evo_plugin_sdk::manifest::{InteractionShape, TransportKind};
+use evo_plugin_sdk::contract::factory::Factory;
+use evo_plugin_sdk::contract::{
+    HealthReport, InstanceAnnouncer, LoadContext, Respondent, Warden,
+};
+use evo_plugin_sdk::manifest::{
+    InstanceShape, InteractionShape, TransportKind,
+};
 use evo_plugin_sdk::Manifest;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -106,6 +113,24 @@ pub struct AdmissionEngine {
     /// [`StewardConfig`](crate::config::StewardConfig) `[plugins.security]`).
     /// Default: disabled. Ignored on non-Unix.
     plugins_security: PluginsSecurityConfig,
+    /// Per-plugin instance announcers, indexed by canonical plugin
+    /// name. Populated at admit time for factory-shaped plugins
+    /// only; consulted at unload time so the drain path can retract
+    /// every announced instance with a structured happening per
+    /// instance (see `RegistryInstanceAnnouncer::retract_all_for_drain`).
+    /// Singleton plugins are not in the map.
+    factory_announcers:
+        std::sync::Mutex<HashMap<String, Arc<RegistryInstanceAnnouncer>>>,
+    /// Provenance map: plugin canonical name → directory that
+    /// admission was driven from. Populated by
+    /// [`Self::admit_out_of_process_from_directory`]; consulted by
+    /// [`Self::reload_plugin`] to decide whether the plugin can
+    /// be re-admitted from its own data without the caller
+    /// supplying a fresh handle. Plugins admitted via the typed
+    /// `admit_*` entry points (in-process, programmatic OOP)
+    /// have no entry here; reload refuses them with a structured
+    /// error pointing at unload + admit.
+    plugin_origins: std::sync::Mutex<HashMap<String, PathBuf>>,
 }
 
 impl std::fmt::Debug for AdmissionEngine {
@@ -119,7 +144,7 @@ impl std::fmt::Debug for AdmissionEngine {
 
 impl AdmissionEngine {
     /// Construct an admission engine over a shared
-    /// [`StewardState`](StewardState).
+    /// [`StewardState`].
     ///
     /// `state` is the bag of shared store handles plus the catalogue
     /// the steward administers; the engine clones the `Arc` and
@@ -147,6 +172,8 @@ impl AdmissionEngine {
             plugins_config_dir,
             plugin_trust,
             plugins_security,
+            factory_announcers: std::sync::Mutex::new(HashMap::new()),
+            plugin_origins: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -160,7 +187,7 @@ impl AdmissionEngine {
         &self.router
     }
 
-    /// Borrow the shared [`StewardState`](StewardState) handle this
+    /// Borrow the shared [`StewardState`] handle this
     /// engine was constructed over.
     ///
     /// Used by tests and by the server / projection layer to reach the
@@ -256,13 +283,19 @@ impl AdmissionEngine {
                 ))
             })?;
 
-        if shelf.shape != manifest.target.shape {
+        if !shelf.accepts_shape(manifest.target.shape) {
+            let supports_note = if shelf.shape_supports.is_empty() {
+                String::new()
+            } else {
+                format!(" (also accepts {:?})", shelf.shape_supports)
+            };
             return Err(StewardError::Admission(format!(
-                "{}: manifest targets shape {} but catalogue shelf {} is shape {}",
+                "{}: manifest targets shape {} but catalogue shelf {} is shape {}{}",
                 manifest.plugin.name,
                 manifest.target.shape,
                 shelf_qualified,
-                shelf.shape
+                shelf.shape,
+                supports_note
             )));
         }
 
@@ -280,7 +313,14 @@ impl AdmissionEngine {
                 manifest.plugin.name, manifest.kind.interaction
             )));
         }
-        validation::reject_factory_for_v0(&manifest)?;
+        if manifest.kind.instance != InstanceShape::Singleton {
+            return Err(StewardError::Admission(format!(
+                "{}: admit_singleton_respondent requires kind.instance \
+                 = 'singleton', manifest declares {:?} \
+                 (use admit_factory_respondent for factories)",
+                manifest.plugin.name, manifest.kind.instance
+            )));
+        }
 
         let mut handle = AdmittedHandle::Respondent(Box::new(
             RespondentAdapter::new(plugin),
@@ -394,13 +434,19 @@ impl AdmissionEngine {
                 ))
             })?;
 
-        if shelf.shape != manifest.target.shape {
+        if !shelf.accepts_shape(manifest.target.shape) {
+            let supports_note = if shelf.shape_supports.is_empty() {
+                String::new()
+            } else {
+                format!(" (also accepts {:?})", shelf.shape_supports)
+            };
             return Err(StewardError::Admission(format!(
-                "{}: manifest targets shape {} but catalogue shelf {} is shape {}",
+                "{}: manifest targets shape {} but catalogue shelf {} is shape {}{}",
                 manifest.plugin.name,
                 manifest.target.shape,
                 shelf_qualified,
-                shelf.shape
+                shelf.shape,
+                supports_note
             )));
         }
 
@@ -418,7 +464,14 @@ impl AdmissionEngine {
                 manifest.plugin.name, manifest.kind.interaction
             )));
         }
-        validation::reject_factory_for_v0(&manifest)?;
+        if manifest.kind.instance != InstanceShape::Singleton {
+            return Err(StewardError::Admission(format!(
+                "{}: admit_singleton_warden requires kind.instance \
+                 = 'singleton', manifest declares {:?} \
+                 (use admit_factory_warden for factories)",
+                manifest.plugin.name, manifest.kind.instance
+            )));
+        }
 
         let mut handle =
             AdmittedHandle::Warden(Box::new(WardenAdapter::new(plugin)));
@@ -497,6 +550,366 @@ impl AdmissionEngine {
         Ok(())
     }
 
+    /// Admit an in-process factory respondent.
+    ///
+    /// Parallel to [`Self::admit_singleton_respondent`] but for
+    /// plugins whose `kind.instance = "factory"`. The plugin's
+    /// [`RetractionPolicy`](evo_plugin_sdk::contract::factory::RetractionPolicy)
+    /// is captured before the plugin is moved into the
+    /// [`RespondentAdapter`] and used to construct a
+    /// [`RegistryInstanceAnnouncer`] tagged with the plugin's name and
+    /// target shelf. The announcer is placed in the plugin's
+    /// [`LoadContext::instance_announcer`] slot, replacing the default
+    /// [`LoggingInstanceAnnouncer`] used for singleton plugins. After
+    /// `load` returns successfully, the announcer's `load_complete`
+    /// flag flips so [`RetractionPolicy::StartupOnly`](evo_plugin_sdk::contract::factory::RetractionPolicy::StartupOnly)
+    /// starts refusing further announces.
+    ///
+    /// Refuses non-factory manifests inline with a structured error
+    /// pointing at [`Self::admit_singleton_respondent`] for the
+    /// singleton path.
+    pub async fn admit_factory_respondent<T>(
+        &mut self,
+        plugin: T,
+        manifest: Manifest,
+    ) -> Result<(), StewardError>
+    where
+        T: Factory + Respondent + 'static,
+    {
+        manifest.validate()?;
+        validation::check_manifest_prerequisites(&manifest)?;
+        validation::check_admin_trust(&manifest)?;
+
+        let shelf_qualified = manifest.target.shelf.clone();
+        let shelf = self
+            .state
+            .catalogue
+            .find_shelf(&shelf_qualified)
+            .ok_or_else(|| {
+                StewardError::Admission(format!(
+                    "{}: target shelf not in catalogue: {}",
+                    manifest.plugin.name, shelf_qualified
+                ))
+            })?;
+
+        if !shelf.accepts_shape(manifest.target.shape) {
+            let supports_note = if shelf.shape_supports.is_empty() {
+                String::new()
+            } else {
+                format!(" (also accepts {:?})", shelf.shape_supports)
+            };
+            return Err(StewardError::Admission(format!(
+                "{}: manifest targets shape {} but catalogue shelf {} is shape {}{}",
+                manifest.plugin.name,
+                manifest.target.shape,
+                shelf_qualified,
+                shelf.shape,
+                supports_note
+            )));
+        }
+
+        if self.router.contains_shelf(&shelf_qualified) {
+            return Err(StewardError::Admission(format!(
+                "{}: shelf {} already occupied",
+                manifest.plugin.name, shelf_qualified
+            )));
+        }
+
+        if manifest.kind.interaction != InteractionShape::Respondent {
+            return Err(StewardError::Admission(format!(
+                "{}: admit_factory_respondent requires kind.interaction \
+                 = 'respondent', manifest declares {:?}",
+                manifest.plugin.name, manifest.kind.interaction
+            )));
+        }
+        if manifest.kind.instance != InstanceShape::Factory {
+            return Err(StewardError::Admission(format!(
+                "{}: admit_factory_respondent requires kind.instance \
+                 = 'factory', manifest declares {:?} \
+                 (use admit_singleton_respondent for singletons)",
+                manifest.plugin.name, manifest.kind.instance
+            )));
+        }
+
+        // Capture the plugin's retraction policy before the move
+        // into the adapter; the adapter sees only the Respondent
+        // surface and the Factory trait would be unreachable
+        // afterwards.
+        let retraction_policy = plugin.retraction_policy();
+
+        let mut handle = AdmittedHandle::Respondent(Box::new(
+            RespondentAdapter::new(plugin),
+        ));
+
+        let description = handle.describe().await;
+        if description.identity.name != manifest.plugin.name {
+            return Err(StewardError::Admission(format!(
+                "plugin describe() name {} does not match manifest name {}",
+                description.identity.name, manifest.plugin.name
+            )));
+        }
+        if description.identity.version != manifest.plugin.version {
+            return Err(StewardError::Admission(format!(
+                "{}: plugin describe() version {} does not match manifest version {}",
+                manifest.plugin.name,
+                description.identity.version,
+                manifest.plugin.version
+            )));
+        }
+        if description.identity.contract != manifest.plugin.contract {
+            return Err(StewardError::Admission(format!(
+                "{}: plugin describe() contract {} does not match manifest contract {}",
+                manifest.plugin.name,
+                description.identity.contract,
+                manifest.plugin.contract
+            )));
+        }
+
+        let announcer = Arc::new(
+            RegistryInstanceAnnouncer::new(
+                Arc::clone(&self.state.subjects),
+                Arc::clone(&self.state.bus),
+                manifest.plugin.name.clone(),
+                manifest.target.shelf.clone(),
+                retraction_policy,
+            )
+            .with_persistence(Arc::clone(&self.state.persistence)),
+        );
+
+        let mut ctx = build_load_context(
+            &self.plugin_data_root,
+            &self.plugins_config_dir,
+            &manifest,
+            Arc::clone(&self.state.subjects),
+            Arc::clone(&self.state.relations),
+            Arc::clone(&self.state.catalogue),
+            Arc::clone(&self.state.bus),
+            Arc::clone(&self.state.admin),
+            Arc::clone(&self.router),
+            Arc::clone(&self.state.persistence),
+            Arc::clone(&self.state.conflict_index),
+        )?;
+        ctx.instance_announcer =
+            Arc::clone(&announcer) as Arc<dyn InstanceAnnouncer>;
+
+        handle.load(&ctx).await.map_err(|e| {
+            StewardError::Admission(format!(
+                "{}: load failed: {}",
+                manifest.plugin.name, e
+            ))
+        })?;
+
+        // Flip the announcer's load_complete flag so any
+        // RetractionPolicy::StartupOnly factory starts refusing
+        // further announces from this point onward.
+        announcer.mark_load_complete();
+        self.factory_announcers
+            .lock()
+            .expect("factory announcers mutex poisoned")
+            .insert(manifest.plugin.name.clone(), Arc::clone(&announcer));
+
+        let kind_name = handle.kind_name();
+        tracing::info!(
+            plugin = %manifest.plugin.name,
+            shelf = %shelf_qualified,
+            kind = %kind_name,
+            instance_kind = "factory",
+            retraction_policy = ?retraction_policy,
+            trust_class = ?manifest.trust.class,
+            "factory plugin admitted"
+        );
+
+        let entry = Arc::new(PluginEntry::new_with_policy(
+            manifest.plugin.name.clone(),
+            shelf_qualified.clone(),
+            handle,
+            EnforcementPolicy::from_manifest(&manifest),
+        ));
+        self.router.insert(entry)?;
+
+        self.state.claimant_issuer.record_version(
+            &manifest.plugin.name,
+            manifest.plugin.version.to_string(),
+        );
+
+        Ok(())
+    }
+
+    /// Admit an in-process factory warden.
+    ///
+    /// Parallel to [`Self::admit_singleton_warden`] but for plugins
+    /// whose `kind.instance = "factory"`. See
+    /// [`Self::admit_factory_respondent`] for the full discussion of
+    /// the announcer wiring; the warden path differs only in that the
+    /// plugin enters the router as an [`AdmittedHandle::Warden`].
+    ///
+    /// Custody handed to a factory warden's instance does not survive
+    /// steward restart while custody / relation / admin durability
+    /// remain in-memory only. Most natural-fit cases work anyway
+    /// because the external entity (e.g. BlueZ pair record, network
+    /// configuration, filesystem mount) carries the durable side of
+    /// state; the plugin re-establishes evo's custody on its
+    /// post-restart re-announce.
+    pub async fn admit_factory_warden<T>(
+        &mut self,
+        plugin: T,
+        manifest: Manifest,
+    ) -> Result<(), StewardError>
+    where
+        T: Factory + Warden + 'static,
+    {
+        manifest.validate()?;
+        validation::check_manifest_prerequisites(&manifest)?;
+        validation::check_admin_trust(&manifest)?;
+
+        let shelf_qualified = manifest.target.shelf.clone();
+        let shelf = self
+            .state
+            .catalogue
+            .find_shelf(&shelf_qualified)
+            .ok_or_else(|| {
+                StewardError::Admission(format!(
+                    "{}: target shelf not in catalogue: {}",
+                    manifest.plugin.name, shelf_qualified
+                ))
+            })?;
+
+        if !shelf.accepts_shape(manifest.target.shape) {
+            let supports_note = if shelf.shape_supports.is_empty() {
+                String::new()
+            } else {
+                format!(" (also accepts {:?})", shelf.shape_supports)
+            };
+            return Err(StewardError::Admission(format!(
+                "{}: manifest targets shape {} but catalogue shelf {} is shape {}{}",
+                manifest.plugin.name,
+                manifest.target.shape,
+                shelf_qualified,
+                shelf.shape,
+                supports_note
+            )));
+        }
+
+        if self.router.contains_shelf(&shelf_qualified) {
+            return Err(StewardError::Admission(format!(
+                "{}: shelf {} already occupied",
+                manifest.plugin.name, shelf_qualified
+            )));
+        }
+
+        if manifest.kind.interaction != InteractionShape::Warden {
+            return Err(StewardError::Admission(format!(
+                "{}: admit_factory_warden requires kind.interaction \
+                 = 'warden', manifest declares {:?}",
+                manifest.plugin.name, manifest.kind.interaction
+            )));
+        }
+        if manifest.kind.instance != InstanceShape::Factory {
+            return Err(StewardError::Admission(format!(
+                "{}: admit_factory_warden requires kind.instance \
+                 = 'factory', manifest declares {:?} \
+                 (use admit_singleton_warden for singletons)",
+                manifest.plugin.name, manifest.kind.instance
+            )));
+        }
+
+        let retraction_policy = plugin.retraction_policy();
+
+        let mut handle =
+            AdmittedHandle::Warden(Box::new(WardenAdapter::new(plugin)));
+
+        let description = handle.describe().await;
+        if description.identity.name != manifest.plugin.name {
+            return Err(StewardError::Admission(format!(
+                "plugin describe() name {} does not match manifest name {}",
+                description.identity.name, manifest.plugin.name
+            )));
+        }
+        if description.identity.version != manifest.plugin.version {
+            return Err(StewardError::Admission(format!(
+                "{}: plugin describe() version {} does not match manifest version {}",
+                manifest.plugin.name,
+                description.identity.version,
+                manifest.plugin.version
+            )));
+        }
+        if description.identity.contract != manifest.plugin.contract {
+            return Err(StewardError::Admission(format!(
+                "{}: plugin describe() contract {} does not match manifest contract {}",
+                manifest.plugin.name,
+                description.identity.contract,
+                manifest.plugin.contract
+            )));
+        }
+
+        let announcer = Arc::new(
+            RegistryInstanceAnnouncer::new(
+                Arc::clone(&self.state.subjects),
+                Arc::clone(&self.state.bus),
+                manifest.plugin.name.clone(),
+                manifest.target.shelf.clone(),
+                retraction_policy,
+            )
+            .with_persistence(Arc::clone(&self.state.persistence)),
+        );
+
+        let mut ctx = build_load_context(
+            &self.plugin_data_root,
+            &self.plugins_config_dir,
+            &manifest,
+            Arc::clone(&self.state.subjects),
+            Arc::clone(&self.state.relations),
+            Arc::clone(&self.state.catalogue),
+            Arc::clone(&self.state.bus),
+            Arc::clone(&self.state.admin),
+            Arc::clone(&self.router),
+            Arc::clone(&self.state.persistence),
+            Arc::clone(&self.state.conflict_index),
+        )?;
+        ctx.instance_announcer =
+            Arc::clone(&announcer) as Arc<dyn InstanceAnnouncer>;
+
+        handle.load(&ctx).await.map_err(|e| {
+            StewardError::Admission(format!(
+                "{}: load failed: {}",
+                manifest.plugin.name, e
+            ))
+        })?;
+
+        announcer.mark_load_complete();
+
+        self.factory_announcers
+            .lock()
+            .expect("factory announcers mutex poisoned")
+            .insert(manifest.plugin.name.clone(), Arc::clone(&announcer));
+
+        let kind_name = handle.kind_name();
+        tracing::info!(
+            plugin = %manifest.plugin.name,
+            shelf = %shelf_qualified,
+            kind = %kind_name,
+            instance_kind = "factory",
+            retraction_policy = ?retraction_policy,
+            trust_class = ?manifest.trust.class,
+            "factory plugin admitted"
+        );
+
+        let entry = Arc::new(PluginEntry::new_with_policy(
+            manifest.plugin.name.clone(),
+            shelf_qualified.clone(),
+            handle,
+            EnforcementPolicy::from_manifest(&manifest),
+        ));
+        self.router.insert(entry)?;
+
+        self.state.claimant_issuer.record_version(
+            &manifest.plugin.name,
+            manifest.plugin.version.to_string(),
+        );
+
+        Ok(())
+    }
+
     /// Admit an out-of-process singleton respondent over the wire
     /// protocol.
     ///
@@ -546,13 +959,19 @@ impl AdmissionEngine {
                 ))
             })?;
 
-        if shelf.shape != manifest.target.shape {
+        if !shelf.accepts_shape(manifest.target.shape) {
+            let supports_note = if shelf.shape_supports.is_empty() {
+                String::new()
+            } else {
+                format!(" (also accepts {:?})", shelf.shape_supports)
+            };
             return Err(StewardError::Admission(format!(
-                "{}: manifest targets shape {} but catalogue shelf {} is shape {}",
+                "{}: manifest targets shape {} but catalogue shelf {} is shape {}{}",
                 manifest.plugin.name,
                 manifest.target.shape,
                 shelf_qualified,
-                shelf.shape
+                shelf.shape,
+                supports_note
             )));
         }
 
@@ -570,7 +989,6 @@ impl AdmissionEngine {
                 manifest.plugin.name, manifest.kind.interaction
             )));
         }
-        validation::reject_factory_for_v0(&manifest)?;
 
         // Connect and eagerly describe. If either the connection or
         // the initial describe fails we return here with no partial
@@ -614,7 +1032,7 @@ impl AdmissionEngine {
 
         let mut handle = AdmittedHandle::Respondent(Box::new(respondent));
 
-        let ctx = build_load_context(
+        let mut ctx = build_load_context(
             &self.plugin_data_root,
             &self.plugins_config_dir,
             &manifest,
@@ -627,6 +1045,34 @@ impl AdmissionEngine {
             Arc::clone(&self.state.persistence),
             Arc::clone(&self.state.conflict_index),
         )?;
+
+        // For factory plugins, swap the default LoggingInstanceAnnouncer
+        // for a real RegistryInstanceAnnouncer that mints subjects and
+        // emits happenings. Out-of-process factories default to
+        // RetractionPolicy::Dynamic; a future enhancement carries the
+        // declared policy across the wire (or through a manifest field)
+        // so StartupOnly / ShutdownOnly are operator-controllable for
+        // OOP factories. The wiring layer's WireRespondent::load reads
+        // ctx.instance_announcer when constructing the EventSink.
+        let factory_announcer =
+            if manifest.kind.instance == InstanceShape::Factory {
+                let announcer = Arc::new(
+                    RegistryInstanceAnnouncer::new(
+                        Arc::clone(&self.state.subjects),
+                        Arc::clone(&self.state.bus),
+                        manifest.plugin.name.clone(),
+                        manifest.target.shelf.clone(),
+                        evo_plugin_sdk::contract::factory::RetractionPolicy::Dynamic,
+                    )
+                    .with_persistence(Arc::clone(&self.state.persistence)),
+                );
+                ctx.instance_announcer =
+                    Arc::clone(&announcer) as Arc<dyn InstanceAnnouncer>;
+                Some(announcer)
+            } else {
+                None
+            };
+
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
                 "{}: load failed: {}",
@@ -634,11 +1080,25 @@ impl AdmissionEngine {
             ))
         })?;
 
+        if let Some(announcer) = &factory_announcer {
+            announcer.mark_load_complete();
+            self.factory_announcers
+                .lock()
+                .expect("factory announcers mutex poisoned")
+                .insert(manifest.plugin.name.clone(), Arc::clone(announcer));
+        }
+
         let kind_name = handle.kind_name();
+        let instance_kind = if factory_announcer.is_some() {
+            "factory"
+        } else {
+            "singleton"
+        };
         tracing::info!(
             plugin = %manifest.plugin.name,
             shelf = %shelf_qualified,
             kind = %kind_name,
+            instance_kind,
             trust_class = ?manifest.trust.class,
             transport = "wire",
             "plugin admitted"
@@ -665,8 +1125,7 @@ impl AdmissionEngine {
         Ok(())
     }
 
-    /// Admit an out-of-process singleton warden over the wire
-    /// protocol.
+    /// Admit an out-of-process warden over the wire protocol.
     ///
     /// Parallel to [`Self::admit_out_of_process_respondent`] for the
     /// warden interaction shape. Follows the same admission
@@ -703,13 +1162,19 @@ impl AdmissionEngine {
                 ))
             })?;
 
-        if shelf.shape != manifest.target.shape {
+        if !shelf.accepts_shape(manifest.target.shape) {
+            let supports_note = if shelf.shape_supports.is_empty() {
+                String::new()
+            } else {
+                format!(" (also accepts {:?})", shelf.shape_supports)
+            };
             return Err(StewardError::Admission(format!(
-                "{}: manifest targets shape {} but catalogue shelf {} is shape {}",
+                "{}: manifest targets shape {} but catalogue shelf {} is shape {}{}",
                 manifest.plugin.name,
                 manifest.target.shape,
                 shelf_qualified,
-                shelf.shape
+                shelf.shape,
+                supports_note
             )));
         }
 
@@ -727,7 +1192,6 @@ impl AdmissionEngine {
                 manifest.plugin.name, manifest.kind.interaction
             )));
         }
-        validation::reject_factory_for_v0(&manifest)?;
 
         // Connect and eagerly describe. Hands the shared custody
         // ledger and happenings bus to WireWarden so its load()
@@ -774,7 +1238,7 @@ impl AdmissionEngine {
 
         let mut handle = AdmittedHandle::Warden(Box::new(warden));
 
-        let ctx = build_load_context(
+        let mut ctx = build_load_context(
             &self.plugin_data_root,
             &self.plugins_config_dir,
             &manifest,
@@ -787,6 +1251,30 @@ impl AdmissionEngine {
             Arc::clone(&self.state.persistence),
             Arc::clone(&self.state.conflict_index),
         )?;
+
+        // For factory plugins, swap the default LoggingInstanceAnnouncer
+        // for a real RegistryInstanceAnnouncer. See the parallel block
+        // in admit_out_of_process_respondent for the rationale +
+        // RetractionPolicy::Dynamic default for OOP factories.
+        let factory_announcer =
+            if manifest.kind.instance == InstanceShape::Factory {
+                let announcer = Arc::new(
+                    RegistryInstanceAnnouncer::new(
+                        Arc::clone(&self.state.subjects),
+                        Arc::clone(&self.state.bus),
+                        manifest.plugin.name.clone(),
+                        manifest.target.shelf.clone(),
+                        evo_plugin_sdk::contract::factory::RetractionPolicy::Dynamic,
+                    )
+                    .with_persistence(Arc::clone(&self.state.persistence)),
+                );
+                ctx.instance_announcer =
+                    Arc::clone(&announcer) as Arc<dyn InstanceAnnouncer>;
+                Some(announcer)
+            } else {
+                None
+            };
+
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
                 "{}: load failed: {}",
@@ -794,11 +1282,25 @@ impl AdmissionEngine {
             ))
         })?;
 
+        if let Some(announcer) = &factory_announcer {
+            announcer.mark_load_complete();
+            self.factory_announcers
+                .lock()
+                .expect("factory announcers mutex poisoned")
+                .insert(manifest.plugin.name.clone(), Arc::clone(announcer));
+        }
+
         let kind_name = handle.kind_name();
+        let instance_kind = if factory_announcer.is_some() {
+            "factory"
+        } else {
+            "singleton"
+        };
         tracing::info!(
             plugin = %manifest.plugin.name,
             shelf = %shelf_qualified,
             kind = %kind_name,
+            instance_kind,
             trust_class = ?manifest.trust.class,
             transport = "wire",
             "plugin admitted"
@@ -838,7 +1340,7 @@ impl AdmissionEngine {
     ///    paths in `exec` are honoured as-is.
     /// 4. Computes a socket path under `runtime_dir` keyed by the
     ///    plugin name: `<runtime_dir>/<plugin-name>.sock`.
-    /// 5. Spawns the plugin binary with that socket path as argv[1].
+    /// 5. Spawns the plugin binary with that socket path as argv\[1\].
     ///    The child is spawned with `kill_on_drop(true)` so it cannot
     ///    outlive this engine even if shutdown is never called. On Unix,
     ///    if the engine was constructed with a non-default
@@ -849,7 +1351,7 @@ impl AdmissionEngine {
     ///    it runs as the steward.
     /// 6. Polls for the socket to become connectable while checking
     ///    that the child has not already exited. Times out after
-    ///    [`SOCKET_READY_TIMEOUT`].
+    ///    `SOCKET_READY_TIMEOUT` (5 s).
     /// 7. On a successful connection, splits the stream via
     ///    `into_split()` and hands the owned halves to either
     ///    [`Self::admit_out_of_process_respondent`] or
@@ -1054,7 +1556,172 @@ impl AdmissionEngine {
             );
         }
 
+        // Record the plugin's origin so the hot-reload path can
+        // re-admit it from the same directory without operator
+        // intervention.
+        self.plugin_origins
+            .lock()
+            .expect("plugin_origins mutex poisoned")
+            .insert(manifest.plugin.name.clone(), plugin_dir.to_path_buf());
+
         Ok(())
+    }
+
+    /// Hot-reload a single admitted plugin per its declared
+    /// `lifecycle.hot_reload` policy.
+    ///
+    /// Three policy outcomes:
+    ///
+    /// - `HotReloadPolicy::None` — refused with a structured
+    ///   error pointing the operator at explicit unload + admit.
+    ///   The plugin author opted out of hot reload; respecting
+    ///   that choice is correct behaviour.
+    /// - `HotReloadPolicy::Restart` — the steward unloads the
+    ///   plugin and re-admits it from the same source. Today the
+    ///   only reachable origin is
+    ///   [`Self::admit_out_of_process_from_directory`]; plugins
+    ///   admitted via the typed in-process or programmatic OOP
+    ///   `admit_*` entry points have no recorded directory and
+    ///   are refused with a structured error pointing at the
+    ///   distribution-layer admit code.
+    /// - `HotReloadPolicy::Live` — refused. The wire-side
+    ///   `reload_in_place` verb is documented but not yet on the
+    ///   wire; the SDK host returns `ReportError::Invalid` for
+    ///   it. Live reload becomes operative when that verb ships.
+    ///
+    /// `runtime_dir` mirrors the parameter on
+    /// [`Self::admit_out_of_process_from_directory`]; it must
+    /// exist and be writable by the steward.
+    ///
+    /// On success, the plugin is unloaded and re-admitted; the
+    /// shelf may briefly hold no plugin during the gap. Callers
+    /// observing the happenings stream see one `unload` event
+    /// followed by a fresh admit (and any factory-instance
+    /// re-announcements) per the standard admission paths.
+    pub async fn reload_plugin(
+        &mut self,
+        plugin_name: &str,
+        runtime_dir: &std::path::Path,
+    ) -> Result<(), StewardError> {
+        // Look up the plugin by canonical name. The router is
+        // keyed by shelf; the lookup walks the admission_order.
+        let entry = self.router.lookup_by_name(plugin_name).ok_or_else(|| {
+            StewardError::Dispatch(format!(
+                "no plugin admitted with name {plugin_name}"
+            ))
+        })?;
+
+        // Resolve the recorded origin. Programmatic plugins
+        // (in-process, typed OOP) do not have one and cannot be
+        // reloaded by the framework alone.
+        let plugin_dir = self
+            .plugin_origins
+            .lock()
+            .expect("plugin_origins mutex poisoned")
+            .get(plugin_name)
+            .cloned();
+
+        // Read the plugin's manifest to learn its hot_reload
+        // policy. The manifest is the source of truth; the
+        // EnforcementPolicy stored on the entry does not carry
+        // the lifecycle field today.
+        let manifest_path = match plugin_dir.as_ref() {
+            Some(dir) => dir.join("manifest.toml"),
+            None => {
+                return Err(StewardError::Dispatch(format!(
+                    "{plugin_name}: cannot reload; the plugin was admitted \
+                     programmatically (no source directory recorded). The \
+                     distribution's admit code must perform unload + admit \
+                     against a fresh handle."
+                )));
+            }
+        };
+        let manifest_text =
+            std::fs::read_to_string(&manifest_path).map_err(|e| {
+                StewardError::io(
+                    format!(
+                        "reading {} for reload",
+                        manifest_path.display()
+                    ),
+                    e,
+                )
+            })?;
+        let manifest = Manifest::from_toml(&manifest_text)?;
+
+        match manifest.lifecycle.hot_reload {
+            evo_plugin_sdk::manifest::HotReloadPolicy::None => {
+                Err(StewardError::Dispatch(format!(
+                    "{plugin_name}: lifecycle.hot_reload = none; the plugin \
+                     opted out of hot reload. Use unload + admit instead, \
+                     or update the manifest to declare a different policy."
+                )))
+            }
+            evo_plugin_sdk::manifest::HotReloadPolicy::Live => {
+                Err(StewardError::Dispatch(format!(
+                    "{plugin_name}: lifecycle.hot_reload = live requires the \
+                     reload_in_place wire verb, which is documented but \
+                     deferred until a future release. Declare \
+                     hot_reload = restart for the framework's current \
+                     reload behaviour."
+                )))
+            }
+            evo_plugin_sdk::manifest::HotReloadPolicy::Restart => {
+                let plugin_dir = plugin_dir.expect("checked above");
+                let shelf = entry.shelf.clone();
+
+                // Evict from the routing table first so the shelf
+                // is free for the re-admit. Concurrent dispatches
+                // see a structured "no plugin on shelf" until the
+                // re-admit completes.
+                let removed = self
+                    .router
+                    .remove(&shelf)
+                    .ok_or_else(|| {
+                        StewardError::Dispatch(format!(
+                            "{plugin_name}: router lost the entry between \
+                             lookup and remove"
+                        ))
+                    })?;
+                // Drop the shared lookup reference so the only
+                // remaining strong owner of the Arc is `removed`;
+                // unload_one_plugin needs to take the handle out
+                // of the entry and that requires sole ownership
+                // of the contents (the AsyncMutex serialises
+                // taking the inner option, so multiple Arcs are
+                // not actually a soundness problem, but the
+                // pattern matches the drain path).
+                drop(entry);
+
+                // Drop the recorded origin BEFORE the re-admit
+                // path inserts a fresh one; otherwise a concurrent
+                // observer could see two distinct origins for the
+                // same plugin name during the gap.
+                self.plugin_origins
+                    .lock()
+                    .expect("plugin_origins mutex poisoned")
+                    .remove(plugin_name);
+
+                // Unload the evicted entry. Errors are logged but
+                // do not block re-admission: the goal of reload
+                // is to bring the plugin back even if the old
+                // copy is misbehaving.
+                if let Err(e) = unload_one_plugin(removed).await {
+                    tracing::warn!(
+                        plugin = %plugin_name,
+                        error = %e,
+                        "reload: unload of old copy failed; \
+                         continuing with re-admission"
+                    );
+                }
+
+                // Re-admit from the same directory.
+                self.admit_out_of_process_from_directory(
+                    &plugin_dir,
+                    runtime_dir,
+                )
+                .await
+            }
+        }
     }
 
     /// Run a health check against every admitted plugin, returning a
@@ -1116,6 +1783,23 @@ impl AdmissionEngine {
     ) -> ShutdownReport {
         let started_at = Instant::now();
 
+        // Stage 1: drain factory-announced instances. Each registered
+        // factory announcer walks its instance map and emits one
+        // `FactoryInstanceRetracted` happening per instance, removing
+        // the underlying subject. Done before plugin unload so
+        // subscribers see the lifecycle reverse the announce-order
+        // and so any in-flight projection invalidations resolve
+        // before the plugin processes go away.
+        let factory_drain_summary = self.drain_factory_instances().await;
+        if factory_drain_summary.total > 0 {
+            tracing::info!(
+                factories = factory_drain_summary.factories,
+                instances_retracted = factory_drain_summary.total,
+                instances_errored = factory_drain_summary.errored,
+                "factory-instance drain complete"
+            );
+        }
+
         // Stage 2: custody drain. Bounded by min(2s, deadline / 4).
         let custody_window =
             std::cmp::min(Duration::from_secs(2), config.global_deadline / 4);
@@ -1148,6 +1832,197 @@ impl AdmissionEngine {
             elapsed,
         }
     }
+
+    /// Walk every persisted factory-instance subject and forget any
+    /// whose owning plugin has not re-announced it since boot.
+    ///
+    /// Called by `evo::run` after the admission setup completes plus
+    /// the operator-configured grace window
+    /// (`[plugins.factory_orphan_grace_secs]`, default 30 seconds).
+    /// During the grace window, factory plugins admit and re-announce
+    /// their instances per their `RetractionPolicy`. After the
+    /// window, any persisted subject under the
+    /// `evo-factory-instance` addressing scheme NOT present in any
+    /// registered factory announcer's live map is an orphan: its
+    /// owning plugin either did not re-admit, or admitted but did
+    /// not re-announce that particular instance. The scrub walks the
+    /// orphans and retracts each through the same path a plugin
+    /// would use itself, emitting `Happening::SubjectForgotten` and
+    /// writing the durable forget record.
+    ///
+    /// Returns a `ScrubReport` summarising orphans forgotten and
+    /// retracts that errored. Errors during individual retracts are
+    /// logged at warn level and counted; the scrub does not abort on
+    /// the first error.
+    pub async fn scrub_factory_orphans(&self) -> ScrubReport {
+        // Collect the set of canonical IDs every registered factory
+        // announcer currently knows about. Anything outside this set
+        // that lives under the factory-instance addressing scheme is
+        // an orphan.
+        let alive_canonical_ids: std::collections::HashSet<String> = {
+            let guard = self
+                .factory_announcers
+                .lock()
+                .expect("factory announcers mutex poisoned");
+            guard
+                .values()
+                .flat_map(|a| a.snapshot_instances())
+                .map(|(_id, canonical)| canonical)
+                .collect()
+        };
+
+        // Snapshot every subject currently in the registry, then
+        // partition by "has at least one factory-scheme addressing".
+        let subjects = self.state.subjects.snapshot_subjects();
+        let mut orphans: Vec<(String, String, String)> = Vec::new();
+        for s in subjects {
+            for addr in &s.addressings {
+                if addr.addressing.scheme
+                    == crate::factory::FACTORY_INSTANCE_SCHEME
+                    && !alive_canonical_ids.contains(&s.id)
+                {
+                    // Parse `<plugin>/<instance_id>` to recover the
+                    // claimant the original announce used. The
+                    // recovered plugin name is what the registry
+                    // requires to match for retract.
+                    let value = &addr.addressing.value;
+                    let plugin = value
+                        .split_once('/')
+                        .map(|(p, _)| p.to_string())
+                        .unwrap_or_else(|| addr.claimant.clone());
+                    orphans.push((s.id.clone(), plugin, value.clone()));
+                    break; // one orphan per subject; further factory
+                           // addressings on the same subject share its
+                           // fate and the registry retract handles
+                           // them through the cascade.
+                }
+            }
+        }
+
+        if orphans.is_empty() {
+            return ScrubReport {
+                forgotten: 0,
+                errored: 0,
+            };
+        }
+
+        let mut forgotten = 0;
+        let mut errored = 0;
+        for (canonical_id, plugin, value) in orphans {
+            let addressing = evo_plugin_sdk::contract::ExternalAddressing::new(
+                crate::factory::FACTORY_INSTANCE_SCHEME,
+                value,
+            );
+            // Use the wiring-layer subject announcer so the retract
+            // path emits durable `Happening::SubjectForgotten` and
+            // records the durable `subject_forget`. The plugin_name
+            // on the synthesised announcer matches the original
+            // claimant recorded with the addressing, so the
+            // registry permits the retract.
+            let announcer = crate::context::RegistrySubjectAnnouncer::new(
+                Arc::clone(&self.state.subjects),
+                Arc::clone(&self.state.relations),
+                Arc::clone(&self.state.catalogue),
+                Arc::clone(&self.state.bus),
+                plugin.clone(),
+            )
+            .with_persistence(Arc::clone(&self.state.persistence))
+            .with_conflict_index(Arc::clone(&self.state.conflict_index));
+
+            use evo_plugin_sdk::contract::SubjectAnnouncer;
+            match announcer
+                .retract(
+                    addressing,
+                    Some(
+                        "factory-orphan grace expired; instance not \
+                         re-announced after restart"
+                            .into(),
+                    ),
+                )
+                .await
+            {
+                Ok(()) => {
+                    forgotten += 1;
+                    tracing::info!(
+                        plugin = %plugin,
+                        canonical_id = %canonical_id,
+                        "factory orphan forgotten after grace window"
+                    );
+                }
+                Err(e) => {
+                    errored += 1;
+                    tracing::warn!(
+                        plugin = %plugin,
+                        canonical_id = %canonical_id,
+                        error = %e,
+                        "factory orphan scrub: retract refused; continuing"
+                    );
+                }
+            }
+        }
+        ScrubReport { forgotten, errored }
+    }
+
+    /// Walk every registered factory announcer and retract its
+    /// announced instances via the bypass-policy drain method. Used
+    /// by [`Self::shutdown_with_config`] as stage 1 of the shutdown
+    /// pipeline; idempotent (a second call retracts nothing because
+    /// the first emptied each announcer's instance map).
+    ///
+    /// Returns a summary: number of factories drained, total
+    /// instances retracted, total instances that errored. Errors are
+    /// logged at warn-level by the announcer; the caller MAY ignore
+    /// them or surface them in the shutdown report.
+    async fn drain_factory_instances(&self) -> FactoryDrainSummary {
+        let announcers: Vec<Arc<RegistryInstanceAnnouncer>> = {
+            let guard = self
+                .factory_announcers
+                .lock()
+                .expect("factory announcers mutex poisoned");
+            guard.values().cloned().collect()
+        };
+        let factories = announcers.len();
+        let mut total = 0;
+        let mut errored = 0;
+        for announcer in announcers {
+            let (r, e) = announcer.retract_all_for_drain().await;
+            total += r;
+            errored += e;
+        }
+        FactoryDrainSummary {
+            factories,
+            total,
+            errored,
+        }
+    }
+}
+
+/// Outcome of [`AdmissionEngine::scrub_factory_orphans`]. Returned to
+/// the caller (typically `evo::run`'s grace-window task) so the
+/// caller can surface a structured log line and decide whether to
+/// alert on errored retracts.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScrubReport {
+    /// Number of orphans successfully forgotten.
+    pub forgotten: usize,
+    /// Number of orphans whose retract errored. Logged at warn level
+    /// by the scrub itself; counted here for callers that want a
+    /// structured summary.
+    pub errored: usize,
+}
+
+/// Summary returned by `AdmissionEngine::drain_factory_instances`.
+/// Diagnostic only; not part of the public `ShutdownReport`.
+#[derive(Debug, Clone, Copy, Default)]
+struct FactoryDrainSummary {
+    /// Number of registered factory plugins whose announcers were
+    /// drained (regardless of how many instances each had).
+    factories: usize,
+    /// Total instances retracted across all factories.
+    total: usize,
+    /// Total instances whose retract returned an error from the
+    /// registry. Logged but not surfaced.
+    errored: usize,
 }
 
 /// Configuration for [`AdmissionEngine::shutdown_with_config`].
@@ -1159,7 +2034,7 @@ impl AdmissionEngine {
 pub struct ShutdownConfig {
     /// Wall-clock budget for the entire parallel-unload stage. Default
     /// 10 seconds. The per-plugin SIGTERM-then-SIGKILL window inside
-    /// the spawned task ([`CHILD_SHUTDOWN_TIMEOUT`]) is no longer the
+    /// the spawned task (`CHILD_SHUTDOWN_TIMEOUT`, 5 s) is no longer the
     /// dominant bound because tasks run in parallel; this deadline is
     /// the wall-clock cap.
     pub global_deadline: Duration,
@@ -1442,11 +2317,10 @@ async fn parallel_unload_with_deadline(
 
 // Pre-admission validation lives in `admission/validation.rs`.
 // Callers reference the helpers as
-// `validation::check_manifest_prerequisites`,
-// `validation::check_admin_trust`, and
-// `validation::reject_factory_for_v0`. Module-level rustdoc on
-// each helper (including the rationale block on the prerequisites
-// gate that previously lived here) moved with the implementations.
+// `validation::check_manifest_prerequisites` and
+// `validation::check_admin_trust`. Module-level rustdoc on each
+// helper (including the rationale block on the prerequisites gate
+// that previously lived here) moved with the implementations.
 
 /// Build a v0 LoadContext for a plugin.
 ///
@@ -1522,15 +2396,18 @@ fn build_load_context(
                 .with_conflict_index(Arc::clone(&conflict_index)),
             );
         let relation_admin: Arc<dyn evo_plugin_sdk::contract::RelationAdmin> =
-            Arc::new(RegistryRelationAdmin::new(
-                Arc::clone(&registry),
-                Arc::clone(&graph),
-                Arc::clone(&catalogue),
-                Arc::clone(&bus),
-                admin_ledger,
-                router,
-                manifest.plugin.name.clone(),
-            ));
+            Arc::new(
+                RegistryRelationAdmin::new(
+                    Arc::clone(&registry),
+                    Arc::clone(&graph),
+                    Arc::clone(&catalogue),
+                    Arc::clone(&bus),
+                    admin_ledger,
+                    router,
+                    manifest.plugin.name.clone(),
+                )
+                .with_persistence(Arc::clone(&persistence)),
+            );
         (Some(subject_admin), Some(relation_admin))
     } else {
         (None, None)
@@ -1560,16 +2437,19 @@ fn build_load_context(
                 Arc::clone(&bus),
                 manifest.plugin.name.clone(),
             )
-            .with_persistence(persistence)
+            .with_persistence(Arc::clone(&persistence))
             .with_conflict_index(conflict_index),
         ),
-        relation_announcer: Arc::new(RegistryRelationAnnouncer::new(
-            Arc::clone(&registry),
-            graph,
-            catalogue,
-            bus,
-            manifest.plugin.name.clone(),
-        )),
+        relation_announcer: Arc::new(
+            RegistryRelationAnnouncer::new(
+                Arc::clone(&registry),
+                graph,
+                catalogue,
+                bus,
+                manifest.plugin.name.clone(),
+            )
+            .with_persistence(persistence),
+        ),
         // Subject querying is read-only and emits no happenings or
         // audit entries; populate the querier for every in-process
         // plugin regardless of capability or trust class. The
@@ -1928,6 +2808,56 @@ response_budget_ms = 1000
     }
 
     #[tokio::test]
+    async fn reload_plugin_refuses_unknown_name() {
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let r = engine
+            .reload_plugin("org.test.never-admitted", runtime_dir.path())
+            .await;
+        match r {
+            Err(StewardError::Dispatch(msg)) => {
+                assert!(
+                    msg.contains("no plugin admitted with name"),
+                    "expected 'no plugin admitted with name' refusal, got: {msg}"
+                );
+            }
+            other => panic!("expected Dispatch refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_plugin_refuses_programmatic_origin() {
+        // A plugin admitted via the typed admit_singleton_respondent
+        // path has no recorded source directory. The reload path
+        // must refuse with a structured error pointing the
+        // distribution at unload + admit, not silently succeed
+        // with "nothing to do" or panic on the missing origin.
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        engine
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
+            .await
+            .unwrap();
+
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let r = engine.reload_plugin("org.test.ping", runtime_dir.path()).await;
+        match r {
+            Err(StewardError::Dispatch(msg)) => {
+                assert!(
+                    msg.contains("admitted programmatically"),
+                    "expected 'admitted programmatically' refusal, got: {msg}"
+                );
+            }
+            other => panic!("expected Dispatch refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn rejects_plugin_with_identity_mismatch() {
         let catalogue = test_catalogue();
         let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
@@ -2036,6 +2966,8 @@ response_budget_ms = 1000
             payload: b"hello".to_vec(),
             correlation_id: 1,
             deadline: None,
+
+            instance_id: None,
         };
         let resp = engine
             .router()
@@ -2053,6 +2985,8 @@ response_budget_ms = 1000
             payload: vec![],
             correlation_id: 1,
             deadline: None,
+
+            instance_id: None,
         };
         let r = engine.router().handle_request("missing.shelf", req).await;
         assert!(matches!(r, Err(StewardError::Dispatch(_))));
@@ -2842,8 +3776,8 @@ custody_failure_mode = "abort"
     }
 
     /// Build a respondent manifest with `kind.instance = "factory"`.
-    /// Used by the Wave 6.a Factory-gate tests; structurally identical
-    /// to `test_manifest` apart from the instance field.
+    /// Used by the factory-gate tests; structurally identical to
+    /// `test_manifest` apart from the instance field.
     fn factory_respondent_manifest(name: &str) -> Manifest {
         let toml = format!(
             r#"
@@ -2906,9 +3840,10 @@ instance_ttl_seconds = 60
             .await;
         match r {
             Err(StewardError::Admission(msg)) => {
+                let lower = msg.to_lowercase();
                 assert!(
-                    msg.contains("factory") && msg.contains("Singleton"),
-                    "expected refusal naming factory + Singleton, got: {msg}"
+                    lower.contains("factory") && lower.contains("singleton"),
+                    "expected refusal naming factory + singleton, got: {msg}"
                 );
             }
             other => {
@@ -3026,6 +3961,8 @@ instance_ttl_seconds = 60
             payload: vec![],
             correlation_id: 1,
             deadline: None,
+
+            instance_id: None,
         };
         let r = engine.router().handle_request("test.custody", req).await;
         match r {
@@ -4041,7 +4978,7 @@ response_budget_ms = 1000
     }
 
     // ---------------------------------------------------------------
-    // Phase 6 staged-shutdown tests.
+    // Staged-shutdown tests.
     //
     // These exercise `shutdown_with_config` end-to-end. The catalogue
     // and manifests below add several pingable shelves so multiple
@@ -4501,5 +5438,765 @@ custody_failure_mode = "abort"
                 + report.plugins_killed_after_deadline.len(),
             report.plugins_total
         );
+    }
+
+    // -----------------------------------------------------------------
+    // In-process factory admission tests.
+    //
+    // Exercise admit_factory_respondent and admit_factory_warden:
+    // - happy path admits the plugin and routes through the
+    //   RegistryInstanceAnnouncer wired into LoadContext
+    // - the singleton admit methods refuse factory manifests
+    // - the factory admit methods refuse non-factory manifests
+    // - the factory admit methods refuse cross-kind manifests
+    //   (warden manifest passed to admit_factory_respondent etc.)
+    //
+    // The announcer's announce/retract semantics (subject mint, policy
+    // enforcement, happening emission) are covered in the factory
+    // module's own tests; admission tests here only verify the wiring
+    // path and the kind-gate enforcement.
+    // -----------------------------------------------------------------
+
+    use evo_plugin_sdk::contract::factory::{Factory, RetractionPolicy};
+
+    /// A minimal factory respondent for the admission tests. Stores
+    /// the announcer Arc captured during `load` so tests can drive
+    /// announcements through the steward-side InstanceAnnouncer
+    /// wiring.
+    #[derive(Default)]
+    struct TestFactoryRespondent {
+        name: String,
+        policy_choice: Option<RetractionPolicy>,
+    }
+
+    impl Plugin for TestFactoryRespondent {
+        fn describe(
+            &self,
+        ) -> impl Future<Output = PluginDescription> + Send + '_ {
+            async move {
+                PluginDescription {
+                    identity: PluginIdentity {
+                        name: self.name.clone(),
+                        version: semver::Version::new(0, 1, 0),
+                        contract: 1,
+                    },
+                    runtime_capabilities: RuntimeCapabilities {
+                        request_types: vec!["ping".into()],
+                        accepts_custody: false,
+                        flags: Default::default(),
+                    },
+                    build_info: BuildInfo {
+                        plugin_build: "test".into(),
+                        sdk_version: "0.1.0".into(),
+                        rustc_version: None,
+                        built_at: None,
+                    },
+                }
+            }
+        }
+
+        fn load<'a>(
+            &'a mut self,
+            _ctx: &'a LoadContext,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+            async move { Ok(()) }
+        }
+
+        fn unload(
+            &mut self,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
+            async move { Ok(()) }
+        }
+
+        fn health_check(
+            &self,
+        ) -> impl Future<Output = HealthReport> + Send + '_ {
+            async move { HealthReport::healthy() }
+        }
+    }
+
+    impl Respondent for TestFactoryRespondent {
+        fn handle_request<'a>(
+            &'a mut self,
+            req: &'a Request,
+        ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a
+        {
+            async move { Ok(Response::for_request(req, req.payload.clone())) }
+        }
+    }
+
+    impl Factory for TestFactoryRespondent {
+        fn retraction_policy(&self) -> RetractionPolicy {
+            self.policy_choice.unwrap_or(RetractionPolicy::Dynamic)
+        }
+    }
+
+    /// A minimal factory warden for admission tests. Same shape as
+    /// `TestWarden` plus a `Factory` impl with a configurable policy.
+    #[derive(Default)]
+    struct TestFactoryWarden {
+        name: String,
+        policy_choice: Option<RetractionPolicy>,
+    }
+
+    impl Plugin for TestFactoryWarden {
+        fn describe(
+            &self,
+        ) -> impl Future<Output = PluginDescription> + Send + '_ {
+            async move {
+                PluginDescription {
+                    identity: PluginIdentity {
+                        name: self.name.clone(),
+                        version: semver::Version::new(0, 1, 0),
+                        contract: 1,
+                    },
+                    runtime_capabilities: RuntimeCapabilities {
+                        request_types: vec![],
+                        accepts_custody: true,
+                        flags: Default::default(),
+                    },
+                    build_info: BuildInfo {
+                        plugin_build: "test".into(),
+                        sdk_version: "0.1.1".into(),
+                        rustc_version: None,
+                        built_at: None,
+                    },
+                }
+            }
+        }
+
+        fn load<'a>(
+            &'a mut self,
+            _ctx: &'a LoadContext,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+            async move { Ok(()) }
+        }
+
+        fn unload(
+            &mut self,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
+            async move { Ok(()) }
+        }
+
+        fn health_check(
+            &self,
+        ) -> impl Future<Output = HealthReport> + Send + '_ {
+            async move { HealthReport::healthy() }
+        }
+    }
+
+    impl Warden for TestFactoryWarden {
+        fn take_custody<'a>(
+            &'a mut self,
+            _assignment: Assignment,
+        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a
+        {
+            let name = self.name.clone();
+            async move { Ok(CustodyHandle::new(name)) }
+        }
+
+        fn course_correct<'a>(
+            &'a mut self,
+            _handle: &'a CustodyHandle,
+            _correction: CourseCorrection,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+            async move { Ok(()) }
+        }
+
+        fn release_custody<'a>(
+            &'a mut self,
+            _handle: CustodyHandle,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+            async move { Ok(()) }
+        }
+    }
+
+    impl Factory for TestFactoryWarden {
+        fn retraction_policy(&self) -> RetractionPolicy {
+            self.policy_choice.unwrap_or(RetractionPolicy::Dynamic)
+        }
+    }
+
+    fn factory_warden_manifest(name: &str) -> Manifest {
+        let toml = format!(
+            r#"
+[plugin]
+name = "{name}"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "test.custody"
+shape = 1
+
+[kind]
+instance = "factory"
+interaction = "warden"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+
+[capabilities.warden]
+custody_domain = "playback"
+custody_failure_mode = "abort"
+custody_exclusive = false
+course_correction_budget_ms = 1000
+
+[capabilities.factory]
+max_instances = 4
+instance_ttl_seconds = 60
+"#
+        );
+        Manifest::from_toml(&toml).unwrap()
+    }
+
+    #[tokio::test]
+    async fn admit_factory_respondent_admits_factory_manifest() {
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestFactoryRespondent {
+            name: "org.test.factory.resp".into(),
+            policy_choice: Some(RetractionPolicy::Dynamic),
+        };
+        engine
+            .admit_factory_respondent(
+                plugin,
+                factory_respondent_manifest("org.test.factory.resp"),
+            )
+            .await
+            .expect("factory respondent admits");
+        assert_eq!(engine.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn admit_factory_warden_admits_factory_manifest() {
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestFactoryWarden {
+            name: "org.test.factory.warden".into(),
+            policy_choice: Some(RetractionPolicy::Dynamic),
+        };
+        engine
+            .admit_factory_warden(
+                plugin,
+                factory_warden_manifest("org.test.factory.warden"),
+            )
+            .await
+            .expect("factory warden admits");
+        assert_eq!(engine.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn admit_factory_respondent_refuses_singleton_manifest() {
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestFactoryRespondent {
+            name: "org.test.singleton".into(),
+            policy_choice: None,
+        };
+        // test_manifest declares kind.instance = "singleton".
+        let r = engine
+            .admit_factory_respondent(
+                plugin,
+                test_manifest("org.test.singleton"),
+            )
+            .await;
+        match r {
+            Err(StewardError::Admission(msg)) => {
+                assert!(
+                    {
+                        let lower = msg.to_lowercase();
+                        lower.contains("factory") && lower.contains("singleton")
+                    },
+                    "expected refusal naming factory + Singleton, got: {msg}"
+                );
+            }
+            other => {
+                panic!("expected Admission(factory ...) error, got {other:?}")
+            }
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admit_factory_warden_refuses_singleton_manifest() {
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestFactoryWarden {
+            name: "org.test.singleton.warden".into(),
+            policy_choice: None,
+        };
+        let r = engine
+            .admit_factory_warden(
+                plugin,
+                test_warden_manifest("org.test.singleton.warden"),
+            )
+            .await;
+        match r {
+            Err(StewardError::Admission(msg)) => {
+                assert!(
+                    {
+                        let lower = msg.to_lowercase();
+                        lower.contains("factory") && lower.contains("singleton")
+                    },
+                    "expected refusal naming factory + Singleton, got: {msg}"
+                );
+            }
+            other => {
+                panic!("expected Admission(factory ...) error, got {other:?}")
+            }
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admit_factory_respondent_refuses_warden_manifest() {
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestFactoryRespondent {
+            name: "org.test.cross".into(),
+            policy_choice: None,
+        };
+        // factory_warden_manifest declares interaction = "warden".
+        let r = engine
+            .admit_factory_respondent(
+                plugin,
+                factory_warden_manifest("org.test.cross"),
+            )
+            .await;
+        match r {
+            Err(StewardError::Admission(msg)) => {
+                assert!(
+                    {
+                        let lower = msg.to_lowercase();
+                        lower.contains("respondent") && lower.contains("warden")
+                    },
+                    "expected refusal naming respondent + Warden, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Admission(interaction mismatch) error, got {other:?}"
+            ),
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admit_factory_warden_refuses_respondent_manifest() {
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestFactoryWarden {
+            name: "org.test.cross.warden".into(),
+            policy_choice: None,
+        };
+        let r = engine
+            .admit_factory_warden(
+                plugin,
+                factory_respondent_manifest("org.test.cross.warden"),
+            )
+            .await;
+        match r {
+            Err(StewardError::Admission(msg)) => {
+                assert!(
+                    {
+                        let lower = msg.to_lowercase();
+                        lower.contains("warden") && lower.contains("respondent")
+                    },
+                    "expected refusal naming warden + Respondent, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Admission(interaction mismatch) error, got {other:?}"
+            ),
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admit_singleton_respondent_still_refuses_factory_manifest() {
+        // Sanity check: removing reject_factory_for_v0 from the
+        // singleton path replaced it with an inline kind check; the
+        // refusal must still happen.
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestFactoryRespondent {
+            name: "org.test.singleton.refuses.factory".into(),
+            policy_choice: None,
+        };
+        let r = engine
+            .admit_singleton_respondent(
+                plugin,
+                factory_respondent_manifest(
+                    "org.test.singleton.refuses.factory",
+                ),
+            )
+            .await;
+        match r {
+            Err(StewardError::Admission(msg)) => {
+                assert!(
+                    {
+                        let lower = msg.to_lowercase();
+                        lower.contains("singleton") && lower.contains("factory")
+                    },
+                    "expected singleton path refuses factory: {msg}"
+                );
+            }
+            other => panic!("expected Admission(factory) error, got {other:?}"),
+        }
+        assert_eq!(engine.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_factory_instances_before_router_drain() {
+        use crate::happenings::Happening;
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+
+        // Subscribe to the bus before admission so we observe every
+        // FactoryInstance happening the drain emits.
+        let mut subscriber = engine.state().bus.subscribe();
+
+        let plugin = TestFactoryRespondent {
+            name: "org.test.factory.drain".into(),
+            policy_choice: Some(RetractionPolicy::Dynamic),
+        };
+        engine
+            .admit_factory_respondent(
+                plugin,
+                factory_respondent_manifest("org.test.factory.drain"),
+            )
+            .await
+            .expect("factory admits");
+
+        // Reach in through the per-plugin map to drive an announce
+        // (the test plugin doesn't auto-announce on load so we
+        // manually announce a couple of instances to exercise the
+        // drain path).
+        let announcer = engine
+            .factory_announcers
+            .lock()
+            .unwrap()
+            .get("org.test.factory.drain")
+            .cloned()
+            .expect("announcer registered");
+
+        announcer
+            .announce(
+                evo_plugin_sdk::contract::factory::InstanceAnnouncement::new(
+                    "x",
+                    vec![],
+                ),
+            )
+            .await
+            .expect("announce x");
+        announcer
+            .announce(
+                evo_plugin_sdk::contract::factory::InstanceAnnouncement::new(
+                    "y",
+                    vec![],
+                ),
+            )
+            .await
+            .expect("announce y");
+        assert_eq!(announcer.instance_count(), 2);
+
+        // Drain a couple of announce happenings off the bus so the
+        // assertions below see only retract events.
+        for _ in 0..2 {
+            let _ = subscriber.recv().await;
+        }
+
+        // Shut down the engine. Stage 1 of shutdown_with_config drains
+        // every registered factory's instances before plugin unload.
+        let report =
+            engine.shutdown_with_config(ShutdownConfig::default()).await;
+
+        // The plugin itself unloaded cleanly.
+        assert_eq!(report.plugins_total, 1);
+        assert_eq!(report.plugins_unloaded_cleanly.len(), 1);
+
+        // Both instances retracted, in announce-order's reverse.
+        let mut retracted_ids = Vec::new();
+        for _ in 0..2 {
+            match subscriber.recv().await.expect("retract happening") {
+                Happening::FactoryInstanceRetracted { instance_id, .. } => {
+                    retracted_ids.push(instance_id)
+                }
+                other => {
+                    panic!("expected FactoryInstanceRetracted, got {other:?}")
+                }
+            }
+        }
+        // Reverse alphabetical = LIFO of (x, y) by sort: y first, then x.
+        assert_eq!(retracted_ids, vec!["y".to_string(), "x".to_string()]);
+
+        // The announcer's internal map is empty after drain.
+        assert_eq!(announcer.instance_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_is_idempotent_for_factories_with_no_instances() {
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestFactoryRespondent {
+            name: "org.test.factory.empty".into(),
+            policy_choice: Some(RetractionPolicy::Dynamic),
+        };
+        engine
+            .admit_factory_respondent(
+                plugin,
+                factory_respondent_manifest("org.test.factory.empty"),
+            )
+            .await
+            .unwrap();
+
+        // No announce calls. Drain should be a no-op (no retract
+        // happenings emitted) and the plugin still unloads cleanly.
+        let report =
+            engine.shutdown_with_config(ShutdownConfig::default()).await;
+        assert_eq!(report.plugins_unloaded_cleanly.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_shutdown_only_factory_instances() {
+        use crate::happenings::Happening;
+        // ShutdownOnly factories: the plugin can't retract during
+        // its lifetime, but the steward's drain path bypasses that
+        // gate so instances are still cleanly retracted on unload.
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let mut subscriber = engine.state().bus.subscribe();
+
+        let plugin = TestFactoryRespondent {
+            name: "org.test.factory.shutdown-only".into(),
+            policy_choice: Some(RetractionPolicy::ShutdownOnly),
+        };
+        engine
+            .admit_factory_respondent(
+                plugin,
+                factory_respondent_manifest("org.test.factory.shutdown-only"),
+            )
+            .await
+            .unwrap();
+
+        let announcer = engine
+            .factory_announcers
+            .lock()
+            .unwrap()
+            .get("org.test.factory.shutdown-only")
+            .cloned()
+            .unwrap();
+
+        announcer
+            .announce(
+                evo_plugin_sdk::contract::factory::InstanceAnnouncement::new(
+                    "live",
+                    vec![],
+                ),
+            )
+            .await
+            .unwrap();
+
+        // Plugin's own retract during lifetime is refused under
+        // ShutdownOnly — sanity check.
+        let err = announcer
+            .retract(evo_plugin_sdk::contract::factory::InstanceId::from(
+                "live",
+            ))
+            .await
+            .expect_err("ShutdownOnly refuses retract during lifetime");
+        assert!(matches!(
+            err,
+            evo_plugin_sdk::contract::ReportError::Invalid(_)
+        ));
+        assert_eq!(announcer.instance_count(), 1);
+
+        // Drain announce happening so we observe only the retract.
+        let _ = subscriber.recv().await;
+
+        // Steward drain DOES retract under ShutdownOnly — that's the
+        // whole point of the bypass.
+        let _report =
+            engine.shutdown_with_config(ShutdownConfig::default()).await;
+        match subscriber.recv().await.unwrap() {
+            Happening::FactoryInstanceRetracted { instance_id, .. } => {
+                assert_eq!(instance_id, "live");
+            }
+            other => panic!("expected FactoryInstanceRetracted, got {other:?}"),
+        }
+        assert_eq!(announcer.instance_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn scrub_factory_orphans_forgets_subjects_with_no_live_announcer() {
+        // Hand-construct a factory subject in the registry without
+        // registering its announcer in the engine's
+        // factory_announcers map. The scrub should treat it as an
+        // orphan and forget it; the registry no longer has the
+        // subject afterwards.
+        use crate::factory::FACTORY_INSTANCE_SCHEME;
+        use evo_plugin_sdk::contract::ExternalAddressing;
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let catalogue = test_catalogue();
+        let engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+
+        // Mint a factory-shaped subject directly into the registry,
+        // bypassing the announcer (simulating a persisted subject from
+        // a previous boot whose owning plugin did not re-admit).
+        let plugin_name = "org.test.factory.previous_boot";
+        let addressing = ExternalAddressing::new(
+            FACTORY_INSTANCE_SCHEME,
+            format!("{plugin_name}/orphan-1"),
+        );
+        let announcement = SubjectAnnouncement {
+            subject_type: "test.ping".into(),
+            addressings: vec![addressing.clone()],
+            claims: Vec::new(),
+            announced_at: std::time::SystemTime::now(),
+        };
+        engine
+            .state()
+            .subjects
+            .announce(&announcement, plugin_name)
+            .expect("hand-mint orphan subject");
+
+        // Sanity: the subject is in the registry pre-scrub.
+        let pre = engine.state().subjects.snapshot_subjects();
+        assert_eq!(pre.len(), 1, "exactly one subject pre-scrub");
+
+        // Scrub: no announcers registered, so the orphan is forgotten.
+        let report = engine.scrub_factory_orphans().await;
+        assert_eq!(report.forgotten, 1);
+        assert_eq!(report.errored, 0);
+
+        // Subject is gone from the registry.
+        let post = engine.state().subjects.snapshot_subjects();
+        assert!(post.is_empty(), "orphan removed; got {post:?}");
+    }
+
+    #[tokio::test]
+    async fn scrub_factory_orphans_preserves_live_factory_subjects() {
+        // Admit a factory plugin and have its announcer mint
+        // instances (so they ARE in the announcer's live map). Scrub
+        // must leave them alone.
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestFactoryRespondent {
+            name: "org.test.factory.live".into(),
+            policy_choice: Some(RetractionPolicy::Dynamic),
+        };
+        engine
+            .admit_factory_respondent(
+                plugin,
+                factory_respondent_manifest("org.test.factory.live"),
+            )
+            .await
+            .unwrap();
+
+        let announcer = engine
+            .factory_announcers
+            .lock()
+            .unwrap()
+            .get("org.test.factory.live")
+            .cloned()
+            .unwrap();
+        announcer
+            .announce(
+                evo_plugin_sdk::contract::factory::InstanceAnnouncement::new(
+                    "live-1",
+                    vec![],
+                ),
+            )
+            .await
+            .unwrap();
+
+        let pre = engine.state().subjects.snapshot_subjects().len();
+        assert_eq!(pre, 1);
+
+        let report = engine.scrub_factory_orphans().await;
+        assert_eq!(report.forgotten, 0);
+        assert_eq!(report.errored, 0);
+
+        // Live instance survives.
+        let post = engine.state().subjects.snapshot_subjects().len();
+        assert_eq!(post, 1);
+        assert_eq!(announcer.instance_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn scrub_factory_orphans_ignores_non_factory_subjects() {
+        // A subject minted under any non-factory addressing scheme is
+        // not in scope for the scrub: even if no announcer claims it,
+        // the scrub leaves it alone.
+        use evo_plugin_sdk::contract::ExternalAddressing;
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let catalogue = test_catalogue();
+        let engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+
+        let announcement = SubjectAnnouncement {
+            subject_type: "test.ping".into(),
+            addressings: vec![ExternalAddressing::new(
+                "mpd-path",
+                "/library/track-1.flac",
+            )],
+            claims: Vec::new(),
+            announced_at: std::time::SystemTime::now(),
+        };
+        engine
+            .state()
+            .subjects
+            .announce(&announcement, "org.test.singleton")
+            .unwrap();
+
+        let report = engine.scrub_factory_orphans().await;
+        assert_eq!(report.forgotten, 0);
+        assert_eq!(report.errored, 0);
+
+        // Subject still present.
+        assert_eq!(engine.state().subjects.snapshot_subjects().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn admit_factory_respondent_supports_all_retraction_policies() {
+        for (policy, suffix) in [
+            (RetractionPolicy::Dynamic, "dynamic"),
+            (RetractionPolicy::StartupOnly, "startup-only"),
+            (RetractionPolicy::ShutdownOnly, "shutdown-only"),
+        ] {
+            let catalogue = test_catalogue();
+            let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+            let name = format!("org.test.factory.{suffix}");
+            let plugin = TestFactoryRespondent {
+                name: name.clone(),
+                policy_choice: Some(policy),
+            };
+            engine
+                .admit_factory_respondent(
+                    plugin,
+                    factory_respondent_manifest(&name),
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("factory admits with policy {policy:?}: {e}")
+                });
+            assert_eq!(engine.len(), 1);
+        }
     }
 }

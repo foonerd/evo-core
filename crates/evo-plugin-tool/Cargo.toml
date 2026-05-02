@@ -32,6 +32,14 @@ tempfile = "3"
 walkdir = "2"
 ureq = "2.9"
 
+[target.'cfg(unix)'.dependencies]
+# `geteuid` for the install-as-root guard. Only the install path
+# needs it, and only on Unix; the dependency is gated behind
+# `cfg(unix)` so cross-builds for non-Unix targets do not pick it
+# up. `rustix` exposes the syscall through a safe API, keeping the
+# tool inside the workspace's `unsafe_code = "forbid"` gate.
+rustix = { version = "0.38", default-features = false, features = ["process", "std"] }
+
 [dev-dependencies]
 # Integration tests generate deterministic ed25519 keys, write
 # PKCS#8 PEM private keys the tool reads via --key, and build
