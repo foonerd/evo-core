@@ -90,13 +90,24 @@ pub const FEATURE_VERSION_MIN: u16 = 1;
 /// Communicated in [`WireFrame::Hello::feature_max`].
 pub const FEATURE_VERSION_MAX: u16 = 1;
 
-/// Codec names this build can decode on inbound frames.
+/// Codec names this build can decode on inbound frames, in
+/// preference order.
 ///
-/// Sent in [`WireFrame::Hello::codecs`]. Both peers exchange
-/// their decode-side codec list and the answerer picks one
-/// they both speak. JSON is mandatory; CBOR is reserved for a
-/// later feature version and is deliberately not added here.
-pub const SUPPORTED_CODECS: &[&str] = &["json"];
+/// Sent in [`WireFrame::Hello::codecs`]. Both peers exchange their
+/// decode-side codec list and the answerer picks one they both speak,
+/// preferring entries that appear earlier in the requester's list.
+/// JSON is listed first to keep the slow-path default text-
+/// debuggable for plugin-author tooling, operator inspection
+/// scripts, and incident response on production devices; CBOR is
+/// available as an opt-in for consumers (frontend bridges, the
+/// Fast Path channel) where bytes-on-the-wire and parse cost
+/// dominate.
+///
+/// Names match [`crate::codec::CODEC_NAME_JSON`] /
+/// [`crate::codec::CODEC_NAME_CBOR`] verbatim. The handshake itself
+/// is JSON-encoded for the lifetime of v1; the chosen codec applies
+/// only to post-handshake frames.
+pub const SUPPORTED_CODECS: &[&str] = &["json", "cbor"];
 
 /// One wire message. Serialised internally-tagged by the `op` field.
 ///
@@ -140,6 +151,15 @@ pub enum WireFrame {
         credentials_dir: String,
         /// Optional call deadline in milliseconds from now.
         deadline_ms: Option<u64>,
+        /// Optional state blob carried across an OOP live-reload
+        /// boundary. Present only when the steward is loading a
+        /// freshly-spawned plugin process to take over from a
+        /// previous instance whose `prepare_for_live_reload`
+        /// returned a non-empty blob; the new plugin's
+        /// `load_with_state` receives this for schema-aware
+        /// migration. Absent for cold loads at admission time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live_reload_state: Option<LiveReloadState>,
     },
 
     /// `unload` request. Plugin releases resources and returns.
@@ -341,6 +361,42 @@ pub enum WireFrame {
         cid: u64,
         /// Canonical plugin name.
         plugin: String,
+    },
+
+    // ---------------------------------------------------------------
+    // Steward -> Plugin: live-reload preparation request.
+    // ---------------------------------------------------------------
+    /// `prepare_for_live_reload` request. The steward asks the
+    /// running plugin instance to emit a state blob it will hand to
+    /// a freshly-spawned successor instance whose `load_with_state`
+    /// performs schema-aware migration. The plugin returns a
+    /// [`PrepareForLiveReloadResponse`](Self::PrepareForLiveReloadResponse)
+    /// carrying the optional blob. A plugin that has nothing to
+    /// hand over returns `state = None`; the steward then performs
+    /// a cold load of the new instance.
+    PrepareForLiveReload {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// `prepare_for_live_reload` response: optional state blob.
+    PrepareForLiveReloadResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// `Some(blob)` when the plugin produced state to carry to
+        /// the successor instance; `None` when the plugin had no
+        /// transient state to preserve and the steward should
+        /// perform a cold load.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<LiveReloadState>,
     },
 
     // ---------------------------------------------------------------
@@ -819,6 +875,98 @@ pub enum WireFrame {
     },
 
     // ---------------------------------------------------------------
+    // Plugin-originated Fast Path dispatch (plugin -> steward).
+    // Mirrors the in-process [`crate::contract::FastPathDispatcher`]
+    // trait's surface across the wire so OOP plugins reach the same
+    // dispatch path as in-process ones. The steward replies with
+    // [`Self::FastPathDispatchResponse`] on success or
+    // [`Self::Error`] on refusal; the latter's
+    // `details.subclass` carries the structured refusal token
+    // (`not_fast_path_eligible`, `fast_path_budget_exceeded`,
+    // `shelf_not_admitted`, `shelf_unloaded`, `shelf_not_warden`).
+    // ---------------------------------------------------------------
+    /// Plugin-originated Fast Path dispatch request.
+    FastPathDispatch {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical name of the dispatching plugin.
+        plugin: String,
+        /// Target shelf hosting the warden the dispatch routes to.
+        target_shelf: String,
+        /// Custody handle binding the dispatch to a specific
+        /// custody session on the target warden.
+        handle: CustodyHandle,
+        /// Verb name. Must be in the target warden's
+        /// `capabilities.warden.fast_path_verbs`.
+        verb: String,
+        /// Opaque payload per the warden's verb shape. Encoded
+        /// as a native CBOR byte string under CBOR and as a
+        /// base64 JSON string under JSON via
+        /// [`crate::codec::base64_bytes`].
+        #[serde(with = "crate::codec::base64_bytes")]
+        payload: Vec<u8>,
+        /// Optional per-call deadline override. The framework
+        /// computes the effective deadline as the minimum of
+        /// this value and the target warden's declared Fast
+        /// Path budget.
+        deadline_ms: Option<u32>,
+    },
+
+    /// Plugin-originated Fast Path dispatch success response.
+    FastPathDispatchResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    // ---------------------------------------------------------------
+    // Plugin-originated user-interaction request (plugin -> steward).
+    // Mirrors the in-process
+    // [`crate::contract::UserInteractionRequester`] trait method
+    // across the wire so OOP plugins reach the same prompt-routing
+    // path as in-process ones. The steward holds the plugin's
+    // request future open until either the consumer answers
+    // (success path: [`Self::RequestUserInteractionResponse`]
+    // carries the typed [`PromptOutcome`]), the consumer or the
+    // plugin cancels (the response carries a `Cancelled`
+    // outcome), or the deadline expires (the response carries
+    // `TimedOut`). Framework-level failures (steward shutting
+    // down, etc.) surface as [`Self::Error`] with a structured
+    // class.
+    // ---------------------------------------------------------------
+    /// Plugin-originated request for user interaction.
+    RequestUserInteraction {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical name of the plugin issuing the request.
+        plugin: String,
+        /// The full prompt payload.
+        prompt: crate::contract::PromptRequest,
+    },
+
+    /// Plugin-originated user-interaction response. Carries the
+    /// typed [`crate::contract::PromptOutcome`] so the plugin's
+    /// awaiting future resolves with the same shape it would
+    /// have received in-process.
+    RequestUserInteractionResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The terminal outcome.
+        outcome: crate::contract::PromptOutcome,
+    },
+
+    // ---------------------------------------------------------------
     // Event acknowledgement (steward -> plugin). Sent in response to
     // a plugin-originated event frame (`AnnounceSubject`,
     // `RetractSubject`, `AssertRelation`, `RetractRelation`,
@@ -839,6 +987,29 @@ pub enum WireFrame {
         /// Canonical plugin name.
         plugin: String,
     },
+}
+
+/// Wire form of [`StateBlob`](crate::contract::StateBlob).
+///
+/// Carried inside [`WireFrame::PrepareForLiveReloadResponse::state`]
+/// when the running instance returns a non-empty blob from
+/// `prepare_for_live_reload`, and inside
+/// [`WireFrame::Load::live_reload_state`] when the steward forwards
+/// that blob to a freshly-spawned successor instance. The framework
+/// converts to and from the SDK's `StateBlob` at the boundary; the
+/// payload is opaque on the wire (base64-encoded in JSON).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveReloadState {
+    /// Plugin-defined schema version. Advisory; the new instance's
+    /// `load_with_state` decides the migration path. Bumping the
+    /// schema version is the plugin author's signal that the blob
+    /// format changed.
+    pub schema_version: u32,
+    /// Plugin-defined opaque payload. Subject to the framework's
+    /// `MAX_LIVE_RELOAD_BLOB_BYTES` cap; the steward refuses to
+    /// forward blobs larger than this.
+    #[serde(with = "crate::codec::base64_bytes")]
+    pub payload: Vec<u8>,
 }
 
 impl WireFrame {
@@ -869,6 +1040,8 @@ impl WireFrame {
             | Self::AnnounceInstance { v, cid, plugin, .. }
             | Self::RetractInstance { v, cid, plugin, .. }
             | Self::ReportCustodyState { v, cid, plugin, .. }
+            | Self::PrepareForLiveReload { v, cid, plugin }
+            | Self::PrepareForLiveReloadResponse { v, cid, plugin, .. }
             | Self::DescribeAlias { v, cid, plugin, .. }
             | Self::DescribeAliasResponse { v, cid, plugin, .. }
             | Self::DescribeSubject { v, cid, plugin, .. }
@@ -885,6 +1058,10 @@ impl WireFrame {
             | Self::SuppressRelationResponse { v, cid, plugin }
             | Self::UnsuppressRelation { v, cid, plugin, .. }
             | Self::UnsuppressRelationResponse { v, cid, plugin }
+            | Self::FastPathDispatch { v, cid, plugin, .. }
+            | Self::FastPathDispatchResponse { v, cid, plugin }
+            | Self::RequestUserInteraction { v, cid, plugin, .. }
+            | Self::RequestUserInteractionResponse { v, cid, plugin, .. }
             | Self::Error { v, cid, plugin, .. }
             | Self::EventAck { v, cid, plugin }
             | Self::Hello { v, cid, plugin, .. }
@@ -910,6 +1087,7 @@ impl WireFrame {
                 | Self::TakeCustody { .. }
                 | Self::CourseCorrect { .. }
                 | Self::ReleaseCustody { .. }
+                | Self::PrepareForLiveReload { .. }
         )
     }
 
@@ -930,6 +1108,8 @@ impl WireFrame {
                 | Self::ForcedRetractClaim { .. }
                 | Self::SuppressRelation { .. }
                 | Self::UnsuppressRelation { .. }
+                | Self::FastPathDispatch { .. }
+                | Self::RequestUserInteraction { .. }
         )
     }
 
@@ -954,6 +1134,9 @@ impl WireFrame {
                 | Self::ForcedRetractClaimResponse { .. }
                 | Self::SuppressRelationResponse { .. }
                 | Self::UnsuppressRelationResponse { .. }
+                | Self::PrepareForLiveReloadResponse { .. }
+                | Self::FastPathDispatchResponse { .. }
+                | Self::RequestUserInteractionResponse { .. }
         )
     }
 
@@ -1028,6 +1211,7 @@ mod tests {
             },
             runtime_capabilities: RuntimeCapabilities {
                 request_types: vec!["ping".into()],
+                course_correct_verbs: vec![],
                 accepts_custody: false,
                 flags: Default::default(),
             },
@@ -1083,8 +1267,92 @@ mod tests {
             credentials_dir: "/var/lib/evo/plugins/org.test.plugin/credentials"
                 .into(),
             deadline_ms: Some(5000),
+            live_reload_state: None,
         };
         let json = serde_json::to_string(&orig).unwrap();
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn load_round_trip_with_live_reload_state() {
+        // Load frame carrying a state blob across an OOP live-
+        // reload boundary serialises and deserialises identically;
+        // the payload base64-roundtrips per the codec helper.
+        let orig = WireFrame::Load {
+            v: PROTOCOL_VERSION,
+            cid: 1,
+            plugin: sample_plugin(),
+            config: serde_json::json!({}),
+            state_dir: "/var/lib/evo/plugins/x/state".into(),
+            credentials_dir: "/var/lib/evo/plugins/x/credentials".into(),
+            deadline_ms: None,
+            live_reload_state: Some(LiveReloadState {
+                schema_version: 7,
+                payload: b"in-flight buffer".to_vec(),
+            }),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(
+            json.contains(r#""payload":"aW4tZmxpZ2h0IGJ1ZmZlcg==""#),
+            "payload must be base64-encoded; got: {json}"
+        );
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn prepare_for_live_reload_round_trip() {
+        let orig = WireFrame::PrepareForLiveReload {
+            v: PROTOCOL_VERSION,
+            cid: 99,
+            plugin: sample_plugin(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"prepare_for_live_reload""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn prepare_for_live_reload_response_round_trip_with_state() {
+        let orig = WireFrame::PrepareForLiveReloadResponse {
+            v: PROTOCOL_VERSION,
+            cid: 99,
+            plugin: sample_plugin(),
+            state: Some(LiveReloadState {
+                schema_version: 3,
+                payload: b"resume-token".to_vec(),
+            }),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"prepare_for_live_reload_response""#));
+        assert!(
+            json.contains(r#""payload":"cmVzdW1lLXRva2Vu""#),
+            "payload must be base64-encoded; got: {json}"
+        );
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn prepare_for_live_reload_response_round_trip_without_state() {
+        // A plugin with nothing to carry returns state = None,
+        // signalling the steward to perform a cold load. The wire
+        // form omits the state field entirely (skip_serializing_if
+        // = "Option::is_none") so older builds parsing the frame
+        // see no unknown field.
+        let orig = WireFrame::PrepareForLiveReloadResponse {
+            v: PROTOCOL_VERSION,
+            cid: 99,
+            plugin: sample_plugin(),
+            state: None,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(
+            !json.contains(r#""state":"#),
+            "state = None must be omitted from the wire form; got: {json}"
+        );
         let back: WireFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(back, orig);
     }
@@ -1609,12 +1877,18 @@ mod tests {
     }
 
     #[test]
-    fn supported_codecs_include_json_first() {
-        // The codec-negotiation default ships with JSON only;
-        // leaving this assertion in place ensures a future codec
-        // addition has to update the test rather than silently
-        // changing the on-wire default.
+    fn supported_codecs_advertise_json_first_then_cbor() {
+        // The slow-path default is JSON: text-debuggable on
+        // production devices, scriptable for incident response,
+        // and the format every plugin-author tool can produce
+        // without a binary decoder. CBOR is the opt-in codec for
+        // consumers that pin it explicitly (frontend bridges,
+        // Fast Path). Pinning the order both
+        // protects the JSON-first default and forces a future
+        // codec addition to update the test rather than silently
+        // change the wire default.
         assert_eq!(SUPPORTED_CODECS.first().copied(), Some("json"));
+        assert!(SUPPORTED_CODECS.contains(&"cbor"));
     }
 
     // ---- Admin-verb wire frames ----
@@ -1721,6 +1995,207 @@ mod tests {
         assert!(json.contains(r#""op":"unsuppress_relation""#));
         let back: WireFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn fast_path_dispatch_round_trip_json() {
+        let orig = WireFrame::FastPathDispatch {
+            v: PROTOCOL_VERSION,
+            cid: 17,
+            plugin: sample_plugin(),
+            target_shelf: "audio.transport".into(),
+            handle: CustodyHandle {
+                id: "custody-1".into(),
+                started_at: std::time::UNIX_EPOCH
+                    + std::time::Duration::from_millis(1_700_000_000_500),
+            },
+            verb: "volume_set".into(),
+            payload: vec![0u8, 1, 2, 3, 0xFF],
+            deadline_ms: Some(40),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"fast_path_dispatch""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn fast_path_dispatch_round_trip_cbor() {
+        let orig = WireFrame::FastPathDispatch {
+            v: PROTOCOL_VERSION,
+            cid: 18,
+            plugin: sample_plugin(),
+            target_shelf: "audio.transport".into(),
+            handle: CustodyHandle {
+                id: "custody-2".into(),
+                started_at: std::time::UNIX_EPOCH,
+            },
+            verb: "mute".into(),
+            payload: vec![],
+            deadline_ms: None,
+        };
+        let bytes = crate::codec::encode_cbor(&orig).unwrap();
+        let back = crate::codec::decode_cbor(&bytes).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn fast_path_dispatch_response_round_trip() {
+        let orig = WireFrame::FastPathDispatchResponse {
+            v: PROTOCOL_VERSION,
+            cid: 19,
+            plugin: sample_plugin(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"fast_path_dispatch_response""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn fast_path_dispatch_classifies_as_plugin_request() {
+        let f = WireFrame::FastPathDispatch {
+            v: PROTOCOL_VERSION,
+            cid: 1,
+            plugin: "p".into(),
+            target_shelf: "s".into(),
+            handle: CustodyHandle {
+                id: "h".into(),
+                started_at: std::time::UNIX_EPOCH,
+            },
+            verb: "v".into(),
+            payload: vec![],
+            deadline_ms: None,
+        };
+        assert!(f.is_plugin_request());
+        assert!(!f.is_response());
+        assert!(!f.is_request());
+        assert!(!f.is_event());
+    }
+
+    #[test]
+    fn fast_path_dispatch_response_classifies_as_response() {
+        let f = WireFrame::FastPathDispatchResponse {
+            v: PROTOCOL_VERSION,
+            cid: 1,
+            plugin: "p".into(),
+        };
+        assert!(f.is_response());
+        assert!(!f.is_plugin_request());
+        assert!(!f.is_request());
+        assert!(!f.is_event());
+    }
+
+    #[test]
+    fn request_user_interaction_round_trip_json() {
+        use crate::contract::{PromptRequest, PromptType};
+        let prompt = PromptRequest {
+            prompt_id: "p-1".into(),
+            prompt_type: PromptType::Confirm {
+                message: "ok?".into(),
+            },
+            timeout_ms: Some(30_000),
+            session_id: Some("login".into()),
+            retention_hint: None,
+            error_context: None,
+            previous_answer: None,
+        };
+        let orig = WireFrame::RequestUserInteraction {
+            v: PROTOCOL_VERSION,
+            cid: 21,
+            plugin: sample_plugin(),
+            prompt,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"request_user_interaction""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn request_user_interaction_round_trip_cbor() {
+        use crate::contract::{PromptRequest, PromptType};
+        let prompt = PromptRequest {
+            prompt_id: "p-2".into(),
+            prompt_type: PromptType::Text {
+                label: "Email".into(),
+                placeholder: None,
+                validation_regex: None,
+            },
+            timeout_ms: None,
+            session_id: None,
+            retention_hint: None,
+            error_context: None,
+            previous_answer: None,
+        };
+        let orig = WireFrame::RequestUserInteraction {
+            v: PROTOCOL_VERSION,
+            cid: 22,
+            plugin: sample_plugin(),
+            prompt,
+        };
+        let bytes = crate::codec::encode_cbor(&orig).unwrap();
+        let back = crate::codec::decode_cbor(&bytes).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn request_user_interaction_response_round_trip() {
+        use crate::contract::{PromptOutcome, PromptResponse, RetentionHint};
+        let outcome = PromptOutcome::Answered {
+            response: PromptResponse::Confirm { confirmed: true },
+            retain_for: Some(RetentionHint::Session),
+        };
+        let orig = WireFrame::RequestUserInteractionResponse {
+            v: PROTOCOL_VERSION,
+            cid: 23,
+            plugin: sample_plugin(),
+            outcome,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"request_user_interaction_response""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn request_user_interaction_classifies_as_plugin_request() {
+        use crate::contract::{PromptRequest, PromptType};
+        let f = WireFrame::RequestUserInteraction {
+            v: PROTOCOL_VERSION,
+            cid: 1,
+            plugin: "p".into(),
+            prompt: PromptRequest {
+                prompt_id: "x".into(),
+                prompt_type: PromptType::Confirm {
+                    message: "?".into(),
+                },
+                timeout_ms: None,
+                session_id: None,
+                retention_hint: None,
+                error_context: None,
+                previous_answer: None,
+            },
+        };
+        assert!(f.is_plugin_request());
+        assert!(!f.is_response());
+        assert!(!f.is_request());
+        assert!(!f.is_event());
+    }
+
+    #[test]
+    fn request_user_interaction_response_classifies_as_response() {
+        use crate::contract::PromptOutcome;
+        let f = WireFrame::RequestUserInteractionResponse {
+            v: PROTOCOL_VERSION,
+            cid: 1,
+            plugin: "p".into(),
+            outcome: PromptOutcome::TimedOut,
+        };
+        assert!(f.is_response());
+        assert!(!f.is_plugin_request());
+        assert!(!f.is_request());
+        assert!(!f.is_event());
     }
 
     #[test]

@@ -15,11 +15,19 @@ manifest = []
 # Plugin contract traits and supporting types. Pulls in tracing for
 # structured logging per docs/engineering/LOGGING.md.
 contract = ["dep:tracing"]
-# Wire protocol message types, JSON codec, and length-prefixed framing
-# over async I/O streams, per docs/engineering/PLUGIN_CONTRACT.md
-# sections 6, 9, and 10. Binary payloads are base64-encoded in JSON.
-# CBOR support is future work.
-wire = ["contract", "dep:serde_json", "dep:tokio", "dep:base64"]
+# Wire protocol message types, JSON + CBOR codecs, and length-
+# prefixed framing over async I/O streams, per
+# docs/engineering/PLUGIN_CONTRACT.md sections 6, 9, and 10. Binary
+# payloads serialise as base64 strings in JSON and as native byte
+# strings in CBOR via the codec module's `is_human_readable`-aware
+# serde helper.
+wire = [
+    "contract",
+    "dep:serde_json",
+    "dep:tokio",
+    "dep:base64",
+    "dep:ciborium",
+]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -28,10 +36,18 @@ thiserror = "1"
 semver = { version = "1", features = ["serde"] }
 regex = "1"
 once_cell = "1"
+evo-coalesce-labels = { path = "../evo-coalesce-labels" }
 tracing = { version = "0.1", optional = true }
 serde_json = { version = "1", optional = true }
 tokio = { version = "1", features = ["io-util", "net", "sync", "rt"], optional = true }
 base64 = { version = "0.22", optional = true }
+# CBOR codec dispatched on the wire alongside JSON. ciborium is the
+# RFC-8949-conformant, serde-driven CBOR implementation maintained by
+# the rust-cbor working group; chosen over the older serde_cbor
+# (unmaintained as of 2022) and the lower-level cbor4ii (no serde
+# bridge). Optional behind the `wire` feature so the manifest /
+# contract crates that don't speak the wire don't pull it in.
+ciborium = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "io-util", "net"] }

@@ -7,9 +7,27 @@ The steward binary is `evo` (`/opt/evo/bin/evo`). The SDK CLI is **`evo-plugin-t
 
 ---
 
-## 1. v1 subcommand set
+## 1. Subcommand set
 
-**Choice B (full author workflow in v1):** implement **`lint`**, **`sign`**, **`verify`**, **`pack`**, and **`install`** in the first released version. **`uninstall`** and **`purge`** remain a future addition until the operator shelf and lifecycle are aligned (see `PLUGIN_PACKAGING.md` §7).
+The CLI implements the full author workflow plus operator-side admin sugar that wraps the steward's wire ops:
+
+**Author workflow:** `lint`, `sign`, `verify`, `pack`, `install`. The `install` path covers ownership / mode promotion via `--chown`. `uninstall` and `purge` are reachable through the operator-side `admin uninstall_plugin` / `admin purge_plugin_state` wire ops rather than as separate top-level CLI verbs.
+
+**Catalogue tooling:** `catalogue lint <path>` validates a catalogue document (rack / shelf / subject grammar). `catalogue validate-shelf-schema [--schemas-path <dir>]` walks a per-shelf schemas tree and validates every `<rack>/<shelf>.v<N>.toml` file. The schemas-path resolution cascade is `--schemas-path` flag, `$EVO_SCHEMAS_DIR`, then `/usr/share/evo-catalogue-schemas/` (distribution-installed). Non-zero exit on any file failure.
+
+**Admin wire-op sugar.** Each subcommand opens a Unix-socket connection to the running steward, negotiates the relevant operator capability, and dispatches the matching wire op. The `--socket` flag overrides the default path.
+
+| Subcommand | Capability | Wire op(s) |
+|---|---|---|
+| `admin enable / disable / uninstall / purge_state <plugin>` | `plugins_admin` | `enable_plugin` / `disable_plugin` / `uninstall_plugin` / `purge_plugin_state` |
+| `admin reload catalogue --inline=<toml> \| --path=<file> [--dry-run]` | `plugins_admin` | `reload_catalogue` |
+| `admin reload manifest <plugin> --inline=<toml> \| --path=<file> [--dry-run]` | `plugins_admin` | `reload_manifest` |
+| `admin reconcile {list,project,now}` | `reconciliation_admin` (for `now`) | `list_reconciliation_pairs` / `project_reconciliation_pair` / `reconcile_pair_now` |
+| `admin flight {list,set <class> <on\|off>,all <on\|off>}` | (none — uses `request` op against `flight_mode` rack shelves) | `project_rack` + per-shelf `request flight_mode.{query,set}` |
+| `admin grammar {list,plan,migrate,accept}` | `grammar_admin` | `list_grammar_orphans` / `migrate_grammar_orphans` (dry_run for `plan`) / `accept_grammar_orphans` |
+| `admin diagnose <plugin>` | (read-only) | `list_plugins` + on-disk manifest |
+
+The `admin grammar plan --from-type=X --to-type=Y` form wraps `migrate_grammar_orphans` with `dry_run = true` and pretty-prints the planned migration count, target-type breakdown, and first / last sample IDs. The `admin grammar migrate` form wraps the same op with `dry_run = false` and accepts `--reason`, `--batch-size`, `--max-subjects` for chunked execution. See `CATALOGUE.md` §5.3 for the operator surface and `CLIENT_API.md` §4.17 for the wire shape.
 
 ---
 

@@ -75,6 +75,7 @@ impl Plugin for ProbeRespondent {
                 },
                 runtime_capabilities: RuntimeCapabilities {
                     request_types: vec!["ping".into()],
+                    course_correct_verbs: vec![],
                     accepts_custody: false,
                     flags: Default::default(),
                 },

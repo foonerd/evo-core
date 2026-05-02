@@ -1,11 +1,13 @@
-# Catalogue schemas — in-tree skeleton
+# Catalogue schemas — in-tree worked example
 
-This directory is the in-tree skeleton of the catalogue-schemas
-publication PLUGIN_PACKAGING.md §10 describes. It exists so a
-distribution authoring its own catalogue has a worked example
-of the on-disk shape inside the framework source tree before
-the standalone sibling repository (`evo-catalogue-schemas`)
-materialises.
+The canonical home for brand-neutral framework-tier catalogue
+schemas (the `org.evoframework.*` namespace) is the spin-out
+repository **[`foonerd/evo-catalogue-schemas`](https://github.com/foonerd/evo-catalogue-schemas)**.
+This directory's role is **a single worked-example reference
+for the on-disk schema shape** so a distribution authoring its
+own per-distribution catalogue-schemas tree (or contributing to
+the spin-out repo) has a checked-in TOML to read alongside the
+contributor docs.
 
 What lives here today:
 
@@ -29,26 +31,31 @@ uses. Distributions declaring their own racks and shelves
 their own per-distribution catalogue-schemas directory or
 publish a sibling repo of their own.
 
-## Future sibling repository
+## Sibling repository
 
-The framework intends to spin out a `foonerd/evo-catalogue-schemas`
-repository hosting the brand-neutral framework-tier shelves
-(those under the `org.evoframework.*` namespace) as a separate
-versioned surface. That spin-out is a follow-on org-level
-action; the in-tree skeleton here remains as the canonical
-reference for the on-disk shape regardless of where individual
-schemas are published.
+The brand-neutral framework-tier shelves (every shelf under
+`org.evoframework.*`) live in
+[`foonerd/evo-catalogue-schemas`](https://github.com/foonerd/evo-catalogue-schemas).
+Plugin authors and distribution maintainers pin a specific tag
+of the sibling repo in their CI / build manifests; distribution
+packages bundle the schemas at
+`/usr/share/evo-catalogue-schemas/` so plugin authors can
+validate locally against the installed copy.
 
 ## Validation tooling
 
-`evo-plugin-tool catalogue lint <path>` (already shipped under
-[evo-core's `evo-plugin-tool`](../../../../crates/evo-plugin-tool/))
-validates the catalogue document grammar (rack and shelf
-declarations, subject-type vocabulary, predicate constraints,
-inverse consistency, the `shape_supports` discipline). A
-companion `validate-shelf-schema` subcommand reading the
-per-shelf schema files in this directory is on the same
-follow-on cycle as the sibling repo spin-out; the plugin
-author's local-build feedback loop today is `cargo build` plus
-the `evo-plugin-tool catalogue lint` pass against the
-distribution's own catalogue.
+`evo-plugin-tool catalogue lint <path>` validates a catalogue
+document's rack / shelf / subject grammar.
+
+`evo-plugin-tool catalogue validate-shelf-schema` validates
+every per-shelf schema TOML file under a schemas tree.
+Resolution cascade:
+
+1. `--schemas-path=<dir>` flag.
+2. `$EVO_SCHEMAS_DIR` environment variable.
+3. `/usr/share/evo-catalogue-schemas/` (distribution-installed).
+
+The framework runtime never consumes the per-shelf schemas;
+they are author-time / CI-time artefacts only. The steward
+validates against the catalogue document at admission, not
+against the per-shelf shape contracts.

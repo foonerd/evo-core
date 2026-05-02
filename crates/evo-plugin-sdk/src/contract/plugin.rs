@@ -78,7 +78,103 @@ pub trait Plugin: Send + Sync {
     /// plugin; the steward's policy (escalation thresholds, consecutive
     /// failure counts) decides when unhealthy translates to action.
     fn health_check(&self) -> impl Future<Output = HealthReport> + Send + '_;
+
+    /// Prepare for a live reload by emitting a state blob the
+    /// reloaded instance will receive.
+    ///
+    /// The framework calls this on a plugin admitted with
+    /// `lifecycle.hot_reload = "live"` when an operator (or the
+    /// `reload_plugin` wire op) requests a live reload. The
+    /// returned blob is opaque to the framework: plugin author
+    /// defines the schema (the `schema_version` field on the
+    /// blob is advisory only — used by the plugin's own
+    /// `load_with_state` to dispatch migration paths).
+    ///
+    /// Returning `Ok(None)` is the explicit "this plugin has no
+    /// state worth preserving across the reload; cold-load is
+    /// fine." The default implementation returns `Ok(None)`, so
+    /// plugins not opting in get the equivalent of
+    /// `lifecycle.hot_reload = "restart"` semantics.
+    ///
+    /// Plugin authors implementing live reload pair this with
+    /// [`load_with_state`](Plugin::load_with_state); the two
+    /// methods together carry the plugin's transient runtime
+    /// state across the reload boundary.
+    ///
+    /// State blob payloads have a framework-enforced size cap
+    /// (16 MiB default; 64 MiB ceiling). Plugins managing larger
+    /// transient state use durable persistence (per-plugin
+    /// `state_dir`, subject store) instead of routing through
+    /// the live-reload blob.
+    fn prepare_for_live_reload(
+        &self,
+    ) -> impl Future<Output = Result<Option<StateBlob>, PluginError>> + Send + '_
+    {
+        async { Ok(None) }
+    }
+
+    /// Load with optional prior state.
+    ///
+    /// The framework calls this on the live-reload path: after
+    /// the previous instance returned a blob from
+    /// [`prepare_for_live_reload`](Plugin::prepare_for_live_reload),
+    /// the framework calls `unload` (or terminates the OOP
+    /// process), then calls `load_with_state` on the new
+    /// instance with the blob. The plugin's implementation
+    /// validates the blob's `schema_version`, dispatches to the
+    /// appropriate migration logic, and resumes operation with
+    /// the prior state restored.
+    ///
+    /// `blob: None` means cold load — equivalent to calling
+    /// `load`. The default implementation forwards to `load`
+    /// and ignores the blob, so plugins not opting in get
+    /// correct cold-load behaviour by default.
+    fn load_with_state<'a>(
+        &'a mut self,
+        ctx: &'a LoadContext,
+        _blob: Option<StateBlob>,
+    ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+        self.load(ctx)
+    }
 }
+
+/// Opaque state blob carried across a live-reload boundary.
+///
+/// The framework treats `payload` as bytes. The plugin author
+/// defines its schema; the schema version is the plugin's own
+/// concern. The framework records `schema_version` in the
+/// `PluginLiveReloadCompleted` happening for audit but does not
+/// validate or interpret the payload.
+///
+/// The blob is for **transient state in flight** — buffer
+/// contents, partial OAuth code, in-progress library scan
+/// position, EQ filter coefficients. Long-lived state belongs
+/// in the plugin's durable persistence (per-plugin `state_dir`,
+/// the subject store).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateBlob {
+    /// Plugin-defined schema version. Advisory — the plugin's
+    /// own `load_with_state` decides the migration path based
+    /// on this value. Bump when the schema changes
+    /// incompatibly.
+    pub schema_version: u32,
+    /// Plugin-defined opaque payload. Subject to the framework's
+    /// size cap. Wire encoding is the SDK's standard binary path
+    /// (base64 in the JSON codec; native bytes when CBOR support
+    /// is added).
+    pub payload: Vec<u8>,
+}
+
+/// Default soft cap on a [`StateBlob::payload`] in bytes.
+/// Plugins with larger transient state should use durable
+/// persistence rather than route through live-reload.
+pub const DEFAULT_LIVE_RELOAD_BLOB_BYTES: usize = 16 * 1024 * 1024;
+
+/// Hard ceiling on [`StateBlob::payload`] in bytes. The
+/// framework refuses to carry blobs above this size regardless
+/// of operator config — at this scale the plugin should be
+/// using durable persistence.
+pub const MAX_LIVE_RELOAD_BLOB_BYTES: usize = 64 * 1024 * 1024;
 
 /// Stable identity of a plugin, cross-checked against its manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,6 +213,22 @@ pub struct RuntimeCapabilities {
     /// Must be a subset of the manifest's declared request types.
     #[serde(default)]
     pub request_types: Vec<String>,
+
+    /// For wardens: the course-correct verbs the plugin currently
+    /// implements. Empty for non-wardens. Must be a subset of the
+    /// manifest's declared `capabilities.warden.course_correct_verbs`;
+    /// the framework's admission-time drift check refuses
+    /// admission on mismatch (subject to the version-skew
+    /// policy — see PLUGIN_PACKAGING for the contract).
+    ///
+    /// Plugins MAY narrow the set at runtime to reflect partial
+    /// initialisation (a backing subsystem failed to come up; the
+    /// plugin keeps the verb list it can actually serve). The
+    /// framework respects the reported runtime set at dispatch
+    /// gating; manifest declarations are the upper bound, not
+    /// the active enforcement set.
+    #[serde(default)]
+    pub course_correct_verbs: Vec<String>,
 
     /// For wardens: whether the plugin is currently able to accept new
     /// custody assignments. A warden recovering from a failure may be

@@ -78,10 +78,19 @@ pub mod subjects;
 pub mod warden;
 
 pub use context::{
-    CallDeadline, CustodyStateReporter, InstanceAnnouncer, LoadContext,
+    AppointmentAction, AppointmentId, AppointmentMissPolicy,
+    AppointmentRecurrence, AppointmentScheduler, AppointmentSpec,
+    AppointmentState, AppointmentTimeZone, CallDeadline, CompositeOp,
+    CustodyStateReporter, DateTimeKind, DayOfWeek, FastPathDispatcher,
+    InstanceAnnouncer, LoadContext, PromptCanceller, PromptField, PromptOption,
+    PromptOutcome, PromptRequest, PromptResponse, PromptState, PromptType,
     RelationAdmin, RelationAnnouncer, ReportError, ReportPriority,
-    StateReporter, SubjectAdmin, SubjectAnnouncer, SubjectQuerier,
-    UserInteraction, UserInteractionRequester,
+    RetentionHint, StatePredicate, StateReporter, SubjectAdmin,
+    SubjectAnnouncer, SubjectQuerier, UserInteractionRequester, WatchAction,
+    WatchCondition, WatchHappeningFilter, WatchId, WatchScheduler, WatchSpec,
+    WatchState, WatchTrigger, DEFAULT_APPOINTMENT_MISS_GRACE_MS,
+    DEFAULT_PROMPT_TIMEOUT_MS, DEFAULT_WATCH_MAX_COMPOSITE_DEPTH,
+    MAX_PROMPT_TIMEOUT_MS,
 };
 pub use error::PluginError;
 pub use factory::{
@@ -89,7 +98,8 @@ pub use factory::{
 };
 pub use plugin::{
     BuildInfo, HealthCheck, HealthReport, HealthStatus, Plugin,
-    PluginDescription, PluginIdentity, RuntimeCapabilities,
+    PluginDescription, PluginIdentity, RuntimeCapabilities, StateBlob,
+    DEFAULT_LIVE_RELOAD_BLOB_BYTES, MAX_LIVE_RELOAD_BLOB_BYTES,
 };
 pub use relations::{RelationAssertion, RelationRetraction};
 pub use respondent::{Request, Respondent, Response};

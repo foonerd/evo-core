@@ -58,7 +58,7 @@ pub enum Happening {
 
 ### 3.1 Current Variants
 
-Twenty variants ship today across six categories. All variants carry an `at: SystemTime` field (the steward's clock when the happening was emitted) - omitted from the per-variant tables below to keep them readable. JSON shapes are in `SCHEMAS.md` section 5.1.
+The variant set spans custody, relation graph, subject registry, factory instances, admin operations, admin cascades, hardware connectivity, time-driven instructions (appointments), condition-driven instructions (watches), and catalogue grammar survival. All variants carry an `at: SystemTime` field (the steward's clock when the happening was emitted) - omitted from the per-variant tables below to keep them readable. JSON shapes are in `SCHEMAS.md` section 5.1.
 
 **Custody transitions**
 
@@ -112,6 +112,43 @@ These variants surface the per-edge and per-claim consequences of merge and spli
 | `ClaimReassigned` | A plugin claim transferred from a source subject onto a new canonical ID by merge or split. One emission per moved claim. Lets the affected plugin discover that cached canonical-ID state is now stale. `kind` distinguishes addressing (`scheme`, `value` populated) from relation (`predicate`, `target_id` populated). | `admin_plugin`, `plugin`, `kind`, `old_subject_id`, `new_subject_id`, optional `scheme`, `value`, `predicate`, `target_id` |
 | `RelationClaimSuppressionCollapsed` | Suppression-collapse during `rewrite_subject_to` demoted a previously-visible claim to invisible because the surviving edge inherited a suppression marker. Without this happening the demotion would be silent. | `admin_plugin`, `subject_id`, `predicate`, `target_id`, `demoted_claimant`, `surviving_suppression_record` |
 
+**Hardware connectivity (flight mode)**
+
+| Variant | Trigger | Carries (besides `at`) |
+|---------|---------|------------------------|
+| `FlightModeChanged` | A device plugin transitions a hardware connectivity class (Bluetooth radio, WiFi radio, cellular modem, etc.). The framework imposes no class taxonomy; `rack_class` is the fully-qualified shelf name (e.g. `flight_mode.wireless.bluetooth`) the distribution declared. Emitted via `emit_durable` so a late-joining subscriber learns the at-boot state via replay. | `rack_class`, `on` |
+
+**Time-driven instructions (appointments)**
+
+Appointments fire instructions on TIME. Per-subject `creator` is the plugin canonical name or an operator label.
+
+| Variant | Trigger | Carries (besides `at`) |
+|---------|---------|------------------------|
+| `AppointmentApproaching` | The `pre_fire_ms` lead-time window opened ahead of an appointment's scheduled fire instant. Lets pre-warming consumers prepare. | `creator`, `appointment_id`, `scheduled_for_ms`, `fires_in_ms` |
+| `AppointmentFired` | The runtime dispatched an appointment's action. `dispatch_outcome` is `"ok"` on success or the structured wire-error class string. | `creator`, `appointment_id`, `fired_at_ms`, `dispatch_outcome` |
+| `AppointmentMissed` | The runtime suppressed a scheduled fire (e.g. clock declared `Untrusted`, miss-policy gate refused, grace window exceeded). `reason` is the structured discriminant. | `creator`, `appointment_id`, `scheduled_for_ms`, `reason` |
+| `AppointmentCancelled` | Either side cancelled. `cancelled_by` attributes the cancellation. | `creator`, `appointment_id`, `cancelled_by` |
+
+**Condition-driven instructions (watches)**
+
+Watches fire instructions on CONDITIONS observed via the bus. Sibling primitive to appointments.
+
+| Variant | Trigger | Carries (besides `at`) |
+|---------|---------|------------------------|
+| `WatchFired` | The runtime dispatched a watch's action after the condition matched. `dispatch_outcome` follows the same shape as `AppointmentFired`. | `creator`, `watch_id`, `fired_at_ms`, `dispatch_outcome` |
+| `WatchMissed` | The runtime suppressed a match (e.g. cooldown active for a level trigger; duration-bearing condition deferred under `Untrusted` time). `reason` is the structured discriminant. | `creator`, `watch_id`, `suppressed_at_ms`, `reason` |
+| `WatchCancelled` | Either side cancelled. `cancelled_by` attributes the cancellation. | `creator`, `watch_id`, `cancelled_by` |
+| `WatchEvaluationThrottled` | The per-watch evaluation rate cap (default 1000/s) fired during a runaway-sensor scenario. Emitted at most once per second per watch under throttle so operators see the runaway without log flooding; `dropped` carries the count over the previous window. | `creator`, `watch_id`, `dropped` |
+
+**Catalogue grammar survival**
+
+| Variant | Trigger | Carries (besides `at`) |
+|---------|---------|------------------------|
+| `SubjectGrammarOrphan` | The boot diagnostic discovered persisted subjects of a `subject_type` the loaded catalogue no longer declares. Emitted once per orphan type per boot; durable-window dedupe collapses repeats when count is unchanged. | `subject_type`, `count`, `first_observed_at_ms` |
+| `SubjectMigrated` | One subject's `subject_type` migrated through `migrate_grammar_orphans`. Emitted per subject for forensic auditability, with the same emission ordering as `SubjectMerged` / `SubjectSplit` (BEFORE the relation-graph rewrite). Subscribers that don't want the per-subject stream collapse via coalesce labels (`["variant", "from_type", "to_type", "migration_id"]`). | `old_id`, `new_id`, `from_type`, `to_type`, `migration_id` |
+| `GrammarMigrationProgress` | Per-batch progress event during a migration. Subscribers on dashboards collapse via coalesce labels (`["variant", "migration_id"]`) to latest-only. | `migration_id`, `from_type`, `completed`, `remaining`, `batch_index` |
+| `GrammarOrphansAccepted` | Operator deliberately accepted the orphans of a type via `accept_grammar_orphans`. Suppresses the boot diagnostic warning while the row stays accepted. | `subject_type`, `reason` |
+
 Every variant carries identifying fields so subscribers can correlate happenings with ledger records (custody) or with the registry / graph (subject and relation). `admin_plugin` distinguishes the privileged actor from the `target_plugin` whose claim was modified.
 
 ### 3.2 Ordering Across Cascade Sequences
@@ -132,10 +169,37 @@ The variant set is open. Categories identified but not yet modelled (aligned wit
 - Subject announcement (`SubjectAnnounced`) on first registry insertion (today subscribers infer "new subject" by observing the first projection).
 - Admission events (`PluginAdmitted`, `PluginUnloaded`, `PluginFailed`).
 - Projection invalidations (push-style projections are reserved; see `STEWARD.md` 12.5).
-- Fast-path transitions (the fast path is reserved; see `STEWARD.md` 12.6 and `FAST_PATH.md`).
-- Catalogue grammar survival (`SubjectGrammarOrphan`, paired with the structured re-statement verb described in `CATALOGUE.md` section 5.3).
 
 Adding a variant requires updating the enum and the relevant emission site; no other source change is required of consumers (thanks to `#[non_exhaustive]`).
+
+### 3.4 Coalesce Labels — Contract for Variant Authors
+
+Every `Happening` variant participates in the per-subscriber coalescing surface (see section 5.2 below). Participation is mediated by the `CoalesceLabels` trait, which the framework's `Happening` enum derives via `#[derive(evo_coalesce_labels::CoalesceLabels)]`. A future contributor adding a new variant — or extending an existing variant with a new field — MUST follow the rules below; the macro's behaviour is otherwise straightforward to misconfigure.
+
+**Generated trait.** The derive produces an instance method `labels(&self) -> BTreeMap<&'static str, String>` and an associated function `static_labels(kind: &str) -> &'static [&'static str]`. The instance method extracts per-event labels at emission time; the associated function enumerates the canonical static label set per variant kind for capability discovery (`describe_capabilities`).
+
+**Display bound is mandatory on label-bearing fields.** Every field that contributes to the runtime label set is converted to a string via `field.to_string()`, which requires `core::fmt::Display`. Fields whose types do NOT implement `Display` MUST be annotated with `#[coalesce_labels(skip)]` or the derive will fail to compile.
+
+**Skip rule by example.** The framework's existing variants annotate the following field types as `skip`:
+
+| Type | Reason |
+|------|--------|
+| `SystemTime` (the universal `at` field on every variant) | Not `Display`. Even if it were, timestamps are uninteresting as coalesce keys; they are the variable, not the group identity. |
+| `Vec<String>` and similar collection types (`source_ids`, `new_ids`, `candidate_new_ids`, `addressings`, `canonical_ids`) | Not `Display`. Vector content is also unhelpful as a coalesce key. |
+| `Option<String>` | Not `Display`. The framework does not synthesise a representation for `None`. |
+| `HealthStatus`, `Cardinality`, `RelationForgottenReason`, `SplitRelationStrategy`, `SuppressionRecord` | Custom enums and structs that do not implement `Display`. Adding `Display` to these is a separate decision (it would expose a public formatting contract that has to stay stable across releases). |
+
+A new field whose type is NOT in the table above and is NOT one of `String`, `&str`, integer / boolean primitives, or another `Display`-implementing wire-stable type SHOULD be annotated with `#[coalesce_labels(skip)]` unless the contributor has explicitly added a `Display` impl that is intended as a public stable formatting contract.
+
+**Why Display, not Debug fallback.** Debug formatting would compile for every type without skip annotations, but it produces user-hostile labels: a `String` with value `foo` becomes `"foo"` (with quotes) under Debug, which would silently break label matching for subscribers expecting `foo`. The Display bound makes the contract explicit at compile time and forces contributors to think about what each field's stable wire-form representation should be — which is the right engineering trade-off, even at the cost of a few extra annotations.
+
+**The `flatten` attribute.** Fields of type `serde_json::Value` may be annotated `#[coalesce_labels(flatten)]` to promote the top-level object keys into the label set. Used today by `Happening::PluginEvent` so plugin-defined payload object keys (e.g., `sensor_id`, `event_subtype`) participate in coalescing without the framework knowing the payload's schema. Non-object payloads (arrays, scalars, nulls) flatten to nothing — the static labels are still emitted, the flattened keys are absent.
+
+**`static_labels` does NOT enumerate flattened keys.** A flattened payload's keys are runtime-determined and plugin-specific; they are not part of the framework's compile-time-known label set. `describe_capabilities` advertises only the static labels for variants with flattened fields. Plugin-author documentation describes the runtime payload schema per `event_type`.
+
+**Variant rename safety.** The macro derives the snake_case kind string from the variant identifier (`MyVariant` → `my_variant`). The wire-form rename rule (`#[serde(rename_all = "snake_case")]`) applies the same transformation; the two stay in sync automatically. Renaming a variant is still a breaking change for subscribers — but the macro will not silently produce a mismatched label set.
+
+**Test discipline.** The proc-macro crate (`crates/evo-coalesce-labels`) carries its own integration tests covering the plain / unit / skip / flatten paths plus the `static_labels` enumeration. Adding a variant should also exercise the `describe_capabilities` advertisement for the new kind in the framework's test suite.
 
 ## 4. The `HappeningBus`
 

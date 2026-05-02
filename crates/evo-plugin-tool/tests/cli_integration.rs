@@ -671,3 +671,124 @@ fn unknown_flag_returns_exit_1() {
         stderr_str(&o)
     );
 }
+
+// -------------------------------------------------------------------
+// verify --describe-json (sign-time drift check)
+// -------------------------------------------------------------------
+
+#[test]
+fn verify_with_matching_describe_json_succeeds() {
+    let plugin = tempfile::tempdir().unwrap();
+    let t = TrustFixture::new();
+    write_bundle(plugin.path());
+
+    // Plugin's runtime describe matches the manifest exactly.
+    // The manifest declares request_types = ["echo"]; the JSON
+    // mirrors that. No drift; verify succeeds with exit 0.
+    let describe_path = plugin.path().join("describe.json");
+    std::fs::write(
+        &describe_path,
+        r#"{"request_types": ["echo"], "course_correct_verbs": [], "accepts_custody": false, "flags": {}}"#,
+    )
+    .unwrap();
+
+    let o = run_tool(&[
+        "verify",
+        plugin.path().to_str().unwrap(),
+        "--allow-unsigned",
+        "--trust-dir-opt",
+        t.opt_path(),
+        "--trust-dir-etc",
+        t.etc_path(),
+        "--revocations",
+        t.revs_path(),
+        "--describe-json",
+        describe_path.to_str().unwrap(),
+    ]);
+    assert_eq!(exit_code(&o), 0, "stderr: {}", stderr_str(&o));
+}
+
+#[test]
+fn verify_with_drifted_describe_json_refuses_with_exit_1() {
+    let plugin = tempfile::tempdir().unwrap();
+    let t = TrustFixture::new();
+    write_bundle(plugin.path());
+
+    // Manifest declares request_types = ["echo"]; describe()
+    // claims the implementation provides ["echo", "ping"]. The
+    // extra "ping" is missing from the manifest — drift on the
+    // manifest side. Verify must refuse.
+    let describe_path = plugin.path().join("describe.json");
+    std::fs::write(
+        &describe_path,
+        r#"{"request_types": ["echo", "ping"], "course_correct_verbs": [], "accepts_custody": false, "flags": {}}"#,
+    )
+    .unwrap();
+
+    let o = run_tool(&[
+        "verify",
+        plugin.path().to_str().unwrap(),
+        "--allow-unsigned",
+        "--trust-dir-opt",
+        t.opt_path(),
+        "--trust-dir-etc",
+        t.etc_path(),
+        "--revocations",
+        t.revs_path(),
+        "--describe-json",
+        describe_path.to_str().unwrap(),
+    ]);
+    assert_eq!(exit_code(&o), 1, "stderr: {}", stderr_str(&o));
+    assert!(
+        stderr_str(&o).contains("manifest drift detected"),
+        "expected drift message in stderr, got: {}",
+        stderr_str(&o)
+    );
+    assert!(
+        stderr_str(&o).contains("ping"),
+        "expected the offending verb \"ping\" in stderr, got: {}",
+        stderr_str(&o)
+    );
+}
+
+#[test]
+fn verify_drift_refuses_when_implementation_is_missing_a_verb() {
+    let plugin = tempfile::tempdir().unwrap();
+    let t = TrustFixture::new();
+    write_bundle(plugin.path());
+
+    // Manifest declares request_types = ["echo"]; describe()
+    // claims the implementation provides nothing. Drift in the
+    // implementation direction.
+    let describe_path = plugin.path().join("describe.json");
+    std::fs::write(
+        &describe_path,
+        r#"{"request_types": [], "course_correct_verbs": [], "accepts_custody": false, "flags": {}}"#,
+    )
+    .unwrap();
+
+    let o = run_tool(&[
+        "verify",
+        plugin.path().to_str().unwrap(),
+        "--allow-unsigned",
+        "--trust-dir-opt",
+        t.opt_path(),
+        "--trust-dir-etc",
+        t.etc_path(),
+        "--revocations",
+        t.revs_path(),
+        "--describe-json",
+        describe_path.to_str().unwrap(),
+    ]);
+    assert_eq!(exit_code(&o), 1, "stderr: {}", stderr_str(&o));
+    assert!(
+        stderr_str(&o).contains("missing in implementation"),
+        "expected missing-in-implementation message in stderr, got: {}",
+        stderr_str(&o)
+    );
+    assert!(
+        stderr_str(&o).contains("echo"),
+        "expected the missing verb \"echo\" in stderr, got: {}",
+        stderr_str(&o)
+    );
+}

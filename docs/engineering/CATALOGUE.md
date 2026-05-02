@@ -169,15 +169,27 @@ Subject types are part of a catalogue's public contract. Renaming a type or remo
 
 Adding a new subject type is additive.
 
-#### Strongly recommended discipline
+#### Recommended discipline
 
-The framework provides a boot-time diagnostic (described next) but not yet a structured migration verb or `SubjectGrammarOrphan` happening. Distributions are strongly recommended to follow an **additive-only** discipline on subject types: never remove or rename a type, only add. An operator who upgrades a catalogue that drops a type must accept that subjects of that type will live on as read-only orphans until either the type is reintroduced or the structured re-statement surface ships.
+Distributions remain encouraged to follow an **additive-only** discipline on subject types where possible: adding new types is non-breaking, while renaming or removing requires the operator-issued migration surface (described below) and a major catalogue version bump.
 
 #### Boot-time orphan diagnostic
 
-At every startup the steward groups every persisted subject by its declared `subject_type` and diffs the result against the loaded catalogue's declared types. A type that appears in storage but not in the catalogue is logged as a `catalogue orphan` warning per type with the row count, and a single summary warning enumerates how many orphaned types and rows were detected. The diagnostic does not refuse boot, modify state, or hide queries — orphans continue to be readable via existing query paths and an attempt to announce a new subject of an orphaned type fails at the wiring layer with the same structured error any unknown-type announcement raises.
+At every startup the steward groups every persisted subject by its declared `subject_type` and diffs the result against the loaded catalogue's declared types. A type that appears in storage but not in the catalogue is logged as a `catalogue orphan` warning per type with the row count, and a single summary warning enumerates how many orphaned types and rows were detected. The diagnostic does not refuse boot, modify state, or hide queries — orphans continue to be readable via existing query paths, and an attempt to announce a new subject of an orphaned type fails at the wiring layer with the same structured error any unknown-type announcement raises.
 
-This gives operators visibility today; the structured migration surface (an operator-callable re-statement verb, a `SubjectGrammarOrphan` happening, and a persistent `pending_grammar_orphans` table) is the next slice of grammar-survival work and is not yet shipped. The warnings let an operator scope the impact of a catalogue change in the meantime.
+The boot diagnostic also persists every discovery into the `pending_grammar_orphans` table (preserving any operator status the table already records — `accepted`, `migrating`, `resolved`) and emits one durable `Happening::SubjectGrammarOrphan` per orphan type so consumers subscribing late see the discovery via replay. Types that re-appeared in the loaded catalogue between boots transition to `recovered`.
+
+#### Operator migration surface
+
+Three operator wire ops, all gated by the `grammar_admin` capability, manage orphan types:
+
+- **`list_grammar_orphans`** returns every row in `pending_grammar_orphans` (subject_type, status, count, first/last observed timestamps, accepted reason, migration_id).
+- **`accept_grammar_orphans { from_type, reason }`** records the deliberate decision to leave the orphans of a type un-migrated. Suppresses the boot diagnostic warning for that type while the row stays `accepted`. Idempotent.
+- **`migrate_grammar_orphans { from_type, strategy, dry_run, batch_size, max_subjects, reason }`** re-states every orphan of `from_type` under a declared catalogue type. The `Rename { to_type }` strategy migrates every orphan to a single declared type. `Map { discriminator_field, mapping, default_to_type }` and `Filter { predicate, to_type }` are wire-stable but their evaluators are not yet wired in this release (calls under those strategies refuse with `strategy_not_yet_implemented`). Per-subject atomic transactions mint a new canonical id and retire the old via a `TypeMigrated` alias (see `SUBJECTS.md`); per-batch commits keep the migration crash-resumable; `max_subjects` caps per-call work for chunked execution.
+
+Per-call admin-ledger receipt; per-subject `Happening::SubjectMigrated` for forensic audit; per-batch `Happening::GrammarMigrationProgress` for dashboards.
+
+The CLI wraps the three verbs as `evo-plugin-tool admin grammar {list,plan,migrate,accept}` (see `PLUGIN_TOOL.md`).
 
 ### 5.4 Enforcement
 
@@ -267,7 +279,7 @@ Catalogue names appear in plugin manifests, consumer queries, logs, and every ex
 
 ## 8. Validation and What Fails Startup
 
-The steward validates the catalogue at startup. A malformed catalogue refuses startup; a missing catalogue file refuses startup too (unless the path falls back through defaults). Every failure produces a `StewardError::Catalogue(...)` message naming the violated rule.
+The steward validates the catalogue at startup. A malformed configured catalogue does **not** refuse startup outright: the loader applies the three-tier resilience chain (see section 8.2) and falls through to the last-known-good shadow or to the binary-baked built-in skeleton, emitting a `Happening::CatalogueFallback` and surfacing the active tier on `op = "describe_capabilities"` (`catalogue_source` field). Validation failures produce a `StewardError::Catalogue(...)` message naming the violated rule, recorded in the structured fallback reason and the WARN-level audit log.
 
 Validation rules (authoritative list in `SCHEMAS.md` section 3.2.3):
 
@@ -289,6 +301,22 @@ One check is on the roadmap and not part of the current build:
 - **Shelf shape support ranges** (multiple admissible shape values on one slot, migration window): the steward today enforces **only** exact equality of `target.shape` with the shelf's single `shape` field. Range data and logic are not part of the schema yet; see section 4.2 above.
 
 The subject-type references, cardinality enforcement, and inverse-consistency checks previously listed here now run at catalogue load and at assertion time respectively; see sections 5.4, 6.2, and 6.3.
+
+### 8.2 Catalogue Load Fallback Chain
+
+The steward applies a three-tier resilience chain at boot. The first tier that produces a valid catalogue becomes the catalogue for the lifetime of the boot.
+
+1. **Configured catalogue** (default `/opt/evo/catalogue/default.toml`, overridable via `[catalogue].path` in `evo.toml` or the `--catalogue` CLI flag). Steady-state path. On a successful steady-state load, the loader mirrors the operator-authored bytes to the LKG shadow file atomically (`<tmp>` + `rename(2)`).
+2. **Last-known-good shadow** (default `/var/lib/evo/state/catalogue.lkg.toml`, overridable via `[catalogue].lkg_path`). Consulted when the configured tier fails to parse or validate. Carries an audit-header comment naming the load timestamp; the body is the operator-authored bytes from the most recent successful steady-state load.
+3. **Built-in skeleton**, baked into the steward binary at compile time. Always parses (validated by `cargo build`). Boots the steward with whatever the skeleton declares — typically the example rack — so the operator can reach the wire socket and recover.
+
+Each non-configured tier emits `Happening::CatalogueFallback { source, reason, at }` exactly once at boot, before any plugin admission. Subscribers observing the wire socket see this signal as the structured indicator of a degraded boot. The active tier is also surfaced on the `op = "describe_capabilities"` response's `catalogue_source` field (`"configured"`, `"lkg"`, or `"builtin"`) so consumers can detect a degraded boot without subscribing to the full happenings stream. A WARN-level audit log line names the source and the chained parse-failure reason.
+
+The fallback chain is **parse-and-validate, not partial-recovery**. A configured catalogue that validates wins; one that does not validate falls through to LKG; an LKG that does not validate falls through to built-in. The steward never tries to merge a partially-broken catalogue with a fallback. The LKG shadow is **mirror-only**: no tool writes it directly; the steward writes it as an atomic side-effect of every successful steady-state load.
+
+Distributions that wipe `/var/lib/evo/state/` on every boot (some immutable-OS designs do) effectively run on the configured + built-in chain only. The built-in tier still protects them.
+
+Tools that mutate the catalogue MUST use atomic-rename writes (write to `<path>.tmp`, then `rename(2)`). POSIX rename is atomic, so a power-cut between write and rename leaves either the old file or the new file on disk, never a truncated mix. Direct write-in-place is a code-review-rejected pattern.
 
 ## 9. Anti-Patterns
 
@@ -338,7 +366,7 @@ Breaking. Plugins that asserted a removed predicate will have their assertions r
 
 ### 10.6 Versioning the Catalogue Itself
 
-The catalogue has no top-level version today. A distribution's catalogue is pinned implicitly by the distribution's version: when `evo-device-volumio v0.5.0` ships, its catalogue is whatever `v0.5.0` contains. This is sufficient for pre-1.0 and will likely remain sufficient post-1.0 for most distributions. If a distribution needs explicit catalogue versioning (e.g., for migration tooling), a `[catalogue] version = "..."` field could be added; no such need exists today.
+The catalogue has no top-level version today. A distribution's catalogue is pinned implicitly by the distribution's version: when an `evo-device-<vendor>` ships, its catalogue is whatever that tag contains. This is sufficient for pre-1.0 and will likely remain sufficient post-1.0 for most distributions. If a distribution needs explicit catalogue versioning (e.g., for migration tooling), a `[catalogue] version = "..."` field could be added; no such need exists today.
 
 ## 11. Examples
 
@@ -414,7 +442,7 @@ target_cardinality = "at_most_one"
 inverse = "album_of"
 ```
 
-A full working distribution catalogue is maintained in the `evo-device-volumio` repository.
+A full working catalogue exercising every core function lives in the `evo-device-audio` repository — the reference generic device for the audio domain. Vendor distributions adopt that catalogue (or layer on top of it) per their product needs; `evo-device-volumio` is one such vendor distribution.
 
 ## 12. Further Reading
 

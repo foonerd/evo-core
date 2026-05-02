@@ -34,6 +34,30 @@ use serde::{Deserialize, Serialize};
 /// [`ManifestError::UnsupportedContractVersion`].
 pub const SUPPORTED_CONTRACT_VERSION: u32 = 1;
 
+/// Default Fast Path per-warden dispatch budget in milliseconds.
+///
+/// Used by [`WardenCapabilities::fast_path_budget_ms`] when the
+/// manifest leaves the field unset. Bounds the steward's
+/// dispatch + serialise overhead plus the warden's
+/// `course_correct` execution on the Fast Path channel; calls
+/// exceeding budget refuse with the structured
+/// `unavailable / fast_path_budget_exceeded` error taxonomy.
+pub const FAST_PATH_BUDGET_MS_DEFAULT: u32 = 50;
+
+/// Maximum Fast Path per-warden dispatch budget the framework
+/// will accept.
+///
+/// Manifests declaring a higher value are clamped at admission
+/// to this maximum. The cap exists to keep Fast Path's
+/// latency-bounded contract honest: a warden declaring a 5-second
+/// budget would defeat the whole point of the channel. 200ms is
+/// the bound documented in the design — operator-finger ↔
+/// device-feedback loops with a <50ms-tactile-latency
+/// expectation tolerate occasional outliers up to roughly 4x
+/// before the channel's distinct-from-slow-path guarantee
+/// becomes meaningless.
+pub const FAST_PATH_BUDGET_MS_MAX: u32 = 200;
+
 /// Regex matching a valid plugin canonical name.
 ///
 /// The pattern is taken verbatim from `PLUGIN_PACKAGING.md` section 4:
@@ -394,6 +418,22 @@ pub struct Lifecycle {
     /// behaviour because no restart attempt is made.
     #[serde(default = "default_restart_budget")]
     pub restart_budget: u32,
+    /// Plugin author's signal that this plugin is normally
+    /// essential to a device that uses it. **Advisory only.**
+    /// The framework does NOT consult this field at admission;
+    /// the catalogue's `[[racks.shelves]] required = true` is
+    /// the authoritative source for refusing operator
+    /// disable / uninstall actions. The manifest field exists
+    /// so tooling can warn operators trying to disable a
+    /// `recommended_essential` plugin even when the catalogue
+    /// has not (yet) marked the shelf required, and so the
+    /// diagnose surface can render the author's intent
+    /// alongside the operator's actual enabled bit.
+    ///
+    /// **Bucket: Advisory.** Parsed and surfaced; never
+    /// influences admission or refusal decisions.
+    #[serde(default)]
+    pub recommended_essential: bool,
 }
 
 fn default_true() -> bool {
@@ -462,6 +502,57 @@ pub struct Capabilities {
     /// without modification.
     #[serde(default)]
     pub admin: bool,
+
+    /// Fast Path sender flag.
+    ///
+    /// When `true`, the plugin declares that its `load` body or
+    /// any of its callbacks may invoke
+    /// `LoadContext::fast_path_dispatch`. Hardware-input plugins
+    /// (IR receivers, Bluetooth controllers, keyboard listeners,
+    /// touch handlers) declare this; pure source / library /
+    /// metadata plugins leave it at the default. Admission
+    /// refuses Fast Path dispatches from plugins whose manifest
+    /// does not declare it.
+    ///
+    /// The flag gates dispatching ON Fast Path; declaring which
+    /// verbs a warden can serve ON Fast Path is the orthogonal
+    /// [`WardenCapabilities::fast_path_verbs`] field. A plugin
+    /// can be a Fast Path target without being a Fast Path
+    /// sender (a warden serving operator-issued volume-set
+    /// frames) and vice versa (an input plugin emitting Fast
+    /// Path frames to a warden it does not itself host).
+    ///
+    /// Default is `false` so existing manifests remain valid
+    /// without modification. The flag is independent of trust
+    /// class and admin capability.
+    #[serde(default)]
+    pub fast_path: bool,
+
+    /// Appointments-creation flag.
+    ///
+    /// When `true`, the plugin declares that it wants the
+    /// `LoadContext.appointments` handle populated. The
+    /// admission engine populates the handle only for plugins
+    /// declaring this; non-declaring plugins see `None` and
+    /// cannot create appointments through the SDK surface.
+    ///
+    /// Default `false`. Independent of trust class and admin
+    /// capability.
+    #[serde(default)]
+    pub appointments: bool,
+
+    /// Watches-creation flag.
+    ///
+    /// When `true`, the plugin declares that it wants the
+    /// `LoadContext.watches` handle populated. The admission
+    /// engine populates the handle only for plugins declaring
+    /// this; non-declaring plugins see `None` and cannot create
+    /// watches through the SDK surface.
+    ///
+    /// Default `false`. Independent of trust class and admin
+    /// capability.
+    #[serde(default)]
+    pub watches: bool,
 }
 
 impl Capabilities {
@@ -505,6 +596,43 @@ impl Capabilities {
                             .to_string(),
                     ));
                 }
+                // Validate course_correct_verbs shape: when set,
+                // it must be non-empty (a warden with zero
+                // declared verbs cannot perform any course
+                // corrections, which is a manifest authoring
+                // error rather than a legitimate state) and
+                // contain no duplicates.
+                if let Some(verbs) = self
+                    .warden
+                    .as_ref()
+                    .and_then(|w| w.course_correct_verbs.as_ref())
+                {
+                    if verbs.is_empty() {
+                        return Err(ManifestError::InconsistentCapabilities(
+                            "[capabilities.warden].course_correct_verbs \
+                             is set to an empty list; a warden with no \
+                             declared verbs cannot dispatch any course \
+                             corrections (omit the field for legacy \
+                             plugins; otherwise list at least one verb)"
+                                .to_string(),
+                        ));
+                    }
+                    let mut seen = std::collections::BTreeSet::new();
+                    for v in verbs {
+                        if !seen.insert(v.as_str()) {
+                            return Err(
+                                ManifestError::InconsistentCapabilities(
+                                    format!(
+                                "[capabilities.warden].course_correct_verbs \
+                                 contains duplicate entry {v:?}"
+                            ),
+                                ),
+                            );
+                        }
+                    }
+                }
+
+                self.validate_warden_fast_path()?;
             }
         }
 
@@ -524,6 +652,124 @@ impl Capabilities {
                         "kind.instance is singleton but \
                          [capabilities.factory] is present"
                             .to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate the warden-side Fast Path declarations.
+    ///
+    /// Caller has already established `kind.interaction == Warden`
+    /// and that `self.warden` is `Some`.
+    ///
+    /// Rules:
+    /// - `fast_path_verbs`, when set, must be non-empty and
+    ///   duplicate-free (mirrors the `course_correct_verbs`
+    ///   shape).
+    /// - `fast_path_verbs ⊆ course_correct_verbs` whenever both
+    ///   are set: Fast Path is a latency-bounded variant of the
+    ///   same dispatch surface, not a different one.
+    /// - `fast_path_budget_ms`, when set, must be `> 0`. A
+    ///   zero-millisecond budget is unreachable. Values exceeding
+    ///   [`FAST_PATH_BUDGET_MS_MAX`] are accepted at parse time
+    ///   but clamped at admission with a warning trace; surfacing
+    ///   a hard parse error here would force every distribution
+    ///   to copy the constant into its CI lints, while clamping
+    ///   keeps the framework's contract centralised.
+    /// - Every key in `fast_path_coalesce_ms` must appear in
+    ///   `fast_path_verbs`. Per-verb coalescing on a verb the
+    ///   warden does not declare on Fast Path is a manifest
+    ///   authoring error.
+    /// - Every value in `fast_path_coalesce_ms` must be `> 0`.
+    fn validate_warden_fast_path(&self) -> Result<(), ManifestError> {
+        let warden = match self.warden.as_ref() {
+            Some(w) => w,
+            // Caller has already produced a structured error if a
+            // warden plugin is missing this block.
+            None => return Ok(()),
+        };
+
+        if let Some(verbs) = warden.fast_path_verbs.as_ref() {
+            if verbs.is_empty() {
+                return Err(ManifestError::InconsistentCapabilities(
+                    "[capabilities.warden].fast_path_verbs is set to an \
+                     empty list; a warden with no Fast Path verbs cannot \
+                     serve Fast Path frames (omit the field to mark the \
+                     warden Fast-Path-ineligible; otherwise list at least \
+                     one verb)"
+                        .to_string(),
+                ));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for v in verbs {
+                if !seen.insert(v.as_str()) {
+                    return Err(ManifestError::InconsistentCapabilities(
+                        format!(
+                            "[capabilities.warden].fast_path_verbs \
+                             contains duplicate entry {v:?}"
+                        ),
+                    ));
+                }
+            }
+
+            if let Some(course_correct) = warden.course_correct_verbs.as_ref() {
+                let cc: std::collections::BTreeSet<&str> =
+                    course_correct.iter().map(String::as_str).collect();
+                for v in verbs {
+                    if !cc.contains(v.as_str()) {
+                        return Err(ManifestError::InconsistentCapabilities(
+                            format!(
+                                "[capabilities.warden].fast_path_verbs \
+                                 entry {v:?} is not in course_correct_verbs; \
+                                 Fast Path verbs must be a subset of the \
+                                 declared course_correct surface"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(budget) = warden.fast_path_budget_ms {
+            if budget == 0 {
+                return Err(ManifestError::InconsistentCapabilities(
+                    "[capabilities.warden].fast_path_budget_ms must be > 0; \
+                     a zero-millisecond Fast Path budget is unreachable"
+                        .to_string(),
+                ));
+            }
+        }
+
+        if let Some(coalesce) = warden.fast_path_coalesce_ms.as_ref() {
+            let declared_verbs: std::collections::BTreeSet<&str> = warden
+                .fast_path_verbs
+                .as_ref()
+                .map(|v| v.iter().map(String::as_str).collect())
+                .unwrap_or_default();
+            for (verb, window) in coalesce {
+                if !declared_verbs.contains(verb.as_str()) {
+                    return Err(ManifestError::InconsistentCapabilities(
+                        format!(
+                            "[capabilities.warden].fast_path_coalesce_ms \
+                             references verb {verb:?} which is not in \
+                             fast_path_verbs; per-verb coalescing on a \
+                             verb the warden does not declare on Fast \
+                             Path is a manifest authoring error"
+                        ),
+                    ));
+                }
+                if *window == 0 {
+                    return Err(ManifestError::InconsistentCapabilities(
+                        format!(
+                            "[capabilities.warden].fast_path_coalesce_ms \
+                             entry for verb {verb:?} is 0; a zero-\
+                             millisecond coalesce window is meaningless \
+                             (omit the entry to disable coalescing for \
+                             that verb)"
+                        ),
                     ));
                 }
             }
@@ -612,6 +858,101 @@ pub struct WardenCapabilities {
     /// failure-mode-aware surface, this field will gate them in
     /// the same way.
     pub custody_failure_mode: CustodyFailureMode,
+    /// Verb names this warden's `course_correct` accepts.
+    ///
+    /// **Bucket: Enforced.** Parallel to a respondent's
+    /// `request_types`. When set, the router refuses any
+    /// `course_correct` whose `correction_type` is not in this
+    /// list with a structured `StewardError::Dispatch` naming the
+    /// offending verb and the declared set; the warden's
+    /// `course_correct` body never sees undeclared verbs.
+    ///
+    /// `None` (legacy plugins authored before this field existed):
+    /// no verb gating; the warden handles unknown verbs in its
+    /// own implementation. Plugins targeting a recent
+    /// `prerequisites.evo_min_version` are expected to declare
+    /// the field; the framework's admission-time skew policy
+    /// decides whether to enforce, warn, or refuse based on the
+    /// declared minimum.
+    ///
+    /// Empty `Some(vec![])` is invalid: a warden with zero
+    /// declared verbs cannot perform any course corrections, so
+    /// declaring zero is a manifest error caught at validate
+    /// time.
+    ///
+    /// Future-compat: when fast-path dispatch ships its own
+    /// `fast_path_verbs` list, manifest validation will require
+    /// `fast_path_verbs ⊆ course_correct_verbs` (Fast Path is a
+    /// latency-bounded variant of the same dispatch surface, not
+    /// a different one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub course_correct_verbs: Option<Vec<String>>,
+
+    /// Verb names this warden serves on the Fast Path channel.
+    ///
+    /// **Bucket: Enforced.** Subset of
+    /// [`Self::course_correct_verbs`] — Fast Path is a
+    /// latency-bounded variant of the same dispatch surface, not
+    /// a different one. A `course_correct` verb omitted here is
+    /// reachable only on the slow path; a verb listed here MUST
+    /// also appear in `course_correct_verbs` (validation
+    /// enforces the subset). Operators issuing Fast Path frames
+    /// against a verb absent from this list see
+    /// `not_found / not_fast_path_eligible`.
+    ///
+    /// `None` (default) means this warden is unreachable on
+    /// Fast Path; `Some(vec![...])` opts in a specific verb
+    /// list. Empty `Some(vec![])` is invalid: a warden that
+    /// declares zero Fast Path verbs cannot serve any, so
+    /// declaring zero is a manifest error caught at validate
+    /// time (mirrors the `course_correct_verbs` shape).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_path_verbs: Option<Vec<String>>,
+
+    /// Per-warden Fast Path dispatch budget in milliseconds.
+    ///
+    /// **Bucket: Enforced.** Bounds the steward's dispatch +
+    /// serialise overhead plus the warden's `course_correct`
+    /// execution on the Fast Path channel; calls exceeding budget
+    /// refuse with the structured
+    /// `unavailable / fast_path_budget_exceeded` error taxonomy.
+    /// `None` defaults to
+    /// [`FAST_PATH_BUDGET_MS_DEFAULT`] at admission. Values above
+    /// [`FAST_PATH_BUDGET_MS_MAX`] are clamped at admission with
+    /// a warning trace; the framework refuses to grant a Fast
+    /// Path budget greater than the max because a 5-second-budget
+    /// warden would defeat the whole point of the channel.
+    ///
+    /// Distinct from
+    /// [`Self::course_correction_budget_ms`] — that field bounds
+    /// slow-path course-correct dispatch and may legitimately be
+    /// in the multi-second range; this field bounds Fast Path
+    /// dispatch and is capped at 200ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_path_budget_ms: Option<u32>,
+
+    /// Per-verb Fast Path coalesce windows in milliseconds.
+    ///
+    /// **Bucket: Distribution-owned.** Map of verb-name -> debounce
+    /// window. Multiple Fast Path frames for the same verb arriving
+    /// within the window collapse to a single dispatch (the most
+    /// recent payload wins). `None` (default) and missing keys mean
+    /// no coalescing for the corresponding verb — every frame
+    /// dispatches.
+    ///
+    /// Used by the warden as a safety net against badly-behaved
+    /// input plugins (a touch slider emitting 1000 Hz volume
+    /// changes coalesces to one dispatch every 20 ms). The right
+    /// per-verb cap is application-specific; a volume slider
+    /// might want 20 ms while a pause/resume verb wants 0 (every
+    /// frame matters).
+    ///
+    /// Validation: every key in this map MUST appear in
+    /// [`Self::fast_path_verbs`]. Per-verb coalescing on a verb
+    /// the warden does not declare on Fast Path is a manifest
+    /// authoring error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_path_coalesce_ms: Option<std::collections::BTreeMap<String, u32>>,
 }
 
 /// Custody failure modes per `PLUGIN_PACKAGING.md` section 2.
@@ -1121,6 +1462,279 @@ instance_ttl_seconds = 0
         let serialised = m1.to_toml().unwrap();
         let m2 = Manifest::from_toml(&serialised).unwrap();
         assert!(m2.capabilities.admin);
+        assert_eq!(m1, m2);
+    }
+
+    #[test]
+    fn lifecycle_recommended_essential_defaults_to_false() {
+        let m = Manifest::from_toml(valid_singleton_respondent())
+            .expect("valid manifest should parse");
+        assert!(
+            !m.lifecycle.recommended_essential,
+            "default must be false; the field is opt-in advisory"
+        );
+    }
+
+    #[test]
+    fn lifecycle_recommended_essential_round_trips_when_declared() {
+        let toml = valid_singleton_respondent().replace(
+            "restart_budget = 5",
+            "restart_budget = 5\nrecommended_essential = true",
+        );
+        let m = Manifest::from_toml(&toml).expect("manifest should parse");
+        assert!(m.lifecycle.recommended_essential);
+        let round_tripped = Manifest::from_toml(&m.to_toml().unwrap()).unwrap();
+        assert!(round_tripped.lifecycle.recommended_essential);
+    }
+
+    // ---------------------------------------------------------------
+    // Fast Path foundation tests. Cover the manifest fields that gate
+    // Fast Path admission: capabilities.fast_path (sender flag),
+    // capabilities.warden.fast_path_verbs / .fast_path_budget_ms /
+    // .fast_path_coalesce_ms (warden-side declarations).
+    // ---------------------------------------------------------------
+
+    /// A warden manifest fragment for Fast Path tests. Includes a
+    /// minimal `course_correct_verbs` list so subset checks have
+    /// something to refer to.
+    fn warden_with_course_correct_verbs() -> String {
+        // Same shape as valid_factory_warden but a singleton (the
+        // factory-admission path is still under construction; using
+        // a singleton avoids tripping the orthogonal factory gate).
+        valid_factory_warden()
+            .replace(
+                r#"instance = "factory""#,
+                r#"instance = "singleton""#,
+            )
+            .replace(
+                "[capabilities.factory]\nmax_instances = 32\ninstance_ttl_seconds = 0\n",
+                "",
+            )
+            .replace(
+                "custody_failure_mode = \"abort\"",
+                r#"custody_failure_mode = "abort"
+course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]"#,
+            )
+    }
+
+    #[test]
+    fn defaults_fast_path_to_false_when_absent() {
+        // Existing manifests without explicit Fast Path opt-in
+        // must remain valid without modification.
+        let m = Manifest::from_toml(valid_singleton_respondent()).unwrap();
+        assert!(
+            !m.capabilities.fast_path,
+            "fast_path must default to false when absent"
+        );
+    }
+
+    #[test]
+    fn accepts_manifest_with_fast_path_true() {
+        let toml = valid_singleton_respondent().replace(
+            "[capabilities.respondent]",
+            "[capabilities]\nfast_path = true\n\n[capabilities.respondent]",
+        );
+        let m = Manifest::from_toml(&toml)
+            .expect("fast_path = true must be accepted on a respondent");
+        assert!(m.capabilities.fast_path);
+    }
+
+    #[test]
+    fn fast_path_true_round_trips_in_toml() {
+        let toml = valid_singleton_respondent().replace(
+            "[capabilities.respondent]",
+            "[capabilities]\nfast_path = true\n\n[capabilities.respondent]",
+        );
+        let m1 = Manifest::from_toml(&toml).unwrap();
+        assert!(m1.capabilities.fast_path);
+        let serialised = m1.to_toml().unwrap();
+        let m2 = Manifest::from_toml(&serialised).unwrap();
+        assert!(m2.capabilities.fast_path);
+        assert_eq!(m1, m2);
+    }
+
+    #[test]
+    fn defaults_fast_path_warden_fields_to_none_when_absent() {
+        let m = Manifest::from_toml(valid_factory_warden()).unwrap();
+        let warden = m.capabilities.warden.expect("warden block present");
+        assert!(warden.fast_path_verbs.is_none());
+        assert!(warden.fast_path_budget_ms.is_none());
+        assert!(warden.fast_path_coalesce_ms.is_none());
+    }
+
+    #[test]
+    fn accepts_warden_with_fast_path_verbs_subset_of_course_correct_verbs() {
+        let base = warden_with_course_correct_verbs();
+        let toml = base.replace(
+            r#"course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]"#,
+            r#"course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]
+fast_path_verbs = ["volume_set", "mute", "pause", "resume", "seek"]
+fast_path_budget_ms = 50
+
+[capabilities.warden.fast_path_coalesce_ms]
+volume_set = 20
+seek = 10"#,
+        );
+        let m = Manifest::from_toml(&toml)
+            .expect("Fast Path declaration must parse");
+        let warden = m.capabilities.warden.expect("warden block present");
+        assert_eq!(
+            warden.fast_path_verbs.as_deref(),
+            Some(
+                ["volume_set", "mute", "pause", "resume", "seek"]
+                    .map(String::from)
+                    .as_slice()
+            )
+        );
+        assert_eq!(warden.fast_path_budget_ms, Some(50));
+        let coalesce = warden
+            .fast_path_coalesce_ms
+            .expect("coalesce block present");
+        assert_eq!(coalesce.get("volume_set"), Some(&20));
+        assert_eq!(coalesce.get("seek"), Some(&10));
+    }
+
+    #[test]
+    fn rejects_empty_fast_path_verbs_list() {
+        let base = warden_with_course_correct_verbs();
+        let toml = base.replace(
+            r#"course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]"#,
+            r#"course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]
+fast_path_verbs = []"#,
+        );
+        let err = Manifest::from_toml(&toml)
+            .expect_err("an empty Fast Path verb list must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fast_path_verbs") && msg.contains("empty"),
+            "error must name the field and the empty-list problem: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_fast_path_verb_entries() {
+        let base = warden_with_course_correct_verbs();
+        let toml = base.replace(
+            r#"course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]"#,
+            r#"course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]
+fast_path_verbs = ["volume_set", "mute", "volume_set"]"#,
+        );
+        let err = Manifest::from_toml(&toml)
+            .expect_err("duplicate Fast Path verb entries must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate") && msg.contains("volume_set"),
+            "error must name the duplicate verb: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_fast_path_verb_not_in_course_correct_verbs() {
+        // The whole point of the subset rule: a Fast Path verb
+        // that the warden does not declare on the slow-path
+        // dispatch surface either is unreachable (bug) or skirts
+        // the slow-path verb gating (security risk). Reject it.
+        let base = warden_with_course_correct_verbs();
+        let toml = base.replace(
+            r#"course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]"#,
+            r#"course_correct_verbs = ["volume_set", "mute"]
+fast_path_verbs = ["volume_set", "mute", "secret_admin_verb"]"#,
+        );
+        let err = Manifest::from_toml(&toml)
+            .expect_err("Fast Path verb must be in course_correct_verbs");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("secret_admin_verb")
+                && msg.contains("course_correct_verbs"),
+            "error must name the offending verb and the subset rule: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_fast_path_budget() {
+        let base = warden_with_course_correct_verbs();
+        let toml = base.replace(
+            r#"course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]"#,
+            r#"course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]
+fast_path_verbs = ["volume_set"]
+fast_path_budget_ms = 0"#,
+        );
+        let err = Manifest::from_toml(&toml)
+            .expect_err("a zero-millisecond Fast Path budget is unreachable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fast_path_budget_ms"),
+            "error must name the field: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_coalesce_for_undeclared_verb() {
+        let base = warden_with_course_correct_verbs();
+        let toml = base.replace(
+            r#"course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]"#,
+            r#"course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]
+fast_path_verbs = ["volume_set", "mute"]
+fast_path_budget_ms = 50
+
+[capabilities.warden.fast_path_coalesce_ms]
+seek = 10"#,
+        );
+        let err = Manifest::from_toml(&toml)
+            .expect_err("coalesce must reference a declared Fast Path verb");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("seek") && msg.contains("fast_path_verbs"),
+            "error must name the undeclared verb and the rule: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_coalesce_window() {
+        let base = warden_with_course_correct_verbs();
+        let toml = base.replace(
+            r#"course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]"#,
+            r#"course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]
+fast_path_verbs = ["volume_set"]
+fast_path_budget_ms = 50
+
+[capabilities.warden.fast_path_coalesce_ms]
+volume_set = 0"#,
+        );
+        let err = Manifest::from_toml(&toml)
+            .expect_err("a zero-millisecond coalesce window is meaningless");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("volume_set"),
+            "error must name the offending verb: {msg}"
+        );
+    }
+
+    #[test]
+    fn fast_path_budget_constants_pin_to_documented_values() {
+        // Pin the constants so a future contributor cannot quietly
+        // raise the budget cap without updating the public
+        // engineering documentation. Default 50ms, framework-
+        // enforced max 200ms.
+        assert_eq!(FAST_PATH_BUDGET_MS_DEFAULT, 50);
+        assert_eq!(FAST_PATH_BUDGET_MS_MAX, 200);
+    }
+
+    #[test]
+    fn fast_path_warden_block_round_trips_in_toml() {
+        let base = warden_with_course_correct_verbs();
+        let toml = base.replace(
+            r#"course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]"#,
+            r#"course_correct_verbs = ["volume_set", "mute", "pause", "resume", "seek"]
+fast_path_verbs = ["volume_set", "mute"]
+fast_path_budget_ms = 75
+
+[capabilities.warden.fast_path_coalesce_ms]
+volume_set = 20"#,
+        );
+        let m1 = Manifest::from_toml(&toml).unwrap();
+        let serialised = m1.to_toml().unwrap();
+        let m2 = Manifest::from_toml(&serialised).unwrap();
         assert_eq!(m1, m2);
     }
 }

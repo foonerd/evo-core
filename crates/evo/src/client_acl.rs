@@ -167,6 +167,185 @@ pub struct ResolveClaimantsPolicy {
     pub allow_gids: Vec<u32>,
 }
 
+/// Per-capability policy block. Mirrors
+/// [`ResolveClaimantsPolicy`] in shape and semantics; used by every
+/// capability that follows the same allow-local / allow-uids /
+/// allow-gids gate (e.g., `plugins_admin`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsAdminPolicy {
+    /// When `true`, any local-socket peer whose UID matches the
+    /// steward's UID is granted `plugins_admin`. Mirrors the
+    /// "local admin" default.
+    #[serde(default)]
+    pub allow_local: Option<bool>,
+    /// Explicit UIDs that may negotiate `plugins_admin` regardless
+    /// of whether they match the steward's UID. Empty by default.
+    #[serde(default)]
+    pub allow_uids: Vec<u32>,
+    /// Explicit GIDs that may negotiate `plugins_admin`. Empty by
+    /// default.
+    #[serde(default)]
+    pub allow_gids: Vec<u32>,
+}
+
+/// Per-capability policy block for the operator-issued
+/// reconciliation-admin verb (`reconcile_pair_now`). Mirrors
+/// [`PluginsAdminPolicy`] in shape and semantics.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationAdminPolicy {
+    /// When `true`, any local-socket peer whose UID matches the
+    /// steward's UID is granted `reconciliation_admin`. Mirrors
+    /// the "local admin" default.
+    #[serde(default)]
+    pub allow_local: Option<bool>,
+    /// Explicit UIDs that may negotiate `reconciliation_admin`
+    /// regardless of whether they match the steward's UID. Empty
+    /// by default.
+    #[serde(default)]
+    pub allow_uids: Vec<u32>,
+    /// Explicit GIDs that may negotiate `reconciliation_admin`.
+    /// Empty by default.
+    #[serde(default)]
+    pub allow_gids: Vec<u32>,
+}
+
+/// Per-capability policy block for the Fast Path channel
+/// (`fast_path_admin`). Mirrors [`PluginsAdminPolicy`] in shape
+/// and semantics; gates which consumers may dispatch Fast Path
+/// frames on the slow-path control connection.
+///
+/// Distributions that want remote Fast Path access (a separate-
+/// host bridge, an MQTT gateway running as a different service
+/// user) configure the ACL explicitly per `client_acl.toml`.
+/// The default — same-UID local-socket peers only — mirrors the
+/// other admin policies and refuses unknown peers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FastPathAdminPolicy {
+    /// When `true`, any local-socket peer whose UID matches the
+    /// steward's UID is granted `fast_path_admin`. Mirrors the
+    /// "local admin" default.
+    #[serde(default)]
+    pub allow_local: Option<bool>,
+    /// Explicit UIDs that may negotiate `fast_path_admin`
+    /// regardless of whether they match the steward's UID. Empty
+    /// by default.
+    #[serde(default)]
+    pub allow_uids: Vec<u32>,
+    /// Explicit GIDs that may negotiate `fast_path_admin`. Empty
+    /// by default.
+    #[serde(default)]
+    pub allow_gids: Vec<u32>,
+}
+
+/// Per-capability policy block for the consumer-side user-
+/// interaction responder (`user_interaction_responder`).
+/// Mirrors [`PluginsAdminPolicy`] in shape and semantics.
+///
+/// Multi-consumer setups (frontend + voice assistant + MQTT
+/// bridge) all want to be the responder; only one can hold the
+/// capability at a time per the framework's first-claimer-wins
+/// rule. Operator decides precedence via the
+/// `[capabilities.user_interaction_responder]` block: the
+/// connection that negotiates the capability first AND is
+/// permitted by this policy holds it; subsequent connections
+/// receive `permission_denied / responder_already_assigned`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserInteractionResponderPolicy {
+    /// When `true`, any local-socket peer whose UID matches the
+    /// steward's UID is permitted to negotiate the capability.
+    /// Default-derived consistently with the other admin
+    /// policies: `Some(true)` when no UID/GID lists are
+    /// configured, `Some(false)` once explicit lists are set.
+    #[serde(default)]
+    pub allow_local: Option<bool>,
+    /// Explicit UIDs permitted to negotiate the capability.
+    /// Empty by default.
+    #[serde(default)]
+    pub allow_uids: Vec<u32>,
+    /// Explicit GIDs permitted to negotiate the capability.
+    /// Empty by default.
+    #[serde(default)]
+    pub allow_gids: Vec<u32>,
+}
+
+/// Per-capability policy block for the operator-issued
+/// appointment-management surface (`appointments_admin`).
+/// Mirrors [`PluginsAdminPolicy`] in shape and semantics.
+///
+/// The capability gates the four operator wire ops
+/// (`create_appointment` / `cancel_appointment` /
+/// `list_appointments` / `project_appointment`). Plugins reach
+/// the runtime in-process via the
+/// [`evo_plugin_sdk::contract::AppointmentScheduler`] trait and
+/// do not consult this policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppointmentsAdminPolicy {
+    /// When `true`, any local-socket peer whose UID matches the
+    /// steward's UID is granted `appointments_admin`. Default-
+    /// derived consistently with the other admin policies:
+    /// `Some(true)` when no UID/GID lists are configured,
+    /// `Some(false)` once explicit lists are set.
+    #[serde(default)]
+    pub allow_local: Option<bool>,
+    /// Explicit UIDs that may negotiate `appointments_admin`.
+    #[serde(default)]
+    pub allow_uids: Vec<u32>,
+    /// Explicit GIDs that may negotiate `appointments_admin`.
+    #[serde(default)]
+    pub allow_gids: Vec<u32>,
+}
+
+/// Per-capability policy block for the operator-issued
+/// watch-management surface (`watches_admin`). Mirrors
+/// [`PluginsAdminPolicy`] in shape and semantics.
+///
+/// The capability gates the operator wire ops
+/// (`create_watch` / `cancel_watch` / `list_watches` /
+/// `project_watch`). Plugins reach the runtime in-process via
+/// the [`evo_plugin_sdk::contract::WatchScheduler`] trait and
+/// do not consult this policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchesAdminPolicy {
+    /// When `true`, any local-socket peer whose UID matches the
+    /// steward's UID is granted `watches_admin`. Default-
+    /// derived consistently with the other admin policies.
+    #[serde(default)]
+    pub allow_local: Option<bool>,
+    /// Explicit UIDs that may negotiate `watches_admin`.
+    #[serde(default)]
+    pub allow_uids: Vec<u32>,
+    /// Explicit GIDs that may negotiate `watches_admin`.
+    #[serde(default)]
+    pub allow_gids: Vec<u32>,
+}
+
+/// Per-capability policy block for the operator-issued
+/// subject-grammar migration surface (`grammar_admin`).
+/// Mirrors [`PluginsAdminPolicy`] in shape and semantics.
+///
+/// Gates the operator wire ops `list_grammar_orphans` /
+/// `accept_grammar_orphans` / `migrate_grammar_orphans`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrammarAdminPolicy {
+    /// When `true`, any local-socket peer whose UID matches the
+    /// steward's UID is granted `grammar_admin`.
+    #[serde(default)]
+    pub allow_local: Option<bool>,
+    /// Explicit UIDs that may negotiate `grammar_admin`.
+    #[serde(default)]
+    pub allow_uids: Vec<u32>,
+    /// Explicit GIDs that may negotiate `grammar_admin`.
+    #[serde(default)]
+    pub allow_gids: Vec<u32>,
+}
+
 /// Top-level structure parsed from `client_acl.toml`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -181,6 +360,20 @@ struct ClientAclFile {
 struct ClientAclCapabilities {
     #[serde(default)]
     resolve_claimants: ResolveClaimantsPolicy,
+    #[serde(default)]
+    plugins_admin: PluginsAdminPolicy,
+    #[serde(default)]
+    reconciliation_admin: ReconciliationAdminPolicy,
+    #[serde(default)]
+    fast_path_admin: FastPathAdminPolicy,
+    #[serde(default)]
+    user_interaction_responder: UserInteractionResponderPolicy,
+    #[serde(default)]
+    appointments_admin: AppointmentsAdminPolicy,
+    #[serde(default)]
+    watches_admin: WatchesAdminPolicy,
+    #[serde(default)]
+    grammar_admin: GrammarAdminPolicy,
 }
 
 /// Loaded, immutable client-API ACL.
@@ -193,6 +386,13 @@ struct ClientAclCapabilities {
 #[derive(Debug, Clone, Default)]
 pub struct ClientAcl {
     resolve_claimants: ResolveClaimantsPolicy,
+    plugins_admin: PluginsAdminPolicy,
+    reconciliation_admin: ReconciliationAdminPolicy,
+    fast_path_admin: FastPathAdminPolicy,
+    user_interaction_responder: UserInteractionResponderPolicy,
+    appointments_admin: AppointmentsAdminPolicy,
+    watches_admin: WatchesAdminPolicy,
+    grammar_admin: GrammarAdminPolicy,
     /// Source path the ACL was loaded from, for diagnostics. `None`
     /// when constructed via [`ClientAcl::default`] or when the
     /// default-path file was absent and the defaults applied.
@@ -243,6 +443,15 @@ impl ClientAcl {
         })?;
         Ok(Self {
             resolve_claimants: file.capabilities.resolve_claimants,
+            plugins_admin: file.capabilities.plugins_admin,
+            reconciliation_admin: file.capabilities.reconciliation_admin,
+            fast_path_admin: file.capabilities.fast_path_admin,
+            user_interaction_responder: file
+                .capabilities
+                .user_interaction_responder,
+            appointments_admin: file.capabilities.appointments_admin,
+            watches_admin: file.capabilities.watches_admin,
+            grammar_admin: file.capabilities.grammar_admin,
             source,
         })
     }
@@ -288,6 +497,318 @@ impl ClientAcl {
         // Determine effective allow_local:
         //   - explicit setting wins,
         //   - else default to true iff neither uid nor gid lists are configured.
+        let allow_local = policy.allow_local.unwrap_or(
+            policy.allow_uids.is_empty() && policy.allow_gids.is_empty(),
+        );
+
+        if allow_local {
+            if let (Some(peer_uid), Some(steward_uid)) = (peer.uid, steward.uid)
+            {
+                if peer_uid == steward_uid {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(peer_uid) = peer.uid {
+            if policy.allow_uids.contains(&peer_uid) {
+                return true;
+            }
+        }
+
+        if let Some(peer_gid) = peer.gid {
+            if policy.allow_gids.contains(&peer_gid) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Return the parsed `plugins_admin` policy. Used in tests
+    /// and diagnostics; the runtime gating goes through
+    /// [`Self::allows_plugins_admin`].
+    pub fn plugins_admin_policy(&self) -> &PluginsAdminPolicy {
+        &self.plugins_admin
+    }
+
+    /// Return the parsed `reconciliation_admin` policy.
+    pub fn reconciliation_admin_policy(&self) -> &ReconciliationAdminPolicy {
+        &self.reconciliation_admin
+    }
+
+    /// Decide whether a connection from `peer` may negotiate the
+    /// `reconciliation_admin` capability. Mirrors
+    /// [`Self::allows_plugins_admin`] in shape and semantics.
+    pub fn allows_reconciliation_admin(
+        &self,
+        peer: PeerCredentials,
+        steward: StewardIdentity,
+    ) -> bool {
+        let policy = &self.reconciliation_admin;
+
+        let allow_local = policy.allow_local.unwrap_or(
+            policy.allow_uids.is_empty() && policy.allow_gids.is_empty(),
+        );
+
+        if allow_local {
+            if let (Some(peer_uid), Some(steward_uid)) = (peer.uid, steward.uid)
+            {
+                if peer_uid == steward_uid {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(peer_uid) = peer.uid {
+            if policy.allow_uids.contains(&peer_uid) {
+                return true;
+            }
+        }
+
+        if let Some(peer_gid) = peer.gid {
+            if policy.allow_gids.contains(&peer_gid) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Return the parsed `fast_path_admin` policy.
+    pub fn fast_path_admin_policy(&self) -> &FastPathAdminPolicy {
+        &self.fast_path_admin
+    }
+
+    /// Return the parsed `user_interaction_responder` policy.
+    pub fn user_interaction_responder_policy(
+        &self,
+    ) -> &UserInteractionResponderPolicy {
+        &self.user_interaction_responder
+    }
+
+    /// Decide whether a connection from `peer` is permitted to
+    /// negotiate the `user_interaction_responder` capability.
+    /// Mirrors [`Self::allows_plugins_admin`] in shape and
+    /// semantics. Note that ACL permission is the *first* gate;
+    /// even a permitted peer is refused when another connection
+    /// already holds the capability (the steward maintains a
+    /// single-responder lock at runtime; first-claimer-wins).
+    pub fn allows_user_interaction_responder(
+        &self,
+        peer: PeerCredentials,
+        steward: StewardIdentity,
+    ) -> bool {
+        let policy = &self.user_interaction_responder;
+
+        let allow_local = policy.allow_local.unwrap_or(
+            policy.allow_uids.is_empty() && policy.allow_gids.is_empty(),
+        );
+
+        if allow_local {
+            if let (Some(peer_uid), Some(steward_uid)) = (peer.uid, steward.uid)
+            {
+                if peer_uid == steward_uid {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(peer_uid) = peer.uid {
+            if policy.allow_uids.contains(&peer_uid) {
+                return true;
+            }
+        }
+
+        if let Some(peer_gid) = peer.gid {
+            if policy.allow_gids.contains(&peer_gid) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Decide whether a connection from `peer` may negotiate the
+    /// `fast_path_admin` capability. Mirrors
+    /// [`Self::allows_plugins_admin`] in shape and semantics.
+    pub fn allows_fast_path_admin(
+        &self,
+        peer: PeerCredentials,
+        steward: StewardIdentity,
+    ) -> bool {
+        let policy = &self.fast_path_admin;
+
+        let allow_local = policy.allow_local.unwrap_or(
+            policy.allow_uids.is_empty() && policy.allow_gids.is_empty(),
+        );
+
+        if allow_local {
+            if let (Some(peer_uid), Some(steward_uid)) = (peer.uid, steward.uid)
+            {
+                if peer_uid == steward_uid {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(peer_uid) = peer.uid {
+            if policy.allow_uids.contains(&peer_uid) {
+                return true;
+            }
+        }
+
+        if let Some(peer_gid) = peer.gid {
+            if policy.allow_gids.contains(&peer_gid) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Return the parsed `appointments_admin` policy.
+    pub fn appointments_admin_policy(&self) -> &AppointmentsAdminPolicy {
+        &self.appointments_admin
+    }
+
+    /// Decide whether a connection from `peer` may negotiate the
+    /// `appointments_admin` capability. Mirrors
+    /// [`Self::allows_plugins_admin`] in shape and semantics.
+    pub fn allows_appointments_admin(
+        &self,
+        peer: PeerCredentials,
+        steward: StewardIdentity,
+    ) -> bool {
+        let policy = &self.appointments_admin;
+
+        let allow_local = policy.allow_local.unwrap_or(
+            policy.allow_uids.is_empty() && policy.allow_gids.is_empty(),
+        );
+
+        if allow_local {
+            if let (Some(peer_uid), Some(steward_uid)) = (peer.uid, steward.uid)
+            {
+                if peer_uid == steward_uid {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(peer_uid) = peer.uid {
+            if policy.allow_uids.contains(&peer_uid) {
+                return true;
+            }
+        }
+
+        if let Some(peer_gid) = peer.gid {
+            if policy.allow_gids.contains(&peer_gid) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Return the parsed `watches_admin` policy.
+    pub fn watches_admin_policy(&self) -> &WatchesAdminPolicy {
+        &self.watches_admin
+    }
+
+    /// Decide whether a connection from `peer` may negotiate
+    /// the `watches_admin` capability. Mirrors
+    /// [`Self::allows_appointments_admin`] in shape and
+    /// semantics.
+    pub fn allows_watches_admin(
+        &self,
+        peer: PeerCredentials,
+        steward: StewardIdentity,
+    ) -> bool {
+        let policy = &self.watches_admin;
+
+        let allow_local = policy.allow_local.unwrap_or(
+            policy.allow_uids.is_empty() && policy.allow_gids.is_empty(),
+        );
+
+        if allow_local {
+            if let (Some(peer_uid), Some(steward_uid)) = (peer.uid, steward.uid)
+            {
+                if peer_uid == steward_uid {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(peer_uid) = peer.uid {
+            if policy.allow_uids.contains(&peer_uid) {
+                return true;
+            }
+        }
+
+        if let Some(peer_gid) = peer.gid {
+            if policy.allow_gids.contains(&peer_gid) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Return the parsed `grammar_admin` policy.
+    pub fn grammar_admin_policy(&self) -> &GrammarAdminPolicy {
+        &self.grammar_admin
+    }
+
+    /// Decide whether a connection from `peer` may negotiate the
+    /// `grammar_admin` capability. Mirrors
+    /// [`Self::allows_appointments_admin`].
+    pub fn allows_grammar_admin(
+        &self,
+        peer: PeerCredentials,
+        steward: StewardIdentity,
+    ) -> bool {
+        let policy = &self.grammar_admin;
+
+        let allow_local = policy.allow_local.unwrap_or(
+            policy.allow_uids.is_empty() && policy.allow_gids.is_empty(),
+        );
+
+        if allow_local {
+            if let (Some(peer_uid), Some(steward_uid)) = (peer.uid, steward.uid)
+            {
+                if peer_uid == steward_uid {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(peer_uid) = peer.uid {
+            if policy.allow_uids.contains(&peer_uid) {
+                return true;
+            }
+        }
+
+        if let Some(peer_gid) = peer.gid {
+            if policy.allow_gids.contains(&peer_gid) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Decide whether a connection from `peer` may negotiate the
+    /// `plugins_admin` capability. Mirrors
+    /// [`Self::allows_resolve_claimants`] in shape: allow-local
+    /// (default-true when neither UID nor GID list is configured),
+    /// allow-UID list, allow-GID list, otherwise deny.
+    pub fn allows_plugins_admin(
+        &self,
+        peer: PeerCredentials,
+        steward: StewardIdentity,
+    ) -> bool {
+        let policy = &self.plugins_admin;
+
         let allow_local = policy.allow_local.unwrap_or(
             policy.allow_uids.is_empty() && policy.allow_gids.is_empty(),
         );
@@ -533,5 +1054,409 @@ mod tests {
         assert_eq!(acl.source(), Some(path.as_path()));
         let steward = steward_at(0);
         assert!(acl.allows_resolve_claimants(peer(42, 0), steward));
+    }
+
+    #[test]
+    fn default_acl_grants_plugins_admin_to_local_steward_uid() {
+        let acl = ClientAcl::default();
+        let steward = steward_at(1000);
+        assert!(
+            acl.allows_plugins_admin(peer(1000, 1000), steward),
+            "matching steward UID is the default local-admin grant"
+        );
+        assert!(
+            !acl.allows_plugins_admin(peer(2000, 1000), steward),
+            "non-matching UID is denied by the conservative default"
+        );
+    }
+
+    #[test]
+    fn plugins_admin_explicit_uid_list_overrides_local_default() {
+        let acl = ClientAcl::parse(
+            r#"
+            [capabilities.plugins_admin]
+            allow_uids = [4242]
+            "#,
+            None,
+        )
+        .expect("parse plugins_admin uid list");
+        let steward = steward_at(1000);
+        // The explicit list grants only the listed UID; local
+        // defaults off once a list is configured.
+        assert!(acl.allows_plugins_admin(peer(4242, 0), steward));
+        assert!(!acl.allows_plugins_admin(peer(1000, 0), steward));
+    }
+
+    #[test]
+    fn plugins_admin_and_resolve_claimants_are_independent() {
+        // Granting one capability does not implicitly grant the
+        // other; each capability gates on its own block.
+        let acl = ClientAcl::parse(
+            r#"
+            [capabilities.plugins_admin]
+            allow_uids = [4242]
+            [capabilities.resolve_claimants]
+            allow_uids = [9999]
+            "#,
+            None,
+        )
+        .expect("parse both blocks");
+        let steward = steward_at(0);
+        assert!(acl.allows_plugins_admin(peer(4242, 0), steward));
+        assert!(!acl.allows_plugins_admin(peer(9999, 0), steward));
+        assert!(acl.allows_resolve_claimants(peer(9999, 0), steward));
+        assert!(!acl.allows_resolve_claimants(peer(4242, 0), steward));
+    }
+
+    #[test]
+    fn default_acl_grants_reconciliation_admin_to_local_steward_uid() {
+        let acl = ClientAcl::default();
+        let steward = steward_at(1000);
+        assert!(
+            acl.allows_reconciliation_admin(peer(1000, 1000), steward),
+            "matching steward UID is the default local-admin grant"
+        );
+        assert!(
+            !acl.allows_reconciliation_admin(peer(2000, 1000), steward),
+            "non-matching UID is denied by the conservative default"
+        );
+    }
+
+    #[test]
+    fn reconciliation_admin_explicit_uid_list_overrides_local_default() {
+        let acl = ClientAcl::parse(
+            r#"
+            [capabilities.reconciliation_admin]
+            allow_uids = [4242]
+            "#,
+            None,
+        )
+        .expect("parse reconciliation_admin uid list");
+        let steward = steward_at(1000);
+        // The explicit list grants only the listed UID; local
+        // defaults off once a list is configured.
+        assert!(acl.allows_reconciliation_admin(peer(4242, 0), steward));
+        assert!(!acl.allows_reconciliation_admin(peer(1000, 0), steward));
+    }
+
+    #[test]
+    fn reconciliation_admin_and_plugins_admin_are_independent() {
+        // The whole point of splitting reconciliation_admin out as
+        // a separate capability is that operators can grant manual-
+        // trigger authority on a different axis from plugin-
+        // lifecycle authority — e.g. a CI/CD bridge that may force
+        // a re-apply but should not be able to disable plugins.
+        // Pin the independence: granting one MUST NOT implicitly
+        // grant the other.
+        let acl = ClientAcl::parse(
+            r#"
+            [capabilities.plugins_admin]
+            allow_uids = [4242]
+            [capabilities.reconciliation_admin]
+            allow_uids = [9999]
+            "#,
+            None,
+        )
+        .expect("parse both admin blocks");
+        let steward = steward_at(0);
+        assert!(acl.allows_plugins_admin(peer(4242, 0), steward));
+        assert!(!acl.allows_plugins_admin(peer(9999, 0), steward));
+        assert!(acl.allows_reconciliation_admin(peer(9999, 0), steward));
+        assert!(!acl.allows_reconciliation_admin(peer(4242, 0), steward));
+    }
+
+    #[test]
+    fn reconciliation_admin_unknown_peer_credentials_are_denied() {
+        // When peer_credentials() returns uid=None / gid=None
+        // (e.g. a non-Linux Unix that doesn't expose SO_PEERCRED at
+        // the same option, or a sandbox that strips the credential),
+        // the ACL MUST refuse a capability that gates on identity.
+        // A grant would let an unidentified peer escalate.
+        let acl = ClientAcl::default();
+        let steward = steward_at(1000);
+        let unidentified = PeerCredentials {
+            uid: None,
+            gid: None,
+        };
+        assert!(!acl.allows_reconciliation_admin(unidentified, steward));
+    }
+
+    #[test]
+    fn default_acl_grants_fast_path_admin_to_local_steward_uid() {
+        let acl = ClientAcl::default();
+        let steward = steward_at(1000);
+        assert!(
+            acl.allows_fast_path_admin(peer(1000, 1000), steward),
+            "matching steward UID is the default local-admin grant"
+        );
+        assert!(
+            !acl.allows_fast_path_admin(peer(2000, 1000), steward),
+            "non-matching UID is denied by the conservative default"
+        );
+    }
+
+    #[test]
+    fn fast_path_admin_explicit_uid_list_overrides_local_default() {
+        let acl = ClientAcl::parse(
+            r#"
+            [capabilities.fast_path_admin]
+            allow_uids = [4242]
+            "#,
+            None,
+        )
+        .expect("parse fast_path_admin uid list");
+        let steward = steward_at(1000);
+        // Explicit list grants only the listed UID; local
+        // defaults off once a list is configured.
+        assert!(acl.allows_fast_path_admin(peer(4242, 0), steward));
+        assert!(!acl.allows_fast_path_admin(peer(1000, 0), steward));
+    }
+
+    #[test]
+    fn fast_path_admin_and_reconciliation_admin_are_independent() {
+        // Fast Path authority and reconciliation-trigger authority
+        // are different axes: a CI/CD bridge that may force-
+        // reapply a reconciliation pair should not automatically
+        // also be allowed to dispatch tactile-latency Fast Path
+        // frames into operator-physical-button verbs. Pin the
+        // independence.
+        let acl = ClientAcl::parse(
+            r#"
+            [capabilities.reconciliation_admin]
+            allow_uids = [4242]
+            [capabilities.fast_path_admin]
+            allow_uids = [9999]
+            "#,
+            None,
+        )
+        .expect("parse both admin blocks");
+        let steward = steward_at(0);
+        assert!(acl.allows_reconciliation_admin(peer(4242, 0), steward));
+        assert!(!acl.allows_reconciliation_admin(peer(9999, 0), steward));
+        assert!(acl.allows_fast_path_admin(peer(9999, 0), steward));
+        assert!(!acl.allows_fast_path_admin(peer(4242, 0), steward));
+    }
+
+    #[test]
+    fn fast_path_admin_unknown_peer_credentials_are_denied() {
+        let acl = ClientAcl::default();
+        let steward = steward_at(1000);
+        let unidentified = PeerCredentials {
+            uid: None,
+            gid: None,
+        };
+        assert!(!acl.allows_fast_path_admin(unidentified, steward));
+    }
+
+    #[test]
+    fn default_acl_grants_user_interaction_responder_to_local_steward_uid() {
+        let acl = ClientAcl::default();
+        let steward = steward_at(1000);
+        assert!(
+            acl.allows_user_interaction_responder(peer(1000, 1000), steward),
+            "matching steward UID is the default local-admin grant"
+        );
+        assert!(
+            !acl.allows_user_interaction_responder(peer(2000, 1000), steward),
+            "non-matching UID is denied by the conservative default"
+        );
+    }
+
+    #[test]
+    fn user_interaction_responder_explicit_uid_list_overrides_local_default() {
+        let acl = ClientAcl::parse(
+            r#"
+            [capabilities.user_interaction_responder]
+            allow_uids = [4242]
+            "#,
+            None,
+        )
+        .expect("parse user_interaction_responder uid list");
+        let steward = steward_at(1000);
+        assert!(acl.allows_user_interaction_responder(peer(4242, 0), steward));
+        assert!(!acl.allows_user_interaction_responder(peer(1000, 0), steward));
+    }
+
+    #[test]
+    fn user_interaction_responder_unknown_peer_credentials_are_denied() {
+        let acl = ClientAcl::default();
+        let steward = steward_at(1000);
+        let unidentified = PeerCredentials {
+            uid: None,
+            gid: None,
+        };
+        assert!(!acl.allows_user_interaction_responder(unidentified, steward));
+    }
+
+    #[test]
+    fn default_acl_grants_appointments_admin_to_local_steward_uid() {
+        let acl = ClientAcl::default();
+        let steward = steward_at(1000);
+        assert!(
+            acl.allows_appointments_admin(peer(1000, 1000), steward),
+            "matching steward UID is the default local-admin grant"
+        );
+        assert!(
+            !acl.allows_appointments_admin(peer(2000, 1000), steward),
+            "non-matching UID is denied under defaults"
+        );
+    }
+
+    #[test]
+    fn appointments_admin_uid_list_overrides_local_default() {
+        let acl = ClientAcl::parse(
+            r#"
+            [capabilities.appointments_admin]
+            allow_uids = [4242]
+            "#,
+            None,
+        )
+        .expect("parse appointments_admin block");
+        let steward = steward_at(1000);
+        assert!(acl.allows_appointments_admin(peer(4242, 0), steward));
+        assert!(
+            !acl.allows_appointments_admin(peer(1000, 0), steward),
+            "explicit list flips allow_local default to false"
+        );
+    }
+
+    #[test]
+    fn appointments_admin_independent_from_other_admin_caps() {
+        // Granting one capability does not implicitly grant the
+        // appointments-admin axis. Operators configure each axis
+        // independently.
+        let acl = ClientAcl::parse(
+            r#"
+            [capabilities.plugins_admin]
+            allow_uids = [4242]
+            [capabilities.appointments_admin]
+            allow_uids = [9999]
+            "#,
+            None,
+        )
+        .expect("parse both blocks");
+        let steward = steward_at(0);
+        assert!(acl.allows_plugins_admin(peer(4242, 0), steward));
+        assert!(!acl.allows_appointments_admin(peer(4242, 0), steward));
+        assert!(acl.allows_appointments_admin(peer(9999, 0), steward));
+        assert!(!acl.allows_plugins_admin(peer(9999, 0), steward));
+    }
+
+    #[test]
+    fn default_acl_grants_watches_admin_to_local_steward_uid() {
+        let acl = ClientAcl::default();
+        let steward = steward_at(1000);
+        assert!(
+            acl.allows_watches_admin(peer(1000, 1000), steward),
+            "matching steward UID is the default local-admin grant"
+        );
+        assert!(
+            !acl.allows_watches_admin(peer(2000, 1000), steward),
+            "non-matching UID is denied under defaults"
+        );
+    }
+
+    #[test]
+    fn watches_admin_uid_list_overrides_local_default() {
+        let acl = ClientAcl::parse(
+            r#"
+            [capabilities.watches_admin]
+            allow_uids = [4242]
+            "#,
+            None,
+        )
+        .expect("parse watches_admin block");
+        let steward = steward_at(1000);
+        assert!(acl.allows_watches_admin(peer(4242, 0), steward));
+        assert!(
+            !acl.allows_watches_admin(peer(1000, 0), steward),
+            "explicit list flips allow_local default to false"
+        );
+    }
+
+    #[test]
+    fn watches_admin_independent_from_other_admin_caps() {
+        let acl = ClientAcl::parse(
+            r#"
+            [capabilities.appointments_admin]
+            allow_uids = [4242]
+            [capabilities.watches_admin]
+            allow_uids = [9999]
+            "#,
+            None,
+        )
+        .expect("parse both blocks");
+        let steward = steward_at(0);
+        assert!(acl.allows_appointments_admin(peer(4242, 0), steward));
+        assert!(!acl.allows_watches_admin(peer(4242, 0), steward));
+        assert!(acl.allows_watches_admin(peer(9999, 0), steward));
+        assert!(!acl.allows_appointments_admin(peer(9999, 0), steward));
+    }
+
+    #[test]
+    fn default_acl_grants_grammar_admin_to_local_steward_uid() {
+        let acl = ClientAcl::default();
+        let steward = steward_at(1000);
+        assert!(
+            acl.allows_grammar_admin(peer(1000, 1000), steward),
+            "matching steward UID is the default local-admin grant"
+        );
+        assert!(!acl.allows_grammar_admin(peer(2000, 1000), steward));
+    }
+
+    #[test]
+    fn grammar_admin_uid_list_overrides_local_default() {
+        let acl = ClientAcl::parse(
+            r#"
+            [capabilities.grammar_admin]
+            allow_uids = [4242]
+            "#,
+            None,
+        )
+        .expect("parse grammar_admin block");
+        let steward = steward_at(1000);
+        assert!(acl.allows_grammar_admin(peer(4242, 0), steward));
+        assert!(!acl.allows_grammar_admin(peer(1000, 0), steward));
+    }
+
+    #[test]
+    fn grammar_admin_independent_from_other_admin_caps() {
+        let acl = ClientAcl::parse(
+            r#"
+            [capabilities.appointments_admin]
+            allow_uids = [4242]
+            [capabilities.grammar_admin]
+            allow_uids = [9999]
+            "#,
+            None,
+        )
+        .expect("parse both blocks");
+        let steward = steward_at(0);
+        assert!(acl.allows_appointments_admin(peer(4242, 0), steward));
+        assert!(!acl.allows_grammar_admin(peer(4242, 0), steward));
+        assert!(acl.allows_grammar_admin(peer(9999, 0), steward));
+        assert!(!acl.allows_appointments_admin(peer(9999, 0), steward));
+    }
+
+    #[test]
+    fn user_interaction_responder_independent_from_other_admin_caps() {
+        // Granting one of the admin capabilities MUST NOT
+        // implicitly grant the responder capability. Operators
+        // configure each axis independently.
+        let acl = ClientAcl::parse(
+            r#"
+            [capabilities.plugins_admin]
+            allow_uids = [4242]
+            [capabilities.user_interaction_responder]
+            allow_uids = [9999]
+            "#,
+            None,
+        )
+        .expect("parse both blocks");
+        let steward = steward_at(0);
+        assert!(acl.allows_plugins_admin(peer(4242, 0), steward));
+        assert!(!acl.allows_plugins_admin(peer(9999, 0), steward));
+        assert!(acl.allows_user_interaction_responder(peer(9999, 0), steward));
+        assert!(!acl.allows_user_interaction_responder(peer(4242, 0), steward));
     }
 }

@@ -2,12 +2,15 @@
 resolver = "2"
 members = [
     "crates/evo",
+    "crates/evo-coalesce-labels",
     "crates/evo-example-admin",
     "crates/evo-example-distribution",
     "crates/evo-example-echo",
     "crates/evo-example-factory",
     "crates/evo-example-warden",
+    "crates/evo-os-clock",
     "crates/evo-plugin-sdk",
+    "crates/evo-plugin-test",
     "crates/evo-plugin-tool",
     "crates/evo-trust",
 ]
@@ -27,7 +30,7 @@ exclude = ["crates/evo-loom"]
 # workspace crate has a corresponding citation in those documents.
 
 [workspace.package]
-version = "0.1.11-rc.4"
+version = "0.1.12"
 edition = "2021"
 # MSRV is a framework-level choice, independent of any single
 # distribution's OS. evo-core supports an open set of distributions

@@ -402,6 +402,29 @@ The partial index on `subjects.forgotten_at_ms IS NULL` supports the common quer
 
 The schema above ships as `crates/evo/migrations/001_initial.sql`. This file is the source of truth for the v1 schema. The Rust code reads it at build time (via `include_str!`) or at runtime (from disk on development builds); production builds include it in the binary. The migration runner (section 8.3) applies it on first startup against a fresh database.
 
+### 7.5 Migrations beyond the initial schema
+
+The initial schema (version 1) declares the subjects / relations subset. Subsequent migrations append tables and columns as new durable surfaces land:
+
+| Version | File | Adds |
+|---------|------|------|
+| 2 | `002_happenings.sql` | `happenings_log` durable trail with monotonic `seq` |
+| 3 | `003_meta.sql` | `meta` key-value (steward `instance_id`) |
+| 4 | `004_pending_conflicts.sql` | `pending_conflicts` table cross-linking unresolved subject conflicts |
+| 5 | `005_subjects_live_by_creation.sql` | Ordered live-subject covering index |
+| 6 | `006_admin_log.sql` | `admin_log` durable audit of admin actions |
+| 7 | `007_custody_ledger.sql` | `custodies` and `custody_state` tables |
+| 8 | `008_relation_graph.sql` | `relations` and `relation_claimants` tables |
+| 9 | `009_installed_plugins.sql` | `installed_plugins` operator enable/disable bit |
+| 10 | `010_reconciliation_state.sql` | `reconciliation_state` per-pair last-known-good |
+| 11 | `011_pending_grammar_orphans.sql` | `pending_grammar_orphans` operator-visible record of subject-grammar orphans and any migration / acceptance decisions |
+
+Every migration appends rows to `schema_version`. The runner applies each in order on first encounter (see §8.3); a steward downgrade attempt against a database whose `MAX(version)` exceeds the binary's maximum refuses to start with `StewardError::SchemaVersionAhead`.
+
+The `pending_grammar_orphans` table (migration 11) carries one row per orphaned `subject_type`. Status is one of `pending` / `migrating` / `resolved` / `accepted` / `recovered`; `accepted_reason` and `accepted_at` populate when an operator records `accept_grammar_orphans`; `migration_id` populates when `migrate_grammar_orphans` transitions the row to `migrating` and ultimately `resolved`. The boot diagnostic upserts every discovered orphan, preserving any operator status the row already records, and emits one `Happening::SubjectGrammarOrphan` per orphan type. See `CATALOGUE.md` §5.3 and `CLIENT_API.md` §4.17 for the operator surface.
+
+The `record_subject_type_migration` trait method on `PersistenceStore` performs one subject's atomic re-statement under a new type within one transaction (insert new subject row, move every addressing from the old id to the new id, delete the old row, write a `type_migrated` alias row, append the claim_log receipt). The shape mirrors `record_subject_merge` with one source instead of two and a type change between old and new. See `SUBJECTS.md` for the `AliasKind::TypeMigrated` alias chain.
+
 ## 8. Schema Versioning and Migrations
 
 ### 8.1 Migration discipline

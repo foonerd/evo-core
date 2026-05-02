@@ -16,7 +16,16 @@
 //! answerable from one file, and keeps the pipeline mechanically
 //! auditable in code review.
 
+use std::sync::Arc;
+use std::time::SystemTime;
+
 use crate::error::StewardError;
+use crate::happenings::{Happening, HappeningBus};
+use crate::manifest_drift::{detect_drift, DriftReport};
+use crate::version_skew::{
+    classify_skew, skew_minor_versions, SkewClassification,
+};
+use evo_plugin_sdk::contract::RuntimeCapabilities;
 use evo_plugin_sdk::Manifest;
 use evo_trust::ADMIN_MINIMUM_TRUST;
 
@@ -92,6 +101,113 @@ pub(super) fn check_admin_trust(
             minimum: ADMIN_MINIMUM_TRUST,
         });
     }
+    Ok(())
+}
+
+/// Run the version-skew classification + manifest-drift check at
+/// admission, emitting structured happenings for warn-band
+/// admissions and refusing admission for out-of-window or
+/// strict-window-with-drift cases.
+///
+/// Called from every admit entry point AFTER
+/// [`check_manifest_prerequisites`] and after
+/// `plugin.describe()` returns. The function:
+///
+/// 1. Classifies the plugin's `prerequisites.evo_min_version`
+///    against the framework's running version.
+/// 2. Refuses admission outright on `OutOfWindow`. (`TooNew` was
+///    already refused by `check_manifest_prerequisites`.)
+/// 3. Computes a [`DriftReport`] comparing the manifest's
+///    declared verb sets to the runtime `describe()` response.
+/// 4. Refuses admission on Strict-window drift. Emits
+///    `Happening::PluginManifestDrift { admitted: false }` so
+///    operators see the refusal reason on the bus.
+/// 5. Admits but warns on warn-band: emits
+///    `Happening::PluginVersionSkewWarning` and (on drift)
+///    `Happening::PluginManifestDrift { admitted: true }`.
+///
+/// Returns `Ok(())` on admit, `Err(StewardError)` on refusal.
+pub(super) async fn check_drift_and_skew(
+    manifest: &Manifest,
+    runtime: &RuntimeCapabilities,
+    bus: &Arc<HappeningBus>,
+) -> Result<(), StewardError> {
+    let framework_version =
+        match semver::Version::parse(env!("CARGO_PKG_VERSION")) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(StewardError::Admission(format!(
+                    "evo's own CARGO_PKG_VERSION is not valid \
+                     semver: {e}"
+                )));
+            }
+        };
+
+    let plugin_min = &manifest.prerequisites.evo_min_version;
+    let skew = classify_skew(plugin_min, &framework_version);
+    let plugin_name = &manifest.plugin.name;
+
+    if matches!(skew, SkewClassification::OutOfWindow) {
+        return Err(StewardError::Admission(format!(
+            "{}: plugin's prerequisites.evo_min_version \
+             {} is too far behind the running framework {} \
+             (skew window: current and current-1 strict, \
+             current-2 warn-band, current-3 or older refused); \
+             rebuild the plugin against a newer evo \
+             framework",
+            plugin_name, plugin_min, framework_version
+        )));
+    }
+
+    let drift = detect_drift(manifest, runtime);
+
+    if !drift.is_empty() {
+        let admitted_through_drift =
+            matches!(skew, SkewClassification::WarnBand);
+
+        let _ = bus
+            .emit_durable(Happening::PluginManifestDrift {
+                plugin: plugin_name.clone(),
+                missing_in_implementation: drift
+                    .missing_in_implementation
+                    .clone(),
+                missing_in_manifest: drift.missing_in_manifest.clone(),
+                admitted: admitted_through_drift,
+                at: SystemTime::now(),
+            })
+            .await;
+
+        if !admitted_through_drift {
+            return Err(StewardError::Admission(format!(
+                "{}: plugin manifest does not match runtime \
+                 describe(): missing in implementation = {:?}, \
+                 missing in manifest = {:?}; rebuild the plugin \
+                 to align manifest declarations with the actual \
+                 implementation",
+                plugin_name,
+                drift.missing_in_implementation,
+                drift.missing_in_manifest
+            )));
+        }
+    }
+
+    if matches!(skew, SkewClassification::WarnBand) {
+        let skew_minor = skew_minor_versions(plugin_min, &framework_version);
+        let _ = bus
+            .emit_durable(Happening::PluginVersionSkewWarning {
+                plugin: plugin_name.clone(),
+                evo_min_version: plugin_min.to_string(),
+                skew_minor_versions: skew_minor,
+                at: SystemTime::now(),
+            })
+            .await;
+    }
+
+    // Surface the verdict for downstream observers (currently
+    // only used for diagnostic purposes; the policy decisions
+    // are already captured in the happenings + the
+    // refused/admitted return shape).
+    let _ = (skew, DriftReport::default());
     Ok(())
 }
 

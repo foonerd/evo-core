@@ -246,6 +246,13 @@ pub enum AliasKind {
     /// chain see "this canonical ID was forgotten" rather than
     /// receiving a bare not-found.
     Tombstone,
+    /// The old subject's `subject_type` changed via the
+    /// operator-issued grammar-orphan migration verb. The
+    /// alias's `new_ids` has length 1 — the new subject ID
+    /// minted for the migrated record. Distinguishes type-
+    /// change identity flips from semantic-change merges so
+    /// `describe_alias` consumers can branch on the kind.
+    TypeMigrated,
 }
 
 /// One addressing currently registered to a subject, with the

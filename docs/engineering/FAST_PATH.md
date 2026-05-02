@@ -400,3 +400,15 @@ Commands are intended to be durable: once sent and acknowledged by the steward, 
 | Guaranteed cross-connection ordering for the rare cases a distribution needs it | Future; out of scope for v0 |
 | Quality-of-service annotations on commands (best-effort vs. must-succeed) | Future; consumer use cases unclear |
 | Declarative retry policies in the catalogue | Future; retry is consumer-side in v0 |
+
+## 16. Implementation Status
+
+The Fast Path channel ships in evo-core. Concrete surfaces:
+
+- **Listener.** A second Unix-domain socket at `/run/evo/fast.sock` accepts Fast Path frames alongside the slow-path control socket. Distributions opt in via `[server] enable_fast_path = true` in the steward config; without it, the listener is not bound and the channel is unavailable.
+- **Per-plugin sender flag.** `[capabilities] fast_path = true` on the dispatching plugin's manifest. Plugins not declaring it see `LoadContext::fast_path_dispatcher = None` and cannot send.
+- **Per-warden eligibility.** `[capabilities.warden] fast_path_verbs = ["volume_set", "volume_step", ...]` declares which verbs the warden accepts on Fast Path; verbs absent from the list refuse with the structured `not_fast_path_eligible` subclass even if they appear in the warden's slow-path `course_correct_verbs`.
+- **Per-connection capability.** `fast_path_admin` is a negotiable consumer capability gated by `client_acl.toml`; a Fast Path frame from a connection that has not negotiated it refuses with `fast_path_admin_not_granted`.
+- **Per-warden Fast Path budget.** Default 50 ms; manifest-declared up to 200 ms via `[capabilities.warden] fast_path_budget_ms`. Exceeding the budget surfaces as `fast_path_budget_exceeded`.
+
+The three gates (`capabilities.fast_path` on the sender, `capabilities.warden.fast_path_verbs` on the target, `fast_path_admin` on the connection) compose. SDK side: the `FastPathDispatcher` trait on `LoadContext` is the in-process surface; out-of-process plugins reach the channel through a wire-side adapter. See `PLUGIN_CONTRACT.md` §5.4 for the SDK shape and `CLIENT_API.md` for the connection-time capability negotiation.

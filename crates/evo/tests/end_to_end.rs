@@ -1548,6 +1548,9 @@ async fn build_negotiation_harness(
         acl,
         steward_identity,
         Arc::clone(&resolution_ledger),
+        evo::catalogue::CatalogueSource::Configured,
+        evo::time_trust::new_shared(),
+        false,
     );
 
     (engine, bus, resolution_ledger, server)

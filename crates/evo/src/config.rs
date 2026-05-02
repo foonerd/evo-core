@@ -33,6 +33,14 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/evo/evo.toml";
 /// Default location of the catalogue.
 pub const DEFAULT_CATALOGUE_PATH: &str = "/opt/evo/catalogue/default.toml";
 
+/// Default location of the steward-managed last-known-good catalogue
+/// shadow. Mirror-written atomically after every successful steady-
+/// state catalogue load; consulted as the second tier of the
+/// resilience chain when the configured catalogue fails to parse or
+/// validate. See `catalogue::Catalogue::load_with_fallback`.
+pub const DEFAULT_CATALOGUE_LKG_PATH: &str =
+    "/var/lib/evo/state/catalogue.lkg.toml";
+
 /// Default location of the steward's client-facing socket.
 pub const DEFAULT_SOCKET_PATH: &str = "/var/run/evo/evo.sock";
 
@@ -128,6 +136,10 @@ pub struct StewardConfig {
     /// reconnect-resume.
     #[serde(default)]
     pub happenings: HappeningsSection,
+    /// Wall-clock trust signal — distribution-declared hardware
+    /// reality plus poll cadence.
+    #[serde(default)]
+    pub time_trust: TimeTrustSection,
 }
 
 impl StewardConfig {
@@ -303,18 +315,73 @@ pub struct CatalogueSection {
     /// Path to the catalogue TOML file.
     #[serde(default = "default_catalogue_path")]
     pub path: PathBuf,
+    /// Path to the last-known-good catalogue shadow. Mirror-written
+    /// atomically after every successful steady-state catalogue
+    /// load; consulted as the second tier of the resilience chain
+    /// when the configured catalogue fails to parse or validate.
+    #[serde(default = "default_catalogue_lkg_path")]
+    pub lkg_path: PathBuf,
 }
 
 impl Default for CatalogueSection {
     fn default() -> Self {
         Self {
             path: default_catalogue_path(),
+            lkg_path: default_catalogue_lkg_path(),
         }
     }
 }
 
 fn default_catalogue_path() -> PathBuf {
     PathBuf::from(DEFAULT_CATALOGUE_PATH)
+}
+
+fn default_catalogue_lkg_path() -> PathBuf {
+    PathBuf::from(DEFAULT_CATALOGUE_LKG_PATH)
+}
+
+/// `[time_trust]` section. Distribution declares the device's
+/// hardware time-keeping reality and the framework's poll cadence
+/// for the kernel's NTP synchronisation state. The framework
+/// itself does NOT run an NTP / PTP / GPS client; it consumes the
+/// state the OS daemon (`systemd-timesyncd`, `chrony`, `ptp4l`,
+/// vendor agents) has already negotiated.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimeTrustSection {
+    /// Whether the device has a battery-backed real-time clock.
+    /// On `false`, the framework treats every boot and post-suspend
+    /// wake as `Untrusted` until the OS time-sync daemon completes
+    /// its first synchronisation. Default: `false` (conservative).
+    #[serde(default)]
+    pub has_battery_rtc: bool,
+    /// Maximum tolerated staleness of the kernel's last-observed
+    /// synchronisation. After this much elapsed time without a
+    /// fresh sync observation, `Trusted` transitions to `Stale`.
+    /// Default: 24 hours (86 400 000 ms).
+    #[serde(default = "default_max_acceptable_staleness_ms")]
+    pub max_acceptable_staleness_ms: u64,
+    /// How often the framework polls the kernel's NTP state.
+    /// Default: 5 seconds.
+    #[serde(default = "default_time_trust_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+}
+
+impl Default for TimeTrustSection {
+    fn default() -> Self {
+        Self {
+            has_battery_rtc: false,
+            max_acceptable_staleness_ms: default_max_acceptable_staleness_ms(),
+            poll_interval_secs: default_time_trust_poll_interval_secs(),
+        }
+    }
+}
+
+fn default_max_acceptable_staleness_ms() -> u64 {
+    crate::time_trust::DEFAULT_MAX_ACCEPTABLE_STALENESS_MS
+}
+
+fn default_time_trust_poll_interval_secs() -> u64 {
+    crate::time_trust::DEFAULT_POLL_INTERVAL_SECS
 }
 
 /// `[plugins]` section.

@@ -49,11 +49,12 @@ use crate::subjects::SubjectRegistry;
 /// describes shared stores, not dispatch or configuration.
 #[derive(Debug)]
 pub struct StewardState {
-    /// The catalogue the steward administers. Loaded once at boot
-    /// and shared by every component that validates against the
-    /// declared rack / shelf / subject-type / relation-predicate
-    /// vocabulary.
-    pub catalogue: Arc<Catalogue>,
+    /// The catalogue the steward administers. Loaded at boot and
+    /// swappable by operator-issued reload_catalogue calls. Wrapped
+    /// in [`arc_swap::ArcSwap`] so reads stay lock-free while a
+    /// reload publishes a new declaration set atomically. Use
+    /// [`Self::current_catalogue`] for ergonomic access.
+    pub catalogue: arc_swap::ArcSwap<Catalogue>,
     /// The subject registry, implementing `SUBJECTS.md`. Plugins
     /// announce into it via their `LoadContext`; the projection
     /// engine and client query paths read from it.
@@ -108,6 +109,15 @@ impl StewardState {
     /// required setter and a new error variant.
     pub fn builder() -> StewardStateBuilder {
         StewardStateBuilder::default()
+    }
+
+    /// Snapshot the current catalogue. Cheap (an `Arc` clone via
+    /// the underlying [`arc_swap::ArcSwap::load_full`]); callers
+    /// hold the snapshot for the duration of one operation and see
+    /// a consistent declaration set even if a concurrent
+    /// reload_catalogue swaps it.
+    pub fn current_catalogue(&self) -> Arc<Catalogue> {
+        self.catalogue.load_full()
     }
 }
 
@@ -197,9 +207,10 @@ impl StewardStateBuilder {
     /// provided.
     pub fn build(self) -> Result<Arc<StewardState>, StewardStateBuildError> {
         Ok(Arc::new(StewardState {
-            catalogue: self
-                .catalogue
-                .ok_or(StewardStateBuildError::MissingCatalogue)?,
+            catalogue: arc_swap::ArcSwap::new(
+                self.catalogue
+                    .ok_or(StewardStateBuildError::MissingCatalogue)?,
+            ),
             subjects: self
                 .subjects
                 .ok_or(StewardStateBuildError::MissingSubjects)?,
@@ -242,7 +253,7 @@ impl StewardState {
     /// subject-type, or relation-predicate validation.
     pub fn for_tests_with_catalogue(catalogue: Arc<Catalogue>) -> Arc<Self> {
         Arc::new(Self {
-            catalogue,
+            catalogue: arc_swap::ArcSwap::new(catalogue),
             subjects: Arc::new(SubjectRegistry::new()),
             relations: Arc::new(RelationGraph::new()),
             custody: Arc::new(CustodyLedger::new()),
@@ -323,7 +334,7 @@ mod tests {
         let state = full_builder().build().expect("build should succeed");
 
         // Every field is reachable through the Arc<StewardState>.
-        assert_eq!(state.catalogue.racks.len(), 0);
+        assert_eq!(state.current_catalogue().racks.len(), 0);
         // Touching the other handles is enough to prove the field is
         // populated; their semantics are covered in their own modules.
         let _ = Arc::clone(&state.subjects);
@@ -481,7 +492,7 @@ mod tests {
             // Hold one Arc clone per store for the duration of this
             // thread; strong counts must include both this thread's
             // clones and the bag the parent still holds.
-            let cat = Arc::clone(&cloned.catalogue);
+            let cat = cloned.current_catalogue();
             let _subjects = Arc::clone(&cloned.subjects);
             let _relations = Arc::clone(&cloned.relations);
             let _custody = Arc::clone(&cloned.custody);
@@ -494,6 +505,6 @@ mod tests {
 
         // The original bag is still usable after the spawned thread
         // has dropped its clones.
-        let _ = Arc::clone(&state.catalogue);
+        let _ = state.current_catalogue();
     }
 }

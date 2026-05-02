@@ -59,7 +59,9 @@ use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use crate::persistence::{PersistedAdminEntry, PersistenceError, PersistenceStore};
+use crate::persistence::{
+    PersistedAdminEntry, PersistenceError, PersistenceStore,
+};
 use crate::relations::RelationKey;
 
 /// Kind of an admin action recorded in the ledger.
@@ -117,6 +119,16 @@ pub enum AdminLogKind {
     /// The entry's `target_relation` carries the relation key;
     /// `target_plugin` is `None`.
     RelationUnsuppress,
+    /// The admin issued a subject-grammar migration via the
+    /// `migrate_grammar_orphans` wire op. Records one row per
+    /// call regardless of how many subjects the call migrated;
+    /// per-subject claim_log entries written during the
+    /// migration carry the per-subject audit trail.
+    /// The entry's `target_subject` carries the call's
+    /// `migration_id` (correlation handle); `additional_subjects`
+    /// is empty; `reason` carries the operator-supplied
+    /// rationale.
+    SubjectTypeMigration,
 }
 
 /// A single admin action recorded in the ledger.
@@ -278,8 +290,7 @@ impl AdminLedger {
                 }
             }
         }
-        let mut g =
-            self.entries.lock().expect("admin ledger mutex poisoned");
+        let mut g = self.entries.lock().expect("admin ledger mutex poisoned");
         g.clear();
         g.extend(rehydrated);
         Ok(())
@@ -361,6 +372,7 @@ fn kind_to_str(kind: AdminLogKind) -> &'static str {
             "relation_suppression_reason_updated"
         }
         AdminLogKind::RelationUnsuppress => "relation_unsuppress",
+        AdminLogKind::SubjectTypeMigration => "subject_type_migration",
     }
 }
 
@@ -379,6 +391,7 @@ fn kind_from_str(s: &str) -> Option<AdminLogKind> {
             AdminLogKind::RelationSuppressionReasonUpdated
         }
         "relation_unsuppress" => AdminLogKind::RelationUnsuppress,
+        "subject_type_migration" => AdminLogKind::SubjectTypeMigration,
         _ => return None,
     })
 }
@@ -400,7 +413,10 @@ fn ms_to_system_time(ms: u64) -> SystemTime {
 fn persisted_admin_entry_from(entry: &AdminLogEntry) -> PersistedAdminEntry {
     let mut payload = serde_json::Map::new();
     if let Some(s) = entry.target_subject.as_ref() {
-        payload.insert("target_subject".into(), serde_json::Value::String(s.clone()));
+        payload.insert(
+            "target_subject".into(),
+            serde_json::Value::String(s.clone()),
+        );
     }
     if let Some(addr) = entry.target_addressing.as_ref() {
         payload.insert(
@@ -695,9 +711,15 @@ mod tests {
         assert_eq!(rows[0].kind, "subject_merge");
         assert_eq!(rows[0].admin_plugin, "admin.plugin");
         assert!(rows[0].target_claimant.is_none());
-        assert_eq!(rows[0].reason.as_deref(), Some("operator confirmed identity"));
         assert_eq!(
-            rows[0].payload.get("target_subject").and_then(|v| v.as_str()),
+            rows[0].reason.as_deref(),
+            Some("operator confirmed identity")
+        );
+        assert_eq!(
+            rows[0]
+                .payload
+                .get("target_subject")
+                .and_then(|v| v.as_str()),
             Some("new-id")
         );
         assert_eq!(

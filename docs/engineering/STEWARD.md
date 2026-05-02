@@ -34,7 +34,7 @@ The steward's charter, in order of foundational-to-operational:
 8. Emit happenings for custody transitions on a bus any interested party can subscribe to.
 9. On shutdown: drive every admitted plugin through unload. Release resources. Remove the socket.
 
-These nine are fully implemented. The subject identity slice (subjects, addressings, aliases, the claim log), the durable happenings log, and the pending-conflicts table are persisted to SQLite at `/var/lib/evo/state/evo.db` via write-through on every state-changing operation; the persisted rows serve the boot-time orphan diagnostic, the replay-window check on `subscribe_happenings`, and forensic queries. Boot-time rehydration of the in-memory subject registry from those rows is the next slice of persistence work; until it ships, a steward restart re-discovers subjects through normal plugin announcement. Relation, custody, and admin durability also remain on the roadmap (section 12.3). Concepts from `CONCEPT.md` section 2 not part of the current build: appointments and watches.
+These nine are fully implemented. The subject identity slice (subjects, addressings, aliases, the claim log), the durable happenings log, the pending-conflicts table, the relation graph, the custody ledger, the admin ledger, the installed-plugins enable bit, the per-pair reconciliation last-known-good, and the pending-grammar-orphans operator state are all persisted to SQLite at `/var/lib/evo/state/evo.db` via write-through on every state-changing operation. Boot-time rehydration reconstructs the in-memory registries (subjects + addressings + aliases, relations, custodies, admin log, reconciliation pairs) from the persisted rows so a steward restart preserves every active claim, custody session, and operator state without depending on plugin re-announcement. The two condition / time-driven instruction primitives — appointments (`AppointmentRuntime`) and watches (`WatchRuntime`) — both ship in this build, alongside plugin-initiated user-interaction routing (`PromptLedger`) and the operator-issued subject-grammar migration verbs.
 
 ## 3. Process Model
 
@@ -390,7 +390,12 @@ Since this document was first authored the following capabilities have shipped: 
 
 ### 12.1 Appointments and Watches
 
-Time-originated and condition-originated producers that feed instructions into the steward as if from outside. Needed for alarm clocks, sleep timers, automations, and condition-driven behaviours (e.g. "when networking goes up, mount NAS shares"). Not present today.
+Time-originated and condition-originated producers that feed instructions into the steward as if from outside. Both ship in this build:
+
+- **Appointments.** `AppointmentRuntime` runs a per-steward scheduler loop that holds a `notify` / bus / `sleep_until` `tokio::select!` across pending entries, dispatches matched fires through `PluginRouter::handle_request`, and re-arms the OS RTC wake hook (when a distribution provides one) on every transition. Recurrence covers `OneShot` / `Daily` / `Weekdays` / `Weekends` / `Weekly` / `Monthly` / `Yearly` with DST-aware Local timezone arithmetic; `Untrusted` clock state defers dispatch under the per-appointment miss policy. Plugins schedule via `LoadContext::appointments` under `capabilities.appointments`; operators reach the runtime over the wire under `appointments_admin` (see `CLIENT_API.md` §4.15).
+- **Watches.** `WatchRuntime` subscribes to the framework happenings bus once and walks every active watch's condition tree against each event. `HappeningMatch` and `Composite` over `HappeningMatch` evaluate fully; `SubjectState` predicates parse and persist but do not yet evaluate (the projection-engine integration is not wired through the watch path in this release). Edge / Level triggers (level requires `cooldown_ms >= 1000`); per-watch evaluation throttle (1000/s default) prevents action storm under runaway sensors. Plugins schedule via `LoadContext::watches` under `capabilities.watches`; operators reach the runtime over the wire under `watches_admin` (see `CLIENT_API.md` §4.16).
+
+Both runtimes are constructed before admission walks the catalogue, so plugins admitted at boot with the relevant capability flags see populated trait handles on their `LoadContext` at load time.
 
 ### 12.2 Happenings Subscription Enrichment
 
@@ -403,9 +408,9 @@ The `subscribe_happenings` op streams every happening from the bus to external c
 
 See `HAPPENINGS.md` section 11 for the full list of enrichment items and design rationales.
 
-### 12.3 Relation, Custody, and Admin Ledger Persistence
+### 12.3 Persistence Status
 
-The subject identity slice (`subjects`, `subject_addressings`, `aliases`, `claim_log`), the durable happenings log, and the pending-conflicts table are persisted to SQLite at `/var/lib/evo/state/evo.db` (`PERSISTENCE.md` and the `001_initial.sql` / `002_happenings.sql` / `003_meta.sql` / `004_pending_conflicts.sql` migrations). The relation graph, the custody ledger, and the admin ledger run in memory today; SQLite-backed durability for those three stores is the next piece of the persistence work and lands in the same database file under additional migrations. The chosen boundary is steward-owned SQLite, not plugin-owned state — plugins continue to keep their own state under `/var/lib/evo/plugins/<name>/state/` for their own purposes.
+Every steward-owned authoritative store is persisted to SQLite at `/var/lib/evo/state/evo.db`. The schema reaches version 11 in this release; `PERSISTENCE.md` §7.5 carries the per-migration table. Migrations 001–011 add: subject identity slice, durable happenings log, steward meta (instance_id), pending conflicts, ordered live-subject covering index, admin log, custody ledger, relation graph, installed-plugins enable bit, per-pair reconciliation last-known-good, and pending grammar orphans (operator-visible record of orphan types and any migration / acceptance decisions). Boot rehydration reconstructs every in-memory store from the persisted rows. The chosen boundary is steward-owned SQLite, not plugin-owned state — plugins continue to keep their own state under `/var/lib/evo/plugins/<name>/state/` for their own purposes.
 
 ### 12.4 Shape Version Enforcement
 
@@ -419,13 +424,13 @@ Structural queries (`get_projection(rack = "audio")`) are documented in `PROJECT
 
 ### 12.6 Fast Path
 
-The real-time mutation channel for parameter changes, transport commands, and volume - see `FAST_PATH.md`. Two halves:
+The real-time mutation channel for parameter changes, transport commands, and volume — see `FAST_PATH.md`. Both halves ship in this build.
 
-**Plugin-wire half (steward → warden):** implemented today. `PluginRouter::course_correct(handle, CourseCorrection)` dispatches a budget-bounded course-correction to the warden holding the relevant custody, with the budget drawn from the manifest's `capabilities.warden.course_correction_budget_ms`. Custody-failure-mode honoured (`abort` vs `partial_ok`) with differential ledger transitions and `Happening::CustodyAborted` / `CustodyDegraded` audit. This is the steward-side mechanism `FAST_PATH.md` §3 maps to: a fast-path command IS a warden course-correction.
+**Plugin-wire half (steward → warden):** `PluginRouter::course_correct_fast(handle, verb, payload, deadline_ms)` dispatches a budget-bounded course-correction to the warden holding the relevant custody. Per-warden Fast Path budget defaults to 50 ms (manifest-declared up to 200 ms via `[capabilities.warden] fast_path_budget_ms`). Verb eligibility is gated by `[capabilities.warden] fast_path_verbs` on the target warden's manifest; verbs not on that list refuse with `not_fast_path_eligible`. Custody-failure-mode honoured (`abort` vs `partial_ok`) with differential ledger transitions and `Happening::CustodyAborted` / `CustodyDegraded` audit.
 
-**Client-wire half (consumer → steward):** on the roadmap. Today's client-facing socket exposes only the slow path: a consumer sending "play" or "set volume" to a warden issues `op = "request"` against the warden's shelf, which the steward dispatches via `forward_plugin_request`. A dedicated client-side fast-path verb (consumer issues a single low-latency frame, steward routes directly to the warden's `course_correct` rather than `handle_request`) lands in a later release.
+**Client-wire half (consumer → steward):** a second Unix-domain socket at `/run/evo/fast.sock` accepts Fast Path frames alongside the slow-path control socket. Distributions opt in via `[server] enable_fast_path = true`. Connections must negotiate the `fast_path_admin` capability before dispatching frames; refusals carry stable subclass tokens (`fast_path_admin_not_granted`, `not_fast_path_eligible`, `fast_path_budget_exceeded`, `shelf_not_admitted`, `shelf_unloaded`, `shelf_not_warden`).
 
-Until the client-side verb lands, consumers wanting course-correction semantics issue the warden-defined slow-path request. The latency profile is single-millisecond range for an in-process plugin and low-ms for an out-of-process plugin via Unix socket — adequate for typical UI control surfaces, not adequate for the audio-frame-deadline shape `FAST_PATH.md` §1 names.
+**SDK-side helper:** plugins originating Fast Path frames against another warden declare `[capabilities] fast_path = true`; their `LoadContext::fast_path_dispatcher` is populated with a router-backed `FastPathDispatcher`. See `PLUGIN_CONTRACT.md` §5.4.
 
 ### 12.7 Factory Plugins
 
@@ -433,7 +438,9 @@ Factory plugins produce variable instances over time (USB drives appearing, peer
 
 ### 12.8 User Interaction Routing
 
-Plugins can request user-facing prompts through `LoadContext::user_interaction_requester`. The steward logs these today. Target behaviour: route to a kiosk plugin if one is admitted, or to a remote UI via the client-facing socket.
+Plugins request user-facing prompts through `LoadContext::user_interaction_requester`. The steward parks the request on the `PromptLedger` and routes it to the consumer connection holding the negotiated `user_interaction_responder` capability (single-claimer; first-claimer-wins; an RAII guard releases the claim when the connection closes). The responder consumer sees `Open` prompts via `subscribe_user_interactions` (live updates ride the existing `subscribe_subject` infrastructure since each prompt is a subject under the synthetic `evo-prompt` scheme) and answers via `answer_user_interaction` or `cancel_user_interaction`. The plugin's awaiting future resolves when the consumer responds (or with `PromptOutcome::Cancelled` on cancel / disconnect / timeout).
+
+Ten typed `PromptType` variants cover credentials, single / multi select, multi-field forms, external redirects, date / time pickers, and a freeform escape hatch. Per-prompt timeout defaults to 60 seconds (max 24 hours). A future kiosk-plugin path (route to a designated consumer plugin rather than to the operator's terminal) reuses the same surface — the responder capability is one negotiable axis, not a hard binding to a specific consumer.
 
 ### 12.9 Plugin Discovery
 

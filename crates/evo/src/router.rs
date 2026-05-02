@@ -102,6 +102,8 @@ use evo_plugin_sdk::contract::{
 use tokio::process::Child;
 use tokio::sync::Mutex as AsyncMutex;
 
+use arc_swap::ArcSwap;
+
 use crate::admission::AdmittedHandle;
 use crate::custody::LedgerCustodyStateReporter;
 use crate::error::StewardError;
@@ -134,8 +136,23 @@ pub struct PluginEntry {
     pub child: AsyncMutex<Option<Child>>,
     /// Manifest-derived enforcement policy consulted on every
     /// dispatch through this entry. Built from the manifest at
-    /// admission time, never mutated after.
-    pub policy: EnforcementPolicy,
+    /// admission time and replaced by operator-issued
+    /// reload-manifest calls. Wrapped in [`ArcSwap`] so dispatch
+    /// reads stay lock-free while reload writes swap atomically.
+    /// Use [`Self::load_policy`] for ergonomic access.
+    pub policy: ArcSwap<EnforcementPolicy>,
+    /// Full manifest that admitted this plugin. Held as `Arc` so
+    /// dispatch never pays a clone cost. The admission engine's
+    /// `reload_plugin` API reads `lifecycle.hot_reload` from here
+    /// (in-process plugins have no disk source); admin /
+    /// introspection paths surface its other fields without
+    /// rereading from disk. `None` for legacy entries built via
+    /// [`Self::new`] (test fixtures); admission entry points
+    /// always populate it. Wrapped in a mutex so reload-manifest
+    /// can swap the manifest at runtime; dispatch never reads
+    /// this field.
+    pub manifest:
+        std::sync::Mutex<Option<Arc<evo_plugin_sdk::manifest::Manifest>>>,
 }
 
 /// Manifest-derived enforcement state attached to every admitted
@@ -170,6 +187,17 @@ pub struct EnforcementPolicy {
     /// [`Self::custody_failure_mode`] for the operator's
     /// reaction.
     pub course_correction_deadline_ms: Option<u32>,
+    /// `Some(verbs)` for wardens that declared
+    /// `capabilities.warden.course_correct_verbs` in their
+    /// manifest — the verbs the warden's `course_correct`
+    /// accepts. `None` for legacy wardens that omitted the
+    /// field; the router does not gate them and the warden's
+    /// own implementation handles unknown verbs. Empty
+    /// `Some(vec![])` is rejected at manifest validation; this
+    /// field is therefore either `None` or a non-empty vec.
+    /// Parallel in shape to [`Self::allowed_request_types`] for
+    /// respondents.
+    pub allowed_course_correct_verbs: Option<Vec<String>>,
     /// Behaviour when a custody operation fails or its budget is
     /// exceeded. Drawn from
     /// `capabilities.warden.custody_failure_mode`. Today the
@@ -179,31 +207,75 @@ pub struct EnforcementPolicy {
     /// consistently.
     pub custody_failure_mode:
         Option<evo_plugin_sdk::manifest::CustodyFailureMode>,
+    /// `Some(verbs)` for wardens that declared
+    /// `capabilities.warden.fast_path_verbs` in their manifest —
+    /// the verbs the warden serves on the Fast Path channel
+    /// (subset of `allowed_course_correct_verbs`). `None` for
+    /// wardens that did not opt in; calls against them on Fast
+    /// Path refuse with `not_found / not_fast_path_eligible`.
+    /// Empty `Some(vec![])` is rejected at manifest validation;
+    /// this field is therefore either `None` or a non-empty vec.
+    pub allowed_fast_path_verbs: Option<Vec<String>>,
+    /// Per-warden Fast Path dispatch budget in milliseconds.
+    /// `None` for wardens that did not declare
+    /// `capabilities.warden.fast_path_budget_ms`; the dispatcher
+    /// applies [`evo_plugin_sdk::manifest::FAST_PATH_BUDGET_MS_DEFAULT`]
+    /// as the implicit value at call time. Values declared above
+    /// [`evo_plugin_sdk::manifest::FAST_PATH_BUDGET_MS_MAX`] are
+    /// clamped here at admission with a warning trace; the
+    /// resulting `Some(u32)` is always in the allowed range.
+    pub fast_path_budget_ms: Option<u32>,
+    /// Per-verb Fast Path coalesce windows in milliseconds.
+    /// `None` (or missing keys) means no coalescing for the
+    /// corresponding verb. Used by the dispatcher to debounce
+    /// rapid-fire Fast Path frames for the same verb (a touch
+    /// slider emitting 1000 Hz volume changes coalesces to one
+    /// dispatch every 20 ms when this map declares
+    /// `volume_set = 20`).
+    pub fast_path_coalesce_ms: Option<std::collections::BTreeMap<String, u32>>,
 }
 
 impl EnforcementPolicy {
     /// Empty policy: no allowed-types restriction, no default
     /// deadline. Used for test fixtures that don't carry a real
-    /// manifest.
+    /// manifest. Identical to [`Default::default`] — see the
+    /// `Default` impl below for the canonical entry point in
+    /// struct-update expressions like
+    /// `EnforcementPolicy { allowed_request_types: ..., ..Default::default() }`.
     pub fn permissive() -> Self {
         Self {
             allowed_request_types: None,
             default_request_deadline_ms: None,
             course_correction_deadline_ms: None,
             custody_failure_mode: None,
+            allowed_course_correct_verbs: None,
+            allowed_fast_path_verbs: None,
+            fast_path_budget_ms: None,
+            fast_path_coalesce_ms: None,
         }
     }
 
     /// Build the policy from a manifest. Inspects the
     /// kind-specific capabilities sub-table and pulls the
-    /// enforcement-relevant fields.
+    /// enforcement-relevant fields. Fast Path budget values
+    /// declared above [`evo_plugin_sdk::manifest::FAST_PATH_BUDGET_MS_MAX`]
+    /// are clamped here with a warning trace; the resulting
+    /// policy always carries a value within the framework's
+    /// allowed range, so dispatch-time enforcement does not need
+    /// to repeat the clamp.
     pub fn from_manifest(
         manifest: &evo_plugin_sdk::manifest::Manifest,
     ) -> Self {
+        use evo_plugin_sdk::manifest::FAST_PATH_BUDGET_MS_MAX;
+
         let mut allowed_request_types = None;
         let mut default_request_deadline_ms = None;
         let mut course_correction_deadline_ms = None;
         let mut custody_failure_mode = None;
+        let mut allowed_course_correct_verbs = None;
+        let mut allowed_fast_path_verbs = None;
+        let mut fast_path_budget_ms = None;
+        let mut fast_path_coalesce_ms = None;
         if let Some(r) = manifest.capabilities.respondent.as_ref() {
             allowed_request_types = Some(r.request_types.clone());
             default_request_deadline_ms = Some(r.response_budget_ms);
@@ -211,13 +283,63 @@ impl EnforcementPolicy {
         if let Some(w) = manifest.capabilities.warden.as_ref() {
             course_correction_deadline_ms = Some(w.course_correction_budget_ms);
             custody_failure_mode = Some(w.custody_failure_mode);
+            allowed_course_correct_verbs = w.course_correct_verbs.clone();
+            allowed_fast_path_verbs = w.fast_path_verbs.clone();
+            fast_path_budget_ms = w.fast_path_budget_ms.map(|raw| {
+                if raw > FAST_PATH_BUDGET_MS_MAX {
+                    tracing::warn!(
+                        plugin = %manifest.plugin.name,
+                        declared_ms = raw,
+                        clamped_ms = FAST_PATH_BUDGET_MS_MAX,
+                        "fast_path_budget_ms exceeds framework maximum; \
+                         clamping at admission"
+                    );
+                    FAST_PATH_BUDGET_MS_MAX
+                } else {
+                    raw
+                }
+            });
+            fast_path_coalesce_ms = w.fast_path_coalesce_ms.clone();
         }
         Self {
             allowed_request_types,
             default_request_deadline_ms,
             course_correction_deadline_ms,
             custody_failure_mode,
+            allowed_course_correct_verbs,
+            allowed_fast_path_verbs,
+            fast_path_budget_ms,
+            fast_path_coalesce_ms,
         }
+    }
+
+    /// True when this warden is reachable on the Fast Path
+    /// channel for any verb. Equivalent to
+    /// `self.allowed_fast_path_verbs.is_some()`; surfaced as a
+    /// named predicate so dispatch-time call sites read clearly.
+    pub fn is_fast_path_eligible(&self) -> bool {
+        self.allowed_fast_path_verbs.is_some()
+    }
+
+    /// True when this warden serves the named verb on the Fast
+    /// Path channel. Refuses both wardens that did not opt in
+    /// (`allowed_fast_path_verbs == None`) and wardens that opted
+    /// in for a different verb set.
+    pub fn allows_fast_path_verb(&self, verb: &str) -> bool {
+        self.allowed_fast_path_verbs
+            .as_ref()
+            .is_some_and(|verbs| verbs.iter().any(|v| v == verb))
+    }
+}
+
+impl Default for EnforcementPolicy {
+    /// The default policy is the permissive one: no allowed-
+    /// types restriction, no default deadline, no Fast Path
+    /// declarations. Pinned via [`Self::permissive`] so callers
+    /// can express partial fixtures via struct-update syntax:
+    /// `EnforcementPolicy { allowed_request_types: ..., ..Default::default() }`.
+    fn default() -> Self {
+        Self::permissive()
     }
 }
 
@@ -236,7 +358,9 @@ impl PluginEntry {
     }
 
     /// Construct an entry with a manifest-derived enforcement
-    /// policy.
+    /// policy. The manifest field is populated separately via
+    /// [`Self::with_manifest`] by admission paths that hold the
+    /// full manifest (every admit_* entry point).
     pub fn new_with_policy(
         name: String,
         shelf: String,
@@ -248,8 +372,43 @@ impl PluginEntry {
             shelf,
             handle: AsyncMutex::new(Some(handle)),
             child: AsyncMutex::new(None),
-            policy,
+            policy: ArcSwap::from_pointee(policy),
+            manifest: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Builder-style setter for the full manifest. Admission
+    /// paths call this to attach the manifest the entry was
+    /// admitted from, supporting later introspection and reload
+    /// without disk I/O.
+    pub fn with_manifest(
+        self,
+        manifest: Arc<evo_plugin_sdk::manifest::Manifest>,
+    ) -> Self {
+        *self.manifest.lock().expect("manifest mutex poisoned") =
+            Some(manifest);
+        self
+    }
+
+    /// Load a snapshot of the current enforcement policy. Cheap
+    /// (an `Arc` clone via the underlying [`ArcSwap`]); callers
+    /// hold the snapshot for the duration of one dispatch and
+    /// see a consistent policy even if a concurrent
+    /// reload-manifest swaps it mid-call.
+    pub fn load_policy(&self) -> Arc<EnforcementPolicy> {
+        self.policy.load_full()
+    }
+
+    /// Snapshot of the current manifest, if any. Cloning the
+    /// `Arc` is cheap; callers hold the snapshot for as long as
+    /// they need it.
+    pub fn current_manifest(
+        &self,
+    ) -> Option<Arc<evo_plugin_sdk::manifest::Manifest>> {
+        self.manifest
+            .lock()
+            .expect("manifest mutex poisoned")
+            .clone()
     }
 }
 
@@ -484,6 +643,25 @@ impl PluginRouter {
         Some(entry)
     }
 
+    /// Atomically replace the entry on `shelf` with `entry`,
+    /// returning the previous occupant. Used by the OOP live-reload
+    /// path: a freshly-loaded plugin process takes over the shelf
+    /// in a single write-lock acquisition, with no observable
+    /// "no plugin on shelf" gap between the old and new entries.
+    /// `entry`'s shelf must equal `shelf`; the admission order
+    /// records the new entry in the old one's slot rather than
+    /// re-pushing it to the tail (preserving the relative ordering
+    /// for shutdown).
+    pub fn replace_in_place(
+        &self,
+        shelf: &str,
+        entry: Arc<PluginEntry>,
+    ) -> Option<Arc<PluginEntry>> {
+        debug_assert_eq!(entry.shelf, shelf, "replace shelf mismatch");
+        let mut inner = self.inner.write().expect("router inner poisoned");
+        inner.by_shelf.insert(shelf.to_string(), entry)
+    }
+
     /// Drain the routing table, returning every admitted plugin
     /// entry in **reverse** admission order (LIFO). Used by
     /// [`AdmissionEngine::shutdown`](crate::admission::AdmissionEngine::shutdown)
@@ -515,12 +693,18 @@ impl PluginRouter {
             StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
         })?;
 
+        // Snapshot the current enforcement policy for the duration
+        // of this dispatch; reload_manifest may swap the policy
+        // concurrently, but each in-flight call sees a consistent
+        // view.
+        let policy = entry.load_policy();
+
         // Enforce manifest-declared `request_types`.
         // A respondent with a declared list refuses every request
         // whose `request_type` is not in the list. Wardens have no
         // list (the field is respondent-specific); their handler
         // refusal lives in the AdmittedHandle::Warden arm below.
-        if let Some(allowed) = entry.policy.allowed_request_types.as_ref() {
+        if let Some(allowed) = policy.allowed_request_types.as_ref() {
             if !allowed.iter().any(|t| t == &request.request_type) {
                 return Err(StewardError::Dispatch(format!(
                     "plugin on shelf {shelf} did not declare \
@@ -535,7 +719,7 @@ impl PluginRouter {
         // when the caller did not supply one. Plugins that want to
         // override per-call still can; this only fills in `None`.
         if request.deadline.is_none() {
-            if let Some(ms) = entry.policy.default_request_deadline_ms {
+            if let Some(ms) = policy.default_request_deadline_ms {
                 request.deadline =
                     Some(Instant::now() + Duration::from_millis(u64::from(ms)));
             }
@@ -689,26 +873,182 @@ impl PluginRouter {
         correction_type: String,
         payload: Vec<u8>,
     ) -> Result<(), StewardError> {
-        let ledger = Arc::clone(&self.state.custody);
-        let bus = Arc::clone(&self.state.bus);
+        let entry = self.lookup(shelf).ok_or_else(|| {
+            StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
+        })?;
+
+        let policy = entry.load_policy();
+
+        // Enforce manifest-declared `course_correct_verbs`.
+        // Parallel to the respondent gate at `handle_request`: a
+        // warden with a declared verb list refuses every
+        // course_correct whose `correction_type` is not in the
+        // list. Wardens that omitted the field
+        // (`None`) — typically older plugins authored before
+        // course_correct_verbs existed — pass through; their own
+        // implementation handles unknown verbs.
+        if let Some(allowed) = policy.allowed_course_correct_verbs.as_ref() {
+            if !allowed.iter().any(|t| t == &correction_type) {
+                return Err(StewardError::Dispatch(format!(
+                    "warden on shelf {shelf} did not declare \
+                     course_correct verb \"{}\" in its manifest \
+                     (declared: {:?})",
+                    correction_type, allowed
+                )));
+            }
+        }
+
+        let correction = CourseCorrection {
+            correction_type,
+            payload,
+            correlation_id: self
+                .custody_cid_counter
+                .fetch_add(1, Ordering::Relaxed),
+        };
+
+        self.dispatch_correction_to_warden(
+            shelf,
+            &entry,
+            handle,
+            correction,
+            policy.course_correction_deadline_ms,
+            policy.custody_failure_mode,
+            "course_correct",
+        )
+        .await
+    }
+
+    /// Fast Path-flavoured course_correct dispatch. Mirrors
+    /// [`Self::course_correct`] but applies the warden's Fast
+    /// Path budget (defaulted to
+    /// [`evo_plugin_sdk::manifest::FAST_PATH_BUDGET_MS_DEFAULT`]
+    /// when the manifest leaves it unset) and an additional
+    /// per-warden verb gate against
+    /// [`EnforcementPolicy::allows_fast_path_verb`].
+    ///
+    /// Refusal subclasses surface in the [`StewardError::Dispatch`]
+    /// message so callers (the Fast Path wire dispatcher in
+    /// [`crate::fast_path`]) can map them to structured wire
+    /// error frames:
+    ///
+    /// - `not_fast_path_eligible`: warden does not declare any
+    ///   Fast Path verbs (`allowed_fast_path_verbs == None`) or
+    ///   the named verb is not in its declared set.
+    /// - `fast_path_budget_exceeded`: dispatch deadline expired.
+    ///
+    /// `frame_deadline_ms` allows a per-frame override (the
+    /// effective deadline is `min(declared_budget,
+    /// frame_deadline_ms)` when both are present). Per-warden
+    /// serialisation is preserved: the dispatch goes through the
+    /// same per-entry mutex as slow-path course_correct, so the
+    /// "one mutation in flight per warden" invariant survives
+    /// Fast Path. Head-of-queue priority over slow-path waiters
+    /// is documented in the design but not yet implemented; the
+    /// existing tokio mutex is FIFO-fair, so a Fast Path arrival
+    /// waits behind any slow-path call already in queue.
+    pub async fn course_correct_fast(
+        &self,
+        shelf: &str,
+        handle: &CustodyHandle,
+        correction_type: String,
+        payload: Vec<u8>,
+        frame_deadline_ms: Option<u32>,
+    ) -> Result<(), StewardError> {
+        use evo_plugin_sdk::manifest::FAST_PATH_BUDGET_MS_DEFAULT;
 
         let entry = self.lookup(shelf).ok_or_else(|| {
             StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
         })?;
 
-        let plugin_name = entry.name.clone();
-        let shelf_qualified = entry.shelf.clone();
+        let policy = entry.load_policy();
 
-        let correlation_id =
-            self.custody_cid_counter.fetch_add(1, Ordering::Relaxed);
+        // Fast Path verb gate. Refuses when the warden did not
+        // opt into Fast Path at all OR opted in for a different
+        // verb set. The error message carries the
+        // `not_fast_path_eligible` subclass token so the wire
+        // dispatcher can lift it into a structured refusal.
+        if !policy.allows_fast_path_verb(&correction_type) {
+            return Err(StewardError::Dispatch(format!(
+                "fast_path:not_fast_path_eligible: warden on shelf \
+                 {shelf} does not serve verb \"{}\" on the Fast Path \
+                 channel (declared fast_path_verbs: {:?})",
+                correction_type, policy.allowed_fast_path_verbs
+            )));
+        }
+
+        // Slow-path verb gate. The manifest validator pins
+        // `fast_path_verbs ⊆ course_correct_verbs`, so a verb
+        // that passed the Fast Path gate also passes this one;
+        // the check stays here as defence-in-depth against a
+        // future bug in the validator.
+        if let Some(allowed) = policy.allowed_course_correct_verbs.as_ref() {
+            if !allowed.iter().any(|t| t == &correction_type) {
+                return Err(StewardError::Dispatch(format!(
+                    "warden on shelf {shelf} did not declare \
+                     course_correct verb \"{}\" in its manifest \
+                     (declared: {:?}); subset rule violated",
+                    correction_type, allowed
+                )));
+            }
+        }
+
+        // Effective Fast Path deadline = min(declared_budget,
+        // frame_deadline). Declared budget defaults to the
+        // framework constant when the manifest left it unset;
+        // values above the framework max have already been
+        // clamped at admission so the budget is in range here.
+        let declared_budget = policy
+            .fast_path_budget_ms
+            .unwrap_or(FAST_PATH_BUDGET_MS_DEFAULT);
+        let effective_deadline_ms = match frame_deadline_ms {
+            Some(frame) => Some(declared_budget.min(frame)),
+            None => Some(declared_budget),
+        };
+
         let correction = CourseCorrection {
             correction_type,
             payload,
-            correlation_id,
+            correlation_id: self
+                .custody_cid_counter
+                .fetch_add(1, Ordering::Relaxed),
         };
 
-        let deadline_ms = entry.policy.course_correction_deadline_ms;
-        let failure_mode = entry.policy.custody_failure_mode;
+        self.dispatch_correction_to_warden(
+            shelf,
+            &entry,
+            handle,
+            correction,
+            effective_deadline_ms,
+            policy.custody_failure_mode,
+            "fast_path:fast_path_budget_exceeded",
+        )
+        .await
+    }
+
+    /// Shared dispatch helper: acquires the per-entry handle
+    /// mutex, invokes the warden's `course_correct` with an
+    /// optional deadline, applies the declared
+    /// `custody_failure_mode` on failure, and returns the
+    /// underlying result. Callers are responsible for the
+    /// upstream verb-gate decisions and for choosing the
+    /// `timeout_label` that surfaces in budget-exceeded error
+    /// messages so consumers can distinguish slow-path from
+    /// Fast Path budget refusals.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_correction_to_warden(
+        &self,
+        shelf: &str,
+        entry: &Arc<PluginEntry>,
+        handle: &CustodyHandle,
+        correction: CourseCorrection,
+        deadline_ms: Option<u32>,
+        failure_mode: Option<evo_plugin_sdk::manifest::CustodyFailureMode>,
+        timeout_label: &str,
+    ) -> Result<(), StewardError> {
+        let ledger = Arc::clone(&self.state.custody);
+        let bus = Arc::clone(&self.state.bus);
+        let plugin_name = entry.name.clone();
+        let shelf_qualified = entry.shelf.clone();
 
         let mut handle_guard = entry.handle.lock().await;
         let admitted = handle_guard.as_mut().ok_or_else(|| {
@@ -737,8 +1077,9 @@ impl PluginRouter {
                 {
                     Ok(inner) => inner.map_err(StewardError::from),
                     Err(_) => Err(StewardError::Dispatch(format!(
-                        "course_correct on shelf {shelf} exceeded budget \
-                         {ms} ms; custody_failure_mode = {}",
+                        "{timeout_label}: dispatch on shelf {shelf} \
+                         exceeded budget {ms} ms; custody_failure_mode \
+                         = {}",
                         failure_mode
                             .map(|m| format!("{m:?}").to_lowercase())
                             .unwrap_or_else(|| "unspecified".to_string()),
@@ -751,7 +1092,7 @@ impl PluginRouter {
                 .map_err(Into::into),
         };
 
-        // Drop the per-entry lock before doing any further .await
+        // Drop the per-entry lock before any further .await
         // work (ledger mark + bus emit). The handle guard is no
         // longer needed; releasing it early keeps the per-entry
         // mutex contention discipline tight.
@@ -773,11 +1114,7 @@ impl PluginRouter {
             let happening = match failure_mode {
                 Some(CustodyFailureMode::PartialOk) => {
                     ledger
-                        .mark_degraded(
-                            &plugin_name,
-                            &handle.id,
-                            reason.clone(),
-                        )
+                        .mark_degraded(&plugin_name, &handle.id, reason.clone())
                         .await
                         .map_err(|e| {
                             StewardError::Dispatch(format!(
@@ -794,11 +1131,7 @@ impl PluginRouter {
                 }
                 Some(CustodyFailureMode::Abort) | None => {
                     ledger
-                        .mark_aborted(
-                            &plugin_name,
-                            &handle.id,
-                            reason.clone(),
-                        )
+                        .mark_aborted(&plugin_name, &handle.id, reason.clone())
                         .await
                         .map_err(|e| {
                             StewardError::Dispatch(format!(
@@ -969,6 +1302,7 @@ mod tests {
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec!["ping".into()],
+                        course_correct_verbs: vec![],
                         accepts_custody: false,
                         flags: Default::default(),
                     },
@@ -1030,6 +1364,7 @@ mod tests {
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec![],
+                        course_correct_verbs: vec![],
                         accepts_custody: true,
                         flags: Default::default(),
                     },
@@ -1134,6 +1469,25 @@ mod tests {
         Arc::new(PluginEntry::new(name.into(), shelf.into(), handle))
     }
 
+    fn warden_entry_with_policy(
+        name: &str,
+        shelf: &str,
+        plugin_name: &str,
+        policy: EnforcementPolicy,
+    ) -> Arc<PluginEntry> {
+        let w: Box<dyn ErasedWarden> =
+            Box::new(WardenAdapter::new(EchoWarden {
+                name: plugin_name.into(),
+            }));
+        let handle = AdmittedHandle::Warden(w);
+        Arc::new(PluginEntry::new_with_policy(
+            name.into(),
+            shelf.into(),
+            handle,
+            policy,
+        ))
+    }
+
     fn fresh_router() -> PluginRouter {
         PluginRouter::new(StewardState::for_tests())
     }
@@ -1227,6 +1581,8 @@ mod tests {
             default_request_deadline_ms: None,
             course_correction_deadline_ms: None,
             custody_failure_mode: None,
+            allowed_course_correct_verbs: None,
+            ..Default::default()
         };
         r.insert(respondent_entry_with_policy("p", "test.ping", "p", policy))
             .unwrap();
@@ -1260,6 +1616,8 @@ mod tests {
             default_request_deadline_ms: None,
             course_correction_deadline_ms: None,
             custody_failure_mode: None,
+            allowed_course_correct_verbs: None,
+            ..Default::default()
         };
         r.insert(respondent_entry_with_policy("p", "test.ping", "p", policy))
             .unwrap();
@@ -1274,6 +1632,113 @@ mod tests {
         };
         let resp = r.handle_request("test.ping", req).await.unwrap();
         assert_eq!(resp.payload, b"hi");
+    }
+
+    // -----------------------------------------------------------------
+    // Warden-side dispatch gate. Parallel to the respondent gate
+    // above: a warden with a declared `course_correct_verbs`
+    // list refuses every dispatch whose `correction_type` is not
+    // in the list. Wardens that omitted the field (legacy
+    // plugins) pass through unchanged.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn course_correct_refuses_undeclared_verb() {
+        let r = fresh_router();
+        let policy = EnforcementPolicy {
+            allowed_request_types: None,
+            default_request_deadline_ms: None,
+            course_correction_deadline_ms: None,
+            custody_failure_mode: None,
+            allowed_course_correct_verbs: Some(vec![
+                "set_volume".into(),
+                "pause".into(),
+            ]),
+            ..Default::default()
+        };
+        r.insert(warden_entry_with_policy("w", "test.custody", "w", policy))
+            .unwrap();
+
+        let handle = CustodyHandle::new("h-1");
+        let res = r
+            .course_correct(
+                "test.custody",
+                &handle,
+                "not_declared".into(),
+                vec![],
+            )
+            .await;
+        match res {
+            Err(StewardError::Dispatch(msg)) => {
+                assert!(
+                    msg.contains("not_declared")
+                        && msg.contains("did not declare"),
+                    "expected refusal naming the offending verb, got: {msg}"
+                );
+            }
+            other => panic!("expected Dispatch error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn course_correct_accepts_declared_verb() {
+        let r = fresh_router();
+        let policy = EnforcementPolicy {
+            allowed_request_types: None,
+            default_request_deadline_ms: None,
+            course_correction_deadline_ms: None,
+            custody_failure_mode: None,
+            allowed_course_correct_verbs: Some(vec!["set_volume".into()]),
+            ..Default::default()
+        };
+        r.insert(warden_entry_with_policy("w", "test.custody", "w", policy))
+            .unwrap();
+
+        let handle = CustodyHandle::new("h-1");
+        // EchoWarden's course_correct accepts any verb and
+        // returns Ok; the test confirms the gate passes the
+        // declared verb through.
+        let res = r
+            .course_correct(
+                "test.custody",
+                &handle,
+                "set_volume".into(),
+                b"7".to_vec(),
+            )
+            .await;
+        assert!(res.is_ok(), "declared verb must pass the gate; got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn course_correct_no_gate_when_verbs_unset() {
+        // Legacy plugins without a course_correct_verbs
+        // declaration pass every verb through to the warden's
+        // own implementation. The router does not gate.
+        let r = fresh_router();
+        let policy = EnforcementPolicy {
+            allowed_request_types: None,
+            default_request_deadline_ms: None,
+            course_correction_deadline_ms: None,
+            custody_failure_mode: None,
+            allowed_course_correct_verbs: None,
+            ..Default::default()
+        };
+        r.insert(warden_entry_with_policy("w", "test.custody", "w", policy))
+            .unwrap();
+
+        let handle = CustodyHandle::new("h-1");
+        let res = r
+            .course_correct(
+                "test.custody",
+                &handle,
+                "anything_at_all".into(),
+                vec![],
+            )
+            .await;
+        assert!(
+            res.is_ok(),
+            "no-gate warden must pass any verb through; got {res:?}"
+        );
     }
 
     #[tokio::test]
@@ -1298,6 +1763,7 @@ mod tests {
                         },
                         runtime_capabilities: RuntimeCapabilities {
                             request_types: vec!["ping".into()],
+                            course_correct_verbs: vec![],
                             accepts_custody: false,
                             flags: Default::default(),
                         },
@@ -1356,6 +1822,8 @@ mod tests {
             default_request_deadline_ms: Some(100),
             course_correction_deadline_ms: None,
             custody_failure_mode: None,
+            allowed_course_correct_verbs: None,
+            ..Default::default()
         };
         let entry = Arc::new(PluginEntry::new_with_policy(
             "p".into(),
@@ -1402,6 +1870,8 @@ mod tests {
             default_request_deadline_ms: Some(100),
             course_correction_deadline_ms: None,
             custody_failure_mode: None,
+            allowed_course_correct_verbs: None,
+            ..Default::default()
         };
         r.insert(respondent_entry_with_policy("p", "test.ping", "p", policy))
             .unwrap();
@@ -1589,6 +2059,7 @@ mod tests {
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec![],
+                        course_correct_verbs: vec![],
                         accepts_custody: true,
                         flags: Default::default(),
                     },
@@ -1678,6 +2149,8 @@ mod tests {
             default_request_deadline_ms: None,
             course_correction_deadline_ms: None,
             custody_failure_mode: Some(CustodyFailureMode::Abort),
+            allowed_course_correct_verbs: None,
+            ..Default::default()
         };
         r.insert(failing_warden_entry_with_policy(
             "w",
@@ -1763,6 +2236,8 @@ mod tests {
             default_request_deadline_ms: None,
             course_correction_deadline_ms: None,
             custody_failure_mode: Some(CustodyFailureMode::PartialOk),
+            allowed_course_correct_verbs: None,
+            ..Default::default()
         };
         r.insert(failing_warden_entry_with_policy(
             "w",
@@ -1858,6 +2333,7 @@ mod tests {
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec![],
+                        course_correct_verbs: vec![],
                         accepts_custody: true,
                         flags: Default::default(),
                     },
@@ -1948,6 +2424,8 @@ mod tests {
             default_request_deadline_ms: None,
             course_correction_deadline_ms: Some(50),
             custody_failure_mode: None,
+            allowed_course_correct_verbs: None,
+            ..Default::default()
         };
         r.insert(slow_warden_entry_with_policy(
             "w",
@@ -1994,6 +2472,410 @@ mod tests {
             other => panic!(
                 "expected CustodyAborted (default Abort), got: {other:?}"
             ),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // EnforcementPolicy Fast Path tests. Cover the from_manifest
+    // extraction, the budget clamp, and the predicate surface
+    // (`is_fast_path_eligible` / `allows_fast_path_verb`).
+    // -----------------------------------------------------------------
+
+    fn warden_manifest_with_fast_path(
+        verbs: &[&str],
+        budget_ms: Option<u32>,
+        coalesce: &[(&str, u32)],
+    ) -> evo_plugin_sdk::manifest::Manifest {
+        // Build a TOML manifest fragment and parse it: cheaper
+        // than reaching for every nested struct constructor and
+        // forward-compatible against future field additions on
+        // Manifest's nested types.
+        let verbs_list = verbs
+            .iter()
+            .map(|v| format!(r#""{v}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut toml = format!(
+            r#"
+[plugin]
+name = "com.example.warden"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "audio.transport"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "warden"
+
+[transport]
+type = "in-process"
+exec = "plugin.so"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "linux"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 64
+max_cpu_percent = 5
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = true
+restart_budget = 5
+
+[capabilities.warden]
+custody_domain = "audio"
+custody_exclusive = false
+course_correction_budget_ms = 100
+custody_failure_mode = "abort"
+course_correct_verbs = [{verbs_list}]
+"#
+        );
+        if !verbs.is_empty() {
+            toml.push_str(&format!("fast_path_verbs = [{verbs_list}]\n"));
+        }
+        if let Some(b) = budget_ms {
+            toml.push_str(&format!("fast_path_budget_ms = {b}\n"));
+        }
+        if !coalesce.is_empty() {
+            toml.push_str("\n[capabilities.warden.fast_path_coalesce_ms]\n");
+            for (v, w) in coalesce {
+                toml.push_str(&format!("{v} = {w}\n"));
+            }
+        }
+        evo_plugin_sdk::manifest::Manifest::from_toml(&toml)
+            .expect("warden_manifest_with_fast_path TOML must parse")
+    }
+
+    #[test]
+    fn enforcement_policy_extracts_fast_path_fields_from_manifest() {
+        let manifest = warden_manifest_with_fast_path(
+            &["volume_set", "mute"],
+            Some(75),
+            &[("volume_set", 20)],
+        );
+        let policy = EnforcementPolicy::from_manifest(&manifest);
+        assert_eq!(
+            policy.allowed_fast_path_verbs.as_deref(),
+            Some(["volume_set".to_string(), "mute".to_string()].as_slice())
+        );
+        assert_eq!(policy.fast_path_budget_ms, Some(75));
+        let coalesce = policy
+            .fast_path_coalesce_ms
+            .as_ref()
+            .expect("coalesce present");
+        assert_eq!(coalesce.get("volume_set"), Some(&20));
+        assert!(policy.is_fast_path_eligible());
+        assert!(policy.allows_fast_path_verb("volume_set"));
+        assert!(policy.allows_fast_path_verb("mute"));
+        assert!(!policy.allows_fast_path_verb("pause"));
+    }
+
+    #[test]
+    fn enforcement_policy_clamps_fast_path_budget_above_max() {
+        // Manifest declarations above FAST_PATH_BUDGET_MS_MAX
+        // should be clamped at admission with a warning trace
+        // rather than rejected outright. The framework's
+        // contract: a 5-second-budget warden cannot escape the
+        // latency-bounded channel by declaring a high number;
+        // it gets clamped to the framework's max.
+        use evo_plugin_sdk::manifest::FAST_PATH_BUDGET_MS_MAX;
+        let manifest =
+            warden_manifest_with_fast_path(&["volume_set"], Some(5_000), &[]);
+        let policy = EnforcementPolicy::from_manifest(&manifest);
+        assert_eq!(policy.fast_path_budget_ms, Some(FAST_PATH_BUDGET_MS_MAX));
+    }
+
+    #[test]
+    fn enforcement_policy_keeps_under_max_fast_path_budget_unchanged() {
+        let manifest =
+            warden_manifest_with_fast_path(&["volume_set"], Some(150), &[]);
+        let policy = EnforcementPolicy::from_manifest(&manifest);
+        assert_eq!(policy.fast_path_budget_ms, Some(150));
+    }
+
+    #[test]
+    fn enforcement_policy_default_is_permissive_with_no_fast_path() {
+        let p = EnforcementPolicy::default();
+        assert!(p.allowed_request_types.is_none());
+        assert!(p.allowed_fast_path_verbs.is_none());
+        assert!(p.fast_path_budget_ms.is_none());
+        assert!(p.fast_path_coalesce_ms.is_none());
+        assert!(!p.is_fast_path_eligible());
+        assert!(!p.allows_fast_path_verb("anything"));
+    }
+
+    #[test]
+    fn allows_fast_path_verb_refuses_non_eligible_warden() {
+        // A warden that did not opt into Fast Path
+        // (`allowed_fast_path_verbs == None`) refuses every
+        // verb, regardless of name.
+        let p = EnforcementPolicy {
+            allowed_course_correct_verbs: Some(vec!["volume_set".into()]),
+            ..Default::default()
+        };
+        assert!(!p.is_fast_path_eligible());
+        assert!(!p.allows_fast_path_verb("volume_set"));
+    }
+
+    // -----------------------------------------------------------------
+    // course_correct_fast dispatch tests. Cover the Fast Path-
+    // specific verb gate, budget application, and refusal subclass
+    // tokens the wire dispatcher classifies on.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn course_correct_fast_refuses_when_warden_not_fast_path_eligible() {
+        // Warden declares no Fast Path verbs at all
+        // (allowed_fast_path_verbs == None) — every Fast Path
+        // dispatch refuses with the not_fast_path_eligible
+        // subclass token.
+        let r = fresh_router();
+        let policy = EnforcementPolicy {
+            allowed_course_correct_verbs: Some(vec!["volume_set".into()]),
+            ..Default::default()
+        };
+        r.insert(warden_entry_with_policy("w", "test.audio", "w", policy))
+            .unwrap();
+
+        let handle = CustodyHandle::new("w");
+        let res = r
+            .course_correct_fast(
+                "test.audio",
+                &handle,
+                "volume_set".into(),
+                vec![],
+                None,
+            )
+            .await;
+        match res {
+            Err(StewardError::Dispatch(msg)) => {
+                assert!(
+                    msg.contains("fast_path:not_fast_path_eligible:"),
+                    "expected not_fast_path_eligible token; got: {msg}"
+                );
+            }
+            other => panic!("expected refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn course_correct_fast_refuses_undeclared_fast_path_verb() {
+        // Warden opts in to Fast Path for one verb; a different
+        // verb refuses with the not_fast_path_eligible subclass.
+        let r = fresh_router();
+        let policy = EnforcementPolicy {
+            allowed_course_correct_verbs: Some(vec![
+                "volume_set".into(),
+                "mute".into(),
+            ]),
+            allowed_fast_path_verbs: Some(vec!["volume_set".into()]),
+            fast_path_budget_ms: Some(50),
+            ..Default::default()
+        };
+        r.insert(warden_entry_with_policy("w", "test.audio", "w", policy))
+            .unwrap();
+
+        let handle = CustodyHandle::new("w");
+        let res = r
+            .course_correct_fast(
+                "test.audio",
+                &handle,
+                "mute".into(),
+                vec![],
+                None,
+            )
+            .await;
+        match res {
+            Err(StewardError::Dispatch(msg)) => {
+                assert!(
+                    msg.contains("fast_path:not_fast_path_eligible:"),
+                    "expected not_fast_path_eligible token; got: {msg}"
+                );
+                assert!(
+                    msg.contains("mute"),
+                    "expected the offending verb in the message; got: {msg}"
+                );
+            }
+            other => panic!("expected refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn course_correct_fast_dispatches_when_verb_eligible() {
+        let r = fresh_router();
+        let policy = EnforcementPolicy {
+            allowed_course_correct_verbs: Some(vec!["volume_set".into()]),
+            allowed_fast_path_verbs: Some(vec!["volume_set".into()]),
+            fast_path_budget_ms: Some(50),
+            ..Default::default()
+        };
+        r.insert(warden_entry_with_policy("w", "test.audio", "w", policy))
+            .unwrap();
+
+        let handle = CustodyHandle::new("w");
+        r.course_correct_fast(
+            "test.audio",
+            &handle,
+            "volume_set".into(),
+            vec![1, 2, 3],
+            None,
+        )
+        .await
+        .expect("Fast Path dispatch must succeed for an eligible verb");
+    }
+
+    #[tokio::test]
+    async fn course_correct_fast_emits_budget_exceeded_subclass_on_timeout() {
+        // SlowWarden sleeps longer than the declared Fast Path
+        // budget; the dispatcher must time out and surface the
+        // fast_path_budget_exceeded subclass token.
+        let r = fresh_router();
+        let policy = EnforcementPolicy {
+            allowed_course_correct_verbs: Some(vec!["v".into()]),
+            allowed_fast_path_verbs: Some(vec!["v".into()]),
+            fast_path_budget_ms: Some(20),
+            ..Default::default()
+        };
+        r.insert(slow_warden_entry_with_policy(
+            "slow",
+            "test.slow",
+            "slow",
+            Duration::from_millis(500),
+            policy,
+        ))
+        .unwrap();
+
+        let handle = CustodyHandle::new("slow");
+        let res = r
+            .course_correct_fast("test.slow", &handle, "v".into(), vec![], None)
+            .await;
+        match res {
+            Err(StewardError::Dispatch(msg)) => {
+                assert!(
+                    msg.contains("fast_path:fast_path_budget_exceeded:"),
+                    "expected fast_path_budget_exceeded token; got: {msg}"
+                );
+            }
+            other => panic!("expected timeout refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn course_correct_fast_uses_smaller_of_declared_and_frame_deadline() {
+        // Frame deadline 5 ms is tighter than declared budget
+        // 50 ms; dispatch should time out at 5 ms.
+        let r = fresh_router();
+        let policy = EnforcementPolicy {
+            allowed_course_correct_verbs: Some(vec!["v".into()]),
+            allowed_fast_path_verbs: Some(vec!["v".into()]),
+            fast_path_budget_ms: Some(50),
+            ..Default::default()
+        };
+        r.insert(slow_warden_entry_with_policy(
+            "slow",
+            "test.slow",
+            "slow",
+            Duration::from_millis(100),
+            policy,
+        ))
+        .unwrap();
+
+        let handle = CustodyHandle::new("slow");
+        let start = std::time::Instant::now();
+        let res = r
+            .course_correct_fast(
+                "test.slow",
+                &handle,
+                "v".into(),
+                vec![],
+                Some(5),
+            )
+            .await;
+        let elapsed = start.elapsed();
+        assert!(
+            res.is_err(),
+            "frame deadline 5ms should timeout the slow warden"
+        );
+        // Sanity: the timeout fired well before the warden's
+        // 100ms sleep would have completed. Allow generous
+        // headroom (50ms) for scheduler jitter.
+        assert!(
+            elapsed.as_millis() < 50,
+            "frame deadline (5ms) should clamp dispatch; saw {} ms",
+            elapsed.as_millis()
+        );
+    }
+
+    #[tokio::test]
+    async fn course_correct_fast_refuses_when_shelf_not_admitted() {
+        let r = fresh_router();
+        let handle = CustodyHandle::new("nope");
+        let res = r
+            .course_correct_fast(
+                "test.absent",
+                &handle,
+                "v".into(),
+                vec![],
+                None,
+            )
+            .await;
+        match res {
+            Err(StewardError::Dispatch(msg)) => {
+                assert!(
+                    msg.starts_with("no plugin on shelf:"),
+                    "expected shelf-not-admitted message; got: {msg}"
+                );
+            }
+            other => panic!("expected refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn course_correct_fast_refuses_when_target_is_respondent() {
+        let r = fresh_router();
+        let policy = EnforcementPolicy {
+            allowed_course_correct_verbs: Some(vec!["v".into()]),
+            allowed_fast_path_verbs: Some(vec!["v".into()]),
+            fast_path_budget_ms: Some(50),
+            ..Default::default()
+        };
+        r.insert(respondent_entry_with_policy(
+            "p",
+            "test.respondent",
+            "p",
+            policy,
+        ))
+        .unwrap();
+
+        let handle = CustodyHandle::new("p");
+        let res = r
+            .course_correct_fast(
+                "test.respondent",
+                &handle,
+                "v".into(),
+                vec![],
+                None,
+            )
+            .await;
+        match res {
+            Err(StewardError::Dispatch(msg)) => {
+                assert!(
+                    msg.contains("respondent, not a warden"),
+                    "expected respondent-mismatch message; got: {msg}"
+                );
+            }
+            other => panic!("expected refusal, got {other:?}"),
         }
     }
 }

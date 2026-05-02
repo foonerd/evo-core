@@ -19,7 +19,10 @@ evo-trust = { path = "../evo-trust" }
 ed25519-dalek = { version = "2.1", features = ["std", "pkcs8", "pem", "alloc"] }
 clap = { version = "4", features = ["derive", "string"] }
 anyhow = "1"
+base64 = "0.22"
 toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 semver = { version = "1", features = ["serde"] }
 tar = "0.4"
 flate2 = "1"
@@ -31,6 +34,12 @@ zip = { version = "2.2", default-features = false, features = ["deflate"] }
 tempfile = "3"
 walkdir = "2"
 ureq = "2.9"
+# Async runtime + Unix socket I/O for the `admin` subcommands
+# that talk to the running steward over `/run/evo/evo.sock`. The
+# rest of the tool is sync; the runtime is built per admin call
+# rather than installed globally so the existing sync paths keep
+# their straightforward exit-code shape.
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
 
 [target.'cfg(unix)'.dependencies]
 # `geteuid` for the install-as-root guard. Only the install path

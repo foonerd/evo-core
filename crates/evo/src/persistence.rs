@@ -143,6 +143,27 @@ pub const SCHEMA_VERSION_CUSTODY_LEDGER: u32 = 7;
 /// the durable layer.
 pub const SCHEMA_VERSION_RELATION_GRAPH: u32 = 8;
 
+/// Schema version that adds the `installed_plugins` table —
+/// durable record of which plugins the operator has explicitly
+/// disabled. Plugins admitted through discovery land in this
+/// table on first successful admission; subsequent boots
+/// consult the `enabled` bit before admission and skip plugins
+/// the operator has marked disabled.
+pub const SCHEMA_VERSION_INSTALLED_PLUGINS: u32 = 9;
+
+/// Schema version that adds the `reconciliation_state` table —
+/// per-pair last-known-good projection the framework re-issues
+/// to the warden on apply failure (rollback) and at boot
+/// (cross-restart resume).
+pub const SCHEMA_VERSION_RECONCILIATION_STATE: u32 = 10;
+
+/// Schema version that adds the `pending_grammar_orphans`
+/// table — operator-visible record of subject-grammar orphans
+/// the boot diagnostic discovers and any migration / acceptance
+/// decisions taken against them. Sibling to the in-memory boot
+/// diagnostic.
+pub const SCHEMA_VERSION_PENDING_GRAMMAR_ORPHANS: u32 = 11;
+
 /// Maximum schema version this build of the steward understands.
 ///
 /// On open, [`SqlitePersistenceStore`] refuses to operate on a
@@ -150,7 +171,8 @@ pub const SCHEMA_VERSION_RELATION_GRAPH: u32 = 8;
 /// than this constant. Downgrades are not supported; an operator
 /// running an older steward against a newer database must restore
 /// from a pre-upgrade backup.
-pub const SUPPORTED_SCHEMA_VERSION: u32 = SCHEMA_VERSION_RELATION_GRAPH;
+pub const SUPPORTED_SCHEMA_VERSION: u32 =
+    SCHEMA_VERSION_PENDING_GRAMMAR_ORPHANS;
 
 /// Logical keys used in the `meta` table. Constants are kept in one
 /// place so a misspelling produces a compile error rather than a
@@ -194,6 +216,22 @@ const MIGRATION_007_CUSTODY_LEDGER: &str =
 /// SQL text of the v8 migration: relation graph durability.
 const MIGRATION_008_RELATION_GRAPH: &str =
     include_str!("../migrations/008_relation_graph.sql");
+
+/// SQL text of the v9 migration: installed plugins table
+/// (operator enable/disable bit).
+const MIGRATION_009_INSTALLED_PLUGINS: &str =
+    include_str!("../migrations/009_installed_plugins.sql");
+
+/// SQL text of the v10 migration: per-pair reconciliation
+/// last-known-good state.
+const MIGRATION_010_RECONCILIATION_STATE: &str =
+    include_str!("../migrations/010_reconciliation_state.sql");
+
+/// SQL text of the v11 migration: persistent grammar-orphan
+/// state used by the operator-issued migration / acceptance
+/// verbs.
+const MIGRATION_011_PENDING_GRAMMAR_ORPHANS: &str =
+    include_str!("../migrations/011_pending_grammar_orphans.sql");
 
 /// Errors raised by the persistence layer.
 ///
@@ -480,6 +518,136 @@ pub struct PersistedAdminEntry {
     pub reverses_admin_id: Option<i64>,
 }
 
+/// One row of the `reconciliation_state` table.
+///
+/// Mirrors the per-pair last-known-good (LKG) the steward
+/// updates after every successful apply. The framework re-issues
+/// this row to the warden on apply failure (rollback) and at boot
+/// (cross-restart resume) so the pipeline restarts from the
+/// last-known-good without operator action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedReconciliationState {
+    /// Operator-visible reconciliation pair identifier (the
+    /// catalogue's `[[reconciliation_pairs]] id`).
+    pub pair_id: String,
+    /// Monotonic per-pair counter the framework increments on
+    /// every successful apply. Rides on the `course_correct`
+    /// envelope so the warden + audit log can sequence applies.
+    pub generation: u64,
+    /// Warden-emitted post-hardware truth from the most recent
+    /// successful apply. Opaque to the framework; the per-pair
+    /// schema is the pair's design ADR's contract.
+    pub applied_state: serde_json::Value,
+    /// Wall-clock millisecond timestamp of the most recent
+    /// successful apply.
+    pub applied_at_ms: u64,
+}
+
+/// One row of the `pending_grammar_orphans` table. Operator-
+/// visible record of a subject-grammar orphan and any
+/// migration / acceptance decision taken against it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedGrammarOrphan {
+    /// The orphaned `subject_type`.
+    pub subject_type: String,
+    /// Wall-clock millisecond timestamp the orphan was first
+    /// observed.
+    pub first_observed_at_ms: u64,
+    /// Wall-clock millisecond timestamp of the most recent boot
+    /// diagnostic that observed this orphan.
+    pub last_observed_at_ms: u64,
+    /// Row count from the most recent boot diagnostic.
+    pub count: u64,
+    /// Lifecycle state.
+    pub status: GrammarOrphanStatus,
+    /// Operator-supplied reason, populated only when `status`
+    /// is `Accepted`.
+    pub accepted_reason: Option<String>,
+    /// Wall-clock millisecond timestamp the operator accepted
+    /// the orphans, populated only when `status` is `Accepted`.
+    pub accepted_at_ms: Option<u64>,
+    /// Identifier of the in-flight or terminal migration call,
+    /// populated when `status` is `Migrating` or `Resolved`.
+    pub migration_id: Option<String>,
+}
+
+/// Lifecycle states for a row in `pending_grammar_orphans`.
+/// Mirrors the SQLite CHECK constraint on the `status` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrammarOrphanStatus {
+    /// Orphans seen at boot, no operator action yet.
+    Pending,
+    /// A `migrate_grammar_orphans` call is in progress.
+    Migrating,
+    /// A migration completed; the type no longer appears in the
+    /// boot diagnostic. Retained for audit.
+    Resolved,
+    /// Operator deliberately accepted the orphans per
+    /// `accept_grammar_orphans`.
+    Accepted,
+    /// The orphan type re-appeared in the loaded catalogue
+    /// (mistake-recovery path).
+    Recovered,
+}
+
+impl GrammarOrphanStatus {
+    /// Stable string used in the SQLite `status` column.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Migrating => "migrating",
+            Self::Resolved => "resolved",
+            Self::Accepted => "accepted",
+            Self::Recovered => "recovered",
+        }
+    }
+
+    /// Parse a `status` column string. Returns `None` for
+    /// unrecognised values; callers use this in tandem with the
+    /// SQLite CHECK constraint so unknown values surface as a
+    /// boot-time migration failure rather than silently here.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "migrating" => Some(Self::Migrating),
+            "resolved" => Some(Self::Resolved),
+            "accepted" => Some(Self::Accepted),
+            "recovered" => Some(Self::Recovered),
+            _ => None,
+        }
+    }
+}
+
+/// One row of the `installed_plugins` table.
+///
+/// Mirrors the operator-controlled enable/disable bit per
+/// admitted plugin. Built by the admission engine on first
+/// successful admission and updated by the operator-issued
+/// `enable_plugin` / `disable_plugin` / `uninstall_plugin`
+/// verbs. Read at boot to populate the skip-set the admission
+/// engine consults before re-admitting discovered plugins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedInstalledPlugin {
+    /// Canonical reverse-DNS plugin name (the manifest's
+    /// `plugin.name`).
+    pub plugin_name: String,
+    /// Operator-set bit. `true` = admit at boot; `false` = skip
+    /// at boot.
+    pub enabled: bool,
+    /// Free-form operator-supplied reason recorded with the
+    /// most recent enable/disable transition. Surfaces in
+    /// `evo-plugin-tool admin diagnose`.
+    pub last_state_reason: Option<String>,
+    /// Wall-clock millisecond timestamp of the most recent
+    /// enable/disable transition.
+    pub last_state_changed_at_ms: u64,
+    /// Bundle install digest pinned at first admission.
+    /// Reserved for the audit / diagnose surfaces; not
+    /// consulted at admission.
+    pub install_digest: String,
+}
+
 /// One row of the `relations` table.
 ///
 /// Mirrors the non-claimant fields of an in-memory
@@ -725,6 +893,37 @@ pub struct MergeRecord<'a> {
     pub at_ms: u64,
 }
 
+/// All inputs to
+/// [`PersistenceStore::record_subject_type_migration`].
+///
+/// One subject's atomic re-statement under a new type. The
+/// operation is shaped like a merge of the old id into the
+/// new id, but with the new id's row carrying a different
+/// `subject_type`. Sibling to [`MergeRecord`] / [`SplitRecord`]
+/// in shape and semantics.
+#[derive(Debug, Clone, Copy)]
+pub struct TypeMigrationRecord<'a> {
+    /// Source subject id (consumed by the migration).
+    pub source: &'a str,
+    /// Newly minted canonical id for the migrated subject.
+    pub new_id: &'a str,
+    /// The pre-migration `subject_type` (driving the orphan
+    /// migration call).
+    pub from_type: &'a str,
+    /// The post-migration `subject_type` declared by the
+    /// loaded catalogue.
+    pub to_type: &'a str,
+    /// Identifier of the migration call that produced this
+    /// record. Same value across every per-subject migration
+    /// belonging to one verb call; used by the admin ledger and
+    /// the SubjectMigrated happenings to correlate batches.
+    pub migration_id: &'a str,
+    /// Operator-supplied reason recorded with the migration.
+    pub reason: Option<&'a str>,
+    /// Wall-clock timestamp, milliseconds since the UNIX epoch.
+    pub at_ms: u64,
+}
+
 /// All inputs to [`PersistenceStore::record_subject_split`].
 #[derive(Debug, Clone, Copy)]
 pub struct SplitRecord<'a> {
@@ -821,6 +1020,35 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
     fn record_subject_merge<'a>(
         &'a self,
         record: MergeRecord<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Record a `subject_type_migration` operation. One
+    /// subject's atomic re-statement under a new type; mirrors
+    /// [`Self::record_subject_merge`] but with only one source
+    /// and a type change.
+    ///
+    /// Within one transaction:
+    ///
+    /// - Inserts a new `subjects` row carrying the
+    ///   post-migration `subject_type` and the new canonical id.
+    /// - Moves every `subject_addressings` row pointing at
+    ///   `source` to point at `new_id`.
+    /// - Deletes the `source` row from `subjects` (its
+    ///   addressings are already moved).
+    /// - Inserts an `aliases` row of kind `type_migrated`
+    ///   recording the redirection from the old id to the new
+    ///   id, including the operator's reason.
+    /// - Appends a `claim_log` entry of kind
+    ///   `subject_type_migration`.
+    ///
+    /// Sources that do not exist in `subjects` are tolerated:
+    /// the moves and deletes operate on zero rows, and the alias
+    /// entry is still recorded so downstream alias-chain
+    /// resolution surfaces the redirect even if the source was
+    /// already retired by some prior operation.
+    fn record_subject_type_migration<'a>(
+        &'a self,
+        record: TypeMigrationRecord<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
 
     /// Record an admin `subject_split` operation.
@@ -1302,6 +1530,170 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
     fn checkpoint_wal<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Upsert one row in the `installed_plugins` table. Called by
+    /// the admission engine on first successful admission of a
+    /// plugin (to record the install digest) and by the
+    /// operator-issued `enable_plugin` / `disable_plugin` verbs
+    /// (to record the new bit + reason + timestamp).
+    fn record_plugin_enabled<'a>(
+        &'a self,
+        row: &'a PersistedInstalledPlugin,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Return every row of the `installed_plugins` table.
+    /// Called once at boot so the admission engine can populate
+    /// its skip-set before walking the discovered-plugins list.
+    /// Plugins absent from the table are treated as enabled by
+    /// default; the table is the operator's persistent
+    /// declaration of disabled plugins, not a complete plugin
+    /// inventory.
+    fn load_all_installed_plugins<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<PersistedInstalledPlugin>,
+                        PersistenceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+    /// Remove one row from `installed_plugins`. Called by the
+    /// operator-issued `uninstall_plugin` verb after the bundle
+    /// has been removed from disk; the row is dropped so a
+    /// subsequent reinstall starts from the default `enabled =
+    /// true` state.
+    fn forget_installed_plugin<'a>(
+        &'a self,
+        plugin_name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Upsert one row in the `reconciliation_state` table.
+    /// Called by the steward's per-pair reconciliation loop on
+    /// every successful apply; the row carries the warden's
+    /// post-hardware truth, the monotonic per-pair generation
+    /// counter, and the timestamp the framework can correlate
+    /// with the durable `ReconciliationApplied` happening.
+    fn record_reconciliation_state<'a>(
+        &'a self,
+        row: &'a PersistedReconciliationState,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Return every row of the `reconciliation_state` table.
+    /// Called once at boot so the framework can re-issue each
+    /// pair's last-known-good projection to the warden as part
+    /// of the cross-restart resume contract.
+    fn load_all_reconciliation_state<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<PersistedReconciliationState>,
+                        PersistenceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+    /// Remove one row from `reconciliation_state`. Called when
+    /// the catalogue stops declaring a pair (the operator
+    /// removed `[[reconciliation_pairs]]` and reloaded the
+    /// catalogue); the LKG no longer has a target warden so the
+    /// row is dropped to keep the table aligned with the
+    /// declared pair set.
+    fn forget_reconciliation_state<'a>(
+        &'a self,
+        pair_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Upsert a row in `pending_grammar_orphans` recording the
+    /// boot diagnostic's discovery for one orphan type. Called
+    /// at every boot for every orphan type the diagnostic
+    /// found; the call is idempotent — first observation
+    /// inserts with `status = 'pending'` and stamps both
+    /// `first_observed_at` and `last_observed_at`; subsequent
+    /// observations advance `last_observed_at` and refresh
+    /// `count` while preserving `first_observed_at` and any
+    /// non-`pending` status the operator has set
+    /// (`accepted` / `migrating` / `resolved`).
+    fn upsert_pending_grammar_orphan<'a>(
+        &'a self,
+        subject_type: &'a str,
+        count: u64,
+        observed_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Mark a row in `pending_grammar_orphans` as `recovered`
+    /// because the type re-appeared in the loaded catalogue.
+    /// Idempotent on already-`recovered` rows. No-op when the
+    /// row is absent. Called at boot once for every type that
+    /// re-appeared since the last boot.
+    fn mark_grammar_orphan_recovered<'a>(
+        &'a self,
+        subject_type: &'a str,
+        observed_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Mark a row in `pending_grammar_orphans` as `accepted`
+    /// per `accept_grammar_orphans`. Refuses with
+    /// [`PersistenceError::Invalid`] when the row is absent
+    /// (the operator can only accept what the diagnostic has
+    /// observed) or when the row is already `migrating`. Returns
+    /// `true` when the transition occurred; `false` when the
+    /// row was already in the `accepted` state (idempotent).
+    fn accept_grammar_orphan<'a>(
+        &'a self,
+        subject_type: &'a str,
+        reason: &'a str,
+        accepted_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>;
+
+    /// Mark a row in `pending_grammar_orphans` as `migrating`
+    /// and stamp the migration_id reference. Idempotent on a
+    /// row already in `migrating` for the same migration_id
+    /// (returns `Ok(())`); refuses with
+    /// [`PersistenceError::Invalid`] if the row is absent or
+    /// already `resolved` (a fresh migration call against a
+    /// resolved type would have produced no orphans, making
+    /// the call a contract error).
+    fn mark_grammar_orphan_migrating<'a>(
+        &'a self,
+        subject_type: &'a str,
+        migration_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Mark a row in `pending_grammar_orphans` as `resolved`
+    /// after the migration completes. Records the terminal
+    /// migration_id reference. Idempotent on already-`resolved`
+    /// rows. No-op when the row is absent.
+    fn mark_grammar_orphan_resolved<'a>(
+        &'a self,
+        subject_type: &'a str,
+        migration_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Load every row of `pending_grammar_orphans`. Used by
+    /// the `list_grammar_orphans` wire op and by tests. Order
+    /// is by `subject_type` ascending for stable output.
+    fn list_pending_grammar_orphans<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<PersistedGrammarOrphan>,
+                        PersistenceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
 }
 
 /// One row of the boot-time subject-type aggregation: a declared
@@ -1334,6 +1726,7 @@ mod claim_kind {
     pub const SUBJECT_MERGE: &str = "subject_merge";
     pub const SUBJECT_SPLIT: &str = "subject_split";
     pub const SUBJECT_FORGOTTEN: &str = "subject_forgotten";
+    pub const SUBJECT_TYPE_MIGRATION: &str = "subject_type_migration";
     pub const EQUIVALENT: &str = "equivalent";
     pub const DISTINCT: &str = "distinct";
     pub const MULTI_SUBJECT_CONFLICT: &str = "multi_subject_conflict";
@@ -1450,21 +1843,43 @@ fn run_migrations(conn: &mut Connection) -> Result<(), PersistenceError> {
     }
 
     if current < SCHEMA_VERSION_CUSTODY_LEDGER {
-        conn.execute_batch(MIGRATION_007_CUSTODY_LEDGER).map_err(
-            |e| PersistenceError::MigrationFailed {
+        conn.execute_batch(MIGRATION_007_CUSTODY_LEDGER)
+            .map_err(|e| PersistenceError::MigrationFailed {
                 version: SCHEMA_VERSION_CUSTODY_LEDGER,
                 source: e,
-            },
-        )?;
+            })?;
     }
 
     if current < SCHEMA_VERSION_RELATION_GRAPH {
-        conn.execute_batch(MIGRATION_008_RELATION_GRAPH).map_err(
-            |e| PersistenceError::MigrationFailed {
+        conn.execute_batch(MIGRATION_008_RELATION_GRAPH)
+            .map_err(|e| PersistenceError::MigrationFailed {
                 version: SCHEMA_VERSION_RELATION_GRAPH,
                 source: e,
-            },
-        )?;
+            })?;
+    }
+
+    if current < SCHEMA_VERSION_INSTALLED_PLUGINS {
+        conn.execute_batch(MIGRATION_009_INSTALLED_PLUGINS)
+            .map_err(|e| PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_INSTALLED_PLUGINS,
+                source: e,
+            })?;
+    }
+
+    if current < SCHEMA_VERSION_RECONCILIATION_STATE {
+        conn.execute_batch(MIGRATION_010_RECONCILIATION_STATE)
+            .map_err(|e| PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_RECONCILIATION_STATE,
+                source: e,
+            })?;
+    }
+
+    if current < SCHEMA_VERSION_PENDING_GRAMMAR_ORPHANS {
+        conn.execute_batch(MIGRATION_011_PENDING_GRAMMAR_ORPHANS)
+            .map_err(|e| PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_PENDING_GRAMMAR_ORPHANS,
+                source: e,
+            })?;
     }
 
     Ok(())
@@ -1865,6 +2280,91 @@ fn merge_tx(
     Ok(())
 }
 
+fn type_migration_tx(
+    conn: &mut Connection,
+    record: TypeMigrationRecord<'_>,
+) -> Result<(), PersistenceError> {
+    let TypeMigrationRecord {
+        source,
+        new_id,
+        from_type,
+        to_type,
+        migration_id,
+        reason,
+        at_ms,
+    } = record;
+    let tx = conn
+        .transaction()
+        .map_err(|e| PersistenceError::sqlite("begin type_migration tx", e))?;
+
+    // Insert the new subject row first so the foreign key from
+    // subject_addressings is satisfied throughout the move. The
+    // new row carries the post-migration subject_type.
+    tx.execute(
+        "INSERT INTO subjects (id, subject_type, created_at_ms, \
+         modified_at_ms, forgotten_at_ms) VALUES (?1, ?2, ?3, ?3, NULL)",
+        params![new_id, to_type, at_ms as i64],
+    )
+    .map_err(|e| PersistenceError::sqlite("insert migrated subject row", e))?;
+
+    // Move every addressing currently pointing at the source
+    // to the new id. Tolerates a missing source (zero rows).
+    tx.execute(
+        "UPDATE subject_addressings SET subject_id = ?1, \
+         asserted_at_ms = ?3 WHERE subject_id = ?2",
+        params![new_id, source, at_ms as i64],
+    )
+    .map_err(|e| {
+        PersistenceError::sqlite("re-attach addressings to migrated id", e)
+    })?;
+
+    // Drop the source subjects row. Its addressings are already
+    // moved; if the source did not exist the DELETE matches zero.
+    tx.execute("DELETE FROM subjects WHERE id = ?1", params![source])
+        .map_err(|e| {
+            PersistenceError::sqlite("delete migrated source row", e)
+        })?;
+
+    // Record the alias chain entry. The kind is `type_migrated`
+    // so describe_alias consumers can branch on it; admin_plugin
+    // is set to the migration_id so the audit trail correlates
+    // with the admin ledger receipt without an extra column.
+    tx.execute(
+        "INSERT INTO aliases (old_id, new_id, kind, recorded_at_ms, \
+         admin_plugin, reason) VALUES (?1, ?2, 'type_migrated', ?3, ?4, ?5)",
+        params![source, new_id, at_ms as i64, migration_id, reason],
+    )
+    .map_err(|e| PersistenceError::sqlite("insert alias (type_migrated)", e))?;
+
+    let payload = serde_json::json!({
+        "source": source,
+        "new_id": new_id,
+        "from_type": from_type,
+        "to_type": to_type,
+        "migration_id": migration_id,
+        "reason": reason,
+    })
+    .to_string();
+    tx.execute(
+        "INSERT INTO claim_log (kind, claimant, asserted_at_ms, payload, reason) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            claim_kind::SUBJECT_TYPE_MIGRATION,
+            migration_id,
+            at_ms as i64,
+            payload,
+            reason
+        ],
+    )
+    .map_err(|e| {
+        PersistenceError::sqlite("append claim_log subject_type_migration", e)
+    })?;
+
+    tx.commit()
+        .map_err(|e| PersistenceError::sqlite("commit type_migration tx", e))?;
+    Ok(())
+}
+
 fn split_tx(
     conn: &mut Connection,
     record: SplitRecord<'_>,
@@ -2212,6 +2712,7 @@ fn read_alias_row(
         "merged" => AliasKind::Merged,
         "split" => AliasKind::Split,
         "tombstone" => AliasKind::Tombstone,
+        "type_migrated" => AliasKind::TypeMigrated,
         other => {
             return Err(rusqlite::Error::FromSqlConversionFailure(
                 3,
@@ -2305,6 +2806,37 @@ impl PersistenceStore for SqlitePersistenceStore {
                         new_id: &n,
                         subject_type: &st,
                         admin_plugin: &admin,
+                        reason: reason.as_deref(),
+                        at_ms,
+                    },
+                )
+            })
+            .await
+        })
+    }
+
+    fn record_subject_type_migration<'a>(
+        &'a self,
+        record: TypeMigrationRecord<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let source = record.source.to_string();
+        let new_id = record.new_id.to_string();
+        let from_type = record.from_type.to_string();
+        let to_type = record.to_type.to_string();
+        let migration_id = record.migration_id.to_string();
+        let reason = record.reason.map(|s| s.to_string());
+        let at_ms = record.at_ms;
+        Box::pin(async move {
+            self.interact("subject_type_migration", move |conn| {
+                type_migration_tx(
+                    conn,
+                    TypeMigrationRecord {
+                        source: &source,
+                        new_id: &new_id,
+                        from_type: &from_type,
+                        to_type: &to_type,
+                        migration_id: &migration_id,
                         reason: reason.as_deref(),
                         at_ms,
                     },
@@ -2763,8 +3295,8 @@ impl PersistenceStore for SqlitePersistenceStore {
         let kind = entry.kind.clone();
         let admin_plugin = entry.admin_plugin.clone();
         let target_claimant = entry.target_claimant.clone();
-        let payload_json =
-            serde_json::to_string(&entry.payload).unwrap_or_else(|_| "{}".into());
+        let payload_json = serde_json::to_string(&entry.payload)
+            .unwrap_or_else(|_| "{}".into());
         let asserted_at_ms = entry.asserted_at_ms;
         let reason = entry.reason.clone();
         let reverses_admin_id = entry.reverses_admin_id;
@@ -2785,9 +3317,7 @@ impl PersistenceStore for SqlitePersistenceStore {
                         reverses_admin_id,
                     ],
                 )
-                .map_err(|e| {
-                    PersistenceError::sqlite("insert admin_log", e)
-                })?;
+                .map_err(|e| PersistenceError::sqlite("insert admin_log", e))?;
                 Ok(())
             })
             .await
@@ -2818,17 +3348,19 @@ impl PersistenceStore for SqlitePersistenceStore {
                 let rows = stmt
                     .query_map([], |row| {
                         let payload_json: String = row.get(4)?;
-                        let payload: serde_json::Value =
-                            serde_json::from_str(&payload_json).map_err(|e| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    4,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        format!("payload not JSON: {e}"),
-                                    )),
-                                )
-                            })?;
+                        let payload: serde_json::Value = serde_json::from_str(
+                            &payload_json,
+                        )
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("payload not JSON: {e}"),
+                                )),
+                            )
+                        })?;
                         Ok(PersistedAdminEntry {
                             admin_id: row.get(0)?,
                             kind: row.get(1)?,
@@ -2885,9 +3417,7 @@ impl PersistenceStore for SqlitePersistenceStore {
                         rel.modified_at_ms as i64,
                     ],
                 )
-                .map_err(|e| {
-                    PersistenceError::sqlite("upsert relations", e)
-                })?;
+                .map_err(|e| PersistenceError::sqlite("upsert relations", e))?;
                 tx.execute(
                     "INSERT OR IGNORE INTO relation_claimants \
                      (source_id, predicate, target_id, claimant, \
@@ -2941,10 +3471,7 @@ impl PersistenceStore for SqlitePersistenceStore {
                         params![source_id, predicate, target_id, claimant],
                     )
                     .map_err(|e| {
-                        PersistenceError::sqlite(
-                            "delete relation_claimant",
-                            e,
-                        )
+                        PersistenceError::sqlite("delete relation_claimant", e)
                     })?;
                 if relation_forgotten {
                     tx.execute(
@@ -3051,10 +3578,7 @@ impl PersistenceStore for SqlitePersistenceStore {
                         ],
                     )
                     .map_err(|e| {
-                        PersistenceError::sqlite(
-                            "update relation suppress",
-                            e,
-                        )
+                        PersistenceError::sqlite("update relation suppress", e)
                     })?;
                 Ok(n > 0)
             })
@@ -3250,9 +3774,7 @@ impl PersistenceStore for SqlitePersistenceStore {
                         last_updated_at_ms as i64,
                     ],
                 )
-                .map_err(|e| {
-                    PersistenceError::sqlite("upsert custodies", e)
-                })?;
+                .map_err(|e| PersistenceError::sqlite("upsert custodies", e))?;
                 Ok(())
             })
             .await
@@ -3504,6 +4026,525 @@ impl PersistenceStore for SqlitePersistenceStore {
             .await
         })
     }
+
+    fn record_plugin_enabled<'a>(
+        &'a self,
+        row: &'a PersistedInstalledPlugin,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let plugin_name = row.plugin_name.clone();
+        let enabled = if row.enabled { 1_i64 } else { 0_i64 };
+        let last_state_reason = row.last_state_reason.clone();
+        let last_state_changed_at_ms = row.last_state_changed_at_ms as i64;
+        let install_digest = row.install_digest.clone();
+        Box::pin(async move {
+            self.interact("record_plugin_enabled", move |conn| {
+                conn.execute(
+                    "INSERT INTO installed_plugins \
+                     (plugin_name, enabled, last_state_reason, \
+                      last_state_changed_at_ms, install_digest) \
+                     VALUES (?1, ?2, ?3, ?4, ?5) \
+                     ON CONFLICT(plugin_name) DO UPDATE SET \
+                       enabled = excluded.enabled, \
+                       last_state_reason = excluded.last_state_reason, \
+                       last_state_changed_at_ms = excluded.last_state_changed_at_ms, \
+                       install_digest = excluded.install_digest",
+                    params![
+                        plugin_name,
+                        enabled,
+                        last_state_reason,
+                        last_state_changed_at_ms,
+                        install_digest,
+                    ],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite(
+                        "upsert installed_plugins",
+                        e,
+                    )
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn load_all_installed_plugins<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<PersistedInstalledPlugin>,
+                        PersistenceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("load_all_installed_plugins", |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT plugin_name, enabled, last_state_reason, \
+                                last_state_changed_at_ms, install_digest \
+                         FROM installed_plugins \
+                         ORDER BY plugin_name",
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "prepare installed_plugins select",
+                            e,
+                        )
+                    })?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let enabled_int: i64 = row.get(1)?;
+                        let last_state_changed_at_ms: i64 = row.get(3)?;
+                        Ok(PersistedInstalledPlugin {
+                            plugin_name: row.get(0)?,
+                            enabled: enabled_int != 0,
+                            last_state_reason: row.get(2)?,
+                            last_state_changed_at_ms: last_state_changed_at_ms
+                                as u64,
+                            install_digest: row.get(4)?,
+                        })
+                    })
+                    .map_err(|e| {
+                        PersistenceError::sqlite("query installed_plugins", e)
+                    })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row.map_err(|e| {
+                        PersistenceError::sqlite(
+                            "decode installed_plugins row",
+                            e,
+                        )
+                    })?);
+                }
+                Ok(out)
+            })
+            .await
+        })
+    }
+
+    fn forget_installed_plugin<'a>(
+        &'a self,
+        plugin_name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let name = plugin_name.to_string();
+        Box::pin(async move {
+            self.interact("forget_installed_plugin", move |conn| {
+                conn.execute(
+                    "DELETE FROM installed_plugins WHERE plugin_name = ?1",
+                    params![name],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("delete installed_plugins", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn record_reconciliation_state<'a>(
+        &'a self,
+        row: &'a PersistedReconciliationState,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let pair_id = row.pair_id.clone();
+        let generation = row.generation as i64;
+        let payload_json = serde_json::to_string(&row.applied_state)
+            .unwrap_or_else(|_| "null".into());
+        let at_ms = row.applied_at_ms as i64;
+        Box::pin(async move {
+            self.interact("record_reconciliation_state", move |conn| {
+                conn.execute(
+                    "INSERT INTO reconciliation_state \
+                     (pair_id, generation, applied_state, applied_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT(pair_id) DO UPDATE SET \
+                       generation = excluded.generation, \
+                       applied_state = excluded.applied_state, \
+                       applied_at_ms = excluded.applied_at_ms",
+                    params![pair_id, generation, payload_json, at_ms],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("upsert reconciliation_state", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn load_all_reconciliation_state<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<PersistedReconciliationState>,
+                        PersistenceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("load_all_reconciliation_state", |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT pair_id, generation, applied_state, \
+                                applied_at_ms \
+                         FROM reconciliation_state \
+                         ORDER BY pair_id",
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "prepare reconciliation_state select",
+                            e,
+                        )
+                    })?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let payload_json: String = row.get(2)?;
+                        let applied_state = serde_json::from_str(&payload_json)
+                            .unwrap_or(serde_json::Value::Null);
+                        let generation: i64 = row.get(1)?;
+                        let at_ms: i64 = row.get(3)?;
+                        Ok(PersistedReconciliationState {
+                            pair_id: row.get(0)?,
+                            generation: generation as u64,
+                            applied_state,
+                            applied_at_ms: at_ms as u64,
+                        })
+                    })
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "query reconciliation_state",
+                            e,
+                        )
+                    })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row.map_err(|e| {
+                        PersistenceError::sqlite(
+                            "decode reconciliation_state row",
+                            e,
+                        )
+                    })?);
+                }
+                Ok(out)
+            })
+            .await
+        })
+    }
+
+    fn forget_reconciliation_state<'a>(
+        &'a self,
+        pair_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let id = pair_id.to_string();
+        Box::pin(async move {
+            self.interact("forget_reconciliation_state", move |conn| {
+                conn.execute(
+                    "DELETE FROM reconciliation_state WHERE pair_id = ?1",
+                    params![id],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("delete reconciliation_state", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn upsert_pending_grammar_orphan<'a>(
+        &'a self,
+        subject_type: &'a str,
+        count: u64,
+        observed_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let st = subject_type.to_string();
+        Box::pin(async move {
+            self.interact("upsert_pending_grammar_orphan", move |conn| {
+                // INSERT OR IGNORE preserves first_observed_at +
+                // any non-pending status; UPDATE refreshes count
+                // and last_observed_at and re-pends the row if a
+                // prior `recovered` state has been re-orphaned.
+                conn.execute(
+                    "INSERT INTO pending_grammar_orphans \
+                     (subject_type, first_observed_at, last_observed_at, \
+                      count, status) \
+                     VALUES (?1, ?2, ?2, ?3, 'pending') \
+                     ON CONFLICT(subject_type) DO UPDATE SET \
+                       last_observed_at = excluded.last_observed_at, \
+                       count = excluded.count, \
+                       status = CASE \
+                         WHEN status = 'recovered' THEN 'pending' \
+                         ELSE status \
+                       END",
+                    params![st, observed_at_ms as i64, count as i64],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite(
+                        "upsert pending_grammar_orphans",
+                        e,
+                    )
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn mark_grammar_orphan_recovered<'a>(
+        &'a self,
+        subject_type: &'a str,
+        observed_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let st = subject_type.to_string();
+        Box::pin(async move {
+            self.interact("mark_grammar_orphan_recovered", move |conn| {
+                conn.execute(
+                    "UPDATE pending_grammar_orphans SET \
+                       status = 'recovered', \
+                       last_observed_at = ?2 \
+                     WHERE subject_type = ?1",
+                    params![st, observed_at_ms as i64],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite(
+                        "update pending_grammar_orphans recovered",
+                        e,
+                    )
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn accept_grammar_orphan<'a>(
+        &'a self,
+        subject_type: &'a str,
+        reason: &'a str,
+        accepted_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>
+    {
+        let st = subject_type.to_string();
+        let reason = reason.to_string();
+        Box::pin(async move {
+            self.interact("accept_grammar_orphan", move |conn| {
+                let current: Option<String> = conn
+                    .query_row(
+                        "SELECT status FROM pending_grammar_orphans \
+                         WHERE subject_type = ?1",
+                        params![st],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .ok();
+                match current.as_deref() {
+                    None => Err(PersistenceError::Invalid(format!(
+                        "accept_grammar_orphan: no pending row for type {st:?}"
+                    ))),
+                    Some("migrating") => {
+                        Err(PersistenceError::Invalid(format!(
+                            "accept_grammar_orphan: type {st:?} has an \
+                             in-flight migration; wait for it to complete"
+                        )))
+                    }
+                    Some("accepted") => Ok(false),
+                    _ => {
+                        conn.execute(
+                            "UPDATE pending_grammar_orphans SET \
+                               status = 'accepted', \
+                               accepted_reason = ?2, \
+                               accepted_at = ?3 \
+                             WHERE subject_type = ?1",
+                            params![st, reason, accepted_at_ms as i64],
+                        )
+                        .map_err(|e| {
+                            PersistenceError::sqlite(
+                                "update pending_grammar_orphans accepted",
+                                e,
+                            )
+                        })?;
+                        Ok(true)
+                    }
+                }
+            })
+            .await
+        })
+    }
+
+    fn mark_grammar_orphan_migrating<'a>(
+        &'a self,
+        subject_type: &'a str,
+        migration_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let st = subject_type.to_string();
+        let mid = migration_id.to_string();
+        Box::pin(async move {
+            self.interact("mark_grammar_orphan_migrating", move |conn| {
+                let current: Option<String> = conn
+                    .query_row(
+                        "SELECT status FROM pending_grammar_orphans \
+                         WHERE subject_type = ?1",
+                        params![st],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .ok();
+                match current.as_deref() {
+                    None => Err(PersistenceError::Invalid(format!(
+                        "mark_grammar_orphan_migrating: no pending row for \
+                         type {st:?}"
+                    ))),
+                    Some("resolved") => {
+                        Err(PersistenceError::Invalid(format!(
+                            "mark_grammar_orphan_migrating: type {st:?} is \
+                             already resolved"
+                        )))
+                    }
+                    _ => {
+                        conn.execute(
+                            "UPDATE pending_grammar_orphans SET \
+                               status = 'migrating', \
+                               migration_id = ?2 \
+                             WHERE subject_type = ?1",
+                            params![st, mid],
+                        )
+                        .map_err(|e| {
+                            PersistenceError::sqlite(
+                                "update pending_grammar_orphans migrating",
+                                e,
+                            )
+                        })?;
+                        Ok(())
+                    }
+                }
+            })
+            .await
+        })
+    }
+
+    fn mark_grammar_orphan_resolved<'a>(
+        &'a self,
+        subject_type: &'a str,
+        migration_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let st = subject_type.to_string();
+        let mid = migration_id.to_string();
+        Box::pin(async move {
+            self.interact("mark_grammar_orphan_resolved", move |conn| {
+                conn.execute(
+                    "UPDATE pending_grammar_orphans SET \
+                       status = 'resolved', \
+                       migration_id = ?2 \
+                     WHERE subject_type = ?1",
+                    params![st, mid],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite(
+                        "update pending_grammar_orphans resolved",
+                        e,
+                    )
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn list_pending_grammar_orphans<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<PersistedGrammarOrphan>,
+                        PersistenceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("list_pending_grammar_orphans", |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT subject_type, first_observed_at, \
+                       last_observed_at, count, status, \
+                       accepted_reason, accepted_at, migration_id \
+                     FROM pending_grammar_orphans \
+                     ORDER BY subject_type ASC",
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "prepare pending_grammar_orphans select",
+                            e,
+                        )
+                    })?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let status_str: String = row.get(4)?;
+                        let status =
+                            GrammarOrphanStatus::parse(status_str.as_str())
+                                .ok_or_else(|| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        4,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            format!(
+                                        "unknown grammar orphan status: \
+                                         {status_str}"
+                                    ),
+                                        )),
+                                    )
+                                })?;
+                        Ok(PersistedGrammarOrphan {
+                            subject_type: row.get(0)?,
+                            first_observed_at_ms: row.get::<_, i64>(1)? as u64,
+                            last_observed_at_ms: row.get::<_, i64>(2)? as u64,
+                            count: row.get::<_, i64>(3)? as u64,
+                            status,
+                            accepted_reason: row.get::<_, Option<String>>(5)?,
+                            accepted_at_ms: row
+                                .get::<_, Option<i64>>(6)?
+                                .map(|v| v as u64),
+                            migration_id: row.get::<_, Option<String>>(7)?,
+                        })
+                    })
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "query pending_grammar_orphans",
+                            e,
+                        )
+                    })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r.map_err(|e| {
+                        PersistenceError::sqlite(
+                            "decode pending_grammar_orphans row",
+                            e,
+                        )
+                    })?);
+                }
+                Ok(out)
+            })
+            .await
+        })
+    }
 }
 
 /// In-memory mock implementation of [`PersistenceStore`].
@@ -3573,6 +4614,20 @@ struct MemoryState {
     /// `(source_id, predicate, target_id, claimant)`.
     relation_claimants:
         HashMap<(String, String, String, String), PersistedRelationClaim>,
+    /// Mirror of `installed_plugins` keyed by canonical plugin
+    /// name. Holds the operator-set enabled bit and audit
+    /// metadata; the admission engine reads this at boot to
+    /// populate its skip-set for disabled plugins.
+    installed_plugins: HashMap<String, PersistedInstalledPlugin>,
+    /// Mirror of `reconciliation_state` keyed by pair id. Holds
+    /// the per-pair last-known-good projection the framework
+    /// re-issues to the warden on apply failure (rollback) and
+    /// at boot (cross-restart resume).
+    reconciliation_state: HashMap<String, PersistedReconciliationState>,
+    /// Mirror of `pending_grammar_orphans` keyed by
+    /// subject_type. Persists the boot diagnostic's discoveries
+    /// and any operator decisions taken against them.
+    pending_grammar_orphans: HashMap<String, PersistedGrammarOrphan>,
 }
 
 #[derive(Debug, Clone)]
@@ -3755,6 +4810,63 @@ impl PersistenceStore for MemoryPersistenceStore {
             g.claim_log.push(MemoryClaimEntry {
                 kind: claim_kind::SUBJECT_MERGE,
                 claimant: admin_plugin.to_string(),
+                at_ms,
+            });
+            Ok(())
+        })
+    }
+
+    fn record_subject_type_migration<'a>(
+        &'a self,
+        record: TypeMigrationRecord<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let TypeMigrationRecord {
+                source,
+                new_id,
+                from_type: _,
+                to_type,
+                migration_id,
+                reason,
+                at_ms,
+            } = record;
+            let mut g = self.inner.lock().await;
+            // Drain addressings off the source (if present) and
+            // attach them to the new subject.
+            let mut moved: Vec<PersistedAddressing> =
+                if let Some(s) = g.subjects.remove(source) {
+                    s.addressings
+                } else {
+                    Vec::new()
+                };
+            for slot in &mut moved {
+                slot.asserted_at_ms = at_ms;
+            }
+            g.subjects.insert(
+                new_id.to_string(),
+                MemorySubject {
+                    subject_type: to_type.to_string(),
+                    created_at_ms: at_ms,
+                    modified_at_ms: at_ms,
+                    forgotten_at_ms: None,
+                    addressings: moved,
+                },
+            );
+            g.next_alias_id += 1;
+            let id = g.next_alias_id;
+            g.aliases.push(PersistedAlias {
+                alias_id: id,
+                old_id: source.to_string(),
+                new_id: new_id.to_string(),
+                kind: AliasKind::TypeMigrated,
+                recorded_at_ms: at_ms,
+                admin_plugin: migration_id.to_string(),
+                reason: reason.map(|s| s.to_string()),
+            });
+            g.claim_log.push(MemoryClaimEntry {
+                kind: claim_kind::SUBJECT_TYPE_MIGRATION,
+                claimant: migration_id.to_string(),
                 at_ms,
             });
             Ok(())
@@ -4202,9 +5314,7 @@ impl PersistenceStore for MemoryPersistenceStore {
             if relation_forgotten {
                 g.relations.remove(&rel_key);
                 g.relation_claimants.retain(|k, _| {
-                    !(k.0 == source_id
-                        && k.1 == predicate
-                        && k.2 == target_id)
+                    !(k.0 == source_id && k.1 == predicate && k.2 == target_id)
                 });
             } else if removed {
                 if let Some(rel) = g.relations.get_mut(&rel_key) {
@@ -4231,9 +5341,7 @@ impl PersistenceStore for MemoryPersistenceStore {
             );
             let removed = g.relations.remove(&rel_key).is_some();
             g.relation_claimants.retain(|k, _| {
-                !(k.0 == source_id
-                    && k.1 == predicate
-                    && k.2 == target_id)
+                !(k.0 == source_id && k.1 == predicate && k.2 == target_id)
             });
             Ok(removed)
         })
@@ -4311,15 +5419,14 @@ impl PersistenceStore for MemoryPersistenceStore {
             let mut rel_keys: Vec<&(String, String, String)> =
                 g.relations.keys().collect();
             rel_keys.sort();
-            let mut out: Vec<RelationLoadRow> = Vec::with_capacity(rel_keys.len());
+            let mut out: Vec<RelationLoadRow> =
+                Vec::with_capacity(rel_keys.len());
             for k in rel_keys {
                 let rel = g.relations.get(k).cloned().expect("key present");
                 let mut claims: Vec<PersistedRelationClaim> = g
                     .relation_claimants
                     .iter()
-                    .filter(|(ck, _)| {
-                        ck.0 == k.0 && ck.1 == k.1 && ck.2 == k.2
-                    })
+                    .filter(|(ck, _)| ck.0 == k.0 && ck.1 == k.1 && ck.2 == k.2)
                     .map(|(_, v)| v.clone())
                     .collect();
                 claims.sort_by(|a, b| a.claimant.cmp(&b.claimant));
@@ -4469,6 +5576,262 @@ impl PersistenceStore for MemoryPersistenceStore {
         // type.
         Box::pin(async move { Ok(()) })
     }
+
+    fn record_plugin_enabled<'a>(
+        &'a self,
+        row: &'a PersistedInstalledPlugin,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let row = row.clone();
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            g.installed_plugins.insert(row.plugin_name.clone(), row);
+            Ok(())
+        })
+    }
+
+    fn load_all_installed_plugins<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<PersistedInstalledPlugin>,
+                        PersistenceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            let mut out: Vec<PersistedInstalledPlugin> =
+                g.installed_plugins.values().cloned().collect();
+            out.sort_by(|a, b| a.plugin_name.cmp(&b.plugin_name));
+            Ok(out)
+        })
+    }
+
+    fn forget_installed_plugin<'a>(
+        &'a self,
+        plugin_name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let name = plugin_name.to_string();
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            g.installed_plugins.remove(&name);
+            Ok(())
+        })
+    }
+
+    fn record_reconciliation_state<'a>(
+        &'a self,
+        row: &'a PersistedReconciliationState,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let row = row.clone();
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            g.reconciliation_state.insert(row.pair_id.clone(), row);
+            Ok(())
+        })
+    }
+
+    fn load_all_reconciliation_state<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<PersistedReconciliationState>,
+                        PersistenceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            let mut out: Vec<PersistedReconciliationState> =
+                g.reconciliation_state.values().cloned().collect();
+            out.sort_by(|a, b| a.pair_id.cmp(&b.pair_id));
+            Ok(out)
+        })
+    }
+
+    fn forget_reconciliation_state<'a>(
+        &'a self,
+        pair_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let id = pair_id.to_string();
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            g.reconciliation_state.remove(&id);
+            Ok(())
+        })
+    }
+
+    fn upsert_pending_grammar_orphan<'a>(
+        &'a self,
+        subject_type: &'a str,
+        count: u64,
+        observed_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let st = subject_type.to_string();
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            let entry = g
+                .pending_grammar_orphans
+                .entry(st.clone())
+                .or_insert_with(|| PersistedGrammarOrphan {
+                    subject_type: st.clone(),
+                    first_observed_at_ms: observed_at_ms,
+                    last_observed_at_ms: observed_at_ms,
+                    count,
+                    status: GrammarOrphanStatus::Pending,
+                    accepted_reason: None,
+                    accepted_at_ms: None,
+                    migration_id: None,
+                });
+            entry.last_observed_at_ms = observed_at_ms;
+            entry.count = count;
+            // A previously-recovered type that re-orphans flips
+            // back to pending so the operator surface lights up
+            // again. Other states are preserved.
+            if matches!(entry.status, GrammarOrphanStatus::Recovered) {
+                entry.status = GrammarOrphanStatus::Pending;
+            }
+            Ok(())
+        })
+    }
+
+    fn mark_grammar_orphan_recovered<'a>(
+        &'a self,
+        subject_type: &'a str,
+        observed_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let st = subject_type.to_string();
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            if let Some(entry) = g.pending_grammar_orphans.get_mut(&st) {
+                entry.status = GrammarOrphanStatus::Recovered;
+                entry.last_observed_at_ms = observed_at_ms;
+            }
+            Ok(())
+        })
+    }
+
+    fn accept_grammar_orphan<'a>(
+        &'a self,
+        subject_type: &'a str,
+        reason: &'a str,
+        accepted_at_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PersistenceError>> + Send + 'a>>
+    {
+        let st = subject_type.to_string();
+        let reason = reason.to_string();
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            let entry = match g.pending_grammar_orphans.get_mut(&st) {
+                Some(e) => e,
+                None => {
+                    return Err(PersistenceError::Invalid(format!(
+                        "accept_grammar_orphan: no pending row for type {st:?}"
+                    )));
+                }
+            };
+            match entry.status {
+                GrammarOrphanStatus::Migrating => {
+                    Err(PersistenceError::Invalid(format!(
+                        "accept_grammar_orphan: type {st:?} has an in-flight \
+                         migration; wait for it to complete"
+                    )))
+                }
+                GrammarOrphanStatus::Accepted => Ok(false),
+                _ => {
+                    entry.status = GrammarOrphanStatus::Accepted;
+                    entry.accepted_reason = Some(reason);
+                    entry.accepted_at_ms = Some(accepted_at_ms);
+                    Ok(true)
+                }
+            }
+        })
+    }
+
+    fn mark_grammar_orphan_migrating<'a>(
+        &'a self,
+        subject_type: &'a str,
+        migration_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let st = subject_type.to_string();
+        let mid = migration_id.to_string();
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            let entry = match g.pending_grammar_orphans.get_mut(&st) {
+                Some(e) => e,
+                None => {
+                    return Err(PersistenceError::Invalid(format!(
+                        "mark_grammar_orphan_migrating: no pending row for \
+                         type {st:?}"
+                    )));
+                }
+            };
+            if matches!(entry.status, GrammarOrphanStatus::Resolved) {
+                return Err(PersistenceError::Invalid(format!(
+                    "mark_grammar_orphan_migrating: type {st:?} is already \
+                     resolved"
+                )));
+            }
+            entry.status = GrammarOrphanStatus::Migrating;
+            entry.migration_id = Some(mid);
+            Ok(())
+        })
+    }
+
+    fn mark_grammar_orphan_resolved<'a>(
+        &'a self,
+        subject_type: &'a str,
+        migration_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let st = subject_type.to_string();
+        let mid = migration_id.to_string();
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            if let Some(entry) = g.pending_grammar_orphans.get_mut(&st) {
+                entry.status = GrammarOrphanStatus::Resolved;
+                entry.migration_id = Some(mid);
+            }
+            Ok(())
+        })
+    }
+
+    fn list_pending_grammar_orphans<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<PersistedGrammarOrphan>,
+                        PersistenceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            let mut out: Vec<_> =
+                g.pending_grammar_orphans.values().cloned().collect();
+            out.sort_by(|a, b| a.subject_type.cmp(&b.subject_type));
+            Ok(out)
+        })
+    }
 }
 
 /// Convenience: test fixture builder for code that needs an
@@ -4600,6 +5963,73 @@ mod tests {
         assert_eq!(aa[0].kind, AliasKind::Merged);
         assert_eq!(ab.len(), 1);
         assert_eq!(ab[0].new_id, "uuid-c");
+    }
+
+    #[tokio::test]
+    async fn memory_type_migration_records_alias_and_moves_addressings() {
+        let s = MemoryPersistenceStore::new();
+        s.record_subject_announce(AnnounceRecord {
+            canonical_id: "uuid-old",
+            subject_type: "audio_track",
+            addressings: &[ext("library", "song-1"), ext("mb", "abc-123")],
+            claimant: "p1",
+            claims: &[],
+            at_ms: 1000,
+        })
+        .await
+        .unwrap();
+        s.record_subject_type_migration(TypeMigrationRecord {
+            source: "uuid-old",
+            new_id: "uuid-new",
+            from_type: "audio_track",
+            to_type: "track",
+            migration_id: "mig_01",
+            reason: Some("catalogue v3 rename"),
+            at_ms: 2000,
+        })
+        .await
+        .unwrap();
+        let aliases = s.load_aliases_for("uuid-old").await.unwrap();
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0].new_id, "uuid-new");
+        assert_eq!(aliases[0].kind, AliasKind::TypeMigrated);
+        assert_eq!(aliases[0].admin_plugin, "mig_01");
+        assert_eq!(aliases[0].reason.as_deref(), Some("catalogue v3 rename"));
+        let all = s.load_all_subjects().await.unwrap();
+        // Source row deleted; new row holds the addressings under
+        // the new subject_type.
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, "uuid-new");
+        assert_eq!(all[0].subject_type, "track");
+        let mut schemes: Vec<_> = all[0]
+            .addressings
+            .iter()
+            .map(|a| a.scheme.as_str())
+            .collect();
+        schemes.sort();
+        assert_eq!(schemes, vec!["library", "mb"]);
+    }
+
+    #[tokio::test]
+    async fn memory_type_migration_tolerates_missing_source() {
+        // Idempotent re-issue: source already migrated in a
+        // prior call. The verb must still record the alias
+        // entry so describe_alias resolves the redirect.
+        let s = MemoryPersistenceStore::new();
+        s.record_subject_type_migration(TypeMigrationRecord {
+            source: "uuid-missing",
+            new_id: "uuid-new",
+            from_type: "audio_track",
+            to_type: "track",
+            migration_id: "mig_01",
+            reason: None,
+            at_ms: 1000,
+        })
+        .await
+        .unwrap();
+        let aliases = s.load_aliases_for("uuid-missing").await.unwrap();
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0].kind, AliasKind::TypeMigrated);
     }
 
     #[tokio::test]
@@ -6012,7 +7442,10 @@ mod tests {
         let (custody, snap) = &rows[0];
         assert_eq!(custody.shelf.as_deref(), Some("example.custody"));
         assert_eq!(custody.custody_type.as_deref(), Some("playback"));
-        assert_eq!(snap.as_ref().map(|s| s.payload.as_slice()), Some(b"state=playing".as_ref()));
+        assert_eq!(
+            snap.as_ref().map(|s| s.payload.as_slice()),
+            Some(b"state=playing".as_ref())
+        );
         assert_eq!(snap.as_ref().map(|s| s.health.as_str()), Some("healthy"));
     }
 
@@ -6230,7 +7663,10 @@ mod tests {
         assert!(hit);
         let rows = store.load_all_relations().await.unwrap();
         let rel = &rows[0].0;
-        assert_eq!(rel.suppressed_admin_plugin.as_deref(), Some("admin.plugin"));
+        assert_eq!(
+            rel.suppressed_admin_plugin.as_deref(),
+            Some("admin.plugin")
+        );
         assert_eq!(rel.suppressed_at_ms, Some(500));
         assert_eq!(rel.suppression_reason.as_deref(), Some("disputed"));
         assert_eq!(rel.modified_at_ms, 500);
@@ -6273,7 +7709,11 @@ mod tests {
         let triples: Vec<(String, String, String)> = rows
             .iter()
             .map(|(r, _)| {
-                (r.source_id.clone(), r.predicate.clone(), r.target_id.clone())
+                (
+                    r.source_id.clone(),
+                    r.predicate.clone(),
+                    r.target_id.clone(),
+                )
             })
             .collect();
         assert_eq!(
@@ -6284,11 +7724,8 @@ mod tests {
                 ("b".into(), "edge".into(), "c".into()),
             ]
         );
-        let az_claimants: Vec<&str> = rows[1]
-            .1
-            .iter()
-            .map(|c| c.claimant.as_str())
-            .collect();
+        let az_claimants: Vec<&str> =
+            rows[1].1.iter().map(|c| c.claimant.as_str()).collect();
         assert_eq!(az_claimants, vec!["p1", "p2"]);
     }
 
@@ -6343,9 +7780,359 @@ mod tests {
         let (rel, claims) = &rows[0];
         assert_eq!(rel.created_at_ms, 100);
         assert_eq!(rel.modified_at_ms, 500);
-        assert_eq!(rel.suppressed_admin_plugin.as_deref(), Some("admin.plugin"));
+        assert_eq!(
+            rel.suppressed_admin_plugin.as_deref(),
+            Some("admin.plugin")
+        );
         assert_eq!(rel.suppression_reason.as_deref(), Some("under review"));
         assert_eq!(claims.len(), 2);
         assert_eq!(claims[0].reason.as_deref(), Some("first"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_installed_plugins_round_trip_and_upsert() {
+        let (_dir, store) = open_temp();
+
+        let row1 = PersistedInstalledPlugin {
+            plugin_name: "org.test.alpha".into(),
+            enabled: true,
+            last_state_reason: Some("first install".into()),
+            last_state_changed_at_ms: 1000,
+            install_digest: "sha256:aaa".into(),
+        };
+        let row2 = PersistedInstalledPlugin {
+            plugin_name: "org.test.bravo".into(),
+            enabled: false,
+            last_state_reason: Some("disabled by operator".into()),
+            last_state_changed_at_ms: 2000,
+            install_digest: "sha256:bbb".into(),
+        };
+        store.record_plugin_enabled(&row1).await.unwrap();
+        store.record_plugin_enabled(&row2).await.unwrap();
+
+        let rows = store.load_all_installed_plugins().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].plugin_name, "org.test.alpha");
+        assert!(rows[0].enabled);
+        assert_eq!(rows[1].plugin_name, "org.test.bravo");
+        assert!(!rows[1].enabled);
+
+        // Upsert: re-record alpha with enabled = false replaces the
+        // existing row in place rather than inserting a duplicate.
+        let row1_updated = PersistedInstalledPlugin {
+            plugin_name: "org.test.alpha".into(),
+            enabled: false,
+            last_state_reason: Some("changed mind".into()),
+            last_state_changed_at_ms: 3000,
+            install_digest: "sha256:aaa".into(),
+        };
+        store.record_plugin_enabled(&row1_updated).await.unwrap();
+        let rows = store.load_all_installed_plugins().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let alpha = rows
+            .iter()
+            .find(|r| r.plugin_name == "org.test.alpha")
+            .unwrap();
+        assert!(!alpha.enabled);
+        assert_eq!(alpha.last_state_changed_at_ms, 3000);
+        assert_eq!(alpha.last_state_reason.as_deref(), Some("changed mind"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_forget_installed_plugin_removes_row() {
+        let (_dir, store) = open_temp();
+        let row = PersistedInstalledPlugin {
+            plugin_name: "org.test.alpha".into(),
+            enabled: true,
+            last_state_reason: None,
+            last_state_changed_at_ms: 1000,
+            install_digest: "sha256:aaa".into(),
+        };
+        store.record_plugin_enabled(&row).await.unwrap();
+        assert_eq!(store.load_all_installed_plugins().await.unwrap().len(), 1);
+        store
+            .forget_installed_plugin("org.test.alpha")
+            .await
+            .unwrap();
+        assert!(store.load_all_installed_plugins().await.unwrap().is_empty());
+        // Forgetting a non-existent row is a silent no-op.
+        store
+            .forget_installed_plugin("org.test.never")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_reconciliation_state_round_trip_and_upsert() {
+        let (_dir, store) = open_temp();
+        let row = PersistedReconciliationState {
+            pair_id: "audio.pipeline".into(),
+            generation: 1,
+            applied_state: serde_json::json!({"sources": ["spotify"]}),
+            applied_at_ms: 1000,
+        };
+        store.record_reconciliation_state(&row).await.unwrap();
+        let rows = store.load_all_reconciliation_state().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pair_id, "audio.pipeline");
+        assert_eq!(rows[0].generation, 1);
+
+        // Upsert: re-record with a higher generation replaces in
+        // place rather than inserting a duplicate.
+        let updated = PersistedReconciliationState {
+            pair_id: "audio.pipeline".into(),
+            generation: 2,
+            applied_state: serde_json::json!({"sources": ["spotify", "usb"]}),
+            applied_at_ms: 2000,
+        };
+        store.record_reconciliation_state(&updated).await.unwrap();
+        let rows = store.load_all_reconciliation_state().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].generation, 2);
+        assert_eq!(rows[0].applied_at_ms, 2000);
+
+        // Forget removes the row; load returns empty.
+        store
+            .forget_reconciliation_state("audio.pipeline")
+            .await
+            .unwrap();
+        assert!(store
+            .load_all_reconciliation_state()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_type_migration_round_trips_subject_and_alias() {
+        let (_dir, s) = open_temp();
+        s.record_subject_announce(AnnounceRecord {
+            canonical_id: "uuid-old",
+            subject_type: "audio_track",
+            addressings: &[ext("library", "song-1")],
+            claimant: "p1",
+            claims: &[],
+            at_ms: 1000,
+        })
+        .await
+        .unwrap();
+        s.record_subject_type_migration(TypeMigrationRecord {
+            source: "uuid-old",
+            new_id: "uuid-new",
+            from_type: "audio_track",
+            to_type: "track",
+            migration_id: "mig_01",
+            reason: Some("catalogue v3"),
+            at_ms: 2000,
+        })
+        .await
+        .unwrap();
+        let aliases = s.load_aliases_for("uuid-old").await.unwrap();
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0].kind, AliasKind::TypeMigrated);
+        assert_eq!(aliases[0].new_id, "uuid-new");
+        let all = s.load_all_subjects().await.unwrap();
+        // Old row gone; new row has the migrated type and the
+        // moved addressings.
+        let new_row = all
+            .iter()
+            .find(|r| r.id == "uuid-new")
+            .expect("new row present");
+        assert_eq!(new_row.subject_type, "track");
+        assert_eq!(new_row.addressings.len(), 1);
+        assert!(all.iter().all(|r| r.id != "uuid-old"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_pending_grammar_orphans_lifecycle() {
+        let (_dir, store) = open_temp();
+        // First observation inserts with status = pending.
+        store
+            .upsert_pending_grammar_orphan("audio_track", 4_500, 1_000)
+            .await
+            .unwrap();
+        let rows = store.list_pending_grammar_orphans().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject_type, "audio_track");
+        assert_eq!(rows[0].first_observed_at_ms, 1_000);
+        assert_eq!(rows[0].last_observed_at_ms, 1_000);
+        assert_eq!(rows[0].count, 4_500);
+        assert_eq!(rows[0].status, GrammarOrphanStatus::Pending);
+
+        // Subsequent observation updates count + last_observed_at,
+        // preserves first_observed_at.
+        store
+            .upsert_pending_grammar_orphan("audio_track", 4_600, 2_000)
+            .await
+            .unwrap();
+        let rows = store.list_pending_grammar_orphans().await.unwrap();
+        assert_eq!(rows[0].first_observed_at_ms, 1_000);
+        assert_eq!(rows[0].last_observed_at_ms, 2_000);
+        assert_eq!(rows[0].count, 4_600);
+
+        // Operator accepts; status flips to accepted.
+        let did_accept = store
+            .accept_grammar_orphan("audio_track", "deliberate retention", 3_000)
+            .await
+            .unwrap();
+        assert!(did_accept);
+        let rows = store.list_pending_grammar_orphans().await.unwrap();
+        assert_eq!(rows[0].status, GrammarOrphanStatus::Accepted);
+        assert_eq!(
+            rows[0].accepted_reason.as_deref(),
+            Some("deliberate retention")
+        );
+        assert_eq!(rows[0].accepted_at_ms, Some(3_000));
+
+        // Re-accept is idempotent (returns false, no state change).
+        let again = store
+            .accept_grammar_orphan("audio_track", "deliberate retention", 4_000)
+            .await
+            .unwrap();
+        assert!(!again);
+        let rows = store.list_pending_grammar_orphans().await.unwrap();
+        assert_eq!(rows[0].accepted_at_ms, Some(3_000));
+
+        // Acceptance preserved across a re-observation upsert.
+        store
+            .upsert_pending_grammar_orphan("audio_track", 4_600, 5_000)
+            .await
+            .unwrap();
+        let rows = store.list_pending_grammar_orphans().await.unwrap();
+        assert_eq!(rows[0].status, GrammarOrphanStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn sqlite_pending_grammar_orphan_migrating_then_resolved() {
+        let (_dir, store) = open_temp();
+        store
+            .upsert_pending_grammar_orphan("media_item", 12_000, 1_000)
+            .await
+            .unwrap();
+        store
+            .mark_grammar_orphan_migrating("media_item", "mig_01")
+            .await
+            .unwrap();
+        let rows = store.list_pending_grammar_orphans().await.unwrap();
+        assert_eq!(rows[0].status, GrammarOrphanStatus::Migrating);
+        assert_eq!(rows[0].migration_id.as_deref(), Some("mig_01"));
+
+        // Accepting an in-flight migration refuses.
+        let err = store
+            .accept_grammar_orphan("media_item", "...", 2_000)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PersistenceError::Invalid(_)));
+
+        store
+            .mark_grammar_orphan_resolved("media_item", "mig_01")
+            .await
+            .unwrap();
+        let rows = store.list_pending_grammar_orphans().await.unwrap();
+        assert_eq!(rows[0].status, GrammarOrphanStatus::Resolved);
+
+        // Migrating a resolved row refuses.
+        let err = store
+            .mark_grammar_orphan_migrating("media_item", "mig_02")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PersistenceError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_pending_grammar_orphan_recovered_re_pends_on_reorphan() {
+        let (_dir, store) = open_temp();
+        store
+            .upsert_pending_grammar_orphan("audio_track", 4_500, 1_000)
+            .await
+            .unwrap();
+        store
+            .mark_grammar_orphan_recovered("audio_track", 2_000)
+            .await
+            .unwrap();
+        let rows = store.list_pending_grammar_orphans().await.unwrap();
+        assert_eq!(rows[0].status, GrammarOrphanStatus::Recovered);
+
+        // Re-orphan: status flips back to pending.
+        store
+            .upsert_pending_grammar_orphan("audio_track", 4_500, 3_000)
+            .await
+            .unwrap();
+        let rows = store.list_pending_grammar_orphans().await.unwrap();
+        assert_eq!(rows[0].status, GrammarOrphanStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn memory_pending_grammar_orphans_mirror_sqlite_lifecycle() {
+        let store = MemoryPersistenceStore::new();
+        store
+            .upsert_pending_grammar_orphan("track", 100, 1_000)
+            .await
+            .unwrap();
+        store
+            .accept_grammar_orphan("track", "deliberate", 2_000)
+            .await
+            .unwrap();
+        store
+            .upsert_pending_grammar_orphan("track", 100, 3_000)
+            .await
+            .unwrap();
+        let rows = store.list_pending_grammar_orphans().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, GrammarOrphanStatus::Accepted);
+        assert_eq!(rows[0].last_observed_at_ms, 3_000);
+
+        // Accept an unknown row refuses.
+        let err = store
+            .accept_grammar_orphan("missing", "x", 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PersistenceError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn memory_reconciliation_state_round_trip() {
+        let store = MemoryPersistenceStore::new();
+        let row = PersistedReconciliationState {
+            pair_id: "audio.pipeline".into(),
+            generation: 7,
+            applied_state: serde_json::json!({"x": 1}),
+            applied_at_ms: 100,
+        };
+        store.record_reconciliation_state(&row).await.unwrap();
+        let rows = store.load_all_reconciliation_state().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].generation, 7);
+        store
+            .forget_reconciliation_state("audio.pipeline")
+            .await
+            .unwrap();
+        assert!(store
+            .load_all_reconciliation_state()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_installed_plugins_round_trip() {
+        let store = MemoryPersistenceStore::new();
+        let row = PersistedInstalledPlugin {
+            plugin_name: "org.test.alpha".into(),
+            enabled: false,
+            last_state_reason: Some("disabled".into()),
+            last_state_changed_at_ms: 42,
+            install_digest: "sha256:abc".into(),
+        };
+        store.record_plugin_enabled(&row).await.unwrap();
+        let rows = store.load_all_installed_plugins().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].enabled);
+        assert_eq!(rows[0].last_state_reason.as_deref(), Some("disabled"));
+        store
+            .forget_installed_plugin("org.test.alpha")
+            .await
+            .unwrap();
+        assert!(store.load_all_installed_plugins().await.unwrap().is_empty());
     }
 }

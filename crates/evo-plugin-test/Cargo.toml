@@ -1,0 +1,14 @@
+[package]
+name = "evo-plugin-test"
+description = "CI-time helpers for plugin authors building on the evo framework. Bridges the plugin's manifest declarations and its runtime describe() response so manifest drift surfaces at unit-test time, before sign / publish / admit."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+evo-plugin-sdk = { path = "../evo-plugin-sdk" }
+
+[lints]
+workspace = true

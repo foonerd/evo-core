@@ -342,6 +342,7 @@ impl Plugin for AdminExamplePlugin {
                         REQ_SUPPRESS.to_string(),
                         REQ_UNSUPPRESS.to_string(),
                     ],
+                    course_correct_verbs: vec![],
                     accepts_custody: false,
                     flags: Default::default(),
                 },

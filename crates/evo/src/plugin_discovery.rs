@@ -2,7 +2,7 @@
 //! admit out-of-process singletons. See `PLUGIN_PACKAGING.md` for
 //! directory layout.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use evo_plugin_sdk::manifest::TransportKind;
@@ -12,6 +12,7 @@ use crate::admission::AdmissionEngine;
 use crate::catalogue::Catalogue;
 use crate::config::StewardConfig;
 use crate::error::StewardError;
+use crate::happenings::Happening;
 
 /// Scan `config.plugins.search_roots`, then admit each discovered
 /// out-of-process singleton bundle. Duplicate `plugin.name` values use the
@@ -71,12 +72,57 @@ pub async fn discover_and_admit(
         }
     }
 
+    // Load the operator-disabled set from persistence. Plugins
+    // absent from the table are treated as enabled by default;
+    // only rows with `enabled = false` populate the skip-set.
+    // Persistence read failures are downgraded to a warning and
+    // the skip-set is treated as empty: a discovery pass that
+    // proceeds without the persistent state is preferable to a
+    // boot abort, since the operator-disabled bit is purely
+    // additive (its absence admits more plugins, never fewer).
+    let disabled: HashSet<String> =
+        match engine.persistence().load_all_installed_plugins().await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|row| !row.enabled)
+                .map(|row| row.plugin_name)
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to load installed_plugins; treating skip-set \
+                     as empty (every discovered plugin will be admitted)"
+                );
+                HashSet::new()
+            }
+        };
+
     let mut names: Vec<String> = by_name.keys().cloned().collect();
     names.sort();
 
     for name in names {
         let (dir, manifest) =
             by_name.get(&name).expect("name came from by_name keys");
+
+        // Operator-disabled plugins are skipped at discovery
+        // time and the structured happening is emitted so
+        // frontends can render the disabled set.
+        if disabled.contains(&name) {
+            tracing::info!(
+                plugin = %name,
+                path = %dir.display(),
+                "skipping plugin: operator-disabled"
+            );
+            let _ = engine
+                .happening_bus()
+                .emit_durable(Happening::PluginAdmissionSkipped {
+                    plugin: name.clone(),
+                    reason: "operator_disabled".to_string(),
+                    at: std::time::SystemTime::now(),
+                })
+                .await;
+            continue;
+        }
 
         // Factory admission gating lives in the admission engine.
         // Discovery surfaces every parseable manifest; admission

@@ -47,6 +47,10 @@ pub enum StewardError {
     #[error("plugin error: {0}")]
     Plugin(#[from] evo_plugin_sdk::contract::PluginError),
 
+    /// Wrapped persistence-store error.
+    #[error("persistence error: {0}")]
+    Persistence(#[from] crate::persistence::PersistenceError),
+
     /// Wrapped TOML parse error.
     #[error("TOML parse error ({context}): {source}")]
     Toml {
@@ -131,6 +135,7 @@ impl StewardError {
             Self::Plugin(e) => e.class(),
             Self::Toml { .. } => ErrorClass::Misconfiguration,
             Self::AdminTrustTooLow { .. } => ErrorClass::TrustViolation,
+            Self::Persistence(_) => ErrorClass::Internal,
         }
     }
 }

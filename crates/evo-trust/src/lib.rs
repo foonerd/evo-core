@@ -32,12 +32,12 @@ pub use digest::{
 };
 pub use error::TrustError;
 pub use key_meta::{Authorisation, KeyMeta, KeyRole, KeySection};
+pub use matchers::effective_trust_class;
+pub use matchers::name_matches_prefixes;
 pub use release_root::{
     role_for_artefact_kind, verify_release_signature, ReleaseKeyMeta,
     ReleaseKeySection, ReleaseRole, ReleaseTrustKey,
 };
-pub use matchers::effective_trust_class;
-pub use matchers::name_matches_prefixes;
 pub use revocation::RevocationSet;
 pub use trust_root::{load_trust_root, read_signature_file, TrustKey};
 pub use verify::{

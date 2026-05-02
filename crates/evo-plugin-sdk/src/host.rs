@@ -65,19 +65,23 @@
 //! Events from callbacks race with request handling; the mpsc channel
 //! serialises them into a single totally-ordered write stream.
 
-use crate::codec::{read_frame_json, write_frame_json, WireError};
+use crate::codec::{
+    read_frame, read_frame_json, write_frame, write_frame_json, Codec,
+    WireError,
+};
 use crate::contract::{
     AliasRecord, Assignment, CallDeadline, CourseCorrection, CustodyHandle,
     CustodyStateReporter, ExplicitRelationAssignment, ExternalAddressing,
-    HealthStatus, InstanceAnnouncement, InstanceAnnouncer, InstanceId,
-    LoadContext, Plugin, PluginError, RelationAdmin, RelationAnnouncer,
-    RelationAssertion, RelationRetraction, ReportError, ReportPriority,
-    Request, Respondent, SplitRelationStrategy, StateReporter, SubjectAdmin,
-    SubjectAnnouncement, SubjectAnnouncer, SubjectQuerier, SubjectQueryResult,
-    UserInteraction, UserInteractionRequester, Warden,
+    FastPathDispatcher, HealthStatus, InstanceAnnouncement, InstanceAnnouncer,
+    InstanceId, LoadContext, Plugin, PluginError, PromptOutcome, PromptRequest,
+    RelationAdmin, RelationAnnouncer, RelationAssertion, RelationRetraction,
+    ReportError, ReportPriority, Request, Respondent, SplitRelationStrategy,
+    StateBlob, StateReporter, SubjectAdmin, SubjectAnnouncement,
+    SubjectAnnouncer, SubjectQuerier, SubjectQueryResult,
+    UserInteractionRequester, Warden,
 };
 use crate::error_taxonomy::ErrorClass;
-use crate::wire::{WireFrame, PROTOCOL_VERSION};
+use crate::wire::{LiveReloadState, WireFrame, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -209,16 +213,20 @@ where
     // dispatch loop sees the wire. The plugin (this side) is the
     // answerer per the spawn model; it reads the steward's Hello,
     // picks a feature version and codec, and replies with HelloAck
-    // (or an Error frame on rejection).
-    perform_plugin_handshake(&mut reader, &mut writer, &config.plugin_name)
-        .await?;
+    // (or an Error frame on rejection). The handshake itself rides
+    // JSON for the lifetime of v1; the chosen codec it returns is
+    // what the post-handshake reader / writer loops use.
+    let codec =
+        perform_plugin_handshake(&mut reader, &mut writer, &config.plugin_name)
+            .await?;
 
     let (tx, rx) = mpsc::channel::<WireFrame>(config.event_channel_capacity);
-    let writer_task = tokio::spawn(writer_loop(writer, rx));
+    let writer_task = tokio::spawn(writer_loop(writer, codec, rx));
     let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
 
     let result =
-        dispatch_loop(plugin, &config, reader, tx, Arc::clone(&pending)).await;
+        dispatch_loop(plugin, &config, reader, codec, tx, Arc::clone(&pending))
+            .await;
 
     // Drain any pending plugin-initiated requests still awaiting a
     // response from the steward; they cannot complete now.
@@ -256,13 +264,14 @@ where
 
 async fn writer_loop<W>(
     mut writer: W,
+    codec: Codec,
     mut rx: mpsc::Receiver<WireFrame>,
 ) -> Result<(), WireError>
 where
     W: AsyncWrite + Unpin,
 {
     while let Some(frame) = rx.recv().await {
-        write_frame_json(&mut writer, &frame).await?;
+        write_frame(&mut writer, codec, &frame).await?;
     }
     Ok(())
 }
@@ -277,11 +286,13 @@ where
 /// codec overlap) writes a connection-fatal [`WireFrame::Error`]
 /// frame (class [`ErrorClass::ProtocolViolation`]) and returns a
 /// [`HostError::Protocol`] so the caller tears down the connection.
+/// Returns the negotiated [`Codec`] so the caller can thread it
+/// through the post-handshake reader / writer loops.
 async fn perform_plugin_handshake<R, W>(
     reader: &mut R,
     writer: &mut W,
     plugin_name: &str,
-) -> Result<(), HostError>
+) -> Result<Codec, HostError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -424,6 +435,20 @@ where
         }
     };
 
+    // Defensive: every name in SUPPORTED_CODECS must map back to a
+    // known [`Codec`] variant. The intersection above only picks
+    // names that appear in our list, so this should never fire;
+    // surfacing a structured Protocol error rather than panicking
+    // keeps a future contributor who adds a name to SUPPORTED_CODECS
+    // without extending [`Codec::from_name`] from crashing the
+    // plugin process.
+    let codec_value = Codec::from_name(&chosen_codec).ok_or_else(|| {
+        HostError::Protocol(format!(
+            "internal: chosen codec '{chosen_codec}' is in SUPPORTED_CODECS \
+             but has no Codec variant — extend Codec::from_name"
+        ))
+    })?;
+
     write_frame_json(
         writer,
         &WireFrame::HelloAck {
@@ -435,7 +460,7 @@ where
         },
     )
     .await?;
-    Ok(())
+    Ok(codec_value)
 }
 
 /// Item the reader task hands to the dispatch task.
@@ -456,6 +481,7 @@ async fn dispatch_loop<P, R>(
     mut plugin: P,
     config: &HostConfig,
     reader: R,
+    codec: Codec,
     tx: mpsc::Sender<WireFrame>,
     pending: Arc<Mutex<PendingMap>>,
 ) -> Result<(), HostError>
@@ -474,6 +500,7 @@ where
     let (req_tx, mut req_rx) = mpsc::channel::<ReaderItem>(1);
     let reader_task = tokio::spawn(reader_loop_serve(
         reader,
+        codec,
         Arc::clone(&pending),
         config.plugin_name.clone(),
         req_tx,
@@ -524,6 +551,7 @@ where
 /// forwarding requests to the dispatch task.
 async fn reader_loop_serve<R>(
     mut reader: R,
+    codec: Codec,
     pending: Arc<Mutex<PendingMap>>,
     expected_plugin: String,
     req_tx: mpsc::Sender<ReaderItem>,
@@ -531,7 +559,7 @@ async fn reader_loop_serve<R>(
     R: AsyncRead + Send + Unpin + 'static,
 {
     loop {
-        let frame = match read_frame_json(&mut reader).await {
+        let frame = match read_frame(&mut reader, codec).await {
             Ok(f) => f,
             Err(WireError::PeerClosed) => return,
             Err(e) => {
@@ -673,6 +701,7 @@ where
             state_dir,
             credentials_dir,
             deadline_ms,
+            live_reload_state,
         } => {
             let ctx = match build_load_context(LoadContextBuildArgs {
                 config: cfg,
@@ -696,7 +725,14 @@ where
                 }
             };
 
-            match plugin.load(&ctx).await {
+            // Cold load when no carry-over blob is present; the
+            // default `load_with_state` impl forwards to `load`,
+            // so plugins not opting in to Live see no surface
+            // change. Carry-over blobs are dispatched to the
+            // plugin's `load_with_state` for schema-aware
+            // migration.
+            let blob = live_reload_state.map(state_from_wire);
+            match plugin.load_with_state(&ctx, blob).await {
                 Ok(()) => WireFrame::LoadResponse { v, cid, plugin: p },
                 Err(e) => plugin_error_to_frame(v, cid, &p, e),
             }
@@ -716,6 +752,18 @@ where
                 cid,
                 plugin: p,
                 report,
+            }
+        }
+
+        WireFrame::PrepareForLiveReload { v, cid, plugin: p } => {
+            match plugin.prepare_for_live_reload().await {
+                Ok(blob) => WireFrame::PrepareForLiveReloadResponse {
+                    v,
+                    cid,
+                    plugin: p,
+                    state: blob.map(state_to_wire),
+                },
+                Err(e) => plugin_error_to_frame(v, cid, &p, e),
             }
         }
 
@@ -868,6 +916,37 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         }
         WireFrame::AnnounceInstance { .. } => "announce_instance",
         WireFrame::RetractInstance { .. } => "retract_instance",
+        WireFrame::PrepareForLiveReload { .. } => "prepare_for_live_reload",
+        WireFrame::PrepareForLiveReloadResponse { .. } => {
+            "prepare_for_live_reload_response"
+        }
+        WireFrame::FastPathDispatch { .. } => "fast_path_dispatch",
+        WireFrame::FastPathDispatchResponse { .. } => {
+            "fast_path_dispatch_response"
+        }
+        WireFrame::RequestUserInteraction { .. } => "request_user_interaction",
+        WireFrame::RequestUserInteractionResponse { .. } => {
+            "request_user_interaction_response"
+        }
+    }
+}
+
+/// Convert a wire-side [`LiveReloadState`] into the SDK's
+/// [`StateBlob`] for handover into [`Plugin::load_with_state`].
+fn state_from_wire(s: LiveReloadState) -> StateBlob {
+    StateBlob {
+        schema_version: s.schema_version,
+        payload: s.payload,
+    }
+}
+
+/// Convert an SDK [`StateBlob`] returned from
+/// [`Plugin::prepare_for_live_reload`] into the wire-side
+/// [`LiveReloadState`].
+fn state_to_wire(s: StateBlob) -> LiveReloadState {
+    LiveReloadState {
+        schema_version: s.schema_version,
+        payload: s.payload,
     }
 }
 
@@ -924,7 +1003,12 @@ fn build_load_context(
             plugin_name: plugin_name.to_string(),
         });
     let user_interaction_requester: Arc<dyn UserInteractionRequester> =
-        Arc::new(WireUserInteractionRequester);
+        Arc::new(WireUserInteractionRequester {
+            tx: tx.clone(),
+            event_cid: event_cid.clone(),
+            pending: Arc::clone(&pending),
+            plugin_name: plugin_name.to_string(),
+        });
     let subject_announcer: Arc<dyn SubjectAnnouncer> =
         Arc::new(WireSubjectAnnouncer {
             tx: tx.clone(),
@@ -967,11 +1051,27 @@ fn build_load_context(
         plugin_name: plugin_name.to_string(),
     });
     let relation_admin: Arc<dyn RelationAdmin> = Arc::new(WireRelationAdmin {
-        tx,
-        event_cid,
-        pending,
+        tx: tx.clone(),
+        event_cid: event_cid.clone(),
+        pending: Arc::clone(&pending),
         plugin_name: plugin_name.to_string(),
     });
+
+    // Wire-backed Fast Path dispatcher. Always populated for OOP
+    // plugins; the steward gates per-plugin sender authority by
+    // checking the dispatching plugin's
+    // `capabilities.fast_path` flag at admission and the target
+    // warden's `fast_path_verbs` per call. Plugins whose manifest
+    // does not declare `capabilities.fast_path = true` see
+    // refusals on every dispatch attempt, surfaced as
+    // `ReportError::Invalid`.
+    let fast_path_dispatcher: Arc<dyn FastPathDispatcher> =
+        Arc::new(WireFastPathDispatcher {
+            tx,
+            event_cid,
+            pending,
+            plugin_name: plugin_name.to_string(),
+        });
 
     let deadline = deadline_ms
         .map(|ms| CallDeadline(Instant::now() + Duration::from_millis(ms)));
@@ -992,6 +1092,17 @@ fn build_load_context(
         subject_querier: Some(subject_querier),
         subject_admin: Some(subject_admin),
         relation_admin: Some(relation_admin),
+        fast_path_dispatcher: Some(fast_path_dispatcher),
+        // Appointments wire-backed scheduler lands in a
+        // follow-up commit alongside the wire ops; until then
+        // OOP plugins see None and cannot create appointments
+        // through the SDK surface.
+        appointments: None,
+        // Watches wire-backed scheduler lands in a follow-up
+        // commit alongside the wire ops; until then OOP plugins
+        // see None and cannot create watches through the SDK
+        // surface.
+        watches: None,
     })
 }
 
@@ -1622,6 +1733,73 @@ impl RelationAdmin for WireRelationAdmin {
     }
 }
 
+/// Wire-backed [`FastPathDispatcher`]. Mints a fresh cid,
+/// registers a pending oneshot, sends a
+/// [`WireFrame::FastPathDispatch`] to the steward, and awaits
+/// the matching `FastPathDispatchResponse` (success) or `Error`
+/// (refusal) on the oneshot.
+///
+/// Refusals propagate as [`ReportError::Invalid`] carrying the
+/// steward-side error message verbatim. Consumers branch on the
+/// message's stable subclass tokens (`not_fast_path_eligible`,
+/// `fast_path_budget_exceeded`, `shelf_not_admitted`,
+/// `shelf_unloaded`, `shelf_not_warden`,
+/// `fast_path_dispatch_failed`) for structured handling.
+struct WireFastPathDispatcher {
+    tx: mpsc::Sender<WireFrame>,
+    event_cid: Arc<AtomicU64>,
+    pending: Arc<Mutex<PendingMap>>,
+    plugin_name: String,
+}
+
+impl FastPathDispatcher for WireFastPathDispatcher {
+    fn fast_path_dispatch<'a>(
+        &'a self,
+        target_shelf: &'a str,
+        handle: &'a CustodyHandle,
+        verb: &'a str,
+        payload: Vec<u8>,
+        deadline_ms: Option<u32>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
+        let plugin = self.plugin_name.clone();
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        let target_shelf = target_shelf.to_string();
+        let handle = handle.clone();
+        let verb = verb.to_string();
+        Box::pin(async move {
+            let rx = register_pending(&pending, cid);
+            let frame = WireFrame::FastPathDispatch {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                target_shelf,
+                handle,
+                verb,
+                payload,
+                deadline_ms,
+            };
+            if tx.send(frame).await.is_err() {
+                remove_pending(&pending, cid);
+                return Err(ReportError::ShuttingDown);
+            }
+            match rx.await {
+                Ok(WireFrame::FastPathDispatchResponse { .. }) => Ok(()),
+                Ok(WireFrame::Error { message, .. }) => {
+                    Err(ReportError::Invalid(message))
+                }
+                Ok(other) => Err(ReportError::Invalid(format!(
+                    "unexpected response frame: {}",
+                    variant_name(&other)
+                ))),
+                Err(_) => Err(ReportError::ShuttingDown),
+            }
+        })
+    }
+}
+
 /// Register a oneshot for `cid` in the pending map and return the
 /// receiver half. The dispatch loop's [`route_pending_response`]
 /// looks up `cid` and forwards the response frame on the matching
@@ -1708,20 +1886,65 @@ impl InstanceAnnouncer for WireInstanceAnnouncer {
 /// Placeholder user-interaction requester. Not yet implemented on the
 /// wire transport; this stub returns `ReportError::Invalid` so plugins
 /// that try to use it get a clear error.
-#[derive(Debug)]
-struct WireUserInteractionRequester;
-
-const USER_INTERACTION_NOT_SUPPORTED: &str =
-    "user-interaction requests are not yet supported on the wire transport";
+/// Wire-backed [`UserInteractionRequester`]. Mirrors the
+/// [`WireFastPathDispatcher`] pattern: mints a fresh cid,
+/// registers a pending oneshot, sends a
+/// [`WireFrame::RequestUserInteraction`] to the steward, and
+/// awaits the matching `RequestUserInteractionResponse` (carries
+/// the typed [`PromptOutcome`]) or `Error` (refusal) on the
+/// oneshot.
+///
+/// The wire round-trip is symmetric with the in-process trait
+/// surface: the plugin's `request_user_interaction(prompt)`
+/// call resolves with the same `Result<PromptOutcome,
+/// ReportError>` shape regardless of whether the plugin runs
+/// in-process or out-of-process.
+struct WireUserInteractionRequester {
+    tx: mpsc::Sender<WireFrame>,
+    event_cid: Arc<AtomicU64>,
+    pending: Arc<Mutex<PendingMap>>,
+    plugin_name: String,
+}
 
 impl UserInteractionRequester for WireUserInteractionRequester {
-    fn request<'a>(
+    fn request_user_interaction<'a>(
         &'a self,
-        _interaction: UserInteraction,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
-    {
-        Box::pin(async {
-            Err(ReportError::Invalid(USER_INTERACTION_NOT_SUPPORTED.into()))
+        prompt: PromptRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<PromptOutcome, ReportError>> + Send + 'a,
+        >,
+    > {
+        let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
+        let plugin = self.plugin_name.clone();
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let rx = register_pending(&pending, cid);
+            let frame = WireFrame::RequestUserInteraction {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                prompt,
+            };
+            if tx.send(frame).await.is_err() {
+                remove_pending(&pending, cid);
+                return Err(ReportError::ShuttingDown);
+            }
+            match rx.await {
+                Ok(WireFrame::RequestUserInteractionResponse {
+                    outcome,
+                    ..
+                }) => Ok(outcome),
+                Ok(WireFrame::Error { message, .. }) => {
+                    Err(ReportError::Invalid(message))
+                }
+                Ok(other) => Err(ReportError::Invalid(format!(
+                    "unexpected response frame: {}",
+                    variant_name(&other)
+                ))),
+                Err(_) => Err(ReportError::ShuttingDown),
+            }
         })
     }
 }
@@ -1762,16 +1985,23 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     // Same handshake discipline as `serve`. See its docs.
-    perform_plugin_handshake(&mut reader, &mut writer, &config.plugin_name)
-        .await?;
+    let codec =
+        perform_plugin_handshake(&mut reader, &mut writer, &config.plugin_name)
+            .await?;
 
     let (tx, rx) = mpsc::channel::<WireFrame>(config.event_channel_capacity);
-    let writer_task = tokio::spawn(writer_loop(writer, rx));
+    let writer_task = tokio::spawn(writer_loop(writer, codec, rx));
     let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
 
-    let result =
-        dispatch_loop_warden(plugin, &config, reader, tx, Arc::clone(&pending))
-            .await;
+    let result = dispatch_loop_warden(
+        plugin,
+        &config,
+        reader,
+        codec,
+        tx,
+        Arc::clone(&pending),
+    )
+    .await;
 
     drain_pending(&pending);
 
@@ -1806,6 +2036,7 @@ async fn dispatch_loop_warden<P, R>(
     mut plugin: P,
     config: &HostConfig,
     reader: R,
+    codec: Codec,
     tx: mpsc::Sender<WireFrame>,
     pending: Arc<Mutex<PendingMap>>,
 ) -> Result<(), HostError>
@@ -1818,6 +2049,7 @@ where
     let (req_tx, mut req_rx) = mpsc::channel::<ReaderItem>(1);
     let reader_task = tokio::spawn(reader_loop_serve(
         reader,
+        codec,
         Arc::clone(&pending),
         config.plugin_name.clone(),
         req_tx,
@@ -1886,6 +2118,7 @@ where
             state_dir,
             credentials_dir,
             deadline_ms,
+            live_reload_state,
         } => {
             let ctx = match build_load_context(LoadContextBuildArgs {
                 config: cfg,
@@ -1909,7 +2142,8 @@ where
                 }
             };
 
-            match plugin.load(&ctx).await {
+            let blob = live_reload_state.map(state_from_wire);
+            match plugin.load_with_state(&ctx, blob).await {
                 Ok(()) => WireFrame::LoadResponse { v, cid, plugin: p },
                 Err(e) => plugin_error_to_frame(v, cid, &p, e),
             }
@@ -1929,6 +2163,18 @@ where
                 cid,
                 plugin: p,
                 report,
+            }
+        }
+
+        WireFrame::PrepareForLiveReload { v, cid, plugin: p } => {
+            match plugin.prepare_for_live_reload().await {
+                Ok(blob) => WireFrame::PrepareForLiveReloadResponse {
+                    v,
+                    cid,
+                    plugin: p,
+                    state: blob.map(state_to_wire),
+                },
+                Err(e) => plugin_error_to_frame(v, cid, &p, e),
             }
         }
 
@@ -2277,6 +2523,7 @@ mod tests {
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec!["echo".into()],
+                        course_correct_verbs: vec![],
                         accepts_custody: false,
                         flags: Default::default(),
                     },
@@ -2353,12 +2600,15 @@ mod tests {
     }
 
     /// Drive the version/codec handshake from the test side acting
-    /// as the steward. Sends a Hello mirroring what the steward
-    /// sends in production (`FEATURE_VERSION_MIN..=FEATURE_VERSION_MAX`,
-    /// the project's `SUPPORTED_CODECS`) and validates the
-    /// plugin's HelloAck. Tests call this immediately after
-    /// spawning `serve` / `serve_warden` so the dispatch loop is
-    /// reached before any verb traffic.
+    /// as the steward. Sends Hello mirroring what the steward sends
+    /// in production (`FEATURE_VERSION_MIN..=FEATURE_VERSION_MAX`,
+    /// the project's `SUPPORTED_CODECS`) and validates the plugin's
+    /// HelloAck. Tests call this immediately after spawning `serve`
+    /// / `serve_warden` so the dispatch loop is reached before any
+    /// verb traffic. The negotiated codec is JSON: it appears first
+    /// in `SUPPORTED_CODECS`, so the answerer picks it. Tests that
+    /// need to exercise the CBOR end-to-end path use
+    /// [`drive_test_handshake_cbor`] instead.
     async fn drive_test_handshake<R, W>(
         reader: &mut R,
         writer: &mut W,
@@ -2389,6 +2639,45 @@ mod tests {
             WireFrame::HelloAck { feature, codec, .. } => {
                 assert_eq!(feature, FEATURE_VERSION_MAX);
                 assert_eq!(codec, SUPPORTED_CODECS[0]);
+            }
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+    }
+
+    /// Drive the handshake forcing the answerer to pick CBOR for
+    /// post-handshake frames. Sends Hello with `codecs = ["cbor"]`
+    /// (single-entry list) so the answerer either picks CBOR or
+    /// fails the handshake outright; asserts the HelloAck echoes
+    /// `"cbor"`. Tests that need explicit CBOR end-to-end coverage
+    /// pair this with [`crate::codec::read_frame`] /
+    /// [`crate::codec::write_frame`] passing [`Codec::Cbor`] for
+    /// every post-handshake frame.
+    async fn drive_test_handshake_cbor<R, W>(
+        reader: &mut R,
+        writer: &mut W,
+        plugin_name: &str,
+    ) where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        use crate::wire::{FEATURE_VERSION_MAX, FEATURE_VERSION_MIN};
+        write_frame_json(
+            writer,
+            &WireFrame::Hello {
+                v: PROTOCOL_VERSION,
+                cid: 0,
+                plugin: plugin_name.to_string(),
+                feature_min: FEATURE_VERSION_MIN,
+                feature_max: FEATURE_VERSION_MAX,
+                codecs: vec![Codec::Cbor.name().to_string()],
+            },
+        )
+        .await
+        .expect("test write Hello");
+        match read_frame_json(reader).await.expect("test read HelloAck") {
+            WireFrame::HelloAck { feature, codec, .. } => {
+                assert_eq!(feature, FEATURE_VERSION_MAX);
+                assert_eq!(codec, Codec::Cbor.name());
             }
             other => panic!("expected HelloAck, got {other:?}"),
         }
@@ -2485,6 +2774,7 @@ mod tests {
                 state_dir: "/tmp/state".into(),
                 credentials_dir: "/tmp/creds".into(),
                 deadline_ms: None,
+                live_reload_state: None,
             },
         )
         .await
@@ -2511,6 +2801,205 @@ mod tests {
             other => panic!("expected UnloadResponse, got {other:?}"),
         }
         assert!(unloaded.load(Ordering::Relaxed));
+
+        drop(client_w);
+        drop(client_r);
+        host.await.unwrap().unwrap();
+    }
+
+    /// Plugin that records the prepare / load_with_state
+    /// callbacks the host dispatches to it.
+    struct LiveReloadObservingPlugin {
+        name: String,
+        // What to return from prepare_for_live_reload.
+        prepare_returns: Option<Vec<u8>>,
+        // Captures the blob seen by load_with_state.
+        seen_blob: Arc<Mutex<Option<Vec<u8>>>>,
+    }
+
+    impl Plugin for LiveReloadObservingPlugin {
+        fn describe(
+            &self,
+        ) -> impl Future<Output = PluginDescription> + Send + '_ {
+            let name = self.name.clone();
+            async move {
+                PluginDescription {
+                    identity: PluginIdentity {
+                        name,
+                        version: semver::Version::new(0, 1, 1),
+                        contract: 1,
+                    },
+                    runtime_capabilities: RuntimeCapabilities {
+                        request_types: vec![],
+                        course_correct_verbs: vec![],
+                        accepts_custody: false,
+                        flags: Default::default(),
+                    },
+                    build_info: BuildInfo {
+                        plugin_build: "test".into(),
+                        sdk_version: crate::VERSION.into(),
+                        rustc_version: None,
+                        built_at: None,
+                    },
+                }
+            }
+        }
+
+        fn load<'a>(
+            &'a mut self,
+            _ctx: &'a LoadContext,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+            async move { Ok(()) }
+        }
+
+        fn unload(
+            &mut self,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
+            async move { Ok(()) }
+        }
+
+        fn health_check(
+            &self,
+        ) -> impl Future<Output = HealthReport> + Send + '_ {
+            async move { HealthReport::healthy() }
+        }
+
+        fn prepare_for_live_reload(
+            &self,
+        ) -> impl Future<Output = Result<Option<StateBlob>, PluginError>> + Send + '_
+        {
+            let payload = self.prepare_returns.clone();
+            async move {
+                Ok(payload.map(|p| StateBlob {
+                    schema_version: 7,
+                    payload: p,
+                }))
+            }
+        }
+
+        fn load_with_state<'a>(
+            &'a mut self,
+            _ctx: &'a LoadContext,
+            blob: Option<StateBlob>,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+            let seen = Arc::clone(&self.seen_blob);
+            async move {
+                let payload = blob.as_ref().map(|b| b.payload.clone());
+                *seen.lock().unwrap() = payload;
+                Ok(())
+            }
+        }
+    }
+
+    impl Respondent for LiveReloadObservingPlugin {
+        fn handle_request<'a>(
+            &'a mut self,
+            _req: &'a Request,
+        ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a
+        {
+            async move { Err(PluginError::Permanent("not used".into())) }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_for_live_reload_dispatches_to_plugin_callback() {
+        // Plugin returns Some(blob) from prepare_for_live_reload;
+        // host carries the payload through the wire response.
+        let (client, server) = duplex_pair();
+        let (server_r, server_w) = tokio::io::split(server);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+
+        let plugin = LiveReloadObservingPlugin {
+            name: "org.test.live".into(),
+            prepare_returns: Some(b"carry-me".to_vec()),
+            seen_blob: Arc::new(Mutex::new(None)),
+        };
+        let host = tokio::spawn(serve(
+            plugin,
+            HostConfig::new("org.test.live"),
+            server_r,
+            server_w,
+        ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.live")
+            .await;
+
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::PrepareForLiveReload {
+                v: PROTOCOL_VERSION,
+                cid: 1,
+                plugin: "org.test.live".into(),
+            },
+        )
+        .await
+        .unwrap();
+        match read_frame_json(&mut client_r).await.unwrap() {
+            WireFrame::PrepareForLiveReloadResponse { cid, state, .. } => {
+                assert_eq!(cid, 1);
+                let s = state.expect("plugin returned Some(blob)");
+                assert_eq!(s.schema_version, 7);
+                assert_eq!(s.payload, b"carry-me");
+            }
+            other => {
+                panic!("expected PrepareForLiveReloadResponse, got {other:?}")
+            }
+        }
+
+        drop(client_w);
+        drop(client_r);
+        host.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_with_live_reload_state_dispatches_to_load_with_state() {
+        // A Load frame carrying live_reload_state must reach the
+        // plugin's load_with_state with the same payload.
+        let (client, server) = duplex_pair();
+        let (server_r, server_w) = tokio::io::split(server);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+
+        let seen = Arc::new(Mutex::new(None));
+        let plugin = LiveReloadObservingPlugin {
+            name: "org.test.live".into(),
+            prepare_returns: None,
+            seen_blob: Arc::clone(&seen),
+        };
+        let host = tokio::spawn(serve(
+            plugin,
+            HostConfig::new("org.test.live"),
+            server_r,
+            server_w,
+        ));
+        drive_test_handshake(&mut client_r, &mut client_w, "org.test.live")
+            .await;
+
+        write_frame_json(
+            &mut client_w,
+            &WireFrame::Load {
+                v: PROTOCOL_VERSION,
+                cid: 11,
+                plugin: "org.test.live".into(),
+                config: serde_json::json!({}),
+                state_dir: "/tmp/state".into(),
+                credentials_dir: "/tmp/creds".into(),
+                deadline_ms: None,
+                live_reload_state: Some(LiveReloadState {
+                    schema_version: 4,
+                    payload: b"resumed-state".to_vec(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        match read_frame_json(&mut client_r).await.unwrap() {
+            WireFrame::LoadResponse { cid, .. } => assert_eq!(cid, 11),
+            other => panic!("expected LoadResponse, got {other:?}"),
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(b"resumed-state".to_vec()),
+            "plugin's load_with_state must receive the carried blob"
+        );
 
         drop(client_w);
         drop(client_r);
@@ -2558,6 +3047,152 @@ mod tests {
             other => panic!("expected HandleRequestResponse, got {other:?}"),
         }
 
+        drop(client_w);
+        drop(client_r);
+        host.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_request_echoes_payload_under_cbor() {
+        // CBOR end-to-end coverage: identical shape to
+        // `handle_request_echoes_payload`, but the
+        // handshake forces CBOR and every post-handshake frame
+        // rides through `read_frame` / `write_frame` with
+        // `Codec::Cbor`. Pins the binary path to the same
+        // contract as the JSON path: a `payload` byte field
+        // round-trips byte-for-byte regardless of codec.
+        let (client, server) = duplex_pair();
+        let (server_r, server_w) = tokio::io::split(server);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+
+        let plugin = TestPlugin {
+            name: "org.test.x".into(),
+            ..Default::default()
+        };
+        let host = tokio::spawn(serve(
+            plugin,
+            HostConfig::new("org.test.x"),
+            server_r,
+            server_w,
+        ));
+        drive_test_handshake_cbor(&mut client_r, &mut client_w, "org.test.x")
+            .await;
+
+        // Binary payload picked to break a JSON-fallthrough: contains
+        // bytes that would be base64-encoded under JSON. If the plugin
+        // host or the steward read_frame inadvertently took the JSON
+        // path, the assertion below catches the mismatch.
+        let binary_payload = vec![0u8, 1, 2, b'"', b'\n', 0xFF, 0xFE];
+
+        write_frame(
+            &mut client_w,
+            Codec::Cbor,
+            &WireFrame::HandleRequest {
+                v: PROTOCOL_VERSION,
+                cid: 7,
+                plugin: "org.test.x".into(),
+                request_type: "echo".into(),
+                payload: binary_payload.clone(),
+                deadline_ms: None,
+                instance_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        match read_frame(&mut client_r, Codec::Cbor).await.unwrap() {
+            WireFrame::HandleRequestResponse { cid, payload, .. } => {
+                assert_eq!(cid, 7);
+                assert_eq!(payload, binary_payload);
+            }
+            other => panic!("expected HandleRequestResponse, got {other:?}"),
+        }
+
+        drop(client_w);
+        drop(client_r);
+        host.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn describe_roundtrip_under_cbor() {
+        // CBOR end-to-end coverage for the describe path. Drives
+        // the handshake forcing CBOR and reads the
+        // `DescribeResponse` back through the binary codec.
+        let (client, server) = duplex_pair();
+        let (server_r, server_w) = tokio::io::split(server);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+
+        let plugin = TestPlugin {
+            name: "org.test.x".into(),
+            ..Default::default()
+        };
+        let host = tokio::spawn(serve(
+            plugin,
+            HostConfig::new("org.test.x"),
+            server_r,
+            server_w,
+        ));
+        drive_test_handshake_cbor(&mut client_r, &mut client_w, "org.test.x")
+            .await;
+
+        write_frame(
+            &mut client_w,
+            Codec::Cbor,
+            &WireFrame::Describe {
+                v: PROTOCOL_VERSION,
+                cid: 1,
+                plugin: "org.test.x".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        match read_frame(&mut client_r, Codec::Cbor).await.unwrap() {
+            WireFrame::DescribeResponse {
+                v,
+                cid,
+                plugin,
+                description,
+            } => {
+                assert_eq!(v, PROTOCOL_VERSION);
+                assert_eq!(cid, 1);
+                assert_eq!(plugin, "org.test.x");
+                assert_eq!(description.identity.name, "org.test.x");
+            }
+            other => panic!("expected DescribeResponse, got {other:?}"),
+        }
+
+        drop(client_w);
+        drop(client_r);
+        host.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cbor_handshake_picks_cbor_when_only_cbor_offered() {
+        // Pins the negotiation contract: when the steward's Hello
+        // advertises only CBOR, the plugin's HelloAck MUST echo
+        // CBOR rather than JSON. drive_test_handshake_cbor's own
+        // assert covers the success branch; this test stands as
+        // the explicit named contract.
+        let (client, server) = duplex_pair();
+        let (server_r, server_w) = tokio::io::split(server);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+
+        let plugin = TestPlugin {
+            name: "org.test.x".into(),
+            ..Default::default()
+        };
+        let host = tokio::spawn(serve(
+            plugin,
+            HostConfig::new("org.test.x"),
+            server_r,
+            server_w,
+        ));
+        drive_test_handshake_cbor(&mut client_r, &mut client_w, "org.test.x")
+            .await;
+
+        // Cleanly close the connection; the handshake itself is
+        // what we wanted to verify.
         drop(client_w);
         drop(client_r);
         host.await.unwrap().unwrap();
@@ -2633,6 +3268,7 @@ mod tests {
                 state_dir: "/tmp/s".into(),
                 credentials_dir: "/tmp/c".into(),
                 deadline_ms: None,
+                live_reload_state: None,
             },
         )
         .await
@@ -2802,6 +3438,7 @@ mod tests {
                 state_dir: "/tmp/s".into(),
                 credentials_dir: "/tmp/c".into(),
                 deadline_ms: None,
+                live_reload_state: None,
             },
         )
         .await
@@ -2922,6 +3559,7 @@ mod tests {
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec![],
+                        course_correct_verbs: vec![],
                         accepts_custody: true,
                         flags: Default::default(),
                     },
@@ -3489,6 +4127,7 @@ mod tests {
                 state_dir: "/tmp/s".into(),
                 credentials_dir: "/tmp/c".into(),
                 deadline_ms: None,
+                live_reload_state: None,
             },
         )
         .await

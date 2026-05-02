@@ -247,10 +247,8 @@ impl CustodyLedger {
         for (custody, snapshot) in rows {
             match custody_record_from_persisted(&custody, snapshot.as_ref()) {
                 Ok(record) => {
-                    rehydrated.insert(
-                        (custody.plugin, custody.handle_id),
-                        record,
-                    );
+                    rehydrated
+                        .insert((custody.plugin, custody.handle_id), record);
                 }
                 Err(reason) => {
                     tracing::debug!(
@@ -609,9 +607,7 @@ fn custody_record_from_persisted(
         "aborted" => CustodyStateKind::Aborted {
             reason: custody.state_reason.clone().unwrap_or_default(),
         },
-        other => {
-            return Err(format!("unknown custodies.state_kind {other:?}"))
-        }
+        other => return Err(format!("unknown custodies.state_kind {other:?}")),
     };
     let last_state = match snapshot {
         Some(s) => {
@@ -753,12 +749,15 @@ mod tests {
     #[tokio::test]
     async fn record_custody_creates_entry() {
         let ledger = CustodyLedger::new();
-        ledger.record_custody(
-            "org.test.warden",
-            "example.custody",
-            &handle("c-1"),
-            "playback",
-        ).await.unwrap();
+        ledger
+            .record_custody(
+                "org.test.warden",
+                "example.custody",
+                &handle("c-1"),
+                "playback",
+            )
+            .await
+            .unwrap();
         assert_eq!(ledger.len(), 1);
 
         let rec = ledger.describe("org.test.warden", "c-1").unwrap();
@@ -773,24 +772,30 @@ mod tests {
     #[tokio::test]
     async fn record_custody_second_call_preserves_started_at() {
         let ledger = CustodyLedger::new();
-        ledger.record_custody(
-            "org.test.warden",
-            "example.custody",
-            &handle("c-1"),
-            "playback",
-        ).await.unwrap();
+        ledger
+            .record_custody(
+                "org.test.warden",
+                "example.custody",
+                &handle("c-1"),
+                "playback",
+            )
+            .await
+            .unwrap();
         let first = ledger.describe("org.test.warden", "c-1").unwrap();
 
         // Second call with different metadata. Simulates a shelf
         // migration or a custody_type correction. started_at must not
         // change.
         std::thread::sleep(std::time::Duration::from_millis(2));
-        ledger.record_custody(
-            "org.test.warden",
-            "example.replacement",
-            &handle("c-1"),
-            "ingest",
-        ).await.unwrap();
+        ledger
+            .record_custody(
+                "org.test.warden",
+                "example.replacement",
+                &handle("c-1"),
+                "ingest",
+            )
+            .await
+            .unwrap();
         let second = ledger.describe("org.test.warden", "c-1").unwrap();
 
         assert_eq!(first.started_at, second.started_at);
@@ -802,12 +807,15 @@ mod tests {
     #[tokio::test]
     async fn record_state_creates_partial_entry() {
         let ledger = CustodyLedger::new();
-        ledger.record_state(
-            "org.test.warden",
-            "c-1",
-            b"state=playing".to_vec(),
-            HealthStatus::Healthy,
-        ).await.unwrap();
+        ledger
+            .record_state(
+                "org.test.warden",
+                "c-1",
+                b"state=playing".to_vec(),
+                HealthStatus::Healthy,
+            )
+            .await
+            .unwrap();
         assert_eq!(ledger.len(), 1);
 
         let rec = ledger.describe("org.test.warden", "c-1").unwrap();
@@ -823,18 +831,24 @@ mod tests {
     #[tokio::test]
     async fn record_state_replaces_previous_snapshot() {
         let ledger = CustodyLedger::new();
-        ledger.record_state(
-            "org.test.warden",
-            "c-1",
-            b"state=starting".to_vec(),
-            HealthStatus::Degraded,
-        ).await.unwrap();
-        ledger.record_state(
-            "org.test.warden",
-            "c-1",
-            b"state=playing".to_vec(),
-            HealthStatus::Healthy,
-        ).await.unwrap();
+        ledger
+            .record_state(
+                "org.test.warden",
+                "c-1",
+                b"state=starting".to_vec(),
+                HealthStatus::Degraded,
+            )
+            .await
+            .unwrap();
+        ledger
+            .record_state(
+                "org.test.warden",
+                "c-1",
+                b"state=playing".to_vec(),
+                HealthStatus::Healthy,
+            )
+            .await
+            .unwrap();
         let rec = ledger.describe("org.test.warden", "c-1").unwrap();
         let state = rec.last_state.expect("last_state");
         assert_eq!(state.payload, b"state=playing");
@@ -846,18 +860,24 @@ mod tests {
         // Simulates the wire-warden race: state report arrives first,
         // then record_custody finalises the metadata.
         let ledger = CustodyLedger::new();
-        ledger.record_state(
-            "org.test.warden",
-            "c-1",
-            b"state=accepted".to_vec(),
-            HealthStatus::Healthy,
-        ).await.unwrap();
-        ledger.record_custody(
-            "org.test.warden",
-            "example.custody",
-            &handle("c-1"),
-            "playback",
-        ).await.unwrap();
+        ledger
+            .record_state(
+                "org.test.warden",
+                "c-1",
+                b"state=accepted".to_vec(),
+                HealthStatus::Healthy,
+            )
+            .await
+            .unwrap();
+        ledger
+            .record_custody(
+                "org.test.warden",
+                "example.custody",
+                &handle("c-1"),
+                "playback",
+            )
+            .await
+            .unwrap();
         let rec = ledger.describe("org.test.warden", "c-1").unwrap();
         assert_eq!(rec.shelf.as_deref(), Some("example.custody"));
         assert_eq!(rec.custody_type.as_deref(), Some("playback"));
@@ -869,18 +889,24 @@ mod tests {
     async fn record_custody_then_record_state_merges() {
         // In-process warden path: record_custody first, then state.
         let ledger = CustodyLedger::new();
-        ledger.record_custody(
-            "org.test.warden",
-            "example.custody",
-            &handle("c-1"),
-            "playback",
-        ).await.unwrap();
-        ledger.record_state(
-            "org.test.warden",
-            "c-1",
-            b"state=playing".to_vec(),
-            HealthStatus::Healthy,
-        ).await.unwrap();
+        ledger
+            .record_custody(
+                "org.test.warden",
+                "example.custody",
+                &handle("c-1"),
+                "playback",
+            )
+            .await
+            .unwrap();
+        ledger
+            .record_state(
+                "org.test.warden",
+                "c-1",
+                b"state=playing".to_vec(),
+                HealthStatus::Healthy,
+            )
+            .await
+            .unwrap();
         let rec = ledger.describe("org.test.warden", "c-1").unwrap();
         assert_eq!(rec.shelf.as_deref(), Some("example.custody"));
         assert_eq!(rec.custody_type.as_deref(), Some("playback"));
@@ -891,18 +917,24 @@ mod tests {
     #[tokio::test]
     async fn release_custody_removes_and_returns_record() {
         let ledger = CustodyLedger::new();
-        ledger.record_custody(
-            "org.test.warden",
-            "example.custody",
-            &handle("c-1"),
-            "playback",
-        ).await.unwrap();
-        ledger.record_state(
-            "org.test.warden",
-            "c-1",
-            b"final".to_vec(),
-            HealthStatus::Healthy,
-        ).await.unwrap();
+        ledger
+            .record_custody(
+                "org.test.warden",
+                "example.custody",
+                &handle("c-1"),
+                "playback",
+            )
+            .await
+            .unwrap();
+        ledger
+            .record_state(
+                "org.test.warden",
+                "c-1",
+                b"final".to_vec(),
+                HealthStatus::Healthy,
+            )
+            .await
+            .unwrap();
         assert_eq!(ledger.len(), 1);
 
         let removed = ledger
@@ -933,18 +965,24 @@ mod tests {
         // Two different wardens use the same internal handle id
         // scheme. The ledger must keep them separate.
         let ledger = CustodyLedger::new();
-        ledger.record_custody(
-            "org.test.alpha",
-            "example.a",
-            &handle("c-1"),
-            "playback",
-        ).await.unwrap();
-        ledger.record_custody(
-            "org.test.beta",
-            "example.b",
-            &handle("c-1"),
-            "ingest",
-        ).await.unwrap();
+        ledger
+            .record_custody(
+                "org.test.alpha",
+                "example.a",
+                &handle("c-1"),
+                "playback",
+            )
+            .await
+            .unwrap();
+        ledger
+            .record_custody(
+                "org.test.beta",
+                "example.b",
+                &handle("c-1"),
+                "ingest",
+            )
+            .await
+            .unwrap();
         assert_eq!(ledger.len(), 2);
 
         let alpha = ledger.describe("org.test.alpha", "c-1").unwrap();
@@ -958,24 +996,33 @@ mod tests {
     #[tokio::test]
     async fn list_active_returns_every_record() {
         let ledger = CustodyLedger::new();
-        ledger.record_custody(
-            "org.test.warden",
-            "example.custody",
-            &handle("c-1"),
-            "playback",
-        ).await.unwrap();
-        ledger.record_custody(
-            "org.test.warden",
-            "example.custody",
-            &handle("c-2"),
-            "playback",
-        ).await.unwrap();
-        ledger.record_custody(
-            "org.test.other",
-            "example.other",
-            &handle("c-3"),
-            "ingest",
-        ).await.unwrap();
+        ledger
+            .record_custody(
+                "org.test.warden",
+                "example.custody",
+                &handle("c-1"),
+                "playback",
+            )
+            .await
+            .unwrap();
+        ledger
+            .record_custody(
+                "org.test.warden",
+                "example.custody",
+                &handle("c-2"),
+                "playback",
+            )
+            .await
+            .unwrap();
+        ledger
+            .record_custody(
+                "org.test.other",
+                "example.other",
+                &handle("c-3"),
+                "ingest",
+            )
+            .await
+            .unwrap();
 
         let all = ledger.list_active();
         assert_eq!(all.len(), 3);

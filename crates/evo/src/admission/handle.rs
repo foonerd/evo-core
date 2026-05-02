@@ -13,7 +13,7 @@
 
 use super::erasure::{ErasedRespondent, ErasedWarden};
 use evo_plugin_sdk::contract::{
-    HealthReport, LoadContext, PluginDescription, PluginError,
+    HealthReport, LoadContext, PluginDescription, PluginError, StateBlob,
 };
 
 /// A handle to an admitted plugin. Each admitted plugin is exactly one
@@ -68,6 +68,32 @@ impl AdmittedHandle {
         match self {
             Self::Respondent(r) => r.health_check().await,
             Self::Warden(w) => w.health_check().await,
+        }
+    }
+
+    /// Dispatch to the inner plugin's `prepare_for_live_reload`. Used
+    /// by the admission engine's Live-mode reload path to obtain a
+    /// state blob before unloading.
+    pub async fn prepare_for_live_reload(
+        &self,
+    ) -> Result<Option<StateBlob>, PluginError> {
+        match self {
+            Self::Respondent(r) => r.prepare_for_live_reload().await,
+            Self::Warden(w) => w.prepare_for_live_reload().await,
+        }
+    }
+
+    /// Dispatch to the inner plugin's `load_with_state`. Used by the
+    /// admission engine's Live-mode reload path after the previous
+    /// instance was unloaded.
+    pub async fn load_with_state(
+        &mut self,
+        ctx: &LoadContext,
+        blob: Option<StateBlob>,
+    ) -> Result<(), PluginError> {
+        match self {
+            Self::Respondent(r) => r.load_with_state(ctx, blob).await,
+            Self::Warden(w) => w.load_with_state(ctx, blob).await,
         }
     }
 

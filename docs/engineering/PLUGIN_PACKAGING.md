@@ -188,8 +188,13 @@ Evo owns three roots on a Debian Trixie device. Nothing evo writes falls outside
       org.evo.example/
         manifest.toml
         plugin.bin
-    distribution/                      # Plugins shipped by the distribution.
-      org.volumio.playback.mpd/
+    reference-device/                  # Plugins from the reference generic device.
+      org.evoframework.playback.mpd/
+        manifest.toml
+        manifest.sig
+        plugin.bin
+    distribution/                      # Plugins shipped by the distribution itself.
+      com.example.distribution.metadata/
         manifest.toml
         manifest.sig
         plugin.bin
@@ -206,7 +211,7 @@ Evo owns three roots on a Debian Trixie device. Nothing evo writes falls outside
   trust/
     evo.pem                            # Evo project's signing key.
     distribution/                      # Distribution signing keys.
-      volumio.pem
+      example-distribution.pem
     vendor/                            # Enrolled vendor keys bundled by the distribution.
       fiio.pem
       sony.pem
@@ -225,7 +230,7 @@ Evo owns three roots on a Debian Trixie device. Nothing evo writes falls outside
   trust.d/                             # Operator-installed trust keys.
     30-vendor-acme.pem
   plugins.d/                           # Per-plugin operator config.
-    org.volumio.playback.mpd.toml      # File name == plugin.name + ".toml".
+    org.evoframework.playback.mpd.toml # File name == plugin.name + ".toml".
   revocations.toml                     # Revoked plugin digests.
 ```
 
@@ -281,7 +286,8 @@ Reverse-DNS, lowercase, dot-separated. Must match the regex `^[a-z][a-z0-9]*(\.[
 Namespace conventions:
 
 - `org.evo.*` - reserved for evo project plugins.
-- `org.volumio.*`, `org.<distribution>.*` - distribution plugins.
+- `org.evoframework.*` - reference generic device plugins (brand-neutral, signed by the evo project's commons key).
+- `org.<distribution>.*` - distribution-specific plugins.
 - `com.<vendor>.*` - enrolled vendor plugins. Vendor namespace governance in `VENDOR_CONTRACT.md` section 4.
 - `org.<project>.*`, `net.<project>.*` - individual author plugins.
 
@@ -515,7 +521,7 @@ The steward's own plugin administration is expressed as a rack in the infrastruc
 
 Administration is performed by consumers projecting the `plugins` rack and issuing instructions to the operator shelf. This is the full admin surface. No parallel admin API exists.
 
-The reachable read-only inventory surface today is `op = "list_plugins"` (`CLIENT_API.md` §4.11), which returns one entry per admitted plugin (name, fully-qualified shelf, interaction kind) in router admission order. The writable verbs of the operator shelf (enable / disable / uninstall / purge-state) and the admission-origin / reloadable telemetry are deferred to a follow-up; the single-plugin lifecycle verb that is reachable today is the admission engine's `reload_plugin` entry point honouring the manifest's `lifecycle.hot_reload` policy (None / Restart).
+The read-only inventory surface is `op = "list_plugins"` (`CLIENT_API.md` §4.11), which returns one entry per admitted plugin (name, fully-qualified shelf, interaction kind) in router admission order. The writable verbs of the operator shelf — `enable_plugin`, `disable_plugin`, `uninstall_plugin`, `purge_plugin_state`, `reload_catalogue`, `reload_manifest` — are reachable on the wire under the `plugins_admin` capability. The admission engine's `reload_plugin` entry point honours the manifest's `lifecycle.hot_reload` policy (None / Restart).
 
 ## 7. Installation Lifecycle
 
@@ -665,7 +671,7 @@ Shelf shapes are published, versioned, and consumed independently of the steward
 
 Validation tooling: `evo-plugin-tool catalogue lint` already validates the catalogue document grammar (racks, shelves, subject types, predicates, inverses, the `shape_supports` discipline). A `validate-shelf-schema` subcommand consuming the per-shelf TOML in this directory ships on the same follow-on cycle as the sibling-repo spin-out.
 
-Distributions may publish their own schema repositories for domain-specific shelves. A plugin targeting a Volumio-specific shelf reads its schema from the Volumio distribution's schema publication, validates locally, then packages.
+Distributions may publish their own schema repositories for distribution-specific shelves. A plugin targeting a vendor-specific shelf reads its schema from that vendor distribution's schema publication, validates locally, then packages.
 
 ## 11. What This Document Does Not Define
 

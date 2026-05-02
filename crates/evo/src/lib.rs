@@ -113,22 +113,29 @@
 
 pub mod admin;
 pub mod admission;
+pub mod appointments;
 pub mod catalogue;
 pub mod claimant;
 pub mod cli;
 pub mod client_acl;
+pub mod coalescer;
 pub mod config;
 pub mod context;
 pub mod custody;
 pub mod error;
 pub mod error_taxonomy;
 pub mod factory;
+pub mod fast_path;
+pub mod grammar_migration;
 pub mod happenings;
 pub mod logging;
+pub mod manifest_drift;
 pub mod persistence;
 pub mod plugin_discovery;
 pub mod plugin_trust;
 pub mod projections;
+pub mod prompts;
+pub mod reconciliation;
 pub mod relations;
 pub mod resolution;
 pub mod router;
@@ -137,6 +144,9 @@ pub mod shutdown;
 pub mod state;
 pub mod subjects;
 pub mod sync;
+pub mod time_trust;
+pub mod version_skew;
+pub mod watches;
 pub mod wire_client;
 
 pub use error::StewardError;
@@ -251,6 +261,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         .catalogue
         .clone()
         .unwrap_or_else(|| config.catalogue.path.clone());
+    let catalogue_lkg_path: PathBuf = config.catalogue.lkg_path.clone();
     let socket_path: PathBuf = args
         .socket
         .clone()
@@ -262,20 +273,64 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
 
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "evo starting");
 
-    // Load the catalogue. Wrap in Arc so the relation announcer can
-    // hold a shared handle alongside the subject registry and
-    // relation graph for predicate-existence validation at assertion.
-    let catalogue = Arc::new(catalogue::Catalogue::load(&catalogue_path)?);
-    tracing::info!(
-        racks = catalogue.racks.len(),
-        shelves = catalogue
-            .racks
-            .iter()
-            .map(|r| r.shelves.len())
-            .sum::<usize>(),
-        path = %catalogue_path.display(),
-        "catalogue loaded"
+    // Load the catalogue through the three-tier resilience chain
+    // (configured → LKG → built-in). The boot never refuses on
+    // catalogue corruption: a parseably-valid tier is always reachable
+    // because the built-in skeleton is compiled in. The
+    // `LoadOutcome` carries the source tier and (when a fallback was
+    // taken) a structured reason; we surface the source on
+    // `describe_capabilities` and emit a `CatalogueFallback` happening
+    // once the bus is available.
+    let catalogue::LoadOutcome {
+        catalogue,
+        source: catalogue_source,
+        reason: catalogue_fallback_reason,
+        mirror_error: catalogue_mirror_error,
+    } = catalogue::Catalogue::load_with_fallback(
+        &catalogue_path,
+        &catalogue_lkg_path,
     );
+    let catalogue = Arc::new(catalogue);
+    if let Some(err) = &catalogue_mirror_error {
+        tracing::warn!(
+            error = %err,
+            lkg_path = %catalogue_lkg_path.display(),
+            "catalogue LKG mirror write failed; \
+             configured tier still in use, recovery on next boot \
+             will fall through to the previous LKG"
+        );
+    }
+    match catalogue_source {
+        catalogue::CatalogueSource::Configured => {
+            tracing::info!(
+                racks = catalogue.racks.len(),
+                shelves = catalogue
+                    .racks
+                    .iter()
+                    .map(|r| r.shelves.len())
+                    .sum::<usize>(),
+                path = %catalogue_path.display(),
+                source = catalogue_source.as_str(),
+                "catalogue loaded"
+            );
+        }
+        catalogue::CatalogueSource::Lkg
+        | catalogue::CatalogueSource::Builtin => {
+            tracing::warn!(
+                racks = catalogue.racks.len(),
+                shelves = catalogue
+                    .racks
+                    .iter()
+                    .map(|r| r.shelves.len())
+                    .sum::<usize>(),
+                source = catalogue_source.as_str(),
+                reason = catalogue_fallback_reason.as_deref().unwrap_or(""),
+                "catalogue loaded via resilience fallback; \
+                 a degraded boot is in progress until the operator \
+                 restores a valid configured catalogue"
+            );
+        }
+    }
 
     // Open the durable persistence store. The file is created if
     // absent; pragmas are applied to every pooled connection;
@@ -304,29 +359,124 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("loading instance_id: {e}"))?;
     tracing::info!(instance_id = %instance_id, "steward instance identified");
 
-    // Catalogue-orphan diagnostic. Boot-time scan of every persisted
-    // subject_type against the loaded catalogue's declared types: a
-    // type that appears in storage but not in the catalogue is an
-    // orphan. The diagnostic does not refuse boot or modify state.
+    let claimant_issuer =
+        Arc::new(claimant::ClaimantTokenIssuer::new(instance_id));
+
+    // Construct the happenings bus with persistence write-through
+    // and operator-tunable retention.
+    let bus = Arc::new(
+        happenings::HappeningBus::with_persistence_capacity_and_window(
+            Arc::clone(&persistence),
+            config.happenings.retention_capacity,
+            config.happenings.retention_window_secs,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("seeding happenings bus: {e}"))?,
+    );
+
+    // Catalogue-orphan diagnostic. Boot-time scan of every
+    // persisted subject_type against the loaded catalogue's
+    // declared types: a type that appears in storage but not in
+    // the catalogue is an orphan. The diagnostic upserts every
+    // discovery into `pending_grammar_orphans` (preserving any
+    // operator status the table already records) and emits one
+    // `SubjectGrammarOrphan` happening per orphan type so
+    // consumers subscribing late see the discovery via replay.
+    // Types that re-appeared since the last boot transition to
+    // `recovered`. The diagnostic does not refuse boot.
     let declared_types: std::collections::HashSet<String> =
         catalogue.subjects.iter().map(|s| s.name.clone()).collect();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
     match persistence.count_subjects_by_type().await {
         Ok(persisted) => {
             let mut orphan_types = 0usize;
             let mut orphan_rows: u64 = 0;
+            // Collect the prior pending rows so we can detect
+            // types that have moved off the orphan list (the
+            // catalogue re-declared them between boots).
+            let prior = persistence
+                .list_pending_grammar_orphans()
+                .await
+                .unwrap_or_default();
+            let mut seen_types = std::collections::HashSet::<String>::new();
             for (subject_type, count) in &persisted {
                 if !declared_types.contains(subject_type) {
+                    seen_types.insert(subject_type.clone());
+                    if let Err(e) = persistence
+                        .upsert_pending_grammar_orphan(
+                            subject_type,
+                            *count,
+                            now_ms,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            subject_type = %subject_type,
+                            "catalogue-orphan scan: upsert failed; \
+                             continuing"
+                        );
+                    }
+                    let first_observed = persistence
+                        .list_pending_grammar_orphans()
+                        .await
+                        .ok()
+                        .and_then(|rows| {
+                            rows.into_iter()
+                                .find(|r| r.subject_type == *subject_type)
+                                .map(|r| r.first_observed_at_ms)
+                        })
+                        .unwrap_or(now_ms);
+                    let _ = bus
+                        .emit_durable(
+                            happenings::Happening::SubjectGrammarOrphan {
+                                subject_type: subject_type.clone(),
+                                count: *count,
+                                first_observed_at_ms: first_observed,
+                                at: std::time::SystemTime::now(),
+                            },
+                        )
+                        .await;
                     tracing::warn!(
                         subject_type = %subject_type,
                         count = *count,
                         "catalogue orphan: persisted subjects of this type \
                          remain in storage but the loaded catalogue no longer \
-                         declares the type; these subjects are read-only via \
-                         existing queries and cannot be re-announced or \
-                         re-stated until a migration verb lands"
+                         declares the type; operator may issue \
+                         `migrate_grammar_orphans` or `accept_grammar_orphans`"
                     );
                     orphan_types += 1;
                     orphan_rows += count;
+                }
+            }
+            // Recovery path: any prior row whose type re-appeared
+            // in the loaded catalogue (and is therefore not an
+            // orphan this boot) transitions to `recovered`.
+            for row in prior.iter() {
+                if !seen_types.contains(&row.subject_type)
+                    && declared_types.contains(&row.subject_type)
+                    && !matches!(
+                        row.status,
+                        crate::persistence::GrammarOrphanStatus::Recovered
+                    )
+                {
+                    if let Err(e) = persistence
+                        .mark_grammar_orphan_recovered(
+                            &row.subject_type,
+                            now_ms,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            subject_type = %row.subject_type,
+                            "catalogue-orphan scan: recovery transition \
+                             failed; continuing"
+                        );
+                    }
                 }
             }
             if orphan_types == 0 {
@@ -354,19 +504,63 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
             );
         }
     }
-    let claimant_issuer =
-        Arc::new(claimant::ClaimantTokenIssuer::new(instance_id));
 
-    // Construct the happenings bus with persistence write-through
-    // and operator-tunable retention.
-    let bus = Arc::new(
-        happenings::HappeningBus::with_persistence_capacity_and_window(
-            Arc::clone(&persistence),
-            config.happenings.retention_capacity,
-            config.happenings.retention_window_secs,
+    // If the catalogue load took a resilience fallback, emit the
+    // structured signal exactly once at boot — before any plugin is
+    // admitted, so consumers subscribing to the wire socket observe
+    // it as the first non-`SubjectRegistered` happening on a degraded
+    // boot. The `Configured` source is silent: the steady-state path
+    // does not announce itself.
+    match catalogue_source {
+        catalogue::CatalogueSource::Configured => {}
+        catalogue::CatalogueSource::Lkg
+        | catalogue::CatalogueSource::Builtin => {
+            let _ = bus
+                .emit_durable(happenings::Happening::CatalogueFallback {
+                    source: catalogue_source.as_str().to_string(),
+                    reason: catalogue_fallback_reason
+                        .clone()
+                        .unwrap_or_default(),
+                    at: std::time::SystemTime::now(),
+                })
+                .await;
+        }
+    }
+
+    // Spawn the wall-clock trust tracker. The tracker observes the
+    // kernel's NTP synchronisation state via `evo-os-clock` and
+    // emits ClockTrustChanged / ClockAdjusted on transitions. The
+    // shared SharedTimeTrust handle is read by the server's
+    // `describe_capabilities` handler to surface the live state to
+    // consumers. The framework does not run an NTP client; the
+    // distribution's OS daemon owns sync.
+    let time_trust_shared = time_trust::new_shared();
+    let time_trust_shutdown = Arc::new(tokio::sync::Notify::new());
+    let time_trust_tracker_config = time_trust::TrackerConfig {
+        poll_interval: std::time::Duration::from_secs(
+            config.time_trust.poll_interval_secs,
+        ),
+        max_acceptable_staleness: std::time::Duration::from_millis(
+            config.time_trust.max_acceptable_staleness_ms,
+        ),
+        has_battery_rtc: config.time_trust.has_battery_rtc,
+    };
+    let time_trust_shared_for_task = Arc::clone(&time_trust_shared);
+    let time_trust_bus_for_task = Arc::clone(&bus);
+    let time_trust_shutdown_for_task = Arc::clone(&time_trust_shutdown);
+    let time_trust_task = tokio::spawn(async move {
+        time_trust::run_tracker(
+            time_trust_shared_for_task,
+            time_trust_bus_for_task,
+            time_trust_tracker_config,
+            time_trust_shutdown_for_task,
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("seeding happenings bus: {e}"))?,
+        .await;
+    });
+    tracing::info!(
+        poll_interval_secs = config.time_trust.poll_interval_secs,
+        has_battery_rtc = config.time_trust.has_battery_rtc,
+        "wall-clock trust tracker started"
     );
 
     // Spawn the happenings_log janitor.
@@ -424,17 +618,16 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     // Boot aborts on rehydrate failure for the same reason subject
     // registry rehydration aborts: serving an inconsistent view of
     // durable state is more dangerous than refusing to boot.
-    let admin_ledger =
-        Arc::new(admin::AdminLedger::with_persistence(Arc::clone(&persistence)));
+    let admin_ledger = Arc::new(admin::AdminLedger::with_persistence(
+        Arc::clone(&persistence),
+    ));
     if let Err(e) = admin_ledger.rehydrate_from(persistence.as_ref()).await {
         tracing::error!(
             error = %e,
             "admin ledger rehydration failed; aborting boot to avoid \
              serving an inconsistent in-memory view of durable state"
         );
-        return Err(anyhow::anyhow!(
-            "admin ledger rehydration failed: {e}"
-        ));
+        return Err(anyhow::anyhow!("admin ledger rehydration failed: {e}"));
     }
 
     // Same shape for the custody ledger: durable write-through plus
@@ -448,9 +641,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
             "custody ledger rehydration failed; aborting boot to avoid \
              serving an inconsistent in-memory view of durable state"
         );
-        return Err(anyhow::anyhow!(
-            "custody ledger rehydration failed: {e}"
-        ));
+        return Err(anyhow::anyhow!("custody ledger rehydration failed: {e}"));
     }
 
     // Relation graph rehydration: load every (relation, claimants)
@@ -465,9 +656,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
             "relation graph rehydration failed; aborting boot to avoid \
              serving an inconsistent in-memory view of durable state"
         );
-        return Err(anyhow::anyhow!(
-            "relation graph rehydration failed: {e}"
-        ));
+        return Err(anyhow::anyhow!("relation graph rehydration failed: {e}"));
     }
 
     // Build the shared steward state once.
@@ -483,8 +672,27 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         .conflict_index(Arc::clone(&conflict_index))
         .build()?;
 
-    // Construct the admission engine and run the distribution-
-    // supplied admission setup (default: plugin discovery).
+    // Construct the prompt ledger before the admission engine so
+    // we can stamp every wire-side adapter (WireRespondent /
+    // WireWarden) with a clone of the handle as the engine
+    // admits each plugin. The ledger backs the user-interaction
+    // routing surface (plugin issues prompt, framework parks
+    // the request future, consumer answers via the responder
+    // capability).
+    let prompt_ledger = Arc::new(prompts::PromptLedger::new());
+
+    // Construct the appointments + watches ledgers + runtimes
+    // BEFORE running admission so plugins declaring
+    // `capabilities.appointments = true` /
+    // `capabilities.watches = true` get their in-process
+    // trait handles populated at load time. The runtimes need
+    // the router; we extract it from the freshly-constructed
+    // admission engine, build the runtimes, then stamp them on
+    // the engine via builder setters before admission walks the
+    // catalogue.
+    let appointment_ledger = Arc::new(appointments::AppointmentLedger::new());
+    let watch_ledger = Arc::new(watches::WatchLedger::new());
+
     let trust = plugin_trust::load_plugin_trust_arc(&config)?;
     let mut engine = admission::AdmissionEngine::new(
         Arc::clone(&state),
@@ -492,7 +700,29 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         config.plugins.config_dir.clone(),
         Some(trust),
         config.plugins.security.clone(),
+    )
+    .with_prompt_ledger(Arc::clone(&prompt_ledger));
+
+    let router = Arc::clone(engine.router());
+
+    let appointments = appointments::AppointmentRuntime::start(
+        Arc::clone(&appointment_ledger),
+        Arc::clone(&router),
+        Arc::clone(&state.bus),
+        Arc::clone(&time_trust_shared),
+        None,
     );
+    let watches_runtime = watches::WatchRuntime::start(
+        Arc::clone(&watch_ledger),
+        Arc::clone(&router),
+        Arc::clone(&state.bus),
+        Arc::clone(&time_trust_shared),
+    );
+
+    engine = engine
+        .with_appointments(Arc::clone(&appointments))
+        .with_watches(Arc::clone(&watches_runtime));
+
     admission(&mut engine, &config).await?;
 
     // Construct a projection engine.
@@ -504,13 +734,16 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         .with_conflict_index(Arc::clone(&conflict_index)),
     );
 
-    // Clone an Arc to the router so the server can dispatch directly
-    // through it without acquiring the admission-engine mutex.
-    let router = Arc::clone(engine.router());
-
     // Wrap engine for shared access between any future admission-side
     // mutations and the final drain.
     let engine = Arc::new(Mutex::new(engine));
+
+    // Start the per-pair reconciliation coordinator.
+    let reconciliation = reconciliation::ReconciliationCoordinator::start(
+        Arc::clone(&state),
+        Arc::clone(&router),
+    )
+    .await;
 
     // Spawn the factory-orphan scrub task. After the operator-
     // configured grace window expires, the task walks every persisted
@@ -558,7 +791,11 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     // `resolve_claimants` call.
     let resolution_ledger = Arc::new(resolution::ResolutionLedger::new());
 
-    // Start the server.
+    // Start the server. Engine handle is wired so the
+    // operator-issued plugin lifecycle and reload verbs reach
+    // the admission engine through the wire dispatcher; the
+    // reconciliation coordinator is wired so the operator-issued
+    // reconciliation read-only and admin verbs reach it.
     let server = server::Server::with_acl(
         socket_path.clone(),
         router,
@@ -567,7 +804,15 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         Arc::clone(&client_acl),
         steward_identity,
         Arc::clone(&resolution_ledger),
-    );
+        catalogue_source,
+        Arc::clone(&time_trust_shared),
+        config.time_trust.has_battery_rtc,
+    )
+    .with_engine(Arc::clone(&engine))
+    .with_reconciliation(Arc::clone(&reconciliation))
+    .with_prompt_ledger(Arc::clone(&prompt_ledger))
+    .with_appointments(Arc::clone(&appointments))
+    .with_watches(Arc::clone(&watches_runtime));
 
     tracing::warn!(socket = %socket_path.display(), "evo ready");
 
@@ -607,6 +852,15 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     janitor_shutdown.notify_waiters();
     if let Err(e) = janitor_task.await {
         tracing::warn!(error = %e, "happenings_log janitor task did not join cleanly");
+    }
+
+    // Notify the time-trust tracker and join its task.
+    time_trust_shutdown.notify_waiters();
+    if let Err(e) = time_trust_task.await {
+        tracing::warn!(
+            error = %e,
+            "time-trust tracker task did not join cleanly"
+        );
     }
 
     // Drain: unload every admitted plugin under a global deadline.

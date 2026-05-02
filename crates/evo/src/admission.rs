@@ -67,7 +67,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 /// The admission engine.
 ///
@@ -131,6 +131,27 @@ pub struct AdmissionEngine {
     /// have no entry here; reload refuses them with a structured
     /// error pointing at unload + admit.
     plugin_origins: std::sync::Mutex<HashMap<String, PathBuf>>,
+    /// Prompt ledger handle. Populated via
+    /// [`Self::with_prompt_ledger`]; the engine stamps each
+    /// out-of-process [`crate::wire_client::WireRespondent`] /
+    /// [`crate::wire_client::WireWarden`] with a clone after
+    /// `connect` so the EventSink built at `load` time routes
+    /// `RequestUserInteraction` frames into the ledger.
+    prompt_ledger: Option<Arc<crate::prompts::PromptLedger>>,
+    /// Appointments runtime handle. Populated via
+    /// [`Self::with_appointments`]; the engine stamps each
+    /// in-process plugin's [`LoadContext`] with a router-backed
+    /// [`crate::context::RouterAppointmentScheduler`] when its
+    /// manifest declares `capabilities.appointments = true`.
+    /// Out-of-process plugins reach the runtime via the same
+    /// adapter once the wire-side surface lands.
+    appointments_runtime: Option<Arc<crate::appointments::AppointmentRuntime>>,
+    /// Watches runtime handle. Populated via
+    /// [`Self::with_watches`]; the engine stamps each
+    /// in-process plugin's [`LoadContext`] with a router-backed
+    /// [`crate::context::RouterWatchScheduler`] when its
+    /// manifest declares `capabilities.watches = true`.
+    watches_runtime: Option<Arc<crate::watches::WatchRuntime>>,
 }
 
 impl std::fmt::Debug for AdmissionEngine {
@@ -174,7 +195,55 @@ impl AdmissionEngine {
             plugins_security,
             factory_announcers: std::sync::Mutex::new(HashMap::new()),
             plugin_origins: std::sync::Mutex::new(HashMap::new()),
+            prompt_ledger: None,
+            appointments_runtime: None,
+            watches_runtime: None,
         }
+    }
+
+    /// Builder-style setter for the watches-runtime handle.
+    /// Plugins whose manifest declares
+    /// `capabilities.watches = true` get a router-backed
+    /// scheduler stamped on their [`LoadContext`] only when
+    /// this handle is set.
+    pub fn with_watches(
+        mut self,
+        runtime: Arc<crate::watches::WatchRuntime>,
+    ) -> Self {
+        self.watches_runtime = Some(runtime);
+        self
+    }
+
+    /// Builder-style setter for the appointments-runtime handle.
+    /// Plugins whose manifest declares
+    /// `capabilities.appointments = true` get a router-backed
+    /// scheduler stamped on their [`LoadContext`] only when this
+    /// handle is set. Plugins admitted before
+    /// `with_appointments` is called have no scheduler on their
+    /// LoadContext and unwrap-on-call surfaces the
+    /// configuration omission loudly.
+    pub fn with_appointments(
+        mut self,
+        runtime: Arc<crate::appointments::AppointmentRuntime>,
+    ) -> Self {
+        self.appointments_runtime = Some(runtime);
+        self
+    }
+
+    /// Builder-style setter for the prompt ledger handle. The
+    /// engine stamps it onto each [`crate::wire_client::WireRespondent`]
+    /// / [`crate::wire_client::WireWarden`] adapter at admission
+    /// time. Plugins admitted before `with_prompt_ledger` is
+    /// called have no ledger handle on their EventSink and
+    /// surface a structured `prompt_ledger_not_configured`
+    /// error on every `RequestUserInteraction` frame; this is
+    /// loud-by-design.
+    pub fn with_prompt_ledger(
+        mut self,
+        ledger: Arc<crate::prompts::PromptLedger>,
+    ) -> Self {
+        self.prompt_ledger = Some(ledger);
+        self
     }
 
     /// Borrow the [`PluginRouter`] handle this engine constructed.
@@ -232,7 +301,14 @@ impl AdmissionEngine {
     /// Borrow a handle to the catalogue this engine validates
     /// admissions against.
     pub fn catalogue(&self) -> Arc<Catalogue> {
-        Arc::clone(&self.state.catalogue)
+        self.state.current_catalogue()
+    }
+
+    /// Borrow a handle to the persistence store. The discovery
+    /// pass consults this for the operator-disabled set;
+    /// operator-issued plugin lifecycle verbs write through it.
+    pub fn persistence(&self) -> Arc<dyn crate::persistence::PersistenceStore> {
+        Arc::clone(&self.state.persistence)
     }
 
     /// Number of currently admitted plugins.
@@ -272,11 +348,9 @@ impl AdmissionEngine {
         validation::check_admin_trust(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
-        let shelf = self
-            .state
-            .catalogue
-            .find_shelf(&shelf_qualified)
-            .ok_or_else(|| {
+        let catalogue = self.state.current_catalogue();
+        let shelf =
+            catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
                 StewardError::Admission(format!(
                     "{}: target shelf not in catalogue: {}",
                     manifest.plugin.name, shelf_qualified
@@ -350,18 +424,27 @@ impl AdmissionEngine {
             )));
         }
 
+        validation::check_drift_and_skew(
+            &manifest,
+            &description.runtime_capabilities,
+            &self.state.bus,
+        )
+        .await?;
+
         let ctx = build_load_context(
             &self.plugin_data_root,
             &self.plugins_config_dir,
             &manifest,
             Arc::clone(&self.state.subjects),
             Arc::clone(&self.state.relations),
-            Arc::clone(&self.state.catalogue),
+            self.state.current_catalogue(),
             Arc::clone(&self.state.bus),
             Arc::clone(&self.state.admin),
             Arc::clone(&self.router),
             Arc::clone(&self.state.persistence),
             Arc::clone(&self.state.conflict_index),
+            self.appointments_runtime.clone(),
+            self.watches_runtime.clone(),
         )?;
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -379,12 +462,15 @@ impl AdmissionEngine {
             "plugin admitted"
         );
 
-        let entry = Arc::new(PluginEntry::new_with_policy(
-            manifest.plugin.name.clone(),
-            shelf_qualified.clone(),
-            handle,
-            EnforcementPolicy::from_manifest(&manifest),
-        ));
+        let entry = Arc::new(
+            PluginEntry::new_with_policy(
+                manifest.plugin.name.clone(),
+                shelf_qualified.clone(),
+                handle,
+                EnforcementPolicy::from_manifest(&manifest),
+            )
+            .with_manifest(Arc::new(manifest.clone())),
+        );
         self.router.insert(entry)?;
 
         // Record the plugin's version against its claimant token so
@@ -423,11 +509,9 @@ impl AdmissionEngine {
         validation::check_admin_trust(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
-        let shelf = self
-            .state
-            .catalogue
-            .find_shelf(&shelf_qualified)
-            .ok_or_else(|| {
+        let catalogue = self.state.current_catalogue();
+        let shelf =
+            catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
                 StewardError::Admission(format!(
                     "{}: target shelf not in catalogue: {}",
                     manifest.plugin.name, shelf_qualified
@@ -500,18 +584,27 @@ impl AdmissionEngine {
             )));
         }
 
+        validation::check_drift_and_skew(
+            &manifest,
+            &description.runtime_capabilities,
+            &self.state.bus,
+        )
+        .await?;
+
         let ctx = build_load_context(
             &self.plugin_data_root,
             &self.plugins_config_dir,
             &manifest,
             Arc::clone(&self.state.subjects),
             Arc::clone(&self.state.relations),
-            Arc::clone(&self.state.catalogue),
+            self.state.current_catalogue(),
             Arc::clone(&self.state.bus),
             Arc::clone(&self.state.admin),
             Arc::clone(&self.router),
             Arc::clone(&self.state.persistence),
             Arc::clone(&self.state.conflict_index),
+            self.appointments_runtime.clone(),
+            self.watches_runtime.clone(),
         )?;
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -529,12 +622,15 @@ impl AdmissionEngine {
             "plugin admitted"
         );
 
-        let entry = Arc::new(PluginEntry::new_with_policy(
-            manifest.plugin.name.clone(),
-            shelf_qualified.clone(),
-            handle,
-            EnforcementPolicy::from_manifest(&manifest),
-        ));
+        let entry = Arc::new(
+            PluginEntry::new_with_policy(
+                manifest.plugin.name.clone(),
+                shelf_qualified.clone(),
+                handle,
+                EnforcementPolicy::from_manifest(&manifest),
+            )
+            .with_manifest(Arc::new(manifest.clone())),
+        );
         self.router.insert(entry)?;
 
         // Record the plugin's version against its claimant token so
@@ -581,11 +677,9 @@ impl AdmissionEngine {
         validation::check_admin_trust(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
-        let shelf = self
-            .state
-            .catalogue
-            .find_shelf(&shelf_qualified)
-            .ok_or_else(|| {
+        let catalogue = self.state.current_catalogue();
+        let shelf =
+            catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
                 StewardError::Admission(format!(
                     "{}: target shelf not in catalogue: {}",
                     manifest.plugin.name, shelf_qualified
@@ -665,6 +759,13 @@ impl AdmissionEngine {
             )));
         }
 
+        validation::check_drift_and_skew(
+            &manifest,
+            &description.runtime_capabilities,
+            &self.state.bus,
+        )
+        .await?;
+
         let announcer = Arc::new(
             RegistryInstanceAnnouncer::new(
                 Arc::clone(&self.state.subjects),
@@ -682,12 +783,14 @@ impl AdmissionEngine {
             &manifest,
             Arc::clone(&self.state.subjects),
             Arc::clone(&self.state.relations),
-            Arc::clone(&self.state.catalogue),
+            self.state.current_catalogue(),
             Arc::clone(&self.state.bus),
             Arc::clone(&self.state.admin),
             Arc::clone(&self.router),
             Arc::clone(&self.state.persistence),
             Arc::clone(&self.state.conflict_index),
+            self.appointments_runtime.clone(),
+            self.watches_runtime.clone(),
         )?;
         ctx.instance_announcer =
             Arc::clone(&announcer) as Arc<dyn InstanceAnnouncer>;
@@ -719,12 +822,15 @@ impl AdmissionEngine {
             "factory plugin admitted"
         );
 
-        let entry = Arc::new(PluginEntry::new_with_policy(
-            manifest.plugin.name.clone(),
-            shelf_qualified.clone(),
-            handle,
-            EnforcementPolicy::from_manifest(&manifest),
-        ));
+        let entry = Arc::new(
+            PluginEntry::new_with_policy(
+                manifest.plugin.name.clone(),
+                shelf_qualified.clone(),
+                handle,
+                EnforcementPolicy::from_manifest(&manifest),
+            )
+            .with_manifest(Arc::new(manifest.clone())),
+        );
         self.router.insert(entry)?;
 
         self.state.claimant_issuer.record_version(
@@ -763,11 +869,9 @@ impl AdmissionEngine {
         validation::check_admin_trust(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
-        let shelf = self
-            .state
-            .catalogue
-            .find_shelf(&shelf_qualified)
-            .ok_or_else(|| {
+        let catalogue = self.state.current_catalogue();
+        let shelf =
+            catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
                 StewardError::Admission(format!(
                     "{}: target shelf not in catalogue: {}",
                     manifest.plugin.name, shelf_qualified
@@ -842,6 +946,13 @@ impl AdmissionEngine {
             )));
         }
 
+        validation::check_drift_and_skew(
+            &manifest,
+            &description.runtime_capabilities,
+            &self.state.bus,
+        )
+        .await?;
+
         let announcer = Arc::new(
             RegistryInstanceAnnouncer::new(
                 Arc::clone(&self.state.subjects),
@@ -859,12 +970,14 @@ impl AdmissionEngine {
             &manifest,
             Arc::clone(&self.state.subjects),
             Arc::clone(&self.state.relations),
-            Arc::clone(&self.state.catalogue),
+            self.state.current_catalogue(),
             Arc::clone(&self.state.bus),
             Arc::clone(&self.state.admin),
             Arc::clone(&self.router),
             Arc::clone(&self.state.persistence),
             Arc::clone(&self.state.conflict_index),
+            self.appointments_runtime.clone(),
+            self.watches_runtime.clone(),
         )?;
         ctx.instance_announcer =
             Arc::clone(&announcer) as Arc<dyn InstanceAnnouncer>;
@@ -894,12 +1007,15 @@ impl AdmissionEngine {
             "factory plugin admitted"
         );
 
-        let entry = Arc::new(PluginEntry::new_with_policy(
-            manifest.plugin.name.clone(),
-            shelf_qualified.clone(),
-            handle,
-            EnforcementPolicy::from_manifest(&manifest),
-        ));
+        let entry = Arc::new(
+            PluginEntry::new_with_policy(
+                manifest.plugin.name.clone(),
+                shelf_qualified.clone(),
+                handle,
+                EnforcementPolicy::from_manifest(&manifest),
+            )
+            .with_manifest(Arc::new(manifest.clone())),
+        );
         self.router.insert(entry)?;
 
         self.state.claimant_issuer.record_version(
@@ -948,11 +1064,9 @@ impl AdmissionEngine {
         validation::check_admin_trust(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
-        let shelf = self
-            .state
-            .catalogue
-            .find_shelf(&shelf_qualified)
-            .ok_or_else(|| {
+        let catalogue = self.state.current_catalogue();
+        let shelf =
+            catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
                 StewardError::Admission(format!(
                     "{}: target shelf not in catalogue: {}",
                     manifest.plugin.name, shelf_qualified
@@ -993,7 +1107,7 @@ impl AdmissionEngine {
         // Connect and eagerly describe. If either the connection or
         // the initial describe fails we return here with no partial
         // state.
-        let respondent = crate::wire_client::WireRespondent::connect(
+        let mut respondent = crate::wire_client::WireRespondent::connect(
             reader,
             writer,
             manifest.plugin.name.clone(),
@@ -1005,6 +1119,9 @@ impl AdmissionEngine {
                 manifest.plugin.name, e
             ))
         })?;
+        if let Some(ledger) = &self.prompt_ledger {
+            respondent.set_prompt_ledger(Arc::clone(ledger));
+        }
 
         let description = respondent.description();
         if description.identity.name != manifest.plugin.name {
@@ -1030,6 +1147,13 @@ impl AdmissionEngine {
             )));
         }
 
+        validation::check_drift_and_skew(
+            &manifest,
+            &description.runtime_capabilities,
+            &self.state.bus,
+        )
+        .await?;
+
         let mut handle = AdmittedHandle::Respondent(Box::new(respondent));
 
         let mut ctx = build_load_context(
@@ -1038,12 +1162,14 @@ impl AdmissionEngine {
             &manifest,
             Arc::clone(&self.state.subjects),
             Arc::clone(&self.state.relations),
-            Arc::clone(&self.state.catalogue),
+            self.state.current_catalogue(),
             Arc::clone(&self.state.bus),
             Arc::clone(&self.state.admin),
             Arc::clone(&self.router),
             Arc::clone(&self.state.persistence),
             Arc::clone(&self.state.conflict_index),
+            self.appointments_runtime.clone(),
+            self.watches_runtime.clone(),
         )?;
 
         // For factory plugins, swap the default LoggingInstanceAnnouncer
@@ -1054,9 +1180,10 @@ impl AdmissionEngine {
         // so StartupOnly / ShutdownOnly are operator-controllable for
         // OOP factories. The wiring layer's WireRespondent::load reads
         // ctx.instance_announcer when constructing the EventSink.
-        let factory_announcer =
-            if manifest.kind.instance == InstanceShape::Factory {
-                let announcer = Arc::new(
+        let factory_announcer = if manifest.kind.instance
+            == InstanceShape::Factory
+        {
+            let announcer = Arc::new(
                     RegistryInstanceAnnouncer::new(
                         Arc::clone(&self.state.subjects),
                         Arc::clone(&self.state.bus),
@@ -1066,12 +1193,12 @@ impl AdmissionEngine {
                     )
                     .with_persistence(Arc::clone(&self.state.persistence)),
                 );
-                ctx.instance_announcer =
-                    Arc::clone(&announcer) as Arc<dyn InstanceAnnouncer>;
-                Some(announcer)
-            } else {
-                None
-            };
+            ctx.instance_announcer =
+                Arc::clone(&announcer) as Arc<dyn InstanceAnnouncer>;
+            Some(announcer)
+        } else {
+            None
+        };
 
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -1104,12 +1231,15 @@ impl AdmissionEngine {
             "plugin admitted"
         );
 
-        let entry = Arc::new(PluginEntry::new_with_policy(
-            manifest.plugin.name.clone(),
-            shelf_qualified.clone(),
-            handle,
-            EnforcementPolicy::from_manifest(&manifest),
-        ));
+        let entry = Arc::new(
+            PluginEntry::new_with_policy(
+                manifest.plugin.name.clone(),
+                shelf_qualified.clone(),
+                handle,
+                EnforcementPolicy::from_manifest(&manifest),
+            )
+            .with_manifest(Arc::new(manifest.clone())),
+        );
         self.router.insert(entry)?;
 
         // Record the plugin's version against its claimant token so
@@ -1151,11 +1281,9 @@ impl AdmissionEngine {
         validation::check_admin_trust(&manifest)?;
 
         let shelf_qualified = manifest.target.shelf.clone();
-        let shelf = self
-            .state
-            .catalogue
-            .find_shelf(&shelf_qualified)
-            .ok_or_else(|| {
+        let catalogue = self.state.current_catalogue();
+        let shelf =
+            catalogue.find_shelf(&shelf_qualified).ok_or_else(|| {
                 StewardError::Admission(format!(
                     "{}: target shelf not in catalogue: {}",
                     manifest.plugin.name, shelf_qualified
@@ -1197,7 +1325,7 @@ impl AdmissionEngine {
         // ledger and happenings bus to WireWarden so its load()
         // installs a LedgerCustodyStateReporter in the event sink
         // that updates both.
-        let warden = crate::wire_client::WireWarden::connect(
+        let mut warden = crate::wire_client::WireWarden::connect(
             reader,
             writer,
             manifest.plugin.name.clone(),
@@ -1211,6 +1339,9 @@ impl AdmissionEngine {
                 manifest.plugin.name, e
             ))
         })?;
+        if let Some(ledger) = &self.prompt_ledger {
+            warden.set_prompt_ledger(Arc::clone(ledger));
+        }
 
         let description = warden.description();
         if description.identity.name != manifest.plugin.name {
@@ -1236,6 +1367,13 @@ impl AdmissionEngine {
             )));
         }
 
+        validation::check_drift_and_skew(
+            &manifest,
+            &description.runtime_capabilities,
+            &self.state.bus,
+        )
+        .await?;
+
         let mut handle = AdmittedHandle::Warden(Box::new(warden));
 
         let mut ctx = build_load_context(
@@ -1244,21 +1382,24 @@ impl AdmissionEngine {
             &manifest,
             Arc::clone(&self.state.subjects),
             Arc::clone(&self.state.relations),
-            Arc::clone(&self.state.catalogue),
+            self.state.current_catalogue(),
             Arc::clone(&self.state.bus),
             Arc::clone(&self.state.admin),
             Arc::clone(&self.router),
             Arc::clone(&self.state.persistence),
             Arc::clone(&self.state.conflict_index),
+            self.appointments_runtime.clone(),
+            self.watches_runtime.clone(),
         )?;
 
         // For factory plugins, swap the default LoggingInstanceAnnouncer
         // for a real RegistryInstanceAnnouncer. See the parallel block
         // in admit_out_of_process_respondent for the rationale +
         // RetractionPolicy::Dynamic default for OOP factories.
-        let factory_announcer =
-            if manifest.kind.instance == InstanceShape::Factory {
-                let announcer = Arc::new(
+        let factory_announcer = if manifest.kind.instance
+            == InstanceShape::Factory
+        {
+            let announcer = Arc::new(
                     RegistryInstanceAnnouncer::new(
                         Arc::clone(&self.state.subjects),
                         Arc::clone(&self.state.bus),
@@ -1268,12 +1409,12 @@ impl AdmissionEngine {
                     )
                     .with_persistence(Arc::clone(&self.state.persistence)),
                 );
-                ctx.instance_announcer =
-                    Arc::clone(&announcer) as Arc<dyn InstanceAnnouncer>;
-                Some(announcer)
-            } else {
-                None
-            };
+            ctx.instance_announcer =
+                Arc::clone(&announcer) as Arc<dyn InstanceAnnouncer>;
+            Some(announcer)
+        } else {
+            None
+        };
 
         handle.load(&ctx).await.map_err(|e| {
             StewardError::Admission(format!(
@@ -1306,12 +1447,15 @@ impl AdmissionEngine {
             "plugin admitted"
         );
 
-        let entry = Arc::new(PluginEntry::new_with_policy(
-            manifest.plugin.name.clone(),
-            shelf_qualified.clone(),
-            handle,
-            EnforcementPolicy::from_manifest(&manifest),
-        ));
+        let entry = Arc::new(
+            PluginEntry::new_with_policy(
+                manifest.plugin.name.clone(),
+                shelf_qualified.clone(),
+                handle,
+                EnforcementPolicy::from_manifest(&manifest),
+            )
+            .with_manifest(Arc::new(manifest.clone())),
+        );
         self.router.insert(entry)?;
 
         // Record the plugin's version against its claimant token so
@@ -1577,27 +1721,38 @@ impl AdmissionEngine {
     ///   The plugin author opted out of hot reload; respecting
     ///   that choice is correct behaviour.
     /// - `HotReloadPolicy::Restart` — the steward unloads the
-    ///   plugin and re-admits it from the same source. Today the
-    ///   only reachable origin is
+    ///   plugin and re-admits it from the same source. Reachable
+    ///   only for plugins admitted via
     ///   [`Self::admit_out_of_process_from_directory`]; plugins
     ///   admitted via the typed in-process or programmatic OOP
     ///   `admit_*` entry points have no recorded directory and
     ///   are refused with a structured error pointing at the
     ///   distribution-layer admit code.
-    /// - `HotReloadPolicy::Live` — refused. The wire-side
-    ///   `reload_in_place` verb is documented but not yet on the
-    ///   wire; the SDK host returns `ReportError::Invalid` for
-    ///   it. Live reload becomes operative when that verb ships.
+    /// - `HotReloadPolicy::Live` — for in-process plugins, the
+    ///   framework calls `prepare_for_live_reload` to obtain a
+    ///   state blob, unloads the plugin, builds a fresh
+    ///   `LoadContext`, and calls `load_with_state`. Plugin's
+    ///   static binary code stays the same; what gets refreshed
+    ///   is everything `LoadContext` provides (catalogue, config,
+    ///   handles, etc.). Failure rolls back per the rollback
+    ///   policy in the lifecycle decision: failure during
+    ///   `load_with_state` triggers a cold reload (unload +
+    ///   load with `blob = None`); the plugin loses its prior
+    ///   state but stays admitted. For OOP plugins, Live mode
+    ///   is refused in this build; the cross-process state-
+    ///   handover wire frames land in a future release.
     ///
     /// `runtime_dir` mirrors the parameter on
     /// [`Self::admit_out_of_process_from_directory`]; it must
-    /// exist and be writable by the steward.
+    /// exist and be writable by the steward. Unused for Live
+    /// mode of in-process plugins.
     ///
-    /// On success, the plugin is unloaded and re-admitted; the
-    /// shelf may briefly hold no plugin during the gap. Callers
-    /// observing the happenings stream see one `unload` event
-    /// followed by a fresh admit (and any factory-instance
-    /// re-announcements) per the standard admission paths.
+    /// On success the plugin is reloaded; observers see the
+    /// reload-lifecycle happenings
+    /// (`PluginLiveReloadStarted` → one of
+    /// `PluginLiveReloadCompleted` / `PluginLiveReloadFailed`)
+    /// for Live mode, or the unload + admit event pair for
+    /// Restart mode.
     pub async fn reload_plugin(
         &mut self,
         plugin_name: &str,
@@ -1605,15 +1760,17 @@ impl AdmissionEngine {
     ) -> Result<(), StewardError> {
         // Look up the plugin by canonical name. The router is
         // keyed by shelf; the lookup walks the admission_order.
-        let entry = self.router.lookup_by_name(plugin_name).ok_or_else(|| {
-            StewardError::Dispatch(format!(
-                "no plugin admitted with name {plugin_name}"
-            ))
-        })?;
+        let entry =
+            self.router.lookup_by_name(plugin_name).ok_or_else(|| {
+                StewardError::Dispatch(format!(
+                    "no plugin admitted with name {plugin_name}"
+                ))
+            })?;
 
         // Resolve the recorded origin. Programmatic plugins
-        // (in-process, typed OOP) do not have one and cannot be
-        // reloaded by the framework alone.
+        // (in-process, typed OOP) do not have one; the Restart
+        // path needs an origin, the Live path for in-process
+        // plugins does not.
         let plugin_dir = self
             .plugin_origins
             .lock()
@@ -1621,34 +1778,22 @@ impl AdmissionEngine {
             .get(plugin_name)
             .cloned();
 
-        // Read the plugin's manifest to learn its hot_reload
-        // policy. The manifest is the source of truth; the
-        // EnforcementPolicy stored on the entry does not carry
-        // the lifecycle field today.
-        let manifest_path = match plugin_dir.as_ref() {
-            Some(dir) => dir.join("manifest.toml"),
-            None => {
-                return Err(StewardError::Dispatch(format!(
-                    "{plugin_name}: cannot reload; the plugin was admitted \
-                     programmatically (no source directory recorded). The \
-                     distribution's admit code must perform unload + admit \
-                     against a fresh handle."
-                )));
-            }
-        };
-        let manifest_text =
-            std::fs::read_to_string(&manifest_path).map_err(|e| {
-                StewardError::io(
-                    format!(
-                        "reading {} for reload",
-                        manifest_path.display()
-                    ),
-                    e,
-                )
-            })?;
-        let manifest = Manifest::from_toml(&manifest_text)?;
+        // The entry's manifest is the source of truth for the
+        // hot-reload policy and plugin version. Every admit_*
+        // entry point attaches the manifest at admission; the
+        // permissive path used by test fixtures does not, and
+        // surfaces here as a structured refusal so the omission
+        // is loud rather than silent.
+        let entry_manifest = entry.current_manifest().ok_or_else(|| {
+            StewardError::Dispatch(format!(
+                "{plugin_name}: plugin entry has no recorded manifest; \
+                 the admission entry point did not attach one. Reload \
+                 is only available for plugins admitted via the typed \
+                 admit_* entry points or admit_out_of_process_from_directory."
+            ))
+        })?;
 
-        match manifest.lifecycle.hot_reload {
+        match entry_manifest.lifecycle.hot_reload {
             evo_plugin_sdk::manifest::HotReloadPolicy::None => {
                 Err(StewardError::Dispatch(format!(
                     "{plugin_name}: lifecycle.hot_reload = none; the plugin \
@@ -1657,15 +1802,35 @@ impl AdmissionEngine {
                 )))
             }
             evo_plugin_sdk::manifest::HotReloadPolicy::Live => {
-                Err(StewardError::Dispatch(format!(
-                    "{plugin_name}: lifecycle.hot_reload = live requires the \
-                     reload_in_place wire verb, which is documented but \
-                     deferred until a future release. Declare \
-                     hot_reload = restart for the framework's current \
-                     reload behaviour."
-                )))
+                drop(entry);
+                match plugin_dir {
+                    Some(dir) => {
+                        self.reload_plugin_oop_live(
+                            plugin_name,
+                            &dir,
+                            runtime_dir,
+                            &entry_manifest,
+                        )
+                        .await
+                    }
+                    None => {
+                        self.reload_plugin_in_process_live(
+                            plugin_name,
+                            &entry_manifest,
+                        )
+                        .await
+                    }
+                }
             }
             evo_plugin_sdk::manifest::HotReloadPolicy::Restart => {
+                if plugin_dir.is_none() {
+                    return Err(StewardError::Dispatch(format!(
+                        "{plugin_name}: cannot reload; the plugin was admitted \
+                         programmatically (no source directory recorded). The \
+                         distribution's admit code must perform unload + admit \
+                         against a fresh handle."
+                    )));
+                }
                 let plugin_dir = plugin_dir.expect("checked above");
                 let shelf = entry.shelf.clone();
 
@@ -1673,15 +1838,12 @@ impl AdmissionEngine {
                 // is free for the re-admit. Concurrent dispatches
                 // see a structured "no plugin on shelf" until the
                 // re-admit completes.
-                let removed = self
-                    .router
-                    .remove(&shelf)
-                    .ok_or_else(|| {
-                        StewardError::Dispatch(format!(
-                            "{plugin_name}: router lost the entry between \
+                let removed = self.router.remove(&shelf).ok_or_else(|| {
+                    StewardError::Dispatch(format!(
+                        "{plugin_name}: router lost the entry between \
                              lookup and remove"
-                        ))
-                    })?;
+                    ))
+                })?;
                 // Drop the shared lookup reference so the only
                 // remaining strong owner of the Arc is `removed`;
                 // unload_one_plugin needs to take the handle out
@@ -1722,6 +1884,1498 @@ impl AdmissionEngine {
                 .await
             }
         }
+    }
+
+    /// In-process Live-mode reload: prepare → unload → load_with_state
+    /// against the same plugin instance. The plugin's static binary
+    /// code stays the same; what gets refreshed is everything
+    /// `LoadContext` provides (catalogue, config, registry handles,
+    /// etc.). On `load_with_state` failure, performs the documented
+    /// rollback: unload the partial state, then load with `blob =
+    /// None` (cold reload). The plugin loses its prior state but
+    /// stays admitted.
+    ///
+    /// Caller has already verified that:
+    /// - the entry exists in the router under `plugin_name`;
+    /// - the manifest declares `lifecycle.hot_reload = "live"`;
+    /// - the plugin was admitted in-process (no recorded origin).
+    ///
+    /// All Plugin-trait calls happen under the entry's per-handle
+    /// async mutex, so concurrent dispatches against this plugin
+    /// queue at the router until the reload completes (success or
+    /// failure).
+    async fn reload_plugin_in_process_live(
+        &self,
+        plugin_name: &str,
+        manifest: &Manifest,
+    ) -> Result<(), StewardError> {
+        let entry =
+            self.router.lookup_by_name(plugin_name).ok_or_else(|| {
+                StewardError::Dispatch(format!(
+                    "{plugin_name}: router lost the entry between dispatch \
+                     and live-reload"
+                ))
+            })?;
+
+        let from_version = manifest.plugin.version.to_string();
+        let to_version = from_version.clone();
+
+        let _ = self
+            .state
+            .bus
+            .emit_durable(
+                crate::happenings::Happening::PluginLiveReloadStarted {
+                    plugin: plugin_name.to_string(),
+                    from_version: from_version.clone(),
+                    to_version: to_version.clone(),
+                    at: std::time::SystemTime::now(),
+                },
+            )
+            .await;
+
+        let mut handle_guard = entry.handle.lock().await;
+        let handle = match handle_guard.as_mut() {
+            Some(h) => h,
+            None => {
+                let reason = "plugin handle was already taken (concurrent \
+                              shutdown or unload?)"
+                    .to_string();
+                let _ = self
+                    .state
+                    .bus
+                    .emit_durable(
+                        crate::happenings::Happening::PluginLiveReloadFailed {
+                            plugin: plugin_name.to_string(),
+                            from_version,
+                            to_version,
+                            stage: "lookup".to_string(),
+                            reason: reason.clone(),
+                            rolled_back: false,
+                            at: std::time::SystemTime::now(),
+                        },
+                    )
+                    .await;
+                return Err(StewardError::Dispatch(format!(
+                    "{plugin_name}: live-reload aborted; {reason}"
+                )));
+            }
+        };
+
+        // Stage 1: prepare_for_live_reload. Failure here is the
+        // safest rollback path — the running plugin has not yet
+        // been unloaded, so we leave it serving requests.
+        let blob = match handle.prepare_for_live_reload().await {
+            Ok(b) => b,
+            Err(e) => {
+                let reason = format!("prepare_for_live_reload failed: {e}");
+                let _ = self
+                    .state
+                    .bus
+                    .emit_durable(
+                        crate::happenings::Happening::PluginLiveReloadFailed {
+                            plugin: plugin_name.to_string(),
+                            from_version,
+                            to_version,
+                            stage: "prepare".to_string(),
+                            reason: reason.clone(),
+                            rolled_back: true,
+                            at: std::time::SystemTime::now(),
+                        },
+                    )
+                    .await;
+                return Err(StewardError::Dispatch(format!(
+                    "{plugin_name}: live-reload {reason}; previous instance \
+                     left running"
+                )));
+            }
+        };
+
+        let blob_bytes = blob.as_ref().map(|b| b.payload.len()).unwrap_or(0);
+        let max_bytes = evo_plugin_sdk::contract::MAX_LIVE_RELOAD_BLOB_BYTES;
+        if blob_bytes > max_bytes {
+            let reason = format!(
+                "state blob {blob_bytes} bytes exceeds framework cap of \
+                 {max_bytes} bytes; plugin must use durable persistence \
+                 for state of this size"
+            );
+            let _ = self
+                .state
+                .bus
+                .emit_durable(
+                    crate::happenings::Happening::PluginLiveReloadFailed {
+                        plugin: plugin_name.to_string(),
+                        from_version,
+                        to_version,
+                        stage: "prepare".to_string(),
+                        reason: reason.clone(),
+                        rolled_back: true,
+                        at: std::time::SystemTime::now(),
+                    },
+                )
+                .await;
+            return Err(StewardError::Dispatch(format!(
+                "{plugin_name}: live-reload {reason}; previous instance \
+                 left running"
+            )));
+        }
+
+        // Stage 2: unload. A failing unload still proceeds to
+        // load_with_state: the goal of reload is to bring the
+        // plugin back even when the previous state is misbehaving,
+        // so a unload error is logged for operator visibility but
+        // does not short-circuit the sequence.
+        if let Err(e) = handle.unload().await {
+            tracing::warn!(
+                plugin = %plugin_name,
+                error = %e,
+                "live-reload: unload of previous state reported error; \
+                 continuing with load_with_state"
+            );
+        }
+
+        // Stage 3: build a fresh LoadContext and call
+        // load_with_state with the carried blob.
+        let ctx = build_load_context(
+            &self.plugin_data_root,
+            &self.plugins_config_dir,
+            manifest,
+            Arc::clone(&self.state.subjects),
+            Arc::clone(&self.state.relations),
+            self.state.current_catalogue(),
+            Arc::clone(&self.state.bus),
+            Arc::clone(&self.state.admin),
+            Arc::clone(&self.router),
+            Arc::clone(&self.state.persistence),
+            Arc::clone(&self.state.conflict_index),
+            self.appointments_runtime.clone(),
+            self.watches_runtime.clone(),
+        )?;
+
+        match handle.load_with_state(&ctx, blob).await {
+            Ok(()) => {
+                let blob_bytes_u64 = blob_bytes as u64;
+                let _ = self
+                    .state
+                    .bus
+                    .emit_durable(
+                        crate::happenings::Happening::PluginLiveReloadCompleted {
+                            plugin: plugin_name.to_string(),
+                            from_version,
+                            to_version,
+                            state_blob_bytes: blob_bytes_u64,
+                            at: std::time::SystemTime::now(),
+                        },
+                    )
+                    .await;
+                Ok(())
+            }
+            Err(load_err) => {
+                // Rollback: unload the partial state, then load
+                // with blob = None (cold reload). The plugin
+                // loses its prior state but stays admitted —
+                // operators see the structured failure happening
+                // and can triage without the plugin disappearing
+                // from the shelf.
+                tracing::warn!(
+                    plugin = %plugin_name,
+                    error = %load_err,
+                    "live-reload: load_with_state failed; rolling back \
+                     to cold reload"
+                );
+                if let Err(e) = handle.unload().await {
+                    tracing::warn!(
+                        plugin = %plugin_name,
+                        error = %e,
+                        "live-reload rollback: unload of partial state \
+                         reported error; continuing with cold reload"
+                    );
+                }
+                let cold_result = handle.load_with_state(&ctx, None).await;
+                match cold_result {
+                    Ok(()) => {
+                        let reason = format!(
+                            "load_with_state(blob) failed: {load_err}; \
+                             cold-reloaded successfully (prior state lost)"
+                        );
+                        let _ = self
+                            .state
+                            .bus
+                            .emit_durable(
+                                crate::happenings::Happening::PluginLiveReloadFailed {
+                                    plugin: plugin_name.to_string(),
+                                    from_version,
+                                    to_version,
+                                    stage: "load_with_state".to_string(),
+                                    reason: reason.clone(),
+                                    rolled_back: true,
+                                    at: std::time::SystemTime::now(),
+                                },
+                            )
+                            .await;
+                        Err(StewardError::Dispatch(format!(
+                            "{plugin_name}: live-reload {reason}"
+                        )))
+                    }
+                    Err(cold_err) => {
+                        let reason = format!(
+                            "load_with_state(blob) failed: {load_err}; \
+                             cold reload also failed: {cold_err}; plugin \
+                             handle is in an undefined state"
+                        );
+                        let _ = self
+                            .state
+                            .bus
+                            .emit_durable(
+                                crate::happenings::Happening::PluginLiveReloadFailed {
+                                    plugin: plugin_name.to_string(),
+                                    from_version,
+                                    to_version,
+                                    stage: "load_with_state".to_string(),
+                                    reason: reason.clone(),
+                                    rolled_back: false,
+                                    at: std::time::SystemTime::now(),
+                                },
+                            )
+                            .await;
+                        Err(StewardError::Dispatch(format!(
+                            "{plugin_name}: live-reload {reason}"
+                        )))
+                    }
+                }
+            }
+        }
+    }
+
+    /// OOP-mode Live reload: prepare → spawn new process → load
+    /// with carried blob → swap → drain old.
+    ///
+    /// The freshly-spawned successor process is loaded at a
+    /// per-reload socket path, connected over the wire, and
+    /// hands `load_with_state` the blob the previous instance
+    /// returned from `prepare_for_live_reload`; this is the
+    /// schema-migration recovery path for OOP plugins whose new
+    /// version expects a different state format than the old
+    /// version stored. The old plugin process keeps serving
+    /// requests until the new one's `load_with_state` returns
+    /// Ok; only then does the framework atomically swap the
+    /// router entry and drain the old child.
+    ///
+    /// Failure semantics:
+    /// - prepare_for_live_reload on old fails → kept_old (no
+    ///   spawn attempted; old keeps running).
+    /// - new spawn / wire-connect / identity check / drift fails
+    ///   → kept_old; the new child is killed.
+    /// - new load_with_state fails → kept_old; the new child is
+    ///   killed.
+    ///
+    /// Caller has already verified that `plugin_dir` matches
+    /// `plugin_origins.get(plugin_name)` and that the manifest
+    /// declares Live mode.
+    async fn reload_plugin_oop_live(
+        &mut self,
+        plugin_name: &str,
+        plugin_dir: &Path,
+        runtime_dir: &Path,
+        running_manifest: &Manifest,
+    ) -> Result<(), StewardError> {
+        let from_version = running_manifest.plugin.version.to_string();
+        // The to_version becomes the freshly-read manifest's
+        // version; populated below after the on-disk manifest is
+        // re-read. Fall back to from_version when the on-disk
+        // manifest cannot be re-read so the happenings still
+        // carry meaningful version fields.
+        let mut to_version = from_version.clone();
+
+        let _ = self
+            .state
+            .bus
+            .emit_durable(
+                crate::happenings::Happening::PluginLiveReloadStarted {
+                    plugin: plugin_name.to_string(),
+                    from_version: from_version.clone(),
+                    to_version: to_version.clone(),
+                    at: std::time::SystemTime::now(),
+                },
+            )
+            .await;
+
+        // Stage 1: prepare_for_live_reload on the running plugin.
+        // Failure here keeps the old plugin running.
+        let old_entry =
+            self.router.lookup_by_name(plugin_name).ok_or_else(|| {
+                StewardError::Dispatch(format!(
+                    "{plugin_name}: router lost the entry between dispatch \
+                     and live-reload"
+                ))
+            })?;
+
+        let blob = {
+            let guard = old_entry.handle.lock().await;
+            match guard.as_ref() {
+                Some(h) => h.prepare_for_live_reload().await,
+                None => {
+                    let reason = "plugin handle was already taken (concurrent \
+                                  shutdown or unload?)"
+                        .to_string();
+                    let _ = self
+                        .state
+                        .bus
+                        .emit_durable(
+                            crate::happenings::Happening::PluginLiveReloadFailed {
+                                plugin: plugin_name.to_string(),
+                                from_version,
+                                to_version,
+                                stage: "lookup".to_string(),
+                                reason: reason.clone(),
+                                rolled_back: true,
+                                at: std::time::SystemTime::now(),
+                            },
+                        )
+                        .await;
+                    return Err(StewardError::Dispatch(format!(
+                        "{plugin_name}: live-reload aborted; {reason}"
+                    )));
+                }
+            }
+        };
+        let blob = match blob {
+            Ok(b) => b,
+            Err(e) => {
+                let reason = format!("prepare_for_live_reload failed: {e}");
+                let _ = self
+                    .state
+                    .bus
+                    .emit_durable(
+                        crate::happenings::Happening::PluginLiveReloadFailed {
+                            plugin: plugin_name.to_string(),
+                            from_version,
+                            to_version,
+                            stage: "prepare".to_string(),
+                            reason: reason.clone(),
+                            rolled_back: true,
+                            at: std::time::SystemTime::now(),
+                        },
+                    )
+                    .await;
+                return Err(StewardError::Dispatch(format!(
+                    "{plugin_name}: live-reload {reason}; previous instance \
+                     left running"
+                )));
+            }
+        };
+
+        let blob_bytes = blob.as_ref().map(|b| b.payload.len()).unwrap_or(0);
+        let max_bytes = evo_plugin_sdk::contract::MAX_LIVE_RELOAD_BLOB_BYTES;
+        if blob_bytes > max_bytes {
+            let reason = format!(
+                "state blob {blob_bytes} bytes exceeds framework cap of \
+                 {max_bytes} bytes"
+            );
+            let _ = self
+                .state
+                .bus
+                .emit_durable(
+                    crate::happenings::Happening::PluginLiveReloadFailed {
+                        plugin: plugin_name.to_string(),
+                        from_version,
+                        to_version,
+                        stage: "prepare".to_string(),
+                        reason: reason.clone(),
+                        rolled_back: true,
+                        at: std::time::SystemTime::now(),
+                    },
+                )
+                .await;
+            return Err(StewardError::Dispatch(format!(
+                "{plugin_name}: live-reload {reason}; previous instance \
+                 left running"
+            )));
+        }
+
+        // Stage 2: re-read manifest from disk (the bundle may
+        // have been updated by an installer between the original
+        // admission and this reload — exactly the schema-
+        // migration use case Live mode covers); re-verify trust;
+        // spawn a successor process at a per-reload socket; wire-
+        // connect; validate identity; drift / skew check; build
+        // a fresh LoadContext; call load_with_state with the
+        // carried blob.
+        let new_admit = self
+            .spawn_oop_replacement_for_live_reload(
+                plugin_name,
+                plugin_dir,
+                runtime_dir,
+                blob,
+            )
+            .await;
+        let (new_entry, new_child, new_to_version) = match new_admit {
+            Ok((entry, child, version)) => (entry, child, version),
+            Err((stage, err)) => {
+                let reason = format!("{stage}: {err}");
+                let _ = self
+                    .state
+                    .bus
+                    .emit_durable(
+                        crate::happenings::Happening::PluginLiveReloadFailed {
+                            plugin: plugin_name.to_string(),
+                            from_version,
+                            to_version,
+                            stage,
+                            reason: reason.clone(),
+                            rolled_back: true,
+                            at: std::time::SystemTime::now(),
+                        },
+                    )
+                    .await;
+                return Err(StewardError::Dispatch(format!(
+                    "{plugin_name}: live-reload {reason}; previous instance \
+                     left running"
+                )));
+            }
+        };
+        to_version = new_to_version;
+
+        // Stage 3: atomically swap. The new entry takes the
+        // shelf; the old entry is returned and drained below.
+        let shelf = old_entry.shelf.clone();
+        // Attach the child BEFORE the swap so the router never
+        // sees a freshly-installed entry without its child.
+        {
+            let mut slot = new_entry.child.lock().await;
+            *slot = Some(new_child);
+        }
+        let displaced =
+            self.router.replace_in_place(&shelf, Arc::clone(&new_entry));
+        // Release our stale lookup reference so the old entry's
+        // sole strong owner is the displaced Arc; the drain path
+        // takes the inner handle out of the Option which requires
+        // sole ownership of the AsyncMutex's contents.
+        drop(old_entry);
+
+        if let Some(old) = displaced {
+            if let Err(e) = unload_one_plugin(old).await {
+                tracing::warn!(
+                    plugin = %plugin_name,
+                    error = %e,
+                    "live-reload: drain of previous OOP process reported \
+                     error after successful swap; new process owns the \
+                     shelf"
+                );
+            }
+        } else {
+            tracing::warn!(
+                plugin = %plugin_name,
+                "live-reload: replace_in_place returned no displaced entry; \
+                 the old entry was already gone before the swap"
+            );
+        }
+
+        let blob_bytes_u64 = blob_bytes as u64;
+        let _ = self
+            .state
+            .bus
+            .emit_durable(
+                crate::happenings::Happening::PluginLiveReloadCompleted {
+                    plugin: plugin_name.to_string(),
+                    from_version,
+                    to_version,
+                    state_blob_bytes: blob_bytes_u64,
+                    at: std::time::SystemTime::now(),
+                },
+            )
+            .await;
+        Ok(())
+    }
+
+    /// Spawn a successor OOP plugin process for live reload, run
+    /// it through the same admission gauntlet as a fresh admit
+    /// (trust verification, identity check, drift / skew), build
+    /// a fresh `LoadContext`, and call `load_with_state` with the
+    /// carried blob. Returns the unlinked-from-router new entry
+    /// plus child plus the freshly-read manifest version on
+    /// success; on failure, returns `(stage, error)` so the
+    /// caller can emit a structured `PluginLiveReloadFailed`
+    /// happening with stage and reason. The new child is killed
+    /// on every failure path before this function returns.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_oop_replacement_for_live_reload(
+        &self,
+        plugin_name: &str,
+        plugin_dir: &Path,
+        runtime_dir: &Path,
+        blob: Option<evo_plugin_sdk::contract::StateBlob>,
+    ) -> Result<(Arc<PluginEntry>, Child, String), (String, String)> {
+        // Re-read the manifest from disk; the bundle may have
+        // been replaced.
+        let manifest_path = plugin_dir.join("manifest.toml");
+        let manifest_text = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| ("read_manifest".to_string(), e.to_string()))?;
+        let mut manifest = Manifest::from_toml(&manifest_text)
+            .map_err(|e| ("parse_manifest".to_string(), e.to_string()))?;
+
+        if manifest.plugin.name != plugin_name {
+            return Err((
+                "manifest_identity".to_string(),
+                format!(
+                    "manifest at {} declares plugin name {} \
+                     but live-reload was requested for {plugin_name}",
+                    manifest_path.display(),
+                    manifest.plugin.name
+                ),
+            ));
+        }
+        if manifest.transport.kind != TransportKind::OutOfProcess {
+            return Err((
+                "manifest_transport".to_string(),
+                "manifest no longer declares transport.type = \
+                 'out-of-process'; OOP live reload requires the \
+                 successor manifest to retain OOP transport"
+                    .to_string(),
+            ));
+        }
+        let to_version = manifest.plugin.version.to_string();
+
+        validation::check_manifest_prerequisites(&manifest)
+            .map_err(|e| ("prerequisites".to_string(), e.to_string()))?;
+        validation::check_admin_trust(&manifest)
+            .map_err(|e| ("admin_trust".to_string(), e.to_string()))?;
+
+        let exec_path = {
+            let raw = Path::new(&manifest.transport.exec);
+            if raw.is_absolute() {
+                raw.to_path_buf()
+            } else {
+                plugin_dir.join(raw)
+            }
+        };
+
+        if let Some(t) = self.plugin_trust.as_ref() {
+            use evo_trust::{
+                verify_out_of_process_bundle, OutOfProcessBundleRef,
+            };
+            let bundle = OutOfProcessBundleRef {
+                plugin_dir,
+                manifest_path: &manifest_path,
+                exec_path: &exec_path,
+                plugin_name: &manifest.plugin.name,
+                declared_trust: manifest.trust.class,
+            };
+            let o = verify_out_of_process_bundle(
+                &bundle,
+                &t.keys,
+                &t.revocations,
+                t.options,
+            )
+            .map_err(|e| ("trust".to_string(), e.to_string()))?;
+            manifest.trust.class = o.effective_trust;
+        }
+
+        // Use a per-reload socket path so the successor binds
+        // beside the still-running predecessor (whose socket is
+        // at `<runtime_dir>/<plugin_name>.sock`). The successor
+        // socket is best-effort cleaned up after drain; if
+        // anything goes wrong the next reload's `remove_file` of
+        // its own per-reload path catches it.
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let socket_path = runtime_dir.join(format!(
+            "{}.live-reload.{now_nanos}.sock",
+            manifest.plugin.name
+        ));
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path)
+                .map_err(|e| ("socket_setup".to_string(), e.to_string()))?;
+        }
+
+        let mut cmd = Command::new(&exec_path);
+        cmd.arg(&socket_path).kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            if let Some((uid, gid)) = self
+                .plugins_security
+                .uid_gid_for_class(manifest.trust.class)
+            {
+                cmd.gid(gid);
+                cmd.uid(uid);
+            }
+        }
+        let mut child = cmd.spawn().map_err(|e| {
+            (
+                "spawn".to_string(),
+                format!(
+                    "spawning {} for live reload: {e}",
+                    exec_path.display()
+                ),
+            )
+        })?;
+
+        let stream = match wait_for_socket_ready(&socket_path, &mut child).await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(("socket_ready".to_string(), e.to_string()));
+            }
+        };
+        let (reader, writer) = stream.into_split();
+
+        let result = self
+            .complete_oop_live_reload_load(
+                manifest.clone(),
+                reader,
+                writer,
+                blob,
+            )
+            .await;
+        match result {
+            Ok(entry) => Ok((entry, child, to_version)),
+            Err((stage, err)) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                Err((stage, err))
+            }
+        }
+    }
+
+    /// Wire-connect, identity-check, drift-check, build context,
+    /// and call `load_with_state` against the just-spawned
+    /// successor process. The returned entry is NOT inserted into
+    /// the router; the caller swaps it in atomically once load
+    /// has succeeded.
+    async fn complete_oop_live_reload_load<R, W>(
+        &self,
+        manifest: Manifest,
+        reader: R,
+        writer: W,
+        blob: Option<evo_plugin_sdk::contract::StateBlob>,
+    ) -> Result<Arc<PluginEntry>, (String, String)>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let plugin_name = manifest.plugin.name.clone();
+        let mut handle = match manifest.kind.interaction {
+            InteractionShape::Respondent => {
+                let mut r = crate::wire_client::WireRespondent::connect(
+                    reader,
+                    writer,
+                    plugin_name.clone(),
+                )
+                .await
+                .map_err(|e| ("wire_connect".to_string(), e.to_string()))?;
+                if let Some(ledger) = &self.prompt_ledger {
+                    r.set_prompt_ledger(Arc::clone(ledger));
+                }
+                let description = r.description().clone();
+                if description.identity.name != manifest.plugin.name {
+                    return Err((
+                        "describe_identity".to_string(),
+                        format!(
+                            "describe() name {} does not match manifest \
+                             name {}",
+                            description.identity.name, manifest.plugin.name
+                        ),
+                    ));
+                }
+                if description.identity.version != manifest.plugin.version {
+                    return Err((
+                        "describe_identity".to_string(),
+                        format!(
+                            "describe() version {} does not match manifest \
+                             version {}",
+                            description.identity.version,
+                            manifest.plugin.version
+                        ),
+                    ));
+                }
+                if description.identity.contract != manifest.plugin.contract {
+                    return Err((
+                        "describe_identity".to_string(),
+                        format!(
+                            "describe() contract {} does not match manifest \
+                             contract {}",
+                            description.identity.contract,
+                            manifest.plugin.contract
+                        ),
+                    ));
+                }
+                validation::check_drift_and_skew(
+                    &manifest,
+                    &description.runtime_capabilities,
+                    &self.state.bus,
+                )
+                .await
+                .map_err(|e| ("drift".to_string(), e.to_string()))?;
+                AdmittedHandle::Respondent(Box::new(r))
+            }
+            InteractionShape::Warden => {
+                let mut w = crate::wire_client::WireWarden::connect(
+                    reader,
+                    writer,
+                    plugin_name.clone(),
+                    Arc::clone(&self.state.custody),
+                    Arc::clone(&self.state.bus),
+                )
+                .await
+                .map_err(|e| ("wire_connect".to_string(), e.to_string()))?;
+                if let Some(ledger) = &self.prompt_ledger {
+                    w.set_prompt_ledger(Arc::clone(ledger));
+                }
+                let description = w.description().clone();
+                if description.identity.name != manifest.plugin.name {
+                    return Err((
+                        "describe_identity".to_string(),
+                        format!(
+                            "describe() name {} does not match manifest \
+                             name {}",
+                            description.identity.name, manifest.plugin.name
+                        ),
+                    ));
+                }
+                if description.identity.version != manifest.plugin.version {
+                    return Err((
+                        "describe_identity".to_string(),
+                        format!(
+                            "describe() version {} does not match manifest \
+                             version {}",
+                            description.identity.version,
+                            manifest.plugin.version
+                        ),
+                    ));
+                }
+                validation::check_drift_and_skew(
+                    &manifest,
+                    &description.runtime_capabilities,
+                    &self.state.bus,
+                )
+                .await
+                .map_err(|e| ("drift".to_string(), e.to_string()))?;
+                AdmittedHandle::Warden(Box::new(w))
+            }
+        };
+
+        let ctx = build_load_context(
+            &self.plugin_data_root,
+            &self.plugins_config_dir,
+            &manifest,
+            Arc::clone(&self.state.subjects),
+            Arc::clone(&self.state.relations),
+            self.state.current_catalogue(),
+            Arc::clone(&self.state.bus),
+            Arc::clone(&self.state.admin),
+            Arc::clone(&self.router),
+            Arc::clone(&self.state.persistence),
+            Arc::clone(&self.state.conflict_index),
+            self.appointments_runtime.clone(),
+            self.watches_runtime.clone(),
+        )
+        .map_err(|e| ("load_context".to_string(), e.to_string()))?;
+
+        handle
+            .load_with_state(&ctx, blob)
+            .await
+            .map_err(|e| ("load_with_state".to_string(), e.to_string()))?;
+
+        let shelf = manifest.target.shelf.clone();
+        let entry = Arc::new(
+            PluginEntry::new_with_policy(
+                plugin_name,
+                shelf,
+                handle,
+                EnforcementPolicy::from_manifest(&manifest),
+            )
+            .with_manifest(Arc::new(manifest)),
+        );
+        Ok(entry)
+    }
+
+    /// Operator-issued reload of a single plugin's manifest
+    /// declarations. The plugin's running instance keeps its
+    /// handle, custodies, and any in-flight session through the
+    /// swap; only the declarative surface (capabilities,
+    /// course-correct verbs, lifecycle policy) changes.
+    ///
+    /// Validation pipeline (atomic-swap semantics):
+    /// 1. Read the source TOML.
+    /// 2. Parse + schema-validate via `Manifest::from_toml` and
+    ///    `Manifest::validate`.
+    /// 3. Identity check: the new manifest's `plugin.name` must
+    ///    match the running plugin's recorded name.
+    /// 4. Transport check: the new manifest's `transport.kind`
+    ///    must match the running plugin's transport (in-process
+    ///    plugins cannot be reloaded into OOP and vice versa).
+    /// 5. Drift re-check: the new manifest's declared verb sets
+    ///    are diffed against the running plugin's `describe()`;
+    ///    drift refuses with a structured error.
+    /// 6. Atomic swap (only after every check passes): the
+    ///    entry's stored manifest and enforcement policy are
+    ///    replaced via the entry's [`ArcSwap`] so dispatch
+    ///    reads stay lock-free.
+    ///
+    /// `dry_run = true` runs the pipeline through validation
+    /// and drift but does NOT swap state; the outcome reports
+    /// the from / to versions so operators can preview.
+    ///
+    /// The `reason` argument is captured for audit visibility
+    /// in the structured `PluginManifestReloaded` /
+    /// `PluginManifestInvalid` happenings; admin-ledger
+    /// receipts ride a follow-up that lands with the operator
+    /// wire op.
+    pub async fn reload_manifest(
+        &self,
+        plugin_name: &str,
+        source: ManifestSource,
+        dry_run: bool,
+    ) -> Result<ManifestReloadOutcome, StewardError> {
+        let started_at = std::time::Instant::now();
+
+        let entry =
+            self.router.lookup_by_name(plugin_name).ok_or_else(|| {
+                StewardError::Dispatch(format!(
+                    "no plugin admitted with name {plugin_name}"
+                ))
+            })?;
+        let current_manifest = entry.current_manifest().ok_or_else(|| {
+            StewardError::Dispatch(format!(
+                "{plugin_name}: plugin entry has no recorded manifest; \
+                 reload_manifest is only available for plugins admitted \
+                 via the typed admit_* entry points or \
+                 admit_out_of_process_from_directory."
+            ))
+        })?;
+        let from_version = current_manifest.plugin.version.to_string();
+
+        // Stage 1: read source.
+        let toml_text = match &source {
+            ManifestSource::Inline(t) => t.clone(),
+            ManifestSource::Path(p) => {
+                std::fs::read_to_string(p).map_err(|e| {
+                    self.emit_manifest_invalid(
+                        plugin_name,
+                        "parse",
+                        &format!("reading {}: {e}", p.display()),
+                    );
+                    StewardError::io(
+                        format!("reading manifest source {}", p.display()),
+                        e,
+                    )
+                })?
+            }
+        };
+
+        // Stage 2: parse + schema validate.
+        let new_manifest = match Manifest::from_toml(&toml_text) {
+            Ok(m) => m,
+            Err(e) => {
+                let reason = format!("parse failed: {e}");
+                self.emit_manifest_invalid(plugin_name, "parse", &reason);
+                return Err(StewardError::Admission(reason));
+            }
+        };
+        if let Err(e) = new_manifest.validate() {
+            let reason = format!("schema validation failed: {e}");
+            self.emit_manifest_invalid(plugin_name, "schema", &reason);
+            return Err(StewardError::Admission(reason));
+        }
+
+        // Stage 3: identity check.
+        if new_manifest.plugin.name != plugin_name {
+            let reason = format!(
+                "manifest declares plugin name {} but reload was \
+                 requested for {plugin_name}",
+                new_manifest.plugin.name
+            );
+            self.emit_manifest_invalid(plugin_name, "identity", &reason);
+            return Err(StewardError::Admission(reason));
+        }
+
+        // Stage 4: transport check.
+        if new_manifest.transport.kind != current_manifest.transport.kind {
+            let reason = format!(
+                "manifest declares transport.kind = {:?} but the running \
+                 plugin was admitted with transport.kind = {:?}; \
+                 transport changes require unload + admit, not \
+                 reload_manifest",
+                new_manifest.transport.kind, current_manifest.transport.kind
+            );
+            self.emit_manifest_invalid(plugin_name, "transport", &reason);
+            return Err(StewardError::Admission(reason));
+        }
+
+        // Stage 5: drift re-check against the running plugin's
+        // describe().
+        let description = {
+            let guard = entry.handle.lock().await;
+            match guard.as_ref() {
+                Some(h) => h.describe().await,
+                None => {
+                    let reason = "plugin handle is unavailable; cannot \
+                                  drift-check reload_manifest"
+                        .to_string();
+                    self.emit_manifest_invalid(plugin_name, "drift", &reason);
+                    return Err(StewardError::Dispatch(format!(
+                        "{plugin_name}: {reason}"
+                    )));
+                }
+            }
+        };
+        let drift = evo_plugin_sdk::drift::detect_drift(
+            &new_manifest,
+            &description.runtime_capabilities,
+        );
+        if !drift.is_empty() {
+            let reason = format!(
+                "manifest does not match runtime describe(): \
+                 missing in implementation = {:?}, missing in \
+                 manifest = {:?}",
+                drift.missing_in_implementation, drift.missing_in_manifest
+            );
+            self.emit_manifest_invalid(plugin_name, "drift", &reason);
+            return Err(StewardError::Admission(reason));
+        }
+
+        let to_version = new_manifest.plugin.version.to_string();
+
+        if dry_run {
+            return Ok(ManifestReloadOutcome {
+                plugin: plugin_name.to_string(),
+                from_manifest_version: from_version,
+                to_manifest_version: to_version,
+                duration_ms: started_at.elapsed().as_millis() as u64,
+                dry_run: true,
+            });
+        }
+
+        // Stage 6: atomic swap. Replace the enforcement policy
+        // first (dispatch sees the new gate immediately), then
+        // the cached manifest (lifecycle paths see the new
+        // declarations on the next reload_plugin / reload_manifest).
+        let new_policy =
+            crate::router::EnforcementPolicy::from_manifest(&new_manifest);
+        entry.policy.store(Arc::new(new_policy));
+        {
+            let mut slot =
+                entry.manifest.lock().expect("manifest mutex poisoned");
+            *slot = Some(Arc::new(new_manifest));
+        }
+
+        let _ = self
+            .state
+            .bus
+            .emit_durable(
+                crate::happenings::Happening::PluginManifestReloaded {
+                    plugin: plugin_name.to_string(),
+                    from_manifest_version: from_version.clone(),
+                    to_manifest_version: to_version.clone(),
+                    at: std::time::SystemTime::now(),
+                },
+            )
+            .await;
+
+        Ok(ManifestReloadOutcome {
+            plugin: plugin_name.to_string(),
+            from_manifest_version: from_version,
+            to_manifest_version: to_version,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+            dry_run: false,
+        })
+    }
+
+    /// Helper for [`Self::reload_manifest`]: spawn-and-forget
+    /// emit of `PluginManifestInvalid`. Invoked from the sync
+    /// stage-error paths, then the caller returns the
+    /// structured error to the operator. The fire-and-forget is
+    /// acceptable because the bus's emit_durable persists to
+    /// the happenings_log before resolving; a dropped future
+    /// here means the durable write may not complete, but the
+    /// operator-visible outcome (the structured error returned)
+    /// is unchanged.
+    fn emit_manifest_invalid(
+        &self,
+        plugin_name: &str,
+        stage: &str,
+        reason: &str,
+    ) {
+        let bus = Arc::clone(&self.state.bus);
+        let plugin = plugin_name.to_string();
+        let stage = stage.to_string();
+        let reason = reason.to_string();
+        tokio::spawn(async move {
+            let _ = bus
+                .emit_durable(
+                    crate::happenings::Happening::PluginManifestInvalid {
+                        plugin,
+                        stage,
+                        reason,
+                        at: std::time::SystemTime::now(),
+                    },
+                )
+                .await;
+        });
+    }
+
+    /// Operator-issued reload of the catalogue declarations.
+    /// Replaces the framework's loaded rack / shelf / type /
+    /// relation-predicate vocabulary atomically; admission paths
+    /// see the new declarations on their next call.
+    ///
+    /// Validation pipeline (atomic-swap semantics):
+    /// 1. Read source TOML.
+    /// 2. Parse + schema-validate via `Catalogue::from_toml`
+    ///    (the parser refuses unknown fields, missing required
+    ///    fields, and out-of-range schema versions).
+    /// 3. Shelf-occupancy re-check: every currently-admitted
+    ///    plugin's shelf must still exist in the new catalogue
+    ///    with a compatible shape. A removed shelf for a
+    ///    running plugin emits a `CardinalityViolation` happening
+    ///    naming the shelf and refuses the reload (plugin
+    ///    re-admission for declaration changes is operator-issued
+    ///    via `reload_plugin`; the framework refuses to silently
+    ///    orphan a running plugin).
+    /// 4. Atomic swap (only after every check passes): the
+    ///    state's catalogue [`arc_swap::ArcSwap`] is updated so
+    ///    subsequent admission paths see the new declarations.
+    ///
+    /// `dry_run = true` runs the pipeline through validation
+    /// without mutating state; the outcome reports the from / to
+    /// schema versions and rack counts for operator preview.
+    ///
+    /// Cardinality re-check against existing storage state
+    /// (subjects-per-shelf vs new declared maxima), automatic
+    /// plugin re-admission, and LKG shadow-file write on success
+    /// land in follow-up commits; today's primitive holds the
+    /// declaration-vocabulary contract atomic and refuses any
+    /// reload that would orphan a running plugin.
+    pub async fn reload_catalogue(
+        &self,
+        source: ManifestSource,
+        dry_run: bool,
+    ) -> Result<CatalogueReloadOutcome, StewardError> {
+        let started_at = std::time::Instant::now();
+
+        // Stage 1: read source.
+        let toml_text = match &source {
+            ManifestSource::Inline(t) => t.clone(),
+            ManifestSource::Path(p) => {
+                std::fs::read_to_string(p).map_err(|e| {
+                    self.emit_catalogue_invalid(
+                        "parse",
+                        &format!("reading {}: {e}", p.display()),
+                    );
+                    StewardError::io(
+                        format!("reading catalogue source {}", p.display()),
+                        e,
+                    )
+                })?
+            }
+        };
+
+        // Stage 2: parse + schema validate. Catalogue::from_toml
+        // returns StewardError directly on parse / schema failures;
+        // reuse its diagnostic verbatim and surface it through the
+        // structured happening.
+        let new_catalogue =
+            match crate::catalogue::Catalogue::from_toml(&toml_text) {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    let reason = e.to_string();
+                    self.emit_catalogue_invalid("parse", &reason);
+                    return Err(e);
+                }
+            };
+
+        let current = self.state.current_catalogue();
+        let from_schema = current.schema_version;
+        let to_schema = new_catalogue.schema_version;
+
+        // Stage 3: shelf-occupancy re-check. Every currently-
+        // admitted plugin's shelf must still exist in the new
+        // catalogue with a compatible shape; otherwise the
+        // reload is refused.
+        let mut conflicts: Vec<(String, String)> = Vec::new();
+        for entry in self.router.entries_in_order() {
+            let shelf_qualified = entry.shelf.clone();
+            match new_catalogue.find_shelf(&shelf_qualified) {
+                None => {
+                    let reason = format!(
+                        "plugin {} occupies shelf {} which the new \
+                         catalogue does not declare",
+                        entry.name, shelf_qualified
+                    );
+                    self.emit_cardinality_violation(&shelf_qualified, &reason);
+                    conflicts.push((shelf_qualified, reason));
+                }
+                Some(new_shelf) => {
+                    if let Some(manifest) = entry.current_manifest() {
+                        if !new_shelf.accepts_shape(manifest.target.shape) {
+                            let reason = format!(
+                                "plugin {} occupies shelf {} with shape {} \
+                                 but the new catalogue declares shape {} \
+                                 for that shelf",
+                                entry.name,
+                                shelf_qualified,
+                                manifest.target.shape,
+                                new_shelf.shape
+                            );
+                            self.emit_cardinality_violation(
+                                &shelf_qualified,
+                                &reason,
+                            );
+                            conflicts.push((shelf_qualified, reason));
+                        }
+                    }
+                }
+            }
+        }
+        if !conflicts.is_empty() {
+            let summary = conflicts
+                .iter()
+                .map(|(s, _)| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let reason = format!(
+                "{} shelf-occupancy conflict(s) refuse the reload: {}",
+                conflicts.len(),
+                summary
+            );
+            self.emit_catalogue_invalid("shelf_in_use", &reason);
+            return Err(StewardError::Admission(reason));
+        }
+
+        let rack_count = new_catalogue.racks.len() as u32;
+
+        if dry_run {
+            return Ok(CatalogueReloadOutcome {
+                from_schema_version: from_schema,
+                to_schema_version: to_schema,
+                rack_count,
+                duration_ms: started_at.elapsed().as_millis() as u64,
+                dry_run: true,
+            });
+        }
+
+        // Stage 4: atomic swap.
+        self.state.catalogue.store(Arc::clone(&new_catalogue));
+
+        let _ = self
+            .state
+            .bus
+            .emit_durable(crate::happenings::Happening::CatalogueReloaded {
+                from_schema_version: from_schema,
+                to_schema_version: to_schema,
+                rack_count,
+                at: std::time::SystemTime::now(),
+            })
+            .await;
+
+        Ok(CatalogueReloadOutcome {
+            from_schema_version: from_schema,
+            to_schema_version: to_schema,
+            rack_count,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+            dry_run: false,
+        })
+    }
+
+    /// Helper for [`Self::reload_catalogue`]: spawn-and-forget
+    /// emit of `CatalogueInvalid`. The fire-and-forget rationale
+    /// matches [`Self::emit_manifest_invalid`].
+    fn emit_catalogue_invalid(&self, stage: &str, reason: &str) {
+        let bus = Arc::clone(&self.state.bus);
+        let stage = stage.to_string();
+        let reason = reason.to_string();
+        tokio::spawn(async move {
+            let _ = bus
+                .emit_durable(crate::happenings::Happening::CatalogueInvalid {
+                    stage,
+                    reason,
+                    at: std::time::SystemTime::now(),
+                })
+                .await;
+        });
+    }
+
+    /// Helper for [`Self::reload_catalogue`]: spawn-and-forget
+    /// emit of `CardinalityViolation`. Emitted per offending
+    /// shelf; the caller aggregates and returns a single
+    /// structured error.
+    fn emit_cardinality_violation(&self, shelf: &str, reason: &str) {
+        let bus = Arc::clone(&self.state.bus);
+        let shelf = shelf.to_string();
+        let reason = reason.to_string();
+        tokio::spawn(async move {
+            let _ = bus
+                .emit_durable(
+                    crate::happenings::Happening::CardinalityViolation {
+                        shelf,
+                        reason,
+                        at: std::time::SystemTime::now(),
+                    },
+                )
+                .await;
+        });
+    }
+
+    /// Operator-issued enable: persists the `installed_plugins`
+    /// row with `enabled = true` and records the operator-supplied
+    /// reason and timestamp. Inline re-admission of a currently-
+    /// unloaded plugin is staged behind the next-discovery
+    /// boundary in this build; today's verb sets the bit and the
+    /// next discovery pass admits the bundle. `was_currently_admitted`
+    /// lets the caller render the "already running" outcome
+    /// distinctly from "now enabled, will admit at next discovery".
+    pub async fn enable_plugin(
+        &self,
+        plugin_name: &str,
+        reason: Option<String>,
+    ) -> Result<PluginLifecycleOutcome, StewardError> {
+        let now_ms = system_time_now_ms();
+        let was_currently_admitted =
+            self.router.lookup_by_name(plugin_name).is_some();
+
+        // Preserve any prior install_digest so consecutive
+        // enable / disable cycles don't lose the audit pin. A
+        // first-time enable on a plugin discovery hasn't yet
+        // recorded gets an empty digest until a future commit
+        // computes the bundle digest at admission time.
+        let prior_digest = self
+            .state
+            .persistence
+            .load_all_installed_plugins()
+            .await?
+            .into_iter()
+            .find(|r| r.plugin_name == plugin_name)
+            .map(|r| r.install_digest)
+            .unwrap_or_default();
+
+        let row = crate::persistence::PersistedInstalledPlugin {
+            plugin_name: plugin_name.to_string(),
+            enabled: true,
+            last_state_reason: reason,
+            last_state_changed_at_ms: now_ms,
+            install_digest: prior_digest,
+        };
+        self.state.persistence.record_plugin_enabled(&row).await?;
+        Ok(PluginLifecycleOutcome {
+            plugin: plugin_name.to_string(),
+            was_currently_admitted,
+            change_applied: true,
+        })
+    }
+
+    /// Operator-issued disable: drains the running plugin if
+    /// admitted, then persists `enabled = false`. Refuses if the
+    /// plugin occupies a catalogue shelf declared `required =
+    /// true` and is the only occupant.
+    pub async fn disable_plugin(
+        &self,
+        plugin_name: &str,
+        reason: Option<String>,
+    ) -> Result<PluginLifecycleOutcome, StewardError> {
+        // Essentialness check via the catalogue's required flag
+        // applied to the running plugin's shelf.
+        if let Some(entry) = self.router.lookup_by_name(plugin_name) {
+            self.refuse_if_essential(&entry, "disable")?;
+        }
+
+        let now_ms = system_time_now_ms();
+        let was_currently_admitted =
+            self.router.lookup_by_name(plugin_name).is_some();
+
+        // Drain the entry if currently admitted.
+        if was_currently_admitted {
+            let entry =
+                self.router.lookup_by_name(plugin_name).ok_or_else(|| {
+                    StewardError::Dispatch(format!(
+                        "{plugin_name}: router lost the entry between \
+                         lookup and disable"
+                    ))
+                })?;
+            let shelf = entry.shelf.clone();
+            drop(entry);
+            self.plugin_origins
+                .lock()
+                .expect("plugin_origins mutex poisoned")
+                .remove(plugin_name);
+            if let Some(removed) = self.router.remove(&shelf) {
+                if let Err(e) = unload_one_plugin(removed).await {
+                    tracing::warn!(
+                        plugin = %plugin_name,
+                        error = %e,
+                        "disable_plugin: drain reported error; proceeding \
+                         with persistence write"
+                    );
+                }
+            }
+        }
+
+        let prior_digest = self
+            .state
+            .persistence
+            .load_all_installed_plugins()
+            .await?
+            .into_iter()
+            .find(|r| r.plugin_name == plugin_name)
+            .map(|r| r.install_digest)
+            .unwrap_or_default();
+
+        let row = crate::persistence::PersistedInstalledPlugin {
+            plugin_name: plugin_name.to_string(),
+            enabled: false,
+            last_state_reason: reason,
+            last_state_changed_at_ms: now_ms,
+            install_digest: prior_digest,
+        };
+        self.state.persistence.record_plugin_enabled(&row).await?;
+        Ok(PluginLifecycleOutcome {
+            plugin: plugin_name.to_string(),
+            was_currently_admitted,
+            change_applied: true,
+        })
+    }
+
+    /// Operator-issued uninstall: drains the running plugin,
+    /// removes the bundle directory from disk (when the plugin
+    /// was admitted from a recorded directory), and forgets the
+    /// `installed_plugins` row. Refuses if the plugin is
+    /// essential. When `purge_state = true`, the per-plugin
+    /// `state/` and `credentials/` directories are wiped after
+    /// the bundle is removed.
+    pub async fn uninstall_plugin(
+        &self,
+        plugin_name: &str,
+        reason: Option<String>,
+        purge_state: bool,
+    ) -> Result<PluginLifecycleOutcome, StewardError> {
+        if let Some(entry) = self.router.lookup_by_name(plugin_name) {
+            self.refuse_if_essential(&entry, "uninstall")?;
+        }
+
+        let was_currently_admitted =
+            self.router.lookup_by_name(plugin_name).is_some();
+
+        // Drain (uninstall implies disable).
+        if was_currently_admitted {
+            self.disable_plugin(plugin_name, reason.clone()).await?;
+        }
+
+        // Remove the bundle directory recorded as the plugin's
+        // origin. In-process plugins have no recorded directory;
+        // their uninstall is a no-op at the bundle layer (the
+        // distribution removes the binary itself).
+        let plugin_dir = self
+            .plugin_origins
+            .lock()
+            .expect("plugin_origins mutex poisoned")
+            .get(plugin_name)
+            .cloned();
+        if let Some(dir) = plugin_dir {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(StewardError::io(
+                        format!(
+                            "removing plugin bundle {} for uninstall",
+                            dir.display()
+                        ),
+                        e,
+                    ));
+                }
+            }
+        }
+
+        if purge_state {
+            self.purge_plugin_state(plugin_name).await?;
+        }
+
+        // Remove the persistence row last so the audit trail
+        // outlives the plugin's identity until disk cleanup
+        // completes.
+        self.state
+            .persistence
+            .forget_installed_plugin(plugin_name)
+            .await?;
+
+        Ok(PluginLifecycleOutcome {
+            plugin: plugin_name.to_string(),
+            was_currently_admitted,
+            change_applied: true,
+        })
+    }
+
+    /// Operator-issued state purge: wipes the plugin's `state/`
+    /// and `credentials/` directories without removing the
+    /// bundle itself. Used when an operator wants to "factory
+    /// reset" a plugin while keeping the code installed.
+    pub async fn purge_plugin_state(
+        &self,
+        plugin_name: &str,
+    ) -> Result<PluginLifecycleOutcome, StewardError> {
+        let was_currently_admitted =
+            self.router.lookup_by_name(plugin_name).is_some();
+        for sub in ["state", "credentials"] {
+            let p = self.plugin_data_root.join(plugin_name).join(sub);
+            if p.exists() {
+                std::fs::remove_dir_all(&p).map_err(|e| {
+                    StewardError::io(
+                        format!(
+                            "purging plugin {} dir {}",
+                            plugin_name,
+                            p.display()
+                        ),
+                        e,
+                    )
+                })?;
+            }
+            // Recreate the empty directory so subsequent admission
+            // paths find a writable structure.
+            std::fs::create_dir_all(&p).map_err(|e| {
+                StewardError::io(format!("recreating {}", p.display()), e)
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&p) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o700);
+                    let _ = std::fs::set_permissions(&p, perms);
+                }
+            }
+        }
+        Ok(PluginLifecycleOutcome {
+            plugin: plugin_name.to_string(),
+            was_currently_admitted,
+            change_applied: true,
+        })
+    }
+
+    /// Helper for [`Self::disable_plugin`] and
+    /// [`Self::uninstall_plugin`]: refuse if the plugin occupies
+    /// a catalogue shelf declared `required = true` and is the
+    /// only occupant. Returns `Ok(())` when the action is
+    /// permitted.
+    fn refuse_if_essential(
+        &self,
+        entry: &Arc<PluginEntry>,
+        verb: &str,
+    ) -> Result<(), StewardError> {
+        let catalogue = self.state.current_catalogue();
+        if let Some(shelf) = catalogue.find_shelf(&entry.shelf) {
+            if shelf.required {
+                // Multi-occupant shelves are out of v0.1.12 scope:
+                // every shelf is single-occupant today, so a
+                // required shelf with an admitted plugin always
+                // refuses the action.
+                return Err(StewardError::Admission(format!(
+                    "{}: cannot {verb}; shelf {} is declared \
+                     required = true in the catalogue",
+                    entry.name, entry.shelf
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Run a health check against every admitted plugin, returning a
@@ -1922,7 +3576,7 @@ impl AdmissionEngine {
             let announcer = crate::context::RegistrySubjectAnnouncer::new(
                 Arc::clone(&self.state.subjects),
                 Arc::clone(&self.state.relations),
-                Arc::clone(&self.state.catalogue),
+                self.state.current_catalogue(),
                 Arc::clone(&self.state.bus),
                 plugin.clone(),
             )
@@ -1995,6 +3649,96 @@ impl AdmissionEngine {
             errored,
         }
     }
+}
+
+/// Source for the new manifest in
+/// [`AdmissionEngine::reload_manifest`].
+///
+/// The configured-source variant (re-read the originally-loaded
+/// manifest path) lands with the operator wire op in a follow-up
+/// commit; today's framework primitive accepts inline TOML or an
+/// arbitrary path so distributions can wire their own operator
+/// surface in the meantime.
+#[derive(Debug, Clone)]
+pub enum ManifestSource {
+    /// Manifest TOML supplied verbatim by the caller.
+    Inline(String),
+    /// Path read at reload time. Relative paths resolve against
+    /// the steward's current working directory; orchestration
+    /// tooling is expected to pass absolute paths.
+    Path(std::path::PathBuf),
+}
+
+/// Outcome of a successful (or dry-run) call to
+/// [`AdmissionEngine::reload_manifest`].
+#[derive(Debug, Clone)]
+pub struct ManifestReloadOutcome {
+    /// Canonical name of the plugin whose manifest was reloaded.
+    pub plugin: String,
+    /// Manifest version before the reload.
+    pub from_manifest_version: String,
+    /// Manifest version after the reload (or the version that
+    /// would have been swapped in for `dry_run = true`).
+    pub to_manifest_version: String,
+    /// Wall-clock duration of the validation pipeline plus the
+    /// atomic swap (or just the pipeline, for dry runs).
+    pub duration_ms: u64,
+    /// `true` when the call ran in dry-run mode and no state
+    /// was mutated.
+    pub dry_run: bool,
+}
+
+/// Wall-clock millisecond timestamp suitable for the
+/// `last_state_changed_at_ms` column on `installed_plugins`.
+fn system_time_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+/// Outcome of an operator-issued plugin lifecycle verb
+/// ([`AdmissionEngine::enable_plugin`],
+/// [`AdmissionEngine::disable_plugin`],
+/// [`AdmissionEngine::uninstall_plugin`],
+/// [`AdmissionEngine::purge_plugin_state`]). The shape is
+/// deliberately uniform so wire serialisation maps to a single
+/// reply struct on the operator surface.
+#[derive(Debug, Clone)]
+pub struct PluginLifecycleOutcome {
+    /// Canonical name of the plugin the verb targeted.
+    pub plugin: String,
+    /// `true` when the plugin was admitted on the router at the
+    /// moment the verb fired. Lets the operator surface render
+    /// the "was running, drained" outcome distinctly from the
+    /// "was already unloaded, bit flipped" outcome.
+    pub was_currently_admitted: bool,
+    /// `true` when the verb actually mutated state (persisted a
+    /// changed bit, removed a bundle, drained an entry). Today
+    /// the verbs always return `true`; a future hash-skip on
+    /// no-op flips populates this with `false` without breaking
+    /// the wire shape.
+    pub change_applied: bool,
+}
+
+/// Outcome of a successful (or dry-run) call to
+/// [`AdmissionEngine::reload_catalogue`].
+#[derive(Debug, Clone)]
+pub struct CatalogueReloadOutcome {
+    /// Catalogue schema version before the reload.
+    pub from_schema_version: u32,
+    /// Catalogue schema version after the reload (or the
+    /// version that would have been swapped in for
+    /// `dry_run = true`).
+    pub to_schema_version: u32,
+    /// Number of racks in the reloaded catalogue.
+    pub rack_count: u32,
+    /// Wall-clock duration of the validation pipeline plus the
+    /// atomic swap (or just the pipeline, for dry runs).
+    pub duration_ms: u64,
+    /// `true` when the call ran in dry-run mode and no state
+    /// was mutated.
+    pub dry_run: bool,
 }
 
 /// Outcome of [`AdmissionEngine::scrub_factory_orphans`]. Returned to
@@ -2362,6 +4106,8 @@ fn build_load_context(
     router: Arc<PluginRouter>,
     persistence: Arc<dyn PersistenceStore>,
     conflict_index: Arc<SubjectConflictIndex>,
+    appointments_runtime: Option<Arc<crate::appointments::AppointmentRuntime>>,
+    watches_runtime: Option<Arc<crate::watches::WatchRuntime>>,
 ) -> Result<LoadContext, StewardError> {
     let state_dir = plugin_data_root.join(&manifest.plugin.name).join("state");
     let credentials_dir = plugin_data_root
@@ -2403,7 +4149,7 @@ fn build_load_context(
                     Arc::clone(&catalogue),
                     Arc::clone(&bus),
                     admin_ledger,
-                    router,
+                    Arc::clone(&router),
                     manifest.plugin.name.clone(),
                 )
                 .with_persistence(Arc::clone(&persistence)),
@@ -2414,6 +4160,42 @@ fn build_load_context(
     };
 
     let config = load_plugin_config(plugins_config_dir, &manifest.plugin.name)?;
+
+    // Fast Path dispatcher is populated only for plugins whose
+    // manifest declares capabilities.fast_path = true. Plugins
+    // that did not opt in see None and an unwrap at use site
+    // surfaces the manifest misconfiguration loudly. The router-
+    // backed dispatcher routes each call through the per-warden
+    // Fast Path verb gate and budget enforcement.
+    let fast_path_dispatcher: Option<
+        Arc<dyn evo_plugin_sdk::contract::FastPathDispatcher>,
+    > = if manifest.capabilities.fast_path {
+        Some(Arc::new(crate::context::RouterFastPathDispatcher::new(
+            Arc::clone(&router),
+        )))
+    } else {
+        None
+    };
+
+    // Appointment scheduler is populated only for plugins whose
+    // manifest declares capabilities.appointments = true AND the
+    // engine was constructed with a runtime handle. Plugins that
+    // did not opt in see None and an unwrap at use site surfaces
+    // the manifest misconfiguration loudly. The router-backed
+    // scheduler binds the dispatcher to the plugin's canonical
+    // name so every appointment is namespaced under that creator
+    // label and counted against that creator's quota.
+    let appointments: Option<
+        Arc<dyn evo_plugin_sdk::contract::AppointmentScheduler>,
+    > = match (&appointments_runtime, manifest.capabilities.appointments) {
+        (Some(runtime), true) => {
+            Some(Arc::new(crate::context::RouterAppointmentScheduler::new(
+                Arc::clone(runtime),
+                manifest.plugin.name.clone(),
+            )))
+        }
+        _ => None,
+    };
 
     Ok(LoadContext {
         config,
@@ -2458,6 +4240,17 @@ fn build_load_context(
         subject_querier: Some(Arc::new(RegistrySubjectQuerier::new(registry))),
         subject_admin,
         relation_admin,
+        fast_path_dispatcher,
+        appointments,
+        watches: match (&watches_runtime, manifest.capabilities.watches) {
+            (Some(runtime), true) => {
+                Some(Arc::new(crate::context::RouterWatchScheduler::new(
+                    Arc::clone(runtime),
+                    manifest.plugin.name.clone(),
+                )))
+            }
+            _ => None,
+        },
     })
 }
 
@@ -2608,6 +4401,7 @@ mod tests {
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec!["ping".into()],
+                        course_correct_verbs: vec![],
                         accepts_custody: false,
                         flags: Default::default(),
                     },
@@ -2829,10 +4623,11 @@ response_budget_ms = 1000
     #[tokio::test]
     async fn reload_plugin_refuses_programmatic_origin() {
         // A plugin admitted via the typed admit_singleton_respondent
-        // path has no recorded source directory. The reload path
-        // must refuse with a structured error pointing the
-        // distribution at unload + admit, not silently succeed
-        // with "nothing to do" or panic on the missing origin.
+        // path has no recorded source directory. With Restart mode
+        // (test_manifest's default), reload must refuse with a
+        // structured error pointing the distribution at unload +
+        // admit, not silently succeed with "nothing to do" or
+        // panic on the missing origin.
         let catalogue = test_catalogue();
         let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
         let plugin = TestRespondent {
@@ -2845,7 +4640,9 @@ response_budget_ms = 1000
             .unwrap();
 
         let runtime_dir = tempfile::tempdir().unwrap();
-        let r = engine.reload_plugin("org.test.ping", runtime_dir.path()).await;
+        let r = engine
+            .reload_plugin("org.test.ping", runtime_dir.path())
+            .await;
         match r {
             Err(StewardError::Dispatch(msg)) => {
                 assert!(
@@ -2855,6 +4652,961 @@ response_budget_ms = 1000
             }
             other => panic!("expected Dispatch refusal, got {other:?}"),
         }
+    }
+
+    /// Manifest declaring `lifecycle.hot_reload = "live"` for the
+    /// in-process Live-mode reload tests below. Mirrors
+    /// [`test_manifest`] otherwise.
+    fn test_manifest_live(name: &str) -> Manifest {
+        let toml = format!(
+            r#"
+[plugin]
+name = "{name}"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "test.ping"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "live"
+
+[capabilities.respondent]
+request_types = ["ping"]
+response_budget_ms = 1000
+"#
+        );
+        Manifest::from_toml(&toml).unwrap()
+    }
+
+    /// Plugin recording its prepare / load_with_state observations
+    /// into a shared bag so the Live-mode tests can assert on what
+    /// the framework called.
+    #[derive(Default, Clone)]
+    struct LiveReloadObservations {
+        loads: u32,
+        prepares: u32,
+        prepare_returns: Vec<Option<Vec<u8>>>,
+        load_with_state_blobs: Vec<Option<Vec<u8>>>,
+    }
+
+    struct LiveReloadRespondent {
+        name: String,
+        obs: Arc<std::sync::Mutex<LiveReloadObservations>>,
+        // Bytes returned from prepare_for_live_reload. None means the
+        // plugin signals "no state to carry"; the framework still
+        // performs the unload + load_with_state(None) sequence.
+        prepare_returns: Option<Vec<u8>>,
+        // When true, load_with_state(blob.is_some()) returns Err on
+        // the first call, exercising the cold-reload rollback path.
+        fail_first_load_with_state: std::sync::atomic::AtomicBool,
+    }
+
+    impl LiveReloadRespondent {
+        fn new(
+            name: &str,
+            obs: Arc<std::sync::Mutex<LiveReloadObservations>>,
+            prepare_returns: Option<Vec<u8>>,
+        ) -> Self {
+            Self {
+                name: name.into(),
+                obs,
+                prepare_returns,
+                fail_first_load_with_state: std::sync::atomic::AtomicBool::new(
+                    false,
+                ),
+            }
+        }
+
+        fn fail_once_on_load_with_state(self) -> Self {
+            self.fail_first_load_with_state
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+    }
+
+    impl Plugin for LiveReloadRespondent {
+        fn describe(
+            &self,
+        ) -> impl Future<Output = PluginDescription> + Send + '_ {
+            async move {
+                PluginDescription {
+                    identity: PluginIdentity {
+                        name: self.name.clone(),
+                        version: semver::Version::new(0, 1, 0),
+                        contract: 1,
+                    },
+                    runtime_capabilities: RuntimeCapabilities {
+                        request_types: vec!["ping".into()],
+                        course_correct_verbs: vec![],
+                        accepts_custody: false,
+                        flags: Default::default(),
+                    },
+                    build_info: BuildInfo {
+                        plugin_build: "test".into(),
+                        sdk_version: "0.1.0".into(),
+                        rustc_version: None,
+                        built_at: None,
+                    },
+                }
+            }
+        }
+
+        fn load<'a>(
+            &'a mut self,
+            _ctx: &'a LoadContext,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+            async move {
+                self.obs.lock().unwrap().loads += 1;
+                Ok(())
+            }
+        }
+
+        fn unload(
+            &mut self,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
+            async move { Ok(()) }
+        }
+
+        fn health_check(
+            &self,
+        ) -> impl Future<Output = HealthReport> + Send + '_ {
+            async move { HealthReport::healthy() }
+        }
+
+        fn prepare_for_live_reload(
+            &self,
+        ) -> impl Future<
+            Output = Result<
+                Option<evo_plugin_sdk::contract::StateBlob>,
+                PluginError,
+            >,
+        > + Send
+               + '_ {
+            async move {
+                self.obs.lock().unwrap().prepares += 1;
+                let payload = self.prepare_returns.clone();
+                self.obs
+                    .lock()
+                    .unwrap()
+                    .prepare_returns
+                    .push(payload.clone());
+                Ok(payload.map(|p| evo_plugin_sdk::contract::StateBlob {
+                    schema_version: 1,
+                    payload: p,
+                }))
+            }
+        }
+
+        fn load_with_state<'a>(
+            &'a mut self,
+            _ctx: &'a LoadContext,
+            blob: Option<evo_plugin_sdk::contract::StateBlob>,
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+            async move {
+                let payload = blob.as_ref().map(|b| b.payload.clone());
+                self.obs.lock().unwrap().load_with_state_blobs.push(payload);
+                if blob.is_some()
+                    && self
+                        .fail_first_load_with_state
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(PluginError::Permanent(
+                        "induced load_with_state failure".to_string(),
+                    ));
+                }
+                self.obs.lock().unwrap().loads += 1;
+                Ok(())
+            }
+        }
+    }
+
+    impl Respondent for LiveReloadRespondent {
+        fn handle_request<'a>(
+            &'a mut self,
+            req: &'a Request,
+        ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a
+        {
+            async move { Ok(Response::for_request(req, req.payload.clone())) }
+        }
+    }
+
+    #[tokio::test]
+    async fn live_reload_in_process_carries_state_through_callbacks() {
+        // Happy path: prepare returns Some(blob); load_with_state
+        // receives the same payload.
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let obs =
+            Arc::new(std::sync::Mutex::new(LiveReloadObservations::default()));
+        let plugin = LiveReloadRespondent::new(
+            "org.test.ping",
+            Arc::clone(&obs),
+            Some(b"hello-state".to_vec()),
+        );
+        engine
+            .admit_singleton_respondent(
+                plugin,
+                test_manifest_live("org.test.ping"),
+            )
+            .await
+            .unwrap();
+
+        let runtime_dir = tempfile::tempdir().unwrap();
+        engine
+            .reload_plugin("org.test.ping", runtime_dir.path())
+            .await
+            .expect("live reload should succeed");
+
+        let snapshot = obs.lock().unwrap().clone();
+        assert_eq!(
+            snapshot.prepares, 1,
+            "prepare_for_live_reload called exactly once"
+        );
+        assert_eq!(
+            snapshot.load_with_state_blobs.len(),
+            1,
+            "load_with_state called exactly once on success"
+        );
+        assert_eq!(
+            snapshot.load_with_state_blobs[0],
+            Some(b"hello-state".to_vec()),
+            "load_with_state must receive the prepare payload verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_reload_in_process_default_prepare_returns_none() {
+        // Plugin returns None from prepare; load_with_state is
+        // called with None. The framework's path runs anyway —
+        // catalogue / config / handles get refreshed.
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let obs =
+            Arc::new(std::sync::Mutex::new(LiveReloadObservations::default()));
+        let plugin =
+            LiveReloadRespondent::new("org.test.ping", Arc::clone(&obs), None);
+        engine
+            .admit_singleton_respondent(
+                plugin,
+                test_manifest_live("org.test.ping"),
+            )
+            .await
+            .unwrap();
+
+        let runtime_dir = tempfile::tempdir().unwrap();
+        engine
+            .reload_plugin("org.test.ping", runtime_dir.path())
+            .await
+            .expect("live reload with empty state should succeed");
+
+        let snapshot = obs.lock().unwrap().clone();
+        assert_eq!(snapshot.prepares, 1);
+        assert_eq!(snapshot.load_with_state_blobs.len(), 1);
+        assert_eq!(snapshot.load_with_state_blobs[0], None);
+    }
+
+    #[tokio::test]
+    async fn live_reload_failure_during_load_with_state_triggers_cold_reload() {
+        // load_with_state fails the first time it sees a blob; the
+        // framework rolls back to cold reload (unload + load with
+        // None). Plugin stays admitted, prior state is lost,
+        // PluginLiveReloadFailed with rolled_back = true is emitted.
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let obs =
+            Arc::new(std::sync::Mutex::new(LiveReloadObservations::default()));
+        let plugin = LiveReloadRespondent::new(
+            "org.test.ping",
+            Arc::clone(&obs),
+            Some(b"will-be-rejected".to_vec()),
+        )
+        .fail_once_on_load_with_state();
+        engine
+            .admit_singleton_respondent(
+                plugin,
+                test_manifest_live("org.test.ping"),
+            )
+            .await
+            .unwrap();
+
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let r = engine
+            .reload_plugin("org.test.ping", runtime_dir.path())
+            .await;
+        match r {
+            Err(StewardError::Dispatch(msg)) => {
+                assert!(
+                    msg.contains("cold-reloaded successfully"),
+                    "expected cold-reload rollback message, got: {msg}"
+                );
+            }
+            other => {
+                panic!("expected Dispatch refusal with rollback, got {other:?}")
+            }
+        }
+        let snapshot = obs.lock().unwrap().clone();
+        assert_eq!(snapshot.prepares, 1);
+        // Two load_with_state calls: first with blob (failed),
+        // second with None (cold reload).
+        assert_eq!(snapshot.load_with_state_blobs.len(), 2);
+        assert!(snapshot.load_with_state_blobs[0].is_some());
+        assert_eq!(snapshot.load_with_state_blobs[1], None);
+    }
+
+    #[tokio::test]
+    async fn live_reload_refuses_when_manifest_declares_none() {
+        // hot_reload = none: the plugin author opted out of any
+        // hot reload. Reload refuses with the documented message.
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let obs =
+            Arc::new(std::sync::Mutex::new(LiveReloadObservations::default()));
+        let plugin =
+            LiveReloadRespondent::new("org.test.ping", Arc::clone(&obs), None);
+        let mut manifest = test_manifest_live("org.test.ping");
+        manifest.lifecycle.hot_reload =
+            evo_plugin_sdk::manifest::HotReloadPolicy::None;
+        engine
+            .admit_singleton_respondent(plugin, manifest)
+            .await
+            .unwrap();
+
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let r = engine
+            .reload_plugin("org.test.ping", runtime_dir.path())
+            .await;
+        match r {
+            Err(StewardError::Dispatch(msg)) => {
+                assert!(
+                    msg.contains("opted out of hot reload"),
+                    "expected 'opted out of hot reload' refusal, got: {msg}"
+                );
+            }
+            other => panic!("expected Dispatch refusal, got {other:?}"),
+        }
+        // Plugin's prepare/load callbacks must not be called when
+        // the manifest declares None: the policy is checked first.
+        let snapshot = obs.lock().unwrap().clone();
+        assert_eq!(snapshot.prepares, 0);
+    }
+
+    #[tokio::test]
+    async fn reload_manifest_swaps_enforcement_policy_atomically() {
+        // Operator updates the manifest's request_types: declares
+        // a new verb on top of "ping". After reload_manifest, the
+        // entry's enforcement policy carries the new declarations
+        // and the dispatch gate accepts the new verb.
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        engine
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
+            .await
+            .unwrap();
+
+        // Sanity-check the old policy.
+        let entry = engine
+            .router()
+            .lookup_by_name("org.test.ping")
+            .expect("admitted");
+        let old_policy = entry.load_policy();
+        assert_eq!(
+            old_policy.allowed_request_types.as_deref(),
+            Some(&["ping".to_string()][..])
+        );
+
+        // Build new manifest TOML with an extended request_types
+        // list. Drift check against TestRespondent's runtime
+        // describe() (which advertises only "ping") would refuse a
+        // *narrower* manifest than runtime, so we keep the runtime
+        // list as a subset of the manifest list — drift detection
+        // permits manifest declarations to exceed runtime
+        // capabilities (the inverse direction is the failure mode).
+        let new_toml = r#"
+[plugin]
+name = "org.test.ping"
+version = "0.2.0"
+contract = 1
+
+[target]
+shelf = "test.ping"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+
+[capabilities.respondent]
+request_types = ["ping"]
+response_budget_ms = 2500
+"#;
+        let outcome = engine
+            .reload_manifest(
+                "org.test.ping",
+                ManifestSource::Inline(new_toml.to_string()),
+                false,
+            )
+            .await
+            .expect("reload should succeed");
+        assert_eq!(outcome.from_manifest_version, "0.1.0");
+        assert_eq!(outcome.to_manifest_version, "0.2.0");
+        assert!(!outcome.dry_run);
+
+        // Policy snapshot now carries the new budget.
+        let new_policy = entry.load_policy();
+        assert_eq!(new_policy.default_request_deadline_ms, Some(2500));
+        // Cached manifest also reflects the new version.
+        assert_eq!(
+            entry
+                .current_manifest()
+                .expect("manifest cached")
+                .plugin
+                .version
+                .to_string(),
+            "0.2.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_manifest_dry_run_does_not_mutate_state() {
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        engine
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
+            .await
+            .unwrap();
+        let entry = engine
+            .router()
+            .lookup_by_name("org.test.ping")
+            .expect("admitted");
+        let policy_before = entry.load_policy();
+        let original_budget = policy_before.default_request_deadline_ms;
+
+        let new_toml = r#"
+[plugin]
+name = "org.test.ping"
+version = "0.5.0"
+contract = 1
+
+[target]
+shelf = "test.ping"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+
+[capabilities.respondent]
+request_types = ["ping"]
+response_budget_ms = 9999
+"#;
+        let outcome = engine
+            .reload_manifest(
+                "org.test.ping",
+                ManifestSource::Inline(new_toml.to_string()),
+                true,
+            )
+            .await
+            .expect("dry_run should succeed");
+        assert!(outcome.dry_run);
+        assert_eq!(outcome.to_manifest_version, "0.5.0");
+
+        let policy_after = entry.load_policy();
+        assert_eq!(
+            policy_after.default_request_deadline_ms, original_budget,
+            "dry-run must not mutate the enforcement policy"
+        );
+        let manifest_after = entry.current_manifest().expect("manifest cached");
+        assert_eq!(
+            manifest_after.plugin.version.to_string(),
+            "0.1.0",
+            "dry-run must not swap the cached manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_manifest_refuses_identity_mismatch() {
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        engine
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
+            .await
+            .unwrap();
+
+        // Same TOML but with a different plugin.name field.
+        let mismatched = r#"
+[plugin]
+name = "org.test.different"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "test.ping"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "in-process"
+exec = "<compiled-in>"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+
+[capabilities.respondent]
+request_types = ["ping"]
+response_budget_ms = 1000
+"#;
+        let r = engine
+            .reload_manifest(
+                "org.test.ping",
+                ManifestSource::Inline(mismatched.to_string()),
+                false,
+            )
+            .await;
+        match r {
+            Err(StewardError::Admission(msg)) => {
+                assert!(
+                    msg.contains("declares plugin name"),
+                    "expected identity-mismatch refusal, got: {msg}"
+                );
+            }
+            other => panic!("expected Admission refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_manifest_refuses_transport_change() {
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        engine
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
+            .await
+            .unwrap();
+
+        // Same plugin name + version but transport switched to OOP.
+        let oop_toml = r#"
+[plugin]
+name = "org.test.ping"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "test.ping"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "/usr/local/bin/ping-plugin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+
+[capabilities.respondent]
+request_types = ["ping"]
+response_budget_ms = 1000
+"#;
+        let r = engine
+            .reload_manifest(
+                "org.test.ping",
+                ManifestSource::Inline(oop_toml.to_string()),
+                false,
+            )
+            .await;
+        match r {
+            Err(StewardError::Admission(msg)) => {
+                assert!(
+                    msg.contains("transport.kind"),
+                    "expected transport-change refusal, got: {msg}"
+                );
+            }
+            other => panic!("expected Admission refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_catalogue_swaps_declarations_atomically() {
+        // Build a starting catalogue with one shelf that
+        // test_manifest plugins admit against, then reload to a
+        // catalogue that adds a second shelf. The swap should
+        // succeed; admitted plugins keep their entries; the new
+        // catalogue is observable via state.current_catalogue().
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        engine
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
+            .await
+            .unwrap();
+
+        let extended_toml = r#"
+schema_version = 1
+
+[[racks]]
+name = "test"
+family = "domain"
+charter = "test rack"
+
+[[racks.shelves]]
+name = "ping"
+shape = 1
+
+[[racks.shelves]]
+name = "extended"
+shape = 1
+"#;
+        let outcome = engine
+            .reload_catalogue(
+                ManifestSource::Inline(extended_toml.to_string()),
+                false,
+            )
+            .await
+            .expect("reload should succeed");
+        assert_eq!(outcome.rack_count, 1);
+        assert!(!outcome.dry_run);
+
+        let after = engine.state().current_catalogue();
+        assert!(after.find_shelf("test.extended").is_some());
+        assert!(after.find_shelf("test.ping").is_some());
+    }
+
+    #[tokio::test]
+    async fn reload_catalogue_dry_run_does_not_mutate() {
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        engine
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
+            .await
+            .unwrap();
+
+        let extended_toml = r#"
+schema_version = 1
+
+[[racks]]
+name = "test"
+family = "domain"
+charter = "test rack"
+
+[[racks.shelves]]
+name = "ping"
+shape = 1
+
+[[racks.shelves]]
+name = "added-by-dry-run"
+shape = 1
+"#;
+        let outcome = engine
+            .reload_catalogue(
+                ManifestSource::Inline(extended_toml.to_string()),
+                true,
+            )
+            .await
+            .expect("dry_run should succeed");
+        assert!(outcome.dry_run);
+
+        // Catalogue must not have changed.
+        let after = engine.state().current_catalogue();
+        assert!(
+            after.find_shelf("test.added-by-dry-run").is_none(),
+            "dry-run must not swap the catalogue"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_catalogue_refuses_when_running_plugin_shelf_removed() {
+        // Admit a plugin against test.ping, then try to reload to a
+        // catalogue that no longer declares test.ping. The reload
+        // must refuse with a structured error and emit a
+        // CardinalityViolation per orphaned shelf; the catalogue
+        // stays unchanged.
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        engine
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
+            .await
+            .unwrap();
+
+        let removed_toml = r#"
+schema_version = 1
+
+[[racks]]
+name = "test"
+family = "domain"
+charter = "test rack"
+
+[[racks.shelves]]
+name = "different-shelf"
+shape = 1
+"#;
+        let r = engine
+            .reload_catalogue(
+                ManifestSource::Inline(removed_toml.to_string()),
+                false,
+            )
+            .await;
+        match r {
+            Err(StewardError::Admission(msg)) => {
+                assert!(
+                    msg.contains("shelf-occupancy conflict"),
+                    "expected shelf-occupancy refusal, got: {msg}"
+                );
+            }
+            other => panic!("expected Admission refusal, got {other:?}"),
+        }
+        // Catalogue unchanged.
+        let after = engine.state().current_catalogue();
+        assert!(after.find_shelf("test.ping").is_some());
+    }
+
+    #[tokio::test]
+    async fn reload_catalogue_refuses_invalid_toml() {
+        let catalogue = test_catalogue();
+        let engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let bogus = "this is not valid toml :::";
+        let r = engine
+            .reload_catalogue(ManifestSource::Inline(bogus.to_string()), false)
+            .await;
+        assert!(r.is_err(), "parse failure must surface as an error");
+    }
+
+    #[tokio::test]
+    async fn enable_plugin_persists_enabled_bit() {
+        let catalogue = test_catalogue();
+        let engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let outcome = engine
+            .enable_plugin("org.test.unknown", Some("operator note".into()))
+            .await
+            .expect("enable should succeed");
+        assert!(!outcome.was_currently_admitted);
+        let rows = engine
+            .persistence()
+            .load_all_installed_plugins()
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].enabled);
+        assert_eq!(rows[0].last_state_reason.as_deref(), Some("operator note"));
+    }
+
+    #[tokio::test]
+    async fn disable_plugin_drains_admitted_and_persists_disabled_bit() {
+        let catalogue = test_catalogue();
+        let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        engine
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
+            .await
+            .unwrap();
+        assert_eq!(engine.len(), 1);
+
+        let outcome = engine
+            .disable_plugin("org.test.ping", Some("disabling".into()))
+            .await
+            .expect("disable should succeed");
+        assert!(outcome.was_currently_admitted);
+        // Plugin drained out of the router.
+        assert_eq!(engine.len(), 0);
+        // Persistence row carries enabled = false.
+        let rows = engine
+            .persistence()
+            .load_all_installed_plugins()
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].enabled);
+    }
+
+    #[tokio::test]
+    async fn disable_plugin_refuses_essential_shelf() {
+        // Build a catalogue where the test.ping shelf is declared
+        // required = true; admit a plugin against it; disable
+        // refuses with a structured error and the plugin remains
+        // admitted.
+        let toml = r#"
+schema_version = 1
+
+[[racks]]
+name = "test"
+family = "domain"
+charter = "test"
+
+[[racks.shelves]]
+name = "ping"
+shape = 1
+required = true
+"#;
+        let cat =
+            Arc::new(crate::catalogue::Catalogue::from_toml(toml).unwrap());
+        let mut engine = test_engine_from_catalogue(Arc::clone(&cat));
+        let plugin = TestRespondent {
+            name: "org.test.ping".into(),
+            ..Default::default()
+        };
+        engine
+            .admit_singleton_respondent(plugin, test_manifest("org.test.ping"))
+            .await
+            .unwrap();
+
+        let r = engine.disable_plugin("org.test.ping", None).await;
+        match r {
+            Err(StewardError::Admission(msg)) => {
+                assert!(
+                    msg.contains("required = true"),
+                    "expected essential refusal, got: {msg}"
+                );
+            }
+            other => panic!("expected Admission refusal, got {other:?}"),
+        }
+        // Plugin still admitted.
+        assert_eq!(engine.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn purge_plugin_state_wipes_state_and_credentials_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plugin_data_root = dir.path().to_path_buf();
+        let state_dir = plugin_data_root.join("org.test.ping").join("state");
+        let cred_dir =
+            plugin_data_root.join("org.test.ping").join("credentials");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&cred_dir).unwrap();
+        std::fs::write(state_dir.join("blob.bin"), b"old data").unwrap();
+        std::fs::write(cred_dir.join("creds.toml"), b"secret").unwrap();
+
+        let catalogue = test_catalogue();
+        let state = StewardState::for_tests_with_catalogue(catalogue);
+        let engine = AdmissionEngine::new(
+            state,
+            plugin_data_root.clone(),
+            std::path::PathBuf::new(),
+            None,
+            PluginsSecurityConfig::default(),
+        );
+
+        let outcome = engine
+            .purge_plugin_state("org.test.ping")
+            .await
+            .expect("purge should succeed");
+        assert!(!outcome.was_currently_admitted);
+        // Files gone, directories preserved (recreated empty).
+        assert!(state_dir.is_dir());
+        assert!(cred_dir.is_dir());
+        assert!(!state_dir.join("blob.bin").exists());
+        assert!(!cred_dir.join("creds.toml").exists());
     }
 
     #[tokio::test]
@@ -3029,6 +5781,7 @@ response_budget_ms = 1000
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec!["ping".into()],
+                        course_correct_verbs: vec![],
                         accepts_custody: false,
                         flags: Default::default(),
                     },
@@ -3199,6 +5952,7 @@ response_budget_ms = 1000
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec!["ping".into()],
+                        course_correct_verbs: vec![],
                         accepts_custody: false,
                         flags: Default::default(),
                     },
@@ -3595,6 +6349,7 @@ custody_failure_mode = "abort"
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec![],
+                        course_correct_verbs: vec![],
                         accepts_custody: true,
                         flags: Default::default(),
                     },
@@ -4922,6 +7677,8 @@ response_budget_ms = 1000
             router,
             persistence,
             conflict_index,
+            None,
+            None,
         )
         .expect("test build_load_context");
         assert!(
@@ -4965,6 +7722,8 @@ response_budget_ms = 1000
             router,
             persistence,
             conflict_index,
+            None,
+            None,
         )
         .expect("test build_load_context");
         assert!(
@@ -5150,6 +7909,7 @@ custody_failure_mode = "abort"
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec!["ping".into()],
+                        course_correct_verbs: vec![],
                         accepts_custody: false,
                         flags: Default::default(),
                     },
@@ -5264,6 +8024,7 @@ custody_failure_mode = "abort"
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec!["ping".into()],
+                        course_correct_verbs: vec![],
                         accepts_custody: false,
                         flags: Default::default(),
                     },
@@ -5482,6 +8243,7 @@ custody_failure_mode = "abort"
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec!["ping".into()],
+                        course_correct_verbs: vec![],
                         accepts_custody: false,
                         flags: Default::default(),
                     },
@@ -5552,6 +8314,7 @@ custody_failure_mode = "abort"
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec![],
+                        course_correct_verbs: vec![],
                         accepts_custody: true,
                         flags: Default::default(),
                     },

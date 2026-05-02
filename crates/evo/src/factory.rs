@@ -451,8 +451,7 @@ impl InstanceAnnouncer for RegistryInstanceAnnouncer {
             // handle (test fixtures), the registry still operates
             // in memory; only durability across restart is missed.
             if let Some(store) = self.persistence.as_ref() {
-                let at_ms =
-                    crate::persistence::system_time_to_ms_now();
+                let at_ms = crate::persistence::system_time_to_ms_now();
                 store
                     .record_subject_announce(
                         crate::persistence::AnnounceRecord {

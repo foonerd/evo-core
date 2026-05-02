@@ -183,7 +183,7 @@ log_level = "info"
 socket_path = "/tmp/evo.sock"
 
 [catalogue]
-path = "/home/dev/evo-device-volumio/catalogue.toml"
+path = "/home/dev/evo-device-audio/catalogue.toml"
 
 [plugins]
 allow_unsigned = true

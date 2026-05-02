@@ -1,9 +1,10 @@
 //! The relation graph.
 //!
 //! Implements the contract specified in
-//! `docs/engineering/RELATIONS.md`. The v0 skeleton graph is in-memory
-//! only; persistence to `/var/lib/evo/state/evo.db` per
-//! `docs/engineering/PERSISTENCE.md` is deferred to a follow-up pass.
+//! `docs/engineering/RELATIONS.md`. The graph is in-memory; the
+//! relations table at `/var/lib/evo/state/evo.db` provides the
+//! durable mirror, with write-through and boot rehydration handled
+//! through the persistence trait.
 //!
 //! ## What's in
 //!
@@ -116,7 +117,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 fn ms_to_system_time(ms: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(ms)
 }
-
 
 /// The relation graph.
 ///
@@ -669,17 +669,17 @@ impl RelationGraph {
                 rel.predicate.clone(),
                 rel.target_id.clone(),
             );
-            let suppression = match (
-                rel.suppressed_admin_plugin,
-                rel.suppressed_at_ms,
-            ) {
-                (Some(admin_plugin), Some(at_ms)) => Some(SuppressionRecord {
-                    admin_plugin,
-                    suppressed_at: ms_to_system_time(at_ms),
-                    reason: rel.suppression_reason,
-                }),
-                _ => None,
-            };
+            let suppression =
+                match (rel.suppressed_admin_plugin, rel.suppressed_at_ms) {
+                    (Some(admin_plugin), Some(at_ms)) => {
+                        Some(SuppressionRecord {
+                            admin_plugin,
+                            suppressed_at: ms_to_system_time(at_ms),
+                            reason: rel.suppression_reason,
+                        })
+                    }
+                    _ => None,
+                };
             let record = RelationRecord {
                 key: key.clone(),
                 created_at: ms_to_system_time(rel.created_at_ms),

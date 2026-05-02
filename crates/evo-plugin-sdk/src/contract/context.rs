@@ -197,6 +197,56 @@ pub struct LoadContext {
     /// inverse. See `RELATIONS.md` section 4.2 for the framework
     /// semantics.
     pub relation_admin: Option<Arc<dyn RelationAdmin>>,
+
+    /// Handle for plugin-initiated time-driven instructions
+    /// (appointments).
+    ///
+    /// Populated as `Some` only when the plugin's manifest
+    /// declares `capabilities.appointments = true`. Plugins
+    /// that did not opt in see `None`; calls would panic on
+    /// unwrap, which is the intended fail-fast — a manifest
+    /// authoring mistake should surface loudly at `load` time
+    /// rather than be silently swallowed at first use.
+    ///
+    /// See [`AppointmentScheduler`] for the per-call shape.
+    pub appointments: Option<Arc<dyn AppointmentScheduler>>,
+
+    /// Handle for plugin-initiated condition-driven instructions
+    /// (watches).
+    ///
+    /// Populated as `Some` only when the plugin's manifest
+    /// declares `capabilities.watches = true`. Plugins that did
+    /// not opt in see `None`; calls would panic on unwrap, which
+    /// is the intended fail-fast — a manifest authoring mistake
+    /// should surface loudly at `load` time rather than be
+    /// silently swallowed at first use.
+    ///
+    /// See [`WatchScheduler`] for the per-call shape.
+    pub watches: Option<Arc<dyn WatchScheduler>>,
+
+    /// Handle for plugin-originated Fast Path dispatch.
+    ///
+    /// Populated as `Some` only when the plugin's manifest
+    /// declares `capabilities.fast_path = true`. Hardware-input
+    /// plugins (IR receivers, Bluetooth controllers, keyboard
+    /// listeners, touch handlers) declare it; pure source /
+    /// library / metadata plugins leave it at the default and
+    /// see `None` here.
+    ///
+    /// Fast Path dispatch routes through a latency-bounded
+    /// channel that bypasses the slow-path frame queue. The
+    /// dispatcher consults the target warden's
+    /// `capabilities.warden.fast_path_verbs` to gate every
+    /// call; verbs the warden did not declare on Fast Path
+    /// refuse with `not_fast_path_eligible` even if they appear
+    /// in the warden's `course_correct_verbs` list. See
+    /// [`FastPathDispatcher`] for the per-call shape.
+    ///
+    /// `None` is the conservative default. Plugins that need
+    /// the dispatcher unwrap this at `load` time and fail
+    /// loudly if it is `None`; that failure signals a manifest
+    /// misconfiguration the operator can fix.
+    pub fast_path_dispatcher: Option<Arc<dyn FastPathDispatcher>>,
 }
 
 impl std::fmt::Debug for LoadContext {
@@ -236,6 +286,30 @@ impl std::fmt::Debug for LoadContext {
                     .relation_admin
                     .as_ref()
                     .map(|_| "<Arc<dyn RelationAdmin>>")
+                    .unwrap_or("None"),
+            )
+            .field(
+                "fast_path_dispatcher",
+                &self
+                    .fast_path_dispatcher
+                    .as_ref()
+                    .map(|_| "<Arc<dyn FastPathDispatcher>>")
+                    .unwrap_or("None"),
+            )
+            .field(
+                "appointments",
+                &self
+                    .appointments
+                    .as_ref()
+                    .map(|_| "<Arc<dyn AppointmentScheduler>>")
+                    .unwrap_or("None"),
+            )
+            .field(
+                "watches",
+                &self
+                    .watches
+                    .as_ref()
+                    .map(|_| "<Arc<dyn WatchScheduler>>")
                     .unwrap_or("None"),
             )
             .finish()
@@ -436,29 +510,1009 @@ pub trait InstanceAnnouncer: Send + Sync {
 }
 
 /// Callback trait: plugin requests user interaction.
+///
+/// Plugins use this to ask a question of the human operator and
+/// await a typed answer: auth flows (OAuth, password + remember-
+/// me, API tokens), config flows (network setup, output device
+/// selection), and confirmations of destructive actions. The
+/// dispatch surface is plugin-initiated only — consumer-
+/// initiated queries (search, list, browse) use the standard
+/// `op = "request"` against the relevant plugin's shelf.
+///
+/// The framework routes the request to whichever consumer holds
+/// the `user_interaction_responder` capability and resolves the
+/// returned future when that consumer answers, the prompt times
+/// out, or either side cancels.
 pub trait UserInteractionRequester: Send + Sync {
-    /// Request a user interaction (auth flow, confirmation, pairing
-    /// code).
+    /// Issue a prompt and await its outcome.
     ///
-    /// The steward routes the request to whichever consumer can render
-    /// it. The response is eventually delivered through the wire
-    /// protocol's user-interaction channel.
-    fn request<'a>(
+    /// Returns:
+    /// - `Ok(PromptOutcome::Answered { response, retain_for })`
+    ///   when the consumer answers within the timeout.
+    /// - `Ok(PromptOutcome::Cancelled { by })` when either the
+    ///   plugin or the consumer cancels.
+    /// - `Ok(PromptOutcome::TimedOut)` when the deadline expires
+    ///   without an answer.
+    /// - `Err(ReportError::*)` for framework-level failures
+    ///   (steward shutting down, no responder configured for
+    ///   this build, etc.).
+    ///
+    /// The plugin owns its own validation logic; if the answer
+    /// fails plugin-side validation, the plugin re-issues the
+    /// prompt with [`PromptRequest::error_context`] and
+    /// [`PromptRequest::previous_answer`] populated. The
+    /// framework does not perform semantic validation on
+    /// answers.
+    fn request_user_interaction<'a>(
         &'a self,
-        interaction: UserInteraction,
+        prompt: PromptRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<PromptOutcome, ReportError>> + Send + 'a,
+        >,
+    >;
+}
+
+/// Default prompt timeout in milliseconds (one minute).
+///
+/// Applied when [`PromptRequest::timeout_ms`] is left `None`.
+/// Pinned at one minute so a prompt issued by a misbehaving
+/// plugin against an unattended device clears in a tight window
+/// rather than wedging the responder for hours.
+pub const DEFAULT_PROMPT_TIMEOUT_MS: u32 = 60_000;
+
+/// Maximum prompt timeout in milliseconds (24 hours).
+///
+/// Manifests / plugins declaring a longer timeout are clamped at
+/// admission. The cap exists to keep the framework's
+/// pending-prompt set bounded; an unattended device with a
+/// prompt parked for days is operationally indistinguishable
+/// from a leak.
+pub const MAX_PROMPT_TIMEOUT_MS: u32 = 24 * 60 * 60 * 1_000;
+
+/// One row of a [`PromptType::Select`] /
+/// [`PromptType::SelectWithOther`] / [`PromptType::MultiSelect`]
+/// option list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptOption {
+    /// Stable identifier the answer carries back. Plugin-
+    /// chosen; the framework does not interpret.
+    pub id: String,
+    /// Human-readable label the consumer renders.
+    pub label: String,
+}
+
+/// One field of a [`PromptType::MultiField`] composite form.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptField {
+    /// Stable identifier. Used as the key in the answer's
+    /// `fields` map.
+    pub id: String,
+    /// Human-readable label rendered alongside the field's
+    /// input.
+    pub label: String,
+    /// Field-typed sub-prompt. The framework does not enforce
+    /// nesting depth limits; plugin authors are expected to
+    /// keep forms shallow (typically one level).
+    pub field_type: PromptType,
+}
+
+/// Date / time / datetime picker variant for
+/// [`PromptType::DateTime`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DateTimeKind {
+    /// Calendar-date picker (no time component).
+    Date,
+    /// Wall-clock time picker (no date component).
+    Time,
+    /// Combined date + time picker.
+    DateTime,
+}
+
+/// The closed enum of prompt content shapes. v0.1.12 ships
+/// ten variants; future variants add via ADR + non-breaking
+/// enum extension. Consumers that observe an unknown variant
+/// MUST render a "newer-client-needed" fallback rather than
+/// crashing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PromptType {
+    /// Single-line free text (email, hostname, API key).
+    Text {
+        /// Human-readable label rendered above the field.
+        label: String,
+        /// Optional placeholder text displayed when the field
+        /// is empty.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placeholder: Option<String>,
+        /// Optional regex hint for consumer-side pre-submit
+        /// validation. Advisory only — the plugin's own
+        /// validation is authoritative.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        validation_regex: Option<String>,
+    },
+    /// Masked single-line text (passwords, API tokens).
+    Password {
+        /// Human-readable label rendered above the field.
+        label: String,
+    },
+    /// Pick exactly one option from the supplied list.
+    Select {
+        /// Human-readable label rendered above the picker.
+        label: String,
+        /// Options to choose from. Non-empty by plugin
+        /// contract; an empty list is a plugin authoring error.
+        options: Vec<PromptOption>,
+    },
+    /// Pick one option from the list OR enter a free-text
+    /// alternative (visible-SSID list with "Hidden network"
+    /// option).
+    SelectWithOther {
+        /// Human-readable label rendered above the picker.
+        label: String,
+        /// Options to choose from.
+        options: Vec<PromptOption>,
+        /// Label for the "other" entry; defaults to a localised
+        /// "Other" in the consumer's UI when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        other_label: Option<String>,
+    },
+    /// Pick zero or more options from the supplied list.
+    MultiSelect {
+        /// Human-readable label rendered above the picker.
+        label: String,
+        /// Options to choose from. Non-empty by plugin
+        /// contract.
+        options: Vec<PromptOption>,
+    },
+    /// Yes / no confirmation.
+    Confirm {
+        /// Human-readable message rendered as the question.
+        message: String,
+    },
+    /// Composite form with field-typed sub-prompts. Each field
+    /// in the answer's `fields` map is keyed by the
+    /// corresponding [`PromptField::id`].
+    MultiField {
+        /// The form's fields, in render order.
+        fields: Vec<PromptField>,
+    },
+    /// External redirect (OAuth, captive portal). The provider-
+    /// side challenge happens outside the framework's view; the
+    /// consumer renders the URL (browser, embedded webview,
+    /// kiosk) and returns the resulting code or token.
+    ExternalRedirect {
+        /// URL the consumer must visit.
+        url: String,
+        /// Optional plugin-supplied help text the consumer
+        /// renders alongside the redirect (e.g. "you'll be
+        /// asked to log in to your provider account").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        callback_help: Option<String>,
+    },
+    /// Date / time / datetime picker.
+    DateTime {
+        /// Human-readable label rendered above the picker.
+        label: String,
+        /// Picker variant (date-only, time-only, combined).
+        /// Renamed from `kind` so the field does not collide
+        /// with the enum's serde-internal `kind` tag.
+        picker: DateTimeKind,
+    },
+    /// Escape hatch for prompt shapes the closed enum does not
+    /// cover. Consumers that recognise the `mime_type` render
+    /// accordingly; consumers that do not surface a "newer-
+    /// client-needed" fallback. Plugin authors using this type
+    /// publish the per-mime-type contract themselves; the
+    /// framework does not interpret the payload.
+    Freeform {
+        /// MIME type identifying the payload's shape.
+        mime_type: String,
+        /// Opaque payload. The framework does not interpret it.
+        /// Serialised as a JSON array of bytes under JSON and as
+        /// a native CBOR byte sequence under CBOR; consumers
+        /// that need compact JSON for large payloads should
+        /// avoid the freeform escape hatch and use a typed
+        /// variant instead.
+        payload: Vec<u8>,
+    },
+}
+
+/// The typed answer to a [`PromptType`]. Variants are matched
+/// to their request shapes 1:1 — a consumer answering a
+/// `Text` prompt MUST send a `Text` response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PromptResponse {
+    /// Answer to [`PromptType::Text`].
+    Text {
+        /// The user's input.
+        value: String,
+    },
+    /// Answer to [`PromptType::Password`].
+    Password {
+        /// The user's input. Plugins are responsible for
+        /// secret hygiene; the framework does not log this
+        /// value.
+        value: String,
+    },
+    /// Answer to [`PromptType::Select`].
+    Select {
+        /// The chosen option's [`PromptOption::id`].
+        option_id: String,
+    },
+    /// Answer to [`PromptType::SelectWithOther`]. Exactly one
+    /// of the two fields is `Some`.
+    SelectWithOther {
+        /// The chosen option's id, when the user picked from
+        /// the list.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        option_id: Option<String>,
+        /// The user's free-text input, when they chose
+        /// "other".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        other: Option<String>,
+    },
+    /// Answer to [`PromptType::MultiSelect`].
+    MultiSelect {
+        /// The chosen options' ids. May be empty if the user
+        /// selected nothing (plugin decides whether that is
+        /// valid).
+        option_ids: Vec<String>,
+    },
+    /// Answer to [`PromptType::Confirm`].
+    Confirm {
+        /// The user's choice.
+        confirmed: bool,
+    },
+    /// Answer to [`PromptType::MultiField`]. The map's keys
+    /// are [`PromptField::id`] values; the map's values are
+    /// the per-field answers.
+    MultiField {
+        /// Per-field answers keyed by field id.
+        fields: std::collections::BTreeMap<String, PromptResponse>,
+    },
+    /// Answer to [`PromptType::ExternalRedirect`].
+    ExternalRedirect {
+        /// The code or token the provider returned to the
+        /// consumer (OAuth `code`, captive-portal session
+        /// token, etc.).
+        code: String,
+    },
+    /// Answer to [`PromptType::DateTime`]. Always serialised
+    /// as ISO 8601: `YYYY-MM-DD` for `Date`, `HH:MM:SS` for
+    /// `Time`, `YYYY-MM-DDTHH:MM:SS` for `DateTime`.
+    DateTime {
+        /// ISO 8601 representation.
+        value: String,
+    },
+    /// Answer to [`PromptType::Freeform`]. The payload's
+    /// shape is per the prompt's declared `mime_type`.
+    Freeform {
+        /// Opaque payload. Same wire-form discipline as
+        /// [`PromptType::Freeform::payload`].
+        payload: Vec<u8>,
+    },
+}
+
+/// Plugin-supplied retention hint and the user's matching
+/// choice on the answer. The framework routes both directions;
+/// the plugin owns the resulting persistence (storing tokens /
+/// credentials in its `credentials_dir`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetentionHint {
+    /// Use the answer once and forget it.
+    SingleUse,
+    /// Keep the answer for the lifetime of the current
+    /// session.
+    Session,
+    /// Keep the answer until the user explicitly revokes it.
+    UntilRevoked,
+}
+
+/// Who initiated a [`PromptOutcome::Cancelled`] outcome.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCanceller {
+    /// The plugin cancelled its own pending prompt (typically
+    /// because its flow was superseded).
+    Plugin,
+    /// The user closed the dialog on the responder side.
+    Consumer,
+}
+
+/// The terminal outcome of a [`UserInteractionRequester::request_user_interaction`]
+/// call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PromptOutcome {
+    /// The consumer answered the prompt.
+    Answered {
+        /// The typed answer.
+        response: PromptResponse,
+        /// User's retention choice, when the prompt declared
+        /// a [`RetentionHint`]. The plugin is responsible for
+        /// the persistence implied by this choice.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retain_for: Option<RetentionHint>,
+    },
+    /// Either the plugin or the consumer cancelled.
+    Cancelled {
+        /// Who cancelled.
+        by: PromptCanceller,
+    },
+    /// The deadline expired without an answer.
+    TimedOut,
+}
+
+/// A prompt the plugin issues. Carries the prompt's content
+/// (the [`PromptType`]), its lifecycle metadata (timeout,
+/// session grouping, retention hint), and re-prompt context
+/// (error message + previous answer when the plugin re-issues
+/// after its own validation failure).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptRequest {
+    /// Plugin-chosen identifier. Stable across plugin
+    /// re-issues so the framework can recognise the same
+    /// prompt across restart and re-attach to the existing
+    /// subject. Idempotency contract is the plugin's: a
+    /// plugin that re-uses the same `prompt_id` for two
+    /// genuinely-different prompts produces ambiguous
+    /// behaviour.
+    pub prompt_id: String,
+    /// The prompt's content shape.
+    pub prompt_type: PromptType,
+    /// Optional dispatch deadline in milliseconds. `None`
+    /// defaults to [`DEFAULT_PROMPT_TIMEOUT_MS`] (one minute);
+    /// values above [`MAX_PROMPT_TIMEOUT_MS`] (24 hours) are
+    /// clamped at admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u32>,
+    /// Optional grouping identifier. Consumers observing
+    /// prompts with the same `session_id` group them in their
+    /// UI as one wizard / flow (multi-stage WiFi setup, OAuth
+    /// + MFA chain, login + remember-me).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Optional retention-policy hint the consumer surfaces as
+    /// a "remember me" affordance. The user's choice flows
+    /// back as [`PromptOutcome::Answered::retain_for`]; the
+    /// plugin owns the resulting persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_hint: Option<RetentionHint>,
+    /// Optional error message the consumer renders inline above
+    /// the form. Set on plugin re-issues after the plugin's
+    /// own semantic validation rejected the previous answer
+    /// (e.g. "Gateway is not in the same subnet as the IP").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_context: Option<String>,
+    /// Optional previous-answer payload the consumer pre-fills
+    /// the form with on a re-prompt, so the user fixes the
+    /// wrong field rather than re-entering everything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_answer: Option<PromptResponse>,
+}
+
+/// The lifecycle state of a prompt as observed via subject
+/// projection. Plugins do not see this directly; the framework
+/// stamps it on the prompt subject and consumers consume it via
+/// the existing `subscribe_subject` / `project_subject` surface.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptState {
+    /// The prompt is open and awaiting an answer.
+    Open,
+    /// The consumer answered the prompt.
+    Answered,
+    /// Either side cancelled the prompt.
+    Cancelled,
+    /// The deadline expired without an answer.
+    TimedOut,
+}
+
+// =====================================================================
+// Appointments — time-driven instructions.
+//
+// Plugins schedule actions via the `AppointmentScheduler` trait;
+// the framework persists each appointment as a subject under the
+// `evo-appointment` synthetic addressing scheme, evaluates
+// recurrence on the steward's clock, and dispatches the
+// configured action when the scheduled time arrives. Sibling to
+// the watches surface (condition-driven instructions; see
+// `WatchScheduler`) — they share action shape, capability model,
+// persistence path, and quota model.
+// =====================================================================
+
+/// Opaque identifier for an appointment. Minted by the
+/// framework on `create_appointment` and passed back to the
+/// plugin / consumer for cancel / lookup operations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct AppointmentId(pub String);
+
+impl AppointmentId {
+    /// Construct an id from a raw string.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+    /// Borrow the underlying string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for AppointmentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Day of week, used by [`AppointmentRecurrence::Weekly`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum DayOfWeek {
+    /// Monday.
+    Mon,
+    /// Tuesday.
+    Tue,
+    /// Wednesday.
+    Wed,
+    /// Thursday.
+    Thu,
+    /// Friday.
+    Fri,
+    /// Saturday.
+    Sat,
+    /// Sunday.
+    Sun,
+}
+
+/// The recurrence rule for an appointment. Closed enum with
+/// structured shorthand for common patterns plus a cron escape
+/// hatch for the long tail.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AppointmentRecurrence {
+    /// Single fire at the named instant. Wall-clock millisecond
+    /// timestamp interpreted under the appointment's
+    /// [`AppointmentTimeZone`].
+    OneShot {
+        /// Wall-clock fire time, ms since UNIX epoch.
+        fire_at_ms: u64,
+    },
+    /// Every day at the appointment's `time`.
+    Daily,
+    /// Mon–Fri at the appointment's `time`.
+    Weekdays,
+    /// Sat–Sun at the appointment's `time`.
+    Weekends,
+    /// Explicit list of weekdays at the appointment's `time`.
+    /// Empty list is invalid; framework refuses at create time.
+    Weekly {
+        /// The days the appointment fires on.
+        days: Vec<DayOfWeek>,
+    },
+    /// On the named day of the month at the appointment's
+    /// `time`. Months without that day skip; February 30 never
+    /// fires.
+    Monthly {
+        /// 1..=31 (range checked at create time).
+        day_of_month: u8,
+    },
+    /// On the named (month, day) every year at the
+    /// appointment's `time`. Feb 29 on non-leap years skips.
+    Yearly {
+        /// 1..=12 (range checked at create time).
+        month: u8,
+        /// 1..=31 (range checked at create time per month).
+        day: u8,
+    },
+    /// POSIX cron expression. Distributions that need patterns
+    /// the structured variants cannot express opt into this
+    /// escape hatch.
+    Cron {
+        /// Five-field cron expression (`min hour dom mon dow`).
+        expr: String,
+    },
+}
+
+/// Time-zone interpretation for the appointment's fire time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AppointmentTimeZone {
+    /// Fire at the exact UTC wall-clock; never affected by DST
+    /// or zone change.
+    Utc,
+    /// Fire at the device's current local time. DST-aware.
+    Local,
+    /// Fire at the named zone's local time. Immune to device
+    /// timezone changes.
+    Anchored {
+        /// IANA zone name (e.g. "Europe/London").
+        zone: String,
+    },
+}
+
+/// Per-appointment policy for what happens when a fire is
+/// missed (device asleep, off, in untrusted-time state).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AppointmentMissPolicy {
+    /// Drop the missed fire silently.
+    Drop,
+    /// Catch up at the next opportunity (no time bound).
+    Catchup,
+    /// Catch up only if the miss was within `grace_ms` of the
+    /// scheduled time. Default policy; default grace is 5
+    /// minutes.
+    CatchupWithinGrace {
+        /// Catch-up window in milliseconds.
+        grace_ms: u64,
+    },
+}
+
+/// Default grace window for [`AppointmentMissPolicy::CatchupWithinGrace`].
+pub const DEFAULT_APPOINTMENT_MISS_GRACE_MS: u64 = 5 * 60 * 1_000;
+
+/// The action an appointment dispatches on fire. The framework
+/// does not interpret the payload; it routes a single
+/// `request` op against `target_shelf` carrying `request_type`
+/// and `payload`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppointmentAction {
+    /// Shelf the dispatch targets. Any plugin admitted on the
+    /// shelf and accepting `request_type` handles the action.
+    pub target_shelf: String,
+    /// Request-type discriminator on the target plugin.
+    pub request_type: String,
+    /// Opaque payload; plugin documents the shape it expects.
+    pub payload: serde_json::Value,
+}
+
+/// The complete specification for an appointment. Carries the
+/// content (action + recurrence + zone), miss/wake policy,
+/// and pre-fire / wake metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppointmentSpec {
+    /// Caller-chosen identifier. Stable across restarts so the
+    /// plugin can re-issue idempotently after a reboot.
+    pub appointment_id: String,
+    /// Time-of-day in 24h `HH:MM` form (interpreted per
+    /// `zone`). Ignored for the OneShot recurrence variant
+    /// which carries its own absolute fire time.
+    pub time: Option<String>,
+    /// Time-zone interpretation. Default is `Local`.
+    #[serde(default = "default_appointment_zone")]
+    pub zone: AppointmentTimeZone,
+    /// Recurrence rule.
+    pub recurrence: AppointmentRecurrence,
+    /// Optional end time after which the recurring entry
+    /// terminates (no further fires). Wall-clock ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_time_ms: Option<u64>,
+    /// Optional cap on total fires. Recurring entries
+    /// terminate after this many.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fires: Option<u32>,
+    /// Per-occurrence exclusion list (ISO `YYYY-MM-DD` dates,
+    /// e.g. holidays). Cron escape hatch covers more elaborate
+    /// patterns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub except: Vec<String>,
+    /// Miss policy. Default: `CatchupWithinGrace { grace_ms = 5min }`.
+    #[serde(default = "default_appointment_miss_policy")]
+    pub miss_policy: AppointmentMissPolicy,
+    /// Approaching-event lead time in milliseconds. When set
+    /// non-zero the framework emits an
+    /// `AppointmentApproaching` happening this many ms before
+    /// the actual fire so plugins can pre-warm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_fire_ms: Option<u32>,
+    /// Wake-the-device flag. When `true` the framework programs
+    /// the OS RTC wake (via the distribution's RTC-wake
+    /// callback) for this appointment's fire time.
+    #[serde(default)]
+    pub must_wake_device: bool,
+    /// Pre-arm time for the wake. Framework wakes the device
+    /// this many ms before the actual fire so network / NTP
+    /// can complete before the dispatch happens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_pre_arm_ms: Option<u32>,
+}
+
+fn default_appointment_zone() -> AppointmentTimeZone {
+    AppointmentTimeZone::Local
+}
+
+fn default_appointment_miss_policy() -> AppointmentMissPolicy {
+    AppointmentMissPolicy::CatchupWithinGrace {
+        grace_ms: DEFAULT_APPOINTMENT_MISS_GRACE_MS,
+    }
+}
+
+/// Lifecycle state for an appointment. Recurring appointments
+/// cycle Pending → Approaching → Firing → Fired → Pending.
+/// OneShot appointments terminate at Fired or Cancelled.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppointmentState {
+    /// Scheduled, not yet fired.
+    Pending,
+    /// Pre-fire window has opened; waiting for the actual
+    /// fire instant.
+    Approaching,
+    /// Currently dispatching the action.
+    Firing,
+    /// Most recent fire complete; recurring entries cycle back
+    /// to Pending on next-fire-time computation.
+    Fired,
+    /// Either side cancelled. Terminal for OneShot;
+    /// recurring entries that cancel mid-cycle do not fire
+    /// again.
+    Cancelled,
+}
+
+/// Callback trait: plugin schedules time-driven instructions.
+///
+/// Populated as `Some` only when the plugin's manifest declares
+/// `capabilities.appointments = true` (default `false`).
+/// Plugins that do not declare it never see the trait method
+/// and cannot create appointments through the SDK surface.
+pub trait AppointmentScheduler: Send + Sync {
+    /// Create an appointment. Returns the framework-minted
+    /// [`AppointmentId`] on success.
+    fn create_appointment<'a>(
+        &'a self,
+        spec: AppointmentSpec,
+        action: AppointmentAction,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<AppointmentId, ReportError>> + Send + 'a,
+        >,
+    >;
+
+    /// Cancel a previously-created appointment by id.
+    /// Idempotent on already-cancelled / unknown ids
+    /// (returns `Ok(())`).
+    fn cancel_appointment<'a>(
+        &'a self,
+        id: AppointmentId,
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
 }
 
-/// A request for user interaction.
-#[derive(Debug, Clone)]
-pub struct UserInteraction {
-    /// Interaction type, declared by the shelf shape.
-    pub interaction_type: String,
-    /// Opaque payload describing the interaction.
-    pub payload: Vec<u8>,
-    /// Correlation ID for tying the eventual user response back to the
-    /// plugin's request.
-    pub correlation_id: u64,
+// =====================================================================
+// Watches surface.
+//
+// Watches fire instructions on observed CONDITIONS — happenings on the
+// bus, subject-state predicates, and composite expressions over those.
+// Sibling primitive to Appointments (which fire on TIME); both share
+// action shape, capability model, persistence path, and quota model.
+// =====================================================================
+
+/// Opaque identifier for a watch. Minted by the framework on
+/// `create_watch` and passed back to the plugin / consumer for
+/// cancel / lookup operations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct WatchId(pub String);
+
+impl WatchId {
+    /// Construct an id from a raw string.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+    /// Borrow the underlying string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for WatchId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Wire-friendly mirror of the framework's `HappeningFilter`:
+/// variant / plugin / shelf dimensions, ANDed at evaluation
+/// time. Empty list on a dimension means "no constraint on that
+/// dimension"; the empty-shape filter (every list empty)
+/// matches every happening.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WatchHappeningFilter {
+    /// Permitted variant kinds (`Happening::kind()` strings).
+    /// Empty: no variant filtering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<String>,
+    /// Permitted plugin names (`Happening::primary_plugin()`).
+    /// Empty: no plugin filtering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<String>,
+    /// Permitted shelf names (`Happening::shelf()`).
+    /// Empty: no shelf filtering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shelves: Vec<String>,
+}
+
+/// Predicate over a single field of a subject's projection.
+/// Numeric comparisons use `f64`; `Equals` / `NotEquals` /
+/// `Regex` route through opaque JSON values so any field shape
+/// surfaces. `Hysteresis` is its own variant rather than a
+/// composite-encoded approximation because the entry/exit
+/// state machine cannot be modelled by composing other
+/// predicates without oscillation in the in-band hold.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StatePredicate {
+    /// Field equals the supplied value.
+    Equals {
+        /// Subject-projection field name.
+        field: String,
+        /// Expected value (any JSON shape).
+        value: serde_json::Value,
+    },
+    /// Field does not equal the supplied value.
+    NotEquals {
+        /// Subject-projection field name.
+        field: String,
+        /// Expected non-value.
+        value: serde_json::Value,
+    },
+    /// Field's numeric value is strictly greater than `value`.
+    GreaterThan {
+        /// Subject-projection field name.
+        field: String,
+        /// Numeric threshold.
+        value: f64,
+    },
+    /// Field's numeric value is strictly less than `value`.
+    LessThan {
+        /// Subject-projection field name.
+        field: String,
+        /// Numeric threshold.
+        value: f64,
+    },
+    /// Field's numeric value is in the open interval
+    /// `(lower, upper)`. Lower-bound-exclusive,
+    /// upper-bound-exclusive matches the typical band-comparator
+    /// shape (sensor reading "in this band").
+    InRange {
+        /// Subject-projection field name.
+        field: String,
+        /// Lower bound (exclusive).
+        lower: f64,
+        /// Upper bound (exclusive).
+        upper: f64,
+    },
+    /// Hysteresis predicate. Fires on transition above `upper`;
+    /// does not fire again until field has dropped below
+    /// `lower`. Standard control-systems pattern; required for
+    /// noisy-sensor scenarios (CPU thermal throttle).
+    Hysteresis {
+        /// Subject-projection field name.
+        field: String,
+        /// Upper threshold; transition above triggers entry.
+        upper: f64,
+        /// Lower threshold; transition below resets.
+        lower: f64,
+    },
+    /// Field's string value matches the supplied regular
+    /// expression. Pattern syntax is the regex crate's; bad
+    /// patterns refuse at create time with a structured error.
+    Regex {
+        /// Subject-projection field name.
+        field: String,
+        /// Regex pattern (Rust regex crate syntax).
+        pattern: String,
+    },
+}
+
+/// Composite operator joining several condition terms.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompositeOp {
+    /// Every term must match (AND).
+    All,
+    /// At least one term must match (OR).
+    Any,
+    /// Single-term negation (NOT). Composite::terms must
+    /// contain exactly one term when this op is selected;
+    /// validation refuses other shapes at create time.
+    Not,
+}
+
+/// One condition for a watch. The framework evaluates the tree
+/// against incoming bus events / projection updates; matching
+/// transitions fire the watch's action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WatchCondition {
+    /// Match a happening on the bus through the framework's
+    /// happening filter (variant / plugin / shelf dimensions).
+    /// Pure event-match conditions do not depend on the clock
+    /// and evaluate freely under any time-trust state.
+    HappeningMatch {
+        /// Filter describing which happenings count as matches.
+        filter: WatchHappeningFilter,
+    },
+    /// Match the named subject's projection against `predicate`.
+    /// `minimum_duration_ms` optionally requires the predicate
+    /// to hold continuously for at least that many ms before
+    /// the watch fires; transition out resets the counter.
+    SubjectState {
+        /// Canonical subject identifier to observe.
+        canonical_id: String,
+        /// Predicate over a single field of the projection.
+        predicate: StatePredicate,
+        /// Optional debounce: condition must hold continuously
+        /// for at least this duration before the watch fires.
+        /// Duration-bearing variants gate on `TimeTrust`: the
+        /// framework defers evaluation while the wall clock is
+        /// declared `Untrusted`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimum_duration_ms: Option<u64>,
+    },
+    /// Recursive composition: `op` (All / Any / Not) joins
+    /// `terms`. `Not` MUST carry exactly one term.
+    Composite {
+        /// Composition operator.
+        op: CompositeOp,
+        /// Term list; AND/OR for any length, single term for Not.
+        terms: Vec<WatchCondition>,
+    },
+}
+
+/// Trigger semantics for a watch.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq,
+)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WatchTrigger {
+    /// Fire on transition into match. Default.
+    #[default]
+    Edge,
+    /// Fire while the condition holds, with a mandatory
+    /// cooldown between consecutive fires. The framework
+    /// enforces `cooldown_ms >= 1000` at create time to
+    /// prevent action storm under high event rates.
+    Level {
+        /// Minimum interval between fires while in match.
+        cooldown_ms: u64,
+    },
+}
+
+/// Default [`WatchTrigger`] for serde defaulting.
+fn default_watch_trigger() -> WatchTrigger {
+    WatchTrigger::Edge
+}
+
+/// Action dispatched when a watch fires. The framework does not
+/// interpret the payload; it routes a single `request` op
+/// against `target_shelf` carrying `request_type` and `payload`.
+/// Identical shape to [`AppointmentAction`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WatchAction {
+    /// Shelf the dispatch targets. Any plugin admitted on the
+    /// shelf and accepting `request_type` handles the action.
+    pub target_shelf: String,
+    /// Request-type discriminator on the target plugin.
+    pub request_type: String,
+    /// Opaque payload; plugin documents the shape it expects.
+    pub payload: serde_json::Value,
+}
+
+/// The complete specification for a watch. Carries the
+/// condition tree, the trigger semantics, and the caller-chosen
+/// identifier.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WatchSpec {
+    /// Caller-chosen identifier. Stable across restarts so the
+    /// plugin can re-issue idempotently after a reboot.
+    pub watch_id: String,
+    /// Condition tree the framework evaluates.
+    pub condition: WatchCondition,
+    /// Trigger semantics. Default `Edge`.
+    #[serde(default = "default_watch_trigger")]
+    pub trigger: WatchTrigger,
+}
+
+/// Lifecycle state for a watch. Recurring watches cycle
+/// Pending → Firing → Pending. Terminal states are Cancelled
+/// (either side cancelled) or Errored (the framework refused to
+/// continue evaluating, e.g. quota or evaluator-throttle
+/// violations); details ride the `Happening::WatchCancelled` /
+/// `Happening::WatchEvaluationThrottled` payloads.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchState {
+    /// Active, condition not currently satisfied. Steady state
+    /// for edge-triggered watches outside their match window.
+    Pending,
+    /// Condition currently satisfied; level-triggered watches
+    /// sit here between cooldown intervals while still matching.
+    Matched,
+    /// Most recent fire complete; recurring entries cycle back
+    /// to Pending on the next condition transition.
+    Fired,
+    /// Either side cancelled. Terminal.
+    Cancelled,
+}
+
+/// Default [`WatchState`] for serde defaulting.
+pub const DEFAULT_WATCH_MAX_COMPOSITE_DEPTH: u32 = 8;
+
+/// Callback trait: plugin schedules condition-driven
+/// instructions.
+///
+/// Populated as `Some` only when the plugin's manifest declares
+/// `capabilities.watches = true` (default `false`). Plugins
+/// that do not declare it never see the trait method and cannot
+/// create watches through the SDK surface.
+pub trait WatchScheduler: Send + Sync {
+    /// Create a watch. Returns the framework-minted [`WatchId`]
+    /// on success.
+    fn create_watch<'a>(
+        &'a self,
+        spec: WatchSpec,
+        action: WatchAction,
+    ) -> Pin<Box<dyn Future<Output = Result<WatchId, ReportError>> + Send + 'a>>;
+
+    /// Cancel a previously-created watch by id. Idempotent on
+    /// already-cancelled / unknown ids (returns `Ok(())`).
+    fn cancel_watch<'a>(
+        &'a self,
+        id: WatchId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
+}
+
+/// Callback trait: plugin dispatches a Fast Path
+/// `course_correct` against another admitted warden.
+///
+/// Populated as `Some` only when the plugin's manifest declares
+/// `capabilities.fast_path = true`. Plugins that did not opt in
+/// see `None`; calls would panic on unwrap, which is the
+/// intended fail-fast — a manifest authoring mistake should
+/// surface loudly at `load` time rather than be silently
+/// swallowed at first use.
+///
+/// The dispatch routes through the same per-warden mutex as
+/// slow-path course_correct (so the warden's "one mutation in
+/// flight" invariant survives) but applies the warden's Fast
+/// Path budget (default 50 ms; manifest-declared up to 200 ms)
+/// instead of the slow-path course_correct deadline. Refusals
+/// surface as [`ReportError::Invalid`] carrying a structured
+/// subclass token in the message: `not_fast_path_eligible` when
+/// the target warden does not declare the verb on its
+/// `fast_path_verbs` list, `fast_path_budget_exceeded` on
+/// timeout, or one of the dispatch-error subclasses
+/// (`shelf_not_admitted`, `shelf_unloaded`, `shelf_not_warden`).
+///
+/// The custody handle binds the dispatch to a specific custody
+/// session: a Fast Path frame against a stale handle (a session
+/// the warden has already released) is refused. Plugins that
+/// took custody themselves carry the handle locally; plugins
+/// dispatching against a warden in another plugin's custody
+/// resolve the handle via state subscription or operator
+/// configuration per their manifest's routing model.
+pub trait FastPathDispatcher: Send + Sync {
+    /// Dispatch a Fast Path `course_correct`.
+    ///
+    /// `target_shelf` names the warden to route to; `handle`
+    /// names the specific custody session; `verb` must be in
+    /// the target warden's `capabilities.warden.fast_path_verbs`;
+    /// `payload` is opaque per the shelf shape. `deadline_ms`
+    /// optionally tightens the dispatch deadline below the
+    /// warden's declared Fast Path budget; the effective
+    /// deadline is `min(declared_budget, deadline_ms)` when both
+    /// are present.
+    fn fast_path_dispatch<'a>(
+        &'a self,
+        target_shelf: &'a str,
+        handle: &'a CustodyHandle,
+        verb: &'a str,
+        payload: Vec<u8>,
+        deadline_ms: Option<u32>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
 }
 
 /// Callback trait: warden reports custody state.
@@ -1005,5 +2059,312 @@ mod tests {
             }
         }
         let _arc: Arc<dyn RelationAdmin> = Arc::new(Noop);
+    }
+
+    // ---------------------------------------------------------------
+    // Prompt type round-trip tests. Pin the on-the-wire shapes for
+    // the ten prompt-content variants, the matching response
+    // variants, and the lifecycle outcome so a future contributor
+    // changing the closed enum surfaces the breakage at test time
+    // rather than at consumer-render time.
+    // ---------------------------------------------------------------
+
+    #[cfg(feature = "wire")]
+    #[test]
+    fn prompt_request_round_trips_through_json() {
+        let p = PromptRequest {
+            prompt_id: "p-1".into(),
+            prompt_type: PromptType::Text {
+                label: "Email".into(),
+                placeholder: Some("you@example.com".into()),
+                validation_regex: None,
+            },
+            timeout_ms: Some(30_000),
+            session_id: Some("login-session".into()),
+            retention_hint: Some(RetentionHint::Session),
+            error_context: None,
+            previous_answer: None,
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: PromptRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[cfg(feature = "wire")]
+    #[test]
+    fn prompt_type_select_round_trips_with_options() {
+        let p = PromptType::Select {
+            label: "Output device".into(),
+            options: vec![
+                PromptOption {
+                    id: "hp".into(),
+                    label: "Headphones".into(),
+                },
+                PromptOption {
+                    id: "spk".into(),
+                    label: "Speakers".into(),
+                },
+            ],
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains(r#""kind":"select""#));
+        let back: PromptType = serde_json::from_str(&s).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[cfg(feature = "wire")]
+    #[test]
+    fn prompt_type_multi_field_round_trips_recursively() {
+        // A login form with two scalar sub-fields. Pins the
+        // recursion through PromptField -> PromptType.
+        let p = PromptType::MultiField {
+            fields: vec![
+                PromptField {
+                    id: "email".into(),
+                    label: "Email".into(),
+                    field_type: PromptType::Text {
+                        label: "Email".into(),
+                        placeholder: None,
+                        validation_regex: None,
+                    },
+                },
+                PromptField {
+                    id: "password".into(),
+                    label: "Password".into(),
+                    field_type: PromptType::Password {
+                        label: "Password".into(),
+                    },
+                },
+            ],
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: PromptType = serde_json::from_str(&s).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[cfg(feature = "wire")]
+    #[test]
+    fn prompt_type_datetime_field_renamed_from_kind_to_picker() {
+        // Pin the rename: PromptType uses serde-internal-tag
+        // "kind", so the DateTime variant's picker discriminator
+        // MUST NOT be a field also named "kind" — that would
+        // collide with the variant tag and break the derive.
+        // The on-the-wire form carries `"kind":"date_time"`
+        // (the variant tag) AND `"picker":"date_time"` (the
+        // picker variant); both coexist because the field is
+        // named differently from the tag.
+        let p = PromptType::DateTime {
+            label: "Schedule".into(),
+            picker: DateTimeKind::DateTime,
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(
+            s.contains(r#""picker":"date_time""#),
+            "picker field must serialise; got {s}"
+        );
+        assert!(
+            s.contains(r#""kind":"date_time""#),
+            "variant tag must serialise; got {s}"
+        );
+        let back: PromptType = serde_json::from_str(&s).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[cfg(feature = "wire")]
+    #[test]
+    fn prompt_outcome_answered_round_trips() {
+        let o = PromptOutcome::Answered {
+            response: PromptResponse::Text {
+                value: "alice@example.com".into(),
+            },
+            retain_for: Some(RetentionHint::UntilRevoked),
+        };
+        let s = serde_json::to_string(&o).unwrap();
+        let back: PromptOutcome = serde_json::from_str(&s).unwrap();
+        assert_eq!(o, back);
+    }
+
+    #[cfg(feature = "wire")]
+    #[test]
+    fn prompt_outcome_cancelled_records_canceller() {
+        let o = PromptOutcome::Cancelled {
+            by: PromptCanceller::Plugin,
+        };
+        let s = serde_json::to_string(&o).unwrap();
+        let back: PromptOutcome = serde_json::from_str(&s).unwrap();
+        assert_eq!(o, back);
+    }
+
+    #[cfg(feature = "wire")]
+    #[test]
+    fn prompt_outcome_timed_out_round_trips() {
+        let o = PromptOutcome::TimedOut;
+        let s = serde_json::to_string(&o).unwrap();
+        let back: PromptOutcome = serde_json::from_str(&s).unwrap();
+        assert_eq!(o, back);
+    }
+
+    #[cfg(feature = "wire")]
+    #[test]
+    fn prompt_response_multi_field_carries_per_field_map() {
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "email".into(),
+            PromptResponse::Text {
+                value: "alice@example.com".into(),
+            },
+        );
+        fields.insert(
+            "password".into(),
+            PromptResponse::Password {
+                value: "hunter2".into(),
+            },
+        );
+        let r = PromptResponse::MultiField { fields };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: PromptResponse = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, back);
+    }
+
+    #[test]
+    fn prompt_timeout_constants_pin_to_documented_values() {
+        // Default 1 minute, max 24 hours per the design.
+        assert_eq!(DEFAULT_PROMPT_TIMEOUT_MS, 60_000);
+        assert_eq!(MAX_PROMPT_TIMEOUT_MS, 24 * 60 * 60 * 1_000);
+    }
+
+    #[test]
+    fn prompt_state_lifecycle_distinct() {
+        // The four states must be distinguishable; a future
+        // contributor who folds two of them together breaks the
+        // lifecycle contract.
+        assert_ne!(PromptState::Open, PromptState::Answered);
+        assert_ne!(PromptState::Answered, PromptState::Cancelled);
+        assert_ne!(PromptState::Cancelled, PromptState::TimedOut);
+        assert_ne!(PromptState::TimedOut, PromptState::Open);
+    }
+
+    // ---------------------------------------------------------------
+    // Appointment type tests.
+    // ---------------------------------------------------------------
+
+    #[cfg(feature = "wire")]
+    #[test]
+    fn appointment_recurrence_round_trips_each_variant() {
+        let cases = [
+            AppointmentRecurrence::OneShot {
+                fire_at_ms: 1_700_000_000_000,
+            },
+            AppointmentRecurrence::Daily,
+            AppointmentRecurrence::Weekdays,
+            AppointmentRecurrence::Weekends,
+            AppointmentRecurrence::Weekly {
+                days: vec![DayOfWeek::Mon, DayOfWeek::Wed, DayOfWeek::Fri],
+            },
+            AppointmentRecurrence::Monthly { day_of_month: 15 },
+            AppointmentRecurrence::Yearly { month: 12, day: 25 },
+            AppointmentRecurrence::Cron {
+                expr: "0 6 * * 1-5".into(),
+            },
+        ];
+        for c in cases {
+            let s = serde_json::to_string(&c).unwrap();
+            let back: AppointmentRecurrence = serde_json::from_str(&s).unwrap();
+            assert_eq!(c, back, "round trip failed for {s}");
+        }
+    }
+
+    #[cfg(feature = "wire")]
+    #[test]
+    fn appointment_zone_round_trips_each_variant() {
+        let cases = [
+            AppointmentTimeZone::Utc,
+            AppointmentTimeZone::Local,
+            AppointmentTimeZone::Anchored {
+                zone: "Europe/London".into(),
+            },
+        ];
+        for c in cases {
+            let s = serde_json::to_string(&c).unwrap();
+            let back: AppointmentTimeZone = serde_json::from_str(&s).unwrap();
+            assert_eq!(c, back);
+        }
+    }
+
+    #[cfg(feature = "wire")]
+    #[test]
+    fn appointment_miss_policy_round_trips() {
+        let cases = [
+            AppointmentMissPolicy::Drop,
+            AppointmentMissPolicy::Catchup,
+            AppointmentMissPolicy::CatchupWithinGrace { grace_ms: 60_000 },
+        ];
+        for c in cases {
+            let s = serde_json::to_string(&c).unwrap();
+            let back: AppointmentMissPolicy = serde_json::from_str(&s).unwrap();
+            assert_eq!(c, back);
+        }
+    }
+
+    #[cfg(feature = "wire")]
+    #[test]
+    fn appointment_spec_default_zone_is_local() {
+        // Pin the deserialise-side default so an operator's
+        // TOML omitting `zone` lands on Local rather than
+        // serde-derive's first variant (Utc — silently
+        // dangerous).
+        let s = serde_json::to_string(&serde_json::json!({
+            "appointment_id": "a-1",
+            "time": "06:30",
+            "recurrence": { "kind": "daily" },
+        }))
+        .unwrap();
+        let spec: AppointmentSpec = serde_json::from_str(&s).unwrap();
+        assert_eq!(spec.zone, AppointmentTimeZone::Local);
+    }
+
+    #[cfg(feature = "wire")]
+    #[test]
+    fn appointment_spec_default_miss_policy_is_catchup_5min() {
+        let s = serde_json::to_string(&serde_json::json!({
+            "appointment_id": "a-1",
+            "time": "06:30",
+            "recurrence": { "kind": "daily" },
+        }))
+        .unwrap();
+        let spec: AppointmentSpec = serde_json::from_str(&s).unwrap();
+        match spec.miss_policy {
+            AppointmentMissPolicy::CatchupWithinGrace { grace_ms } => {
+                assert_eq!(grace_ms, DEFAULT_APPOINTMENT_MISS_GRACE_MS);
+                assert_eq!(grace_ms, 5 * 60 * 1_000);
+            }
+            other => panic!("expected CatchupWithinGrace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn appointment_id_round_trips_through_string() {
+        let id = AppointmentId::new("abc-123");
+        assert_eq!(id.as_str(), "abc-123");
+        assert_eq!(format!("{id}"), "abc-123");
+    }
+
+    #[test]
+    fn appointment_state_lifecycle_distinct() {
+        // Five states. Distinct equality. A future contributor
+        // who folds Pending/Approaching/Firing into one variant
+        // breaks the lifecycle contract documented on the type.
+        assert_ne!(AppointmentState::Pending, AppointmentState::Approaching);
+        assert_ne!(AppointmentState::Approaching, AppointmentState::Firing);
+        assert_ne!(AppointmentState::Firing, AppointmentState::Fired);
+        assert_ne!(AppointmentState::Fired, AppointmentState::Cancelled);
+        assert_ne!(AppointmentState::Cancelled, AppointmentState::Pending);
+    }
+
+    #[test]
+    fn appointment_default_grace_constant_matches_5_minutes() {
+        // Pin the constant so a future contributor cannot
+        // tighten or loosen the default grace silently.
+        assert_eq!(DEFAULT_APPOINTMENT_MISS_GRACE_MS, 5 * 60 * 1_000);
     }
 }

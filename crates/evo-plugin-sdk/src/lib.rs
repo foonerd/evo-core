@@ -72,8 +72,10 @@
 /// without hardcoding a string that drifts on every workspace bump.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod drift;
 pub mod error;
 pub mod error_taxonomy;
+pub mod happenings;
 pub mod manifest;
 
 #[cfg(feature = "contract")]
@@ -92,16 +94,23 @@ pub use manifest::Manifest;
 
 #[cfg(feature = "contract")]
 pub use contract::{
-    Assignment, BuildInfo, CallDeadline, CanonicalSubjectId, ClaimConfidence,
-    CourseCorrection, CustodyHandle, CustodyStateReporter, ExternalAddressing,
-    Factory, HealthCheck, HealthReport, HealthStatus, InstanceAnnouncement,
+    AppointmentAction, AppointmentId, AppointmentMissPolicy,
+    AppointmentRecurrence, AppointmentScheduler, AppointmentSpec,
+    AppointmentState, AppointmentTimeZone, Assignment, BuildInfo, CallDeadline,
+    CanonicalSubjectId, ClaimConfidence, CourseCorrection, CustodyHandle,
+    CustodyStateReporter, DateTimeKind, DayOfWeek, ExternalAddressing, Factory,
+    HealthCheck, HealthReport, HealthStatus, InstanceAnnouncement,
     InstanceAnnouncer, InstanceId, LoadContext, Plugin, PluginDescription,
-    PluginError, PluginIdentity, RelationAnnouncer, RelationAssertion,
-    RelationRetraction, ReportError, ReportPriority, Request, Respondent,
-    Response, RetractionPolicy, RuntimeCapabilities, StateReporter,
+    PluginError, PluginIdentity, PromptCanceller, PromptField, PromptOption,
+    PromptOutcome, PromptRequest, PromptResponse, PromptState, PromptType,
+    RelationAnnouncer, RelationAssertion, RelationRetraction, ReportError,
+    ReportPriority, Request, Respondent, Response, RetentionHint,
+    RetractionPolicy, RuntimeCapabilities, StateBlob, StateReporter,
     SubjectAnnouncement, SubjectAnnouncer, SubjectClaim, SubjectQuerier,
-    SubjectQueryResult, SubjectRecord, UserInteraction,
-    UserInteractionRequester, Warden,
+    SubjectQueryResult, SubjectRecord, UserInteractionRequester, Warden,
+    DEFAULT_APPOINTMENT_MISS_GRACE_MS, DEFAULT_LIVE_RELOAD_BLOB_BYTES,
+    DEFAULT_PROMPT_TIMEOUT_MS, MAX_LIVE_RELOAD_BLOB_BYTES,
+    MAX_PROMPT_TIMEOUT_MS,
 };
 
 #[cfg(feature = "wire")]

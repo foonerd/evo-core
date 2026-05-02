@@ -25,6 +25,8 @@ SCHEMAS.md is authoritative for schema **definitions**: field names, types, vali
 
 In-source Rust types (in `crates/evo` and `crates/evo-plugin-sdk`) are the implementation. A divergence between a Rust type and SCHEMAS.md is a bug in SCHEMAS.md if the type is stable, or in the type if the schema has been intentionally revised. Either way, the two are kept in sync.
 
+**Per-shelf shape schemas.** Brand-neutral framework-tier shelf schemas (under the `org.evoframework.*` namespace) live in the sibling repository [`foonerd/evo-catalogue-schemas`](https://github.com/foonerd/evo-catalogue-schemas), separate from evo-core. Distributions and plugin authors pin a specific tag of the sibling repo; distribution packages bundle the schemas at `/usr/share/evo-catalogue-schemas/` so plugin authors can validate locally. The in-tree skeleton at `dist/catalogue/schemas/` retains a single worked example (`example/echo.v1.toml`) as on-disk-shape reference; framework-tier schemas migrate to (or originate in) the sibling repo. Validation is via `evo-plugin-tool catalogue validate-shelf-schema`, which walks a schemas tree and validates every per-shelf TOML file against the shape rules; resolution cascade is `--schemas-path` flag, `$EVO_SCHEMAS_DIR`, then `/usr/share/evo-catalogue-schemas/`.
+
 ## 3. File-Based Schemas (Write-Side)
 
 Schemas you author as TOML files. A distribution writes all three; an individual plugin author writes the manifest.
@@ -543,7 +545,7 @@ log_level = "info"
 socket_path = "/tmp/evo.sock"
 
 [catalogue]
-path = "/home/dev/evo-device-volumio/catalogue.toml"
+path = "/home/dev/evo-device-audio/catalogue.toml"
 ```
 
 Production with strict admission policy:
@@ -1649,6 +1651,8 @@ Serialises as a snake_case string.
 |-------|---------|
 | `"merged"` | The old subject was merged into another subject. The alias's `new_ids` has length 1. |
 | `"split"` | The old subject was split into multiple subjects. The alias's `new_ids` has length at least 2. |
+| `"tombstone"` | The old subject was forgotten with no successor. The alias's `new_ids` is empty so consumers walking the chain see "this canonical ID was forgotten" rather than a bare not-found. |
+| `"type_migrated"` | The old subject was re-stated under a new `subject_type` via the operator-issued `migrate_grammar_orphans` verb. The alias's `new_ids` has length 1 (the new ID minted for the migrated record). Distinguishes type-change identity flips from semantic-change merges. See `CATALOGUE.md` §5.3 and `SUBJECTS.md` §10.4. |
 
 ### 5.5 AliasedFrom (project_subject envelope)
 

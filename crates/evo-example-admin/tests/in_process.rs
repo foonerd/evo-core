@@ -141,6 +141,7 @@ impl Plugin for VictimPlugin {
                 },
                 runtime_capabilities: RuntimeCapabilities {
                     request_types: vec!["noop".into()],
+                    course_correct_verbs: vec![],
                     accepts_custody: false,
                     flags: Default::default(),
                 },
@@ -446,14 +447,29 @@ response_budget_ms = 1000
         .await;
     match r {
         Err(StewardError::Admission(msg)) => {
-            // Admission surfaces the plugin's load error.
+            // Admission must refuse the plugin. Two refusal paths
+            // are valid:
+            //  - the framework's manifest-vs-describe drift check
+            //    (the manifest's request_types omit the admin
+            //    verbs the runtime advertises);
+            //  - the plugin's load() unwrapping ctx.subject_admin
+            //    (None for non-admin manifests).
+            // Either path is a correct refusal of a manifest that
+            // declares less than the runtime provides.
             assert!(
-                msg.contains("subject_admin") || msg.contains("load failed"),
-                "expected diagnostic mentioning subject_admin/load, got {msg:?}"
+                msg.contains("subject_admin")
+                    || msg.contains("load failed")
+                    || msg.contains("manifest does not match runtime")
+                    || msg.contains("missing in manifest"),
+                "expected drift / subject_admin / load-failed diagnostic, \
+                 got {msg:?}"
             );
         }
         other => {
-            panic!("expected Admission error from failed load, got {other:?}")
+            panic!(
+                "expected Admission error from drift / failed load, got \
+                 {other:?}"
+            )
         }
     }
     assert_eq!(engine.len(), 0);

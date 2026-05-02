@@ -137,6 +137,54 @@ The `*Self*Target`, `Merge*`, and `Split*` variants on `ReportError` apply only 
 
 **Consumer-facing surface.** The same alias-aware semantics are also reachable from the client socket (consumers, frontends, diagnostic tools) via two new ops: `op = "describe_alias"` (a direct echo of this trait) and `op = "project_subject"` with `follow_aliases: true` (auto-follows the chain to the terminal subject and returns its projection). The plugin-side and consumer-side surfaces share the same JSON shapes for the chain and the terminal subject, so a parser written for one carries to the other. See `CLIENT_API.md` sections 4.2 and 4.3 for the consumer-side reference.
 
+## 5.3 Plugin-initiated user interaction (`UserInteractionRequester`)
+
+Plugins that need to ask the human operator a question at runtime — re-entering credentials after a token expiry, choosing among ambiguous match candidates, confirming a destructive action — call `request_user_interaction(PromptRequest)` via the `LoadContext::user_interaction_requester` callback. The framework parks the request on the prompt ledger, routes it to the consumer connection holding the `user_interaction_responder` capability (single-claimer; first-claimer-wins), and resolves the plugin's awaiting future when the consumer answers via `answer_user_interaction` or `cancel_user_interaction`.
+
+| Callback | Trait | Purpose |
+|----------|-------|---------|
+| `user_interaction_requester` | `UserInteractionRequester` | Park a typed prompt and await the consumer's response. |
+
+`PromptRequest` carries a stable per-plugin `prompt_id`, an optional `session_id` and `error_context`, an optional `previous_answer`, an optional retention hint, and one of ten `PromptType` variants: `Text`, `Password`, `Select`, `SelectWithOther`, `MultiSelect`, `Confirm`, `MultiField`, `ExternalRedirect`, `DateTime { picker }`, `Freeform`. Per-prompt timeout defaults to 60 seconds (max 24 hours).
+
+The trait is populated unconditionally on every `LoadContext`. The framework refuses the actual round-trip with a structured `responder_not_assigned` error when no consumer holds the responder capability, surfacing the plugin as `ReportError::Invalid` so the plugin can fall back to a non-interactive default. The plugin-side awaiter resolves with `PromptOutcome::Answered { response, retain_for }` on consumer answer or `PromptOutcome::Cancelled { canceller }` on consumer cancel.
+
+The consumer-side wire surface is documented in `CLIENT_API.md` §4.14.
+
+## 5.4 Fast Path dispatch (`FastPathDispatcher`)
+
+Plugins that declare `[capabilities] fast_path = true` get a `LoadContext::fast_path_dispatcher` populated with a router-backed adapter. Calling `fast_path_dispatch(target_shelf, custody_handle, verb, payload, deadline_ms?)` routes the verb against another admitted warden through the latency-bounded Fast Path channel rather than the slow-path frame queue.
+
+Three gates compose:
+
+1. The dispatching plugin's manifest must declare `capabilities.fast_path = true` (this section's gate).
+2. The target warden's manifest must declare the verb in `capabilities.warden.fast_path_verbs`.
+3. The dispatch frame must arrive on a connection that has negotiated the `fast_path_admin` capability (the consumer-side gate).
+
+Refusals carry stable subclass tokens: `not_fast_path_eligible` (verb not on the warden's list), `fast_path_budget_exceeded` (default 50 ms; manifest-declared up to 200 ms), `shelf_not_admitted`, `shelf_unloaded`, `shelf_not_warden`, `fast_path_admin_not_granted`. See `FAST_PATH.md` for the engineering-layer contract.
+
+## 5.5 Time-driven instructions (`AppointmentScheduler`)
+
+Plugins that declare `[capabilities] appointments = true` get a `LoadContext::appointments` populated with an `AppointmentScheduler` trait object. Two methods:
+
+- `create_appointment(spec, action) -> Result<AppointmentId, ReportError>`
+- `cancel_appointment(id) -> Result<(), ReportError>`
+
+`AppointmentSpec` carries `appointment_id`, optional `time` (HH:MM), `zone` (UTC / Local / Anchored), `recurrence` (`OneShot` / `Daily` / `Weekdays` / `Weekends` / `Weekly` / `Monthly` / `Yearly`), and optional `end_time_ms`, `max_fires`, `except`, `miss_policy` (`Drop` / `CatchupWithinGrace { grace_ms }` / `Catchup`), `pre_fire_ms`, `must_wake_device`, `wake_pre_arm_ms`. `AppointmentAction` is `{ target_shelf, request_type, payload }`. Recurrence semantics use DST-aware Local timezone arithmetic; `Untrusted` clock state defers dispatch under the miss policy.
+
+`AppointmentApproaching` / `AppointmentFired` / `AppointmentMissed` / `AppointmentCancelled` happenings ride the durable bus.
+
+## 5.6 Condition-driven instructions (`WatchScheduler`)
+
+Sibling primitive to appointments. Plugins that declare `[capabilities] watches = true` get a `LoadContext::watches` populated with a `WatchScheduler` trait object. Two methods:
+
+- `create_watch(spec, action) -> Result<WatchId, ReportError>`
+- `cancel_watch(id) -> Result<(), ReportError>`
+
+`WatchSpec` carries `watch_id`, `condition`, and `trigger`. `WatchCondition` is `HappeningMatch { filter }` / `SubjectState { canonical_id, predicate, minimum_duration_ms? }` / `Composite { op: All|Any|Not, terms }`. `StatePredicate` is `Equals` / `NotEquals` / `GreaterThan` / `LessThan` / `InRange` / `Hysteresis { upper, lower }` / `Regex`. `WatchTrigger` is `Edge` (default) or `Level { cooldown_ms }` (cooldown_ms must be ≥ 1000). `WatchAction` is identical in shape to `AppointmentAction`.
+
+`HappeningMatch` and `Composite`-over-`HappeningMatch` evaluate fully today; `SubjectState` predicates parse and persist but do not yet evaluate (the projection-engine integration is not wired through the watch path in this release). The runtime emits `WatchFired` / `WatchMissed` / `WatchCancelled` / `WatchEvaluationThrottled` happenings; per-watch evaluation throttle (default 1000/s) prevents action storm under runaway sensors.
+
 ## 6. Message Framing
 
 Wire framing is identical across transports. Each message is:

@@ -1,0 +1,35 @@
+[package]
+name = "evo-os-clock"
+description = "OS clock-state interface for the evo framework. Reads the kernel's NTP synchronisation state via adjtimex(2). Linux-only; gracefully degrades on other targets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# libc is needed for the adjtimex(2) FFI wrapper. Already transitively
+# in the workspace dep graph via tokio; declaring it here directly
+# does not expand the graph.
+libc = "0.2"
+# thiserror provides #[derive(Error)] for the AdjtimexError public
+# error type, matching the error-derivation style used across the
+# rest of the workspace.
+thiserror = "1"
+
+[dev-dependencies]
+
+# This crate intentionally does NOT inherit the workspace lints. The
+# rest of the workspace runs at `unsafe_code = "forbid"`; this crate
+# relaxes that to `deny` so a single tightly-scoped FFI wrapper can
+# `#[allow(unsafe_code)]` the syscall transition. Every other module
+# in this crate inherits the deny posture and stays unsafe-free.
+#
+# The unsafe surface is exactly one block in src/adjtimex.rs, behind
+# a documented contract describing the kernel ABI assumptions, the
+# memory layout of the timex struct, and the error-mapping rules.
+# A reader can find every use of `unsafe` in this crate by grepping
+# `unsafe ` in src/adjtimex.rs.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"

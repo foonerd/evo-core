@@ -23,6 +23,8 @@ path = "examples/subscribe_and_reconcile.rs"
 [dependencies]
 evo-plugin-sdk = { path = "../evo-plugin-sdk" }
 evo-trust = { path = "../evo-trust" }
+evo-os-clock = { path = "../evo-os-clock" }
+evo-coalesce-labels = { path = "../evo-coalesce-labels" }
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -35,9 +37,22 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+# Calendar / wall-clock arithmetic for the appointments
+# scheduler. `clock` enables `chrono::Local::now()` (libc
+# localtime_r-backed); `serde` is unused by the scheduler today
+# but matches the feature set evo-trust takes so the dep
+# graph is consistent. Default features off keeps the
+# transitive footprint small (no oldtime, no rkyv shims).
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
 base64 = "0.22"
 semver = { version = "1", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
+# Lock-free Arc swap used by per-plugin entries to publish updated
+# enforcement policies and manifests when reload-manifest swaps
+# them. Reads on the dispatch path stay lock-free; writes happen
+# only at admission and reload time.
+arc-swap = "1.7"
 
 # BLAKE3 powers claimant-token derivation. Pulled here (not via
 # evo-trust) because the steward derives tokens for every admitted

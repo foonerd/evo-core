@@ -130,6 +130,7 @@ impl Plugin for WardenPlugin {
                 },
                 runtime_capabilities: RuntimeCapabilities {
                     request_types: vec![],
+                    course_correct_verbs: vec![],
                     accepts_custody: true,
                     flags: Default::default(),
                 },

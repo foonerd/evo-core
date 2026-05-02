@@ -723,6 +723,8 @@ Request:
 |-------|------|-------|
 | `capabilities` | array of strings | Capability names the consumer requests. Unknown names are silently dropped from the response (forward-compatibility). |
 
+The negotiable capability names known today are: `resolve_claimants` (claimant-token lookup), `plugins_admin` (plugin lifecycle and reload verbs — see §4.12), `reconciliation_admin` (`reconcile_pair_now` — see §4.13), `user_interaction_responder` (single-claimer prompt routing — see §4.14), `appointments_admin` (appointment admin verbs — see §4.15), `watches_admin` (watch admin verbs — see §4.16), `grammar_admin` (grammar-orphan admin verbs — see §4.17), and `fast_path_admin` (gates dispatching frames on the Fast Path channel at `/run/evo/fast.sock` — see `FAST_PATH.md`). Unknown names are dropped silently so consumers can probe forward-compatibly.
+
 Response:
 
 ```json
@@ -875,7 +877,7 @@ The subscription ends when the client closes the connection or the subject is fo
 
 ### 4.11 `op = "list_plugins"`
 
-Read-only inventory of every admitted plugin. The op is the inventory surface PLUGIN_PACKAGING.md §6 names; the operator-instruction half of the administration rack (writable verbs) ships in a follow-up.
+Read-only inventory of every admitted plugin. The op is the read-only half of the administration rack PLUGIN_PACKAGING.md §6 names; the writable verbs are reachable as separate ops gated by `plugins_admin` (see §4.12).
 
 Request:
 
@@ -905,6 +907,75 @@ Response:
 ```
 
 Entries are in router admission order. `interaction_kind` is `respondent` or `warden`; mid-transition entries (concurrent reload) surface as `unknown` rather than blocking the projection. `current_seq` is the bus cursor at projection time so consumers can pin a `subscribe_happenings` subscription to the same position and apply admit / unload events as deltas. An empty router is a valid census; the response carries `plugins: []` rather than an error.
+
+### 4.12 Plugin lifecycle admin ops
+
+Six ops mutate plugin lifecycle state. All gated by the `plugins_admin` capability; consumers MUST `negotiate` it before issuing any of these.
+
+- **`enable_plugin { plugin, reason }`** flips the operator enable bit on (admit at next boot or reload). Returns `{ "plugin_enabled": true, "plugin": "...", "previously_enabled": false }`.
+- **`disable_plugin { plugin, reason }`** flips it off (skip at boot; live admission is drained).
+- **`uninstall_plugin { plugin, reason, purge_state }`** drains the plugin and removes its bundle from disk. With `purge_state = true` also deletes the per-plugin state directory.
+- **`purge_plugin_state { plugin }`** deletes the per-plugin state directory without uninstalling.
+- **`reload_catalogue { source, dry_run }`** loads a fresh catalogue document. `source` is `{ "kind": "inline", "body": "..." }` or `{ "kind": "path", "path": "..." }`. `dry_run = true` validates without applying.
+- **`reload_manifest { plugin, source, dry_run }`** swaps a plugin's manifest in place under the same lifecycle policy. Same `source` shape.
+
+Refusals carry stable subclass tokens: `plugins_admin_not_granted`, `unknown_plugin`, `admission_engine_not_configured`, `manifest_invalid`, `catalogue_invalid`.
+
+### 4.13 Reconciliation admin ops
+
+Three ops manage the per-pair compose-and-apply loop the framework drives for declared `[[reconciliation_pairs]]` entries. The two read-only ops (`list_reconciliation_pairs`, `project_reconciliation_pair`) are ungated; the manual trigger (`reconcile_pair_now`) requires the `reconciliation_admin` capability.
+
+- **`list_reconciliation_pairs`** returns one entry per declared pair: `pair_id`, `composer_shelf`, `warden_shelf`, `generation`, `last_applied_at_ms`.
+- **`project_reconciliation_pair { pair }`** returns the last-applied projection for one pair: `pair_id`, `generation`, `applied_state` (opaque per-pair JSON document).
+- **`reconcile_pair_now { pair }`** bypasses the pair's debounce window and runs one compose-and-apply cycle immediately. Returns `{ "reconcile_now": true, "pair": "..." }` on completion (success or rolled-back failure); the structured outcome rides the durable happenings stream as `ReconciliationApplied` / `ReconciliationFailed`. Refuses with `reconciliation_pair_not_found` for unknown pairs and `reconciliation_admin_not_granted` without the capability.
+
+### 4.14 User-interaction routing ops
+
+Three ops route plugin-initiated user prompts to a consumer connection holding the `user_interaction_responder` capability (single-claimer, first-claimer-wins). Plugins call `request_user_interaction(...)` via the SDK; the framework parks the request on the prompt ledger, the responder consumer answers via `answer_user_interaction`, and the plugin's awaiting future resolves.
+
+- **`list_user_interactions`** returns every prompt currently in `Open` state: `[{ "plugin": "...", "prompt": <PromptRequest> }]`.
+- **`answer_user_interaction { plugin, prompt_id, response, retain_for? }`** transitions the prompt to `Answered` and resolves the plugin's awaiting future with the typed response.
+- **`cancel_user_interaction { plugin, prompt_id }`** transitions the prompt to `Cancelled` (consumer attribution) and resolves the plugin's future with the cancellation outcome.
+
+All three gated by `user_interaction_responder`. Refusals: `user_interaction_responder_not_granted`, `prompt_not_found`, `responder_already_assigned` (negotiate-time refusal when another connection holds the capability).
+
+### 4.15 Appointment admin ops
+
+Four ops manage time-driven instructions (sibling primitive to watches). Plugins schedule appointments via the in-process `AppointmentScheduler` trait under `capabilities.appointments`; operators reach the runtime over the wire under `appointments_admin`.
+
+- **`create_appointment { creator, spec, action }`** creates one entry. `spec` carries `appointment_id`, optional `time` (HH:MM), `zone` (UTC / Local), `recurrence` (`one_shot { fire_at_ms }` / `daily` / `weekdays` / `weekends` / `weekly { days }` / `monthly { day_of_month }` / `yearly { month, day }`), and optional `end_time_ms`, `max_fires`, `except`, `miss_policy`, `pre_fire_ms`, `must_wake_device`, `wake_pre_arm_ms`. `action` is `{ target_shelf, request_type, payload }`. Returns `{ "appointment_created": true, "creator", "appointment_id", "next_fire_ms" }`.
+- **`cancel_appointment { creator, appointment_id }`** idempotent transition to `Cancelled`. Returns `{ "appointment_cancelled": true, "cancelled": <bool> }` (false on no-op).
+- **`list_appointments`** returns every entry in any state (sorted by `(creator, appointment_id)`).
+- **`project_appointment { creator, appointment_id }`** returns one entry; `entry: null` for unknown pairs.
+
+Refusals: `appointments_admin_not_granted`, `appointments_not_configured`, `bad_recurrence`, `quota_exceeded`.
+
+### 4.16 Watch admin ops
+
+Four ops manage condition-driven instructions. Plugins schedule watches via the in-process `WatchScheduler` trait under `capabilities.watches`; operators reach the runtime over the wire under `watches_admin`.
+
+- **`create_watch { creator, spec, action }`** creates one entry. `spec` carries `watch_id`, `condition` (`happening_match { filter }` / `subject_state { canonical_id, predicate, minimum_duration_ms? }` / `composite { op: all|any|not, terms }`), and `trigger` (`edge` or `level { cooldown_ms }`; level requires `cooldown_ms >= 1000`). `condition.predicate` for `subject_state` is one of `equals` / `not_equals` / `greater_than` / `less_than` / `in_range` / `hysteresis { upper, lower }` / `regex`. `action` is `{ target_shelf, request_type, payload }`.
+- **`cancel_watch { creator, watch_id }`** idempotent.
+- **`list_watches`** returns every entry in any state.
+- **`project_watch { creator, watch_id }`** returns one entry; `entry: null` for unknown pairs.
+
+`HappeningMatch` and `Composite`-over-`HappeningMatch` evaluate fully today; `SubjectState` predicates parse and persist but evaluate to non-match in this release (the projection-engine integration is not yet wired through the migration path).
+
+Refusals: `watches_admin_not_granted`, `watches_not_configured`, `bad_spec` (invalid recurrence, level cooldown < 1000 ms, composite-Not arity, composite tree depth), `quota_exceeded`.
+
+### 4.17 Subject-grammar migration ops
+
+Three ops manage orphan subject types — subjects whose `subject_type` is no longer declared in the loaded catalogue. See `CATALOGUE.md` §5.3 for the boot diagnostic and `SUBJECTS.md` for the `TypeMigrated` alias kind. All three gated by the `grammar_admin` capability.
+
+- **`list_grammar_orphans`** returns every row in `pending_grammar_orphans`: `[{ subject_type, first_observed_at_ms, last_observed_at_ms, count, status, accepted_reason?, accepted_at_ms?, migration_id? }]` sorted by `subject_type`. `status` is `pending` / `migrating` / `resolved` / `accepted` / `recovered`.
+- **`accept_grammar_orphans { from_type, reason }`** records the deliberate decision to leave the orphans of `from_type` un-migrated. Idempotent; refuses with `not_found` for unknown types and `migration_in_flight` (ContractViolation) when an in-flight migration holds the row.
+- **`migrate_grammar_orphans { from_type, strategy, dry_run, batch_size?, max_subjects?, reason? }`** re-states every orphan of `from_type` under a declared catalogue type. `strategy` is `{ kind: "rename", to_type }` (every orphan migrates to the same `to_type`) or `{ kind: "map", discriminator_field, mapping, default_to_type? }` or `{ kind: "filter", predicate, to_type }`. `dry_run = true` returns a plan with `target_type_breakdown`, `sample_first`, `sample_last` without mutating. Real-run response: `{ migration_id, from_type, migrated_count, unmigrated_count, unmigrated_sample, duration_ms, dry_run: false }`. Per-subject atomic transactions; per-batch commits (default 100 subjects/batch); `max_subjects` caps per-call work for chunked execution. Per-call admin-ledger receipt; per-subject `Happening::SubjectMigrated`; per-batch `Happening::GrammarMigrationProgress`.
+
+`Map` and `Filter` strategies parse and validate but currently refuse with `strategy_not_yet_implemented` (Unavailable class) — their evaluators consume subject projections, which the runtime does not yet expose to the migration path.
+
+Refusals: `grammar_admin_not_granted`, `not_an_orphan` (the `from_type` is currently declared in the loaded catalogue), `undeclared_target_type`, `bad_recurrence`, `quota_exceeded`, `strategy_not_yet_implemented`, `persistence_error`.
+
+The CLI wraps these as `evo-plugin-tool admin grammar {list,plan,migrate,accept}` (see `PLUGIN_TOOL.md`).
 
 ## 5. Error Handling
 

@@ -13,15 +13,16 @@
 //! are future work.
 
 use evo_plugin_sdk::contract::{
-    AliasKind, AliasRecord, CanonicalSubjectId, CustodyHandle,
+    AliasKind, AliasRecord, AppointmentAction, AppointmentId,
+    AppointmentScheduler, AppointmentSpec, CanonicalSubjectId, CustodyHandle,
     CustodyStateReporter, ExplicitRelationAssignment, ExternalAddressing,
-    HealthStatus, InstanceAnnouncement, InstanceAnnouncer, InstanceId,
-    RelationAdmin, RelationAnnouncer, RelationAssertion, RelationRetraction,
-    ReportError, ReportPriority, SplitRelationStrategy, StateReporter,
-    SubjectAddressingRecord, SubjectAdmin, SubjectAnnouncement,
-    SubjectAnnouncer, SubjectQuerier, SubjectQueryResult,
-    SubjectRecord as SdkSubjectRecord, UserInteraction,
-    UserInteractionRequester,
+    FastPathDispatcher, HealthStatus, InstanceAnnouncement, InstanceAnnouncer,
+    InstanceId, PromptOutcome, PromptRequest, RelationAdmin, RelationAnnouncer,
+    RelationAssertion, RelationRetraction, ReportError, ReportPriority,
+    SplitRelationStrategy, StateReporter, SubjectAddressingRecord,
+    SubjectAdmin, SubjectAnnouncement, SubjectAnnouncer, SubjectQuerier,
+    SubjectQueryResult, SubjectRecord as SdkSubjectRecord,
+    UserInteractionRequester, WatchAction, WatchId, WatchScheduler, WatchSpec,
 };
 use std::collections::HashSet;
 use std::future::Future;
@@ -157,20 +158,30 @@ impl LoggingUserInteractionRequester {
 }
 
 impl UserInteractionRequester for LoggingUserInteractionRequester {
-    fn request<'a>(
+    fn request_user_interaction<'a>(
         &'a self,
-        interaction: UserInteraction,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
-    {
+        prompt: PromptRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<PromptOutcome, ReportError>> + Send + 'a,
+        >,
+    > {
         let name = self.plugin_name.clone();
         Box::pin(async move {
             tracing::warn!(
                 plugin = %name,
-                interaction_type = %interaction.interaction_type,
-                cid = interaction.correlation_id,
-                "user interaction requested (not routed in v0)"
+                prompt_id = %prompt.prompt_id,
+                "user interaction prompt issued (router pending; refused)"
             );
-            Ok(())
+            // Routing is wired in a later commit. Refuse with a
+            // structured error so the plugin observes the
+            // not-yet-implemented disposition rather than
+            // hanging on a never-resolving future.
+            Err(ReportError::Invalid(
+                "user-interaction routing is not yet wired; the plugin's \
+                 prompt was logged and refused"
+                    .into(),
+            ))
         })
     }
 }
@@ -383,12 +394,13 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                 };
                 if let Some(canonical_id) = canonical_id_opt {
                     let at_ms = system_time_to_ms(SystemTime::now());
-                    let persisted_claims: Vec<crate::persistence::PersistedClaim> =
-                        announcement
-                            .claims
-                            .iter()
-                            .map(persisted_claim_from_subject_claim)
-                            .collect();
+                    let persisted_claims: Vec<
+                        crate::persistence::PersistedClaim,
+                    > = announcement
+                        .claims
+                        .iter()
+                        .map(persisted_claim_from_subject_claim)
+                        .collect();
                     store
                         .record_subject_announce(
                             crate::persistence::AnnounceRecord {
@@ -511,9 +523,10 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                 // removal to the persistence layer so a restart
                 // does not bring the addressing back from disk.
                 SubjectRetractOutcome::AddressingRemoved => {
-                    if let (Some(store), Some(canonical_id)) =
-                        (persistence.as_ref(), pre_retract_canonical_id.as_ref())
-                    {
+                    if let (Some(store), Some(canonical_id)) = (
+                        persistence.as_ref(),
+                        pre_retract_canonical_id.as_ref(),
+                    ) {
                         let at_ms = system_time_to_ms(SystemTime::now());
                         store
                             .record_subject_retract(
@@ -1066,35 +1079,40 @@ impl RelationAnnouncer for RegistryRelationAnnouncer {
                     .find(|c| c.claimant == plugin_name)
                     .map(|c| system_time_to_ms(c.asserted_at))
                     .unwrap_or(modified_at_ms);
-                let persisted_relation = crate::persistence::PersistedRelation {
-                    source_id: source_id.clone(),
-                    predicate: assertion.predicate.clone(),
-                    target_id: target_id.clone(),
-                    created_at_ms,
-                    modified_at_ms,
-                    suppressed_admin_plugin: record
-                        .suppression
-                        .as_ref()
-                        .map(|s| s.admin_plugin.clone()),
-                    suppressed_at_ms: record
-                        .suppression
-                        .as_ref()
-                        .map(|s| system_time_to_ms(s.suppressed_at)),
-                    suppression_reason: record
-                        .suppression
-                        .as_ref()
-                        .and_then(|s| s.reason.clone()),
-                };
-                let persisted_claim = crate::persistence::PersistedRelationClaim {
-                    source_id: source_id.clone(),
-                    predicate: assertion.predicate.clone(),
-                    target_id: target_id.clone(),
-                    claimant: plugin_name.clone(),
-                    asserted_at_ms,
-                    reason: assert_reason,
-                };
+                let persisted_relation =
+                    crate::persistence::PersistedRelation {
+                        source_id: source_id.clone(),
+                        predicate: assertion.predicate.clone(),
+                        target_id: target_id.clone(),
+                        created_at_ms,
+                        modified_at_ms,
+                        suppressed_admin_plugin: record
+                            .suppression
+                            .as_ref()
+                            .map(|s| s.admin_plugin.clone()),
+                        suppressed_at_ms: record
+                            .suppression
+                            .as_ref()
+                            .map(|s| system_time_to_ms(s.suppressed_at)),
+                        suppression_reason: record
+                            .suppression
+                            .as_ref()
+                            .and_then(|s| s.reason.clone()),
+                    };
+                let persisted_claim =
+                    crate::persistence::PersistedRelationClaim {
+                        source_id: source_id.clone(),
+                        predicate: assertion.predicate.clone(),
+                        target_id: target_id.clone(),
+                        claimant: plugin_name.clone(),
+                        asserted_at_ms,
+                        reason: assert_reason,
+                    };
                 store
-                    .record_relation_assert(&persisted_relation, &persisted_claim)
+                    .record_relation_assert(
+                        &persisted_relation,
+                        &persisted_claim,
+                    )
                     .await
                     .map_err(|e| {
                         ReportError::Invalid(format!(
@@ -1538,18 +1556,19 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                         ))
                     })?;
 
-                    ledger.record(AdminLogEntry {
-                        kind: AdminLogKind::SubjectAddressingForcedRetract,
-                        admin_plugin: admin_plugin.clone(),
-                        target_plugin: Some(target_plugin),
-                        target_subject: Some(canonical_id),
-                        target_addressing: Some(addressing),
-                        target_relation: None,
-                        additional_subjects: Vec::new(),
-                        reason,
-                        prior_reason: None,
-                        at,
-                    })
+                    ledger
+                        .record(AdminLogEntry {
+                            kind: AdminLogKind::SubjectAddressingForcedRetract,
+                            admin_plugin: admin_plugin.clone(),
+                            target_plugin: Some(target_plugin),
+                            target_subject: Some(canonical_id),
+                            target_addressing: Some(addressing),
+                            target_relation: None,
+                            additional_subjects: Vec::new(),
+                            reason,
+                            prior_reason: None,
+                            at,
+                        })
                         .await
                         .map_err(|e| {
                             ReportError::Invalid(format!(
@@ -1673,18 +1692,19 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                     // 4. Audit ledger entry records the admin
                     //    action, with the forgotten subject's
                     //    canonical ID for cross-reference.
-                    ledger.record(AdminLogEntry {
-                        kind: AdminLogKind::SubjectAddressingForcedRetract,
-                        admin_plugin: admin_plugin.clone(),
-                        target_plugin: Some(target_plugin),
-                        target_subject: Some(canonical_id),
-                        target_addressing: Some(addressing),
-                        target_relation: None,
-                        additional_subjects: Vec::new(),
-                        reason,
-                        prior_reason: None,
-                        at,
-                    })
+                    ledger
+                        .record(AdminLogEntry {
+                            kind: AdminLogKind::SubjectAddressingForcedRetract,
+                            admin_plugin: admin_plugin.clone(),
+                            target_plugin: Some(target_plugin),
+                            target_subject: Some(canonical_id),
+                            target_addressing: Some(addressing),
+                            target_relation: None,
+                            additional_subjects: Vec::new(),
+                            reason,
+                            prior_reason: None,
+                            at,
+                        })
                         .await
                         .map_err(|e| {
                             ReportError::Invalid(format!(
@@ -1836,17 +1856,15 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             {
                 let at_ms = system_time_to_ms(SystemTime::now());
                 store
-                    .record_subject_merge(
-                        crate::persistence::MergeRecord {
-                            source_a: &source_a_id,
-                            source_b: &source_b_id,
-                            new_id: &new_id,
-                            subject_type,
-                            admin_plugin: &admin_plugin,
-                            reason: reason.as_deref(),
-                            at_ms,
-                        },
-                    )
+                    .record_subject_merge(crate::persistence::MergeRecord {
+                        source_a: &source_a_id,
+                        source_b: &source_b_id,
+                        new_id: &new_id,
+                        subject_type,
+                        admin_plugin: &admin_plugin,
+                        reason: reason.as_deref(),
+                        at_ms,
+                    })
                     .await
                     .map_err(|e| {
                         ReportError::Invalid(format!(
@@ -2062,27 +2080,28 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 })?;
             }
 
-            ledger.record(AdminLogEntry {
-                kind: AdminLogKind::SubjectMerge,
-                admin_plugin: admin_plugin.clone(),
-                target_plugin: None,
-                target_subject: Some(new_id.clone()),
-                target_addressing: None,
-                target_relation: None,
-                additional_subjects: vec![
-                    source_a_id.clone(),
-                    source_b_id.clone(),
-                ],
-                reason,
-                prior_reason: None,
-                at,
-            })
-                        .await
-                        .map_err(|e| {
-                            ReportError::Invalid(format!(
-                                "admin ledger write failed: {e}"
-                            ))
-                        })?;
+            ledger
+                .record(AdminLogEntry {
+                    kind: AdminLogKind::SubjectMerge,
+                    admin_plugin: admin_plugin.clone(),
+                    target_plugin: None,
+                    target_subject: Some(new_id.clone()),
+                    target_addressing: None,
+                    target_relation: None,
+                    additional_subjects: vec![
+                        source_a_id.clone(),
+                        source_b_id.clone(),
+                    ],
+                    reason,
+                    prior_reason: None,
+                    at,
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "admin ledger write failed: {e}"
+                    ))
+                })?;
 
             // Conflict-lifecycle scan. When persistence and the
             // in-memory conflict index are both attached, walk the
@@ -2238,9 +2257,8 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             // subjects-table mutation without re-querying the
             // registry (which has already moved on to the new
             // canonical IDs).
-            let split_subject_type: Option<String> = registry
-                .describe(&source_id)
-                .map(|rec| rec.subject_type);
+            let split_subject_type: Option<String> =
+                registry.describe(&source_id).map(|rec| rec.subject_type);
             let partition_for_persistence: Vec<Vec<ExternalAddressing>> =
                 partition.clone();
 
@@ -2273,17 +2291,15 @@ impl SubjectAdmin for RegistrySubjectAdmin {
             {
                 let at_ms = system_time_to_ms(SystemTime::now());
                 store
-                    .record_subject_split(
-                        crate::persistence::SplitRecord {
-                            source: &source_id,
-                            new_ids: &new_ids,
-                            subject_type,
-                            partition: &partition_for_persistence,
-                            admin_plugin: &admin_plugin,
-                            reason: reason.as_deref(),
-                            at_ms,
-                        },
-                    )
+                    .record_subject_split(crate::persistence::SplitRecord {
+                        source: &source_id,
+                        new_ids: &new_ids,
+                        subject_type,
+                        partition: &partition_for_persistence,
+                        admin_plugin: &admin_plugin,
+                        reason: reason.as_deref(),
+                        at_ms,
+                    })
                     .await
                     .map_err(|e| {
                         ReportError::Invalid(format!(
@@ -2491,24 +2507,25 @@ impl SubjectAdmin for RegistrySubjectAdmin {
                 })?;
             }
 
-            ledger.record(AdminLogEntry {
-                kind: AdminLogKind::SubjectSplit,
-                admin_plugin: admin_plugin.clone(),
-                target_plugin: None,
-                target_subject: Some(source_id),
-                target_addressing: None,
-                target_relation: None,
-                additional_subjects: new_ids,
-                reason,
-                prior_reason: None,
-                at,
-            })
-                        .await
-                        .map_err(|e| {
-                            ReportError::Invalid(format!(
-                                "admin ledger write failed: {e}"
-                            ))
-                        })?;
+            ledger
+                .record(AdminLogEntry {
+                    kind: AdminLogKind::SubjectSplit,
+                    admin_plugin: admin_plugin.clone(),
+                    target_plugin: None,
+                    target_subject: Some(source_id),
+                    target_addressing: None,
+                    target_relation: None,
+                    additional_subjects: new_ids,
+                    reason,
+                    prior_reason: None,
+                    at,
+                })
+                .await
+                .map_err(|e| {
+                    ReportError::Invalid(format!(
+                        "admin ledger write failed: {e}"
+                    ))
+                })?;
 
             // Conflict-lifecycle scan. Symmetric with the merge
             // path: a split takes one live id and produces N live
@@ -2723,20 +2740,21 @@ impl RelationAdmin for RegistryRelationAdmin {
                             "persistence write failed: {e}"
                         ))
                     })?;
-                    ledger.record(AdminLogEntry {
-                        kind: AdminLogKind::RelationClaimForcedRetract,
-                        admin_plugin: admin_plugin.clone(),
-                        target_plugin: Some(target_plugin),
-                        target_subject: None,
-                        target_addressing: None,
-                        target_relation: Some(RelationKey::new(
-                            source_id, predicate, target_id,
-                        )),
-                        additional_subjects: Vec::new(),
-                        reason,
-                        prior_reason: None,
-                        at,
-                    })
+                    ledger
+                        .record(AdminLogEntry {
+                            kind: AdminLogKind::RelationClaimForcedRetract,
+                            admin_plugin: admin_plugin.clone(),
+                            target_plugin: Some(target_plugin),
+                            target_subject: None,
+                            target_addressing: None,
+                            target_relation: Some(RelationKey::new(
+                                source_id, predicate, target_id,
+                            )),
+                            additional_subjects: Vec::new(),
+                            reason,
+                            prior_reason: None,
+                            at,
+                        })
                         .await
                         .map_err(|e| {
                             ReportError::Invalid(format!(
@@ -2803,20 +2821,21 @@ impl RelationAdmin for RegistryRelationAdmin {
                         ))
                     })?;
 
-                    ledger.record(AdminLogEntry {
-                        kind: AdminLogKind::RelationClaimForcedRetract,
-                        admin_plugin: admin_plugin.clone(),
-                        target_plugin: Some(target_plugin),
-                        target_subject: None,
-                        target_addressing: None,
-                        target_relation: Some(RelationKey::new(
-                            source_id, predicate, target_id,
-                        )),
-                        additional_subjects: Vec::new(),
-                        reason,
-                        prior_reason: None,
-                        at,
-                    })
+                    ledger
+                        .record(AdminLogEntry {
+                            kind: AdminLogKind::RelationClaimForcedRetract,
+                            admin_plugin: admin_plugin.clone(),
+                            target_plugin: Some(target_plugin),
+                            target_subject: None,
+                            target_addressing: None,
+                            target_relation: Some(RelationKey::new(
+                                source_id, predicate, target_id,
+                            )),
+                            additional_subjects: Vec::new(),
+                            reason,
+                            prior_reason: None,
+                            at,
+                        })
                         .await
                         .map_err(|e| {
                             ReportError::Invalid(format!(
@@ -2932,20 +2951,21 @@ impl RelationAdmin for RegistryRelationAdmin {
                             "persistence write failed: {e}"
                         ))
                     })?;
-                    ledger.record(AdminLogEntry {
-                        kind: AdminLogKind::RelationSuppress,
-                        admin_plugin,
-                        target_plugin: None,
-                        target_subject: None,
-                        target_addressing: None,
-                        target_relation: Some(RelationKey::new(
-                            source_id, predicate, target_id,
-                        )),
-                        additional_subjects: Vec::new(),
-                        reason,
-                        prior_reason: None,
-                        at,
-                    })
+                    ledger
+                        .record(AdminLogEntry {
+                            kind: AdminLogKind::RelationSuppress,
+                            admin_plugin,
+                            target_plugin: None,
+                            target_subject: None,
+                            target_addressing: None,
+                            target_relation: Some(RelationKey::new(
+                                source_id, predicate, target_id,
+                            )),
+                            additional_subjects: Vec::new(),
+                            reason,
+                            prior_reason: None,
+                            at,
+                        })
                         .await
                         .map_err(|e| {
                             ReportError::Invalid(format!(
@@ -2996,20 +3016,22 @@ impl RelationAdmin for RegistryRelationAdmin {
                             "persistence write failed: {e}"
                         ))
                     })?;
-                    ledger.record(AdminLogEntry {
-                        kind: AdminLogKind::RelationSuppressionReasonUpdated,
-                        admin_plugin,
-                        target_plugin: None,
-                        target_subject: None,
-                        target_addressing: None,
-                        target_relation: Some(RelationKey::new(
-                            source_id, predicate, target_id,
-                        )),
-                        additional_subjects: Vec::new(),
-                        reason: new_reason,
-                        prior_reason: old_reason,
-                        at,
-                    })
+                    ledger
+                        .record(AdminLogEntry {
+                            kind:
+                                AdminLogKind::RelationSuppressionReasonUpdated,
+                            admin_plugin,
+                            target_plugin: None,
+                            target_subject: None,
+                            target_addressing: None,
+                            target_relation: Some(RelationKey::new(
+                                source_id, predicate, target_id,
+                            )),
+                            additional_subjects: Vec::new(),
+                            reason: new_reason,
+                            prior_reason: old_reason,
+                            at,
+                        })
                         .await
                         .map_err(|e| {
                             ReportError::Invalid(format!(
@@ -3101,20 +3123,21 @@ impl RelationAdmin for RegistryRelationAdmin {
                             "persistence write failed: {e}"
                         ))
                     })?;
-                    ledger.record(AdminLogEntry {
-                        kind: AdminLogKind::RelationUnsuppress,
-                        admin_plugin,
-                        target_plugin: None,
-                        target_subject: None,
-                        target_addressing: None,
-                        target_relation: Some(RelationKey::new(
-                            source_id, predicate, target_id,
-                        )),
-                        additional_subjects: Vec::new(),
-                        reason: None,
-                        prior_reason: None,
-                        at,
-                    })
+                    ledger
+                        .record(AdminLogEntry {
+                            kind: AdminLogKind::RelationUnsuppress,
+                            admin_plugin,
+                            target_plugin: None,
+                            target_subject: None,
+                            target_addressing: None,
+                            target_relation: Some(RelationKey::new(
+                                source_id, predicate, target_id,
+                            )),
+                            additional_subjects: Vec::new(),
+                            reason: None,
+                            prior_reason: None,
+                            at,
+                        })
                         .await
                         .map_err(|e| {
                             ReportError::Invalid(format!(
@@ -3353,6 +3376,191 @@ impl SubjectQuerier for RegistrySubjectQuerier {
     }
 }
 
+/// In-process [`FastPathDispatcher`] backed by a shared
+/// [`PluginRouter`]. Used by the admission engine to populate
+/// [`evo_plugin_sdk::contract::LoadContext::fast_path_dispatcher`]
+/// for plugins whose manifest declares
+/// `capabilities.fast_path = true`.
+///
+/// The dispatch routes through
+/// [`PluginRouter::course_correct_fast`] which applies the
+/// per-warden Fast Path verb gate, the budget (clamped at
+/// admission), and the failure-mode bookkeeping. Refusals
+/// surface as [`ReportError::Invalid`] carrying the steward-
+/// side error message verbatim; consumers branch on the stable
+/// subclass tokens embedded in the message
+/// (`not_fast_path_eligible`, `fast_path_budget_exceeded`,
+/// `shelf_not_admitted`, `shelf_unloaded`, `shelf_not_warden`).
+#[derive(Debug)]
+pub struct RouterFastPathDispatcher {
+    router: Arc<PluginRouter>,
+}
+
+impl RouterFastPathDispatcher {
+    /// Construct a dispatcher bound to the shared router.
+    pub fn new(router: Arc<PluginRouter>) -> Self {
+        Self { router }
+    }
+}
+
+impl FastPathDispatcher for RouterFastPathDispatcher {
+    fn fast_path_dispatch<'a>(
+        &'a self,
+        target_shelf: &'a str,
+        handle: &'a CustodyHandle,
+        verb: &'a str,
+        payload: Vec<u8>,
+        deadline_ms: Option<u32>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let router = Arc::clone(&self.router);
+        let target_shelf = target_shelf.to_string();
+        let handle = handle.clone();
+        let verb = verb.to_string();
+        Box::pin(async move {
+            router
+                .course_correct_fast(
+                    &target_shelf,
+                    &handle,
+                    verb,
+                    payload,
+                    deadline_ms,
+                )
+                .await
+                .map_err(|e| ReportError::Invalid(e.to_string()))
+        })
+    }
+}
+
+/// In-process [`AppointmentScheduler`] backed by a shared
+/// [`crate::appointments::AppointmentRuntime`]. Used by the
+/// admission engine to populate
+/// [`evo_plugin_sdk::contract::LoadContext::appointments`] for
+/// plugins whose manifest declares
+/// `capabilities.appointments = true`.
+///
+/// The wrapper binds the dispatcher to the plugin's canonical
+/// name so every appointment created through the trait surface
+/// is namespaced under that creator label. The runtime's
+/// per-creator quota check then bounds appointments per plugin.
+#[derive(Debug)]
+pub struct RouterAppointmentScheduler {
+    runtime: Arc<crate::appointments::AppointmentRuntime>,
+    plugin_name: String,
+}
+
+impl RouterAppointmentScheduler {
+    /// Construct a scheduler bound to the shared runtime and a
+    /// plugin's canonical name. The name is used as the creator
+    /// label on every entry the plugin schedules.
+    pub fn new(
+        runtime: Arc<crate::appointments::AppointmentRuntime>,
+        plugin_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            runtime,
+            plugin_name: plugin_name.into(),
+        }
+    }
+}
+
+impl AppointmentScheduler for RouterAppointmentScheduler {
+    fn create_appointment<'a>(
+        &'a self,
+        spec: AppointmentSpec,
+        action: AppointmentAction,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<AppointmentId, ReportError>> + Send + 'a,
+        >,
+    > {
+        let creator = self.plugin_name.clone();
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            let id = AppointmentId::new(spec.appointment_id.clone());
+            runtime
+                .schedule(&creator, spec, action)
+                .map(|_| id)
+                .map_err(|e| ReportError::Invalid(e.to_string()))
+        })
+    }
+
+    fn cancel_appointment<'a>(
+        &'a self,
+        id: AppointmentId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let creator = self.plugin_name.clone();
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            runtime.cancel(&creator, id.as_str(), &creator).await;
+            Ok(())
+        })
+    }
+}
+
+/// In-process [`WatchScheduler`] backed by a shared
+/// [`crate::watches::WatchRuntime`]. Used by the admission
+/// engine to populate
+/// [`evo_plugin_sdk::contract::LoadContext::watches`] for
+/// plugins whose manifest declares
+/// `capabilities.watches = true`.
+///
+/// Binds the dispatcher to the plugin's canonical name so every
+/// watch created through the trait surface is namespaced under
+/// that creator label and counted against the plugin's quota.
+#[derive(Debug)]
+pub struct RouterWatchScheduler {
+    runtime: Arc<crate::watches::WatchRuntime>,
+    plugin_name: String,
+}
+
+impl RouterWatchScheduler {
+    /// Construct a scheduler bound to the shared runtime and a
+    /// plugin's canonical name.
+    pub fn new(
+        runtime: Arc<crate::watches::WatchRuntime>,
+        plugin_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            runtime,
+            plugin_name: plugin_name.into(),
+        }
+    }
+}
+
+impl WatchScheduler for RouterWatchScheduler {
+    fn create_watch<'a>(
+        &'a self,
+        spec: WatchSpec,
+        action: WatchAction,
+    ) -> Pin<Box<dyn Future<Output = Result<WatchId, ReportError>> + Send + 'a>>
+    {
+        let creator = self.plugin_name.clone();
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            let id = WatchId::new(spec.watch_id.clone());
+            runtime
+                .schedule(&creator, spec, action)
+                .map(|_| id)
+                .map_err(|e| ReportError::Invalid(e.to_string()))
+        })
+    }
+
+    fn cancel_watch<'a>(
+        &'a self,
+        id: WatchId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let creator = self.plugin_name.clone();
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            runtime.cancel(&creator, id.as_str(), &creator).await;
+            Ok(())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3366,6 +3574,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_fast_path_dispatcher_refuses_when_shelf_not_admitted() {
+        // Pin the in-process dispatcher's refusal shape: a
+        // Fast Path call against an unadmitted shelf surfaces
+        // the router's `no plugin on shelf` message via
+        // `ReportError::Invalid` (the dispatcher maps every
+        // StewardError to that variant). Consumers branch on
+        // the embedded subclass token, not the variant.
+        let router = Arc::new(PluginRouter::new(
+            crate::state::StewardState::for_tests(),
+        ));
+        let dispatcher = RouterFastPathDispatcher::new(router);
+        let handle = CustodyHandle {
+            id: "no-such-handle".into(),
+            started_at: std::time::UNIX_EPOCH,
+        };
+        let res = dispatcher
+            .fast_path_dispatch(
+                "test.absent",
+                &handle,
+                "volume_set",
+                vec![],
+                None,
+            )
+            .await;
+        match res {
+            Err(ReportError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("no plugin on shelf:"),
+                    "expected shelf-not-admitted message; got: {msg}"
+                );
+            }
+            other => panic!("expected Invalid refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn instance_announcer_announces_and_retracts() {
         let a = LoggingInstanceAnnouncer::new("org.test.factory");
         let announcement = InstanceAnnouncement::new("i1", b"data".to_vec());
@@ -3374,14 +3618,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_interaction_requester_logs() {
+    async fn user_interaction_requester_logs_and_refuses_until_routed() {
+        use evo_plugin_sdk::contract::PromptType;
+        // The placeholder LoggingUserInteractionRequester logs
+        // the prompt and refuses with a structured error so the
+        // plugin sees a concrete disposition rather than hanging
+        // on a never-resolving future. Wire-up of real consumer
+        // routing lands in a follow-up commit.
         let r = LoggingUserInteractionRequester::new("org.test.auth");
-        let ui = UserInteraction {
-            interaction_type: "confirm".into(),
-            payload: vec![],
-            correlation_id: 1,
+        let prompt = PromptRequest {
+            prompt_id: "test-1".into(),
+            prompt_type: PromptType::Confirm {
+                message: "proceed?".into(),
+            },
+            timeout_ms: None,
+            session_id: None,
+            retention_hint: None,
+            error_context: None,
+            previous_answer: None,
         };
-        assert!(r.request(ui).await.is_ok());
+        let res = r.request_user_interaction(prompt).await;
+        assert!(matches!(res, Err(ReportError::Invalid(_))));
     }
 
     #[tokio::test]
@@ -5266,6 +5523,7 @@ target_type = "*"
                     runtime_capabilities:
                         evo_plugin_sdk::contract::RuntimeCapabilities {
                             request_types: vec![],
+                            course_correct_verbs: vec![],
                             accepts_custody: false,
                             flags: Default::default(),
                         },

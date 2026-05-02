@@ -22,7 +22,7 @@
 use evo_plugin_sdk::contract::{
     Assignment, CourseCorrection, CustodyHandle, HealthReport, LoadContext,
     Plugin, PluginDescription, PluginError, Request, Respondent, Response,
-    Warden,
+    StateBlob, Warden,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -59,6 +59,24 @@ pub trait ErasedRespondent: Send + Sync {
         &'a mut self,
         req: &'a Request,
     ) -> Pin<Box<dyn Future<Output = Result<Response, PluginError>> + Send + 'a>>;
+
+    /// Dispatches to `Plugin::prepare_for_live_reload`.
+    fn prepare_for_live_reload(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<StateBlob>, PluginError>>
+                + Send
+                + '_,
+        >,
+    >;
+
+    /// Dispatches to `Plugin::load_with_state`.
+    fn load_with_state<'a>(
+        &'a mut self,
+        ctx: &'a LoadContext,
+        blob: Option<StateBlob>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>;
 }
 
 /// Generic adapter: wraps any `T: Respondent + 'static` as an
@@ -114,6 +132,27 @@ impl<T: Respondent + 'static> ErasedRespondent for RespondentAdapter<T> {
     {
         Box::pin(Respondent::handle_request(&mut self.inner, req))
     }
+
+    fn prepare_for_live_reload(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<StateBlob>, PluginError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(Plugin::prepare_for_live_reload(&self.inner))
+    }
+
+    fn load_with_state<'a>(
+        &'a mut self,
+        ctx: &'a LoadContext,
+        blob: Option<StateBlob>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
+        Box::pin(Plugin::load_with_state(&mut self.inner, ctx, blob))
+    }
 }
 
 /// Object-safe internal trait for admitted warden plugins.
@@ -165,6 +204,24 @@ pub trait ErasedWarden: Send + Sync {
     fn release_custody<'a>(
         &'a mut self,
         handle: CustodyHandle,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>;
+
+    /// Dispatches to `Plugin::prepare_for_live_reload`.
+    fn prepare_for_live_reload(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<StateBlob>, PluginError>>
+                + Send
+                + '_,
+        >,
+    >;
+
+    /// Dispatches to `Plugin::load_with_state`.
+    fn load_with_state<'a>(
+        &'a mut self,
+        ctx: &'a LoadContext,
+        blob: Option<StateBlob>,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>;
 }
 
@@ -240,5 +297,26 @@ impl<T: Warden + 'static> ErasedWarden for WardenAdapter<T> {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
     {
         Box::pin(Warden::release_custody(&mut self.inner, handle))
+    }
+
+    fn prepare_for_live_reload(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<StateBlob>, PluginError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(Plugin::prepare_for_live_reload(&self.inner))
+    }
+
+    fn load_with_state<'a>(
+        &'a mut self,
+        ctx: &'a LoadContext,
+        blob: Option<StateBlob>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
+        Box::pin(Plugin::load_with_state(&mut self.inner, ctx, blob))
     }
 }

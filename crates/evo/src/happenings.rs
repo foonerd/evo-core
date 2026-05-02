@@ -313,7 +313,37 @@ pub struct HappeningEnvelope {
 /// Marked `#[non_exhaustive]`: future passes add variants without
 /// breaking match arms on the existing custody variants. Callers
 /// matching on `Happening` MUST include a catch-all arm.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// # Coalesce-labels derive — variant-author contract
+///
+/// This enum derives [`evo_coalesce_labels::CoalesceLabels`] (the
+/// per-subscriber happenings-coalescing surface). Every named
+/// field that contributes to the runtime label set is converted
+/// via `field.to_string()`, which requires
+/// [`core::fmt::Display`]. Fields whose types do NOT implement
+/// `Display` MUST be annotated with `#[coalesce_labels(skip)]`
+/// or the derive will fail to compile.
+///
+/// The currently-skipped types in this enum are: `SystemTime`
+/// (the universal `at` field), `Vec<...>` collection fields
+/// (`source_ids`, `new_ids`, `candidate_new_ids`, `addressings`,
+/// `canonical_ids`), `Option<String>` (every `reason`-style
+/// field plus `scheme`, `value`, `predicate`, `target_id`,
+/// `old_reason`, `new_reason`), and the custom enums / structs
+/// `HealthStatus`, `Cardinality`, `RelationForgottenReason`,
+/// `SplitRelationStrategy`, and `SuppressionRecord`. The
+/// authoritative rationale and the rules for adding new fields
+/// live in `docs/engineering/HAPPENINGS.md` section 3.4 — a
+/// future variant author MUST consult that section before adding
+/// a field whose type is not in the documented `skip` set.
+///
+/// `Happening::PluginEvent` uses
+/// `#[coalesce_labels(flatten)]` on its `payload`
+/// (`serde_json::Value`) field so plugin-defined object keys
+/// become coalesce-eligible labels at runtime.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, evo_coalesce_labels::CoalesceLabels,
+)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Happening {
@@ -330,6 +360,7 @@ pub enum Happening {
         /// Custody type tag from the Assignment.
         custody_type: String,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// A warden relinquished custody. Emitted from `release_custody`
@@ -340,6 +371,7 @@ pub enum Happening {
         /// Handle id of the released custody.
         handle_id: String,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// A warden reported state on an ongoing custody. Emitted by the
@@ -358,8 +390,10 @@ pub enum Happening {
         /// Handle id the report pertains to.
         handle_id: String,
         /// Health declared by the plugin at report time.
+        #[coalesce_labels(skip)]
         health: HealthStatus,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// A custody operation failed under an `abort` failure-mode
@@ -386,6 +420,7 @@ pub enum Happening {
         /// Steward-recorded failure reason.
         reason: String,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// A custody operation failed under a `partial_ok` failure-mode
@@ -410,6 +445,7 @@ pub enum Happening {
         /// Steward-recorded failure reason.
         reason: String,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// A relation assertion exceeded a declared cardinality bound.
@@ -435,12 +471,14 @@ pub enum Happening {
         /// Which side's bound was exceeded.
         side: CardinalityViolationSide,
         /// The declared bound on the violating side.
+        #[coalesce_labels(skip)]
         declared: Cardinality,
         /// The count on that side after the assertion was stored.
         /// For an `AtMostOne` or `ExactlyOne` bound this is 2 or
         /// more; for other bounds the happening does not fire.
         observed_count: usize,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// A subject was forgotten. Emitted by
@@ -466,6 +504,7 @@ pub enum Happening {
         /// can filter without re-querying.
         subject_type: String,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// A relation was forgotten. Emitted by either
@@ -502,8 +541,10 @@ pub enum Happening {
         /// was retraction of this same subject.
         target_id: String,
         /// Why the relation was forgotten.
+        #[coalesce_labels(skip)]
         reason: RelationForgottenReason,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// An admin plugin force-retracted an addressing claimed by
@@ -536,8 +577,10 @@ pub enum Happening {
         /// `ExternalAddressing`).
         value: String,
         /// Operator-supplied reason, if any.
+        #[coalesce_labels(skip)]
         reason: Option<String>,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// An admin plugin force-retracted a relation claim made by
@@ -564,8 +607,10 @@ pub enum Happening {
         /// Canonical ID of the target subject on the relation.
         target_id: String,
         /// Operator-supplied reason, if any.
+        #[coalesce_labels(skip)]
         reason: Option<String>,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// An admin plugin merged two canonical subjects into one.
@@ -594,14 +639,17 @@ pub enum Happening {
         /// Canonical IDs of the source subjects, in operator-
         /// supplied order. Length 2 today; modelled as a `Vec`
         /// for forward compatibility with multi-way merge.
+        #[coalesce_labels(skip)]
         source_ids: Vec<String>,
         /// Canonical ID of the new subject. The two source IDs
         /// no longer resolve directly after this happening
         /// fires; they resolve through alias records.
         new_id: String,
         /// Operator-supplied reason, if any.
+        #[coalesce_labels(skip)]
         reason: Option<String>,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// An admin plugin split one canonical subject into two or
@@ -630,12 +678,103 @@ pub enum Happening {
         source_id: String,
         /// Canonical IDs of the new subjects, in partition order.
         /// Length at least 2.
+        #[coalesce_labels(skip)]
         new_ids: Vec<String>,
         /// Relation-distribution strategy the operator chose.
+        #[coalesce_labels(skip)]
         strategy: SplitRelationStrategy,
         /// Operator-supplied reason, if any.
+        #[coalesce_labels(skip)]
         reason: Option<String>,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// The boot-time grammar diagnostic recorded an orphan
+    /// type — subjects whose `subject_type` is no longer
+    /// declared in the loaded catalogue. Emitted once per
+    /// orphan type per boot. Idempotent on re-boot if
+    /// `(subject_type, count)` is unchanged: the durable-window
+    /// dedupe collapses repeats so a long-standing orphan does
+    /// not flood the audit log on every restart.
+    ///
+    /// Operators handle the orphan via the
+    /// `migrate_grammar_orphans` (re-state to a declared type)
+    /// or `accept_grammar_orphans` (record the deliberate
+    /// decision to leave them un-migrated) verbs.
+    SubjectGrammarOrphan {
+        /// The orphaned subject_type.
+        subject_type: String,
+        /// Row count discovered at this boot.
+        count: u64,
+        /// Wall-clock millisecond timestamp the orphan was
+        /// first observed (preserved across reboots from the
+        /// `pending_grammar_orphans` table).
+        first_observed_at_ms: u64,
+        /// When the happening was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// One subject's `subject_type` migrated through the
+    /// operator-issued `migrate_grammar_orphans` verb. Emitted
+    /// per subject for forensic auditability, durable, with the
+    /// same emission ordering as `SubjectMerged` /
+    /// `SubjectSplit` (BEFORE the relation-graph rewrite).
+    /// Subscribers that only want one event per migration
+    /// declare coalesce labels
+    /// `["variant", "from_type", "to_type", "migration_id"]`
+    /// to collapse to one event per from_type/to_type pair per
+    /// migration via the per-subscriber coalescing surface.
+    SubjectMigrated {
+        /// Canonical ID before migration. Resolves through the
+        /// alias chain after this happening fires.
+        old_id: String,
+        /// Canonical ID minted for the migrated record.
+        new_id: String,
+        /// The pre-migration `subject_type`.
+        from_type: String,
+        /// The post-migration `subject_type`.
+        to_type: String,
+        /// Identifier of the migration call that produced this
+        /// record. Same value across every per-subject
+        /// `SubjectMigrated` emission belonging to one verb call.
+        migration_id: String,
+        /// When the happening was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Per-batch progress event during a
+    /// `migrate_grammar_orphans` call. Emitted at most ~50
+    /// events for a 5,000-subject migration at default batch
+    /// size; subscribers can declare coalesce labels
+    /// `["variant", "migration_id"]` to collapse to latest-only
+    /// via the per-subscriber coalescing surface.
+    GrammarMigrationProgress {
+        /// Identifier of the in-flight migration.
+        migration_id: String,
+        /// The pre-migration `subject_type` driving the call.
+        from_type: String,
+        /// Subjects migrated so far.
+        completed: u64,
+        /// Subjects remaining to migrate.
+        remaining: u64,
+        /// Zero-based batch index just committed.
+        batch_index: u32,
+        /// When the happening was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Operator deliberately accepted the orphans of a type and
+    /// recorded the decision via `accept_grammar_orphans`.
+    /// Suppresses the boot diagnostic warning for the type
+    /// while the row stays `accepted`.
+    GrammarOrphansAccepted {
+        /// The accepted subject_type.
+        subject_type: String,
+        /// Operator-supplied reason for accepting.
+        reason: String,
+        /// When the acceptance was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// An admin plugin suppressed a relation. Emitted by
@@ -663,8 +802,10 @@ pub enum Happening {
         /// relation.
         target_id: String,
         /// Operator-supplied reason, if any.
+        #[coalesce_labels(skip)]
         reason: Option<String>,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// An admin plugin re-suppressed an already-suppressed
@@ -695,11 +836,14 @@ pub enum Happening {
         target_id: String,
         /// The reason carried on the existing suppression record
         /// before the update.
+        #[coalesce_labels(skip)]
         old_reason: Option<String>,
         /// The reason the caller supplied; now stored on the
         /// suppression record.
+        #[coalesce_labels(skip)]
         new_reason: Option<String>,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// An admin plugin unsuppressed a previously-suppressed
@@ -719,6 +863,7 @@ pub enum Happening {
         /// Canonical ID of the target subject on the relation.
         target_id: String,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// A subject split with strategy
@@ -754,8 +899,10 @@ pub enum Happening {
         /// a follow-up retract via
         /// [`RelationAdmin::forced_retract_claim`](evo_plugin_sdk::contract::RelationAdmin::forced_retract_claim)
         /// on the unwanted copies.
+        #[coalesce_labels(skip)]
         candidate_new_ids: Vec<String>,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// A relation edge was rewritten because one of its endpoints
@@ -794,6 +941,7 @@ pub enum Happening {
         /// not change).
         target_id: String,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// A `(subject_id, predicate)` exceeds the catalogue's declared
@@ -831,12 +979,14 @@ pub enum Happening {
         /// many sources point at `subject_id` via this predicate.
         side: CardinalityViolationSide,
         /// The declared bound on the violating side.
+        #[coalesce_labels(skip)]
         declared: Cardinality,
         /// The count on that side after the rewrite settled. For
         /// an `at_most_one` or `exactly_one` bound this is 2 or
         /// more; for other bounds the happening is not emitted.
         observed_count: usize,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// A plugin claim was transferred from a source subject onto
@@ -873,21 +1023,26 @@ pub enum Happening {
         /// Addressing scheme of the reassigned claim. Populated
         /// when `kind` is [`ReassignedClaimKind::Addressing`];
         /// `None` otherwise.
+        #[coalesce_labels(skip)]
         scheme: Option<String>,
         /// Addressing value of the reassigned claim. Populated
         /// when `kind` is [`ReassignedClaimKind::Addressing`];
         /// `None` otherwise.
+        #[coalesce_labels(skip)]
         value: Option<String>,
         /// Predicate of the reassigned relation claim. Populated
         /// when `kind` is [`ReassignedClaimKind::Relation`];
         /// `None` otherwise.
+        #[coalesce_labels(skip)]
         predicate: Option<String>,
         /// Target endpoint of the reassigned relation claim
         /// (canonical ID of the side that did not change).
         /// Populated when `kind` is
         /// [`ReassignedClaimKind::Relation`]; `None` otherwise.
+        #[coalesce_labels(skip)]
         target_id: Option<String>,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// During a merge rewrite, suppression collapse demoted a
@@ -927,8 +1082,10 @@ pub enum Happening {
         /// edge. Carries the original suppressing admin, the
         /// suppression timestamp, and the operator-supplied
         /// reason if any.
+        #[coalesce_labels(skip)]
         surviving_suppression_record: SuppressionRecord,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// An announcement spanned more than one existing canonical
@@ -946,12 +1103,15 @@ pub enum Happening {
         plugin: String,
         /// The announcement's addressings (the ones that spanned
         /// multiple subjects).
+        #[coalesce_labels(skip)]
         addressings: Vec<ExternalAddressing>,
         /// The distinct canonical IDs the announcement touched.
         /// Length at least 2; ordering matches whatever the registry
         /// returned (no canonical sort is imposed).
+        #[coalesce_labels(skip)]
         canonical_ids: Vec<String>,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// A factory plugin announced an instance through its
@@ -983,6 +1143,7 @@ pub enum Happening {
         /// shelf interpret it per the shelf-shape contract.
         payload_bytes: usize,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
     /// A factory plugin retracted an instance it had previously
@@ -1004,6 +1165,564 @@ pub enum Happening {
         /// The factory's `target.shelf` from its manifest.
         shelf: String,
         /// When the happening was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// The catalogue load took a resilience fallback during boot.
+    ///
+    /// Emitted exactly once per boot, before any plugin admission,
+    /// when the steady-state catalogue path failed to parse or
+    /// validate and the loader fell back to the steward-managed
+    /// last-known-good shadow or the binary-baked built-in
+    /// skeleton. Operators and consumers subscribing through the
+    /// wire socket observe this signal as the structured indicator
+    /// of a degraded boot. The same source is also surfaced on the
+    /// `op = "describe_capabilities"` response's `catalogue_source`
+    /// field so consumers can detect a degraded boot without
+    /// subscribing to the full happenings stream.
+    CatalogueFallback {
+        /// Which tier of the resilience chain produced the
+        /// catalogue. One of `"lkg"` or `"builtin"` — the
+        /// `Configured` tier is the steady-state path and does not
+        /// emit this happening.
+        source: String,
+        /// Human-readable reason naming the failure(s) that
+        /// triggered the fall-through. Includes the configured
+        /// tier's failure and (when fell through to builtin) the
+        /// LKG tier's failure.
+        reason: String,
+        /// When the happening was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// The framework's wall-clock trust state transitioned.
+    ///
+    /// Emitted by the time-trust tracker on every observed change
+    /// in the trust state. Plugins requiring synced time subscribe
+    /// to this stream to learn when their gating condition is met
+    /// (or lost). Consumer surfaces render the new state to
+    /// operators (e.g., a "clock not yet trusted" indicator).
+    ClockTrustChanged {
+        /// Wire-form of the previous trust state. One of
+        /// `"untrusted"`, `"trusted"`, `"stale"`, `"adjusting"`.
+        from: String,
+        /// Wire-form of the new trust state.
+        to: String,
+        /// When the transition was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// The wall-clock was adjusted by a detectable step.
+    ///
+    /// Emitted when the time-trust tracker detects a wall-clock
+    /// jump (NTP step) larger than the scheduler-jitter floor.
+    /// Consumers maintaining their own time-pegged schedules
+    /// (alarm-clock plugins, calendar bridges, transport timers)
+    /// re-evaluate their pending work after observing this signal.
+    /// Framework-managed schedules (appointments, watches) are
+    /// re-evaluated by the framework itself.
+    ClockAdjusted {
+        /// Signed delta in seconds: positive when the clock
+        /// stepped forward, negative when it stepped backward.
+        delta_seconds: i64,
+        /// When the adjustment was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Manifest-drift detected at admission.
+    ///
+    /// Emitted when the framework's admission-time check observes
+    /// a mismatch between the plugin's manifest declarations and
+    /// its runtime `describe()` response. In the strict-window of
+    /// the version-skew policy this is paired with admission
+    /// refusal; in the warn-band the plugin is admitted anyway
+    /// and the happening alerts operators to the stale plugin.
+    /// Either side of the mismatch (manifest declares a verb the
+    /// implementation lacks; implementation provides a verb the
+    /// manifest does not declare) is captured here.
+    PluginManifestDrift {
+        /// Canonical name of the plugin whose manifest drifted.
+        plugin: String,
+        /// Verb names declared in the manifest but absent from
+        /// the plugin's runtime `describe()`.
+        #[coalesce_labels(skip)]
+        missing_in_implementation: Vec<String>,
+        /// Verb names reported by the plugin's runtime
+        /// `describe()` but absent from the manifest.
+        #[coalesce_labels(skip)]
+        missing_in_manifest: Vec<String>,
+        /// `true` when the plugin was nonetheless admitted (warn-
+        /// band of the skew policy); `false` when the plugin was
+        /// refused (strict-window).
+        admitted: bool,
+        /// When the mismatch was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Plugin admitted under the warn-band of the version-skew
+    /// policy.
+    ///
+    /// Emitted exactly once per warn-band admission. Plugins
+    /// declaring `prerequisites.evo_min_version` two minor
+    /// versions behind the running framework are admitted (rather
+    /// than refused outright as out-of-window plugins are) but
+    /// flagged so operators can plan refresh; mandatory
+    /// new-feature drift is downgraded from refusal to warning
+    /// for these plugins. Plugins three or more minor versions
+    /// behind are refused before this happening can fire.
+    PluginVersionSkewWarning {
+        /// Canonical name of the plugin admitted in warn-band.
+        plugin: String,
+        /// The plugin's declared `prerequisites.evo_min_version`.
+        evo_min_version: String,
+        /// Difference in minor-version count between the
+        /// framework and the plugin's required minimum (positive;
+        /// 2 in the warn-band by definition).
+        skew_minor_versions: u32,
+        /// When the warn-band admission was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Live hot-reload of a plugin has begun.
+    ///
+    /// Emitted when the framework starts a Live reload of a
+    /// plugin whose manifest declares `lifecycle.hot_reload =
+    /// "live"`. The framework calls `prepare_for_live_reload`
+    /// on the running plugin, unloads it, then re-instantiates
+    /// it with the carried `StateBlob`. Pairs with exactly one
+    /// of `PluginLiveReloadCompleted` or `PluginLiveReloadFailed`
+    /// for the same `plugin` + `to_version`.
+    PluginLiveReloadStarted {
+        /// Canonical name of the plugin being reloaded.
+        plugin: String,
+        /// Manifest version of the plugin before reload.
+        from_version: String,
+        /// Manifest version of the bundle being loaded.
+        to_version: String,
+        /// When the reload began.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Live hot-reload of a plugin completed successfully.
+    ///
+    /// Emitted after `load_with_state` returns Ok. The plugin
+    /// is now serving requests on the new code with the carried
+    /// state. `state_blob_bytes` is `0` when the previous
+    /// instance returned `None` from `prepare_for_live_reload`.
+    PluginLiveReloadCompleted {
+        /// Canonical name of the plugin reloaded.
+        plugin: String,
+        /// Manifest version of the plugin before reload.
+        from_version: String,
+        /// Manifest version of the freshly loaded plugin.
+        to_version: String,
+        /// Size of the carried `StateBlob.payload` in bytes.
+        /// `0` when no state was carried.
+        state_blob_bytes: u64,
+        /// When the reload completed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Reconciliation pair completed a successful compose +
+    /// apply cycle.
+    ///
+    /// Emitted on every successful apply by the steward's
+    /// per-pair reconciliation loop. Carries the warden-emitted
+    /// post-hardware truth as `applied_state`; the per-pair
+    /// payload schema is the pair's design-ADR contract — the
+    /// framework treats the body as opaque. Consumers reconciling
+    /// state via `subscribe_happenings.since` see every successful
+    /// apply in order.
+    ReconciliationApplied {
+        /// Operator-visible pair identifier (catalogue's
+        /// `[[reconciliation_pairs]] id`).
+        pair: String,
+        /// Monotonic per-pair generation counter incremented on
+        /// every successful apply.
+        generation: u64,
+        /// Warden-emitted opaque payload describing the
+        /// post-apply truth.
+        #[coalesce_labels(skip)]
+        applied_state: serde_json::Value,
+        /// When the apply completed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Reconciliation pair failed compose or apply.
+    ///
+    /// Emitted when the composer respondent's `compose` call
+    /// errors, when the warden's `course_correct` errors, or
+    /// when either exceeds its declared budget. The framework
+    /// re-issues the last-known-good to the warden as the
+    /// rollback step; failed rollback degrades the pair
+    /// (operator triages).
+    ReconciliationFailed {
+        /// Operator-visible pair identifier.
+        pair: String,
+        /// Generation of the apply attempt that failed.
+        generation: u64,
+        /// Wire-error class taxonomy name (snake_case).
+        error_class: String,
+        /// Operator-readable failure reason.
+        error_message: String,
+        /// When the failure was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Discovery skipped a plugin at boot.
+    ///
+    /// Emitted when the steward's discovery pass finds a plugin
+    /// the operator has explicitly disabled (the plugin's row in
+    /// the `installed_plugins` table carries `enabled = false`).
+    /// The plugin is not admitted; the structured signal lets
+    /// frontends render the disabled set without polling the
+    /// table directly.
+    PluginAdmissionSkipped {
+        /// Canonical name of the plugin that was skipped.
+        plugin: String,
+        /// Operator-readable reason. Today the only reason is
+        /// `operator_disabled`; future skip paths (e.g.
+        /// admission-time refusal that survives across boots)
+        /// can extend the vocabulary.
+        reason: String,
+        /// When the skip was decided.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Catalogue declarations reloaded.
+    ///
+    /// Emitted on a successful operator-issued `reload_catalogue`.
+    /// The framework's loaded catalogue is now the new declaration
+    /// set; admission paths see the updated rack / shelf vocabulary
+    /// on their next call. Plugin re-admission against the new
+    /// catalogue is not yet automatic; operators issue
+    /// reload_plugin against affected plugins to rebind them to the
+    /// updated declarations.
+    CatalogueReloaded {
+        /// Catalogue schema version before the reload.
+        from_schema_version: u32,
+        /// Catalogue schema version after the reload.
+        to_schema_version: u32,
+        /// Number of racks in the reloaded catalogue.
+        rack_count: u32,
+        /// When the reload completed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Catalogue reload was refused at validation.
+    ///
+    /// Emitted when an operator-issued `reload_catalogue` fails at
+    /// parse, schema, or shelf-occupancy checks. The framework's
+    /// loaded catalogue stays unchanged; plugins continue to be
+    /// admitted against the previous declarations.
+    CatalogueInvalid {
+        /// Stage at which validation refused. One of `parse`,
+        /// `schema`, `shelf_in_use`.
+        stage: String,
+        /// Operator-readable reason describing the failure.
+        reason: String,
+        /// When the refusal was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Cardinality conflict observed during a catalogue reload.
+    ///
+    /// Emitted for each shelf where the new catalogue's cardinality
+    /// declaration conflicts with an admitted plugin's declared
+    /// shape (the running plugin's manifest declares a shape the
+    /// new catalogue's shelf no longer accepts). The reload either
+    /// refuses (default) or proceeds (under
+    /// `allow_cardinality_divergence`), per the operator's choice;
+    /// this happening is the per-shelf record of the conflict.
+    CardinalityViolation {
+        /// Fully-qualified shelf name where the conflict was
+        /// observed.
+        shelf: String,
+        /// Operator-readable reason describing the conflict.
+        reason: String,
+        /// When the conflict was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Plugin manifest declarations reloaded.
+    ///
+    /// Emitted on a successful operator-issued reload of a plugin's
+    /// manifest. Carries the manifest version before and after the
+    /// swap so consumers can correlate the declarations in effect
+    /// at any point in time. The plugin instance keeps its handle,
+    /// custodies, and any in-flight session through the swap; only
+    /// the declarative surface (capabilities, course-correct verbs,
+    /// lifecycle policy) changes.
+    PluginManifestReloaded {
+        /// Canonical name of the plugin whose manifest was reloaded.
+        plugin: String,
+        /// Manifest version before the reload.
+        from_manifest_version: String,
+        /// Manifest version after the reload.
+        to_manifest_version: String,
+        /// When the reload completed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Plugin manifest reload was refused at validation.
+    ///
+    /// Emitted when an operator-issued manifest reload fails at
+    /// parse, schema, identity, transport, or drift checks. The
+    /// framework's loaded manifest stays unchanged; the plugin
+    /// keeps serving against its previous declarations. `stage`
+    /// names which validation step refused; `reason` carries the
+    /// operator-readable diagnostic.
+    PluginManifestInvalid {
+        /// Canonical name of the plugin whose manifest reload was
+        /// refused.
+        plugin: String,
+        /// Stage at which validation refused. One of `parse`,
+        /// `schema`, `identity`, `transport`, `drift`.
+        stage: String,
+        /// Operator-readable reason describing the failure.
+        reason: String,
+        /// When the refusal was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Live hot-reload of a plugin failed.
+    ///
+    /// Emitted when any stage of the Live-reload sequence fails.
+    /// `rolled_back = true` indicates the previous plugin instance
+    /// is still serving requests (failure happened during
+    /// `prepare_for_live_reload`, before unload). `rolled_back =
+    /// false` indicates the previous instance was unloaded and
+    /// the fresh load failed; the plugin is no longer admitted
+    /// and operators must re-install or fall back to Restart
+    /// reload.
+    PluginLiveReloadFailed {
+        /// Canonical name of the plugin whose reload failed.
+        plugin: String,
+        /// Manifest version of the plugin before reload.
+        from_version: String,
+        /// Manifest version of the bundle that was being loaded.
+        to_version: String,
+        /// Stage at which the reload failed. One of `prepare`,
+        /// `unload`, or `load_with_state`. The framework's
+        /// rollback policy is determined by stage.
+        stage: String,
+        /// Operator-readable reason describing the failure. The
+        /// framework's structured error retains the precise wire
+        /// classification; this string is for happenings
+        /// visibility.
+        reason: String,
+        /// `true` if the previous plugin instance is still
+        /// serving requests (failure happened before unload).
+        /// `false` if the plugin is no longer admitted.
+        rolled_back: bool,
+        /// When the failure was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Pre-fire approach for an upcoming appointment. Emitted
+    /// `pre_fire_ms` before the scheduled fire when the
+    /// appointment declared a non-zero `pre_fire_ms`. Lets
+    /// plugins pre-warm (light up the screen, prefetch
+    /// network resources) before the action.
+    AppointmentApproaching {
+        /// Per-creator namespace identifier (plugin name or
+        /// consumer claimant token).
+        creator: String,
+        /// Caller-chosen appointment id.
+        appointment_id: String,
+        /// Wall-clock millisecond timestamp the fire is
+        /// scheduled for.
+        scheduled_for_ms: u64,
+        /// Lead time in milliseconds.
+        fires_in_ms: u32,
+        /// When the approaching event was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// An appointment fired and the framework dispatched its
+    /// configured action. The dispatch outcome (success or
+    /// the structured wire-error class) rides in
+    /// `dispatch_outcome` so consumers can audit.
+    AppointmentFired {
+        /// Per-creator namespace identifier.
+        creator: String,
+        /// Caller-chosen appointment id.
+        appointment_id: String,
+        /// Wall-clock millisecond timestamp the fire occurred.
+        fired_at_ms: u64,
+        /// Dispatch outcome string. `"ok"` on success;
+        /// otherwise the structured wire-error class plus
+        /// optional subclass (e.g. `"not_found"`,
+        /// `"unavailable/shutting_down"`).
+        dispatch_outcome: String,
+        /// When the happening was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// An appointment was missed (its scheduled fire instant
+    /// passed without dispatching, per its `miss_policy`).
+    AppointmentMissed {
+        /// Per-creator namespace identifier.
+        creator: String,
+        /// Caller-chosen appointment id.
+        appointment_id: String,
+        /// Wall-clock millisecond timestamp the fire was
+        /// scheduled for.
+        scheduled_for_ms: u64,
+        /// Reason for the miss (e.g. `"drop_policy"`,
+        /// `"untrusted_time"`, `"grace_window_exceeded"`).
+        reason: String,
+        /// When the miss was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// An appointment was cancelled. Either the issuer
+    /// (plugin or consumer) cancelled, or an admin cancelled
+    /// on its behalf via the wire op.
+    AppointmentCancelled {
+        /// Per-creator namespace identifier.
+        creator: String,
+        /// Caller-chosen appointment id.
+        appointment_id: String,
+        /// Token attributing the cancellation.
+        cancelled_by: String,
+        /// When the cancellation was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A watch's condition matched and the framework dispatched
+    /// its configured action. The dispatch outcome rides in
+    /// `dispatch_outcome` so consumers can audit. Sibling to
+    /// [`Self::AppointmentFired`] for the condition-driven path.
+    WatchFired {
+        /// Per-creator namespace identifier.
+        creator: String,
+        /// Caller-chosen watch id.
+        watch_id: String,
+        /// Wall-clock millisecond timestamp the fire occurred.
+        fired_at_ms: u64,
+        /// Dispatch outcome string. `"ok"` on success; otherwise
+        /// the structured wire-error class.
+        dispatch_outcome: String,
+        /// When the happening was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A watch's match was suppressed (e.g. fired during
+    /// `Untrusted` time-trust for a duration-bearing condition,
+    /// or the runtime's evaluation throttle was active).
+    WatchMissed {
+        /// Per-creator namespace identifier.
+        creator: String,
+        /// Caller-chosen watch id.
+        watch_id: String,
+        /// Wall-clock millisecond timestamp the suppression
+        /// occurred.
+        suppressed_at_ms: u64,
+        /// Reason for the miss (e.g. `"untrusted_time"`,
+        /// `"evaluation_throttled"`, `"in_cooldown"`).
+        reason: String,
+        /// When the miss was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A watch was cancelled. Either the issuer (plugin or
+    /// consumer) cancelled, or an admin cancelled on its
+    /// behalf via the wire op.
+    WatchCancelled {
+        /// Per-creator namespace identifier.
+        creator: String,
+        /// Caller-chosen watch id.
+        watch_id: String,
+        /// Token attributing the cancellation.
+        cancelled_by: String,
+        /// When the cancellation was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// The watch evaluator throttled per-watch evaluations
+    /// because the bus event rate exceeded the configured
+    /// `max_state_evaluations_per_second` cap. Emitted at most
+    /// once per second per watch under throttle so operators
+    /// see a runaway sensor without flooding the log.
+    WatchEvaluationThrottled {
+        /// Per-creator namespace identifier.
+        creator: String,
+        /// Caller-chosen watch id.
+        watch_id: String,
+        /// Number of evaluations dropped during the throttle
+        /// window.
+        dropped: u64,
+        /// When the throttle window closed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Flight-mode state changed for a hardware connectivity
+    /// class. Emitted by the device plugin that owns the
+    /// underlying hardware switch (Bluetooth, WiFi, cellular,
+    /// etc.); subscribers (consuming plugins, frontends, audit
+    /// log collectors) react to the signal per the framework-
+    /// wide no-panic invariant: graceful dependency loss when
+    /// `on = true`, attempted resume when `on = false`. The
+    /// `rack_class` value is the fully-qualified shelf name
+    /// (`<rack>.<shelf>`, e.g.
+    /// `flight_mode.wireless.bluetooth`); the framework imposes
+    /// no class-name taxonomy, leaving distributions free to
+    /// choose their own.
+    ///
+    /// Emitted via `emit_durable` so the signal survives
+    /// restart and a subscribing consumer that connects late
+    /// can learn the at-boot state via happenings replay
+    /// without polling.
+    FlightModeChanged {
+        /// Fully-qualified shelf name (`<rack>.<shelf>`),
+        /// e.g. `flight_mode.wireless.bluetooth`. Distribution-
+        /// chosen taxonomy; the framework treats this as an
+        /// opaque string.
+        rack_class: String,
+        /// `true` when flight mode is active (the radio is
+        /// off); `false` when it is cleared (radio on). The
+        /// device plugin emits the initial state on `load` so
+        /// late-joining subscribers learn it from replay.
+        on: bool,
+        /// When the state transition was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Generic plugin-emit envelope for structured events the
+    /// framework's enum does not enumerate.
+    ///
+    /// A plugin emits through this variant when it has a
+    /// plugin-defined event whose semantics are not part of the
+    /// framework's vocabulary — sensor readings, hardware
+    /// state-change signals, vendor-specific lifecycle events.
+    /// The framework knows nothing about the payload's content;
+    /// the payload is the plugin's vocabulary.
+    ///
+    /// The `payload` field carries `#[coalesce_labels(flatten)]`,
+    /// so subscribers can declare coalesce label lists that
+    /// include payload object keys (e.g., `sensor_id`,
+    /// `event_subtype`). The static label set advertised on
+    /// `op = "describe_capabilities"` enumerates only the
+    /// compile-time-known labels (`variant`, `plugin`,
+    /// `event_type`); plugin-author documentation describes the
+    /// runtime payload schema per `event_type`.
+    PluginEvent {
+        /// Canonical name of the plugin emitting the event. The
+        /// framework's claimant-token mapping translates this to
+        /// the wire form on emission.
+        plugin: String,
+        /// Plugin-defined event type discriminator. Stable per
+        /// plugin; changes to the event_type vocabulary are a
+        /// breaking change for the plugin's consumers.
+        event_type: String,
+        /// Plugin-defined opaque payload. Object-shaped payloads
+        /// have their top-level keys flattened into coalesce
+        /// labels via the derive macro.
+        #[coalesce_labels(flatten)]
+        payload: serde_json::Value,
+        /// When the happening was recorded.
+        #[coalesce_labels(skip)]
         at: SystemTime,
     },
 }
@@ -1524,6 +2243,84 @@ impl Happening {
             | Happening::FactoryInstanceRetracted { plugin, .. } => {
                 Some(plugin.as_str())
             }
+            // Catalogue-fallback events are framework-level; no
+            // plugin actor is involved.
+            Happening::CatalogueFallback { .. } => None,
+            // Clock-trust events are framework-level; no plugin
+            // actor is involved.
+            Happening::ClockTrustChanged { .. }
+            | Happening::ClockAdjusted { .. } => None,
+            // Flight-mode signal is emitted by the device plugin
+            // owning the hardware switch, but the
+            // `plugin` field is not on the variant (the
+            // distribution-chosen `rack_class` identifies the
+            // hardware class, not the emitter). Consumers
+            // filtering by plugin do not match this variant.
+            Happening::FlightModeChanged { .. } => None,
+            // Appointment events carry a `creator` identifier
+            // (plugin canonical name or consumer claimant
+            // token); the ledger's per-creator namespacing
+            // does not map cleanly to the `primary_plugin`
+            // contract because consumer-created appointments
+            // do not have a plugin. Subscribers filtering by
+            // plugin do not match these variants directly;
+            // they branch on `creator` instead.
+            Happening::AppointmentApproaching { .. }
+            | Happening::AppointmentFired { .. }
+            | Happening::AppointmentMissed { .. }
+            | Happening::AppointmentCancelled { .. } => None,
+            // Watch happenings: same posture as appointments —
+            // creator is plugin name OR consumer claimant token,
+            // so primary_plugin returns None.
+            Happening::WatchFired { .. }
+            | Happening::WatchMissed { .. }
+            | Happening::WatchCancelled { .. }
+            | Happening::WatchEvaluationThrottled { .. } => None,
+            // Grammar-orphan / migration happenings: actor is
+            // either the boot diagnostic (no plugin) or an
+            // operator (no plugin); subscribers branch on
+            // subject_type / from_type / to_type rather than
+            // primary_plugin.
+            Happening::SubjectGrammarOrphan { .. }
+            | Happening::SubjectMigrated { .. }
+            | Happening::GrammarMigrationProgress { .. }
+            | Happening::GrammarOrphansAccepted { .. } => None,
+            // Generic plugin-emit envelope: the plugin field is
+            // exactly the actor.
+            Happening::PluginEvent { plugin, .. } => Some(plugin.as_str()),
+            // Drift / skew warnings name the affected plugin so
+            // consumers filtering by plugin see them.
+            Happening::PluginManifestDrift { plugin, .. }
+            | Happening::PluginVersionSkewWarning { plugin, .. } => {
+                Some(plugin.as_str())
+            }
+            // Live-reload lifecycle events name the plugin under
+            // reload.
+            Happening::PluginLiveReloadStarted { plugin, .. }
+            | Happening::PluginLiveReloadCompleted { plugin, .. }
+            | Happening::PluginLiveReloadFailed { plugin, .. } => {
+                Some(plugin.as_str())
+            }
+            // Manifest-reload events name the plugin whose
+            // declarations were swapped or refused.
+            Happening::PluginManifestReloaded { plugin, .. }
+            | Happening::PluginManifestInvalid { plugin, .. } => {
+                Some(plugin.as_str())
+            }
+            // Catalogue-reload events are framework-level; no
+            // plugin actor is involved.
+            Happening::CatalogueReloaded { .. }
+            | Happening::CatalogueInvalid { .. }
+            | Happening::CardinalityViolation { .. } => None,
+            // Boot-time skip names the plugin the operator
+            // disabled.
+            Happening::PluginAdmissionSkipped { plugin, .. } => {
+                Some(plugin.as_str())
+            }
+            // Reconciliation events are pair-keyed, not plugin-
+            // keyed; no plugin actor.
+            Happening::ReconciliationApplied { .. }
+            | Happening::ReconciliationFailed { .. } => None,
         }
     }
 
@@ -1599,15 +2396,14 @@ impl Happening {
                 source_id == canonical_id
                     || new_ids.iter().any(|s| s == canonical_id)
             }
-            Happening::SubjectConflictDetected {
-                canonical_ids, ..
-            } => canonical_ids.iter().any(|id| id == canonical_id),
+            Happening::SubjectConflictDetected { canonical_ids, .. } => {
+                canonical_ids.iter().any(|id| id == canonical_id)
+            }
             Happening::FactoryInstanceAnnounced {
                 canonical_id: id, ..
             }
             | Happening::FactoryInstanceRetracted {
-                canonical_id: id,
-                ..
+                canonical_id: id, ..
             } => id == canonical_id,
 
             // Relation events whose `source_id` and `target_id`
@@ -1714,6 +2510,84 @@ impl Happening {
             | Happening::CustodyStateReported { .. }
             | Happening::CustodyAborted { .. }
             | Happening::CustodyDegraded { .. } => false,
+            // Catalogue-fallback is a framework-level boot event;
+            // it does not affect any subject's projection.
+            Happening::CatalogueFallback { .. } => false,
+            // Clock-trust events are framework-level; they do not
+            // affect any subject's projection.
+            Happening::ClockTrustChanged { .. }
+            | Happening::ClockAdjusted { .. } => false,
+            // Flight-mode is a framework-level signal, not
+            // subject-keyed. Subscribing consumers branch on
+            // `rack_class`.
+            Happening::FlightModeChanged { .. } => false,
+            // Appointment events project onto the appointment
+            // subject's lifecycle but the framework does not
+            // mark them as subject-keyed for the
+            // `affects_subject` predicate; consumers who want
+            // to follow a specific appointment use
+            // `subscribe_subject` against the synthetic
+            // `evo-appointment` addressing directly.
+            Happening::AppointmentApproaching { .. }
+            | Happening::AppointmentFired { .. }
+            | Happening::AppointmentMissed { .. }
+            | Happening::AppointmentCancelled { .. } => false,
+            // Watch lifecycle events do not directly affect a
+            // single subject either; the addressed subject is
+            // synthesised under the evo-watch scheme but
+            // consumers filter by creator + watch_id rather than
+            // canonical_id.
+            Happening::WatchFired { .. }
+            | Happening::WatchMissed { .. }
+            | Happening::WatchCancelled { .. }
+            | Happening::WatchEvaluationThrottled { .. } => false,
+            // SubjectMigrated affects two subjects: the old id
+            // (now an alias) and the new id (now the live row).
+            // Subscribers querying for either should see the
+            // event so the alias chain resolution is observable.
+            Happening::SubjectMigrated { old_id, new_id, .. } => {
+                old_id == canonical_id || new_id == canonical_id
+            }
+            // The orphan / progress / acceptance variants are
+            // type-keyed, not subject-keyed.
+            Happening::SubjectGrammarOrphan { .. }
+            | Happening::GrammarMigrationProgress { .. }
+            | Happening::GrammarOrphansAccepted { .. } => false,
+            // Generic plugin events are not subject-keyed; the
+            // payload may carry subject references but the
+            // framework does not interpret them.
+            Happening::PluginEvent { .. } => false,
+            // Drift / skew warnings are framework-level
+            // diagnostics; they do not affect any subject's
+            // projection.
+            Happening::PluginManifestDrift { .. }
+            | Happening::PluginVersionSkewWarning { .. } => false,
+            // Live-reload lifecycle events are framework-level
+            // diagnostics; the plugin's own happenings carry
+            // any subject-projection effects.
+            Happening::PluginLiveReloadStarted { .. }
+            | Happening::PluginLiveReloadCompleted { .. }
+            | Happening::PluginLiveReloadFailed { .. } => false,
+            // Manifest reload events are framework-level
+            // diagnostics; declarations changing does not affect
+            // any subject's projection.
+            Happening::PluginManifestReloaded { .. }
+            | Happening::PluginManifestInvalid { .. } => false,
+            // Catalogue reload events are framework-level; the
+            // catalogue's vocabulary changes do not retroactively
+            // affect any subject's projection.
+            Happening::CatalogueReloaded { .. }
+            | Happening::CatalogueInvalid { .. }
+            | Happening::CardinalityViolation { .. } => false,
+            // Boot-time skip is a framework-level diagnostic;
+            // not admitting a plugin doesn't affect any
+            // subject's projection.
+            Happening::PluginAdmissionSkipped { .. } => false,
+            // Reconciliation events are pair-scoped pipeline
+            // transitions; subjects projection effects ride the
+            // warden's separate per-subject events.
+            Happening::ReconciliationApplied { .. }
+            | Happening::ReconciliationFailed { .. } => false,
         }
     }
 }
@@ -1827,6 +2701,46 @@ fn happening_kind_str(h: &Happening) -> &'static str {
         Happening::FactoryInstanceRetracted { .. } => {
             "factory_instance_retracted"
         }
+        Happening::CatalogueFallback { .. } => "catalogue_fallback",
+        Happening::ClockTrustChanged { .. } => "clock_trust_changed",
+        Happening::ClockAdjusted { .. } => "clock_adjusted",
+        Happening::FlightModeChanged { .. } => "flight_mode_changed",
+        Happening::AppointmentApproaching { .. } => "appointment_approaching",
+        Happening::AppointmentFired { .. } => "appointment_fired",
+        Happening::AppointmentMissed { .. } => "appointment_missed",
+        Happening::AppointmentCancelled { .. } => "appointment_cancelled",
+        Happening::WatchFired { .. } => "watch_fired",
+        Happening::WatchMissed { .. } => "watch_missed",
+        Happening::WatchCancelled { .. } => "watch_cancelled",
+        Happening::WatchEvaluationThrottled { .. } => {
+            "watch_evaluation_throttled"
+        }
+        Happening::SubjectGrammarOrphan { .. } => "subject_grammar_orphan",
+        Happening::SubjectMigrated { .. } => "subject_migrated",
+        Happening::GrammarMigrationProgress { .. } => {
+            "grammar_migration_progress"
+        }
+        Happening::GrammarOrphansAccepted { .. } => "grammar_orphans_accepted",
+        Happening::PluginEvent { .. } => "plugin_event",
+        Happening::PluginManifestDrift { .. } => "plugin_manifest_drift",
+        Happening::PluginVersionSkewWarning { .. } => {
+            "plugin_version_skew_warning"
+        }
+        Happening::PluginLiveReloadStarted { .. } => {
+            "plugin_live_reload_started"
+        }
+        Happening::PluginLiveReloadCompleted { .. } => {
+            "plugin_live_reload_completed"
+        }
+        Happening::PluginLiveReloadFailed { .. } => "plugin_live_reload_failed",
+        Happening::PluginManifestReloaded { .. } => "plugin_manifest_reloaded",
+        Happening::PluginManifestInvalid { .. } => "plugin_manifest_invalid",
+        Happening::CatalogueReloaded { .. } => "catalogue_reloaded",
+        Happening::CatalogueInvalid { .. } => "catalogue_invalid",
+        Happening::CardinalityViolation { .. } => "cardinality_violation",
+        Happening::PluginAdmissionSkipped { .. } => "plugin_admission_skipped",
+        Happening::ReconciliationApplied { .. } => "reconciliation_applied",
+        Happening::ReconciliationFailed { .. } => "reconciliation_failed",
     }
 }
 
@@ -2788,5 +3702,55 @@ mod tests {
         // The "replay window exceeded" gate at the server surface is
         // `oldest > 0 && cursor < oldest`. Pin both halves here.
         assert!(0 < oldest, "cursor=0 < oldest={oldest} fires the gate");
+    }
+
+    // ---------------------------------------------------------------
+    // FlightModeChanged tests. Pin the variant's classification
+    // shape (no primary_plugin, not subject-keyed, distinct
+    // variant_name).
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn flight_mode_changed_has_no_primary_plugin() {
+        // The framework imposes no per-plugin attribution on
+        // flight-mode signals: the rack_class identifies the
+        // hardware class, the emitting device plugin is
+        // observable separately via subject projection. Pin
+        // the predicate result here so a future refactor that
+        // adds a plugin field surfaces the question.
+        let h = Happening::FlightModeChanged {
+            rack_class: "flight_mode.wireless.bluetooth".into(),
+            on: true,
+            at: SystemTime::now(),
+        };
+        assert_eq!(h.primary_plugin(), None);
+    }
+
+    #[test]
+    fn flight_mode_changed_is_not_subject_keyed() {
+        // Flight-mode is a framework-level signal, not a
+        // subject-projection event. Subscribers branch on
+        // rack_class; the consumer-side `subscribe_subject`
+        // path is not the right surface for this variant.
+        // `affects_subject` requires a candidate id; pass an
+        // arbitrary one — the predicate must return false for
+        // every candidate.
+        let h = Happening::FlightModeChanged {
+            rack_class: "flight_mode.wireless.wifi".into(),
+            on: false,
+            at: SystemTime::now(),
+        };
+        assert!(!h.affects_subject("any-canonical-id"));
+        assert!(!h.affects_subject(""));
+    }
+
+    #[test]
+    fn flight_mode_changed_variant_name() {
+        let h = Happening::FlightModeChanged {
+            rack_class: "flight_mode.wireless.cellular".into(),
+            on: true,
+            at: SystemTime::now(),
+        };
+        assert_eq!(happening_kind_str(&h), "flight_mode_changed");
     }
 }

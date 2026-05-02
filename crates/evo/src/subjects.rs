@@ -1,9 +1,10 @@
 //! The subject registry.
 //!
 //! Implements the contract specified in `docs/engineering/SUBJECTS.md`.
-//! The v0 skeleton registry is in-memory only; persistence to
-//! `/var/lib/evo/state/evo.db` per `docs/engineering/PERSISTENCE.md` is
-//! deferred to a follow-up pass.
+//! The registry is in-memory; the subjects + addressings + aliases
+//! tables at `/var/lib/evo/state/evo.db` provide the durable mirror,
+//! with write-through and boot rehydration handled through the
+//! persistence trait.
 //!
 //! ## What's in
 //!
@@ -573,6 +574,9 @@ impl SubjectRegistry {
                 AliasKind::Merged => report.merged_aliases_loaded += 1,
                 AliasKind::Split => report.split_aliases_loaded += 1,
                 AliasKind::Tombstone => report.tombstone_aliases_loaded += 1,
+                AliasKind::TypeMigrated => {
+                    report.type_migrated_aliases_loaded += 1
+                }
             }
         }
         Ok(report)
@@ -1568,6 +1572,9 @@ pub struct RehydrateReport {
     /// `AliasKind::Tombstone` records reassembled (one record
     /// per forgotten id, with empty `new_ids`).
     pub tombstone_aliases_loaded: usize,
+    /// `AliasKind::TypeMigrated` records reassembled (one
+    /// record per migrated id, with `new_ids` length 1).
+    pub type_migrated_aliases_loaded: usize,
 }
 
 fn claim_to_kind_and_reason(

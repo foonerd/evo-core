@@ -726,6 +726,85 @@ OOP factories currently default to `RetractionPolicy::Dynamic` regardless of wha
 
 `crates/evo-example-factory` ships a minimal factory respondent: announces three instances (`instance-a`, `instance-b`, `instance-c`) at load time, declares `RetractionPolicy::StartupOnly`, and answers any `echo` request by mirroring the payload back. The crate produces both an in-process library and an OOP wire bin (`factory-wire`); copy its shape for new factory plugins.
 
+## 6c. Optional Capability Callbacks
+
+The framework offers four additional opt-in callbacks on `LoadContext`. Each is gated by a manifest capability flag and populated as `Some(...)` only when the plugin's manifest declares it. Plugins that do not declare a capability see `None` and the corresponding feature is unreachable through the SDK surface.
+
+| Manifest flag | `LoadContext` field | Trait | Use when |
+|---|---|---|---|
+| `capabilities.fast_path = true` | `fast_path_dispatcher` | `FastPathDispatcher` | The plugin originates real-time mutations against another warden (hardware-input plugins: IR, Bluetooth, keyboard, touch). |
+| `capabilities.appointments = true` | `appointments` | `AppointmentScheduler` | The plugin schedules time-driven instructions (recurring jobs, one-shot reminders, daily / weekly / monthly cycles). |
+| `capabilities.watches = true` | `watches` | `WatchScheduler` | The plugin schedules condition-driven instructions (fire when a hardware event happens, when a subject's state matches a predicate). |
+| (always populated) | `user_interaction_requester` | `UserInteractionRequester` | The plugin needs to ask the human operator a question at runtime (re-auth, ambiguous match, destructive confirmation). The trait is always populated; the round-trip refuses with `responder_not_assigned` when no consumer holds the responder capability. |
+
+`PLUGIN_CONTRACT.md` §5.3–5.6 carries the per-trait shape; the engineering-layer `FAST_PATH.md` covers the Fast Path channel in depth.
+
+### 6c.1 Reaching for an appointment
+
+```rust
+use evo_plugin_sdk::contract::{
+    AppointmentSpec, AppointmentAction, AppointmentRecurrence,
+    AppointmentTimeZone,
+};
+
+let spec = AppointmentSpec {
+    appointment_id: "nightly-rescan".into(),
+    time: Some("03:30".into()),
+    zone: AppointmentTimeZone::Local,
+    recurrence: AppointmentRecurrence::Daily,
+    end_time_ms: None,
+    max_fires: None,
+    except: vec![],
+    miss_policy: Default::default(),
+    pre_fire_ms: None,
+    must_wake_device: false,
+    wake_pre_arm_ms: None,
+};
+let action = AppointmentAction {
+    target_shelf: "library.scanner".into(),
+    request_type: "rescan_full".into(),
+    payload: serde_json::json!({}),
+};
+ctx.appointments
+    .as_ref()
+    .expect("capabilities.appointments must be true")
+    .create_appointment(spec, action)
+    .await?;
+```
+
+### 6c.2 Reaching for a watch
+
+```rust
+use evo_plugin_sdk::contract::{
+    WatchSpec, WatchAction, WatchCondition, WatchHappeningFilter,
+    WatchTrigger,
+};
+
+let spec = WatchSpec {
+    watch_id: "switch-on-bt-connect".into(),
+    condition: WatchCondition::HappeningMatch {
+        filter: WatchHappeningFilter {
+            variants: vec!["flight_mode_changed".into()],
+            shelves: vec!["flight_mode.wireless.bluetooth".into()],
+            ..Default::default()
+        },
+    },
+    trigger: WatchTrigger::Edge,
+};
+let action = WatchAction {
+    target_shelf: "audio.delivery".into(),
+    request_type: "switch_output".into(),
+    payload: serde_json::json!({"target": "bluetooth"}),
+};
+ctx.watches
+    .as_ref()
+    .expect("capabilities.watches must be true")
+    .create_watch(spec, action)
+    .await?;
+```
+
+`HappeningMatch` and `Composite` over `HappeningMatch` evaluate fully today. `SubjectState` predicates parse and persist but do not yet evaluate (the projection-engine integration is not wired through the watch path in this release); plugins authoring `SubjectState` watches today should expect non-match behaviour at fire time and plan for the evaluator landing in a subsequent release.
+
 ## 7. Packaging
 
 A plugin ships as:

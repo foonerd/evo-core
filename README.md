@@ -6,7 +6,10 @@ Write the catalogue. Stock the plugins. The steward does the rest.
 
 Evo is a fabric for building devices where many concerns - sources, processing, outputs, metadata, networking, presentation - have to compose into something coherent without turning into a monolith. The framework is the steward: a single long-running process that administers a declared catalogue, admits plugins that stock its slots, reconciles subject identities across the plugins, and emits projections and happenings to any consumer that looks.
 
-The framework knows nothing about audio, streaming services, DACs, protocols, or any specific device. Everything that names a real service or piece of hardware lives in a **distribution** - a separate `evo-device-<vendor>` repository that imports evo-core, declares its own catalogue, ships its own plugins, and packages them as a product. The first distribution is `evo-device-volumio`; the framework supports an open set of distributions without upper bound.
+The framework knows nothing about audio, streaming services, DACs, protocols, or any specific device. Everything that names a real service or piece of hardware lives in two outer tiers:
+
+- A **reference generic device** (`evo-device-<domain>`) ships brand-neutral plugins for one domain, signed by the evo project, ready for any distribution to admit by name. The first reference is [`evo-device-audio`](https://github.com/foonerd/evo-device-audio): brand-neutral audio plugins (MPD playback, ALSA composition, file-tag metadata, local artwork, etc.) under the `org.evoframework.*` namespace. It is the canonical demonstration of the framework's surface — every core function exercised against a real workload.
+- A **vendor distribution** (`evo-device-<vendor>`) imports a reference generic device and adds the vendor layer: catalogue choices, branding, product-specific plugins, packaging. [`evo-device-volumio`](https://github.com/foonerd/evo-device-volumio) is one such adopter, building on `evo-device-audio`. The framework supports an open set of reference generic devices and an open set of vendor distributions; the architecture has no upper bound on either.
 
 ## Architecture
 
@@ -163,7 +166,7 @@ Reference crates to look at: [`crates/evo`](crates/evo) (the steward), [`crates/
 
 ## Distributions
 
-Evo is domain-neutral. A device ships as a distribution of evo in its own `evo-device-<vendor>` repository: a catalogue declaration plus a plugin set plus branding plus frontend plus packaging. The framework imposes no upper bound on how many distributions exist or which vendors they target. The first distribution is `evo-device-volumio`, using Volumio's existing device functions (MPD, ALSA, NetworkManager, NAS mounts) as its reference feature set.
+Evo is domain-neutral. Devices ship across two outer tiers. A **reference generic device** (`evo-device-<domain>`) hosts brand-neutral plugins for one domain — `evo-device-audio` is the first, exercising every core function against a real audio workload (MPD playback, ALSA composition, file-tag metadata, local artwork). A **vendor distribution** (`evo-device-<vendor>`) imports the reference generic device of its domain and adds the vendor layer: catalogue, branding, packaging, and any plugins that are genuinely vendor-specific. `evo-device-volumio` is one such adopter for the audio domain. The framework imposes no upper bound on how many reference generic devices or vendor distributions exist.
 
 See [BOUNDARY.md](docs/engineering/BOUNDARY.md) for the boundary contract and the distribution-integrator checklist.
 

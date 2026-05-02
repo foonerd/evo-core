@@ -64,12 +64,15 @@ use crate::happenings::HappeningBus;
 use crate::relations::RelationGraph;
 #[cfg(test)]
 use crate::subjects::SubjectRegistry;
-use evo_plugin_sdk::codec::{read_frame_json, write_frame_json, WireError};
+use evo_plugin_sdk::codec::{
+    read_frame, read_frame_json, write_frame, write_frame_json, Codec,
+    WireError,
+};
 use evo_plugin_sdk::contract::{
     Assignment, CourseCorrection, CustodyHandle, CustodyStateReporter,
-    HealthReport, InstanceAnnouncer, LoadContext, PluginDescription,
-    PluginError, RelationAdmin, RelationAnnouncer, Request, Response,
-    StateReporter, SubjectAdmin, SubjectAnnouncer, SubjectQuerier,
+    FastPathDispatcher, HealthReport, InstanceAnnouncer, LoadContext,
+    PluginDescription, PluginError, RelationAdmin, RelationAnnouncer, Request,
+    Response, StateReporter, SubjectAdmin, SubjectAnnouncer, SubjectQuerier,
 };
 use evo_plugin_sdk::wire::{
     WireFrame, FEATURE_VERSION_MAX, FEATURE_VERSION_MIN, PROTOCOL_VERSION,
@@ -216,6 +219,27 @@ pub struct EventSink {
     /// `suppress_relation` / `unsuppress_relation` requests (admin
     /// surface). Same gating as [`Self::subject_admin`].
     pub relation_admin: Option<Arc<dyn RelationAdmin>>,
+    /// Where to route plugin-initiated `fast_path_dispatch`
+    /// requests. `None` when the plugin's manifest does not
+    /// declare `capabilities.fast_path = true`; the reader task
+    /// then replies with a structured `Error` frame so the
+    /// dispatching plugin observes the manifest-level refusal
+    /// rather than a silent drop. `Some(dispatcher)` for plugins
+    /// whose manifest opted in; the dispatcher routes through
+    /// the per-warden Fast Path verb gate and budget enforcement.
+    pub fast_path_dispatcher: Option<Arc<dyn FastPathDispatcher>>,
+    /// Prompt ledger backing plugin-initiated user-interaction
+    /// requests. `None` for builds without the ledger
+    /// configured; `RequestUserInteraction` frames refuse with
+    /// a structured `Internal` error in that case. `Some` for
+    /// the production path; the steward's reader task registers
+    /// each prompt and spawns a waiter that fires the response
+    /// frame when the prompt completes.
+    pub prompt_ledger: Option<Arc<crate::prompts::PromptLedger>>,
+    /// Canonical plugin name owning this connection. Stamped on
+    /// the prompt ledger as the prompt's originating plugin.
+    /// Cloned out of the LoadContext at admission time.
+    pub plugin_name: String,
 }
 
 impl fmt::Debug for EventSink {
@@ -323,9 +347,13 @@ impl WireClient {
         // Run the version/codec handshake on the raw halves before
         // spawning the dispatch loops. The steward initiates per the
         // spawn model (`admission.rs` connects to the plugin's
-        // socket).
-        perform_steward_handshake(&mut reader, &mut writer, &plugin_name)
-            .await?;
+        // socket). The handshake itself rides JSON for the lifetime
+        // of v1; the chosen codec it returns is what the post-
+        // handshake reader / writer loops use for every subsequent
+        // frame.
+        let codec =
+            perform_steward_handshake(&mut reader, &mut writer, &plugin_name)
+                .await?;
 
         let (out_tx, out_rx) =
             mpsc::channel::<WireFrame>(OUTBOUND_CHANNEL_CAPACITY);
@@ -338,6 +366,7 @@ impl WireClient {
 
         let reader_task = tokio::spawn(reader_loop(
             reader,
+            codec,
             Arc::clone(&pending),
             Arc::clone(&event_sink),
             plugin_name.clone(),
@@ -346,6 +375,7 @@ impl WireClient {
         ));
         let writer_task = tokio::spawn(writer_loop(
             writer,
+            codec,
             out_rx,
             Arc::clone(&pending),
             Arc::clone(&alive),
@@ -486,6 +516,30 @@ impl WireClient {
         credentials_dir: String,
         deadline_ms: Option<u64>,
     ) -> Result<(), WireClientError> {
+        self.load_with_state(
+            config,
+            state_dir,
+            credentials_dir,
+            deadline_ms,
+            None,
+        )
+        .await
+    }
+
+    /// Send the `load` verb with an optional carry-over state blob.
+    /// Used by the OOP live-reload path: the steward forwards the
+    /// blob the previous instance returned from
+    /// [`Self::prepare_for_live_reload`] to the freshly-spawned
+    /// successor instance, which dispatches to the plugin's
+    /// `load_with_state` for schema-aware migration.
+    pub async fn load_with_state(
+        &self,
+        config: serde_json::Value,
+        state_dir: String,
+        credentials_dir: String,
+        deadline_ms: Option<u64>,
+        live_reload_state: Option<evo_plugin_sdk::wire::LiveReloadState>,
+    ) -> Result<(), WireClientError> {
         let cid = self.next_cid();
         let frame = WireFrame::Load {
             v: PROTOCOL_VERSION,
@@ -495,6 +549,7 @@ impl WireClient {
             state_dir,
             credentials_dir,
             deadline_ms,
+            live_reload_state,
         };
         match self.request(cid, frame).await? {
             WireFrame::LoadResponse { .. } => Ok(()),
@@ -510,6 +565,38 @@ impl WireClient {
             }),
             other => Err(WireClientError::Protocol(format!(
                 "expected load_response, got {}",
+                variant_name(&other)
+            ))),
+        }
+    }
+
+    /// Send the `prepare_for_live_reload` verb. Returns the
+    /// optional state blob the plugin emitted (None when the
+    /// plugin had no transient state to preserve).
+    pub async fn prepare_for_live_reload(
+        &self,
+    ) -> Result<Option<evo_plugin_sdk::wire::LiveReloadState>, WireClientError>
+    {
+        let cid = self.next_cid();
+        let frame = WireFrame::PrepareForLiveReload {
+            v: PROTOCOL_VERSION,
+            cid,
+            plugin: self.plugin_name.clone(),
+        };
+        match self.request(cid, frame).await? {
+            WireFrame::PrepareForLiveReloadResponse { state, .. } => Ok(state),
+            WireFrame::Error {
+                message,
+                class,
+                details,
+                ..
+            } => Err(WireClientError::PluginReturnedError {
+                message,
+                class,
+                details,
+            }),
+            other => Err(WireClientError::Protocol(format!(
+                "expected prepare_for_live_reload_response, got {}",
                 variant_name(&other)
             ))),
         }
@@ -736,12 +823,15 @@ impl WireClient {
 ///
 /// Validates that the chosen `feature` and `codec` lie inside the
 /// steward's own ranges; a peer that picks something outside its
-/// declared offer is treated as a protocol violation.
+/// declared offer is treated as a protocol violation. Returns the
+/// negotiated [`Codec`] so the caller can thread it into post-
+/// handshake reader / writer loops; the handshake itself stays JSON
+/// for the lifetime of v1 regardless of the chosen codec.
 async fn perform_steward_handshake<R, W>(
     reader: &mut R,
     writer: &mut W,
     plugin_name: &str,
-) -> Result<(), WireClientError>
+) -> Result<Codec, WireClientError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -789,6 +879,15 @@ where
                     ),
                 });
             }
+            let chosen = Codec::from_name(&codec).ok_or_else(|| {
+                WireClientError::HandshakeFailed {
+                    reason: format!(
+                        "plugin chose codec '{codec}' which the steward \
+                         cannot encode (supported: {:?})",
+                        SUPPORTED_CODECS
+                    ),
+                }
+            })?;
             if !SUPPORTED_CODECS.iter().any(|c| *c == codec) {
                 return Err(WireClientError::HandshakeFailed {
                     reason: format!(
@@ -798,7 +897,7 @@ where
                     ),
                 });
             }
-            Ok(())
+            Ok(chosen)
         }
         WireFrame::Error {
             message,
@@ -833,6 +932,7 @@ where
 
 async fn writer_loop<W>(
     mut writer: W,
+    codec: Codec,
     mut rx: mpsc::Receiver<WireFrame>,
     pending: Arc<Mutex<PendingMap>>,
     alive: Arc<std::sync::atomic::AtomicBool>,
@@ -840,7 +940,7 @@ async fn writer_loop<W>(
     W: AsyncWrite + Unpin,
 {
     while let Some(frame) = rx.recv().await {
-        if let Err(e) = write_frame_json(&mut writer, &frame).await {
+        if let Err(e) = write_frame(&mut writer, codec, &frame).await {
             tracing::error!(error = %e, "wire client writer error");
             break;
         }
@@ -853,6 +953,7 @@ async fn writer_loop<W>(
 
 async fn reader_loop<R>(
     mut reader: R,
+    codec: Codec,
     pending: Arc<Mutex<PendingMap>>,
     event_sink: Arc<Mutex<Option<Arc<EventSink>>>>,
     expected_plugin: String,
@@ -862,7 +963,7 @@ async fn reader_loop<R>(
     R: AsyncRead + Unpin,
 {
     loop {
-        match read_frame_json(&mut reader).await {
+        match read_frame(&mut reader, codec).await {
             Ok(frame) => {
                 let keep_going = handle_inbound_frame(
                     frame,
@@ -1293,6 +1394,70 @@ async fn forward_plugin_request(
             None => admin_capability_denied_error(v, cid, plugin),
         },
 
+        WireFrame::RequestUserInteraction {
+            v,
+            cid,
+            plugin,
+            prompt,
+        } => {
+            return forward_request_user_interaction(
+                v, cid, plugin, prompt, sink, out_tx,
+            )
+            .await;
+        }
+
+        WireFrame::FastPathDispatch {
+            v,
+            cid,
+            plugin,
+            target_shelf,
+            handle,
+            verb,
+            payload,
+            deadline_ms,
+        } => match sink.fast_path_dispatcher.as_ref() {
+            Some(dispatcher) => match dispatcher
+                .fast_path_dispatch(
+                    &target_shelf,
+                    &handle,
+                    &verb,
+                    payload,
+                    deadline_ms,
+                )
+                .await
+            {
+                Ok(()) => {
+                    WireFrame::FastPathDispatchResponse { v, cid, plugin }
+                }
+                Err(e) => WireFrame::Error {
+                    v,
+                    cid,
+                    plugin,
+                    class: e.class(),
+                    message: format!("fast_path_dispatch: {e}"),
+                    details: report_error_details(&e),
+                },
+            },
+            // No dispatcher on this connection's sink means the
+            // dispatching plugin's manifest does not declare
+            // capabilities.fast_path = true. Refuse with a
+            // structured PermissionDenied frame so the plugin
+            // observes the manifest-level gate rather than a
+            // silent drop.
+            None => WireFrame::Error {
+                v,
+                cid,
+                plugin,
+                class: ErrorClass::PermissionDenied,
+                message: "fast_path_dispatch: this plugin's manifest does not \
+                     declare capabilities.fast_path = true"
+                    .into(),
+                details: Some(serde_json::json!({
+                    "subclass": "fast_path_sender_not_declared"
+                })),
+            },
+        },
+
         other => {
             // Should never happen: caller guards on
             // is_plugin_request() before calling.
@@ -1308,6 +1473,129 @@ async fn forward_plugin_request(
             "writer task closed before plugin-request response could be sent"
         );
     }
+}
+
+/// Handle a plugin-originated [`WireFrame::RequestUserInteraction`].
+///
+/// Distinct from the synchronous-dispatch shape of every other
+/// arm in [`forward_plugin_request`]: a prompt's outcome is
+/// not known when the steward receives the request — it
+/// resolves later when the consumer answers, when either side
+/// cancels, or when the deadline expires. Awaiting the outcome
+/// inline would block the reader loop and starve every other
+/// frame on the connection.
+///
+/// Instead this handler registers the prompt in the ledger,
+/// captures the receiver half of the per-prompt oneshot, and
+/// spawns a tokio task that waits for the outcome and emits
+/// the response frame on `out_tx`. The reader returns
+/// immediately so the next frame can be dispatched.
+async fn forward_request_user_interaction(
+    v: u16,
+    cid: u64,
+    plugin: String,
+    prompt: evo_plugin_sdk::contract::PromptRequest,
+    sink: &EventSink,
+    out_tx: &mpsc::Sender<WireFrame>,
+) {
+    use evo_plugin_sdk::contract::{
+        PromptCanceller, PromptOutcome, DEFAULT_PROMPT_TIMEOUT_MS,
+        MAX_PROMPT_TIMEOUT_MS,
+    };
+
+    let ledger = match sink.prompt_ledger.as_ref() {
+        Some(l) => Arc::clone(l),
+        None => {
+            // No ledger configured ⇒ refuse with a structured
+            // internal error so the plugin sees a concrete
+            // disposition rather than hanging.
+            let frame = WireFrame::Error {
+                v,
+                cid,
+                plugin,
+                class: ErrorClass::Internal,
+                message: "request_user_interaction: this server was \
+                          constructed without a prompt ledger; user-\
+                          interaction routing is unavailable"
+                    .into(),
+                details: Some(serde_json::json!({
+                    "subclass": "prompt_ledger_not_configured",
+                })),
+            };
+            if out_tx.send(frame).await.is_err() {
+                tracing::warn!(
+                    "writer task closed before request_user_interaction \
+                     refusal could be sent"
+                );
+            }
+            return;
+        }
+    };
+
+    // Compute the effective timeout: declared value clamped at
+    // [DEFAULT_PROMPT_TIMEOUT_MS .. MAX_PROMPT_TIMEOUT_MS].
+    let declared = prompt.timeout_ms.unwrap_or(DEFAULT_PROMPT_TIMEOUT_MS);
+    let effective_ms = declared.clamp(1, MAX_PROMPT_TIMEOUT_MS);
+    let effective_timeout =
+        std::time::Duration::from_millis(u64::from(effective_ms));
+    let prompt_id = prompt.prompt_id.clone();
+
+    // Register the prompt and capture the waiter. The framework
+    // returns the deadline alongside; the timeout-sweep wakes
+    // up after `effective_timeout` and transitions the prompt
+    // to TimedOut if no responder has answered. For now the
+    // sweep is a per-prompt tokio::time::sleep on the spawned
+    // waiter task; a global sweep with a single timer wheel
+    // is reserved for a follow-up if profiling motivates it.
+    let (_deadline, waiter) =
+        ledger.issue_with_waiter(&plugin, prompt, effective_timeout);
+
+    // Spawn the per-prompt waiter. It races the consumer's
+    // answer / cancel (delivered via the ledger's oneshot)
+    // against the wall-clock deadline. The first to fire wins;
+    // the framework always sends exactly one response frame.
+    let out_tx = out_tx.clone();
+    let plugin_for_wait = plugin.clone();
+    let prompt_id_for_wait = prompt_id.clone();
+    let ledger_for_wait = Arc::clone(&ledger);
+    tokio::spawn(async move {
+        let outcome = tokio::select! {
+            biased;
+            received = waiter => match received {
+                Ok(o) => o,
+                // The sender dropped without firing. This means
+                // the prompt was superseded by a re-issue; the
+                // dropped waiter maps to a Plugin-attributed
+                // cancellation per the contract.
+                Err(_) => PromptOutcome::Cancelled {
+                    by: PromptCanceller::Plugin,
+                },
+            },
+            _ = tokio::time::sleep(effective_timeout) => {
+                // Timeout. Transition the ledger entry to
+                // TimedOut (idempotent if the answer arrived
+                // first; we just race here).
+                ledger_for_wait.complete_with_outcome(
+                    &plugin_for_wait,
+                    &prompt_id_for_wait,
+                    PromptOutcome::TimedOut,
+                );
+                PromptOutcome::TimedOut
+            }
+        };
+        let frame = WireFrame::RequestUserInteractionResponse {
+            v,
+            cid,
+            plugin: plugin_for_wait,
+            outcome,
+        };
+        if out_tx.send(frame).await.is_err() {
+            tracing::debug!(
+                prompt_id = %prompt_id_for_wait,
+                "writer task closed before user-interaction outcome could be sent"
+            );
+        }
+    });
 }
 
 /// Map a [`ReportError`] to the structured `details` payload that
@@ -1628,6 +1916,18 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         }
         WireFrame::AnnounceInstance { .. } => "announce_instance",
         WireFrame::RetractInstance { .. } => "retract_instance",
+        WireFrame::PrepareForLiveReload { .. } => "prepare_for_live_reload",
+        WireFrame::PrepareForLiveReloadResponse { .. } => {
+            "prepare_for_live_reload_response"
+        }
+        WireFrame::FastPathDispatch { .. } => "fast_path_dispatch",
+        WireFrame::FastPathDispatchResponse { .. } => {
+            "fast_path_dispatch_response"
+        }
+        WireFrame::RequestUserInteraction { .. } => "request_user_interaction",
+        WireFrame::RequestUserInteractionResponse { .. } => {
+            "request_user_interaction_response"
+        }
     }
 }
 
@@ -1656,6 +1956,12 @@ fn variant_name(frame: &WireFrame) -> &'static str {
 pub struct WireRespondent {
     client: WireClient,
     cached_description: PluginDescription,
+    /// Prompt ledger handle. The admission engine stamps this
+    /// after connection-time so the [`EventSink`] built at
+    /// `load` time carries the ledger through to the user-
+    /// interaction routing path. `None` for builds that have
+    /// not yet wired user-interaction routing.
+    prompt_ledger: Option<Arc<crate::prompts::PromptLedger>>,
 }
 
 impl fmt::Debug for WireRespondent {
@@ -1690,6 +1996,7 @@ impl WireRespondent {
         Ok(Self {
             client,
             cached_description,
+            prompt_ledger: None,
         })
     }
 
@@ -1701,6 +2008,19 @@ impl WireRespondent {
     /// Borrow the underlying wire client.
     pub fn client(&self) -> &WireClient {
         &self.client
+    }
+
+    /// Stamp a prompt ledger handle on this respondent so the
+    /// `EventSink` built at `load` time can route plugin-
+    /// originated `request_user_interaction` frames into the
+    /// ledger. Called by the admission engine after
+    /// [`Self::connect`] and before the plugin's `load` is
+    /// dispatched.
+    pub fn set_prompt_ledger(
+        &mut self,
+        ledger: Arc<crate::prompts::PromptLedger>,
+    ) {
+        self.prompt_ledger = Some(ledger);
     }
 }
 
@@ -1802,6 +2122,9 @@ impl crate::admission::ErasedRespondent for WireRespondent {
                 subject_querier,
                 subject_admin: ctx.subject_admin.clone(),
                 relation_admin: ctx.relation_admin.clone(),
+                fast_path_dispatcher: ctx.fast_path_dispatcher.clone(),
+                prompt_ledger: self.prompt_ledger.clone(),
+                plugin_name: self.client.plugin_name().to_string(),
             });
 
             let config_json = toml_table_to_json_value(ctx.config.clone())
@@ -1895,6 +2218,94 @@ impl crate::admission::ErasedRespondent for WireRespondent {
             }
         })
     }
+
+    fn prepare_for_live_reload(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Option<evo_plugin_sdk::contract::StateBlob>,
+                        PluginError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            match self.client.prepare_for_live_reload().await {
+                Ok(state) => Ok(state.map(wire_state_to_blob)),
+                Err(e) => Err(wire_error_to_plugin_error(
+                    e,
+                    "wire prepare_for_live_reload",
+                )),
+            }
+        })
+    }
+
+    fn load_with_state<'a>(
+        &'a mut self,
+        ctx: &'a LoadContext,
+        blob: Option<evo_plugin_sdk::contract::StateBlob>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // Same setup as the cold load path: install the event
+            // sink before sending the frame so events the plugin
+            // emits during load_with_state reach the registries.
+            let subject_querier: Arc<dyn SubjectQuerier> = ctx
+                .subject_querier
+                .clone()
+                .unwrap_or_else(|| Arc::new(NotFoundSubjectQuerier));
+            self.client.set_event_sink(EventSink {
+                state_reporter: Arc::clone(&ctx.state_reporter),
+                subject_announcer: Arc::clone(&ctx.subject_announcer),
+                relation_announcer: Arc::clone(&ctx.relation_announcer),
+                instance_announcer: Arc::clone(&ctx.instance_announcer),
+                custody_state_reporter: None,
+                subject_querier,
+                subject_admin: ctx.subject_admin.clone(),
+                relation_admin: ctx.relation_admin.clone(),
+                fast_path_dispatcher: ctx.fast_path_dispatcher.clone(),
+                prompt_ledger: self.prompt_ledger.clone(),
+                plugin_name: self.client.plugin_name().to_string(),
+            });
+
+            let config_json = toml_table_to_json_value(ctx.config.clone())
+                .map_err(|e| {
+                    PluginError::Permanent(format!(
+                        "config conversion to JSON failed: {e}"
+                    ))
+                })?;
+
+            let deadline_ms = ctx.deadline.map(|d| {
+                d.remaining().as_millis().min(u64::MAX as u128) as u64
+            });
+
+            let state_dir = ctx.state_dir.to_string_lossy().into_owned();
+            let credentials_dir =
+                ctx.credentials_dir.to_string_lossy().into_owned();
+
+            let wire_state = blob.map(blob_to_wire_state);
+            match self
+                .client
+                .load_with_state(
+                    config_json,
+                    state_dir,
+                    credentials_dir,
+                    deadline_ms,
+                    wire_state,
+                )
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    self.client.clear_event_sink();
+                    Err(wire_error_to_plugin_error(e, "wire load_with_state"))
+                }
+            }
+        })
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1946,6 +2357,9 @@ pub struct WireWarden {
     cached_description: PluginDescription,
     ledger: Arc<CustodyLedger>,
     bus: Arc<HappeningBus>,
+    /// Prompt ledger handle. Same shape as
+    /// [`WireRespondent::prompt_ledger`].
+    prompt_ledger: Option<Arc<crate::prompts::PromptLedger>>,
 }
 
 impl fmt::Debug for WireWarden {
@@ -1988,7 +2402,17 @@ impl WireWarden {
             cached_description,
             ledger,
             bus,
+            prompt_ledger: None,
         })
+    }
+
+    /// Stamp a prompt ledger handle on this warden. Mirrors
+    /// [`WireRespondent::set_prompt_ledger`].
+    pub fn set_prompt_ledger(
+        &mut self,
+        ledger: Arc<crate::prompts::PromptLedger>,
+    ) {
+        self.prompt_ledger = Some(ledger);
     }
 
     /// Borrow the cached plugin description.
@@ -2047,6 +2471,9 @@ impl crate::admission::ErasedWarden for WireWarden {
                 subject_querier,
                 subject_admin: ctx.subject_admin.clone(),
                 relation_admin: ctx.relation_admin.clone(),
+                fast_path_dispatcher: ctx.fast_path_dispatcher.clone(),
+                prompt_ledger: self.prompt_ledger.clone(),
+                plugin_name: self.client.plugin_name().to_string(),
             });
 
             let config_json = toml_table_to_json_value(ctx.config.clone())
@@ -2187,6 +2614,123 @@ impl crate::admission::ErasedWarden for WireWarden {
             }
         })
     }
+
+    fn prepare_for_live_reload(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Option<evo_plugin_sdk::contract::StateBlob>,
+                        PluginError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            match self.client.prepare_for_live_reload().await {
+                Ok(state) => Ok(state.map(wire_state_to_blob)),
+                Err(e) => Err(wire_error_to_plugin_error(
+                    e,
+                    "wire prepare_for_live_reload",
+                )),
+            }
+        })
+    }
+
+    fn load_with_state<'a>(
+        &'a mut self,
+        ctx: &'a LoadContext,
+        blob: Option<evo_plugin_sdk::contract::StateBlob>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // Mirrors WireWarden::load: install the event sink with
+            // the ledger-backed custody reporter before sending the
+            // wire load frame, so any custody state reports the
+            // warden emits during load_with_state are persisted.
+            let custody_reporter: Arc<dyn CustodyStateReporter> =
+                Arc::new(LedgerCustodyStateReporter::new(
+                    Arc::clone(&self.ledger),
+                    Arc::clone(&self.bus),
+                    self.client.plugin_name().to_string(),
+                ));
+            let subject_querier: Arc<dyn SubjectQuerier> = ctx
+                .subject_querier
+                .clone()
+                .unwrap_or_else(|| Arc::new(NotFoundSubjectQuerier));
+            self.client.set_event_sink(EventSink {
+                state_reporter: Arc::clone(&ctx.state_reporter),
+                subject_announcer: Arc::clone(&ctx.subject_announcer),
+                relation_announcer: Arc::clone(&ctx.relation_announcer),
+                instance_announcer: Arc::clone(&ctx.instance_announcer),
+                custody_state_reporter: Some(custody_reporter),
+                subject_querier,
+                subject_admin: ctx.subject_admin.clone(),
+                relation_admin: ctx.relation_admin.clone(),
+                fast_path_dispatcher: ctx.fast_path_dispatcher.clone(),
+                prompt_ledger: self.prompt_ledger.clone(),
+                plugin_name: self.client.plugin_name().to_string(),
+            });
+
+            let config_json = toml_table_to_json_value(ctx.config.clone())
+                .map_err(|e| {
+                    PluginError::Permanent(format!(
+                        "config conversion to JSON failed: {e}"
+                    ))
+                })?;
+
+            let deadline_ms = ctx.deadline.map(|d| {
+                d.remaining().as_millis().min(u64::MAX as u128) as u64
+            });
+
+            let state_dir = ctx.state_dir.to_string_lossy().into_owned();
+            let credentials_dir =
+                ctx.credentials_dir.to_string_lossy().into_owned();
+
+            let wire_state = blob.map(blob_to_wire_state);
+            match self
+                .client
+                .load_with_state(
+                    config_json,
+                    state_dir,
+                    credentials_dir,
+                    deadline_ms,
+                    wire_state,
+                )
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    self.client.clear_event_sink();
+                    Err(wire_error_to_plugin_error(e, "wire load_with_state"))
+                }
+            }
+        })
+    }
+}
+
+/// Convert a wire-side [`evo_plugin_sdk::wire::LiveReloadState`]
+/// into the SDK's [`StateBlob`].
+fn wire_state_to_blob(
+    s: evo_plugin_sdk::wire::LiveReloadState,
+) -> evo_plugin_sdk::contract::StateBlob {
+    evo_plugin_sdk::contract::StateBlob {
+        schema_version: s.schema_version,
+        payload: s.payload,
+    }
+}
+
+/// Convert an SDK [`StateBlob`] into the wire-side
+/// [`evo_plugin_sdk::wire::LiveReloadState`].
+fn blob_to_wire_state(
+    b: evo_plugin_sdk::contract::StateBlob,
+) -> evo_plugin_sdk::wire::LiveReloadState {
+    evo_plugin_sdk::wire::LiveReloadState {
+        schema_version: b.schema_version,
+        payload: b.payload,
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -2315,6 +2859,7 @@ mod tests {
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec!["echo".into()],
+                        course_correct_verbs: vec![],
                         accepts_custody: false,
                         flags: Default::default(),
                     },
@@ -2826,6 +3371,12 @@ target_type = "album"
             // drives build_load_context.
             subject_admin: None,
             relation_admin: None,
+            // Test harness constructs non-Fast-Path LoadContexts;
+            // the dispatcher is None so a plugin under test that
+            // attempts Fast Path dispatch fails fast on unwrap.
+            fast_path_dispatcher: None,
+            appointments: None,
+            watches: None,
         }
     }
 
@@ -2866,6 +3417,7 @@ target_type = "album"
                     },
                     runtime_capabilities: RuntimeCapabilities {
                         request_types: vec![],
+                        course_correct_verbs: vec![],
                         accepts_custody: true,
                         flags: Default::default(),
                     },
@@ -3279,6 +3831,9 @@ target_type = "album"
             subject_querier: Arc::new(NotFoundSubjectQuerier),
             subject_admin: None,
             relation_admin: None,
+            fast_path_dispatcher: None,
+            prompt_ledger: None,
+            plugin_name: "test".into(),
         });
 
         // Take custody. The plugin emits the state report BEFORE
@@ -3475,6 +4030,9 @@ name = "album"
             ))),
             subject_admin: None,
             relation_admin: None,
+            fast_path_dispatcher: None,
+            appointments: None,
+            watches: None,
         }
     }
 
@@ -3906,6 +4464,9 @@ name = "track"
             subject_querier: Arc::new(NotFoundSubjectQuerier),
             subject_admin: None,
             relation_admin: None,
+            fast_path_dispatcher: None,
+            prompt_ledger: None,
+            plugin_name: "test".into(),
         }
     }
 
@@ -4105,6 +4666,9 @@ name = "track"
             subject_querier: Arc::new(NotFoundSubjectQuerier),
             subject_admin: None,
             relation_admin: None,
+            fast_path_dispatcher: None,
+            prompt_ledger: None,
+            plugin_name: "test".into(),
         }
     }
 
@@ -4289,6 +4853,9 @@ name = "track"
             subject_querier: Arc::new(NotFoundSubjectQuerier),
             subject_admin: admin,
             relation_admin: None,
+            fast_path_dispatcher: None,
+            prompt_ledger: None,
+            plugin_name: "test".into(),
         }
     }
 
@@ -4441,9 +5008,62 @@ name = "track"
             .unwrap();
         });
 
-        perform_steward_handshake(&mut client_r, &mut client_w, "org.test.x")
+        let codec = perform_steward_handshake(
+            &mut client_r,
+            &mut client_w,
+            "org.test.x",
+        )
+        .await
+        .expect("handshake must succeed");
+        assert_eq!(
+            codec,
+            Codec::Json,
+            "peer answered with json; the handshake MUST surface that as Codec::Json"
+        );
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_returns_cbor_when_peer_picks_cbor() {
+        // CBOR coverage on the steward side. The peer answers
+        // with `codec: "cbor"`, which is in the steward's
+        // SUPPORTED_CODECS; the handshake MUST surface the
+        // choice as `Codec::Cbor` so the post-handshake reader
+        // / writer loops use the binary codec for every frame.
+        use evo_plugin_sdk::codec::{read_frame_json, write_frame_json};
+        let (client, server) = tokio::io::duplex(8192);
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let (mut server_r, mut server_w) = tokio::io::split(server);
+
+        let peer = tokio::spawn(async move {
+            let frame = read_frame_json(&mut server_r).await.unwrap();
+            assert!(matches!(frame, WireFrame::Hello { .. }));
+            write_frame_json(
+                &mut server_w,
+                &WireFrame::HelloAck {
+                    v: PROTOCOL_VERSION,
+                    cid: 0,
+                    plugin: "org.test.x".into(),
+                    feature: FEATURE_VERSION_MAX,
+                    codec: "cbor".into(),
+                },
+            )
             .await
-            .expect("handshake must succeed");
+            .unwrap();
+        });
+
+        let codec = perform_steward_handshake(
+            &mut client_r,
+            &mut client_w,
+            "org.test.x",
+        )
+        .await
+        .expect("handshake must succeed");
+        assert_eq!(
+            codec,
+            Codec::Cbor,
+            "peer answered with cbor; the handshake MUST surface that as Codec::Cbor"
+        );
         peer.await.unwrap();
     }
 
@@ -4539,6 +5159,11 @@ name = "track"
         let (mut client_r, mut client_w) = tokio::io::split(client);
         let (mut server_r, mut server_w) = tokio::io::split(server);
 
+        // The mock peer answers with a codec name the steward does
+        // not recognise — `protobuf` is deliberately not in
+        // SUPPORTED_CODECS today. Updates to the codec set should
+        // pick a name that is still unknown rather than weaken the
+        // assertion.
         let peer = tokio::spawn(async move {
             let _ = read_frame_json(&mut server_r).await.unwrap();
             write_frame_json(
@@ -4548,7 +5173,7 @@ name = "track"
                     cid: 0,
                     plugin: "org.test.x".into(),
                     feature: FEATURE_VERSION_MAX,
-                    codec: "cbor".into(),
+                    codec: "protobuf".into(),
                 },
             )
             .await
@@ -4564,7 +5189,7 @@ name = "track"
         match result {
             Err(WireClientError::HandshakeFailed { reason }) => {
                 assert!(
-                    reason.contains("cbor"),
+                    reason.contains("protobuf"),
                     "must name the unsupported codec: {reason}"
                 );
             }
@@ -4855,6 +5480,9 @@ name = "track"
             subject_querier: querier,
             subject_admin: None,
             relation_admin: None,
+            fast_path_dispatcher: None,
+            prompt_ledger: None,
+            plugin_name: "test".into(),
         }
     }
 

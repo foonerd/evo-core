@@ -42,7 +42,21 @@
 
 use crate::error::StewardError;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+/// Built-in fallback catalogue, baked into the binary at compile time.
+///
+/// Loaded as the last tier of [`Catalogue::load_with_fallback`] when
+/// both the operator's configured catalogue and the steward-managed
+/// last-known-good shadow fail to parse or validate. Sourced from the
+/// in-tree skeleton at `dist/catalogue/v0-skeleton.toml`. Always
+/// parses (validated by `cargo build` since it is compile-time
+/// content). The framework boots with whatever the skeleton declares
+/// (today: one `example` rack with `echo` + `custody` shelves), so
+/// the operator can still reach the wire and recover.
+const BUILTIN_SKELETON: &str =
+    include_str!("../../../dist/catalogue/v0-skeleton.toml");
 
 /// Lowest catalogue schema version this steward parses.
 ///
@@ -97,6 +111,14 @@ pub struct Catalogue {
     /// `RELATIONS.md` section 3.
     #[serde(default, rename = "relation")]
     pub relations: Vec<RelationPredicate>,
+    /// Reconciliation pairs declared in this catalogue. Each pair
+    /// names a composer respondent shelf, a warden delivery
+    /// shelf, and the trigger-happening vocabulary that drives
+    /// the steward's per-pair compose-and-apply loop. Empty by
+    /// default; distributions opting into reconciliation
+    /// orchestration declare one or more pairs here.
+    #[serde(default, rename = "reconciliation_pairs")]
+    pub reconciliation_pairs: Vec<ReconciliationPair>,
 }
 
 impl Default for Catalogue {
@@ -106,6 +128,7 @@ impl Default for Catalogue {
             racks: Vec::new(),
             subjects: Vec::new(),
             relations: Vec::new(),
+            reconciliation_pairs: Vec::new(),
         }
     }
 }
@@ -157,6 +180,17 @@ pub struct Shelf {
     /// One-sentence description.
     #[serde(default)]
     pub description: String,
+    /// `true` when the distribution declares this shelf
+    /// essential — operators are refused when they try to
+    /// disable or uninstall the only plugin admitted on the
+    /// shelf. Default `false`; multi-occupant shelves refuse
+    /// only when an operator's action would cross zero
+    /// occupants. Distributions opt in per shelf in their
+    /// catalogue; the framework refuses the action with a
+    /// structured `permission_denied / essential_plugin` error
+    /// naming the catalogue rule.
+    #[serde(default)]
+    pub required: bool,
 }
 
 impl Shelf {
@@ -267,6 +301,58 @@ pub struct RelationPredicate {
     pub inverse: Option<String>,
 }
 
+/// Default debounce window for a reconciliation pair when the
+/// catalogue declaration omits `debounce_ms`. Bursts of
+/// triggering happenings within this window collapse into a
+/// single compose + apply call. Tuned for boot-time admit
+/// bursts where many plugins admit nearly simultaneously: 100ms
+/// is long enough to swallow the burst yet short enough that
+/// state-change-driven reconciliation feels live to operators.
+pub const DEFAULT_RECONCILIATION_DEBOUNCE_MS: u32 = 100;
+
+/// One declared reconciliation pair: a composer respondent
+/// shelf paired with a warden delivery shelf, plus the trigger-
+/// happening vocabulary the steward subscribes to on the pair's
+/// behalf.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReconciliationPair {
+    /// Operator-visible identifier. Globally unique within a
+    /// catalogue. Lowercase reverse-DNS-style or dotted name;
+    /// the parser refuses duplicates.
+    pub id: String,
+    /// Fully-qualified shelf the composer respondent occupies.
+    /// Must reference a `[[racks.shelves]]` declared elsewhere
+    /// in the catalogue; the parser refuses dangling references.
+    pub composer_shelf: String,
+    /// Fully-qualified shelf the warden delivery plugin occupies.
+    /// Must reference a `[[racks.shelves]]` declared elsewhere.
+    pub warden_shelf: String,
+    /// Names of `Happening` variants whose emission should
+    /// trigger this pair's reconciliation loop. The framework
+    /// subscribes to the bus on the pair's behalf; every matching
+    /// happening enters the per-pair trigger queue. Refused on
+    /// empty.
+    pub trigger_variants: Vec<String>,
+    /// Optional debounce window in milliseconds. Bursts of
+    /// triggers within this window collapse into a single
+    /// compose + apply call. Defaults to
+    /// [`DEFAULT_RECONCILIATION_DEBOUNCE_MS`].
+    #[serde(default = "default_reconciliation_debounce_ms")]
+    pub debounce_ms: u32,
+    /// Optional `evo-catalogue-schemas` URI for the per-pair
+    /// `applied_state` payload schema. Advisory only — the
+    /// framework does not validate the warden's emitted state
+    /// against this schema; consumers reading the
+    /// `ReconciliationApplied` happening reference the schema
+    /// for their own per-pair contract.
+    #[serde(default)]
+    pub applied_state_schema: Option<String>,
+}
+
+fn default_reconciliation_debounce_ms() -> u32 {
+    DEFAULT_RECONCILIATION_DEBOUNCE_MS
+}
+
 impl Catalogue {
     /// Load a catalogue from a TOML file.
     pub fn load(path: &Path) -> Result<Self, StewardError> {
@@ -287,6 +373,80 @@ impl Catalogue {
             .map_err(|e| StewardError::toml("catalogue", e))?;
         c.validate()?;
         Ok(c)
+    }
+
+    /// Load a catalogue with the three-tier resilience chain.
+    ///
+    /// Tries the configured catalogue first; on parse or validation
+    /// failure falls back to the steward-managed last-known-good
+    /// shadow; if that also fails, falls back to the binary-baked
+    /// built-in skeleton. The first tier that produces a valid
+    /// catalogue becomes the catalogue for the lifetime of the boot.
+    /// On a successful steady-state load (configured tier), the
+    /// catalogue is mirrored to the LKG shadow atomically so a
+    /// subsequent boot has a recovery target.
+    ///
+    /// The returned [`LoadOutcome`] carries the source tier in use
+    /// and, when a fallback was taken, a structured reason naming
+    /// the failure that triggered the fall-through. The caller
+    /// emits the `Happening::CatalogueFallback` signal on the
+    /// happenings bus once it is available.
+    ///
+    /// This call NEVER fails: the built-in skeleton is compile-time
+    /// content and is unconditionally available; a degenerate
+    /// environment (configured invalid + LKG invalid + somehow the
+    /// built-in unable to parse) is impossible by construction
+    /// because `cargo build` validates the embedded content.
+    pub fn load_with_fallback(configured: &Path, lkg: &Path) -> LoadOutcome {
+        match Self::load(configured) {
+            Ok(catalogue) => {
+                // Mirror the operator-authored bytes to the LKG
+                // shadow. Failure to mirror is logged but does not
+                // refuse the boot — the configured tier already
+                // produced a valid catalogue.
+                let mirror_result = mirror_to_lkg(configured, lkg);
+                LoadOutcome {
+                    catalogue,
+                    source: CatalogueSource::Configured,
+                    reason: None,
+                    mirror_error: mirror_result.err(),
+                }
+            }
+            Err(configured_err) => match Self::load(lkg) {
+                Ok(catalogue) => LoadOutcome {
+                    catalogue,
+                    source: CatalogueSource::Lkg,
+                    reason: Some(format!(
+                        "configured catalogue at {} failed to load: {}",
+                        configured.display(),
+                        configured_err
+                    )),
+                    mirror_error: None,
+                },
+                Err(lkg_err) => {
+                    // Built-in is compile-time validated; expect-on-
+                    // parse here is a structural invariant, not a
+                    // runtime risk.
+                    let catalogue = Self::from_toml(BUILTIN_SKELETON).expect(
+                        "built-in skeleton catalogue must parse \
+                             (compile-time validated)",
+                    );
+                    LoadOutcome {
+                        catalogue,
+                        source: CatalogueSource::Builtin,
+                        reason: Some(format!(
+                            "configured catalogue at {} failed to \
+                             load: {}; LKG shadow at {} failed: {}",
+                            configured.display(),
+                            configured_err,
+                            lkg.display(),
+                            lkg_err
+                        )),
+                        mirror_error: None,
+                    }
+                }
+            },
+        }
     }
 
     /// Look up a shelf by fully qualified name (`<rack>.<shelf>`).
@@ -346,7 +506,66 @@ impl Catalogue {
         self.validate_relations()?;
         self.validate_relation_type_references()?;
         self.validate_inverses()?;
+        self.validate_reconciliation_pairs()?;
         Ok(())
+    }
+
+    /// Reconciliation-pair validation. Refuses dangling shelf
+    /// references (composer or warden shelf not declared
+    /// elsewhere in the catalogue), duplicate pair IDs, and
+    /// pairs whose trigger_variants list is empty. Returns a
+    /// structured `Catalogue` error naming the offending pair.
+    fn validate_reconciliation_pairs(&self) -> Result<(), StewardError> {
+        let mut seen_ids = std::collections::HashSet::new();
+        let known_shelves = self.collect_qualified_shelves();
+        for pair in &self.reconciliation_pairs {
+            if pair.id.is_empty() {
+                return Err(StewardError::Catalogue(
+                    "reconciliation pair with empty id".into(),
+                ));
+            }
+            if !seen_ids.insert(pair.id.clone()) {
+                return Err(StewardError::Catalogue(format!(
+                    "duplicate reconciliation pair id: {}",
+                    pair.id
+                )));
+            }
+            if !known_shelves.contains(&pair.composer_shelf) {
+                return Err(StewardError::Catalogue(format!(
+                    "reconciliation pair {}: composer_shelf {} is not \
+                     declared in the catalogue",
+                    pair.id, pair.composer_shelf
+                )));
+            }
+            if !known_shelves.contains(&pair.warden_shelf) {
+                return Err(StewardError::Catalogue(format!(
+                    "reconciliation pair {}: warden_shelf {} is not \
+                     declared in the catalogue",
+                    pair.id, pair.warden_shelf
+                )));
+            }
+            if pair.trigger_variants.is_empty() {
+                return Err(StewardError::Catalogue(format!(
+                    "reconciliation pair {}: trigger_variants must not be \
+                     empty",
+                    pair.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Collect every fully-qualified shelf name (`<rack>.<shelf>`)
+    /// declared in the catalogue. Used by reconciliation-pair
+    /// validation to detect dangling references.
+    fn collect_qualified_shelves(&self) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        for rack in &self.racks {
+            for shelf in &rack.shelves {
+                out.insert(format!("{}.{}", rack.name, shelf.name));
+            }
+        }
+        out
     }
 
     /// Reject documents whose declared `schema_version` is outside
@@ -429,8 +648,7 @@ impl Catalogue {
                         rack.name, shelf.name, shelf.shape
                     )));
                 }
-                let mut seen_supports =
-                    std::collections::HashSet::new();
+                let mut seen_supports = std::collections::HashSet::new();
                 for v in &shelf.shape_supports {
                     if !seen_supports.insert(v) {
                         return Err(StewardError::Catalogue(format!(
@@ -632,6 +850,98 @@ impl Catalogue {
         }
         Ok(())
     }
+}
+
+/// Which tier of the resilience chain produced the loaded catalogue.
+///
+/// The configured tier is the steady-state path: the operator's
+/// catalogue at the path declared in `[catalogue].path`. The LKG tier
+/// is the steward-managed shadow at `[catalogue].lkg_path`, written
+/// atomically after every successful steady-state load. The built-in
+/// tier is the binary-baked skeleton.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogueSource {
+    /// Operator's configured catalogue parsed and validated. The
+    /// dominant case.
+    Configured,
+    /// Configured catalogue invalid; loaded the steward-managed LKG
+    /// shadow instead.
+    Lkg,
+    /// Configured + LKG both invalid (or absent); loaded the
+    /// binary-baked built-in skeleton.
+    Builtin,
+}
+
+impl CatalogueSource {
+    /// Wire-form name. Stable; serialised on
+    /// `Happening::CatalogueFallback` and on the
+    /// `op = "describe_capabilities"` response's `catalogue_source`
+    /// field.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CatalogueSource::Configured => "configured",
+            CatalogueSource::Lkg => "lkg",
+            CatalogueSource::Builtin => "builtin",
+        }
+    }
+}
+
+/// Outcome of [`Catalogue::load_with_fallback`]. Carries the parsed
+/// catalogue, the source tier, and (when a fallback was taken) a
+/// structured reason naming the failure that triggered the
+/// fall-through. The optional `mirror_error` carries any error
+/// observed while writing the LKG shadow; the boot does not refuse
+/// because of mirror failure (the configured tier already produced a
+/// valid catalogue), but the caller logs it.
+#[derive(Debug)]
+pub struct LoadOutcome {
+    /// The catalogue, ready for use.
+    pub catalogue: Catalogue,
+    /// Which tier produced this catalogue.
+    pub source: CatalogueSource,
+    /// When `source != Configured`, the chained reason message
+    /// describing why the higher tiers were skipped. Naming both the
+    /// configured-tier failure and the LKG-tier failure (when both
+    /// fell through to built-in) so the audit trail is complete.
+    pub reason: Option<String>,
+    /// Best-effort LKG mirror error from the configured-tier success
+    /// path. `None` when the mirror succeeded or when no mirror was
+    /// attempted (LKG / built-in tiers do not write to LKG).
+    pub mirror_error: Option<std::io::Error>,
+}
+
+/// Mirror the operator's configured catalogue to the LKG shadow file.
+///
+/// Reads the original bytes verbatim, prepends an audit header
+/// (TOML-comment style, parses as no-op), writes the result to
+/// `<lkg_path>.tmp`, and `rename(2)`s into place. POSIX rename is
+/// atomic so a power-cut between write and rename leaves the
+/// existing LKG (or no LKG) untouched. Distributions that wipe
+/// `/var/lib/evo/state/` on every boot effectively run on the
+/// configured + built-in chain only — acceptable because the wipe
+/// was the distribution's choice.
+fn mirror_to_lkg(configured: &Path, lkg: &Path) -> std::io::Result<()> {
+    if let Some(parent) = lkg.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let original_bytes = std::fs::read(configured)?;
+    let header = format!(
+        "# Last-known-good catalogue mirror, written by evo-core.\n\
+         # DO NOT EDIT BY HAND — this file is rewritten on every \
+         successful steady-state\n\
+         # catalogue load and any operator edits are lost.\n\
+         # lkg_loaded_at = {:?}\n\
+         #\n",
+        SystemTime::now(),
+    );
+    let tmp: PathBuf = lkg.with_extension("toml.tmp");
+    let mut buf = Vec::with_capacity(header.len() + original_bytes.len());
+    buf.extend_from_slice(header.as_bytes());
+    buf.extend_from_slice(&original_bytes);
+    std::fs::write(&tmp, &buf)?;
+    std::fs::rename(&tmp, lkg)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1716,5 +2026,341 @@ description = "Duplicate entry."
             msg.contains("duplicate entry"),
             "expected duplicate refusal, got: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // load_with_fallback — three-tier resilience chain
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn load_with_fallback_uses_configured_when_valid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let configured = dir.path().join("catalogue.toml");
+        let lkg = dir.path().join("catalogue.lkg.toml");
+
+        std::fs::write(&configured, MINIMAL).expect("write configured");
+
+        let outcome = Catalogue::load_with_fallback(&configured, &lkg);
+        assert_eq!(outcome.source, CatalogueSource::Configured);
+        assert!(outcome.reason.is_none());
+        // Mirror should have written the LKG.
+        assert!(
+            lkg.exists(),
+            "LKG shadow must be mirrored after a successful \
+             configured-tier load"
+        );
+        // Mirror error is None on a writable filesystem.
+        assert!(outcome.mirror_error.is_none());
+    }
+
+    #[test]
+    fn load_with_fallback_falls_through_to_lkg_on_invalid_configured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let configured = dir.path().join("catalogue.toml");
+        let lkg = dir.path().join("catalogue.lkg.toml");
+
+        // Seed the LKG with valid content.
+        std::fs::write(&lkg, MINIMAL).expect("seed LKG");
+        // Configured catalogue is malformed.
+        std::fs::write(&configured, "this is not toml = = =")
+            .expect("write configured");
+
+        let outcome = Catalogue::load_with_fallback(&configured, &lkg);
+        assert_eq!(outcome.source, CatalogueSource::Lkg);
+        assert!(outcome.reason.is_some());
+        let reason = outcome.reason.unwrap();
+        assert!(
+            reason.contains("configured catalogue"),
+            "fallback reason must name the configured-tier failure: {reason}"
+        );
+    }
+
+    #[test]
+    fn load_with_fallback_falls_through_to_builtin_when_both_invalid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let configured = dir.path().join("catalogue.toml");
+        let lkg = dir.path().join("catalogue.lkg.toml");
+
+        std::fs::write(&configured, "completely invalid = =")
+            .expect("write configured");
+        std::fs::write(&lkg, "also invalid = =").expect("write LKG");
+
+        let outcome = Catalogue::load_with_fallback(&configured, &lkg);
+        assert_eq!(outcome.source, CatalogueSource::Builtin);
+        assert!(outcome.reason.is_some());
+        let reason = outcome.reason.unwrap();
+        assert!(
+            reason.contains("configured catalogue") && reason.contains("LKG"),
+            "fallback reason must name both prior-tier failures: {reason}"
+        );
+    }
+
+    #[test]
+    fn load_with_fallback_falls_through_to_builtin_when_files_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let configured = dir.path().join("catalogue.toml");
+        let lkg = dir.path().join("catalogue.lkg.toml");
+        // Neither file exists.
+
+        let outcome = Catalogue::load_with_fallback(&configured, &lkg);
+        assert_eq!(outcome.source, CatalogueSource::Builtin);
+        assert!(outcome.reason.is_some());
+    }
+
+    #[test]
+    fn lkg_mirror_carries_audit_header_and_parses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let configured = dir.path().join("catalogue.toml");
+        let lkg = dir.path().join("catalogue.lkg.toml");
+
+        std::fs::write(&configured, MINIMAL).expect("write configured");
+
+        let _ = Catalogue::load_with_fallback(&configured, &lkg);
+
+        let mirrored = std::fs::read_to_string(&lkg).expect("read LKG");
+        assert!(
+            mirrored.contains("Last-known-good catalogue mirror"),
+            "LKG must carry the audit header"
+        );
+        assert!(
+            mirrored.contains("lkg_loaded_at"),
+            "LKG must record the load timestamp as a TOML comment"
+        );
+
+        // The mirrored file must still parse — the audit header is a
+        // TOML comment block, so prepending it does not break parsing.
+        let parsed = Catalogue::from_toml(&mirrored)
+            .expect("LKG must remain parseable after the audit header");
+        assert_eq!(parsed.schema_version, 1);
+    }
+
+    #[test]
+    fn lkg_mirror_overwrites_atomically_on_subsequent_loads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let configured = dir.path().join("catalogue.toml");
+        let lkg = dir.path().join("catalogue.lkg.toml");
+
+        // First boot: write the minimal catalogue and load.
+        std::fs::write(&configured, MINIMAL).expect("first write");
+        let _ = Catalogue::load_with_fallback(&configured, &lkg);
+        let first_mirror_bytes = std::fs::read(&lkg).expect("read LKG #1");
+
+        // Second boot: write a different valid catalogue.
+        let second_input = r#"
+schema_version = 1
+
+[[racks]]
+name = "second"
+family = "domain"
+kinds = ["registrar"]
+charter = "Second-boot worked example."
+
+[[racks.shelves]]
+name = "echo"
+shape = 1
+description = "Echoes payload."
+"#;
+        std::fs::write(&configured, second_input).expect("second write");
+        let _ = Catalogue::load_with_fallback(&configured, &lkg);
+        let second_mirror_bytes = std::fs::read(&lkg).expect("read LKG #2");
+
+        // The LKG must now contain the second boot's content,
+        // overwriting the first.
+        assert_ne!(
+            first_mirror_bytes, second_mirror_bytes,
+            "LKG must be rewritten on every successful steady-state load"
+        );
+        let parsed = Catalogue::from_toml(
+            &String::from_utf8(second_mirror_bytes).unwrap(),
+        )
+        .expect("LKG #2 must parse");
+        assert_eq!(parsed.racks.first().unwrap().name, "second");
+    }
+
+    #[test]
+    fn catalogue_source_serialises_as_snake_case() {
+        assert_eq!(CatalogueSource::Configured.as_str(), "configured");
+        assert_eq!(CatalogueSource::Lkg.as_str(), "lkg");
+        assert_eq!(CatalogueSource::Builtin.as_str(), "builtin");
+    }
+
+    #[test]
+    fn shelf_required_defaults_to_false() {
+        let toml = r#"
+schema_version = 1
+
+[[racks]]
+name = "test"
+family = "domain"
+charter = "test"
+
+[[racks.shelves]]
+name = "ping"
+shape = 1
+"#;
+        let c = Catalogue::from_toml(toml).unwrap();
+        let s = c.find_shelf("test.ping").unwrap();
+        assert!(!s.required);
+    }
+
+    #[test]
+    fn shelf_required_round_trips_when_declared() {
+        let toml = r#"
+schema_version = 1
+
+[[racks]]
+name = "test"
+family = "domain"
+charter = "test"
+
+[[racks.shelves]]
+name = "ping"
+shape = 1
+required = true
+"#;
+        let c = Catalogue::from_toml(toml).unwrap();
+        let s = c.find_shelf("test.ping").unwrap();
+        assert!(s.required);
+    }
+
+    #[test]
+    fn reconciliation_pair_round_trips_with_defaults() {
+        let toml = r#"
+schema_version = 1
+
+[[racks]]
+name = "audio"
+family = "domain"
+charter = "audio rack"
+
+[[racks.shelves]]
+name = "composition"
+shape = 1
+
+[[racks.shelves]]
+name = "delivery"
+shape = 1
+
+[[reconciliation_pairs]]
+id = "audio.pipeline"
+composer_shelf = "audio.composition"
+warden_shelf = "audio.delivery"
+trigger_variants = ["plugin_admitted", "plugin_unloaded"]
+"#;
+        let c = Catalogue::from_toml(toml).unwrap();
+        assert_eq!(c.reconciliation_pairs.len(), 1);
+        let p = &c.reconciliation_pairs[0];
+        assert_eq!(p.id, "audio.pipeline");
+        assert_eq!(p.composer_shelf, "audio.composition");
+        assert_eq!(p.warden_shelf, "audio.delivery");
+        assert_eq!(
+            p.trigger_variants,
+            vec!["plugin_admitted".to_string(), "plugin_unloaded".to_string()]
+        );
+        assert_eq!(p.debounce_ms, DEFAULT_RECONCILIATION_DEBOUNCE_MS);
+    }
+
+    #[test]
+    fn reconciliation_pair_refuses_dangling_composer_shelf() {
+        let toml = r#"
+schema_version = 1
+
+[[racks]]
+name = "audio"
+family = "domain"
+charter = "audio rack"
+
+[[racks.shelves]]
+name = "delivery"
+shape = 1
+
+[[reconciliation_pairs]]
+id = "audio.pipeline"
+composer_shelf = "audio.composition"
+warden_shelf = "audio.delivery"
+trigger_variants = ["plugin_admitted"]
+"#;
+        let r = Catalogue::from_toml(toml);
+        match r {
+            Err(StewardError::Catalogue(msg)) => {
+                assert!(
+                    msg.contains("composer_shelf")
+                        && msg.contains("audio.composition")
+                );
+            }
+            other => panic!("expected Catalogue refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconciliation_pair_refuses_empty_trigger_variants() {
+        let toml = r#"
+schema_version = 1
+
+[[racks]]
+name = "audio"
+family = "domain"
+charter = "audio rack"
+
+[[racks.shelves]]
+name = "composition"
+shape = 1
+
+[[racks.shelves]]
+name = "delivery"
+shape = 1
+
+[[reconciliation_pairs]]
+id = "audio.pipeline"
+composer_shelf = "audio.composition"
+warden_shelf = "audio.delivery"
+trigger_variants = []
+"#;
+        let r = Catalogue::from_toml(toml);
+        match r {
+            Err(StewardError::Catalogue(msg)) => {
+                assert!(msg.contains("trigger_variants must not be empty"));
+            }
+            other => panic!("expected Catalogue refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconciliation_pair_refuses_duplicate_id() {
+        let toml = r#"
+schema_version = 1
+
+[[racks]]
+name = "audio"
+family = "domain"
+charter = "audio rack"
+
+[[racks.shelves]]
+name = "composition"
+shape = 1
+
+[[racks.shelves]]
+name = "delivery"
+shape = 1
+
+[[reconciliation_pairs]]
+id = "audio.pipeline"
+composer_shelf = "audio.composition"
+warden_shelf = "audio.delivery"
+trigger_variants = ["plugin_admitted"]
+
+[[reconciliation_pairs]]
+id = "audio.pipeline"
+composer_shelf = "audio.composition"
+warden_shelf = "audio.delivery"
+trigger_variants = ["plugin_unloaded"]
+"#;
+        let r = Catalogue::from_toml(toml);
+        match r {
+            Err(StewardError::Catalogue(msg)) => {
+                assert!(msg.contains("duplicate reconciliation pair id"));
+            }
+            other => panic!("expected Catalogue refusal, got {other:?}"),
+        }
     }
 }

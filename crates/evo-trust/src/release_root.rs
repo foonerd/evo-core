@@ -333,14 +333,8 @@ name_prefixes = ["org.evoframework.core.*"]
 max_trust_class = "platform"
 "#;
         let m: ReleaseKeyMeta = toml::from_str(toml_text).unwrap();
-        assert_eq!(
-            m.key.release_role,
-            ReleaseRole::FrameworkRelease
-        );
-        assert_eq!(
-            m.key.key_id.as_deref(),
-            Some("evo-core-release-2026")
-        );
+        assert_eq!(m.key.release_role, ReleaseRole::FrameworkRelease);
+        assert_eq!(m.key.key_id.as_deref(), Some("evo-core-release-2026"));
         assert_eq!(
             m.authorisation.name_prefixes,
             vec!["org.evoframework.core.*".to_string()]
@@ -358,7 +352,8 @@ max_trust_class = "platform"
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let vk = sk.verifying_key();
         let payload = b"build-info contents";
-        let sig: ed25519_dalek::Signature = ed25519_dalek::Signer::sign(&sk, payload);
+        let sig: ed25519_dalek::Signature =
+            ed25519_dalek::Signer::sign(&sk, payload);
         let key = ReleaseTrustKey {
             meta: ReleaseKeyMeta {
                 key: ReleaseKeySection {
@@ -393,7 +388,8 @@ max_trust_class = "platform"
         let sk = SigningKey::from_bytes(&[11u8; 32]);
         let vk = sk.verifying_key();
         let payload = b"core-binaries manifest payload";
-        let sig: ed25519_dalek::Signature = ed25519_dalek::Signer::sign(&sk, payload);
+        let sig: ed25519_dalek::Signature =
+            ed25519_dalek::Signer::sign(&sk, payload);
         let key = ReleaseTrustKey {
             meta: ReleaseKeyMeta {
                 key: ReleaseKeySection {
@@ -405,9 +401,7 @@ max_trust_class = "platform"
                     not_after: None,
                 },
                 authorisation: Authorisation {
-                    name_prefixes: vec![
-                        "org.evoframework.core.*".into(),
-                    ],
+                    name_prefixes: vec!["org.evoframework.core.*".into()],
                     max_trust_class:
                         evo_plugin_sdk::manifest::TrustClass::Platform,
                 },
@@ -443,10 +437,8 @@ max_trust_class = "platform"
                         evo_plugin_sdk::manifest::TrustClass::Standard,
                 },
             },
-            verifying_key: ed25519_dalek::SigningKey::from_bytes(
-                &[1u8; 32],
-            )
-            .verifying_key(),
+            verifying_key: ed25519_dalek::SigningKey::from_bytes(&[1u8; 32])
+                .verifying_key(),
             key_id: "x".into(),
         };
         let r = verify_release_signature(

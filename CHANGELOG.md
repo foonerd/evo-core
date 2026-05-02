@@ -15,6 +15,66 @@ artefacts. Consult the git log for pre-0.1.8 history.
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-05-02
+
+### Release
+
+- **Workspace** `version` in the root `Cargo.toml` is **0.1.12**; published as git tag **`v0.1.12`**.
+- Cross-architecture binaries (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf`) published to `foonerd/evo-core-artefacts` under `binaries/<target>/`. Each carries its `evo` and `evo-plugin-tool` binaries plus `build-info.toml`, an ed25519 detached signature, and a SHA-256 digest sidecar.
+
+### Added — wire protocol
+
+- **CBOR codec end-to-end on the plugin wire.** The handshake gains a `codec` negotiation field; `json` and `cbor` are both supported with `json` first in `SUPPORTED_CODECS` so the slow-path default stays text-debuggable. Once a codec is chosen at handshake, every post-handshake frame on that connection rides through the chosen encoder; format-aware byte serialization routes through `Deserializer::deserialize_any` so a single `PromptType::Freeform`-style helper handles JSON's array-of-integers and CBOR's byte-string forms transparently. Capabilities advertise `codec_negotiation`.
+- **Fast Path channel for hardware-input plugins.** A second listener at `/run/evo/fast.sock` accepts dispatches that bypass the slow-path frame queue. Per-warden `capabilities.warden.fast_path_verbs` declares which verbs the warden accepts on Fast Path; per-plugin `capabilities.fast_path` declares the plugin as a Fast Path sender; per-connection `fast_path_admin` capability gates the dispatch. Three gates compose; refusals carry stable subclass tokens (`not_fast_path_eligible`, `fast_path_budget_exceeded`, `fast_path_admin_not_granted`). The default Fast Path budget is 50 ms (manifest-declared up to 200 ms); slow-path course_correct continues to use the existing deadline. SDK exposes `FastPathDispatcher` for in-process plugins; OOP plugins reach the channel via the `WireFastPathDispatcher` adapter.
+- **Plugin-initiated user-interaction routing (prompts).** Plugins that declare `capabilities.user_interaction_responder` on a manifest call `request_user_interaction(PromptRequest)` via the `LoadContext::user_interaction_requester` handle; the framework parks the request on the new `PromptLedger`, routes it to the consumer connection holding `user_interaction_responder` (single-claimer, first-claimer-wins, RAII guard releases on disconnect), and resolves the plugin's awaiting future when the consumer answers via `answer_user_interaction` or `cancel_user_interaction`. Synthetic addressing scheme `evo-prompt`. 10 prompt-type variants on the SDK side: `Text`, `Password`, `Select`, `SelectWithOther`, `MultiSelect`, `Confirm`, `MultiField`, `ExternalRedirect`, `DateTime`, `Freeform`. Per-prompt timeout (default 60 s, max 24 h) with deadline tracking. Wire ops `list_user_interactions` / `answer_user_interaction` / `cancel_user_interaction` gated by `user_interaction_responder` capability.
+- **Flight-mode primitive.** New `FlightModeChanged` happening + `evo-plugin-tool admin flight {list,set,all}` CLI subcommands. Distributions own the per-class taxonomy (the framework imposes none); device plugins emit on hardware switch transitions; consuming plugins react per the framework-wide no-panic invariant.
+- **Time-driven instruction primitive (Appointments).** Plugins that declare `capabilities.appointments` schedule and cancel time-driven instructions via the `AppointmentScheduler` trait on `LoadContext`. Recurrence evaluator handles `OneShot` / `Daily` / `Weekdays` / `Weekends` / `Weekly` / `Monthly` / `Yearly` with DST-aware Local timezone semantics. Miss-policy gate (`Drop` / `CatchupWithinGrace` / `Catchup`) handles deferred fires from `Untrusted` clock states. RTC wake hook (`RtcWakeCallback`) lets distributions program the OS RTC for must-wake-device appointments. Wire ops `create_appointment` / `cancel_appointment` / `list_appointments` / `project_appointment` gated by `appointments_admin` capability.
+- **Condition-driven instruction primitive (Watches).** Plugins that declare `capabilities.watches` schedule and cancel condition-driven instructions via the `WatchScheduler` trait on `LoadContext`. Synthetic addressing scheme `evo-watch`. Condition vocabulary: `HappeningMatch`, `SubjectState`, `Composite { All / Any / Not }`. Predicates: `Equals`, `NotEquals`, `GreaterThan`, `LessThan`, `InRange`, `Hysteresis`, `Regex`. Edge / Level triggers (Level requires `cooldown_ms >= 1000`). Bus-subscription evaluator dispatches matching watches against the router; per-watch evaluation throttle (1000/s default) prevents action storm under runaway sensors. `HappeningMatch` and `Composite` over `HappeningMatch` terms evaluate fully; `SubjectState` predicates parse and persist but currently evaluate to non-match (the projection-engine path is not wired in this release). Wire ops `create_watch` / `cancel_watch` / `list_watches` / `project_watch` gated by `watches_admin` capability.
+- **Subject-grammar migration verbs.** `migrate_grammar_orphans` re-states orphan subjects under a declared catalogue type via the `Rename` strategy; per-subject atomic transactions mint a new canonical id and retire the old via a `TypeMigrated` alias. Foreground execution with batched commits (default 100 subjects/batch); `max_subjects` caps per-call work; `dry_run` returns a plan with target-type breakdown + first/last samples without mutating. `Map` and `Filter` strategies parse and validate but currently refuse with `strategy_not_yet_implemented` (their evaluators consume subject projections, which the runtime does not yet expose to the migration path). Sibling verbs `list_grammar_orphans` (read-only) and `accept_grammar_orphans` (record deliberate non-migration). All three gated by `grammar_admin` capability. Per-call admin-ledger receipt; per-subject `SubjectMigrated` happenings; per-batch `GrammarMigrationProgress` happenings.
+
+### Added — persistence
+
+- **Reconciliation last-known-good state (migration 010).** Per-pair `applied_state` JSON document persisted via `record_reconciliation_state`; re-issued to the warden on apply failure (rollback) and at boot (cross-restart resume). `forget_reconciliation_state` removes the row when the catalogue stops declaring the pair.
+- **Pending grammar orphans (migration 011).** `pending_grammar_orphans` table records the boot diagnostic's discoveries and any operator decisions taken against them. Status enum: `pending` / `migrating` / `resolved` / `accepted` / `recovered`. Six trait methods: `upsert_pending_grammar_orphan`, `mark_grammar_orphan_recovered`, `accept_grammar_orphan`, `mark_grammar_orphan_migrating`, `mark_grammar_orphan_resolved`, `list_pending_grammar_orphans`. SQLite + in-memory backends.
+- **Subject type migration primitive.** `record_subject_type_migration` performs one subject's atomic re-statement (insert new row, move addressings, retire old, write `type_migrated` alias, append claim_log) within one transaction. `AliasKind::TypeMigrated` joins the existing `Merged` / `Split` / `Tombstone` set.
+
+### Added — happenings
+
+- 9 new variants: `WatchFired`, `WatchMissed`, `WatchCancelled`, `WatchEvaluationThrottled`, `AppointmentApproaching`, `AppointmentFired`, `AppointmentMissed`, `AppointmentCancelled`, `FlightModeChanged`, `SubjectGrammarOrphan`, `SubjectMigrated`, `GrammarMigrationProgress`, `GrammarOrphansAccepted`. Wire forms + `from_happening` conversions. `affects_subject` taxonomy extended; `SubjectMigrated` matches against both `old_id` and `new_id`.
+
+### Added — bootstrap
+
+- **Boot diagnostic persists + emits.** The catalogue-orphan diagnostic now upserts every discovered orphan into `pending_grammar_orphans` (preserving any operator status), emits one durable `SubjectGrammarOrphan` happening per orphan type, and transitions re-declared types to `recovered`. Diagnostic moved to after bus construction so the emissions are observable.
+- **Engine receives runtimes before admission.** Run-loop reordered so `AppointmentRuntime` and `WatchRuntime` are constructed and stamped on the engine via `with_appointments` / `with_watches` BEFORE admission walks the catalogue. Plugins admitted at boot with `capabilities.appointments` / `capabilities.watches` see populated trait handles on their `LoadContext` at load time.
+
+### Added — SDK
+
+- **Manifest capability flags:** `capabilities.fast_path`, `capabilities.appointments`, `capabilities.watches` (default `false` each).
+- **`LoadContext` fields:** `fast_path_dispatcher`, `appointments`, `watches` (each `Option<Arc<dyn …>>`).
+- **Wire frames:** `RequestUserInteraction` / `RequestUserInteractionResponse` plugin-initiated round trip; `FastPathDispatch` / `FastPathDispatchResponse`.
+
+### Added — tooling
+
+- **`evo-plugin-tool admin grammar {list,plan,migrate,accept}`** subcommands wrap the three grammar verbs.
+- **`evo-plugin-tool admin flight {list,set,all}`** subcommands drive flight-mode classes via the operator surface.
+- **`evo-plugin-tool catalogue validate-shelf-schema`** validates per-shelf schema TOML files. Resolution cascade: `--schemas-path`, `$EVO_SCHEMAS_DIR`, `/usr/share/evo-catalogue-schemas/`.
+
+### Added — capabilities
+
+- New negotiable capabilities: `fast_path_admin`, `user_interaction_responder`, `appointments_admin`, `watches_admin`, `grammar_admin`. Each ships an ACL block in `client_acl.toml` mirroring the existing `plugins_admin` / `reconciliation_admin` shape.
+
+### Added — supported features
+
+- `subscribe_subject_push`, `rack_structural_projection`, `plugin_inventory`, `catalogue_resilience`, `clock_trust_signal`, `plugins_admin_lifecycle`, `operator_reload_verbs`, `reconciliation_pairs`, `user_interaction_routing`, `appointment_scheduling`, `condition_driven_watches`, `grammar_orphan_admin`, `codec_negotiation`.
+
+### Changed
+
+- **Catalogue schemas in-tree skeleton role narrowed.** `dist/catalogue/schemas/` retains only the `example/echo.v1.toml` worked example. Brand-neutral framework-tier shelves migrate to (or originate in) the spin-out `foonerd/evo-catalogue-schemas` repository.
+
+### Acceptance
+
+- Validated on aarch64 Linux (Raspberry Pi 5, 8 GB, Trixie 13.4): cross-compilation, persistence migration 011 against a populated v0.1.11 database, capability negotiation, end-to-end round-trip of every new wire op (`list_grammar_orphans`, `accept_grammar_orphans`, `migrate_grammar_orphans`, `create_appointment` / `cancel_appointment` / `list_appointments`, `create_watch` / `cancel_watch` / `list_watches`), and `evo-plugin-tool catalogue validate-shelf-schema` against the in-tree worked example.
+
 ## [0.1.11] - 2026-04-29
 
 ### Release
@@ -39,7 +99,7 @@ artefacts. Consult the git log for pre-0.1.8 history.
 - **Custody ledger durability.** Every custody handoff (`take_custody`, `course_correct`, `release_custody`, `mark_aborted`, `mark_degraded`) writes through to the SQLite `custodies` and `custody_state` tables in the same transaction that mutates the in-memory ledger. Boot rehydrates the ledger from the persisted rows so a steward restart preserves every active custody for live wardens to reason about.
 - **Relation graph durability.** Relation `assert`, `retract`, `forget`, `suppress`, and `unsuppress` paths write through to the SQLite `relations` and `relation_claimants` tables. Boot rehydrates the in-memory graph from the persisted rows.
 - **Admin ledger durability.** Every entry recorded into `AdminLedger` (forced-retract, merge, split, suppress, unsuppress) writes through to the SQLite `admin_log` table. Boot rehydrates the in-memory ledger so the audit surface survives restart.
-- **Subject identity write-through wired in production paths.** The wiring layer (`RegistrySubjectAnnouncer.{announce, retract}`, `RegistryInstanceAnnouncer.{announce, retract, retract_all_for_drain}`, `RegistrySubjectAdmin.{forced_retract_addressing, merge, split}`) now calls the matching `record_subject_*` trait methods after every in-memory mutation. Production construction sites attach the persistence handle via the `with_persistence` builders so the bus, the announcers, and the admin path share one handle. Closes the gap surfaced by hardware acceptance against `v0.1.10-rc.2` where in-memory state was correct but the SQLite tables were empty.
+- **Subject identity write-through wired in production paths.** The wiring layer (`RegistrySubjectAnnouncer.{announce, retract}`, `RegistryInstanceAnnouncer.{announce, retract, retract_all_for_drain}`, `RegistrySubjectAdmin.{forced_retract_addressing, merge, split}`) now calls the matching `record_subject_*` trait methods after every in-memory mutation. Production construction sites attach the persistence handle via the `with_persistence` builders so the bus, the announcers, and the admin path share one handle. Subject-identity state now survives steward restart end-to-end; previous releases mutated only the in-memory registry, leaving the SQLite tables empty.
 - **Factory happenings durability.** The factory plugin's three happening sites (`announce` success, `retract` success, drain retract) now use `bus.emit_durable(...).await` instead of fire-and-forget `bus.emit(...)`. Drain treats persistence failure as non-fatal so a failed write does not leak subjects on plugin unload. `happenings_log.MAX(seq)` now matches the wire `current_seq` after factory admission.
 
 ### Added — trust
@@ -49,7 +109,7 @@ artefacts. Consult the git log for pre-0.1.8 history.
 ### Added — distribution and CI
 
 - **Reference factory plugin bundle published.** The `org.evo.example.factory` bundle is staged and published per-arch alongside the existing `org.evo.example.echo` bundle. The publish workflow's bundle-staging stanza now covers both reference plugins.
-- **CI workflow modernisation.** `actions/checkout` v4 → v5, `actions/download-artifact` v6 → v8, `docker/setup-buildx-action` v3 → v4 across the publish workflow; manual repo-secrets smoke test added. Re-validated against the `v0.1.11-rc.3` publish run with zero workflow annotations across every matrix job.
+- **CI workflow modernisation.** `actions/checkout` v4 → v5, `actions/download-artifact` v6 → v8, `docker/setup-buildx-action` v3 → v4 across the publish workflow; manual repo-secrets smoke test added. Publish run completes with zero workflow annotations across every matrix job.
 
 ### Added — documentation and tooling
 
@@ -95,7 +155,7 @@ artefacts. Consult the git log for pre-0.1.8 history.
 
 ### Added — admission
 
-- **`evo-plugin-tool install` `--chown` discipline.** The tool now defaults to chowning bundle files to the configured `[plugins.security.runtime_user]` when invoked under `sudo`, with an opt-out flag for the legacy root-owned path. Closes the friction the v0.1.10-rc.2 acceptance test surfaced where the steward (running as a non-root service user) could not read its own root-owned plugin bundles.
+- **`evo-plugin-tool install` `--chown` discipline.** The tool now defaults to chowning bundle files to the configured `[plugins.security.runtime_user]` when invoked under `sudo`, with an opt-out flag for the legacy root-owned path. A steward running as a non-root service user can now read its own bundle files without manual chown, closing a friction with the prior root-owned default.
 - **Default `runtime_dir` creation.** The steward creates `/run/evo` on boot when missing rather than refusing to start. systemd's `RuntimeDirectory=evo` (per `dist/systemd/evo.service.example`) handles this for service deployments; foreground/manual runs no longer require the operator to create the directory by hand.
 
 ### Acceptance
@@ -138,7 +198,7 @@ artefacts. Consult the git log for pre-0.1.8 history.
 ### Changed
 - **`SubjectQueryResult` enum is `#[non_exhaustive]`.** Future variants land without breaking source compatibility for consumers with a catch-all match arm. Existing `Found`, `Aliased`, `NotFound` are unchanged.
 - **`TrustClass` enum is `#[non_exhaustive]`.** Same reasoning — future trust classes can be added without source-breaking consumers.
-- **Public engineering docs and source rustdoc strip internal-rationale citations.** Vendor-facing `docs/engineering/CLIENT_API.md`, `HAPPENINGS.md`, `SCHEMAS.md`, plus all crate rustdoc, SQL migrations, integration-test assertion messages, and `Cargo.toml` comments no longer cite internal design-decision artefacts. Public surfaces embody decisions; the rationale they record lives in maintainer-only artefacts. Verified by an end-to-end audit.
+- **Public engineering docs and source rustdoc carry no out-of-tree citations.** Vendor-facing `docs/engineering/CLIENT_API.md`, `HAPPENINGS.md`, `SCHEMAS.md`, plus all crate rustdoc, SQL migrations, integration-test assertion messages, and `Cargo.toml` comments are descriptive: they state what the framework requires and how it behaves, without referring to artefacts that live outside the repository. Verified by an end-to-end audit.
 
 ### Added — testing and tooling
 - **Loom and property tests pinning router lock discipline.** Loom tests exercise the router's read-clone-drop sequence under cooperative scheduling; proptest covers the `WireClient` pending-map pattern. Both run on a separate workspace member to keep loom's `cfg(loom)` rustflag scoped.
@@ -292,13 +352,11 @@ artefacts. Consult the git log for pre-0.1.8 history.
  gap Phase 3. `docs/engineering/RELATIONS.md` section 11.2
  ("Location") rewritten from the stale `/var/lib/evo/relations/` path
  to the same redirect. `docs/engineering/CUSTODY.md` section 11.1
- ("Persistence") rewritten from a three-option deferred-design table
- (steward-owned vs plugin-owned vs hybrid) to a concrete statement:
- the ledger is persisted alongside subject and relation state in
+ ("Persistence") rewritten as a concrete statement: the ledger is
+ persisted alongside subject and relation state in
  `/var/lib/evo/state/evo.db`, write-through on every `record_custody`
  / `record_state` / `release_custody`, rehydrated from the database
- on startup; implementation tracked by gap. The three rejected
- options are removed; the design picks steward-owned with write-through,
+ on startup. The design is steward-owned with write-through,
  and the `STEWARD.md` section 12.3 cross-reference (which pointed at
  the deferred discussion) is dropped. `docs/engineering/BOUNDARY.md`
  section 9 filesystem footprint table: the single
@@ -344,8 +402,7 @@ artefacts. Consult the git log for pre-0.1.8 history.
  visibly stale. Gap stays OPEN: design settled, code not yet
  landed.
 - **Phase 3 Predicate existence validation at assertion**: gap RESOLVED (IMPLEMENTED predicate-existence half + OUT OF SCOPE
- type-constraint half, deferred to a follow-up after gap grounds
- subject types). `RegistryRelationAnnouncer` in
+ type-constraint half, which awaits subject-type grounding). `RegistryRelationAnnouncer` in
  `crates/evo/src/context.rs` now holds an `Arc<Catalogue>` and
  validates every assertion and retraction's predicate name against
  `Catalogue::find_predicate` before touching the subject registry or
