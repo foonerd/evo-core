@@ -36,18 +36,17 @@ flowchart TD
     Q1 -->|hold sustained work| W{How many<br/>instances?}
 
     R -->|one forever| SR[<b>Singleton<br/>Respondent</b><br/><i>easiest start</i>]
-    R -->|many, event-driven| FR[Factory<br/>Respondent<br/><i>reserved</i>]
+    R -->|many, event-driven| FR[<b>Factory<br/>Respondent</b>]
     W -->|one forever| SW[<b>Singleton<br/>Warden</b>]
-    W -->|many, event-driven| FW[Factory<br/>Warden<br/><i>reserved</i>]
+    W -->|many, event-driven| FW[<b>Factory<br/>Warden</b>]
 
     SR --> T{Transport?}
     SW --> T
+    FR --> T
+    FW --> T
 
     T -->|same process<br/>Rust only<br/>lowest latency| IP[<b>in-process</b>]
     T -->|separate process<br/>any language<br/>isolation| WT[<b>wire</b>]
-
-    style FR stroke-dasharray: 5 5
-    style FW stroke-dasharray: 5 5
 ```
 
 In prose:
@@ -57,7 +56,7 @@ In prose:
 - **Factory Respondent**. Your instances come and go driven by external events; each instance answers requests. Examples: a USB-collection reader (one instance per connected USB drive), a discovered-peer responder (one instance per peer).
 - **Factory Warden**. Your instances come and go, and each holds sustained work. Rarer; a per-connected-client streaming session might fit.
 
-Factory admission is reserved in evo-core (`STEWARD.md` section 12.7); the steward refuses `kind.instance = "factory"` at validation, and the `[capabilities.factory]` manifest block is parsed but not yet acted on. Singleton is the only supported instance shape today. This document covers Singleton Respondent and Singleton Warden; the factory shapes will follow the same tutorial once admission accepts them.
+Factory admission is implemented in evo-core (`STEWARD.md` section 12.7): the steward accepts `kind.instance = "factory"` manifests on the in-process and out-of-process paths, the `[capabilities.factory]` manifest block carries the factory's announce / retract surface, and each announced instance becomes a subject under the `evo-factory-instance` addressing scheme keyed by `<plugin>/<instance_id>`. The reference factory plugin (`crates/evo-example-factory`) ships as both an in-process example and a published out-of-process bundle. Plugin requests carry an `instance_id: Option<String>` field that selects which factory-managed instance receives the request; shutdown drains every announced instance before per-plugin unload. This document focuses on Singleton Respondent and Singleton Warden because they are the most common starting shapes; the factory variants share the same trait surface plus the announcer / retractor verbs documented in section 6b.
 
 Orthogonal to the kind, you choose a transport:
 
@@ -656,7 +655,7 @@ exec = "<compiled-in>"
 class = "standard"
 
 [prerequisites]
-evo_min_version = "0.1.10"
+evo_min_version = "0.1.12"
 os_family = "linux"
 outbound_network = false
 filesystem_scopes = []

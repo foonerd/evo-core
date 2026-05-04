@@ -166,7 +166,7 @@ Length-prefixed JSON:
 [4-byte big-endian length] [length bytes of UTF-8 JSON]
 ```
 
-Frames above 1 MiB are rejected as `Dispatch("frame too large")`. Zero-length frames are rejected as `Dispatch("zero-length frame")`.
+Frames above 64 MiB are rejected as `Dispatch("frame too large")`. Zero-length frames are rejected as `Dispatch("zero-length frame")`. The 64 MiB cap matches the absolute hard ceiling on `prepare_for_live_reload` state blobs (`MAX_LIVE_RELOAD_BLOB_BYTES`), so any blob the framework's admission would admit can also cross the wire.
 
 ### 6.2 Request Shapes
 
@@ -329,7 +329,7 @@ The steward is asynchronous and single-process. Its concurrency primitives:
 | `tokio::sync::broadcast` | Happenings bus. Multiple consumers, each sees every happening emitted after subscribing; slow consumers get `Lagged` errors and recover. |
 | `tokio::spawn` | Accept loop task, per-connection handler tasks, per-plugin reader/writer tasks for out-of-process plugins. |
 
-The admission engine's mutex serialises admission and shutdown. Request dispatch lives on the `PluginRouter` (`crates/evo/src/router.rs`) so per-request handling does not need to take the admission mutex; admission and shutdown serialise but request dispatch does not block on either. High-frequency warden state reports flow through the same path, with the fast path (`FAST_PATH.md`) reserved for the real-time mutation channel.
+The admission engine's mutex serialises admission and shutdown. Request dispatch lives on the `PluginRouter` (`crates/evo/src/router.rs`) so per-request handling does not need to take the admission mutex; admission and shutdown serialise but request dispatch does not block on either. High-frequency warden state reports flow through the same path; the fast path (`FAST_PATH.md`) is the dedicated real-time mutation channel and runs alongside the slow-path control socket.
 
 Out-of-process plugin shutdown is serial: one plugin at a time. For a handful of plugins this is fine; for larger plugin sets it will need parallelisation (section 12.1).
 
@@ -382,11 +382,11 @@ The catalogue is a TOML document declaring racks, shelves, slots, and the relati
 
 Catalogue validation runs at steward startup. Malformed catalogues refuse startup with a specific error naming the offending declaration. The steward never writes the catalogue.
 
-## 12. Reserved Capabilities
+## 12. Capability Status
 
-These are documented in `CONCEPT.md` as fabric-level concepts but are not yet part of the steward's runtime. Each is named here so a follow-on engineering doc can pick it up.
+`CONCEPT.md` enumerates the fabric-level capabilities of the steward. This section reports their implementation status today: which are fully shipped, which are partially shipped (and what remains), and which are still on the roadmap.
 
-Since this document was first authored the following capabilities have shipped: warden admission (in-process and wire), the custody ledger, the custody state reporter, `list_active_custodies` on the client socket, the happenings bus (with custody and subject/relation variants), the `subscribe_happenings` streaming op with replay cursors, the SQLite persistence backend covering subjects/addressings/aliases/claim-log/happenings/pending-conflicts, the unified `ErrorClass` taxonomy on the wire, claimant-token resolution gated by client ACL, and the boot-time orphan diagnostic that diffs persisted subject types against the catalogue.
+Since this document was first authored the following capabilities have shipped: warden admission (in-process and wire), the custody ledger, the custody state reporter, `list_active_custodies` on the client socket, the happenings bus (with custody and subject/relation variants), the `subscribe_happenings` streaming op with replay cursors, the SQLite persistence backend covering subjects/addressings/aliases/claim-log/happenings/pending-conflicts, the unified `ErrorClass` taxonomy on the wire, claimant-token resolution gated by client ACL, and the boot-time orphan diagnostic that diffs persisted subject types against the catalogue. Subsequent waves added the time-driven and condition-driven instruction primitives (Appointments + Watches), the Fast Path real-time mutation channel, plugin-initiated user-interaction routing (prompts), factory-instance admission, and the operator-facing reload + grammar-migration verbs — each described below at the implementation depth it has reached.
 
 ### 12.1 Appointments and Watches
 

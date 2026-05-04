@@ -70,15 +70,17 @@ use crate::codec::{
     WireError,
 };
 use crate::contract::{
-    AliasRecord, Assignment, CallDeadline, CourseCorrection, CustodyHandle,
+    AliasRecord, AppointmentAction, AppointmentId, AppointmentScheduler,
+    AppointmentSpec, Assignment, CallDeadline, CourseCorrection, CustodyHandle,
     CustodyStateReporter, ExplicitRelationAssignment, ExternalAddressing,
-    FastPathDispatcher, HealthStatus, InstanceAnnouncement, InstanceAnnouncer,
-    InstanceId, LoadContext, Plugin, PluginError, PromptOutcome, PromptRequest,
-    RelationAdmin, RelationAnnouncer, RelationAssertion, RelationRetraction,
-    ReportError, ReportPriority, Request, Respondent, SplitRelationStrategy,
-    StateBlob, StateReporter, SubjectAdmin, SubjectAnnouncement,
-    SubjectAnnouncer, SubjectQuerier, SubjectQueryResult,
-    UserInteractionRequester, Warden,
+    FastPathDispatcher, HappeningEmitter, HealthStatus, InstanceAnnouncement,
+    InstanceAnnouncer, InstanceId, LoadContext, Plugin, PluginError,
+    PromptOutcome, PromptRequest, RelationAdmin, RelationAnnouncer,
+    RelationAssertion, RelationRetraction, ReportError, ReportPriority,
+    Request, Respondent, SplitRelationStrategy, StateBlob, StateReporter,
+    SubjectAdmin, SubjectAnnouncement, SubjectAnnouncer, SubjectQuerier,
+    SubjectQueryResult, UserInteractionRequester, Warden, WatchAction, WatchId,
+    WatchScheduler, WatchSpec,
 };
 use crate::error_taxonomy::ErrorClass;
 use crate::wire::{LiveReloadState, WireFrame, PROTOCOL_VERSION};
@@ -513,6 +515,16 @@ where
         };
         match item {
             ReaderItem::Request(frame) => {
+                // Per LOGGING.md §2 (each verb invocation fires at
+                // debug): plugin-side dispatch_loop sees every wire
+                // request from the steward; emit a debug per frame
+                // so an operator running with debug enabled sees
+                // the OOP plugin's view of incoming verbs.
+                tracing::debug!(
+                    plugin = %config.plugin_name,
+                    frame_variant = std::any::type_name_of_val(&*frame),
+                    "plugin host: dispatching wire request frame"
+                );
                 let response = handle_frame(
                     &mut plugin,
                     *frame,
@@ -879,6 +891,7 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::ReportState { .. } => "report_state",
         WireFrame::AnnounceSubject { .. } => "announce_subject",
         WireFrame::RetractSubject { .. } => "retract_subject",
+        WireFrame::UpdateSubjectState { .. } => "update_subject_state",
         WireFrame::AssertRelation { .. } => "assert_relation",
         WireFrame::RetractRelation { .. } => "retract_relation",
         WireFrame::ReportCustodyState { .. } => "report_custody_state",
@@ -887,6 +900,10 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::DescribeSubject { .. } => "describe_subject",
         WireFrame::DescribeSubjectResponse { .. } => {
             "describe_subject_response"
+        }
+        WireFrame::ResolveAddressing { .. } => "resolve_addressing",
+        WireFrame::ResolveAddressingResponse { .. } => {
+            "resolve_addressing_response"
         }
         WireFrame::Error { .. } => "error",
         WireFrame::EventAck { .. } => "event_ack",
@@ -927,6 +944,22 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::RequestUserInteraction { .. } => "request_user_interaction",
         WireFrame::RequestUserInteractionResponse { .. } => {
             "request_user_interaction_response"
+        }
+        WireFrame::CreateAppointment { .. } => "create_appointment",
+        WireFrame::CreateAppointmentResponse { .. } => {
+            "create_appointment_response"
+        }
+        WireFrame::CancelAppointment { .. } => "cancel_appointment",
+        WireFrame::CancelAppointmentResponse { .. } => {
+            "cancel_appointment_response"
+        }
+        WireFrame::CreateWatch { .. } => "create_watch",
+        WireFrame::CreateWatchResponse { .. } => "create_watch_response",
+        WireFrame::CancelWatch { .. } => "cancel_watch",
+        WireFrame::CancelWatchResponse { .. } => "cancel_watch_response",
+        WireFrame::EmitPluginEvent { .. } => "emit_plugin_event",
+        WireFrame::EmitPluginEventResponse { .. } => {
+            "emit_plugin_event_response"
         }
     }
 }
@@ -1009,6 +1042,13 @@ fn build_load_context(
             pending: Arc::clone(&pending),
             plugin_name: plugin_name.to_string(),
         });
+    let happening_emitter: Arc<dyn HappeningEmitter> =
+        Arc::new(WireHappeningEmitter {
+            tx: tx.clone(),
+            event_cid: event_cid.clone(),
+            pending: Arc::clone(&pending),
+            plugin_name: plugin_name.to_string(),
+        });
     let subject_announcer: Arc<dyn SubjectAnnouncer> =
         Arc::new(WireSubjectAnnouncer {
             tx: tx.clone(),
@@ -1067,9 +1107,9 @@ fn build_load_context(
     // `ReportError::Invalid`.
     let fast_path_dispatcher: Arc<dyn FastPathDispatcher> =
         Arc::new(WireFastPathDispatcher {
-            tx,
-            event_cid,
-            pending,
+            tx: tx.clone(),
+            event_cid: event_cid.clone(),
+            pending: Arc::clone(&pending),
             plugin_name: plugin_name.to_string(),
         });
 
@@ -1084,6 +1124,7 @@ fn build_load_context(
         state_reporter,
         instance_announcer,
         user_interaction_requester,
+        happening_emitter,
         subject_announcer,
         relation_announcer,
         // Wire plugins receive a wire-backed querier that round-trips
@@ -1093,16 +1134,31 @@ fn build_load_context(
         subject_admin: Some(subject_admin),
         relation_admin: Some(relation_admin),
         fast_path_dispatcher: Some(fast_path_dispatcher),
-        // Appointments wire-backed scheduler lands in a
-        // follow-up commit alongside the wire ops; until then
-        // OOP plugins see None and cannot create appointments
-        // through the SDK surface.
-        appointments: None,
-        // Watches wire-backed scheduler lands in a follow-up
-        // commit alongside the wire ops; until then OOP plugins
-        // see None and cannot create watches through the SDK
-        // surface.
-        watches: None,
+        // Wire-backed appointment scheduler. Mirrors the
+        // WireFastPathDispatcher pattern: send a
+        // `Create/CancelAppointment` frame, await the matching
+        // response on a per-cid oneshot, surface refusals as
+        // ReportError. The framework decides at admission time
+        // whether the plugin's manifest declared
+        // `capabilities.appointments = true`; plugins that did
+        // not opt in observe the gate at the steward end (the
+        // server-side handler refuses with a structured Error
+        // frame), so this slot is always populated for OOP
+        // plugins.
+        appointments: Some(Arc::new(WireAppointmentScheduler {
+            tx: tx.clone(),
+            event_cid: event_cid.clone(),
+            pending: Arc::clone(&pending),
+            plugin_name: plugin_name.to_string(),
+        }) as Arc<dyn AppointmentScheduler>),
+        // Wire-backed watch scheduler. Same shape as the
+        // appointment scheduler above.
+        watches: Some(Arc::new(WireWatchScheduler {
+            tx: tx.clone(),
+            event_cid: event_cid.clone(),
+            pending: Arc::clone(&pending),
+            plugin_name: plugin_name.to_string(),
+        }) as Arc<dyn WatchScheduler>),
     })
 }
 
@@ -1314,6 +1370,28 @@ impl SubjectAnnouncer for WireSubjectAnnouncer {
             await_event_response(&tx, &pending, cid, frame).await
         })
     }
+
+    fn update_state<'a>(
+        &'a self,
+        addressing: ExternalAddressing,
+        state: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
+        let plugin = self.plugin_name.clone();
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let frame = WireFrame::UpdateSubjectState {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                addressing,
+                state,
+            };
+            await_event_response(&tx, &pending, cid, frame).await
+        })
+    }
 }
 
 /// Relation announcer that pushes frames into the wire event channel
@@ -1459,6 +1537,49 @@ impl SubjectQuerier for WireSubjectQuerier {
                 Ok(WireFrame::DescribeSubjectResponse { result, .. }) => {
                     Ok(result)
                 }
+                Ok(WireFrame::Error { message, .. }) => {
+                    Err(ReportError::Invalid(message))
+                }
+                Ok(other) => Err(ReportError::Invalid(format!(
+                    "unexpected response frame: {}",
+                    variant_name(&other)
+                ))),
+                Err(_) => Err(ReportError::ShuttingDown),
+            }
+        })
+    }
+
+    fn resolve_addressing<'a>(
+        &'a self,
+        addressing: ExternalAddressing,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<String>, ReportError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let tx = self.tx.clone();
+        let plugin = self.plugin_name.clone();
+        let pending = Arc::clone(&self.pending);
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let rx = register_pending(&pending, cid);
+            let frame = WireFrame::ResolveAddressing {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                addressing,
+            };
+            if tx.send(frame).await.is_err() {
+                remove_pending(&pending, cid);
+                return Err(ReportError::ShuttingDown);
+            }
+            match rx.await {
+                Ok(WireFrame::ResolveAddressingResponse {
+                    canonical_id,
+                    ..
+                }) => Ok(canonical_id),
                 Ok(WireFrame::Error { message, .. }) => {
                     Err(ReportError::Invalid(message))
                 }
@@ -1800,6 +1921,239 @@ impl FastPathDispatcher for WireFastPathDispatcher {
     }
 }
 
+/// Wire-backed [`HappeningEmitter`]. Mints a fresh cid, registers
+/// a pending oneshot, sends a [`WireFrame::EmitPluginEvent`] to
+/// the steward, and awaits the matching `EmitPluginEventResponse`
+/// (success) or `Error` (refusal) on the oneshot.
+struct WireHappeningEmitter {
+    tx: mpsc::Sender<WireFrame>,
+    event_cid: Arc<AtomicU64>,
+    pending: Arc<Mutex<PendingMap>>,
+    plugin_name: String,
+}
+
+impl HappeningEmitter for WireHappeningEmitter {
+    fn emit_plugin_event<'a>(
+        &'a self,
+        event_type: String,
+        payload: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
+        let plugin = self.plugin_name.clone();
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let rx = register_pending(&pending, cid);
+            let frame = WireFrame::EmitPluginEvent {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                event_type,
+                payload,
+            };
+            if tx.send(frame).await.is_err() {
+                remove_pending(&pending, cid);
+                return Err(ReportError::ShuttingDown);
+            }
+            match rx.await {
+                Ok(WireFrame::EmitPluginEventResponse { .. }) => Ok(()),
+                Ok(WireFrame::Error { message, .. }) => {
+                    Err(ReportError::Invalid(message))
+                }
+                Ok(other) => Err(ReportError::Invalid(format!(
+                    "unexpected response frame: {}",
+                    variant_name(&other)
+                ))),
+                Err(_) => Err(ReportError::ShuttingDown),
+            }
+        })
+    }
+}
+
+/// Wire-backed [`AppointmentScheduler`]. Mints a fresh cid,
+/// registers a pending oneshot, sends a
+/// [`WireFrame::CreateAppointment`] / [`WireFrame::CancelAppointment`]
+/// frame, and awaits the matching response (carrying the
+/// minted [`AppointmentId`] for create) or [`WireFrame::Error`]
+/// on the oneshot.
+///
+/// Refusals propagate as [`ReportError::Invalid`] carrying the
+/// steward-side error message verbatim.
+struct WireAppointmentScheduler {
+    tx: mpsc::Sender<WireFrame>,
+    event_cid: Arc<AtomicU64>,
+    pending: Arc<Mutex<PendingMap>>,
+    plugin_name: String,
+}
+
+impl AppointmentScheduler for WireAppointmentScheduler {
+    fn create_appointment<'a>(
+        &'a self,
+        spec: AppointmentSpec,
+        action: AppointmentAction,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<AppointmentId, ReportError>> + Send + 'a,
+        >,
+    > {
+        let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
+        let plugin = self.plugin_name.clone();
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let rx = register_pending(&pending, cid);
+            let frame = WireFrame::CreateAppointment {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                spec,
+                action,
+            };
+            if tx.send(frame).await.is_err() {
+                remove_pending(&pending, cid);
+                return Err(ReportError::ShuttingDown);
+            }
+            match rx.await {
+                Ok(WireFrame::CreateAppointmentResponse {
+                    appointment_id,
+                    ..
+                }) => Ok(appointment_id),
+                Ok(WireFrame::Error { message, .. }) => {
+                    Err(ReportError::Invalid(message))
+                }
+                Ok(other) => Err(ReportError::Invalid(format!(
+                    "unexpected response frame: {}",
+                    variant_name(&other)
+                ))),
+                Err(_) => Err(ReportError::ShuttingDown),
+            }
+        })
+    }
+
+    fn cancel_appointment<'a>(
+        &'a self,
+        id: AppointmentId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
+        let plugin = self.plugin_name.clone();
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let rx = register_pending(&pending, cid);
+            let frame = WireFrame::CancelAppointment {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                appointment_id: id,
+            };
+            if tx.send(frame).await.is_err() {
+                remove_pending(&pending, cid);
+                return Err(ReportError::ShuttingDown);
+            }
+            match rx.await {
+                Ok(WireFrame::CancelAppointmentResponse { .. }) => Ok(()),
+                Ok(WireFrame::Error { message, .. }) => {
+                    Err(ReportError::Invalid(message))
+                }
+                Ok(other) => Err(ReportError::Invalid(format!(
+                    "unexpected response frame: {}",
+                    variant_name(&other)
+                ))),
+                Err(_) => Err(ReportError::ShuttingDown),
+            }
+        })
+    }
+}
+
+/// Wire-backed [`WatchScheduler`]. Mirrors
+/// [`WireAppointmentScheduler`]; the framework's two scheduling
+/// primitives share their wire shape because their SDK trait
+/// surface is symmetric.
+struct WireWatchScheduler {
+    tx: mpsc::Sender<WireFrame>,
+    event_cid: Arc<AtomicU64>,
+    pending: Arc<Mutex<PendingMap>>,
+    plugin_name: String,
+}
+
+impl WatchScheduler for WireWatchScheduler {
+    fn create_watch<'a>(
+        &'a self,
+        spec: WatchSpec,
+        action: WatchAction,
+    ) -> Pin<Box<dyn Future<Output = Result<WatchId, ReportError>> + Send + 'a>>
+    {
+        let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
+        let plugin = self.plugin_name.clone();
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let rx = register_pending(&pending, cid);
+            let frame = WireFrame::CreateWatch {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                spec,
+                action,
+            };
+            if tx.send(frame).await.is_err() {
+                remove_pending(&pending, cid);
+                return Err(ReportError::ShuttingDown);
+            }
+            match rx.await {
+                Ok(WireFrame::CreateWatchResponse { watch_id, .. }) => {
+                    Ok(watch_id)
+                }
+                Ok(WireFrame::Error { message, .. }) => {
+                    Err(ReportError::Invalid(message))
+                }
+                Ok(other) => Err(ReportError::Invalid(format!(
+                    "unexpected response frame: {}",
+                    variant_name(&other)
+                ))),
+                Err(_) => Err(ReportError::ShuttingDown),
+            }
+        })
+    }
+
+    fn cancel_watch<'a>(
+        &'a self,
+        id: WatchId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
+        let plugin = self.plugin_name.clone();
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let rx = register_pending(&pending, cid);
+            let frame = WireFrame::CancelWatch {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                watch_id: id,
+            };
+            if tx.send(frame).await.is_err() {
+                remove_pending(&pending, cid);
+                return Err(ReportError::ShuttingDown);
+            }
+            match rx.await {
+                Ok(WireFrame::CancelWatchResponse { .. }) => Ok(()),
+                Ok(WireFrame::Error { message, .. }) => {
+                    Err(ReportError::Invalid(message))
+                }
+                Ok(other) => Err(ReportError::Invalid(format!(
+                    "unexpected response frame: {}",
+                    variant_name(&other)
+                ))),
+                Err(_) => Err(ReportError::ShuttingDown),
+            }
+        })
+    }
+}
+
 /// Register a oneshot for `cid` in the pending map and return the
 /// receiver half. The dispatch loop's [`route_pending_response`]
 /// looks up `cid` and forwards the response frame on the matching
@@ -2062,6 +2416,15 @@ where
         };
         match item {
             ReaderItem::Request(frame) => {
+                // Per LOGGING.md §2: warden-side dispatch_loop sees
+                // every wire request from the steward (take_custody,
+                // course_correct, release_custody, lifecycle verbs);
+                // emit a debug per frame.
+                tracing::debug!(
+                    plugin = %config.plugin_name,
+                    frame_variant = std::any::type_name_of_val(&*frame),
+                    "plugin host (warden): dispatching wire request frame"
+                );
                 let response = handle_warden_frame(
                     &mut plugin,
                     *frame,

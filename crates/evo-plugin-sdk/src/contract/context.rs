@@ -198,6 +198,21 @@ pub struct LoadContext {
     /// semantics.
     pub relation_admin: Option<Arc<dyn RelationAdmin>>,
 
+    /// Handle for plugin-authored happening emission via the
+    /// framework's bus.
+    ///
+    /// Always populated. Plugins emit `Happening::PluginEvent`
+    /// instances via [`HappeningEmitter::emit_plugin_event`]; the
+    /// framework stamps the plugin name (the wire connection
+    /// knows it; in-process plugins inherit it from the
+    /// router-backed emitter) and routes through
+    /// `bus.emit_durable`. The closed-set framework variants
+    /// (FlightModeChanged, AppointmentFired, WatchFired, etc.)
+    /// remain framework-authoritative — emitted by the framework
+    /// on dispatch hooks, not by plugins. Plugins author their
+    /// own taxonomy under PluginEvent's `event_type` namespace.
+    pub happening_emitter: Arc<dyn HappeningEmitter>,
+
     /// Handle for plugin-initiated time-driven instructions
     /// (appointments).
     ///
@@ -262,6 +277,7 @@ impl std::fmt::Debug for LoadContext {
                 "user_interaction_requester",
                 &"<Arc<dyn UserInteractionRequester>>",
             )
+            .field("happening_emitter", &"<Arc<dyn HappeningEmitter>>")
             .field("subject_announcer", &"<Arc<dyn SubjectAnnouncer>>")
             .field("relation_announcer", &"<Arc<dyn RelationAnnouncer>>")
             .field(
@@ -1015,6 +1031,19 @@ pub enum AppointmentRecurrence {
         /// Five-field cron expression (`min hour dom mon dow`).
         expr: String,
     },
+    /// Fire every `interval_ms` milliseconds, starting one
+    /// interval after the appointment is scheduled. The
+    /// `time` and `zone` fields are unused by this variant —
+    /// the recurrence is computed from wall-clock arithmetic on
+    /// the millisecond timeline rather than the calendar walk
+    /// the structured variants use. Suitable for short-period
+    /// sensor polling where the appointment is the simplest
+    /// surface and a watch-driven alternative would be heavier.
+    Periodic {
+        /// Period between fires in milliseconds. Must be
+        /// greater than zero; zero is refused at create time.
+        interval_ms: u64,
+    },
 }
 
 /// Time-zone interpretation for the appointment's fire time.
@@ -1151,6 +1180,42 @@ pub enum AppointmentState {
     /// recurring entries that cancel mid-cycle do not fire
     /// again.
     Cancelled,
+}
+
+/// Callback trait: plugin authors a `Happening::PluginEvent`
+/// over the framework's bus.
+///
+/// Always populated on the [`LoadContext`] (no manifest
+/// capability flag gates this surface — `PluginEvent` is open to
+/// every plugin by design). The plugin name is implicit: the
+/// wire connection identifies the emitter on OOP plugins; the
+/// router-backed in-process implementation is constructed bound
+/// to the plugin's canonical name.
+///
+/// `event_type` is plugin-defined and stable per plugin
+/// (changes to a plugin's `event_type` vocabulary are a breaking
+/// change for the plugin's downstream consumers). The
+/// framework does not interpret `event_type` or the payload;
+/// it routes both verbatim through `bus.emit_durable`.
+///
+/// Closed-set framework variants (FlightModeChanged,
+/// AppointmentFired, WatchFired, …) stay framework-authoritative
+/// and are NOT emittable through this trait. Plugin-authored
+/// "the airplane button was pressed" events ride
+/// `event_type = "flight_mode_changed"` (or similar) under
+/// PluginEvent; consumer-side dissemination distinguishes the
+/// authoritative framework emission from plugin reports via the
+/// variant kind.
+pub trait HappeningEmitter: Send + Sync {
+    /// Emit a `Happening::PluginEvent` with the supplied
+    /// `event_type` and JSON payload. Returns `Ok(())` on durable
+    /// write; `Err(ReportError)` on framework-level failures
+    /// (steward shutting down, no bus configured, etc.).
+    fn emit_plugin_event<'a>(
+        &'a self,
+        event_type: String,
+        payload: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
 }
 
 /// Callback trait: plugin schedules time-driven instructions.
@@ -1574,6 +1639,31 @@ pub trait SubjectAnnouncer: Send + Sync {
         addressing: ExternalAddressing,
         reason: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
+
+    /// Publish a new runtime-state value for a subject the plugin
+    /// previously announced.
+    ///
+    /// The addressing identifies the subject; the steward resolves it
+    /// to a canonical id and stores `state` on the subject's record.
+    /// Subsequent projections see the updated value through
+    /// `SubjectProjection.state`.
+    ///
+    /// State is structured but free-form: the steward does not
+    /// validate `state` against the catalogue, the same way it does
+    /// not validate addressings beyond declared subject types. The
+    /// emitted `SubjectStateChanged` happening carries the previous
+    /// and new values so a watch evaluator can compute predicates
+    /// without an extra projection round-trip.
+    ///
+    /// Returns `ReportError::Invalid` if the addressing does not
+    /// resolve to a known subject. Plugins MAY update state for any
+    /// subject they have a claim on; cross-plugin updates without
+    /// claim are rejected the same as `retract`.
+    fn update_state<'a>(
+        &'a self,
+        addressing: ExternalAddressing,
+        state: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
 }
 
 /// Callback trait: alias-aware subject lookup.
@@ -1632,6 +1722,30 @@ pub trait SubjectQuerier: Send + Sync {
     ) -> Pin<
         Box<
             dyn Future<Output = Result<SubjectQueryResult, ReportError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Resolve an external addressing to its canonical subject id.
+    ///
+    /// Returns `Ok(Some(canonical_id))` when the addressing is in
+    /// the registry, `Ok(None)` when it is unknown. The plugin
+    /// uses this to discover the steward-minted canonical id of a
+    /// subject it just announced — required for authoring
+    /// `WatchCondition::SubjectState { canonical_id, .. }`
+    /// watches on the plugin's own subjects.
+    ///
+    /// The resolution does not follow alias chains: a retired
+    /// addressing returns `None`. Callers that need alias
+    /// awareness pair this with
+    /// [`describe_subject_with_aliases`](Self::describe_subject_with_aliases).
+    fn resolve_addressing<'a>(
+        &'a self,
+        addressing: ExternalAddressing,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<String>, ReportError>>
                 + Send
                 + 'a,
         >,

@@ -81,6 +81,9 @@ pub mod manifest;
 #[cfg(feature = "contract")]
 pub mod contract;
 
+#[cfg(feature = "privileges")]
+pub mod privileges;
+
 #[cfg(feature = "wire")]
 pub mod codec;
 #[cfg(feature = "wire")]

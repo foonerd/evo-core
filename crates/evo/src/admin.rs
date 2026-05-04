@@ -310,6 +310,15 @@ impl AdminLedger {
         &self,
         entry: AdminLogEntry,
     ) -> Result<(), PersistenceError> {
+        // Per LOGGING.md §2: admin ledger append is a verb-shaped
+        // audit operation triggered by admin-plugin actions; debug
+        // is the right depth for the audit trail.
+        tracing::debug!(
+            admin_plugin = %entry.admin_plugin,
+            kind = ?entry.kind,
+            target_plugin = ?entry.target_plugin,
+            "admin ledger: record"
+        );
         if let Some(store) = self.persistence.as_ref() {
             let persisted = persisted_admin_entry_from(&entry);
             store.record_admin_entry(&persisted).await?;

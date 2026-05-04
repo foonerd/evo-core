@@ -50,7 +50,7 @@ Every frame on the wire, in either direction:
 +---------------------------+--------------------------------+
 ```
 
-No delimiter inside the payload. No framing bytes before the length. No trailer. Maximum frame size is 1 MiB; frames larger than that are rejected as errors.
+No delimiter inside the payload. No framing bytes before the length. No trailer. Maximum frame size is 64 MiB; frames larger than that are rejected as errors. The 64 MiB cap matches the absolute hard ceiling on `prepare_for_live_reload` state blobs so any blob the steward's admission would admit can also cross the wire.
 
 A frame carries exactly one JSON object. The object's shape disambiguates whether it is a request or a response. There is no request-ID correlation: a response to a request is the next frame the server writes on that connection.
 
@@ -1698,7 +1698,10 @@ int evo_send_frame(int fd, const char *json_body, size_t len) {
 
 // Caller provides buf of at least bufsize bytes; returns length written
 // (null-terminates) or -1 on error. Frames larger than bufsize cause
-// truncation errors; pick bufsize >= 1 MiB for safety.
+// truncation errors. Most operator-control responses fit in a few KiB;
+// reserve 64 MiB only for callers that intentionally receive
+// `prepare_for_live_reload` state blobs (the wire cap matches the
+// blob hard ceiling).
 ssize_t evo_recv_frame(int fd, char *buf, size_t bufsize) {
     uint32_t header;
     if (read_all(fd, &header, 4) < 0) return -1;

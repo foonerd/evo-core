@@ -29,6 +29,52 @@ use evo_plugin_sdk::contract::RuntimeCapabilities;
 use evo_plugin_sdk::Manifest;
 use evo_trust::ADMIN_MINIMUM_TRUST;
 
+/// Synthetic-acceptance-only override for the framework version
+/// used by `check_manifest_prerequisites` /
+/// `check_drift_and_skew`. When set to a parseable semver, both
+/// helpers behave as if the steward were that version; when unset
+/// or unparseable, the canonical `CARGO_PKG_VERSION` is used.
+///
+/// Required by `T2.version-skew-warn-band`: the WarnBand band is
+/// `framework_minor - plugin_minor == 2`. With the framework's
+/// own minor version at 1, no real plugin can land in WarnBand
+/// (would need `plugin_minor = -1`), so the test sets this
+/// override to a value like `0.3.0` and admits a plugin with
+/// `evo_min_version = 0.1.0` to exercise the WarnBand emit path.
+///
+/// Production stewards never set this env. The acceptance
+/// distribution sets it from a systemd drop-in inside the test's
+/// trap-bounded scope and unsets it on cleanup.
+const ENV_FRAMEWORK_VERSION_OVERRIDE: &str = "EVO_FRAMEWORK_VERSION_OVERRIDE";
+
+/// Resolve the framework version the admission validators should
+/// compare against. Reads the
+/// [`ENV_FRAMEWORK_VERSION_OVERRIDE`] env when set; falls back to
+/// the compiled-in `CARGO_PKG_VERSION` otherwise. An unparseable
+/// override returns the canonical version (logged at warn) so a
+/// typo never silently disables version-skew enforcement.
+fn framework_version() -> Result<semver::Version, StewardError> {
+    if let Ok(raw) = std::env::var(ENV_FRAMEWORK_VERSION_OVERRIDE) {
+        match semver::Version::parse(&raw) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                tracing::warn!(
+                    env = ENV_FRAMEWORK_VERSION_OVERRIDE,
+                    raw = %raw,
+                    error = %e,
+                    "framework version override is set but unparseable; \
+                     falling back to compiled-in CARGO_PKG_VERSION"
+                );
+            }
+        }
+    }
+    semver::Version::parse(env!("CARGO_PKG_VERSION")).map_err(|e| {
+        StewardError::Admission(format!(
+            "evo's own CARGO_PKG_VERSION is not valid semver: {e}"
+        ))
+    })
+}
+
 /// Enforce the in-scope half of `[prerequisites]` at admission.
 ///
 /// Called from every `admit_*` entry point after
@@ -55,14 +101,7 @@ use evo_trust::ADMIN_MINIMUM_TRUST;
 pub(super) fn check_manifest_prerequisites(
     manifest: &Manifest,
 ) -> Result<(), StewardError> {
-    let evo_version = match semver::Version::parse(env!("CARGO_PKG_VERSION")) {
-        Ok(v) => v,
-        Err(e) => {
-            return Err(StewardError::Admission(format!(
-                "evo's own CARGO_PKG_VERSION is not valid semver: {e}"
-            )));
-        }
-    };
+    let evo_version = framework_version()?;
     manifest.check_prerequisites(&evo_version, std::env::consts::OS)?;
     Ok(())
 }
@@ -132,16 +171,7 @@ pub(super) async fn check_drift_and_skew(
     runtime: &RuntimeCapabilities,
     bus: &Arc<HappeningBus>,
 ) -> Result<(), StewardError> {
-    let framework_version =
-        match semver::Version::parse(env!("CARGO_PKG_VERSION")) {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(StewardError::Admission(format!(
-                    "evo's own CARGO_PKG_VERSION is not valid \
-                     semver: {e}"
-                )));
-            }
-        };
+    let framework_version = framework_version()?;
 
     let plugin_min = &manifest.prerequisites.evo_min_version;
     let skew = classify_skew(plugin_min, &framework_version);
@@ -285,5 +315,40 @@ response_budget_ms = 1000
         let m = manifest_for(true, "standard", "singleton");
         let err = check_admin_trust(&m).expect_err("must reject");
         assert!(matches!(err, StewardError::AdminTrustTooLow { .. }));
+    }
+
+    #[test]
+    fn framework_version_falls_back_to_cargo_version_when_env_unset() {
+        // Tests share the same process env, so guard against a
+        // parallel test having set the override and not restored
+        // it. `remove_var` is enough; subsequent tests that need
+        // the override `set_var` it themselves.
+        std::env::remove_var(ENV_FRAMEWORK_VERSION_OVERRIDE);
+        let v = framework_version().expect("compiled-in version parses");
+        let expected =
+            semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        assert_eq!(v, expected);
+    }
+
+    #[test]
+    fn framework_version_uses_env_override_when_set() {
+        std::env::set_var(ENV_FRAMEWORK_VERSION_OVERRIDE, "0.3.0");
+        let v = framework_version().expect("override parses");
+        assert_eq!(v, semver::Version::new(0, 3, 0));
+        std::env::remove_var(ENV_FRAMEWORK_VERSION_OVERRIDE);
+    }
+
+    #[test]
+    fn framework_version_falls_back_when_env_override_is_garbage() {
+        // Acceptance contract: a typo in the override never
+        // silently disables version-skew enforcement; the helper
+        // logs a warn and falls back to the canonical version so
+        // the steward continues to enforce the real bands.
+        std::env::set_var(ENV_FRAMEWORK_VERSION_OVERRIDE, "not-a-semver");
+        let v = framework_version().expect("fallback succeeds");
+        let expected =
+            semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        assert_eq!(v, expected);
+        std::env::remove_var(ENV_FRAMEWORK_VERSION_OVERRIDE);
     }
 }

@@ -38,19 +38,27 @@
 //!
 //! # Persistence
 //!
-//! Per the design, prompt persistence rides on the existing
-//! subject infrastructure: the synthetic subject created when a
-//! prompt is issued persists across restart through the same
-//! write-through path that backs every other subject. The
-//! ledger itself is in-memory and rehydrates from the subject
-//! registry at boot when the wire-up lands.
+//! Each `issue` and state transition mirrors to the durable
+//! `prompts` table through an attached
+//! [`PersistenceStore`](crate::persistence::PersistenceStore).
+//! The in-memory ledger is the hot read path; the table is the
+//! restart-resilient backing. On steward boot,
+//! [`PromptLedger::rehydrate_from_persistence`] replays every
+//! `Open` row back into the in-memory ledger so multi-stage
+//! interaction state survives a restart — consumers reconnecting
+//! observe the same prompt set they were rendering before.
+//! Rows whose deadline already elapsed are transitioned to
+//! `TimedOut` during rehydration rather than re-inserted.
 
+use crate::persistence::{
+    PersistedPromptState, PersistenceError, PersistenceStore,
+};
 use evo_plugin_sdk::contract::{
     PromptCanceller, PromptOutcome, PromptRequest, PromptState,
 };
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::oneshot;
 
 /// Synthetic addressing scheme reserved for plugin-initiated
@@ -178,6 +186,13 @@ pub struct PromptLedger {
     /// the previous version, so the previous waiter is cancelled
     /// implicitly).
     waiters: Mutex<HashMap<PromptKey, oneshot::Sender<PromptOutcome>>>,
+    /// Optional durable backing for the ledger. When attached,
+    /// every `issue` and state transition mirrors to the
+    /// `prompts` table; `rehydrate_from_persistence` restores
+    /// the in-memory ledger from those rows on steward boot.
+    /// Tests that don't care about persistence pass `None`
+    /// (the ledger stays in-memory only).
+    persistence: Option<Arc<dyn PersistenceStore>>,
 }
 
 impl PromptLedger {
@@ -187,7 +202,19 @@ impl PromptLedger {
             entries: Mutex::new(HashMap::new()),
             responder: Mutex::new(None),
             waiters: Mutex::new(HashMap::new()),
+            persistence: None,
         }
+    }
+
+    /// Attach a persistence backend so every `issue` / state
+    /// transition mirrors to the `prompts` table. Returns
+    /// `self` for builder-style construction at boot.
+    pub fn with_persistence(
+        mut self,
+        store: Arc<dyn PersistenceStore>,
+    ) -> Self {
+        self.persistence = Some(store);
+        self
     }
 
     /// Attempt to claim the responder capability for the given
@@ -263,7 +290,7 @@ impl PromptLedger {
         let deadline = Instant::now() + effective_timeout;
         let entry = PromptEntry {
             plugin: plugin.to_string(),
-            request,
+            request: request.clone(),
             state: PromptState::Open,
             deadline,
         };
@@ -280,6 +307,51 @@ impl PromptLedger {
             .lock()
             .expect("prompt ledger waiters mutex poisoned");
         waiters.remove(&key);
+        drop(guard);
+        drop(waiters);
+
+        // Mirror to the durable backing. The wall-clock
+        // deadline rides on `now + effective_timeout` so a
+        // restart can reconstruct the same `Instant`-based
+        // deadline from `(deadline_utc_ms - now_utc_ms_at_boot)`.
+        if let Some(store) = self.persistence.as_ref() {
+            let store = Arc::clone(store);
+            let plugin_for_task = plugin.to_string();
+            let now_ms = system_time_ms_now();
+            let deadline_utc_ms =
+                now_ms.saturating_add(effective_timeout.as_millis() as u64);
+            let request_json =
+                serde_json::to_string(&request).unwrap_or_else(|_| {
+                    // PromptRequest implements Serialize via
+                    // derives over types that all serialise; a
+                    // failure here would be a serde bug, not a
+                    // legitimate error path. Falling back to an
+                    // empty object keeps the row schema intact
+                    // (request_json is NOT NULL) and the failure
+                    // is visible on rehydration where the empty
+                    // object will fail PromptRequest deserialisation.
+                    "{}".into()
+                });
+            tokio::spawn(async move {
+                if let Err(e) = store
+                    .record_prompt_issue(
+                        &plugin_for_task,
+                        &request.prompt_id,
+                        &request_json,
+                        deadline_utc_ms,
+                        now_ms,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        plugin = %plugin_for_task,
+                        prompt_id = %request.prompt_id,
+                        error = %e,
+                        "failed to persist prompt issue"
+                    );
+                }
+            });
+        }
         deadline
     }
 
@@ -404,14 +476,47 @@ impl PromptLedger {
         let key = (plugin.to_string(), prompt_id.to_string());
         let mut guard =
             self.entries.lock().expect("prompt ledger mutex poisoned");
-        match guard.get_mut(&key) {
+        let transitioned = match guard.get_mut(&key) {
             Some(entry) if entry.state == PromptState::Open => {
                 entry.state = new_state;
                 true
             }
             // Already terminal or absent: idempotent no-op.
             _ => false,
+        };
+        drop(guard);
+
+        if transitioned {
+            if let Some(store) = self.persistence.as_ref() {
+                let store = Arc::clone(store);
+                let plugin = plugin.to_string();
+                let prompt_id = prompt_id.to_string();
+                let persisted = match new_state {
+                    PromptState::Open => PersistedPromptState::Open,
+                    PromptState::Answered => PersistedPromptState::Answered,
+                    PromptState::Cancelled => PersistedPromptState::Cancelled,
+                    PromptState::TimedOut => PersistedPromptState::TimedOut,
+                };
+                let now_ms = system_time_ms_now();
+                tokio::spawn(async move {
+                    if let Err(e) = store
+                        .update_prompt_state(
+                            &plugin, &prompt_id, persisted, now_ms,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            plugin = %plugin,
+                            prompt_id = %prompt_id,
+                            error = %e,
+                            "failed to persist prompt state transition"
+                        );
+                    }
+                });
+            }
         }
+
+        transitioned
     }
 
     /// Remove a prompt from the ledger entirely. Used by
@@ -469,6 +574,90 @@ impl PromptLedger {
             .expect("prompt ledger mutex poisoned")
             .is_empty()
     }
+
+    /// Restore the in-memory ledger from the durable backing.
+    ///
+    /// Walks every `Open` row in the supplied store and inserts
+    /// a matching ledger entry. The persisted wall-clock
+    /// `deadline_utc_ms` is converted to a tokio `Instant` by
+    /// computing the remaining duration relative to the current
+    /// wall clock; rows whose deadline has already elapsed are
+    /// transitioned to `TimedOut` in the durable store and not
+    /// inserted into the in-memory ledger so the timeout sweep
+    /// does not fire a stale wake.
+    ///
+    /// `request_json` failures (a row whose `PromptRequest`
+    /// payload no longer deserialises) are logged at warn and
+    /// skipped — the row stays in the durable store for an
+    /// operator to inspect, but the live surface does not break.
+    pub async fn rehydrate_from_persistence(
+        &self,
+        store: &dyn PersistenceStore,
+    ) -> Result<usize, PersistenceError> {
+        let now_ms = system_time_ms_now();
+        let now_instant = Instant::now();
+        let rows = store.list_open_prompts().await?;
+        let mut restored = 0usize;
+        for row in rows {
+            let request: PromptRequest =
+                match serde_json::from_str(&row.request_json) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = %row.plugin,
+                            prompt_id = %row.prompt_id,
+                            error = %e,
+                            "failed to deserialise persisted prompt request — \
+                             skipping rehydration"
+                        );
+                        continue;
+                    }
+                };
+            if row.deadline_utc_ms <= now_ms {
+                if let Err(e) = store
+                    .update_prompt_state(
+                        &row.plugin,
+                        &row.prompt_id,
+                        PersistedPromptState::TimedOut,
+                        now_ms,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        plugin = %row.plugin,
+                        prompt_id = %row.prompt_id,
+                        error = %e,
+                        "failed to mark elapsed-deadline prompt as timed_out \
+                         during rehydration"
+                    );
+                }
+                continue;
+            }
+            let remaining_ms = row.deadline_utc_ms - now_ms;
+            let deadline = now_instant + Duration::from_millis(remaining_ms);
+            let entry = PromptEntry {
+                plugin: row.plugin.clone(),
+                request,
+                state: PromptState::Open,
+                deadline,
+            };
+            let mut guard =
+                self.entries.lock().expect("prompt ledger mutex poisoned");
+            guard.insert((row.plugin, row.prompt_id), entry);
+            restored += 1;
+        }
+        Ok(restored)
+    }
+}
+
+/// Wall-clock millisecond timestamp now. Returns 0 if the
+/// clock predates UNIX epoch (which never happens in practice
+/// on a deployed steward; the fallback keeps the helper total).
+fn system_time_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Default for PromptLedger {
@@ -865,5 +1054,156 @@ mod tests {
         // State unchanged.
         let e = l.lookup("org.test", "p-1").unwrap();
         assert_eq!(e.state, PromptState::Answered);
+    }
+
+    // ---------------------------------------------------------------
+    // Persistence + rehydration tests. Cover the durable backing
+    // wired in for v0.1.13: every issue / state transition must
+    // mirror to the store, and a fresh ledger seeded with the
+    // store's open rows must reconstruct the live ledger surface
+    // (multi-stage interaction restore on steward restart).
+    // ---------------------------------------------------------------
+
+    use crate::persistence::{MemoryPersistenceStore, PersistedPromptState};
+    use std::sync::Arc;
+
+    fn store() -> Arc<dyn crate::persistence::PersistenceStore> {
+        Arc::new(MemoryPersistenceStore::new())
+    }
+
+    #[tokio::test]
+    async fn issue_mirrors_to_persistence() {
+        let s = store();
+        let l = PromptLedger::new().with_persistence(Arc::clone(&s));
+        l.issue("org.test", sample_request("p-1"), Duration::from_secs(60));
+        // The persistence write is dispatched on a tokio task;
+        // yield until the row appears.
+        let mut tries = 0;
+        loop {
+            let rows = s.list_open_prompts().await.unwrap();
+            if !rows.is_empty() {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].plugin, "org.test");
+                assert_eq!(rows[0].prompt_id, "p-1");
+                assert_eq!(rows[0].state, PersistedPromptState::Open);
+                break;
+            }
+            tries += 1;
+            assert!(
+                tries < 100,
+                "expected prompt issue to persist within 100 yields"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn state_transition_mirrors_to_persistence() {
+        let s = store();
+        let l = PromptLedger::new().with_persistence(Arc::clone(&s));
+        l.issue("org.test", sample_request("p-1"), Duration::from_secs(60));
+        // Wait for the issue write to land.
+        for _ in 0..100 {
+            if !s.list_open_prompts().await.unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(l.mark_answered("org.test", "p-1"));
+        // Wait for the transition write to land — the open
+        // listing should drop to empty.
+        for _ in 0..100 {
+            if s.list_open_prompts().await.unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(s.list_open_prompts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rehydrate_restores_open_prompts() {
+        // Seed an open prompt through one ledger, then create a
+        // fresh ledger backed by the same store and restore.
+        let s = store();
+        let issuer = PromptLedger::new().with_persistence(Arc::clone(&s));
+        issuer.issue(
+            "org.test",
+            sample_request("p-1"),
+            Duration::from_secs(60),
+        );
+        for _ in 0..100 {
+            if !s.list_open_prompts().await.unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let fresh = PromptLedger::new();
+        let restored =
+            fresh.rehydrate_from_persistence(s.as_ref()).await.unwrap();
+        assert_eq!(restored, 1);
+        let entry = fresh.lookup("org.test", "p-1").expect("rehydrated");
+        assert_eq!(entry.state, PromptState::Open);
+        assert_eq!(entry.request.prompt_id, "p-1");
+    }
+
+    #[tokio::test]
+    async fn rehydrate_skips_terminal_rows() {
+        // Issue + answer leaves the row in `Answered`; a fresh
+        // ledger restoring from the store does not pick it up.
+        let s = store();
+        let issuer = PromptLedger::new().with_persistence(Arc::clone(&s));
+        issuer.issue(
+            "org.test",
+            sample_request("p-1"),
+            Duration::from_secs(60),
+        );
+        for _ in 0..100 {
+            if !s.list_open_prompts().await.unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        issuer.mark_answered("org.test", "p-1");
+        for _ in 0..100 {
+            if s.list_open_prompts().await.unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let fresh = PromptLedger::new();
+        let restored =
+            fresh.rehydrate_from_persistence(s.as_ref()).await.unwrap();
+        assert_eq!(restored, 0);
+        assert!(fresh.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rehydrate_marks_elapsed_deadline_as_timed_out() {
+        // Manually inject a row with a deadline already in the
+        // past, then rehydrate. The ledger must not insert it
+        // and the persistence row must transition to TimedOut.
+        let s = MemoryPersistenceStore::new();
+        let req_json = serde_json::to_string(&sample_request("p-1")).unwrap();
+        s.record_prompt_issue(
+            "org.test", "p-1", &req_json,
+            1, // deadline_utc_ms in the deep past
+            1,
+        )
+        .await
+        .unwrap();
+        let s_arc: Arc<dyn crate::persistence::PersistenceStore> = Arc::new(s);
+
+        let fresh = PromptLedger::new();
+        let restored = fresh
+            .rehydrate_from_persistence(s_arc.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(restored, 0);
+        assert!(fresh.is_empty());
+        // No more open rows in the store.
+        assert!(s_arc.list_open_prompts().await.unwrap().is_empty());
     }
 }

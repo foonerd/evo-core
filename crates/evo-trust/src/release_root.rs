@@ -229,6 +229,15 @@ pub fn verify_release_signature<'a>(
     required_role: ReleaseRole,
     keys: &'a [ReleaseTrustKey],
 ) -> Result<&'a ReleaseTrustKey, TrustError> {
+    // Per LOGGING.md §2: release-signature verification is a verb
+    // invocation per release artefact admission.
+    tracing::debug!(
+        payload_bytes = payload.len(),
+        sig_bytes = sig_bytes.len(),
+        required_role = ?required_role,
+        candidate_keys = keys.len(),
+        "release trust verify: invoking"
+    );
     if sig_bytes.len() != 64 {
         return Err(TrustError::MissingOrBadSignature);
     }
@@ -241,6 +250,10 @@ pub fn verify_release_signature<'a>(
             continue;
         }
         if k.verifying_key.verify_strict(payload, &sig).is_ok() {
+            tracing::debug!(
+                key_id = ?k.key_id,
+                "release trust verify: accepted"
+            );
             return Ok(k);
         }
     }

@@ -1,0 +1,49 @@
+schema_version: "1.0"
+plugin: org.evoframework.steward
+owner: evo-framework-core
+isolation: oop
+
+# Intent-only record. The steward's privilege contract declares WHAT
+# the framework needs from the OS to run; HOW that intent is satisfied
+# (service identity, supplementary groups, capability bounding set,
+# polkit drop-in, filesystem isolation) is a deployment-specific
+# concern that lives in the distribution-bootstrap record (e.g.
+# evo-device-audio's PRIVILEGES.yaml). The framework does not pin a
+# username, group, or distribution choice — vendors and operators make
+# those decisions per their target environment.
+
+capability_intent:
+  - id: state_storage
+    need: read and write the evo state directory (catalogue, plugins, ledger, sessions, replay-cursor) so the steward survives restart with persistent state.
+    access_path: filesystem/state
+    failure_mode: refuse to start; structured admission error on the wire socket; no panic.
+  - id: config_read
+    need: read /etc/evo/ for catalogue document, trust roots, revocations, and operator config.
+    access_path: filesystem/config
+    failure_mode: refuse to start; reason logged with structured admission error.
+  - id: wire_socket
+    need: bind and serve /run/evo/evo.sock for client and out-of-process plugin connections.
+    access_path: filesystem/run
+    failure_mode: refuse to start; reason logged.
+  - id: in_process_plugin_host
+    need: load in-process plugins into the steward identity. Privileges declared by in-process plugins union into this steward record at admission; out-of-process plugins run under their own systemd unit and identity, with privileges scoped to that unit's surface only.
+    access_path: framework/internal
+    failure_mode: per-plugin admission failure with structured event; steward continues serving other plugins.
+
+required_binaries: []
+
+required_kernel_modules: []
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+    - "test -r /etc/evo"
+    - "test -d /run/evo"
+  expected:
+    - state directory exists and is writable as the steward identity
+    - config directory exists and is readable
+    - run directory exists for the wire socket
+
+host_provisioning: {}

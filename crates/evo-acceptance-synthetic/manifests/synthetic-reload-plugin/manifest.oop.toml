@@ -1,0 +1,50 @@
+# Synthetic live-reload plugin — out-of-process bundle manifest.
+#
+# Declares lifecycle.hot_reload = "live" so reload_plugin dispatches
+# to the OOP Live path (prepare_for_live_reload on the running
+# instance, spawn successor, load_with_state on the successor with
+# the blob the prior instance returned).
+#
+# The plugin records every prepare and load_with_state call to
+# {state_dir}/reload-events.log so the acceptance scenario can
+# observe the round-trip end-to-end.
+
+[plugin]
+name = "org.evoframework.acceptance.reload-plugin"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.reload"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "live"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities.respondent]
+request_types = ["never_called"]
+response_budget_ms = 1000

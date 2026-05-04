@@ -1,0 +1,56 @@
+# Synthetic skew plugin — out-of-process bundle manifest.
+#
+# Declares evo_min_version equal to the framework's current
+# version (`0.1.12` at v0.1.12.1). The framework's
+# classify_skew(plugin_min, framework) returns
+# SkewClassification::Strict for delta=0 minor versions; the
+# manifest's describe() carries no drift, so admission proceeds
+# cleanly. The acceptance scenario installs the bundle,
+# restarts the steward, and asserts diagnose reports the plugin
+# as admitted.
+#
+# Used by T2.version-skew-strict in the evo acceptance plan.
+# T2.version-skew-warn-band is unreachable at v0.1.x because the
+# WarnBand classification requires plugin minor = framework minor
+# - 2; framework at 0.1.12 (minor=1) cannot place any plugin in
+# that band. Reachable from framework v0.3+.
+
+[plugin]
+name = "org.evoframework.acceptance.skew-plugin"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.skew"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.12"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities.respondent]
+request_types = ["never_called"]
+response_budget_ms = 1000

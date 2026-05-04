@@ -1,0 +1,62 @@
+# Synthetic watch-SubjectState plugin — out-of-process bundle manifest.
+#
+# Drives the SubjectState watch arm end-to-end:
+#
+#   1. announce subject (test-scheme, "trigger-target")
+#      with state={"trigger":"off"}
+#   2. resolve addressing -> canonical id
+#   3. register SubjectState watch on canonical id with predicate
+#      Equals { field: "trigger", value: "on" }
+#   4. schedule a OneShot appointment 3s out
+#   5. on appointment fire, call update_state to flip the trigger
+#      to "on"; the framework emits SubjectStateChanged; the watch
+#      evaluator matches the predicate and dispatches the watch
+#      action; the plugin records the dispatch arrival to
+#      {state_dir}/watch-subject-state-fires.log
+#
+# Used by `T2.watch-subject-state-transition`. Has no value
+# outside that scenario.
+
+[plugin]
+name = "org.evoframework.acceptance.watch-subject-state-plugin"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.watch-subject-state"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities]
+appointments = true
+watches = true
+
+[capabilities.respondent]
+request_types = ["appointment_fired", "subject_state_watch_fired"]
+response_budget_ms = 1000

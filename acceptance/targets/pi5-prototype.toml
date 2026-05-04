@@ -1,0 +1,259 @@
+# Pi 5 prototype acceptance target. Reference aarch64 device the
+# framework's release candidates run against.
+#
+# Capability vocabulary documented in acceptance/CAPABILITIES.md.
+#
+# Connection details (host, user, ssh key) are machine-specific
+# and live in a sibling override file `pi5-prototype.local.toml`,
+# gitignored, never committed. The committed file below carries
+# `REPLACE_ME` sentinels in [ssh]; the harness loader merges the
+# `.local.toml` overlay on top and refuses to start if the
+# sentinels survive the merge. See acceptance/README.md §Local
+# overrides for the convention and a worked example.
+
+name = "pi5-prototype"
+arch = "aarch64-unknown-linux-gnu"
+connection_type = "ssh"
+
+[ssh]
+host = "REPLACE_ME"
+user = "REPLACE_ME"
+# SSH key path on the host machine running evo-acceptance. Falls
+# back to the user's ssh-agent if omitted.
+key_path = "REPLACE_ME"
+port = 22
+
+# Hardware capabilities present on this specific prototype.
+# Scenarios that declare `requires_capability = "<name>"` skip with
+# reason if the capability is absent. See acceptance/CAPABILITIES.md
+# for the full vocabulary; declare only what is actually wired.
+
+# --- System ---
+
+[[capabilities]]
+name = "sysrq_trigger"
+note = "/proc/sysrq-trigger writable; allows OOM injection"
+
+[[capabilities]]
+name = "nopasswd_sudo"
+note = "Sudo configured NOPASSWD; failure-mode scenarios run non-interactive"
+
+[[capabilities]]
+name = "systemd"
+
+[[capabilities]]
+name = "journald"
+
+# --- Storage ---
+
+[[capabilities]]
+name = "storage_microsd"
+note = "Pi 5 microSD slot present"
+
+[[capabilities]]
+name = "storage_nvme"
+note = "476 GB NVMe SSD attached (boot device)"
+
+[[capabilities]]
+name = "storage_usb"
+note = "USB ports present; mass-storage devices mountable when plugged in"
+
+# --- Display ---
+
+[[capabilities]]
+name = "display_hdmi"
+note = "Pi 5 has 2x micro-HDMI; primary display attachable"
+
+# --- Bridges (Pi 5 40-pin GPIO header) ---
+
+[[capabilities]]
+name = "bridge_gpio"
+note = "Pi 5 40-pin GPIO header"
+
+[[capabilities]]
+name = "bridge_i2c"
+note = "I2C bus exposed on GPIO header"
+
+[[capabilities]]
+name = "bridge_i2s"
+note = "I2S bus exposed on GPIO header (DAC HATs supported)"
+
+[[capabilities]]
+name = "bridge_spi"
+note = "SPI bus exposed on GPIO header"
+
+[[capabilities]]
+name = "bridge_onewire"
+note = "1-Wire enabled on GPIO 4"
+
+# --- Communication ---
+
+[[capabilities]]
+name = "comm_bluetooth"
+note = "Pi 5 onboard Bluetooth"
+
+[[capabilities]]
+name = "comm_wifi"
+note = "Pi 5 onboard Wi-Fi (2.4 / 5 GHz)"
+
+[[capabilities]]
+name = "comm_ethernet"
+note = "Pi 5 onboard gigabit Ethernet"
+
+# --- Audio ---
+
+[[capabilities]]
+name = "audio_hdmi"
+note = "Audio out via HDMI when display attached"
+
+[[capabilities]]
+name = "audio_jack"
+note = "3.5mm analog audio out via attached HAT (Pi 5 lacks onboard jack)"
+
+# --- Test fixtures ---
+# Each fixture capability declares that the target is opted-in for
+# scenarios that mutate state (corrupt files, restart steward, etc.)
+# and has the necessary helper paths/permissions in place. The
+# scenarios themselves run inline shell that does the mutation +
+# cleanup; the target advertising the capability is the consent
+# signal that those mutations are acceptable on this host.
+
+[[capabilities]]
+name = "test_fixture_catalogue_corrupt"
+note = "Inline backup + corrupt + restart-steward + journal-grep + restore for /opt/evo/catalogue/default.toml and /var/lib/evo/state/catalogue.lkg.toml. Requires nopasswd_sudo (above)."
+
+[[capabilities]]
+name = "test_fixture_plugin_admin"
+note = "Inline disable + diagnose + enable + steward-restart cycle against the bundled org.evo.example.echo plugin. Cleanup re-enables and restarts on exit. Requires nopasswd_sudo."
+
+[[capabilities]]
+name = "test_fixture_drift_plugin"
+note = "Synthetic drift-respondent bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-drift-bundle.tar.gz. The bundle is signed with the acceptance-only signing key (public half at /etc/evo/trust.d/evo-acceptance-signing-public.pem) and authorises plugin names under org.evoframework.acceptance.*. The scenario installs the bundle, mutates the catalogue to add an acceptance.drift shelf, restarts the steward, and tails the journal for the drift refusal. Cleanup removes the bundle directory, restores the catalogue, and restarts the steward."
+
+[[capabilities]]
+name = "test_fixture_synthetic_appointment_plugin"
+note = "Synthetic appointment plugin bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-appointment-bundle.tar.gz. Same trust + naming setup as test_fixture_drift_plugin. The plugin registers a OneShot appointment 5s into the future on every load() and records each fire to {state_dir}/appointment-fires.log. The scenario installs the bundle, mutates the catalogue to add an acceptance.appointment shelf, restarts the steward, waits past the fire window, and asserts the log carries one fire entry. Requires the wire-bridge for OOP appointment scheduler (landed alongside this fixture)."
+
+[[capabilities]]
+name = "test_fixture_capabilities_query"
+note = "evo-plugin-tool exposes `admin describe-capabilities` issuing the steward's `op = describe_capabilities` over /run/evo/evo.sock. The scenario greps the response for `clock_trust:` carrying one of the four valid enum values."
+
+[[capabilities]]
+name = "test_fixture_synthetic_watch_plugin_happening_match"
+note = "Synthetic watch plugin bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-watch-bundle.tar.gz. Plugin registers BOTH a OneShot appointment 5s out AND a watch matching the framework's `appointment_fired` happening variant. When the appointment fires the framework emits the AppointmentFired happening; the watch matches it and fires its own action. Both action dispatches loop back to the plugin's handle_request and write a `fired_kind={appointment,watch}` line to {state_dir}/watch-fires.log. Scenario asserts both lines exist."
+
+[[capabilities]]
+name = "test_fixture_prompt_responder"
+note = "Synthetic prompt plugin bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-prompt-bundle.tar.gz. Plugin issues a Text prompt with 5s timeout from a background task spawned during load(). Three scenarios share the fixture: text-prompt drives `evo-plugin-tool admin prompt answer-text`; cancelled drives `prompt cancel`; timeout waits past the 5s deadline. Each asserts the expected outcome line in {state_dir}/prompt-outcomes.log."
+
+[[capabilities]]
+name = "test_fixture_synthetic_reload_plugin_oop"
+note = "Synthetic reload plugin bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-reload-bundle.tar.gz. Plugin declares lifecycle.hot_reload=\"live\" and records every load/load_with_state/prepare_for_live_reload/unload call to {state_dir}/reload-events.log. Scenario installs the bundle, restarts the steward, triggers `evo-plugin-tool admin reload-plugin`, and asserts the log shows the prepare → load_with_state round-trip with matching schema_version and payload_len."
+
+[[capabilities]]
+name = "test_fixture_skew_plugin_strict"
+note = "Synthetic skew plugin bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-skew-bundle.tar.gz. Plugin declares evo_min_version=0.1.12 (delta=0 minor versions from the v0.1.12 framework, classified Strict by classify_skew); manifest declares request_types=[\"never_called\"] and describe() returns the same set so no drift fires. Scenario installs + restarts steward + asserts the plugin admits cleanly via diagnose."
+
+[[capabilities]]
+name = "test_fixture_synthetic_flight_rack"
+note = "Synthetic flight-rack plugin bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-flight-rack-bundle.tar.gz. Plugin admits as a respondent on the synthetic flight_mode.bluetooth shelf and handles flight_mode.set + flight_mode.query. The framework's post-dispatch hook emits Happening::FlightModeChanged on every successful flight_mode.set; three scenarios share the bundle: T2.flight-mode-set-emits drives a single subscribe-happenings stream and asserts the variant + rack_class + on fields land; T3.flight-multi-consumer drives three concurrent subscribe-happenings clients and asserts each one observes the event (the broadcast bus delivers to every subscriber); T5.flight-mode-no-panic alternates five toggles and asserts the steward stays active + panic-free + still dispatches a follow-up set."
+
+[[capabilities]]
+name = "test_fixture_synthetic_watch_plugin_subject_state"
+note = "Synthetic watch-SubjectState plugin bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-watch-subject-state-bundle.tar.gz. Plugin announces a subject with state={trigger:'off'}, resolves the addressing to the steward's canonical id (via SubjectQuerier::resolve_addressing), registers a SubjectState watch on that canonical id with predicate Equals{field:'trigger', value:'on'}, and schedules a OneShot appointment 3s out. On appointment fire the plugin calls update_state to flip the trigger to 'on'; the framework emits SubjectStateChanged; the watch evaluator matches and dispatches the watch action; the plugin records the dispatch arrival. Scenario installs the bundle, mutates the catalogue to add the acceptance.watch-subject-state shelf and the acceptance_track subject type, restarts the steward, waits past the 3s trigger + dispatch propagation, and asserts the fire log carries the expected line."
+
+[[capabilities]]
+name = "test_fixture_synthetic_watch_plugin_hysteresis"
+note = "Synthetic watch-Hysteresis plugin bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-watch-hysteresis-bundle.tar.gz. Plugin announces a subject with state.value=50.0, registers a SubjectState watch with predicate Hysteresis{upper=80, lower=60}, and schedules a Periodic appointment at 1s interval (max_fires=6). Each fire advances through the value sequence [50, 85, 90, 70, 50, 85] via update_state. The hysteresis state machine fires twice: once on the first 50→85 upward edge, then silent through 85→90→70 (still in_high or in band), reset by 70→50 (below lower), then re-fires on the second 50→85 transition. Scenario asserts exactly two WatchFired arrivals in the fire log."
+
+[[capabilities]]
+name = "test_fixture_appointment_subminute_recurring"
+note = "Synthetic Periodic-appointment plugin bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-appointment-periodic-bundle.tar.gz. Plugin schedules an AppointmentRecurrence::Periodic{interval_ms=2000} with max_fires=3. Each fire dispatches back to the plugin's handle_request and writes a line to {state_dir}/appointment-periodic-fires.log. Scenario asserts exactly three log lines after a 9s wait. Exercises the Periodic recurrence variant added in Phase 1.G."
+
+[[capabilities]]
+name = "test_fixture_prompt_responder_multistage_persistence"
+note = "Synthetic multi-stage prompt persistence plugin bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-prompt-multistage-bundle.tar.gz. Plugin issues a Text prompt with session_id='ms-test' and a 90s timeout. Scenario stops the steward mid-prompt (the durable prompts-table row survives), restarts (Phase 1.H boot rehydration restores the in-memory ledger; the plugin's load() re-issues with the same prompt_id and re-attaches), then answers via admin prompt answer-text. Asserts the outcome log carries 'outcome=answered value=answer-after-restart'. Exercises the durable prompts ledger from Phase 1.H end-to-end including SQLite-direct verification of the open row across the stop window."
+
+[[capabilities]]
+name = "test_fixture_fast_path_warden"
+note = "Synthetic Fast-Path warden bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-fast-path-warden-bundle.tar.gz. Warden declares fast_path_verbs = ['ping', 'slow'] and fast_path_budget_ms = 100; ping returns immediately, slow sleeps 500ms. Two scenarios share the bundle: T2.fast-path-rtt drives `evo-plugin-tool admin warden take-custody` + fast-path-dispatch ping and asserts 'fast-path dispatch accepted'; T2.fast-path-budget-refused drives the slow verb and asserts subclass=fast_path_budget_exceeded. Exercises Phase 1.E (operator fast-path CLI) + Phase 1.J (lib.rs wiring of the fast-path accept loop) end-to-end."
+
+[[capabilities]]
+name = "test_fixture_synthetic_warden"
+note = "Synthetic warden bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-warden-bundle.tar.gz. Warden declares course_correct_verbs = ['a', 'b']. T2.warden-verb-gate drives `evo-plugin-tool admin warden course-correct --verb c` and asserts the framework's router-layer refusal (StewardError::Dispatch carrying 'did not declare course_correct verb \"c\"') — the verb-gate fires before the plugin body runs."
+
+[[capabilities]]
+name = "test_fixture_synthetic_watch_plugin_cooldown_burst"
+note = "Synthetic watch-cooldown-burst plugin bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-watch-cooldown-burst-bundle.tar.gz. Plugin registers a Periodic appointment (interval_ms=200, max_fires=5) plus a Level-triggered watch on the appointment_fired happening with cooldown_ms=1000. The 5-fire ~1 s burst causes the framework's Level arm to fire the watch once, then suppress the remaining 4 evaluations while cooldown holds. T2.watch-cooldown-debounce greps the plugin's log for exactly 5 appointment fires and exactly 1 watch fire."
+
+[[capabilities]]
+name = "test_fixture_appointment_past_due_persistence"
+note = "Synthetic appointment-past-due plugin bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-appointment-past-due-bundle.tar.gz. Plugin's first load() registers a OneShot for now+5s (Catchup miss-policy) and writes a marker so subsequent loads skip re-registration. T2.appointment-miss-policy-fire-once installs the bundle, restarts the steward, sleeps 2 s, stops the steward (the appointment is durably persisted in the framework's appointments table per Phase 1.Q but has not fired), sleeps 8 s (the appointment is now past-due by ~5 s), restarts the steward. The framework's boot rehydration path loads the past-due row, the Catchup policy fires it once on the first runtime tick, and the scenario asserts exactly 1 fire AND that the fire timestamp is at-or-after the second steward boot. Exercises the appointment durable-persistence + boot-rehydration + miss-policy paths end-to-end."
+
+[[capabilities]]
+name = "test_fixture_compose_apply_pair"
+note = "Synthetic reconciliation composer + delivery warden bundles staged at /var/lib/evo-acceptance-fixtures/synthetic-composer-bundle.tar.gz and /var/lib/evo-acceptance-fixtures/synthetic-delivery-warden-bundle.tar.gz. Composer is a respondent on acceptance.composition declaring `compose` request_type; delivery warden is a singleton warden on acceptance.delivery declaring `course_correct_verbs = ['apply']`. T2.reconciliation-compose-apply triggers via `evo-plugin-tool admin reconcile now`; T3.recon-fast-watch chains a SubjectStateChanged-driven trigger via the watch-subject-state plugin; T5.plugin-crash-mid-recon injects EVO_ACCEPTANCE_SYNTHETIC_DELIVERY_FAIL_FIRST=1 via a systemd drop-in to force the warden's first apply to refuse, asserts ReconciliationFailed + LKG rollback path + steward stays active, then asserts the second `reconcile now` call applies cleanly. Exercises the framework's reconciliation surface + LKG + retry path end-to-end."
+
+[[capabilities]]
+name = "test_fixture_grammar_migration"
+note = "Synthetic grammar-source plugin bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-grammar-source-bundle.tar.gz. Plugin announces N subjects of type acceptance_track_v1 (N from EVO_ACCEPTANCE_GRAMMAR_COUNT systemd env). Used by T2.grammar-orphans-rename / T2.grammar-orphans-bulk-50k / T2.grammar-orphans-resume-after-crash / T3.orphan-reload to exercise hot-reload-driven orphan discovery + framework batched type-migration + alias-chain integrity."
+
+[[capabilities]]
+name = "test_fixture_coalescing_burst"
+note = "Synthetic coalescing-source plugin bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-coalescing-source-bundle.tar.gz. Plugin emits a configurable burst of Happening::PluginEvent on load (count / event_type / payload / pre-burst delay / inter-event interval all from EVO_ACCEPTANCE_COALESCING_* env). Used by T2.coalescing-burst-collapse / T2.coalescing-label-mismatch-passthrough / T2.coalescing-plugin-event-variant / T4.coalescing-burst to exercise per-subscriber coalescer + happenings_log durability + retention janitor."
+
+[[capabilities]]
+name = "test_fixture_synthetic_reload_plugin_oversized_blob"
+note = "Synthetic reload-plugin bundles (default-cap and raised-cap variants) staged at /var/lib/evo-acceptance-fixtures/synthetic-reload-bundle.tar.gz and /var/lib/evo-acceptance-fixtures/synthetic-reload-raised-cap-bundle.tar.gz. Default-cap manifest leaves lifecycle.live_blob_max unset (framework default 16 MiB); raised-cap declares 32 MiB. Plugin sizes its prepare_for_live_reload blob via EVO_ACCEPTANCE_RELOAD_BLOB_BYTES. Used by T2.hot-reload-blob-size-cap to demonstrate per-plugin cap admission + hard-ceiling refusal + wire transport carrying multi-MiB state blobs."
+
+[[capabilities]]
+name = "test_fixture_synthetic_reload_plugin_inproc"
+note = "evo-acceptance-distribution binary staged at /var/lib/evo-acceptance-fixtures/evo-acceptance-distribution. Replaces the production steward at /opt/evo/bin/evo for the test scope; admits the synthetic reload plugin in-process under acceptance.reload-inproc. Used by T2.hot-reload-live-inproc to exercise the framework's in-process Live-reload path (no spawn / no wire / state passed directly between Plugin trait calls). Trap restores the production binary on exit."
+
+[[capabilities]]
+name = "test_fixture_skew_plugin_warn_band_reachable"
+note = "Synthetic skew-plugin warn-band bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-skew-warn-band-bundle.tar.gz. The bundle declares evo_min_version=0.1.0; the scenario sets EVO_FRAMEWORK_VERSION_OVERRIDE=0.3.0 via systemd drop-in so classify_skew sees delta=2 and lands the plugin in WarnBand. Used by T2.version-skew-warn-band to exercise the framework's WarnBand admit-and-warn path (no plugin in v0.1.x can naturally reach WarnBand without the override)."
+
+[[capabilities]]
+name = "test_fixture_ntp_isolation"
+note = "Driven by the framework's file-based time-trust override (EVO_TIME_TRUST_OVERRIDE_FILE env, file at /var/lib/evo/state/time-trust-override). Re-read every tracker tick so a scenario can flip from `synced` to `unsynced` mid-flight without a steward restart. Used by T2.time-trust-untrusted-on-no-ntp to drive the tracker through Trusted → Stale (and emit ClockTrustChanged) deterministically without disturbing the host's actual NTP state."
+
+[[capabilities]]
+name = "test_fixture_synthetic_appointment_wake"
+note = "Synthetic appointment-wake plugin bundle staged at /var/lib/evo-acceptance-fixtures/synthetic-appointment-wake-bundle.tar.gz. Schedules a OneShot with must_wake_device=true and configurable wake_pre_arm_ms via EVO_ACCEPTANCE_WAKE_* env. Used by T2.appointment-wake-device and T3.appt-time-wake. The acceptance distribution wires a recording RtcWakeCallback (synthetic-acceptance only; production distributions wire an adapter that drives /sys/class/rtc/rtc0/wakealarm) so scenarios validate the framework's wake-arming contract independently of OS-level suspend/resume plumbing."
+
+[[capabilities]]
+name = "test_fixture_long_runner"
+note = "Pi 5 prototype is configured for the T4 long-runner cluster (coalescing-burst, concurrent-admission, idle-soak, bulk-orphan-stress, fast-path-throughput). Storage class is USB-attached SSD; per-event fsync is the binding constraint for happenings_log throughput, so contract durations are scaled to fit within Pi-5-realistic wall-clock budgets while still exercising the same framework code paths. Full design-target validation moves to amd64/NVMe rigs in a future test pass."
+
+[[capabilities]]
+name = "test_fixture_disk_full"
+note = "Pi 5 prototype admits the T5.disk-full scenario via a per-test tmpfs mount at /var/lib/evo/test-state. Scenario overrides [persistence].path in evo.toml to point at the tmpfs, fills it to ~95%, observes the framework's structured refusal (class=internal subclass=persistence_error message names \"disk is full\"), then verifies recovery on free space. Trap restores the original evo.toml + unmounts the tmpfs."
+
+[[capabilities]]
+name = "test_fixture_network_drop"
+note = "T5.network-drop drives ungraceful client closes against /run/evo/evo.sock from a Python AF_UNIX socket. Four malformed-frame modes (empty-close, partial-len, bad-len, bad-payload). No fixture binary needed — the test runs purely against the production steward."
+
+# --- Capabilities NOT declared on this prototype (scenarios that
+# require these will skip with reason). Add as the prototype grows: ---
+#
+# - rtc_pirtc_hat        — PiRTC HAT not attached
+# - audio_usb_dac        — no USB DAC plugged in
+# - audio_i2s_hat        — no I2S DAC HAT
+# - audio_spdif          — no S/PDIF output
+# - storage_sata         — no SATA HAT
+# - storage_cdrom        — no optical drive
+# - display_dsi          — no DSI display attached
+# - display_spi          — no SPI display attached
+# - display_touch        — no touch surface
+# - input_keyboard       — no keyboard plugged in
+# - input_mouse          — no pointer plugged in
+# - input_touch          — no touch surface
+# - input_remote_ir      — no IR remote paired
+# - input_rotary_encoder — no rotary encoder wired
+# - comm_ir_receiver     — no IR receiver wired
+# - comm_ir_transmitter  — no IR transmitter wired
+# - comm_zigbee          — no Zigbee coordinator
+# - comm_zwave           — no Z-Wave controller
+# - comm_proprietary_lirc — no LIRC userspace stack
+# - sensor_temperature / humidity / light / motion / camera_csi / camera_usb

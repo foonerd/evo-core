@@ -9,13 +9,16 @@ mod install;
 mod lint;
 mod pack_cmd;
 mod paths;
+mod privileges_cmd;
 mod shelf_schema;
 mod sign;
 mod verify_cmd;
 
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
 const MAX_URL_DEFAULT: u64 = paths::DEFAULT_MAX_URL_BYTES;
@@ -130,6 +133,48 @@ enum Sub {
         #[command(subcommand)]
         sub: AdminSub,
     },
+    /// Read-only inspection and host-prerequisites verification of
+    /// a `privileges.yaml` record. Plugin authors run these locally
+    /// during development; operators run `check` on a target host
+    /// before admission.
+    Privileges {
+        #[command(subcommand)]
+        sub: PrivilegesSub,
+    },
+}
+
+#[derive(Subcommand)]
+enum PrivilegesSub {
+    /// Parse a privileges.yaml record and print it as a human-
+    /// readable report (or JSON with `--format=json`).
+    Describe {
+        /// Path to a privileges.yaml file or to a directory
+        /// containing one.
+        path: PathBuf,
+        #[arg(long, value_enum, default_value_t = privileges_cmd::DescribeFormat::Text)]
+        format: privileges_cmd::DescribeFormat,
+    },
+    /// Validate a privileges.yaml record and verify the host
+    /// satisfies its prerequisites: required binaries on PATH,
+    /// kernel modules loadable, system services reachable,
+    /// verification commands exit 0. Schema validation always
+    /// runs; `--schema-only` skips host probes (useful off-target).
+    Check {
+        /// Path to a privileges.yaml file or to a directory
+        /// containing one.
+        path: PathBuf,
+        /// Skip host-prerequisite probes; only validate the schema.
+        #[arg(long)]
+        schema_only: bool,
+        /// Skip running verification commands. Useful when the
+        /// declared service identity does not yet exist on this
+        /// host (admission gate enforcement rides v0.1.13).
+        #[arg(long)]
+        skip_verification: bool,
+        /// Treat advisory warnings as failures.
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -189,6 +234,74 @@ enum AdminSub {
         #[arg(long, value_name = "PATH", default_value = admin::DEFAULT_SOCKET_PATH)]
         socket: PathBuf,
     },
+    /// Print the steward's `describe_capabilities` response: wire
+    /// version, supported ops, named features, catalogue source
+    /// (`configured` / `lkg` / `builtin`), wall-clock trust state
+    /// (`trusted` / `untrusted` / `stale` / `adjusting`), and
+    /// whether the device has a battery-backed RTC. Read-only;
+    /// no capability negotiation. The clock-trust field is the
+    /// canonical operator-facing surface for time-trust state.
+    DescribeCapabilities {
+        #[arg(long, value_name = "PATH", default_value = admin::DEFAULT_SOCKET_PATH)]
+        socket: PathBuf,
+    },
+    /// Subscribe to the steward's happenings bus and stream every
+    /// matching event to stdout, one happening per line as JSON.
+    /// Promotes the connection to streaming mode; exits after
+    /// `--max-count` events received OR `--duration-secs` elapsed,
+    /// whichever comes first. Default bounds: 100 events / 30s.
+    SubscribeHappenings {
+        /// Maximum events to print before exiting.
+        #[arg(long, value_name = "N", default_value_t = 100)]
+        max_count: u64,
+        /// Maximum seconds to stream before exiting.
+        #[arg(long, value_name = "SECS", default_value_t = 30)]
+        duration_secs: u64,
+        /// Optional cursor for replay. Only happenings with seq
+        /// strictly greater than `since` are streamed.
+        #[arg(long, value_name = "SEQ")]
+        since: Option<u64>,
+        /// Optional comma-separated variant whitelist (e.g.
+        /// `appointment_fired,watch_fired`). Empty = no filter.
+        #[arg(long, value_name = "VARIANTS")]
+        variants: Option<String>,
+        /// Optional comma-separated plugin whitelist. Empty = no
+        /// filter.
+        #[arg(long, value_name = "PLUGINS")]
+        plugins: Option<String>,
+        /// Optional comma-separated shelf whitelist. Empty = no
+        /// filter.
+        #[arg(long, value_name = "SHELVES")]
+        shelves: Option<String>,
+        /// Optional comma-separated coalesce labels. Same-label
+        /// happenings within the window collapse into one delivered
+        /// envelope per the framework's selection rule. Common
+        /// shapes: `variant,plugin`; `variant,plugin,sensor_id`.
+        /// Absent = firehose delivery.
+        #[arg(long, value_name = "LABELS")]
+        coalesce_labels: Option<String>,
+        /// Coalesce window in milliseconds. Same-key happenings
+        /// within the window collapse. Defaults to the framework
+        /// default when omitted; only consulted when
+        /// --coalesce-labels is set.
+        #[arg(long, value_name = "MS")]
+        coalesce_window_ms: Option<u32>,
+        #[arg(long, value_name = "PATH", default_value = admin::DEFAULT_SOCKET_PATH)]
+        socket: PathBuf,
+    },
+    /// Reload one plugin. Drives the steward's reload_plugin op,
+    /// which dispatches to Live or Restart mode per the plugin's
+    /// manifest `lifecycle.hot_reload`. For OOP Live, the
+    /// framework calls prepare_for_live_reload on the running
+    /// instance, spawns a successor from the recorded bundle
+    /// directory, and calls load_with_state on the successor with
+    /// the blob the prior instance returned.
+    ReloadPlugin {
+        /// Canonical name of the plugin to reload.
+        plugin: String,
+        #[arg(long, value_name = "PATH", default_value = admin::DEFAULT_SOCKET_PATH)]
+        socket: PathBuf,
+    },
     /// Reload catalogue or manifest declarations.
     Reload {
         #[command(subcommand)]
@@ -216,6 +329,166 @@ enum AdminSub {
     Grammar {
         #[command(subcommand)]
         sub: AdminGrammarSub,
+    },
+    /// Operator-side responder for plugin-issued user-interaction
+    /// prompts. List open prompts, answer them, or cancel them.
+    /// Each verb requires the `user_interaction_responder`
+    /// capability the steward enforces server-side.
+    Prompt {
+        #[command(subcommand)]
+        sub: AdminPromptSub,
+    },
+    /// Operator-side warden custody surface. Take custody, issue
+    /// course-corrections, release custody. The framework's
+    /// `course_correct_verbs` manifest gate refuses verbs not in
+    /// the warden's declared set; the verb-gate is the
+    /// operator-visible refusal point.
+    Warden {
+        #[command(subcommand)]
+        sub: AdminWardenSub,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminWardenSub {
+    /// One-shot bundled custody flow: take custody, issue a
+    /// single course-correction, release custody. Exit code is
+    /// the course-correction's outcome — 0 on accepted, non-zero
+    /// on the framework's structured refusal (e.g. verb not in
+    /// `course_correct_verbs`). Take and release are best-effort
+    /// (logged on failure but do not affect exit code).
+    CourseCorrect {
+        /// Shelf the warden is admitted on (e.g. `playback.mpd`).
+        #[arg(long, value_name = "SHELF")]
+        shelf: String,
+        /// Custody type discriminator declared by the shelf shape.
+        #[arg(long, value_name = "TYPE")]
+        custody_type: String,
+        /// Verb name. Refused if not in the warden's
+        /// `capabilities.warden.course_correct_verbs`.
+        #[arg(long, value_name = "VERB")]
+        verb: String,
+        /// Optional base64 payload for take_custody. Default
+        /// empty.
+        #[arg(long, value_name = "B64", default_value = "")]
+        custody_payload_b64: String,
+        /// Optional base64 payload for course_correct. Default
+        /// empty.
+        #[arg(long, value_name = "B64", default_value = "")]
+        payload_b64: String,
+        #[arg(long, value_name = "PATH", default_value = admin::DEFAULT_SOCKET_PATH)]
+        socket: PathBuf,
+    },
+    /// Take custody on a warden and print the resulting handle
+    /// id + started_at_ms to stdout (one `key=value` per line)
+    /// so a script can capture them and feed them to a follow-up
+    /// `fast-path-dispatch` or `release-custody` call. The
+    /// bundled `course-correct` verb hides the handle inside
+    /// one round-trip; this verb exposes it for the held-handle
+    /// flows fast-path and multi-step custody scenarios need.
+    TakeCustody {
+        /// Shelf the warden is admitted on.
+        #[arg(long, value_name = "SHELF")]
+        shelf: String,
+        /// Custody type discriminator declared by the shelf shape.
+        #[arg(long, value_name = "TYPE")]
+        custody_type: String,
+        /// Optional base64 payload for take_custody. Default
+        /// empty.
+        #[arg(long, value_name = "B64", default_value = "")]
+        payload_b64: String,
+        #[arg(long, value_name = "PATH", default_value = admin::DEFAULT_SOCKET_PATH)]
+        socket: PathBuf,
+    },
+    /// Release a previously-taken custody by handle id +
+    /// started_at_ms. Counterpart to `take-custody`. The
+    /// bundled `course-correct` verb releases automatically;
+    /// scripts driving the held-handle flow use this verb to
+    /// release at the chosen point.
+    ReleaseCustody {
+        /// Shelf the warden is admitted on.
+        #[arg(long, value_name = "SHELF")]
+        shelf: String,
+        /// Custody handle id (from a prior take_custody).
+        #[arg(long, value_name = "ID")]
+        handle_id: String,
+        /// Custody handle started_at, milliseconds since UNIX
+        /// epoch (from a prior take_custody response).
+        #[arg(long, value_name = "MS")]
+        handle_started_at_ms: u64,
+        #[arg(long, value_name = "PATH", default_value = admin::DEFAULT_SOCKET_PATH)]
+        socket: PathBuf,
+    },
+    /// Fast-path dispatch against an open custody. Drives the
+    /// steward's `/run/evo/fast.sock` channel directly with a
+    /// length-prefixed CBOR `FastPathRequest::Dispatch`. The
+    /// warden's manifest `fast_path_verbs` gate refuses verbs
+    /// not in the declared set; the budget gate refuses calls
+    /// exceeding `fast_path_budget_ms`. Distinct from
+    /// `course-correct` (slow path): this is the latency-bounded
+    /// channel.
+    FastPathDispatch {
+        /// Shelf the warden is admitted on.
+        #[arg(long, value_name = "SHELF")]
+        shelf: String,
+        /// Verb name. Must be in the warden's
+        /// `capabilities.warden.fast_path_verbs`.
+        #[arg(long, value_name = "VERB")]
+        verb: String,
+        /// Custody handle id (from a prior take_custody).
+        #[arg(long, value_name = "ID")]
+        handle_id: String,
+        /// Custody handle started_at, milliseconds since UNIX
+        /// epoch (from a prior take_custody response).
+        #[arg(long, value_name = "MS")]
+        handle_started_at_ms: u64,
+        /// Optional base64 payload. Default empty.
+        #[arg(long, value_name = "B64", default_value = "")]
+        payload_b64: String,
+        /// Optional per-frame deadline override in ms.
+        #[arg(long, value_name = "MS")]
+        deadline_ms: Option<u32>,
+        /// Path to the steward's Fast Path socket.
+        #[arg(long, value_name = "PATH", default_value = "/run/evo/fast.sock")]
+        socket: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminPromptSub {
+    /// List every open user-interaction prompt currently held
+    /// by the steward's prompt ledger. One line per prompt.
+    List {
+        #[arg(long, value_name = "PATH", default_value = admin::DEFAULT_SOCKET_PATH)]
+        socket: PathBuf,
+    },
+    /// Answer an open prompt with a `Text` response. Sub-shells
+    /// for non-text prompt types (Select / Confirm / MultiField)
+    /// land alongside the scenarios that need them.
+    AnswerText {
+        /// Canonical name of the plugin that issued the prompt.
+        #[arg(long, value_name = "NAME")]
+        plugin: String,
+        /// Plugin-chosen prompt id.
+        #[arg(long, value_name = "ID")]
+        prompt_id: String,
+        /// The text value to send back as the response.
+        #[arg(long, value_name = "TEXT")]
+        value: String,
+        #[arg(long, value_name = "PATH", default_value = admin::DEFAULT_SOCKET_PATH)]
+        socket: PathBuf,
+    },
+    /// Cancel an open prompt. The plugin's awaiting future
+    /// resolves with `PromptOutcome::Cancelled { by: Consumer }`.
+    Cancel {
+        /// Canonical name of the plugin that issued the prompt.
+        #[arg(long, value_name = "NAME")]
+        plugin: String,
+        /// Plugin-chosen prompt id.
+        #[arg(long, value_name = "ID")]
+        prompt_id: String,
+        #[arg(long, value_name = "PATH", default_value = admin::DEFAULT_SOCKET_PATH)]
+        socket: PathBuf,
     },
 }
 
@@ -512,6 +785,22 @@ fn run(cli: Cli) -> Result<(), anyhow::Error> {
             max_url_bytes,
         ),
         Sub::Admin { sub } => run_admin(sub),
+        Sub::Privileges { sub } => match sub {
+            PrivilegesSub::Describe { path, format } => {
+                privileges_cmd::describe(&path, format)
+            }
+            PrivilegesSub::Check {
+                path,
+                schema_only,
+                skip_verification,
+                strict,
+            } => privileges_cmd::check(
+                &path,
+                schema_only,
+                skip_verification,
+                strict,
+            ),
+        },
     }
 }
 
@@ -538,6 +827,33 @@ fn run_admin(sub: AdminSub) -> Result<(), anyhow::Error> {
         }
         AdminSub::Diagnose { plugin, socket } => {
             admin::diagnose(&socket, &plugin)
+        }
+        AdminSub::DescribeCapabilities { socket } => {
+            admin::describe_capabilities(&socket)
+        }
+        AdminSub::SubscribeHappenings {
+            max_count,
+            duration_secs,
+            since,
+            variants,
+            plugins,
+            shelves,
+            coalesce_labels,
+            coalesce_window_ms,
+            socket,
+        } => admin::subscribe_happenings(
+            &socket,
+            max_count,
+            duration_secs,
+            since,
+            variants.as_deref(),
+            plugins.as_deref(),
+            shelves.as_deref(),
+            coalesce_labels.as_deref(),
+            coalesce_window_ms,
+        ),
+        AdminSub::ReloadPlugin { plugin, socket } => {
+            admin::reload_plugin(&socket, &plugin)
         }
         AdminSub::Reload { sub } => match sub {
             AdminReloadSub::Catalogue {
@@ -610,15 +926,103 @@ fn run_admin(sub: AdminSub) -> Result<(), anyhow::Error> {
                 socket,
             } => admin::grammar_accept(&socket, &from_type, &reason),
         },
+        AdminSub::Warden { sub } => match sub {
+            AdminWardenSub::CourseCorrect {
+                shelf,
+                custody_type,
+                verb,
+                custody_payload_b64,
+                payload_b64,
+                socket,
+            } => admin::warden_course_correct(
+                &socket,
+                &shelf,
+                &custody_type,
+                &custody_payload_b64,
+                &verb,
+                &payload_b64,
+            ),
+            AdminWardenSub::FastPathDispatch {
+                shelf,
+                verb,
+                handle_id,
+                handle_started_at_ms,
+                payload_b64,
+                deadline_ms,
+                socket,
+            } => admin::warden_fast_path_dispatch(
+                &socket,
+                &shelf,
+                &verb,
+                &handle_id,
+                handle_started_at_ms,
+                &payload_b64,
+                deadline_ms,
+            ),
+            AdminWardenSub::TakeCustody {
+                shelf,
+                custody_type,
+                payload_b64,
+                socket,
+            } => admin::warden_take_custody(
+                &socket,
+                &shelf,
+                &custody_type,
+                &payload_b64,
+            ),
+            AdminWardenSub::ReleaseCustody {
+                shelf,
+                handle_id,
+                handle_started_at_ms,
+                socket,
+            } => admin::warden_release_custody(
+                &socket,
+                &shelf,
+                &handle_id,
+                handle_started_at_ms,
+            ),
+        },
+        AdminSub::Prompt { sub } => match sub {
+            AdminPromptSub::List { socket } => admin::prompt_list(&socket),
+            AdminPromptSub::AnswerText {
+                plugin,
+                prompt_id,
+                value,
+                socket,
+            } => {
+                admin::prompt_answer_text(&socket, &plugin, &prompt_id, &value)
+            }
+            AdminPromptSub::Cancel {
+                plugin,
+                prompt_id,
+                socket,
+            } => admin::prompt_cancel(&socket, &plugin, &prompt_id),
+        },
     }
 }
 
-/// Pick between `--inline` and `--path` for the reload
-/// subcommands. Refuses with a usage error when both or neither
-/// are supplied.
+/// Pick between `--inline`, `--path`, and stdin for the reload
+/// subcommands.
+///
+/// Resolution order:
+///
+/// - `--inline=<TOML>` returns `Inline`.
+/// - `--path=<FILE>` returns `Path`.
+/// - Neither supplied AND stdin is not a terminal: read stdin to
+///   end-of-file and return `Inline` with the captured bytes.
+///   Useful for `cat manifest.toml | evo-plugin-tool admin reload
+///   manifest --plugin=...`, and the only path that works under
+///   service-side `PrivateTmp=yes` since no path crosses the
+///   sandbox.
+/// - Neither supplied AND stdin IS a terminal: refuse with a
+///   usage error rather than hanging on a blank prompt.
+/// - Both supplied: refuse — `--inline` and `--path` are mutually
+///   exclusive (and combining either with a piped stdin is also
+///   refused on the principle that one explicit source per
+///   invocation beats silent precedence rules).
 fn resolve_reload_source(
     inline: Option<String>,
-    path: Option<std::path::PathBuf>,
+    path: Option<PathBuf>,
 ) -> Result<admin::ReloadSource, anyhow::Error> {
     match (inline, path) {
         (Some(t), None) => Ok(admin::ReloadSource::Inline(t)),
@@ -626,9 +1030,116 @@ fn resolve_reload_source(
         (Some(_), Some(_)) => Err(anyhow::anyhow!(
             "--inline and --path are mutually exclusive"
         )),
-        (None, None) => Err(anyhow::anyhow!(
-            "one of --inline=<TOML> or --path=<FILE> is required"
-        )),
+        (None, None) => read_reload_source_from_stdin(),
+    }
+}
+
+/// Read a reload TOML body from stdin. Refuses when stdin is a
+/// terminal (no piped body) and when the captured body is empty.
+fn read_reload_source_from_stdin() -> Result<admin::ReloadSource, anyhow::Error>
+{
+    let mut stdin = std::io::stdin().lock();
+    if stdin.is_terminal() {
+        return Err(anyhow::anyhow!(
+            "no source supplied: provide --inline=<TOML>, \
+             --path=<FILE>, or pipe the TOML body on stdin"
+        ));
+    }
+    read_reload_source_from_reader(&mut stdin)
+}
+
+/// Read a reload TOML body from any reader. Extracted so the
+/// stdin-handling semantics (empty-input refusal, error wrapping)
+/// can be unit-tested without touching real stdin.
+fn read_reload_source_from_reader<R: Read>(
+    r: &mut R,
+) -> Result<admin::ReloadSource, anyhow::Error> {
+    let mut buf = String::new();
+    r.read_to_string(&mut buf)
+        .context("reading reload TOML body from stdin")?;
+    if buf.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "stdin produced an empty body; supply non-empty TOML"
+        ));
+    }
+    Ok(admin::ReloadSource::Inline(buf))
+}
+
+#[cfg(test)]
+mod resolve_reload_source_tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+
+    #[test]
+    fn inline_wins_when_only_inline_supplied() {
+        let r = resolve_reload_source(Some("schema_version = 1".into()), None)
+            .expect("inline source resolves");
+        match r {
+            admin::ReloadSource::Inline(t) => {
+                assert_eq!(t, "schema_version = 1");
+            }
+            admin::ReloadSource::Path(_) => panic!("expected Inline"),
+        }
+    }
+
+    #[test]
+    fn path_wins_when_only_path_supplied() {
+        let r =
+            resolve_reload_source(None, Some(PathBuf::from("/etc/foo.toml")))
+                .expect("path source resolves");
+        match r {
+            admin::ReloadSource::Path(p) => {
+                assert_eq!(p, PathBuf::from("/etc/foo.toml"));
+            }
+            admin::ReloadSource::Inline(_) => panic!("expected Path"),
+        }
+    }
+
+    #[test]
+    fn both_supplied_is_refused() {
+        let e = resolve_reload_source(
+            Some("x = 1".into()),
+            Some(PathBuf::from("/etc/foo.toml")),
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string().contains("mutually exclusive"),
+            "expected mutual-exclusion message, got: {e}"
+        );
+    }
+
+    #[test]
+    fn reader_returns_captured_body_as_inline() {
+        let mut cur = Cursor::new(b"schema_version = 1\nrack = []\n".to_vec());
+        let r = read_reload_source_from_reader(&mut cur)
+            .expect("reader source resolves");
+        match r {
+            admin::ReloadSource::Inline(t) => {
+                assert_eq!(t, "schema_version = 1\nrack = []\n");
+            }
+            admin::ReloadSource::Path(_) => panic!("expected Inline"),
+        }
+    }
+
+    #[test]
+    fn reader_refuses_empty_body() {
+        let mut cur = Cursor::new(b"".to_vec());
+        let e = read_reload_source_from_reader(&mut cur).unwrap_err();
+        assert!(
+            e.to_string().contains("empty body"),
+            "expected empty-body message, got: {e}"
+        );
+    }
+
+    #[test]
+    fn reader_refuses_whitespace_only_body() {
+        let mut cur = Cursor::new(b"   \n\t\n".to_vec());
+        let e = read_reload_source_from_reader(&mut cur).unwrap_err();
+        assert!(
+            e.to_string().contains("empty body"),
+            "expected empty-body message, got: {e}"
+        );
     }
 }
 

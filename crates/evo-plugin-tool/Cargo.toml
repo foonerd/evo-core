@@ -34,6 +34,9 @@ zip = { version = "2.2", default-features = false, features = ["deflate"] }
 tempfile = "3"
 walkdir = "2"
 ureq = "2.9"
+# Cross-platform PATH lookup for the `privileges check` host probes.
+# Avoids fork+exec'ing `which`/`command -v` from the shell.
+which = "6"
 # Async runtime + Unix socket I/O for the `admin` subcommands
 # that talk to the running steward over `/run/evo/evo.sock`. The
 # rest of the tool is sync; the runtime is built per admin call

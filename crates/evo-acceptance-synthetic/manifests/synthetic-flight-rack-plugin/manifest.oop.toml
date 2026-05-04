@@ -1,0 +1,55 @@
+# Synthetic flight-rack plugin — out-of-process bundle manifest.
+#
+# Admits as a respondent on the `flight_mode.bluetooth` shelf and
+# handles `flight_mode.set` + `flight_mode.query` request types.
+# The plugin holds no hardware: success on `flight_mode.set` is the
+# only behaviour the acceptance scenarios actually exercise — the
+# framework's post-dispatch hook then emits
+# `Happening::FlightModeChanged`, which is what consumer
+# subscriptions observe.
+#
+# Used by the three flight-mode acceptance scenarios:
+# `T2.flight-mode-set-emits` (single-consumer happening observation),
+# `T3.flight-multi-consumer` (three concurrent subscribers),
+# `T5.flight-mode-no-panic` (repeated operations leave the steward
+# panic-free).
+
+[plugin]
+name = "org.evoframework.acceptance.flight-rack-plugin"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "flight_mode.bluetooth"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities.respondent]
+request_types = ["flight_mode.set", "flight_mode.query"]
+response_budget_ms = 1000

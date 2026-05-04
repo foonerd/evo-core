@@ -1,0 +1,56 @@
+# Synthetic happenings-burst source plugin — out-of-process bundle
+# manifest.
+#
+# Admits as a singleton respondent on the synthetic
+# `acceptance.coalescing-source` shelf. On load, schedules a
+# happening burst: after EVO_ACCEPTANCE_COALESCING_DELAY_MS the
+# plugin emits EVO_ACCEPTANCE_COALESCING_COUNT
+# `Happening::PluginEvent` instances with the configured event_type
+# and payload. The respondent's declared request_type is a
+# placeholder; the plugin is not invoked over the wire by tests —
+# the burst is the surface under test.
+#
+# Used by T2.coalescing-burst-collapse,
+# T2.coalescing-label-mismatch-passthrough,
+# T2.coalescing-plugin-event-variant. Has no value outside those
+# scenarios.
+
+[plugin]
+name = "org.evoframework.acceptance.synthetic-coalescing-source"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.coalescing-source"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 64
+max_cpu_percent = 5
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities.respondent]
+request_types = ["never_called"]
+response_budget_ms = 1000

@@ -1,0 +1,58 @@
+# Synthetic warden — out-of-process bundle manifest.
+#
+# Admits as a singleton warden on the synthetic
+# `acceptance.warden` shelf. Declares a closed
+# `course_correct_verbs` allowlist of `["a", "b"]`. The framework's
+# `course_correct` boundary refuses any verb not in this list with
+# the message:
+#
+#     "warden on shelf <shelf> did not declare course_correct verb
+#      \"<verb>\" in its manifest (declared: [\"a\", \"b\"])"
+#
+# T2.warden-verb-gate exercises that boundary by issuing a
+# `course_correct` with `correction_type = "c"` and asserting the
+# refusal text. Used only by that scenario; has no value outside
+# of it.
+
+[plugin]
+name = "org.evoframework.acceptance.synthetic-warden"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.warden"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "warden"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities.warden]
+custody_domain = "acceptance"
+custody_exclusive = false
+course_correction_budget_ms = 1000
+custody_failure_mode = "abort"
+course_correct_verbs = ["a", "b"]

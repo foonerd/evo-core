@@ -162,9 +162,13 @@ The tables below enumerate the current per-field bucket assignment.
 
 Core's position on the distribution-owned fields: they are **contract text** a plugin author declares and a distribution reads. A plugin that declares `max_memory_mb = 16` is making a promise to the distribution packager, who decides how to hold the plugin to that promise. A distribution that does not care (for example, a single-tenant A/V appliance with all plugins reviewed first-party) may leave the declarations advisory and unenforced. A distribution that does care (multi-tenant, untrusted third-party plugins, regulated environments) configures its systemd / cgroup / namespace layer to enforce them. The same split applies to deeper isolation (`seccomp`, Linux capabilities, SELinux domains, Android sandbox): distribution-owned, not part of the evo-core admission contract. See `BOUNDARY.md` section 6.2 for the framework-vs-distribution line.
 
+**Enforced** (acted on by the steward at runtime):
+
+- `lifecycle.hot_reload` — `Restart` / `Live` / `None`. The steward's `reload_plugin` admin verb consults the field and dispatches to the matching path. `Live` for OOP performs `prepare_for_live_reload` on the running instance, spawns a successor, and calls `load_with_state` on the successor with the carried `StateBlob`. `Live` for in-process passes the `StateBlob` directly between calls on the same Plugin trait object.
+- `lifecycle.live_blob_max` — Optional `u64` (bytes). Per-plugin override of the framework's default soft cap (16 MiB) on `prepare_for_live_reload` state blobs. When set, the framework uses the declared value clamped to the hard ceiling (`MAX_LIVE_RELOAD_BLOB_BYTES = 64 MiB`). Blobs above the effective cap are refused with a structured admission error naming which cap was hit (`per-manifest live_blob_max` vs. `default 16 MiB cap`); the previous instance keeps serving.
+
 **Reserved** (parsed and preserved in the manifest, but not acted on by the steward today; the field is published for forward-compatibility against the roadmap feature that will consult it):
 
-- `lifecycle.hot_reload` — `Restart` / `Live` parsed but not acted on; today only `None` (full unload-reload) is operative regardless of declaration. Promoted when the hot-reload supervisor lands.
 - `lifecycle.restart_on_crash` — Parsed for forward-compat; the out-of-process supervisor today reaps a crashed child and deregisters without restarting. Promoted with `restart_budget` when the per-plugin restart supervisor lands.
 - `lifecycle.restart_budget` — Bounded with `restart_on_crash`; both fields graduate together.
 - `capabilities.factory.max_instances` — v0 admission refuses `kind.instance = "factory"` at the pre-admission validation pass, so no factory reaches this field. Promoted when factory admission lands.
@@ -521,7 +525,7 @@ The steward's own plugin administration is expressed as a rack in the infrastruc
 
 Administration is performed by consumers projecting the `plugins` rack and issuing instructions to the operator shelf. This is the full admin surface. No parallel admin API exists.
 
-The read-only inventory surface is `op = "list_plugins"` (`CLIENT_API.md` §4.11), which returns one entry per admitted plugin (name, fully-qualified shelf, interaction kind) in router admission order. The writable verbs of the operator shelf — `enable_plugin`, `disable_plugin`, `uninstall_plugin`, `purge_plugin_state`, `reload_catalogue`, `reload_manifest` — are reachable on the wire under the `plugins_admin` capability. The admission engine's `reload_plugin` entry point honours the manifest's `lifecycle.hot_reload` policy (None / Restart).
+The read-only inventory surface is `op = "list_plugins"` (`CLIENT_API.md` §4.11), which returns one entry per admitted plugin (name, fully-qualified shelf, interaction kind) in router admission order. The writable verbs of the operator shelf — `enable_plugin`, `disable_plugin`, `uninstall_plugin`, `purge_plugin_state`, `reload_catalogue`, `reload_manifest` — are reachable on the wire under the `plugins_admin` capability. The admission engine's `reload_plugin` entry point honours the manifest's `lifecycle.hot_reload` policy (None / Restart / Live).
 
 ## 7. Installation Lifecycle
 

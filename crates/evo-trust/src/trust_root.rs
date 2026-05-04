@@ -43,9 +43,18 @@ pub fn load_trust_root(
     opt_trust: &Path,
     etc_trust_d: &Path,
 ) -> Result<Vec<TrustKey>, TrustError> {
+    // Per LOGGING.md §2 (each verb invocation fires at debug):
+    // trust-root load is a verb-shaped boot operation that walks
+    // two filesystem trees and parses every PEM + meta sidecar.
+    tracing::debug!(
+        opt_trust = %opt_trust.display(),
+        etc_trust_d = %etc_trust_d.display(),
+        "trust root: load invoking"
+    );
     let mut out = Vec::new();
     load_dir(&mut out, opt_trust)?;
     load_dir(&mut out, etc_trust_d)?;
+    tracing::debug!(keys = out.len(), "trust root: load returned");
     Ok(out)
 }
 

@@ -200,9 +200,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
-/// Maximum size of a single JSON frame. Prevents malicious or malformed
-/// clients from forcing the steward to allocate unbounded memory.
-const MAX_FRAME_SIZE: usize = 1024 * 1024;
+/// Maximum size of a single JSON frame the steward's admin server
+/// will accept. Pinned to
+/// [`evo_plugin_sdk::contract::MAX_LIVE_RELOAD_BLOB_BYTES`] (64 MiB)
+/// so the wire transport can carry the largest `prepare_for_live_reload`
+/// state blob the framework's admission path would ever admit.
+/// Prevents malicious or malformed clients from forcing the steward
+/// to allocate unbounded memory while keeping the cap aligned with
+/// the SDK-side codec.
+const MAX_FRAME_SIZE: usize =
+    evo_plugin_sdk::contract::MAX_LIVE_RELOAD_BLOB_BYTES;
 
 /// Source of correlation IDs assigned to incoming requests that do not
 /// already carry one.
@@ -516,6 +523,58 @@ enum ClientRequest {
     /// `plugins_admin`.
     PurgePluginState {
         /// Canonical name of the plugin to purge state for.
+        plugin: String,
+    },
+    /// Operator-issued take-custody against a warden. Mirrors
+    /// [`crate::router::PluginRouter::take_custody`]; bypasses no
+    /// gates the in-process plugin-to-plugin path applies. The
+    /// shelf must hold an admitted warden; respondents refuse
+    /// with a structured error.
+    TakeCustody {
+        /// Shelf the warden is admitted on.
+        shelf: String,
+        /// Custody type discriminator declared by the shelf shape.
+        custody_type: String,
+        /// Opaque payload, base64-encoded for JSON transport. The
+        /// warden deserialises per the shelf's schema.
+        payload_b64: String,
+    },
+    /// Operator-issued course-correction on an open custody. The
+    /// warden's manifest declares `course_correct_verbs`; verbs
+    /// not in that list refuse at the framework boundary with
+    /// `permission_denied / verb_not_declared`. Bounded by the
+    /// warden's `course_correction_budget_ms`.
+    CourseCorrect {
+        /// Shelf the warden is admitted on.
+        shelf: String,
+        /// Custody handle returned by an earlier `TakeCustody`.
+        handle: evo_plugin_sdk::contract::CustodyHandle,
+        /// Verb name to dispatch. Must appear in the warden's
+        /// `capabilities.warden.course_correct_verbs`.
+        correction_type: String,
+        /// Opaque payload, base64-encoded for JSON transport.
+        payload_b64: String,
+    },
+    /// Operator-issued release of an open custody. Idempotent on
+    /// already-released or unknown handles in shape (errors are
+    /// surfaced; the framework does not silently swallow them).
+    ReleaseCustody {
+        /// Shelf the warden is admitted on.
+        shelf: String,
+        /// Custody handle returned by an earlier `TakeCustody`.
+        handle: evo_plugin_sdk::contract::CustodyHandle,
+    },
+    /// Operator-issued plugin reload. Drives the
+    /// [`AdmissionEngine::reload_plugin`] entry point, which
+    /// dispatches to Live or Restart mode per the plugin's
+    /// manifest `lifecycle.hot_reload` policy. For OOP Live, the
+    /// framework calls `prepare_for_live_reload` on the running
+    /// instance, spawns a successor from the recorded bundle
+    /// directory, and calls `load_with_state` on the successor
+    /// with the blob the prior instance returned. Capability-
+    /// gated by `plugins_admin`.
+    ReloadPlugin {
+        /// Canonical name of the plugin to reload.
         plugin: String,
     },
     /// Operator-issued catalogue reload. Validates and
@@ -1655,6 +1714,50 @@ enum ClientResponse {
         /// state was mutated.
         dry_run: bool,
     },
+    /// Successful response to [`ClientRequest::TakeCustody`].
+    /// Carries the warden-generated [`CustodyHandle`] for use in
+    /// subsequent `CourseCorrect` / `ReleaseCustody` calls.
+    CustodyTaken {
+        /// Always `true`; the distinctive top-level key.
+        custody: bool,
+        /// Shelf (echoed).
+        shelf: String,
+        /// The minted custody handle.
+        handle: evo_plugin_sdk::contract::CustodyHandle,
+    },
+    /// Successful response to [`ClientRequest::CourseCorrect`].
+    /// The warden accepted the correction within the declared
+    /// budget; refused course-corrections surface as
+    /// [`Self::Error`].
+    CustodyCourseCorrected {
+        /// Always `true`; the distinctive top-level key.
+        course_corrected: bool,
+        /// Shelf (echoed).
+        shelf: String,
+        /// Handle id (echoed).
+        handle_id: String,
+    },
+    /// Successful response to [`ClientRequest::ReleaseCustody`].
+    CustodyReleased {
+        /// Always `true`; the distinctive top-level key.
+        released: bool,
+        /// Shelf (echoed).
+        shelf: String,
+        /// Handle id (echoed).
+        handle_id: String,
+    },
+    /// Successful response to [`ClientRequest::ReloadPlugin`].
+    /// The lifecycle happenings (`PluginLiveReloadStarted`,
+    /// `PluginLiveReloadCompleted` / `PluginLiveReloadFailed`,
+    /// or the unload + admit pair under Restart mode) carry the
+    /// observable details; this response just confirms the
+    /// reload completed without error.
+    PluginReloaded {
+        /// Always `true`; the distinctive top-level key.
+        plugin_reload: bool,
+        /// Canonical plugin name (echoed).
+        plugin: String,
+    },
     /// Any failure.
     ///
     /// The `error` envelope is structured: it carries
@@ -2196,6 +2299,29 @@ enum HappeningWire {
         /// Subject type of the forgotten subject, captured before
         /// removal.
         subject_type: String,
+        /// When the happening was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::SubjectStateChanged`].
+    ///
+    /// Emitted when a plugin publishes a new runtime state for a
+    /// subject it had previously announced. Carries both previous
+    /// and new state values so subscribers (notably the watch
+    /// evaluator's `SubjectState` arm) can compute predicates
+    /// without re-projecting the subject.
+    SubjectStateChanged {
+        /// Opaque token identifying the plugin that published the
+        /// state.
+        claimant_token: ClaimantToken,
+        /// Canonical ID of the subject whose state was updated.
+        canonical_id: String,
+        /// Subject type, captured from the registry record.
+        subject_type: String,
+        /// State value before the update; `null` on the first
+        /// state publication for a subject.
+        prev_state: serde_json::Value,
+        /// State value after the update.
+        new_state: serde_json::Value,
         /// When the happening was recorded, ms since UNIX epoch.
         at_ms: u64,
     },
@@ -3090,6 +3216,21 @@ impl HappeningWire {
                 claimant_token: issuer.token_for(&plugin),
                 canonical_id,
                 subject_type,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::SubjectStateChanged {
+                plugin,
+                canonical_id,
+                subject_type,
+                prev_state,
+                new_state,
+                at,
+            } => HappeningWire::SubjectStateChanged {
+                claimant_token: issuer.token_for(&plugin),
+                canonical_id,
+                subject_type,
+                prev_state,
+                new_state,
                 at_ms: system_time_to_ms(at),
             },
             Happening::RelationForgotten {
@@ -4630,6 +4771,20 @@ async fn dispatch_request(
     watches: Option<&Arc<crate::watches::WatchRuntime>>,
     conn: &mut ConnectionState,
 ) -> ClientResponse {
+    // Per `docs/engineering/LOGGING.md` §2: every verb invocation
+    // emits a debug-level log so an engineer enabling
+    // `RUST_LOG=evo=debug` sees the per-request narrative
+    // alongside the info-level lifecycle milestones. The op tag
+    // is the serde-tagged variant name; payload-bearing fields
+    // are excluded here (they may be large; the per-handler
+    // debug logs surface them where useful).
+    tracing::debug!(
+        op = client_request_op_tag(&req),
+        peer_uid = conn.peer.uid,
+        peer_gid = conn.peer.gid,
+        granted_capabilities = ?conn.granted_capabilities,
+        "dispatch_request: incoming op"
+    );
     match req {
         ClientRequest::Request {
             shelf,
@@ -4639,6 +4794,7 @@ async fn dispatch_request(
         } => {
             handle_plugin_request(
                 router,
+                state,
                 shelf,
                 request_type,
                 payload_b64,
@@ -4727,6 +4883,34 @@ async fn dispatch_request(
         } => {
             handle_reload_manifest(engine, conn, plugin, source, dry_run).await
         }
+        ClientRequest::ReloadPlugin { plugin } => {
+            handle_reload_plugin(engine, conn, plugin).await
+        }
+        ClientRequest::TakeCustody {
+            shelf,
+            custody_type,
+            payload_b64,
+        } => {
+            handle_take_custody(router, shelf, custody_type, payload_b64).await
+        }
+        ClientRequest::CourseCorrect {
+            shelf,
+            handle,
+            correction_type,
+            payload_b64,
+        } => {
+            handle_course_correct(
+                router,
+                shelf,
+                handle,
+                correction_type,
+                payload_b64,
+            )
+            .await
+        }
+        ClientRequest::ReleaseCustody { shelf, handle } => {
+            handle_release_custody(router, shelf, handle).await
+        }
         ClientRequest::ListReconciliationPairs => {
             handle_list_reconciliation_pairs(reconciliation).await
         }
@@ -4766,6 +4950,7 @@ async fn dispatch_request(
             action,
         } => {
             handle_create_appointment(appointments, conn, creator, spec, action)
+                .await
         }
         ClientRequest::CancelAppointment {
             creator,
@@ -4851,6 +5036,67 @@ async fn dispatch_request(
                 .with_subclass("dispatch_misroute"),
             }
         }
+    }
+}
+
+/// Return a stable, snake_case op tag for a [`ClientRequest`]
+/// variant — the same string the serde-tagged enum carries on
+/// the wire under the `op` field. Used by debug-level logging
+/// at dispatch entry to give an engineer a structured field
+/// they can filter on (e.g. `journalctl EVO_OP=take_custody`)
+/// without paying the cost of formatting the full request body
+/// at every verb invocation.
+fn client_request_op_tag(req: &ClientRequest) -> &'static str {
+    match req {
+        ClientRequest::Request { .. } => "request",
+        ClientRequest::ProjectSubject { .. } => "project_subject",
+        ClientRequest::ProjectRack { .. } => "project_rack",
+        ClientRequest::ListPlugins => "list_plugins",
+        ClientRequest::DescribeAlias { .. } => "describe_alias",
+        ClientRequest::ListActiveCustodies => "list_active_custodies",
+        ClientRequest::ListSubjects { .. } => "list_subjects",
+        ClientRequest::ListRelations { .. } => "list_relations",
+        ClientRequest::EnumerateAddressings { .. } => "enumerate_addressings",
+        ClientRequest::DescribeCapabilities => "describe_capabilities",
+        ClientRequest::Negotiate { .. } => "negotiate",
+        ClientRequest::ResolveClaimants { .. } => "resolve_claimants",
+        ClientRequest::EnablePlugin { .. } => "enable_plugin",
+        ClientRequest::DisablePlugin { .. } => "disable_plugin",
+        ClientRequest::UninstallPlugin { .. } => "uninstall_plugin",
+        ClientRequest::PurgePluginState { .. } => "purge_plugin_state",
+        ClientRequest::ReloadCatalogue { .. } => "reload_catalogue",
+        ClientRequest::ReloadManifest { .. } => "reload_manifest",
+        ClientRequest::ReloadPlugin { .. } => "reload_plugin",
+        ClientRequest::TakeCustody { .. } => "take_custody",
+        ClientRequest::CourseCorrect { .. } => "course_correct",
+        ClientRequest::ReleaseCustody { .. } => "release_custody",
+        ClientRequest::ListReconciliationPairs => "list_reconciliation_pairs",
+        ClientRequest::ProjectReconciliationPair { .. } => {
+            "project_reconciliation_pair"
+        }
+        ClientRequest::ReconcilePairNow { .. } => "reconcile_pair_now",
+        ClientRequest::ListUserInteractions => "list_user_interactions",
+        ClientRequest::AnswerUserInteraction { .. } => {
+            "answer_user_interaction"
+        }
+        ClientRequest::CancelUserInteraction { .. } => {
+            "cancel_user_interaction"
+        }
+        ClientRequest::CreateAppointment { .. } => "create_appointment",
+        ClientRequest::CancelAppointment { .. } => "cancel_appointment",
+        ClientRequest::ListAppointments => "list_appointments",
+        ClientRequest::ProjectAppointment { .. } => "project_appointment",
+        ClientRequest::CreateWatch { .. } => "create_watch",
+        ClientRequest::CancelWatch { .. } => "cancel_watch",
+        ClientRequest::ListWatches => "list_watches",
+        ClientRequest::ProjectWatch { .. } => "project_watch",
+        ClientRequest::ListGrammarOrphans => "list_grammar_orphans",
+        ClientRequest::AcceptGrammarOrphans { .. } => "accept_grammar_orphans",
+        ClientRequest::MigrateGrammarOrphans { .. } => {
+            "migrate_grammar_orphans"
+        }
+        ClientRequest::SubscribeHappenings { .. } => "subscribe_happenings",
+        ClientRequest::SubscribeSubject { .. } => "subscribe_subject",
     }
 }
 
@@ -5169,6 +5415,111 @@ async fn handle_reload_catalogue(
             dry_run: o.dry_run,
         },
         Err(e) => lifecycle_error("reload_catalogue", e),
+    }
+}
+
+async fn handle_take_custody(
+    router: &Arc<PluginRouter>,
+    shelf: String,
+    custody_type: String,
+    payload_b64: String,
+) -> ClientResponse {
+    let payload = match B64.decode(&payload_b64) {
+        Ok(p) => p,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!("take_custody: invalid base64 payload: {e}"),
+                )
+                .with_subclass("invalid_base64"),
+            };
+        }
+    };
+    match router
+        .take_custody(&shelf, custody_type, payload, None)
+        .await
+    {
+        Ok(handle) => ClientResponse::CustodyTaken {
+            custody: true,
+            shelf,
+            handle,
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::from(&e),
+        },
+    }
+}
+
+async fn handle_course_correct(
+    router: &Arc<PluginRouter>,
+    shelf: String,
+    handle: evo_plugin_sdk::contract::CustodyHandle,
+    correction_type: String,
+    payload_b64: String,
+) -> ClientResponse {
+    let payload = match B64.decode(&payload_b64) {
+        Ok(p) => p,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!("course_correct: invalid base64 payload: {e}"),
+                )
+                .with_subclass("invalid_base64"),
+            };
+        }
+    };
+    let handle_id = handle.id.clone();
+    match router
+        .course_correct(&shelf, &handle, correction_type, payload)
+        .await
+    {
+        Ok(()) => ClientResponse::CustodyCourseCorrected {
+            course_corrected: true,
+            shelf,
+            handle_id,
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::from(&e),
+        },
+    }
+}
+
+async fn handle_release_custody(
+    router: &Arc<PluginRouter>,
+    shelf: String,
+    handle: evo_plugin_sdk::contract::CustodyHandle,
+) -> ClientResponse {
+    let handle_id = handle.id.clone();
+    match router.release_custody(&shelf, handle).await {
+        Ok(()) => ClientResponse::CustodyReleased {
+            released: true,
+            shelf,
+            handle_id,
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::from(&e),
+        },
+    }
+}
+
+async fn handle_reload_plugin(
+    engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
+    conn: &ConnectionState,
+    plugin: String,
+) -> ClientResponse {
+    let engine = match require_plugins_admin(engine, conn, "reload_plugin") {
+        Ok(e) => e,
+        Err(resp) => return *resp,
+    };
+    let mut guard = engine.lock().await;
+    match guard.reload_plugin(&plugin).await {
+        Ok(()) => ClientResponse::PluginReloaded {
+            plugin_reload: true,
+            plugin,
+        },
+        Err(e) => lifecycle_error("reload_plugin", e),
     }
 }
 
@@ -5587,7 +5938,7 @@ fn project_appointment_entry(
 /// `appointments_admin`. Surfaces structured errors for
 /// recurrence-validation failure (`bad_recurrence`) and
 /// quota-exhaustion (`quota_exceeded`).
-fn handle_create_appointment(
+async fn handle_create_appointment(
     runtime: Option<&Arc<crate::appointments::AppointmentRuntime>>,
     conn: &ConnectionState,
     creator: String,
@@ -5600,7 +5951,7 @@ fn handle_create_appointment(
             Err(resp) => return *resp,
         };
     let appointment_id = spec.appointment_id.clone();
-    match runtime.schedule(&creator, spec, action) {
+    match runtime.schedule(&creator, spec, action).await {
         Ok(next_fire_ms) => ClientResponse::AppointmentCreated {
             appointment_created: true,
             creator,
@@ -6694,6 +7045,7 @@ async fn run_subject_subscription(
 /// the engine lock.
 async fn handle_plugin_request(
     router: &Arc<PluginRouter>,
+    state: &Arc<StewardState>,
     shelf: String,
     request_type: String,
     payload_b64: String,
@@ -6714,14 +7066,27 @@ async fn handle_plugin_request(
 
     let cid = NEXT_CID.fetch_add(1, Ordering::Relaxed);
     let sdk_request = Request {
-        request_type,
-        payload,
+        request_type: request_type.clone(),
+        payload: payload.clone(),
         correlation_id: cid,
         deadline: None,
         instance_id,
     };
 
     let result = router.handle_request(&shelf, sdk_request).await;
+
+    // Authoritative emission of declared framework happenings on
+    // successful dispatch of well-known operator-issued ops.
+    // Plugin handlers actuate the side-effect (e.g. flip the
+    // radio); the framework records the audit trail. Plugins
+    // authoring custom Happening variants use the
+    // LoadContext.happening_emitter SDK surface (item 1.B); the
+    // hook here covers framework-defined variants whose emission
+    // is the framework's responsibility.
+    if result.is_ok() {
+        emit_post_dispatch_happening(state, &shelf, &request_type, &payload)
+            .await;
+    }
 
     match result {
         Ok(resp) => ClientResponse::Success {
@@ -6731,6 +7096,53 @@ async fn handle_plugin_request(
             error: ApiError::from(&e),
         },
     }
+}
+
+/// Emit framework-declared happenings on successful dispatch of
+/// well-known operator-issued ops. Currently covers
+/// `flight_mode.set` against any `flight_mode.<class>` shelf;
+/// future framework-declared variants extend the match arm here.
+/// Failures to emit are logged at `warn` and do not affect the
+/// caller's response — the dispatch already succeeded; the
+/// audit-trail is best-effort durable.
+async fn emit_post_dispatch_happening(
+    state: &Arc<StewardState>,
+    shelf: &str,
+    request_type: &str,
+    payload: &[u8],
+) {
+    if let Some(rack_class) = shelf.strip_prefix("flight_mode.") {
+        if request_type == "flight_mode.set" {
+            let on = parse_flight_mode_set_on(payload);
+            let happening = crate::happenings::Happening::FlightModeChanged {
+                rack_class: rack_class.to_string(),
+                on,
+                at: std::time::SystemTime::now(),
+            };
+            if let Err(e) = state.bus.emit_durable(happening).await {
+                tracing::warn!(
+                    error = %e,
+                    rack_class = %rack_class,
+                    on = on,
+                    "post-dispatch FlightModeChanged emission failed"
+                );
+            }
+        }
+    }
+}
+
+/// Best-effort `on` extractor from a `flight_mode.set` payload.
+/// The payload format is `{ "on": <bool> }` per
+/// `evo-plugin-tool admin flight set`. Malformed / non-bool
+/// payloads default to `true` (the same disposition the framework
+/// would draw if the plugin's handler returned success on a
+/// malformed request — the audit trail records "something
+/// happened" rather than dropping the emission silently).
+fn parse_flight_mode_set_on(payload: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| v.get("on").and_then(|x| x.as_bool()))
+        .unwrap_or(true)
 }
 
 /// Compose and emit a subject projection (`op = "project_subject"`).
@@ -7423,6 +7835,10 @@ const SUPPORTED_OPS: &[&str] = &[
     "purge_plugin_state",
     "reload_catalogue",
     "reload_manifest",
+    "reload_plugin",
+    "take_custody",
+    "course_correct",
+    "release_custody",
     "list_reconciliation_pairs",
     "project_reconciliation_pair",
     "reconcile_pair_now",
@@ -10900,7 +11316,8 @@ mod tests {
             "operator/test".into(),
             test_one_shot_spec("a-1"),
             test_action(),
-        );
+        )
+        .await;
         match response {
             ClientResponse::Error { error } => {
                 assert_eq!(error.class, ErrorClass::PermissionDenied);
@@ -10914,8 +11331,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn create_appointment_refuses_when_runtime_unconfigured() {
+    #[tokio::test]
+    async fn create_appointment_refuses_when_runtime_unconfigured() {
         let conn = appointments_admin_conn();
         let response = handle_create_appointment(
             None,
@@ -10923,7 +11340,8 @@ mod tests {
             "operator/test".into(),
             test_one_shot_spec("a-1"),
             test_action(),
-        );
+        )
+        .await;
         match response {
             ClientResponse::Error { error } => {
                 assert_eq!(error.class, ErrorClass::Internal);
@@ -10947,7 +11365,8 @@ mod tests {
             "operator/test".into(),
             test_one_shot_spec("a-1"),
             test_action(),
-        );
+        )
+        .await;
         match create {
             ClientResponse::AppointmentCreated {
                 appointment_created,
@@ -11246,7 +11665,8 @@ mod tests {
             "operator/test".into(),
             test_one_shot_spec("a-1"),
             test_action(),
-        );
+        )
+        .await;
         let cancel = handle_cancel_appointment(
             Some(&runtime),
             &conn,

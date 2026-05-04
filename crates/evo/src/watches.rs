@@ -506,15 +506,18 @@ fn happening_matches_filter(
 }
 
 /// Recursively evaluate whether a [`WatchCondition`] tree
-/// matches against `h`. SubjectState terms are not evaluated
-/// in this build (they require projection-engine wire-up that
-/// lands in a follow-up commit); they conservatively return
-/// `false`, which is the safe default — the watch never fires
-/// against the unwired path. HappeningMatch and
-/// Composite-over-HappeningMatch evaluate fully.
-fn evaluate_condition_against_happening(
+/// matches against `h`.
+///
+/// `HappeningMatch` arms run the filter directly. `SubjectState`
+/// arms only fire on `Happening::SubjectStateChanged` events whose
+/// canonical id matches the predicate's target — for any other
+/// event, a `SubjectState` arm conservatively returns `false`. The
+/// hysteresis state for `StatePredicate::Hysteresis` lives in
+/// `eval_state` so it survives across calls.
+fn evaluate_condition_against_event(
     condition: &evo_plugin_sdk::contract::WatchCondition,
     h: &crate::happenings::Happening,
+    eval_state: &mut WatchEvaluatorState,
 ) -> bool {
     use evo_plugin_sdk::contract::CompositeOp;
     use evo_plugin_sdk::contract::WatchCondition;
@@ -522,23 +525,21 @@ fn evaluate_condition_against_happening(
         WatchCondition::HappeningMatch { filter } => {
             happening_matches_filter(h, filter)
         }
-        WatchCondition::SubjectState { .. } => {
-            // SubjectState evaluation against the projection
-            // engine lands in a follow-up commit. Falling
-            // through to false means a watch with a SubjectState
-            // term never fires today.
-            false
-        }
+        WatchCondition::SubjectState {
+            canonical_id,
+            predicate,
+            ..
+        } => evaluate_subject_state_arm(h, canonical_id, predicate, eval_state),
         WatchCondition::Composite { op, terms } => match op {
             CompositeOp::All => terms
                 .iter()
-                .all(|t| evaluate_condition_against_happening(t, h)),
+                .all(|t| evaluate_condition_against_event(t, h, eval_state)),
             CompositeOp::Any => terms
                 .iter()
-                .any(|t| evaluate_condition_against_happening(t, h)),
+                .any(|t| evaluate_condition_against_event(t, h, eval_state)),
             CompositeOp::Not => {
                 if let Some(only) = terms.first() {
-                    !evaluate_condition_against_happening(only, h)
+                    !evaluate_condition_against_event(only, h, eval_state)
                 } else {
                     // Validation refuses Not with no term; the
                     // defensive false here is unreachable.
@@ -546,6 +547,125 @@ fn evaluate_condition_against_happening(
                 }
             }
         },
+    }
+}
+
+/// Evaluate one `SubjectState` arm against an event.
+///
+/// Returns `false` when the event is not a `SubjectStateChanged`
+/// happening, when its canonical id does not match the predicate's
+/// target, or when the predicate evaluates `false`. The hysteresis
+/// state for `StatePredicate::Hysteresis` is updated through
+/// `eval_state.hysteresis_high`.
+fn evaluate_subject_state_arm(
+    h: &crate::happenings::Happening,
+    target_canonical_id: &str,
+    predicate: &evo_plugin_sdk::contract::StatePredicate,
+    eval_state: &mut WatchEvaluatorState,
+) -> bool {
+    let crate::happenings::Happening::SubjectStateChanged {
+        canonical_id,
+        new_state,
+        ..
+    } = h
+    else {
+        return false;
+    };
+    if canonical_id != target_canonical_id {
+        return false;
+    }
+    apply_state_predicate(predicate, new_state, canonical_id, eval_state)
+}
+
+/// Apply a [`StatePredicate`] to a JSON state object. The state
+/// is expected to be a JSON object whose property keyed by
+/// `field` is the value the predicate observes; any other shape
+/// (state is `null`, the field is missing, or the value is not
+/// the expected type) returns `false`.
+fn apply_state_predicate(
+    predicate: &evo_plugin_sdk::contract::StatePredicate,
+    state: &serde_json::Value,
+    canonical_id: &str,
+    eval_state: &mut WatchEvaluatorState,
+) -> bool {
+    use evo_plugin_sdk::contract::StatePredicate;
+    match predicate {
+        StatePredicate::Equals { field, value } => {
+            state.get(field).map(|v| v == value).unwrap_or(false)
+        }
+        StatePredicate::NotEquals { field, value } => {
+            state.get(field).map(|v| v != value).unwrap_or(false)
+        }
+        StatePredicate::GreaterThan { field, value } => state
+            .get(field)
+            .and_then(|v| v.as_f64())
+            .map(|v| v > *value)
+            .unwrap_or(false),
+        StatePredicate::LessThan { field, value } => state
+            .get(field)
+            .and_then(|v| v.as_f64())
+            .map(|v| v < *value)
+            .unwrap_or(false),
+        StatePredicate::InRange {
+            field,
+            lower,
+            upper,
+        } => state
+            .get(field)
+            .and_then(|v| v.as_f64())
+            .map(|v| v > *lower && v < *upper)
+            .unwrap_or(false),
+        StatePredicate::Hysteresis {
+            field,
+            upper,
+            lower,
+        } => {
+            let in_high = eval_state
+                .hysteresis_high
+                .entry(canonical_id.to_string())
+                .or_insert(false);
+            let val = state.get(field).and_then(|v| v.as_f64());
+            match val {
+                Some(v) if v > *upper && !*in_high => {
+                    *in_high = true;
+                    true
+                }
+                Some(v) if v < *lower => {
+                    *in_high = false;
+                    false
+                }
+                _ => false,
+            }
+        }
+        StatePredicate::Regex { field, pattern } => {
+            let s = state.get(field).and_then(|v| v.as_str()).unwrap_or("");
+            regex::Regex::new(pattern)
+                .map(|re| re.is_match(s))
+                .unwrap_or(false)
+        }
+    }
+}
+
+/// Walk a condition tree and return the maximum
+/// `minimum_duration_ms` across all `SubjectState` arms it
+/// contains. Returns `0` when no arm requested duration gating.
+/// Used by the evaluator to decide whether the watch is
+/// duration-bearing (and therefore subject to the time-trust gate)
+/// and what wall-clock interval the predicate must hold for
+/// before the watch can fire.
+fn max_minimum_duration_ms(
+    condition: &evo_plugin_sdk::contract::WatchCondition,
+) -> u64 {
+    use evo_plugin_sdk::contract::WatchCondition;
+    match condition {
+        WatchCondition::HappeningMatch { .. } => 0,
+        WatchCondition::SubjectState {
+            minimum_duration_ms,
+            ..
+        } => minimum_duration_ms.unwrap_or(0),
+        WatchCondition::Composite { terms, .. } => {
+            terms.iter().map(max_minimum_duration_ms).max().unwrap_or(0)
+        }
     }
 }
 
@@ -569,6 +689,14 @@ struct WatchEvaluatorState {
     /// Evaluations dropped (over the cap) in the current
     /// throttle window. Reset on each window roll.
     throttle_window_dropped: u64,
+    /// Hysteresis state for `StatePredicate::Hysteresis` arms,
+    /// keyed by canonical subject id. `true` means the
+    /// predicate has crossed above `upper` and has not yet
+    /// crossed back below `lower`. The standard control-systems
+    /// pattern: a value oscillating between thresholds fires
+    /// once on the upward edge and is silent until it has
+    /// dropped below `lower`.
+    hysteresis_high: HashMap<String, bool>,
 }
 
 /// Default evaluation rate cap per watch per second. Operators
@@ -744,6 +872,14 @@ impl WatchRuntime {
         }
 
         let active = self.ledger.active();
+        // Per LOGGING.md §2: trace-level on the per-event scan
+        // (very high-volume path), debug-level on actual matches
+        // and fires inside evaluate_one.
+        tracing::trace!(
+            active_watches = active.len(),
+            event_kind = std::any::type_name_of_val(event),
+            "watch runtime: evaluating event against active watches"
+        );
         let now = Instant::now();
         let now_ms = now_utc_ms();
         for entry in active {
@@ -766,32 +902,89 @@ impl WatchRuntime {
             return;
         }
 
-        if !evaluate_condition_against_happening(&entry.spec.condition, event) {
+        let key = (entry.creator.clone(), entry.spec.watch_id.clone());
+        let condition_match = {
+            let mut guard = match self.evaluator_state.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let st = guard.entry(key.clone()).or_default();
+            evaluate_condition_against_event(&entry.spec.condition, event, st)
+        };
+
+        // Per LOGGING.md §2: each predicate evaluation is a verb-
+        // shaped decision. Trace level because watches can match
+        // a high frequency of events; debug is reserved for
+        // actual fires below.
+        tracing::trace!(
+            creator = %entry.creator,
+            watch_id = %entry.spec.watch_id,
+            condition_match,
+            "watch evaluator: predicate evaluated"
+        );
+
+        // Duration-gating: the condition tree may carry
+        // `minimum_duration_ms` on one or more `SubjectState`
+        // arms; the watch must observe a continuous match for
+        // at least the maximum across those arms before firing.
+        // The ledger's `match_entered_at_ms` is the per-watch
+        // anchor: we set it on the first matching evaluation
+        // and clear it on a non-matching evaluation. Watches
+        // whose tree carries no duration evaluate as before
+        // (max_duration == 0).
+        let max_duration = max_minimum_duration_ms(&entry.spec.condition);
+
+        if !condition_match {
+            // Predicate left match: clear the ledger anchor so
+            // the next entry restarts the duration counter.
+            if max_duration > 0 && entry.match_entered_at_ms.is_some() {
+                self.ledger
+                    .note_match_exited(&entry.creator, &entry.spec.watch_id);
+            }
             return;
+        }
+
+        // Predicate matched. Stamp the entry timestamp on first
+        // entry so the duration counter starts; subsequent calls
+        // are no-ops at the ledger.
+        if max_duration > 0 {
+            self.ledger.note_match_entered(
+                &entry.creator,
+                &entry.spec.watch_id,
+                now_ms,
+            );
+            // Re-read the entry to see the now-stamped timestamp.
+            let entered = self
+                .ledger
+                .lookup(&entry.creator, &entry.spec.watch_id)
+                .and_then(|e| e.match_entered_at_ms);
+            let elapsed = match entered {
+                Some(t) => now_ms.saturating_sub(t),
+                None => 0,
+            };
+            if elapsed < max_duration {
+                // Still within the debounce window — the watch
+                // is in a "matching but waiting" state. Do not
+                // fire and do not emit a Missed (the predicate
+                // is happily holding; nothing has been
+                // suppressed). The next state-changed event for
+                // the same canonical id will re-evaluate; if the
+                // predicate still holds and the elapsed time has
+                // crossed the threshold, the watch fires there.
+                return;
+            }
         }
 
         // Edge-vs-Level dispatch decision.
         let trigger = entry.spec.trigger;
         let should_fire = match trigger {
-            evo_plugin_sdk::contract::WatchTrigger::Edge => {
-                // Pure edge semantics for HappeningMatch:
-                // every matching event is a transition into
-                // match (the framework treats one-shot events
-                // as edges by definition). Subsequent
-                // refinements (level-track for SubjectState)
-                // arrive with the SubjectState wire-up.
-                true
-            }
+            evo_plugin_sdk::contract::WatchTrigger::Edge => true,
             evo_plugin_sdk::contract::WatchTrigger::Level { .. } => {
                 let cooldown_active = {
                     let guard = self.evaluator_state.lock().ok();
                     guard
                         .and_then(|g| {
-                            g.get(&(
-                                entry.creator.clone(),
-                                entry.spec.watch_id.clone(),
-                            ))
-                            .and_then(|s| s.cooldown_until)
+                            g.get(&key).and_then(|s| s.cooldown_until)
                         })
                         .map(|until| until > now)
                         .unwrap_or(false)
@@ -808,12 +1001,21 @@ impl WatchRuntime {
             return;
         }
 
-        // Time-trust gate: we currently fire HappeningMatch
-        // watches under any trust state. Duration-bearing
-        // SubjectState watches will gate here when the
-        // SubjectState wire-up lands; the structure is in
-        // place so the gate point doesn't move.
-        let _trust = crate::time_trust::current_trust(&self.clock_trust);
+        // Time-trust gate: duration-bearing watches require
+        // `Trusted` time. A debounce that uses an unreliable
+        // wall clock could fire prematurely or never; refusing
+        // to fire under degraded trust is the conservative
+        // posture and matches the appointments runtime's
+        // strict-trust gate. Watches with no
+        // `minimum_duration_ms` are not gated and fire under
+        // any trust state.
+        if max_duration > 0 {
+            let trust = crate::time_trust::current_trust(&self.clock_trust);
+            if !trust.is_strict() {
+                self.emit_missed(entry, "time_untrusted", now_ms).await;
+                return;
+            }
+        }
 
         // Dispatch the action.
         let request = evo_plugin_sdk::contract::Request {
@@ -824,6 +1026,17 @@ impl WatchRuntime {
             deadline: None,
             instance_id: None,
         };
+        // Per LOGGING.md §2: a watch firing IS a verb invocation
+        // (debug). Trace covers the scan + per-event evaluation
+        // above; debug brackets the actual fire+dispatch.
+        tracing::debug!(
+            creator = %entry.creator,
+            watch_id = %entry.spec.watch_id,
+            target_shelf = %entry.action.target_shelf,
+            request_type = %entry.action.request_type,
+            trigger = ?trigger,
+            "watch fire: invoking"
+        );
         let outcome = match self
             .router
             .handle_request(&entry.action.target_shelf, request)
@@ -832,6 +1045,12 @@ impl WatchRuntime {
             Ok(_) => "ok".to_string(),
             Err(e) => format!("error: {e}"),
         };
+        tracing::debug!(
+            creator = %entry.creator,
+            watch_id = %entry.spec.watch_id,
+            outcome = %outcome,
+            "watch fire: returned"
+        );
 
         // Stamp ledger + per-watch state.
         let cooldown_until = match trigger {
@@ -1376,6 +1595,259 @@ mod tests {
         let all = ledger.all_entries();
         assert_eq!(all.len(), 2);
     }
+
+    // -----------------------------------------------------------------
+    // apply_state_predicate
+    // -----------------------------------------------------------------
+
+    fn empty_eval_state() -> WatchEvaluatorState {
+        WatchEvaluatorState::default()
+    }
+
+    #[test]
+    fn equals_matches_when_field_equals_value() {
+        let mut s = empty_eval_state();
+        let state = serde_json::json!({"playback": "playing"});
+        let pred = StatePredicate::Equals {
+            field: "playback".into(),
+            value: serde_json::json!("playing"),
+        };
+        assert!(apply_state_predicate(&pred, &state, "id-1", &mut s));
+    }
+
+    #[test]
+    fn equals_misses_when_field_absent() {
+        let mut s = empty_eval_state();
+        let state = serde_json::json!({"other": "x"});
+        let pred = StatePredicate::Equals {
+            field: "playback".into(),
+            value: serde_json::json!("playing"),
+        };
+        assert!(!apply_state_predicate(&pred, &state, "id-1", &mut s));
+    }
+
+    #[test]
+    fn not_equals_matches_when_value_differs() {
+        let mut s = empty_eval_state();
+        let state = serde_json::json!({"playback": "paused"});
+        let pred = StatePredicate::NotEquals {
+            field: "playback".into(),
+            value: serde_json::json!("playing"),
+        };
+        assert!(apply_state_predicate(&pred, &state, "id-1", &mut s));
+    }
+
+    #[test]
+    fn greater_than_matches_when_above() {
+        let mut s = empty_eval_state();
+        let state = serde_json::json!({"temp": 90.0});
+        let pred = StatePredicate::GreaterThan {
+            field: "temp".into(),
+            value: 80.0,
+        };
+        assert!(apply_state_predicate(&pred, &state, "id-1", &mut s));
+    }
+
+    #[test]
+    fn less_than_misses_at_threshold() {
+        let mut s = empty_eval_state();
+        let state = serde_json::json!({"x": 5.0});
+        let pred = StatePredicate::LessThan {
+            field: "x".into(),
+            value: 5.0,
+        };
+        assert!(!apply_state_predicate(&pred, &state, "id-1", &mut s));
+    }
+
+    #[test]
+    fn in_range_matches_strictly_between_bounds() {
+        let mut s = empty_eval_state();
+        let state = serde_json::json!({"x": 5.0});
+        let pred = StatePredicate::InRange {
+            field: "x".into(),
+            lower: 1.0,
+            upper: 10.0,
+        };
+        assert!(apply_state_predicate(&pred, &state, "id-1", &mut s));
+    }
+
+    #[test]
+    fn hysteresis_fires_on_upward_edge_then_silent_until_lower() {
+        let mut s = empty_eval_state();
+        let pred = StatePredicate::Hysteresis {
+            field: "temp".into(),
+            upper: 80.0,
+            lower: 60.0,
+        };
+
+        // First crossing above upper: fire.
+        let first = serde_json::json!({"temp": 85.0});
+        assert!(apply_state_predicate(&pred, &first, "id-1", &mut s));
+
+        // Still above upper but already in high state: no
+        // re-fire.
+        let second = serde_json::json!({"temp": 90.0});
+        assert!(!apply_state_predicate(&pred, &second, "id-1", &mut s));
+
+        // Drift between thresholds (oscillation guard): still
+        // no fire.
+        let third = serde_json::json!({"temp": 70.0});
+        assert!(!apply_state_predicate(&pred, &third, "id-1", &mut s));
+
+        // Drop below lower: reset, no fire on the drop itself.
+        let fourth = serde_json::json!({"temp": 50.0});
+        assert!(!apply_state_predicate(&pred, &fourth, "id-1", &mut s));
+
+        // Re-cross above upper: fires again.
+        let fifth = serde_json::json!({"temp": 85.0});
+        assert!(apply_state_predicate(&pred, &fifth, "id-1", &mut s));
+    }
+
+    #[test]
+    fn hysteresis_state_is_per_canonical_id() {
+        let mut s = empty_eval_state();
+        let pred = StatePredicate::Hysteresis {
+            field: "temp".into(),
+            upper: 80.0,
+            lower: 60.0,
+        };
+        let hot = serde_json::json!({"temp": 85.0});
+
+        // Two different canonical ids each fire independently
+        // on their own first crossing.
+        assert!(apply_state_predicate(&pred, &hot, "id-A", &mut s));
+        assert!(apply_state_predicate(&pred, &hot, "id-B", &mut s));
+        // Re-firing the same id stays silent.
+        assert!(!apply_state_predicate(&pred, &hot, "id-A", &mut s));
+    }
+
+    #[test]
+    fn regex_matches_string_field() {
+        let mut s = empty_eval_state();
+        let state = serde_json::json!({"label": "alpha-3"});
+        let pred = StatePredicate::Regex {
+            field: "label".into(),
+            pattern: "^alpha-[0-9]$".into(),
+        };
+        assert!(apply_state_predicate(&pred, &state, "id-1", &mut s));
+    }
+
+    #[test]
+    fn regex_misses_on_non_string_field() {
+        let mut s = empty_eval_state();
+        let state = serde_json::json!({"label": 7});
+        let pred = StatePredicate::Regex {
+            field: "label".into(),
+            pattern: "^7$".into(),
+        };
+        assert!(!apply_state_predicate(&pred, &state, "id-1", &mut s));
+    }
+
+    // -----------------------------------------------------------------
+    // evaluate_subject_state_arm
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn subject_state_arm_misses_on_non_state_changed_event() {
+        let mut s = empty_eval_state();
+        let h = crate::happenings::Happening::FlightModeChanged {
+            rack_class: "flight.bt".into(),
+            on: true,
+            at: std::time::SystemTime::now(),
+        };
+        let pred = StatePredicate::Equals {
+            field: "x".into(),
+            value: serde_json::json!(1),
+        };
+        assert!(!evaluate_subject_state_arm(&h, "id-1", &pred, &mut s));
+    }
+
+    #[test]
+    fn subject_state_arm_misses_on_wrong_canonical_id() {
+        let mut s = empty_eval_state();
+        let h = crate::happenings::Happening::SubjectStateChanged {
+            plugin: "p".into(),
+            canonical_id: "other-id".into(),
+            subject_type: "track".into(),
+            prev_state: serde_json::Value::Null,
+            new_state: serde_json::json!({"x": 1}),
+            at: std::time::SystemTime::now(),
+        };
+        let pred = StatePredicate::Equals {
+            field: "x".into(),
+            value: serde_json::json!(1),
+        };
+        assert!(!evaluate_subject_state_arm(&h, "target-id", &pred, &mut s));
+    }
+
+    #[test]
+    fn subject_state_arm_fires_when_predicate_matches() {
+        let mut s = empty_eval_state();
+        let h = crate::happenings::Happening::SubjectStateChanged {
+            plugin: "p".into(),
+            canonical_id: "target-id".into(),
+            subject_type: "track".into(),
+            prev_state: serde_json::Value::Null,
+            new_state: serde_json::json!({"x": 1}),
+            at: std::time::SystemTime::now(),
+        };
+        let pred = StatePredicate::Equals {
+            field: "x".into(),
+            value: serde_json::json!(1),
+        };
+        assert!(evaluate_subject_state_arm(&h, "target-id", &pred, &mut s));
+    }
+
+    // -----------------------------------------------------------------
+    // max_minimum_duration_ms
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn max_minimum_duration_ms_zero_for_happening_match() {
+        let cond = WatchCondition::HappeningMatch {
+            filter: WatchHappeningFilter::default(),
+        };
+        assert_eq!(max_minimum_duration_ms(&cond), 0);
+    }
+
+    #[test]
+    fn max_minimum_duration_ms_picks_subject_state_arm() {
+        let cond = WatchCondition::SubjectState {
+            canonical_id: "id".into(),
+            predicate: StatePredicate::Equals {
+                field: "x".into(),
+                value: serde_json::json!(1),
+            },
+            minimum_duration_ms: Some(2_000),
+        };
+        assert_eq!(max_minimum_duration_ms(&cond), 2_000);
+    }
+
+    #[test]
+    fn max_minimum_duration_ms_picks_max_in_composite() {
+        let cond = WatchCondition::Composite {
+            op: CompositeOp::All,
+            terms: vec![
+                WatchCondition::SubjectState {
+                    canonical_id: "a".into(),
+                    predicate: StatePredicate::Equals {
+                        field: "x".into(),
+                        value: serde_json::json!(1),
+                    },
+                    minimum_duration_ms: Some(500),
+                },
+                WatchCondition::SubjectState {
+                    canonical_id: "b".into(),
+                    predicate: StatePredicate::Equals {
+                        field: "y".into(),
+                        value: serde_json::json!(2),
+                    },
+                    minimum_duration_ms: Some(3_000),
+                },
+            ],
+        };
+        assert_eq!(max_minimum_duration_ms(&cond), 3_000);
+    }
 }
 
 #[cfg(test)]
@@ -1759,5 +2231,340 @@ mod runtime_tests {
             "wildcard watch fires exactly once; WatchFired self-emission is \
              refused"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // SubjectState watch evaluator
+    // -----------------------------------------------------------------
+
+    fn subject_state_equals_spec(
+        id: &str,
+        canonical_id: &str,
+        field: &str,
+        value: serde_json::Value,
+        minimum_duration_ms: Option<u64>,
+    ) -> WatchSpec {
+        WatchSpec {
+            watch_id: id.to_string(),
+            condition: WatchCondition::SubjectState {
+                canonical_id: canonical_id.to_string(),
+                predicate: evo_plugin_sdk::contract::StatePredicate::Equals {
+                    field: field.to_string(),
+                    value,
+                },
+                minimum_duration_ms,
+            },
+            trigger: WatchTrigger::Edge,
+        }
+    }
+
+    fn subject_state_changed(
+        canonical_id: &str,
+        new_state: serde_json::Value,
+    ) -> Happening {
+        Happening::SubjectStateChanged {
+            plugin: "org.test.sensor".into(),
+            canonical_id: canonical_id.to_string(),
+            subject_type: "track".into(),
+            prev_state: serde_json::Value::Null,
+            new_state,
+            at: std::time::SystemTime::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn subject_state_watch_fires_on_matching_state_change() {
+        let runtime = build_runtime();
+        runtime
+            .schedule(
+                "operator/test",
+                subject_state_equals_spec(
+                    "w-1",
+                    "track:42",
+                    "playback",
+                    serde_json::json!("playing"),
+                    None,
+                ),
+                test_action(),
+            )
+            .unwrap();
+        let bus = Arc::clone(&runtime.bus);
+        let drain =
+            tokio::spawn(
+                async move { drain_until_watch_fired(&bus, 1_000).await },
+            );
+        tokio::task::yield_now().await;
+        runtime
+            .bus
+            .emit_durable(subject_state_changed(
+                "track:42",
+                serde_json::json!({"playback": "playing"}),
+            ))
+            .await
+            .unwrap();
+        let fired = drain.await.unwrap().expect("WatchFired arrives");
+        match fired {
+            Happening::WatchFired {
+                creator, watch_id, ..
+            } => {
+                assert_eq!(creator, "operator/test");
+                assert_eq!(watch_id, "w-1");
+            }
+            other => panic!("expected WatchFired, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subject_state_watch_misses_when_predicate_fails() {
+        let runtime = build_runtime();
+        runtime
+            .schedule(
+                "operator/test",
+                subject_state_equals_spec(
+                    "w-1",
+                    "track:42",
+                    "playback",
+                    serde_json::json!("playing"),
+                    None,
+                ),
+                test_action(),
+            )
+            .unwrap();
+        let bus = Arc::clone(&runtime.bus);
+        let drain =
+            tokio::spawn(
+                async move { drain_until_watch_fired(&bus, 250).await },
+            );
+        tokio::task::yield_now().await;
+        runtime
+            .bus
+            .emit_durable(subject_state_changed(
+                "track:42",
+                serde_json::json!({"playback": "paused"}),
+            ))
+            .await
+            .unwrap();
+        assert!(drain.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn subject_state_watch_misses_under_untrusted_clock_with_duration() {
+        // Default trust is Untrusted; a duration-bearing watch
+        // declines to fire under that trust state and emits a
+        // WatchMissed with reason="time_untrusted".
+        let runtime = build_runtime();
+        runtime
+            .schedule(
+                "operator/test",
+                subject_state_equals_spec(
+                    "w-1",
+                    "track:42",
+                    "playback",
+                    serde_json::json!("playing"),
+                    Some(1),
+                ),
+                test_action(),
+            )
+            .unwrap();
+        let bus = Arc::clone(&runtime.bus);
+        let drain = tokio::spawn(async move {
+            let mut rx = bus.subscribe();
+            let timeout = tokio::time::Duration::from_millis(500);
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return None;
+                }
+                match tokio::time::timeout(deadline - now, rx.recv()).await {
+                    Ok(Ok(h @ Happening::WatchMissed { .. })) => {
+                        return Some(h);
+                    }
+                    Ok(Ok(_)) => continue,
+                    _ => return None,
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+        // First emission to enter match state.
+        runtime
+            .bus
+            .emit_durable(subject_state_changed(
+                "track:42",
+                serde_json::json!({"playback": "playing"}),
+            ))
+            .await
+            .unwrap();
+        // Wait long enough for the duration to elapse, then send
+        // a second matching event so the runtime re-evaluates
+        // and trips the time-trust gate.
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        runtime
+            .bus
+            .emit_durable(subject_state_changed(
+                "track:42",
+                serde_json::json!({"playback": "playing"}),
+            ))
+            .await
+            .unwrap();
+        let missed = drain.await.unwrap();
+        let missed = missed.expect("WatchMissed arrives");
+        match missed {
+            Happening::WatchMissed { reason, .. } => {
+                assert_eq!(reason, "time_untrusted");
+            }
+            other => panic!("expected WatchMissed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subject_state_watch_with_duration_fires_after_elapsed_under_trust()
+    {
+        // Trusted clock + duration gate: the watch fires only
+        // after the predicate has held continuously for at least
+        // the configured duration. We bump the runtime's
+        // shared trust to Trusted, emit one matching event, then
+        // emit a second after sleeping past the duration; the
+        // second triggers the fire.
+        let ledger = Arc::new(WatchLedger::new());
+        let state = StewardState::for_tests();
+        let router = Arc::new(PluginRouter::new(Arc::clone(&state)));
+        let bus = Arc::clone(&state.bus);
+        let trust = new_shared();
+        {
+            let mut guard = trust.write().await;
+            *guard = crate::time_trust::TimeTrust::Trusted {
+                last_sync_at: std::time::SystemTime::now(),
+            };
+        }
+        let runtime = WatchRuntime::start(ledger, router, bus, trust);
+
+        runtime
+            .schedule(
+                "operator/test",
+                subject_state_equals_spec(
+                    "w-1",
+                    "track:42",
+                    "playback",
+                    serde_json::json!("playing"),
+                    Some(20),
+                ),
+                test_action(),
+            )
+            .unwrap();
+        let bus = Arc::clone(&runtime.bus);
+        let drain =
+            tokio::spawn(
+                async move { drain_until_watch_fired(&bus, 1_000).await },
+            );
+        tokio::task::yield_now().await;
+        // Enter match.
+        runtime
+            .bus
+            .emit_durable(subject_state_changed(
+                "track:42",
+                serde_json::json!({"playback": "playing"}),
+            ))
+            .await
+            .unwrap();
+        // Wait past the 20ms duration.
+        tokio::time::sleep(tokio::time::Duration::from_millis(40)).await;
+        // Re-emit so the runtime checks the elapsed timer.
+        runtime
+            .bus
+            .emit_durable(subject_state_changed(
+                "track:42",
+                serde_json::json!({"playback": "playing"}),
+            ))
+            .await
+            .unwrap();
+        let fired = drain.await.unwrap();
+        assert!(
+            fired.is_some(),
+            "WatchFired arrives once duration has elapsed"
+        );
+    }
+
+    #[tokio::test]
+    async fn subject_state_watch_with_duration_resets_on_predicate_exit() {
+        // Trusted clock; predicate enters match, exits before
+        // the duration elapses, then re-enters: the duration
+        // counter restarts, so the second entry must again wait
+        // the full duration before firing.
+        let ledger = Arc::new(WatchLedger::new());
+        let state = StewardState::for_tests();
+        let router = Arc::new(PluginRouter::new(Arc::clone(&state)));
+        let bus = Arc::clone(&state.bus);
+        let trust = new_shared();
+        {
+            let mut guard = trust.write().await;
+            *guard = crate::time_trust::TimeTrust::Trusted {
+                last_sync_at: std::time::SystemTime::now(),
+            };
+        }
+        let runtime = WatchRuntime::start(ledger, router, bus, trust);
+
+        runtime
+            .schedule(
+                "operator/test",
+                subject_state_equals_spec(
+                    "w-1",
+                    "track:42",
+                    "playback",
+                    serde_json::json!("playing"),
+                    Some(60),
+                ),
+                test_action(),
+            )
+            .unwrap();
+        let bus_for_drain = Arc::clone(&runtime.bus);
+        let drain = tokio::spawn(async move {
+            drain_until_watch_fired(&bus_for_drain, 100).await
+        });
+        tokio::task::yield_now().await;
+
+        // Enter match.
+        runtime
+            .bus
+            .emit_durable(subject_state_changed(
+                "track:42",
+                serde_json::json!({"playback": "playing"}),
+            ))
+            .await
+            .unwrap();
+        // Exit before the duration elapses.
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        runtime
+            .bus
+            .emit_durable(subject_state_changed(
+                "track:42",
+                serde_json::json!({"playback": "paused"}),
+            ))
+            .await
+            .unwrap();
+        // Re-enter immediately, then wait less than full
+        // duration before re-checking: should still not fire.
+        runtime
+            .bus
+            .emit_durable(subject_state_changed(
+                "track:42",
+                serde_json::json!({"playback": "playing"}),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        runtime
+            .bus
+            .emit_durable(subject_state_changed(
+                "track:42",
+                serde_json::json!({"playback": "playing"}),
+            ))
+            .await
+            .unwrap();
+
+        // The drain task only waits 100 ms total; it should
+        // observe no WatchFired because the duration counter
+        // restarted on the predicate exit and 20 ms < 60 ms.
+        assert!(drain.await.unwrap().is_none());
     }
 }

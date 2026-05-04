@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use deadpool_sqlite::{Config as PoolConfig, Pool, Runtime};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
@@ -164,6 +164,17 @@ pub const SCHEMA_VERSION_RECONCILIATION_STATE: u32 = 10;
 /// diagnostic.
 pub const SCHEMA_VERSION_PENDING_GRAMMAR_ORPHANS: u32 = 11;
 
+/// Schema version that adds the durable prompt ledger backing
+/// multi-stage user-interaction restore across steward restart.
+pub const SCHEMA_VERSION_PROMPTS: u32 = 12;
+
+/// Schema version that adds the durable appointment ledger backing
+/// boot rehydration of scheduled appointments. Without this the
+/// AppointmentRuntime loses every scheduled fire on restart; the
+/// past-due / Catchup-miss-policy path can't be exercised across
+/// boots.
+pub const SCHEMA_VERSION_APPOINTMENTS: u32 = 13;
+
 /// Maximum schema version this build of the steward understands.
 ///
 /// On open, [`SqlitePersistenceStore`] refuses to operate on a
@@ -171,8 +182,7 @@ pub const SCHEMA_VERSION_PENDING_GRAMMAR_ORPHANS: u32 = 11;
 /// than this constant. Downgrades are not supported; an operator
 /// running an older steward against a newer database must restore
 /// from a pre-upgrade backup.
-pub const SUPPORTED_SCHEMA_VERSION: u32 =
-    SCHEMA_VERSION_PENDING_GRAMMAR_ORPHANS;
+pub const SUPPORTED_SCHEMA_VERSION: u32 = SCHEMA_VERSION_APPOINTMENTS;
 
 /// Logical keys used in the `meta` table. Constants are kept in one
 /// place so a misspelling produces a compile error rather than a
@@ -232,6 +242,14 @@ const MIGRATION_010_RECONCILIATION_STATE: &str =
 /// verbs.
 const MIGRATION_011_PENDING_GRAMMAR_ORPHANS: &str =
     include_str!("../migrations/011_pending_grammar_orphans.sql");
+
+/// SQL text of the v12 migration: durable prompt ledger
+/// (multi-stage interaction restore on steward restart).
+const MIGRATION_012_PROMPTS: &str =
+    include_str!("../migrations/012_prompts.sql");
+
+const MIGRATION_013_APPOINTMENTS: &str =
+    include_str!("../migrations/013_appointments.sql");
 
 /// Errors raised by the persistence layer.
 ///
@@ -924,6 +942,48 @@ pub struct TypeMigrationRecord<'a> {
     pub at_ms: u64,
 }
 
+/// Owned counterpart of [`TypeMigrationRecord`] used by the
+/// batched accessor: callers pre-build a `Vec` of records and the
+/// store applies them in one transaction (one fsync), so a 50k
+/// migration costs ~50 fsyncs at batch_size=1000 instead of 50,000
+/// with the per-record path.
+#[derive(Debug, Clone)]
+pub struct TypeMigrationRecordOwned {
+    /// Source subject id (consumed by the migration).
+    pub source: String,
+    /// Newly minted canonical id for the migrated subject.
+    pub new_id: String,
+    /// The pre-migration `subject_type` (driving the orphan
+    /// migration call).
+    pub from_type: String,
+    /// The post-migration `subject_type` declared by the
+    /// loaded catalogue.
+    pub to_type: String,
+    /// Identifier of the migration call that produced this
+    /// record. Same value across every record in the batch.
+    pub migration_id: String,
+    /// Operator-supplied reason recorded with the migration.
+    pub reason: Option<String>,
+    /// Wall-clock timestamp, milliseconds since the UNIX epoch.
+    pub at_ms: u64,
+}
+
+impl TypeMigrationRecordOwned {
+    /// Borrow this record as a [`TypeMigrationRecord`] for the
+    /// duration of the call.
+    pub fn as_borrowed(&self) -> TypeMigrationRecord<'_> {
+        TypeMigrationRecord {
+            source: &self.source,
+            new_id: &self.new_id,
+            from_type: &self.from_type,
+            to_type: &self.to_type,
+            migration_id: &self.migration_id,
+            reason: self.reason.as_deref(),
+            at_ms: self.at_ms,
+        }
+    }
+}
+
 /// All inputs to [`PersistenceStore::record_subject_split`].
 #[derive(Debug, Clone, Copy)]
 pub struct SplitRecord<'a> {
@@ -1049,6 +1109,21 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
     fn record_subject_type_migration<'a>(
         &'a self,
         record: TypeMigrationRecord<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Apply a slice of type-migration records in one transaction.
+    ///
+    /// Equivalent in effect to calling
+    /// [`Self::record_subject_type_migration`] once per record, but
+    /// emits a single COMMIT (one fsync on WAL-mode SQLite) for
+    /// the whole batch. The grammar-orphan migration uses this so
+    /// a 50k-row re-statement costs ~50 fsyncs at batch_size=1000
+    /// instead of 50,000 with the per-record path.
+    ///
+    /// An empty slice is a no-op (returns Ok).
+    fn record_subject_type_migrations_batch<'a>(
+        &'a self,
+        records: Vec<TypeMigrationRecordOwned>,
     ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
 
     /// Record an admin `subject_split` operation.
@@ -1694,6 +1769,124 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
                 + 'a,
         >,
     >;
+
+    /// Insert or replace a prompt row at issue time. The
+    /// `(plugin, prompt_id)` pair is the primary key; an
+    /// existing row with the same key is overwritten (re-issue
+    /// semantics — same identity ⇒ same logical prompt).
+    /// `request_json` is the serialised `PromptRequest`
+    /// payload the boot-time rehydration round-trips back into
+    /// memory.
+    fn record_prompt_issue<'a>(
+        &'a self,
+        plugin: &'a str,
+        prompt_id: &'a str,
+        request_json: &'a str,
+        deadline_utc_ms: u64,
+        now_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Update the lifecycle state of an existing prompt row.
+    /// No-op on absent rows: the in-memory ledger transitions
+    /// idempotently and the persistence layer follows. Updates
+    /// `updated_at_ms` to the supplied value so retention
+    /// sweeps can age out terminal rows.
+    fn update_prompt_state<'a>(
+        &'a self,
+        plugin: &'a str,
+        prompt_id: &'a str,
+        state: PersistedPromptState,
+        now_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Delete a prompt row outright. Used by retention sweeps
+    /// after a terminal row has been observed long enough to
+    /// forget. No-op on absent rows.
+    fn delete_prompt<'a>(
+        &'a self,
+        plugin: &'a str,
+        prompt_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// List every prompt currently in the `Open` lifecycle
+    /// state. Used by the steward at boot to rehydrate the
+    /// in-memory prompt ledger so consumers reconnecting after
+    /// a restart see the same multi-stage interaction surface
+    /// they were observing before. Order is by `created_at_ms`
+    /// ascending so multi-stage flows replay in their original
+    /// issue order.
+    fn list_open_prompts<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<PersistedPrompt>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Insert or replace an appointment row at schedule time.
+    /// The `(creator, appointment_id)` pair is the primary key;
+    /// an existing row with the same key is overwritten (re-
+    /// schedule semantics — the in-memory ledger documents that
+    /// re-issuing the same id resets state to `Pending`, and the
+    /// persistence row mirrors that). The framework calls this
+    /// on every `AppointmentLedger::schedule` invocation.
+    fn record_appointment<'a>(
+        &'a self,
+        row: &'a PersistedAppointment,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Update the post-fire snapshot of an existing appointment
+    /// row. Called from `AppointmentLedger::mark_fired` after
+    /// the framework's runtime tick advances the entry. For a
+    /// recurring entry the ledger recomputes a fresh
+    /// `next_fire_at_ms` and the row stays `Pending`. For a
+    /// terminal entry (OneShot fire complete, or recurring
+    /// `max_fires` / `end_time_ms` exhausted), the framework
+    /// instead calls [`Self::forget_appointment`] to delete the
+    /// row outright. No-op on absent rows.
+    #[allow(clippy::too_many_arguments)]
+    fn update_appointment_after_fire<'a>(
+        &'a self,
+        creator: &'a str,
+        appointment_id: &'a str,
+        next_fire_at_ms: Option<u64>,
+        last_fired_at_ms: u64,
+        fires_completed: u32,
+        state: PersistedAppointmentState,
+        now_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// Delete an appointment row outright. Used on cancel and on
+    /// terminal-state transitions so the table tracks only the
+    /// live schedule. No-op on absent rows.
+    fn forget_appointment<'a>(
+        &'a self,
+        creator: &'a str,
+        appointment_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
+
+    /// List every pending appointment. Used by the steward at
+    /// boot to rehydrate the in-memory ledger so the
+    /// `AppointmentRuntime` resumes against the same schedule it
+    /// had before the restart. Order is by `created_at_ms`
+    /// ascending so chains of dependent appointments replay in
+    /// their original issue order. Terminal rows are pruned at
+    /// write time and never appear in the result.
+    fn list_pending_appointments<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<PersistedAppointment>,
+                        PersistenceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >;
 }
 
 /// One row of the boot-time subject-type aggregation: a declared
@@ -1703,6 +1896,175 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
 /// diff a sorted slice against the catalogue's declared set
 /// without re-sorting.
 pub type SubjectTypeCount = (String, u64);
+
+/// Durable mirror of one row in the in-memory prompt ledger.
+/// Returned by [`PersistenceStore::list_open_prompts`] at boot
+/// so the ledger rehydrates without consulting the live wire
+/// surface; the request payload is carried as a serialised
+/// `PromptRequest` JSON string the caller deserialises.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedPrompt {
+    /// Canonical name of the plugin that issued the prompt.
+    pub plugin: String,
+    /// Plugin-chosen prompt identifier; per-plugin namespaced.
+    pub prompt_id: String,
+    /// Serialised `PromptRequest` payload. Consumers
+    /// deserialise via `serde_json::from_str` to reconstruct
+    /// the in-memory ledger row.
+    pub request_json: String,
+    /// Lifecycle state.
+    pub state: PersistedPromptState,
+    /// Wall-clock millisecond deadline (UTC) at which the
+    /// framework times the prompt out.
+    pub deadline_utc_ms: u64,
+    /// Wall-clock millisecond timestamp the prompt was issued.
+    pub created_at_ms: u64,
+    /// Wall-clock millisecond timestamp of the most recent
+    /// state change.
+    pub updated_at_ms: u64,
+}
+
+/// Lifecycle states for a row in `prompts`. Mirrors the
+/// SQLite CHECK constraint on the `state` column and the
+/// in-memory [`evo_plugin_sdk::contract::PromptState`] one-to-
+/// one (the persistence layer keeps a private copy because the
+/// SDK enum lives in `evo-plugin-sdk` and the persistence
+/// trait is steward-private).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedPromptState {
+    /// Awaiting an answer.
+    Open,
+    /// The consumer answered the prompt.
+    Answered,
+    /// Either side cancelled the prompt.
+    Cancelled,
+    /// The deadline elapsed without an answer.
+    TimedOut,
+}
+
+impl PersistedPromptState {
+    /// Stable string used in the SQLite `state` column.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Answered => "answered",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+        }
+    }
+
+    /// Parse a `state` column string. Returns `None` for an
+    /// unrecognised value (the SQLite CHECK constraint refuses
+    /// such writes, so reaching this case means external
+    /// tampering with the database file).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "open" => Some(Self::Open),
+            "answered" => Some(Self::Answered),
+            "cancelled" => Some(Self::Cancelled),
+            "timed_out" => Some(Self::TimedOut),
+            _ => None,
+        }
+    }
+}
+
+/// Durable mirror of one row in the in-memory appointment ledger.
+/// Returned by [`PersistenceStore::list_pending_appointments`] at
+/// boot so [`crate::appointments::AppointmentLedger`] can rehydrate
+/// the runtime without consulting the live plugin surface.
+///
+/// `spec_json` and `action_json` carry the SDK contract types
+/// (`AppointmentSpec` and `AppointmentAction`) as serialised JSON
+/// strings. The persistence layer is deliberately schema-blind on
+/// the inner shape: callers serialise with `serde_json::to_string`
+/// at write time and round-trip via `serde_json::from_str` on
+/// rehydration. Forward compatibility is by SDK contract version,
+/// not by SQL DDL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedAppointment {
+    /// Plugin canonical name (or consumer claimant token) that
+    /// issued the schedule call.
+    pub creator: String,
+    /// Caller-chosen appointment id. Stable across plugin
+    /// restarts; the `(creator, appointment_id)` pair is the
+    /// upsert key.
+    pub appointment_id: String,
+    /// Serialised `AppointmentSpec`.
+    pub spec_json: String,
+    /// Serialised `AppointmentAction`.
+    pub action_json: String,
+    /// Lifecycle state.
+    pub state: PersistedAppointmentState,
+    /// Next scheduled fire (UTC milliseconds). `None` if terminal
+    /// (the framework prunes terminal rows before write so a
+    /// `None` here is a structural anomaly the rehydration path
+    /// surfaces as a debug skip).
+    pub next_fire_at_ms: Option<u64>,
+    /// Wall-clock millisecond timestamp of the most recent fire;
+    /// `None` until the first fire completes.
+    pub last_fired_at_ms: Option<u64>,
+    /// Cumulative fire count. Compared against
+    /// `spec.max_fires` to terminate recurring entries.
+    pub fires_completed: u32,
+    /// Wall-clock millisecond timestamp the appointment was
+    /// scheduled.
+    pub created_at_ms: u64,
+    /// Wall-clock millisecond timestamp of the most recent
+    /// state transition.
+    pub updated_at_ms: u64,
+}
+
+/// Lifecycle states for a row in `appointments`. Mirrors the
+/// SQLite `CHECK` constraint on the `state` column and is the
+/// persistence-side counterpart to
+/// [`crate::appointments::AppointmentState`]. The persistence
+/// layer keeps a private copy because the in-memory enum lives in
+/// `crate::appointments` and the persistence trait is module-
+/// boundary-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedAppointmentState {
+    /// Awaiting next scheduled fire.
+    Pending,
+    /// Last fire completed; transient state used when the in-
+    /// memory ledger is recomputing `next_fire` for a recurring
+    /// entry. The persistence row is updated back to `Pending`
+    /// immediately after.
+    Fired,
+    /// Cancelled by creator or operator. Pruned at write time;
+    /// rehydration never sees these.
+    Cancelled,
+    /// `max_fires` / `end_time_ms` exhausted. Pruned at write
+    /// time; rehydration never sees these.
+    Terminal,
+}
+
+impl PersistedAppointmentState {
+    /// Stable string used in the SQLite `state` column.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Fired => "fired",
+            Self::Cancelled => "cancelled",
+            Self::Terminal => "terminal",
+        }
+    }
+
+    /// Parse a `state` column string. Returns `None` for an
+    /// unrecognised value (the SQLite CHECK constraint refuses
+    /// such writes, so reaching this case means external
+    /// tampering with the database file).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "fired" => Some(Self::Fired),
+            "cancelled" => Some(Self::Cancelled),
+            "terminal" => Some(Self::Terminal),
+            _ => None,
+        }
+    }
+}
 
 /// Wall-clock milliseconds since the UNIX epoch, computed from
 /// `SystemTime::now()`. Returns 0 if the system clock predates the
@@ -1878,6 +2240,23 @@ fn run_migrations(conn: &mut Connection) -> Result<(), PersistenceError> {
         conn.execute_batch(MIGRATION_011_PENDING_GRAMMAR_ORPHANS)
             .map_err(|e| PersistenceError::MigrationFailed {
                 version: SCHEMA_VERSION_PENDING_GRAMMAR_ORPHANS,
+                source: e,
+            })?;
+    }
+
+    if current < SCHEMA_VERSION_PROMPTS {
+        conn.execute_batch(MIGRATION_012_PROMPTS).map_err(|e| {
+            PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_PROMPTS,
+                source: e,
+            }
+        })?;
+    }
+
+    if current < SCHEMA_VERSION_APPOINTMENTS {
+        conn.execute_batch(MIGRATION_013_APPOINTMENTS)
+            .map_err(|e| PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_APPOINTMENTS,
                 source: e,
             })?;
     }
@@ -2280,8 +2659,11 @@ fn merge_tx(
     Ok(())
 }
 
-fn type_migration_tx(
-    conn: &mut Connection,
+// Per-record body of a type-migration. Caller controls the
+// transaction boundary so the batch path can amortize one fsync
+// across N records.
+fn type_migration_step(
+    tx: &Transaction<'_>,
     record: TypeMigrationRecord<'_>,
 ) -> Result<(), PersistenceError> {
     let TypeMigrationRecord {
@@ -2293,13 +2675,7 @@ fn type_migration_tx(
         reason,
         at_ms,
     } = record;
-    let tx = conn
-        .transaction()
-        .map_err(|e| PersistenceError::sqlite("begin type_migration tx", e))?;
 
-    // Insert the new subject row first so the foreign key from
-    // subject_addressings is satisfied throughout the move. The
-    // new row carries the post-migration subject_type.
     tx.execute(
         "INSERT INTO subjects (id, subject_type, created_at_ms, \
          modified_at_ms, forgotten_at_ms) VALUES (?1, ?2, ?3, ?3, NULL)",
@@ -2307,8 +2683,6 @@ fn type_migration_tx(
     )
     .map_err(|e| PersistenceError::sqlite("insert migrated subject row", e))?;
 
-    // Move every addressing currently pointing at the source
-    // to the new id. Tolerates a missing source (zero rows).
     tx.execute(
         "UPDATE subject_addressings SET subject_id = ?1, \
          asserted_at_ms = ?3 WHERE subject_id = ?2",
@@ -2318,17 +2692,11 @@ fn type_migration_tx(
         PersistenceError::sqlite("re-attach addressings to migrated id", e)
     })?;
 
-    // Drop the source subjects row. Its addressings are already
-    // moved; if the source did not exist the DELETE matches zero.
     tx.execute("DELETE FROM subjects WHERE id = ?1", params![source])
         .map_err(|e| {
             PersistenceError::sqlite("delete migrated source row", e)
         })?;
 
-    // Record the alias chain entry. The kind is `type_migrated`
-    // so describe_alias consumers can branch on it; admin_plugin
-    // is set to the migration_id so the audit trail correlates
-    // with the admin ledger receipt without an extra column.
     tx.execute(
         "INSERT INTO aliases (old_id, new_id, kind, recorded_at_ms, \
          admin_plugin, reason) VALUES (?1, ?2, 'type_migrated', ?3, ?4, ?5)",
@@ -2360,8 +2728,42 @@ fn type_migration_tx(
         PersistenceError::sqlite("append claim_log subject_type_migration", e)
     })?;
 
+    Ok(())
+}
+
+fn type_migration_tx(
+    conn: &mut Connection,
+    record: TypeMigrationRecord<'_>,
+) -> Result<(), PersistenceError> {
+    let tx = conn
+        .transaction()
+        .map_err(|e| PersistenceError::sqlite("begin type_migration tx", e))?;
+    type_migration_step(&tx, record)?;
     tx.commit()
         .map_err(|e| PersistenceError::sqlite("commit type_migration tx", e))?;
+    Ok(())
+}
+
+// Batched type-migration: one BEGIN + N record steps + one COMMIT.
+// On WAL-mode SQLite this is one fsync per call regardless of
+// `records.len()`, so a 50k migration costs 50 fsyncs at
+// batch_size=1000 instead of 50,000 with the per-record path.
+fn type_migration_batch_tx(
+    conn: &mut Connection,
+    records: &[TypeMigrationRecordOwned],
+) -> Result<(), PersistenceError> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction().map_err(|e| {
+        PersistenceError::sqlite("begin type_migration_batch tx", e)
+    })?;
+    for r in records {
+        type_migration_step(&tx, r.as_borrowed())?;
+    }
+    tx.commit().map_err(|e| {
+        PersistenceError::sqlite("commit type_migration_batch tx", e)
+    })?;
     Ok(())
 }
 
@@ -2841,6 +3243,22 @@ impl PersistenceStore for SqlitePersistenceStore {
                         at_ms,
                     },
                 )
+            })
+            .await
+        })
+    }
+
+    fn record_subject_type_migrations_batch<'a>(
+        &'a self,
+        records: Vec<TypeMigrationRecordOwned>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if records.is_empty() {
+                return Ok(());
+            }
+            self.interact("subject_type_migrations_batch", move |conn| {
+                type_migration_batch_tx(conn, &records)
             })
             .await
         })
@@ -4545,6 +4963,360 @@ impl PersistenceStore for SqlitePersistenceStore {
             .await
         })
     }
+
+    fn record_prompt_issue<'a>(
+        &'a self,
+        plugin: &'a str,
+        prompt_id: &'a str,
+        request_json: &'a str,
+        deadline_utc_ms: u64,
+        now_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let plugin = plugin.to_string();
+            let prompt_id = prompt_id.to_string();
+            let request_json = request_json.to_string();
+            self.interact("record_prompt_issue", move |conn| {
+                conn.execute(
+                    "INSERT INTO prompts \
+                     (plugin, prompt_id, request_json, state, \
+                      deadline_utc_ms, created_at_ms, updated_at_ms) \
+                     VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?5) \
+                     ON CONFLICT (plugin, prompt_id) DO UPDATE SET \
+                       request_json = excluded.request_json, \
+                       state = 'open', \
+                       deadline_utc_ms = excluded.deadline_utc_ms, \
+                       updated_at_ms = excluded.updated_at_ms",
+                    rusqlite::params![
+                        plugin,
+                        prompt_id,
+                        request_json,
+                        deadline_utc_ms as i64,
+                        now_ms as i64,
+                    ],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("upsert prompts row", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn update_prompt_state<'a>(
+        &'a self,
+        plugin: &'a str,
+        prompt_id: &'a str,
+        state: PersistedPromptState,
+        now_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let plugin = plugin.to_string();
+            let prompt_id = prompt_id.to_string();
+            let state_str = state.as_str();
+            self.interact("update_prompt_state", move |conn| {
+                conn.execute(
+                    "UPDATE prompts \
+                     SET state = ?3, updated_at_ms = ?4 \
+                     WHERE plugin = ?1 AND prompt_id = ?2",
+                    rusqlite::params![
+                        plugin,
+                        prompt_id,
+                        state_str,
+                        now_ms as i64,
+                    ],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("update prompts.state", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn delete_prompt<'a>(
+        &'a self,
+        plugin: &'a str,
+        prompt_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let plugin = plugin.to_string();
+            let prompt_id = prompt_id.to_string();
+            self.interact("delete_prompt", move |conn| {
+                conn.execute(
+                    "DELETE FROM prompts \
+                     WHERE plugin = ?1 AND prompt_id = ?2",
+                    rusqlite::params![plugin, prompt_id],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("delete prompts row", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn list_open_prompts<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<PersistedPrompt>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("list_open_prompts", |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT plugin, prompt_id, request_json, state, \
+                                deadline_utc_ms, created_at_ms, updated_at_ms \
+                         FROM prompts \
+                         WHERE state = 'open' \
+                         ORDER BY created_at_ms ASC",
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite("prepare prompts select", e)
+                    })?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let state_str: String = row.get(3)?;
+                        let state = PersistedPromptState::parse(&state_str)
+                            .ok_or_else(|| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    3,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!(
+                                            "unknown prompt state: \
+                                             {state_str}"
+                                        ),
+                                    )),
+                                )
+                            })?;
+                        Ok(PersistedPrompt {
+                            plugin: row.get(0)?,
+                            prompt_id: row.get(1)?,
+                            request_json: row.get(2)?,
+                            state,
+                            deadline_utc_ms: row.get::<_, i64>(4)? as u64,
+                            created_at_ms: row.get::<_, i64>(5)? as u64,
+                            updated_at_ms: row.get::<_, i64>(6)? as u64,
+                        })
+                    })
+                    .map_err(|e| {
+                        PersistenceError::sqlite("query prompts", e)
+                    })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r.map_err(|e| {
+                        PersistenceError::sqlite("decode prompts row", e)
+                    })?);
+                }
+                Ok(out)
+            })
+            .await
+        })
+    }
+
+    fn record_appointment<'a>(
+        &'a self,
+        row: &'a PersistedAppointment,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let row = row.clone();
+            self.interact("record_appointment", move |conn| {
+                conn.execute(
+                    "INSERT INTO appointments \
+                     (creator, appointment_id, spec_json, action_json, \
+                      state, next_fire_at_ms, last_fired_at_ms, \
+                      fires_completed, created_at_ms, updated_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                     ON CONFLICT (creator, appointment_id) DO UPDATE SET \
+                       spec_json = excluded.spec_json, \
+                       action_json = excluded.action_json, \
+                       state = excluded.state, \
+                       next_fire_at_ms = excluded.next_fire_at_ms, \
+                       last_fired_at_ms = excluded.last_fired_at_ms, \
+                       fires_completed = excluded.fires_completed, \
+                       updated_at_ms = excluded.updated_at_ms",
+                    rusqlite::params![
+                        row.creator,
+                        row.appointment_id,
+                        row.spec_json,
+                        row.action_json,
+                        row.state.as_str(),
+                        row.next_fire_at_ms.map(|v| v as i64),
+                        row.last_fired_at_ms.map(|v| v as i64),
+                        row.fires_completed as i64,
+                        row.created_at_ms as i64,
+                        row.updated_at_ms as i64,
+                    ],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("upsert appointments row", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn update_appointment_after_fire<'a>(
+        &'a self,
+        creator: &'a str,
+        appointment_id: &'a str,
+        next_fire_at_ms: Option<u64>,
+        last_fired_at_ms: u64,
+        fires_completed: u32,
+        state: PersistedAppointmentState,
+        now_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let creator = creator.to_string();
+            let appointment_id = appointment_id.to_string();
+            let state_str = state.as_str();
+            self.interact("update_appointment_after_fire", move |conn| {
+                conn.execute(
+                    "UPDATE appointments \
+                     SET state = ?3, \
+                         next_fire_at_ms = ?4, \
+                         last_fired_at_ms = ?5, \
+                         fires_completed = ?6, \
+                         updated_at_ms = ?7 \
+                     WHERE creator = ?1 AND appointment_id = ?2",
+                    rusqlite::params![
+                        creator,
+                        appointment_id,
+                        state_str,
+                        next_fire_at_ms.map(|v| v as i64),
+                        last_fired_at_ms as i64,
+                        fires_completed as i64,
+                        now_ms as i64,
+                    ],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("update appointments post-fire", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn forget_appointment<'a>(
+        &'a self,
+        creator: &'a str,
+        appointment_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let creator = creator.to_string();
+            let appointment_id = appointment_id.to_string();
+            self.interact("forget_appointment", move |conn| {
+                conn.execute(
+                    "DELETE FROM appointments \
+                     WHERE creator = ?1 AND appointment_id = ?2",
+                    rusqlite::params![creator, appointment_id],
+                )
+                .map_err(|e| {
+                    PersistenceError::sqlite("delete appointments row", e)
+                })?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn list_pending_appointments<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<PersistedAppointment>,
+                        PersistenceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("list_pending_appointments", |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT creator, appointment_id, spec_json, \
+                                action_json, state, next_fire_at_ms, \
+                                last_fired_at_ms, fires_completed, \
+                                created_at_ms, updated_at_ms \
+                         FROM appointments \
+                         WHERE state = 'pending' \
+                         ORDER BY created_at_ms ASC",
+                    )
+                    .map_err(|e| {
+                        PersistenceError::sqlite(
+                            "prepare appointments select",
+                            e,
+                        )
+                    })?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let state_str: String = row.get(4)?;
+                        let state =
+                            PersistedAppointmentState::parse(&state_str)
+                                .ok_or_else(|| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        4,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            format!(
+                                                "unknown appointment state: \
+                                                 {state_str}"
+                                            ),
+                                        )),
+                                    )
+                                })?;
+                        Ok(PersistedAppointment {
+                            creator: row.get(0)?,
+                            appointment_id: row.get(1)?,
+                            spec_json: row.get(2)?,
+                            action_json: row.get(3)?,
+                            state,
+                            next_fire_at_ms: row
+                                .get::<_, Option<i64>>(5)?
+                                .map(|v| v as u64),
+                            last_fired_at_ms: row
+                                .get::<_, Option<i64>>(6)?
+                                .map(|v| v as u64),
+                            fires_completed: row.get::<_, i64>(7)? as u32,
+                            created_at_ms: row.get::<_, i64>(8)? as u64,
+                            updated_at_ms: row.get::<_, i64>(9)? as u64,
+                        })
+                    })
+                    .map_err(|e| {
+                        PersistenceError::sqlite("query appointments", e)
+                    })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r.map_err(|e| {
+                        PersistenceError::sqlite("decode appointments row", e)
+                    })?);
+                }
+                Ok(out)
+            })
+            .await
+        })
+    }
 }
 
 /// In-memory mock implementation of [`PersistenceStore`].
@@ -4628,6 +5400,17 @@ struct MemoryState {
     /// subject_type. Persists the boot diagnostic's discoveries
     /// and any operator decisions taken against them.
     pending_grammar_orphans: HashMap<String, PersistedGrammarOrphan>,
+    /// Mirror of the `prompts` table keyed by
+    /// `(plugin, prompt_id)`. Holds the durable side of the
+    /// in-memory prompt ledger so multi-stage interaction state
+    /// survives a steward restart.
+    prompts: HashMap<(String, String), PersistedPrompt>,
+    /// Mirror of the `appointments` table keyed by
+    /// `(creator, appointment_id)`. Holds the durable side of
+    /// the in-memory appointment ledger so the
+    /// `AppointmentRuntime` can rehydrate against the same
+    /// schedule across a steward restart.
+    appointments: HashMap<(String, String), PersistedAppointment>,
 }
 
 #[derive(Debug, Clone)]
@@ -4869,6 +5652,62 @@ impl PersistenceStore for MemoryPersistenceStore {
                 claimant: migration_id.to_string(),
                 at_ms,
             });
+            Ok(())
+        })
+    }
+
+    fn record_subject_type_migrations_batch<'a>(
+        &'a self,
+        records: Vec<TypeMigrationRecordOwned>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if records.is_empty() {
+                return Ok(());
+            }
+            // The in-memory store has no fsync to amortize, but the
+            // semantics still need to match the SQLite path: every
+            // record is applied or none are. A single mutex hold
+            // gives that atomicity (no concurrent reader observes
+            // a half-applied batch).
+            let mut g = self.inner.lock().await;
+            for r in &records {
+                let mut moved: Vec<PersistedAddressing> =
+                    if let Some(s) = g.subjects.remove(&r.source) {
+                        s.addressings
+                    } else {
+                        Vec::new()
+                    };
+                for slot in &mut moved {
+                    slot.asserted_at_ms = r.at_ms;
+                }
+                g.subjects.insert(
+                    r.new_id.clone(),
+                    MemorySubject {
+                        subject_type: r.to_type.clone(),
+                        created_at_ms: r.at_ms,
+                        modified_at_ms: r.at_ms,
+                        forgotten_at_ms: None,
+                        addressings: moved,
+                    },
+                );
+                g.next_alias_id += 1;
+                let id = g.next_alias_id;
+                g.aliases.push(PersistedAlias {
+                    alias_id: id,
+                    old_id: r.source.clone(),
+                    new_id: r.new_id.clone(),
+                    kind: AliasKind::TypeMigrated,
+                    recorded_at_ms: r.at_ms,
+                    admin_plugin: r.migration_id.clone(),
+                    reason: r.reason.clone(),
+                });
+                g.claim_log.push(MemoryClaimEntry {
+                    kind: claim_kind::SUBJECT_TYPE_MIGRATION,
+                    claimant: r.migration_id.clone(),
+                    at_ms: r.at_ms,
+                });
+            }
             Ok(())
         })
     }
@@ -5829,6 +6668,176 @@ impl PersistenceStore for MemoryPersistenceStore {
             let mut out: Vec<_> =
                 g.pending_grammar_orphans.values().cloned().collect();
             out.sort_by(|a, b| a.subject_type.cmp(&b.subject_type));
+            Ok(out)
+        })
+    }
+
+    fn record_prompt_issue<'a>(
+        &'a self,
+        plugin: &'a str,
+        prompt_id: &'a str,
+        request_json: &'a str,
+        deadline_utc_ms: u64,
+        now_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            let key = (plugin.to_string(), prompt_id.to_string());
+            let created_at_ms = g
+                .prompts
+                .get(&key)
+                .map(|p| p.created_at_ms)
+                .unwrap_or(now_ms);
+            g.prompts.insert(
+                key.clone(),
+                PersistedPrompt {
+                    plugin: key.0,
+                    prompt_id: key.1,
+                    request_json: request_json.to_string(),
+                    state: PersistedPromptState::Open,
+                    deadline_utc_ms,
+                    created_at_ms,
+                    updated_at_ms: now_ms,
+                },
+            );
+            Ok(())
+        })
+    }
+
+    fn update_prompt_state<'a>(
+        &'a self,
+        plugin: &'a str,
+        prompt_id: &'a str,
+        state: PersistedPromptState,
+        now_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            let key = (plugin.to_string(), prompt_id.to_string());
+            if let Some(entry) = g.prompts.get_mut(&key) {
+                entry.state = state;
+                entry.updated_at_ms = now_ms;
+            }
+            Ok(())
+        })
+    }
+
+    fn delete_prompt<'a>(
+        &'a self,
+        plugin: &'a str,
+        prompt_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            g.prompts
+                .remove(&(plugin.to_string(), prompt_id.to_string()));
+            Ok(())
+        })
+    }
+
+    fn list_open_prompts<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<PersistedPrompt>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            let mut out: Vec<_> = g
+                .prompts
+                .values()
+                .filter(|p| p.state == PersistedPromptState::Open)
+                .cloned()
+                .collect();
+            out.sort_by_key(|p| p.created_at_ms);
+            Ok(out)
+        })
+    }
+
+    fn record_appointment<'a>(
+        &'a self,
+        row: &'a PersistedAppointment,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            g.appointments.insert(
+                (row.creator.clone(), row.appointment_id.clone()),
+                row.clone(),
+            );
+            Ok(())
+        })
+    }
+
+    fn update_appointment_after_fire<'a>(
+        &'a self,
+        creator: &'a str,
+        appointment_id: &'a str,
+        next_fire_at_ms: Option<u64>,
+        last_fired_at_ms: u64,
+        fires_completed: u32,
+        state: PersistedAppointmentState,
+        now_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            if let Some(row) = g
+                .appointments
+                .get_mut(&(creator.to_string(), appointment_id.to_string()))
+            {
+                row.state = state;
+                row.next_fire_at_ms = next_fire_at_ms;
+                row.last_fired_at_ms = Some(last_fired_at_ms);
+                row.fires_completed = fires_completed;
+                row.updated_at_ms = now_ms;
+            }
+            Ok(())
+        })
+    }
+
+    fn forget_appointment<'a>(
+        &'a self,
+        creator: &'a str,
+        appointment_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            g.appointments
+                .remove(&(creator.to_string(), appointment_id.to_string()));
+            Ok(())
+        })
+    }
+
+    fn list_pending_appointments<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<PersistedAppointment>,
+                        PersistenceError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            let mut out: Vec<_> = g
+                .appointments
+                .values()
+                .filter(|a| a.state == PersistedAppointmentState::Pending)
+                .cloned()
+                .collect();
+            out.sort_by_key(|a| a.created_at_ms);
             Ok(out)
         })
     }

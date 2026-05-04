@@ -128,6 +128,14 @@ impl SubjectConflictIndex {
     /// [`crate::persistence::PersistenceStore::record_pending_conflict`]
     /// call; recording the same id twice is idempotent.
     pub fn record(&self, conflict_id: i64, canonical_ids: &[String]) {
+        // Per LOGGING.md §2 ("struct field comparisons" fire at
+        // trace): per-conflict record trace showing which subjects
+        // were marked degraded by the conflict.
+        tracing::trace!(
+            conflict_id,
+            subjects = canonical_ids.len(),
+            "conflict index: recording conflict"
+        );
         let mut inner = self.inner.lock().expect("conflict index poisoned");
         inner
             .conflict_to_subjects
@@ -148,6 +156,11 @@ impl SubjectConflictIndex {
     pub fn resolve(&self, conflict_id: i64) {
         let mut inner = self.inner.lock().expect("conflict index poisoned");
         if let Some(ids) = inner.conflict_to_subjects.remove(&conflict_id) {
+            tracing::trace!(
+                conflict_id,
+                subjects_cleared = ids.len(),
+                "conflict index: resolving conflict"
+            );
             for id in &ids {
                 if let Some(set) = inner.subject_to_conflicts.get_mut(id) {
                     set.remove(&conflict_id);
@@ -416,11 +429,17 @@ impl ProjectionEngine {
         let claimants = deduplicated_claimants(&addressings, &related);
         let degraded = !degraded_reasons.is_empty();
 
+        let state = self
+            .registry
+            .state_of(&record.id)
+            .unwrap_or(serde_json::Value::Null);
+
         Ok(SubjectProjection {
             canonical_id: record.id,
             subject_type: record.subject_type,
             addressings,
             related,
+            state,
             composed_at: SystemTime::now(),
             shape_version: SUBJECT_PROJECTION_SHAPE_VERSION,
             claimants,
@@ -751,6 +770,14 @@ pub struct SubjectProjection {
     /// recursively composed `nested` [`SubjectProjection`] when the
     /// scope's depth permits.
     pub related: Vec<RelatedSubject>,
+    /// Plugin-contributed runtime state for this subject. `null`
+    /// when no plugin has contributed state via
+    /// `SubjectAnnouncement::state` or
+    /// `SubjectRegistry::update_state`. Top-level path is the
+    /// query target for `WatchCondition::SubjectState`'s
+    /// `field` lookup. In-memory only as of v0.1.12.1; durable
+    /// persistence rides v0.1.13.
+    pub state: serde_json::Value,
     /// When this projection was composed.
     pub composed_at: SystemTime,
     /// Projection shape version. See

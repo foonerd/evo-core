@@ -127,8 +127,24 @@ pub fn verify_out_of_process_bundle_at(
     opt: TrustOptions,
     now: SystemTime,
 ) -> Result<TrustOutcome, TrustError> {
+    // Per LOGGING.md §2: trust verification is a verb invocation
+    // fired once per plugin admission. Bracket with debug entry +
+    // return so an operator running with debug enabled sees
+    // exactly what trust posture admitted each plugin.
+    tracing::debug!(
+        plugin_dir = %bundle.plugin_dir.display(),
+        declared_trust = ?bundle.declared_trust,
+        candidate_keys = keys.len(),
+        allow_unsigned = opt.allow_unsigned,
+        "trust verify: invoking"
+    );
     let id = install_digest(bundle.manifest_path, bundle.exec_path)?;
     if revocations.is_revoked(&id) {
+        tracing::debug!(
+            plugin_dir = %bundle.plugin_dir.display(),
+            digest = %RevocationSet::display_digest(&id),
+            "trust verify: refused (revoked)"
+        );
         return Err(TrustError::Revoked(
             RevocationSet::display_digest(&id).to_string(),
         ));

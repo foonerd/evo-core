@@ -1,0 +1,53 @@
+# Synthetic prompt plugin — out-of-process bundle manifest.
+#
+# Issues a Text prompt with a 5s timeout from a background task
+# spawned during load(). The plugin awaits the outcome and writes
+# a one-line `outcome=...` entry to {state_dir}/prompt-outcomes.log.
+# The acceptance scenario drives the consumer side via
+# `evo-plugin-tool admin prompt list / answer-text / cancel`,
+# producing answered / cancelled / timed_out outcomes for the
+# three scenarios that share this fixture.
+#
+# Used by T2.user-interaction-text-prompt,
+# T2.user-interaction-prompt-cancelled, and
+# T2.user-interaction-prompt-timeout.
+
+[plugin]
+name = "org.evoframework.acceptance.prompt-plugin"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.prompt"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities.respondent]
+request_types = ["never_called"]
+response_budget_ms = 1000

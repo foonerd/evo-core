@@ -64,7 +64,7 @@ binaries/<target>/build-info.toml
 ```toml
 schema_version = 0                       # u32, monotonic
 kind           = "core-binaries"         # bundle kind, fixed per file
-evo_core_tag   = "v0.1.11"               # source tag the build came from
+evo_core_tag   = "v0.1.12"               # source tag the build came from
 target         = "x86_64-unknown-linux-gnu"  # rustc target triple
 binaries       = ["evo", "evo-plugin-tool"]  # files in this directory
 built_at       = "2026-04-28T12:34:56Z"  # UTC ISO 8601, build timestamp
@@ -87,8 +87,8 @@ sha256 = "<64 hex chars>"
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `schema_version` | `u32` | Bumps on additive changes. Consumers MUST tolerate higher versions for fields they recognise (forward compat). `0` is the v0.1.10 / v0.1.11 line. |
-| `kind` | string | Bundle taxonomy. v0.1.10 / v0.1.11 publish `"core-binaries"` (the steward + tooling) and `"plugin-bundle"` (signed OOP plugin bundles, see §2.3); future releases add `"image"`, `"toolchain"`. |
+| `schema_version` | `u32` | Bumps on additive changes. Consumers MUST tolerate higher versions for fields they recognise (forward compat). `0` is the v0.1.10–v0.1.12 line. |
+| `kind` | string | Bundle taxonomy. The v0.1.10–v0.1.12 line publishes `"core-binaries"` (the steward + tooling) and `"plugin-bundle"` (signed OOP plugin bundles, see §2.3); future releases add `"image"`, `"toolchain"`. |
 | `evo_core_tag` | string | Source tag the binaries were built from. Format: `v<MAJOR>.<MINOR>.<PATCH>[-<pre>]`. The tag is in the evo-core repository; consumers can clone evo-core at this tag for full reproducibility. |
 | `target` | string | rustc target triple. Consumers match this against their device's triple. |
 | `binaries` | array of strings | Files in this directory. Each file `<name>` has a sibling `<name>.sig` (signature) and `<name>.sha256` (digest). |
@@ -362,8 +362,10 @@ added at the end of the manifest; existing fields' semantics are
 fixed once published.
 
 A breaking change to the schema requires a major version bump on the
-release plane (a separate decision recorded in an ADR). v0.1.10
-ships `schema_version = 0`; the line numbering matches the framework
+release plane (an opt-in change to the published contract; consumers
+on the older line continue to verify against `schema_version = 0`
+until they migrate). The v0.1.10–v0.1.12 line ships
+`schema_version = 0`; the line numbering matches the framework
 release line.
 
 ## References

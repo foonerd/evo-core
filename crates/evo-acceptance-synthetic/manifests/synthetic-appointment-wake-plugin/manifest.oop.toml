@@ -1,0 +1,60 @@
+# Synthetic appointment-wake plugin — out-of-process bundle.
+#
+# Like synthetic-appointment-plugin but the OneShot it registers on
+# load carries `must_wake_device = true` and a configurable
+# `wake_pre_arm_ms` (env `EVO_ACCEPTANCE_WAKE_PRE_ARM_MS`, default
+# 2000). The framework's AppointmentRuntime calls the
+# distribution-supplied RtcWakeCallback at
+# `(scheduled_fire_ms - wake_pre_arm_ms)` for must-wake
+# appointments; the acceptance distribution
+# (evo-acceptance-distribution) wires a RecordingRtcWakeCallback
+# that logs every program_wake call so the scenario can validate
+# the framework's wake-arming contract without depending on
+# OS-level suspend/resume plumbing (which is distribution-owned
+# and platform-variable).
+#
+# Used by T2.appointment-wake-device and T3.appt-time-wake. Has
+# no value outside those scenarios.
+
+[plugin]
+name = "org.evoframework.acceptance.appointment-wake-plugin"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.appointment-wake"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities]
+appointments = true
+
+[capabilities.respondent]
+request_types = ["appointment_fired"]
+response_budget_ms = 1000

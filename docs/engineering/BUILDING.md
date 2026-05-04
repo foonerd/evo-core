@@ -314,16 +314,16 @@ For cross-built binaries, use the matching strip utility: `aarch64-linux-gnu-str
 
 ### 10.4 Binary size baseline
 
-As of evo-core 0.1.7, release binary sizes on a few primary targets (stripped, default profile):
+Release binary sizes on the primary targets (default profile, post-strip; numbers re-measured against the current release on cut):
 
 | Target | Approximate size |
 |--------|------------------|
-| `x86_64-unknown-linux-gnu` | 4-6 MB |
-| `aarch64-unknown-linux-gnu` | 4-6 MB |
-| `armv7-unknown-linux-gnueabihf` | 3-5 MB |
-| `arm-unknown-linux-gnueabihf` | 3-5 MB |
+| `x86_64-unknown-linux-gnu` | 8-12 MB |
+| `aarch64-unknown-linux-gnu` | 8-12 MB |
+| `armv7-unknown-linux-gnueabihf` | 6-10 MB |
+| `arm-unknown-linux-gnueabihf` | 6-10 MB |
 
-Sizes grow modestly with each feature pass but are fundamentally bounded by the set of dependencies, which is deliberately small. Devices with single-digit MB of storage for the steward binary remain comfortably inside budget.
+Sizes grow with each feature pass but are fundamentally bounded by the set of dependencies, which is deliberately small. Devices with low-tens-of-MB of storage for the steward binary remain comfortably inside budget; embedded targets with single-digit-MB budgets should profile against the current release rather than this document.
 
 ## 11. glibc vs musl
 

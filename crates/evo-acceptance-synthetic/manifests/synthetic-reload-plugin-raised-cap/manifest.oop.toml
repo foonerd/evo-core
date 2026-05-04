@@ -1,0 +1,61 @@
+# Synthetic live-reload plugin — RAISED-CAP manifest variant.
+#
+# Identical to manifests/synthetic-reload-plugin/manifest.oop.toml
+# except for two fields: `[plugin].name` is the raised-cap variant
+# identity, and `[lifecycle].live_blob_max` is set to 32 MiB so the
+# framework allows state blobs above the default 16 MiB cap (still
+# below the 64 MiB hard ceiling).
+#
+# Used by `T2.hot-reload-blob-size-cap` to demonstrate that the
+# per-plugin live_blob_max raises the soft cap. The same plugin
+# binary serves both manifests; a systemd drop-in passes
+# `EVO_ACCEPTANCE_RELOAD_PLUGIN_NAME` so the plugin's
+# `Plugin::describe()` matches `[plugin].name` here.
+
+[plugin]
+# 52 characters. The framework's live-reload successor socket
+# path uses a `.lr.{6-hex-suffix}.sock` scheme that fits plugin
+# names up to 70 chars within Linux's SUN_PATH_MAX bound (see
+# `admission::live_reload_successor_socket_path`).
+name = "org.evoframework.acceptance.reload-plugin-raised-cap"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.reload-raised"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "live"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+# 32 MiB — twice the framework's default soft cap, still well
+# below the 64 MiB hard ceiling. Demonstrates the per-plugin
+# raise.
+live_blob_max = 33554432
+
+[capabilities.respondent]
+request_types = ["never_called"]
+response_budget_ms = 1000

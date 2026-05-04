@@ -507,6 +507,35 @@ pub enum Happening {
         #[coalesce_labels(skip)]
         at: SystemTime,
     },
+    /// A plugin published a new runtime state for a subject it had
+    /// previously announced. Emitted by
+    /// [`RegistrySubjectAnnouncer::update_state`](crate::context::RegistrySubjectAnnouncer)
+    /// after the registry's `update_state` call succeeds.
+    ///
+    /// The previous and new state values are carried inline so
+    /// subscribers (notably the watch evaluator's
+    /// `WatchCondition::SubjectState` arm) can compute predicates
+    /// without re-projecting the subject. `prev_state` is `null`
+    /// the first time a subject's state is published.
+    SubjectStateChanged {
+        /// Canonical name of the plugin that published the state.
+        plugin: String,
+        /// Canonical ID of the subject whose state was updated.
+        canonical_id: String,
+        /// Subject type, copied from the registry record so
+        /// subscribers can filter without re-querying.
+        subject_type: String,
+        /// State value before the update. `null` on the first
+        /// state publication for a subject.
+        #[coalesce_labels(skip)]
+        prev_state: serde_json::Value,
+        /// State value after the update.
+        #[coalesce_labels(skip)]
+        new_state: serde_json::Value,
+        /// When the happening was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
     /// A relation was forgotten. Emitted by either
     /// [`RegistryRelationAnnouncer`](crate::context::RegistryRelationAnnouncer)
     /// or
@@ -2195,6 +2224,7 @@ impl Happening {
             | Happening::CustodyDegraded { plugin, .. }
             | Happening::RelationCardinalityViolation { plugin, .. }
             | Happening::SubjectForgotten { plugin, .. }
+            | Happening::SubjectStateChanged { plugin, .. }
             | Happening::RelationForgotten { plugin, .. }
             | Happening::SubjectConflictDetected { plugin, .. } => {
                 Some(plugin.as_str())
@@ -2378,6 +2408,9 @@ impl Happening {
         match self {
             // Direct subject events.
             Happening::SubjectForgotten {
+                canonical_id: id, ..
+            }
+            | Happening::SubjectStateChanged {
                 canonical_id: id, ..
             }
             | Happening::SubjectAddressingForcedRetract {
@@ -2669,6 +2702,7 @@ fn happening_kind_str(h: &Happening) -> &'static str {
             "relation_cardinality_violation"
         }
         Happening::SubjectForgotten { .. } => "subject_forgotten",
+        Happening::SubjectStateChanged { .. } => "subject_state_changed",
         Happening::RelationForgotten { .. } => "relation_forgotten",
         Happening::SubjectAddressingForcedRetract { .. } => {
             "subject_addressing_forced_retract"

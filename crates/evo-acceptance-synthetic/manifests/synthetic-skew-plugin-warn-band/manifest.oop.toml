@@ -1,0 +1,53 @@
+# Synthetic skew plugin — WarnBand manifest variant.
+#
+# Identical to manifests/synthetic-skew-plugin/manifest.oop.toml
+# except for `[plugin].name` and `prerequisites.evo_min_version`.
+# Declares evo_min_version = "0.1.0" so when the steward is told
+# (via EVO_FRAMEWORK_VERSION_OVERRIDE in the systemd drop-in) that
+# it is running v0.3.0, the framework's classify_skew sees a
+# delta of 2 minor versions and lands the plugin in WarnBand.
+# Admission proceeds and the framework emits
+# Happening::PluginVersionSkewWarning, which T2.version-skew-warn-band
+# subscribes to and asserts.
+#
+# Used only by T2.version-skew-warn-band.
+
+[plugin]
+name = "org.evoframework.acceptance.skew-warn-band"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.skew-warn-band"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities.respondent]
+request_types = ["never_called"]
+response_budget_ms = 1000

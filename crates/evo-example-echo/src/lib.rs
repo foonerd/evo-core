@@ -94,6 +94,11 @@ impl Plugin for EchoPlugin {
         _ctx: &'a LoadContext,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         async move {
+            tracing::debug!(
+                plugin = "org.evo.example.echo",
+                verb = "load",
+                "plugin verb invoking"
+            );
             tracing::info!(plugin = "org.evo.example.echo", "plugin load");
             self.loaded = true;
             Ok(())
@@ -104,6 +109,11 @@ impl Plugin for EchoPlugin {
         &mut self,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
         async move {
+            tracing::debug!(
+                plugin = "org.evo.example.echo",
+                verb = "unload",
+                "plugin verb invoking"
+            );
             tracing::info!(
                 plugin = "org.evo.example.echo",
                 echoes = self.echo_count,
@@ -116,6 +126,11 @@ impl Plugin for EchoPlugin {
 
     fn health_check(&self) -> impl Future<Output = HealthReport> + Send + '_ {
         async move {
+            tracing::debug!(
+                plugin = "org.evo.example.echo",
+                verb = "health_check",
+                "plugin verb invoking"
+            );
             if self.loaded {
                 HealthReport::healthy()
             } else {

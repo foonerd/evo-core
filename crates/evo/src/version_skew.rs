@@ -104,6 +104,15 @@ pub fn classify_skew(
     plugin_min: &Version,
     framework: &Version,
 ) -> SkewClassification {
+    // Per LOGGING.md §2 ("regex match decisions" / "struct field
+    // comparisons" fire at trace): version-band classification is a
+    // per-admission field comparison whose decision drives admit /
+    // refuse / warn-band outcomes.
+    tracing::trace!(
+        plugin_min = %plugin_min,
+        framework = %framework,
+        "version skew: classify invoking"
+    );
     if plugin_min.major != framework.major {
         // Cross-major skew is out-of-band for this classifier.
         // Plugin major > framework major: plugin requires a

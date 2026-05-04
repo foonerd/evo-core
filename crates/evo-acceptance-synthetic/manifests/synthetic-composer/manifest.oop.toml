@@ -1,0 +1,53 @@
+# Synthetic reconciliation composer — out-of-process bundle manifest.
+#
+# Admits as a singleton respondent on the synthetic
+# `acceptance.composition` shelf. Reserved request_type `compose`
+# is what the steward's `ReconciliationCoordinator` dispatches at
+# every reconciliation tick. The composer reads the supplied
+# `(pair_id, generation)` envelope and returns a deterministic
+# projection payload the matching `synthetic-delivery-warden`
+# consumes via `course_correct(handle, "apply", payload)`.
+#
+# Used by T2.reconciliation-compose-apply, T3.recon-fast-watch,
+# and T5.plugin-crash-mid-recon. Has no value outside those
+# scenarios.
+
+[plugin]
+name = "org.evoframework.acceptance.synthetic-composer"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.composition"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities.respondent]
+request_types = ["compose"]
+response_budget_ms = 1000

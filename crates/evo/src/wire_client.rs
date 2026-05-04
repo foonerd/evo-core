@@ -228,6 +228,27 @@ pub struct EventSink {
     /// whose manifest opted in; the dispatcher routes through
     /// the per-warden Fast Path verb gate and budget enforcement.
     pub fast_path_dispatcher: Option<Arc<dyn FastPathDispatcher>>,
+    /// Where to route plugin-initiated `emit_plugin_event` wire
+    /// requests. Always populated; the server-side adapter
+    /// constructs a `Happening::PluginEvent` and emits via
+    /// `state.bus.emit_durable`. The closed-set framework
+    /// variants stay framework-authoritative; only PluginEvent
+    /// is reachable through this surface.
+    pub happening_emitter: Arc<dyn evo_plugin_sdk::contract::HappeningEmitter>,
+    /// Where to route plugin-initiated `create_appointment` /
+    /// `cancel_appointment` requests. `None` when the plugin's
+    /// manifest does not declare `capabilities.appointments =
+    /// true`; the reader task then replies with a structured
+    /// `Error` frame so the plugin observes the manifest-level
+    /// refusal rather than a silent drop. `Some(scheduler)` for
+    /// plugins whose manifest opted in.
+    pub appointment_scheduler:
+        Option<Arc<dyn evo_plugin_sdk::contract::AppointmentScheduler>>,
+    /// Where to route plugin-initiated `create_watch` /
+    /// `cancel_watch` requests. Same gating shape as
+    /// [`Self::appointment_scheduler`].
+    pub watch_scheduler:
+        Option<Arc<dyn evo_plugin_sdk::contract::WatchScheduler>>,
     /// Prompt ledger backing plugin-initiated user-interaction
     /// requests. `None` for builds without the ledger
     /// configured; `RequestUserInteraction` frames refuse with
@@ -941,7 +962,27 @@ async fn writer_loop<W>(
 {
     while let Some(frame) = rx.recv().await {
         if let Err(e) = write_frame(&mut writer, codec, &frame).await {
-            tracing::error!(error = %e, "wire client writer error");
+            // Per `docs/engineering/LOGGING.md` §2: classify
+            // before logging. A peer-disconnect during a normal
+            // shutdown (the cgroup-wide SIGTERM under systemd
+            // KillMode=control-group, plugin crash, or remote
+            // transport network drop) closes the wire and the
+            // next write fails with BrokenPipe / ConnectionReset
+            // / ConnectionAborted. That is the lifecycle event,
+            // not a recoverable anomaly the operator must
+            // notice — the matching reader loop's PeerClosed
+            // arm is already silent for the analogous case on
+            // its side. Anything else is a genuine I/O or
+            // codec failure and stays at error.
+            if is_wire_peer_disconnect(&e) {
+                tracing::debug!(
+                    error = %e,
+                    "wire client writer: peer disconnected; \
+                     ending writer loop"
+                );
+            } else {
+                tracing::error!(error = %e, "wire client writer error");
+            }
             break;
         }
     }
@@ -988,11 +1029,60 @@ async fn reader_loop<R>(
                 return;
             }
             Err(e) => {
-                tracing::error!(error = %e, "wire client reader error");
+                // Same classifier as the writer loop: a
+                // BrokenPipe / ConnectionReset / ConnectionAborted
+                // / UnexpectedEof on read is the analogue of
+                // PeerClosed (cleanly framed EOF) — the lifecycle
+                // event, not an anomaly. PeerClosed is already
+                // handled silently above; non-disconnect
+                // failures (codec parse error, frame too large,
+                // unexpected I/O) stay at error.
+                if is_wire_peer_disconnect(&e) {
+                    tracing::debug!(
+                        error = %e,
+                        "wire client reader: peer disconnected; \
+                         ending reader loop"
+                    );
+                } else {
+                    tracing::error!(error = %e, "wire client reader error");
+                }
                 drain_and_disable(&pending, &alive);
                 return;
             }
         }
+    }
+}
+
+/// Classify a [`WireError`] as a peer-disconnect outcome (the
+/// connection went away — expected during normal shutdown,
+/// plugin crash, or remote transport drop) versus a genuine
+/// I/O / codec failure that the operator may want to notice.
+///
+/// Returns `true` when the error is:
+///
+/// - [`WireError::PeerClosed`] — cleanly framed EOF, already
+///   handled silently in the reader's match arm; included here
+///   for completeness so callers using this classifier can
+///   match all disconnect shapes uniformly.
+/// - [`WireError::Io`] whose [`std::io::ErrorKind`] is one of
+///   `BrokenPipe`, `ConnectionReset`, `ConnectionAborted`, or
+///   `UnexpectedEof`. These four kinds are the standard
+///   "the peer went away" set; on Linux a write to a closed
+///   socket reports `BrokenPipe` (with `EPIPE`), a read of a
+///   closed socket reports `ConnectionReset` if RST was sent
+///   or `UnexpectedEof` if FIN was sent.
+fn is_wire_peer_disconnect(err: &WireError) -> bool {
+    use std::io::ErrorKind;
+    match err {
+        WireError::PeerClosed => true,
+        WireError::Io(io_err) => matches!(
+            io_err.kind(),
+            ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::UnexpectedEof
+        ),
+        _ => false,
     }
 }
 
@@ -1165,6 +1255,18 @@ async fn forward_plugin_request(
     sink: &EventSink,
     out_tx: &mpsc::Sender<WireFrame>,
 ) {
+    // Per `docs/engineering/LOGGING.md` §2: every verb invocation
+    // emits debug. The plugin-request path is one of the four
+    // major verb-dispatch entries (alongside dispatch_request,
+    // forward_event, and the router's handle_request); each
+    // frame here is one verb. Envelope fields are cheap to log.
+    let (_v, cid, plugin) = frame.envelope();
+    tracing::debug!(
+        op = variant_name(&frame),
+        cid,
+        plugin = %plugin,
+        "forward_plugin_request: incoming verb"
+    );
     let response = match frame {
         WireFrame::DescribeAlias {
             v,
@@ -1216,6 +1318,27 @@ async fn forward_plugin_request(
                 plugin,
                 class: e.class(),
                 message: format!("describe_subject: {e}"),
+                details: report_error_details(&e),
+            },
+        },
+        WireFrame::ResolveAddressing {
+            v,
+            cid,
+            plugin,
+            addressing,
+        } => match sink.subject_querier.resolve_addressing(addressing).await {
+            Ok(canonical_id) => WireFrame::ResolveAddressingResponse {
+                v,
+                cid,
+                plugin,
+                canonical_id,
+            },
+            Err(e) => WireFrame::Error {
+                v,
+                cid,
+                plugin,
+                class: e.class(),
+                message: format!("resolve_addressing: {e}"),
                 details: report_error_details(&e),
             },
         },
@@ -1405,6 +1528,174 @@ async fn forward_plugin_request(
             )
             .await;
         }
+
+        WireFrame::EmitPluginEvent {
+            v,
+            cid,
+            plugin,
+            event_type,
+            payload,
+        } => match sink
+            .happening_emitter
+            .emit_plugin_event(event_type, payload)
+            .await
+        {
+            Ok(()) => WireFrame::EmitPluginEventResponse { v, cid, plugin },
+            Err(e) => WireFrame::Error {
+                v,
+                cid,
+                plugin,
+                class: e.class(),
+                message: format!("emit_plugin_event: {e}"),
+                details: report_error_details(&e),
+            },
+        },
+
+        WireFrame::CreateAppointment {
+            v,
+            cid,
+            plugin,
+            spec,
+            action,
+        } => match sink.appointment_scheduler.as_ref() {
+            Some(scheduler) => {
+                match scheduler.create_appointment(spec, action).await {
+                    Ok(appointment_id) => {
+                        WireFrame::CreateAppointmentResponse {
+                            v,
+                            cid,
+                            plugin,
+                            appointment_id,
+                        }
+                    }
+                    Err(e) => WireFrame::Error {
+                        v,
+                        cid,
+                        plugin,
+                        class: e.class(),
+                        message: format!("create_appointment: {e}"),
+                        details: report_error_details(&e),
+                    },
+                }
+            }
+            None => WireFrame::Error {
+                v,
+                cid,
+                plugin,
+                class: ErrorClass::PermissionDenied,
+                message: "create_appointment: this plugin's manifest does \
+                          not declare capabilities.appointments = true"
+                    .into(),
+                details: Some(serde_json::json!({
+                    "subclass": "appointments_capability_not_declared"
+                })),
+            },
+        },
+
+        WireFrame::CancelAppointment {
+            v,
+            cid,
+            plugin,
+            appointment_id,
+        } => match sink.appointment_scheduler.as_ref() {
+            Some(scheduler) => {
+                match scheduler.cancel_appointment(appointment_id).await {
+                    Ok(()) => {
+                        WireFrame::CancelAppointmentResponse { v, cid, plugin }
+                    }
+                    Err(e) => WireFrame::Error {
+                        v,
+                        cid,
+                        plugin,
+                        class: e.class(),
+                        message: format!("cancel_appointment: {e}"),
+                        details: report_error_details(&e),
+                    },
+                }
+            }
+            None => WireFrame::Error {
+                v,
+                cid,
+                plugin,
+                class: ErrorClass::PermissionDenied,
+                message: "cancel_appointment: this plugin's manifest does \
+                          not declare capabilities.appointments = true"
+                    .into(),
+                details: Some(serde_json::json!({
+                    "subclass": "appointments_capability_not_declared"
+                })),
+            },
+        },
+
+        WireFrame::CreateWatch {
+            v,
+            cid,
+            plugin,
+            spec,
+            action,
+        } => match sink.watch_scheduler.as_ref() {
+            Some(scheduler) => {
+                match scheduler.create_watch(spec, action).await {
+                    Ok(watch_id) => WireFrame::CreateWatchResponse {
+                        v,
+                        cid,
+                        plugin,
+                        watch_id,
+                    },
+                    Err(e) => WireFrame::Error {
+                        v,
+                        cid,
+                        plugin,
+                        class: e.class(),
+                        message: format!("create_watch: {e}"),
+                        details: report_error_details(&e),
+                    },
+                }
+            }
+            None => WireFrame::Error {
+                v,
+                cid,
+                plugin,
+                class: ErrorClass::PermissionDenied,
+                message: "create_watch: this plugin's manifest does \
+                          not declare capabilities.watches = true"
+                    .into(),
+                details: Some(serde_json::json!({
+                    "subclass": "watches_capability_not_declared"
+                })),
+            },
+        },
+
+        WireFrame::CancelWatch {
+            v,
+            cid,
+            plugin,
+            watch_id,
+        } => match sink.watch_scheduler.as_ref() {
+            Some(scheduler) => match scheduler.cancel_watch(watch_id).await {
+                Ok(()) => WireFrame::CancelWatchResponse { v, cid, plugin },
+                Err(e) => WireFrame::Error {
+                    v,
+                    cid,
+                    plugin,
+                    class: e.class(),
+                    message: format!("cancel_watch: {e}"),
+                    details: report_error_details(&e),
+                },
+            },
+            None => WireFrame::Error {
+                v,
+                cid,
+                plugin,
+                class: ErrorClass::PermissionDenied,
+                message: "cancel_watch: this plugin's manifest does \
+                          not declare capabilities.watches = true"
+                    .into(),
+                details: Some(serde_json::json!({
+                    "subclass": "watches_capability_not_declared"
+                })),
+            },
+        },
 
         WireFrame::FastPathDispatch {
             v,
@@ -1734,6 +2025,23 @@ impl SubjectQuerier for NotFoundSubjectQuerier {
             Ok(evo_plugin_sdk::contract::SubjectQueryResult::NotFound)
         })
     }
+
+    fn resolve_addressing<'a>(
+        &'a self,
+        _addressing: evo_plugin_sdk::ExternalAddressing,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Option<String>,
+                        evo_plugin_sdk::contract::ReportError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 async fn forward_event(
@@ -1743,6 +2051,19 @@ async fn forward_event(
 ) {
     let (_v, cid, peer_plugin) = frame.envelope();
     let plugin = peer_plugin.to_string();
+    // Per `docs/engineering/LOGGING.md` §2: every plugin-emitted
+    // event gets a debug entry so an engineer can trace the
+    // narrative — which plugin emitted which event, in what
+    // order, with what cid. Heavy payload bodies are excluded
+    // (the per-handler debug surface in announcer / state
+    // reporter call sites covers payload content where it
+    // matters).
+    tracing::debug!(
+        op = variant_name(&frame),
+        cid,
+        plugin = %plugin,
+        "forward_event: incoming plugin event"
+    );
 
     let outcome: Result<(), evo_plugin_sdk::contract::ReportError> = match frame
     {
@@ -1755,6 +2076,9 @@ async fn forward_event(
         WireFrame::RetractSubject {
             addressing, reason, ..
         } => sink.subject_announcer.retract(addressing, reason).await,
+        WireFrame::UpdateSubjectState {
+            addressing, state, ..
+        } => sink.subject_announcer.update_state(addressing, state).await,
         WireFrame::AssertRelation { assertion, .. } => {
             sink.relation_announcer.assert(assertion).await
         }
@@ -1879,12 +2203,17 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::ReportState { .. } => "report_state",
         WireFrame::AnnounceSubject { .. } => "announce_subject",
         WireFrame::RetractSubject { .. } => "retract_subject",
+        WireFrame::UpdateSubjectState { .. } => "update_subject_state",
         WireFrame::AssertRelation { .. } => "assert_relation",
         WireFrame::RetractRelation { .. } => "retract_relation",
         WireFrame::ReportCustodyState { .. } => "report_custody_state",
         WireFrame::DescribeAlias { .. } => "describe_alias",
         WireFrame::DescribeAliasResponse { .. } => "describe_alias_response",
         WireFrame::DescribeSubject { .. } => "describe_subject",
+        WireFrame::ResolveAddressing { .. } => "resolve_addressing",
+        WireFrame::ResolveAddressingResponse { .. } => {
+            "resolve_addressing_response"
+        }
         WireFrame::DescribeSubjectResponse { .. } => {
             "describe_subject_response"
         }
@@ -1927,6 +2256,22 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::RequestUserInteraction { .. } => "request_user_interaction",
         WireFrame::RequestUserInteractionResponse { .. } => {
             "request_user_interaction_response"
+        }
+        WireFrame::CreateAppointment { .. } => "create_appointment",
+        WireFrame::CreateAppointmentResponse { .. } => {
+            "create_appointment_response"
+        }
+        WireFrame::CancelAppointment { .. } => "cancel_appointment",
+        WireFrame::CancelAppointmentResponse { .. } => {
+            "cancel_appointment_response"
+        }
+        WireFrame::CreateWatch { .. } => "create_watch",
+        WireFrame::CreateWatchResponse { .. } => "create_watch_response",
+        WireFrame::CancelWatch { .. } => "cancel_watch",
+        WireFrame::CancelWatchResponse { .. } => "cancel_watch_response",
+        WireFrame::EmitPluginEvent { .. } => "emit_plugin_event",
+        WireFrame::EmitPluginEventResponse { .. } => {
+            "emit_plugin_event_response"
         }
     }
 }
@@ -2123,6 +2468,9 @@ impl crate::admission::ErasedRespondent for WireRespondent {
                 subject_admin: ctx.subject_admin.clone(),
                 relation_admin: ctx.relation_admin.clone(),
                 fast_path_dispatcher: ctx.fast_path_dispatcher.clone(),
+                happening_emitter: Arc::clone(&ctx.happening_emitter),
+                appointment_scheduler: ctx.appointments.clone(),
+                watch_scheduler: ctx.watches.clone(),
                 prompt_ledger: self.prompt_ledger.clone(),
                 plugin_name: self.client.plugin_name().to_string(),
             });
@@ -2267,6 +2615,9 @@ impl crate::admission::ErasedRespondent for WireRespondent {
                 subject_admin: ctx.subject_admin.clone(),
                 relation_admin: ctx.relation_admin.clone(),
                 fast_path_dispatcher: ctx.fast_path_dispatcher.clone(),
+                happening_emitter: Arc::clone(&ctx.happening_emitter),
+                appointment_scheduler: ctx.appointments.clone(),
+                watch_scheduler: ctx.watches.clone(),
                 prompt_ledger: self.prompt_ledger.clone(),
                 plugin_name: self.client.plugin_name().to_string(),
             });
@@ -2472,6 +2823,9 @@ impl crate::admission::ErasedWarden for WireWarden {
                 subject_admin: ctx.subject_admin.clone(),
                 relation_admin: ctx.relation_admin.clone(),
                 fast_path_dispatcher: ctx.fast_path_dispatcher.clone(),
+                happening_emitter: Arc::clone(&ctx.happening_emitter),
+                appointment_scheduler: ctx.appointments.clone(),
+                watch_scheduler: ctx.watches.clone(),
                 prompt_ledger: self.prompt_ledger.clone(),
                 plugin_name: self.client.plugin_name().to_string(),
             });
@@ -2670,6 +3024,9 @@ impl crate::admission::ErasedWarden for WireWarden {
                 subject_admin: ctx.subject_admin.clone(),
                 relation_admin: ctx.relation_admin.clone(),
                 fast_path_dispatcher: ctx.fast_path_dispatcher.clone(),
+                happening_emitter: Arc::clone(&ctx.happening_emitter),
+                appointment_scheduler: ctx.appointments.clone(),
+                watch_scheduler: ctx.watches.clone(),
                 prompt_ledger: self.prompt_ledger.clone(),
                 plugin_name: self.client.plugin_name().to_string(),
             });
@@ -2800,6 +3157,79 @@ mod tests {
     use evo_plugin_sdk::host::{serve, serve_warden, HostConfig};
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
+
+    // -----------------------------------------------------------------
+    // is_wire_peer_disconnect classifier — log-level discipline.
+    // Pin every disconnect shape against the contract so a future
+    // refactor that misses one breaks loudly at test time rather than
+    // resurrecting the spurious-error log noise the user flagged as
+    // a showstopper.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn wire_peer_disconnect_recognises_peer_closed() {
+        assert!(is_wire_peer_disconnect(&WireError::PeerClosed));
+    }
+
+    #[test]
+    fn wire_peer_disconnect_recognises_broken_pipe() {
+        let err = WireError::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken pipe",
+        ));
+        assert!(is_wire_peer_disconnect(&err));
+    }
+
+    #[test]
+    fn wire_peer_disconnect_recognises_connection_reset() {
+        let err = WireError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ));
+        assert!(is_wire_peer_disconnect(&err));
+    }
+
+    #[test]
+    fn wire_peer_disconnect_recognises_connection_aborted() {
+        let err = WireError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "connection aborted",
+        ));
+        assert!(is_wire_peer_disconnect(&err));
+    }
+
+    #[test]
+    fn wire_peer_disconnect_recognises_unexpected_eof() {
+        let err = WireError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "unexpected eof",
+        ));
+        assert!(is_wire_peer_disconnect(&err));
+    }
+
+    #[test]
+    fn wire_peer_disconnect_rejects_permission_denied() {
+        let err = WireError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ));
+        assert!(!is_wire_peer_disconnect(&err));
+    }
+
+    #[test]
+    fn wire_peer_disconnect_rejects_codec_failure() {
+        let err = WireError::CborDecode("malformed cbor".into());
+        assert!(!is_wire_peer_disconnect(&err));
+    }
+
+    #[test]
+    fn wire_peer_disconnect_rejects_frame_too_large() {
+        let err = WireError::FrameTooLarge {
+            size: 999_999,
+            limit: 1_000,
+        };
+        assert!(!is_wire_peer_disconnect(&err));
+    }
 
     // -----------------------------------------------------------------
     // Test plugin that can be driven through the SDK's serve()
@@ -3375,6 +3805,9 @@ target_type = "album"
             // the dispatcher is None so a plugin under test that
             // attempts Fast Path dispatch fails fast on unwrap.
             fast_path_dispatcher: None,
+            happening_emitter: Arc::new(
+                crate::context::LoggingHappeningEmitter::new("test"),
+            ),
             appointments: None,
             watches: None,
         }
@@ -3832,6 +4265,11 @@ target_type = "album"
             subject_admin: None,
             relation_admin: None,
             fast_path_dispatcher: None,
+            happening_emitter: Arc::new(
+                crate::context::LoggingHappeningEmitter::new("test"),
+            ),
+            appointment_scheduler: None,
+            watch_scheduler: None,
             prompt_ledger: None,
             plugin_name: "test".into(),
         });
@@ -4031,6 +4469,9 @@ name = "album"
             subject_admin: None,
             relation_admin: None,
             fast_path_dispatcher: None,
+            happening_emitter: Arc::new(
+                crate::context::LoggingHappeningEmitter::new("test"),
+            ),
             appointments: None,
             watches: None,
         }
@@ -4397,6 +4838,15 @@ name = "track"
         {
             unreachable!("forward_event Err-path test only exercises announce")
         }
+
+        fn update_state<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _state: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            unreachable!("forward_event Err-path test only exercises announce")
+        }
     }
 
     /// SubjectAnnouncer whose `announce` always succeeds.
@@ -4415,6 +4865,15 @@ name = "track"
             &'a self,
             _addressing: ExternalAddressing,
             _reason: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            unreachable!("forward_event Ok-path test only exercises announce")
+        }
+
+        fn update_state<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _state: serde_json::Value,
         ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
         {
             unreachable!("forward_event Ok-path test only exercises announce")
@@ -4465,6 +4924,11 @@ name = "track"
             subject_admin: None,
             relation_admin: None,
             fast_path_dispatcher: None,
+            happening_emitter: Arc::new(
+                crate::context::LoggingHappeningEmitter::new("test"),
+            ),
+            appointment_scheduler: None,
+            watch_scheduler: None,
             prompt_ledger: None,
             plugin_name: "test".into(),
         }
@@ -4667,6 +5131,11 @@ name = "track"
             subject_admin: None,
             relation_admin: None,
             fast_path_dispatcher: None,
+            happening_emitter: Arc::new(
+                crate::context::LoggingHappeningEmitter::new("test"),
+            ),
+            appointment_scheduler: None,
+            watch_scheduler: None,
             prompt_ledger: None,
             plugin_name: "test".into(),
         }
@@ -4854,6 +5323,11 @@ name = "track"
             subject_admin: admin,
             relation_admin: None,
             fast_path_dispatcher: None,
+            happening_emitter: Arc::new(
+                crate::context::LoggingHappeningEmitter::new("test"),
+            ),
+            appointment_scheduler: None,
+            watch_scheduler: None,
             prompt_ledger: None,
             plugin_name: "test".into(),
         }
@@ -5463,6 +5937,19 @@ name = "track"
                 .expect("scripted querier called more than once");
             Box::pin(async move { Err(err) })
         }
+
+        fn resolve_addressing<'a>(
+            &'a self,
+            _addressing: evo_plugin_sdk::ExternalAddressing,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Option<String>, ReportError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            unreachable!("resolve_addressing not exercised by these tests")
+        }
     }
 
     fn sink_with_subject_querier(
@@ -5481,6 +5968,11 @@ name = "track"
             subject_admin: None,
             relation_admin: None,
             fast_path_dispatcher: None,
+            happening_emitter: Arc::new(
+                crate::context::LoggingHappeningEmitter::new("test"),
+            ),
+            appointment_scheduler: None,
+            watch_scheduler: None,
             prompt_ledger: None,
             plugin_name: "test".into(),
         }
@@ -5676,6 +6168,15 @@ name = "track"
             &'a self,
             _addressing: ExternalAddressing,
             _reason: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+        {
+            unreachable!("per-variant subclass tests only exercise announce")
+        }
+
+        fn update_state<'a>(
+            &'a self,
+            _addressing: ExternalAddressing,
+            _state: serde_json::Value,
         ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
         {
             unreachable!("per-variant subclass tests only exercise announce")

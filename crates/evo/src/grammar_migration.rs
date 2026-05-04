@@ -24,7 +24,8 @@ use std::time::SystemTime;
 use crate::admin::{AdminLedger, AdminLogEntry, AdminLogKind};
 use crate::happenings::{Happening, HappeningBus};
 use crate::persistence::{
-    PersistedSubject, PersistenceError, PersistenceStore, TypeMigrationRecord,
+    PersistedSubject, PersistenceError, PersistenceStore,
+    TypeMigrationRecordOwned,
 };
 
 /// Default per-batch commit boundary. Configurable via the
@@ -32,6 +33,148 @@ use crate::persistence::{
 /// default works on SD-card storage per the ADR's Pi-Zero W
 /// reasoning.
 pub const DEFAULT_BATCH_SIZE: usize = 100;
+
+/// Walk the persistence layer for subjects whose declared
+/// `subject_type` is no longer in the catalogue and surface them
+/// as orphans.
+///
+/// For every orphan type (a `subject_type` present in the
+/// `subjects` table but absent from `declared_types`):
+/// - upsert a row into `pending_grammar_orphans` (preserves any
+///   operator decision that already mutated the row's status)
+/// - emit one `Happening::SubjectGrammarOrphan` so consumers
+///   subscribing late see the discovery via replay
+///
+/// Types that previously had a pending row but no longer appear
+/// orphaned (the catalogue re-declared them) transition to
+/// `Recovered`.
+///
+/// Called from two places:
+/// - `lib.rs` boot path, once at startup (catalogue declared at
+///   boot is the authoritative declaration set).
+/// - `admission.rs::reload_catalogue` after the atomic swap, so
+///   pushing a new catalogue at runtime that no longer declares
+///   a subject type makes the orphan visible immediately.
+///
+/// Persistence-accessor failures (count_subjects_by_type,
+/// upsert, list, mark_recovered) are logged at warn and the scan
+/// continues — the boot/reload path proceeds even if the orphan
+/// surface is temporarily unavailable.
+pub async fn scan_grammar_orphans(
+    persistence: &Arc<dyn PersistenceStore>,
+    bus: &Arc<HappeningBus>,
+    declared_types: &HashSet<String>,
+) {
+    let now_ms = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+
+    let persisted = match persistence.count_subjects_by_type().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "catalogue-orphan scan: persistence accessor failed; orphan \
+                 detection skipped"
+            );
+            return;
+        }
+    };
+
+    let prior = persistence
+        .list_pending_grammar_orphans()
+        .await
+        .unwrap_or_default();
+
+    let mut orphan_types = 0usize;
+    let mut orphan_rows: u64 = 0;
+    let mut seen_types = HashSet::<String>::new();
+
+    for (subject_type, count) in &persisted {
+        if declared_types.contains(subject_type) {
+            continue;
+        }
+        seen_types.insert(subject_type.clone());
+        if let Err(e) = persistence
+            .upsert_pending_grammar_orphan(subject_type, *count, now_ms)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                subject_type = %subject_type,
+                "catalogue-orphan scan: upsert failed; continuing"
+            );
+        }
+        let first_observed = persistence
+            .list_pending_grammar_orphans()
+            .await
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter()
+                    .find(|r| r.subject_type == *subject_type)
+                    .map(|r| r.first_observed_at_ms)
+            })
+            .unwrap_or(now_ms);
+        let _ = bus
+            .emit_durable(Happening::SubjectGrammarOrphan {
+                subject_type: subject_type.clone(),
+                count: *count,
+                first_observed_at_ms: first_observed,
+                at: SystemTime::now(),
+            })
+            .await;
+        tracing::warn!(
+            subject_type = %subject_type,
+            count = *count,
+            "catalogue orphan: persisted subjects of this type remain in \
+             storage but the loaded catalogue no longer declares the type; \
+             operator may issue `migrate_grammar_orphans` or \
+             `accept_grammar_orphans`"
+        );
+        orphan_types += 1;
+        orphan_rows += *count;
+    }
+
+    // Recovery: prior orphan rows whose type re-appeared in the
+    // catalogue transition to `Recovered`.
+    for row in prior.iter() {
+        if !seen_types.contains(&row.subject_type)
+            && declared_types.contains(&row.subject_type)
+            && !matches!(
+                row.status,
+                crate::persistence::GrammarOrphanStatus::Recovered
+            )
+        {
+            if let Err(e) = persistence
+                .mark_grammar_orphan_recovered(&row.subject_type, now_ms)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    subject_type = %row.subject_type,
+                    "catalogue-orphan scan: recovery transition failed; \
+                     continuing"
+                );
+            }
+        }
+    }
+
+    if orphan_types == 0 {
+        tracing::info!(
+            declared_types = declared_types.len(),
+            persisted_types = persisted.len(),
+            "catalogue-orphan scan: no orphans"
+        );
+    } else {
+        tracing::warn!(
+            orphan_types,
+            orphan_rows,
+            "catalogue-orphan scan: {orphan_types} orphaned subject_type(s) \
+             covering {orphan_rows} row(s); operator action recommended"
+        );
+    }
+}
 
 /// Operator-issued migration strategy. `Rename` is fully
 /// implemented; `Map` and `Filter` are wire-stable but their
@@ -210,6 +353,15 @@ pub async fn migrate_grammar_orphans(
     declared_types: &HashSet<String>,
     request: MigrateRequest,
 ) -> Result<MigrateOutcome, MigrateError> {
+    // Per LOGGING.md §2: orphan migration is an operator-issued
+    // verb invocation; debug-level entry so an operator running
+    // with debug enabled sees the migration's lifecycle.
+    tracing::debug!(
+        from_type = %request.from_type,
+        strategy = ?request.strategy,
+        dry_run = request.dry_run,
+        "grammar orphan migration: invoking"
+    );
     let started = std::time::Instant::now();
     let migration_id = format!("mig_{}", uuid::Uuid::new_v4().simple());
 
@@ -329,22 +481,35 @@ pub async fn migrate_grammar_orphans(
     let now_ms_at_start = system_time_ms();
 
     for batch in candidates.chunks(batch_size) {
+        // Pre-mint a new id per subject and build the owned
+        // record list. The store applies the whole list in one
+        // transaction (one fsync on WAL-mode SQLite) — without
+        // this, a 50k migration would issue 50,000 fsyncs and run
+        // ~100x slower on USB-attached SSD storage.
+        let mut records: Vec<TypeMigrationRecordOwned> =
+            Vec::with_capacity(batch.len());
+        let mut new_ids: Vec<String> = Vec::with_capacity(batch.len());
         for subject in batch {
             let new_id = uuid::Uuid::new_v4().to_string();
-            let record = TypeMigrationRecord {
-                source: subject.id.as_str(),
-                new_id: new_id.as_str(),
-                from_type: request.from_type.as_str(),
-                to_type: to_type.as_str(),
-                migration_id: migration_id.as_str(),
-                reason: request.reason.as_deref(),
+            records.push(TypeMigrationRecordOwned {
+                source: subject.id.clone(),
+                new_id: new_id.clone(),
+                from_type: request.from_type.clone(),
+                to_type: to_type.clone(),
+                migration_id: migration_id.clone(),
+                reason: request.reason.clone(),
                 at_ms: now_ms_at_start,
-            };
-            persistence.record_subject_type_migration(record).await?;
-            // Emit the per-subject SubjectMigrated event in
-            // the same emission ordering as merge / split:
-            // the data-plane mutation is committed; consumers
-            // observing the event see the post-state.
+            });
+            new_ids.push(new_id);
+        }
+        persistence
+            .record_subject_type_migrations_batch(records)
+            .await?;
+        // Emit the per-subject SubjectMigrated events after the
+        // batch has committed so consumers observing the event
+        // see the post-state. Same emission ordering as merge /
+        // split.
+        for (subject, new_id) in batch.iter().zip(new_ids) {
             let _ = bus
                 .emit_durable(Happening::SubjectMigrated {
                     old_id: subject.id.clone(),

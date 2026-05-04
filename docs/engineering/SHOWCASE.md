@@ -151,10 +151,10 @@ reference device signs its own binaries, vendors sign their own
 binaries. Each release plane stands on its own trust root; no
 plane authorises another plane's artefacts.
 
-The stop-gap on `evo-device-audio` retires when v0.1.10's
-artefacts repo carries its first published manifest. The
-reference device thereafter consumes evo-core binaries from
-`foonerd/evo-core-artefacts` like any other distribution.
+The stop-gap on `evo-device-audio` retired with v0.1.10's first
+published artefact manifest. The reference device thereafter
+consumes evo-core binaries from `foonerd/evo-core-artefacts` like
+any other distribution.
 
 ## 6. What this document does NOT define
 

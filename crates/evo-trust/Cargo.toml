@@ -19,6 +19,7 @@ thiserror = "1"
 regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 subtle = { version = "2", default-features = false }
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

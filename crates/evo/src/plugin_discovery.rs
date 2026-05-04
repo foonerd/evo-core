@@ -57,8 +57,20 @@ pub async fn discover_and_admit(
 
     let mut by_name: HashMap<String, (PathBuf, Manifest)> = HashMap::new();
     for root in &config.plugins.search_roots {
-        for dir in discover_plugin_bundles(root)? {
+        let bundles = discover_plugin_bundles(root)?;
+        tracing::debug!(
+            root = %root.display(),
+            bundle_count = bundles.len(),
+            staged = is_staged_root(root),
+            "discovery: walked search root"
+        );
+        for dir in bundles {
             let mpath = dir.join("manifest.toml");
+            tracing::debug!(
+                bundle = %dir.display(),
+                manifest = %mpath.display(),
+                "discovery: parsing bundle manifest"
+            );
             let text = std::fs::read_to_string(&mpath).map_err(|e| {
                 StewardError::io(format!("reading {}", mpath.display()), e)
             })?;
@@ -68,9 +80,32 @@ pub async fn discover_and_admit(
                     mpath.display()
                 ))
             })?;
+            tracing::debug!(
+                plugin = %manifest.plugin.name,
+                version = %manifest.plugin.version,
+                shelf = %manifest.target.shelf,
+                instance = ?manifest.kind.instance,
+                interaction = ?manifest.kind.interaction,
+                transport = ?manifest.transport.kind,
+                trust_class = ?manifest.trust.class,
+                "discovery: manifest parsed"
+            );
+            if let Some((existing_dir, _)) = by_name.get(&manifest.plugin.name)
+            {
+                tracing::debug!(
+                    plugin = %manifest.plugin.name,
+                    superseded = %existing_dir.display(),
+                    superseding = %dir.display(),
+                    "discovery: duplicate plugin name; later root wins"
+                );
+            }
             by_name.insert(manifest.plugin.name.clone(), (dir, manifest));
         }
     }
+    tracing::debug!(
+        total_unique_plugins = by_name.len(),
+        "discovery: bundle-walk complete"
+    );
 
     // Load the operator-disabled set from persistence. Plugins
     // absent from the table are treated as enabled by default;
@@ -100,9 +135,20 @@ pub async fn discover_and_admit(
     let mut names: Vec<String> = by_name.keys().cloned().collect();
     names.sort();
 
+    tracing::debug!(
+        plugin_count = names.len(),
+        disabled_count = disabled.len(),
+        "discovery: starting per-plugin admission walk"
+    );
     for name in names {
         let (dir, manifest) =
             by_name.get(&name).expect("name came from by_name keys");
+        tracing::debug!(
+            plugin = %name,
+            path = %dir.display(),
+            transport = ?manifest.transport.kind,
+            "discovery: evaluating plugin for admission"
+        );
 
         // Operator-disabled plugins are skipped at discovery
         // time and the structured happening is emitted so
@@ -139,12 +185,38 @@ pub async fn discover_and_admit(
         }
 
         ensure_plugin_state_and_credentials(engine.plugin_data_root(), &name)?;
-        engine
+        // Per-plugin admission failure is non-fatal at startup. The
+        // steward must stay up so the operator can restore catalogue
+        // state, remove the misbehaving plugin, or otherwise recover
+        // — particularly under the catalogue-resilience degraded-boot
+        // path (corrupted catalogue + LKG → built-in skeleton, which
+        // necessarily declares fewer shelves than the live plugin
+        // set). Skip + structured happening + continue, mirroring
+        // the operator-disabled and transport-mismatch skip paths
+        // above.
+        if let Err(e) = engine
             .admit_out_of_process_from_directory(
                 dir.as_path(),
                 &config.plugins.runtime_dir,
             )
-            .await?;
+            .await
+        {
+            tracing::warn!(
+                plugin = %name,
+                path = %dir.display(),
+                error = %e,
+                "skipping plugin: admission failed"
+            );
+            let _ = engine
+                .happening_bus()
+                .emit_durable(Happening::PluginAdmissionSkipped {
+                    plugin: name.clone(),
+                    reason: format!("admission_failed: {e}"),
+                    at: std::time::SystemTime::now(),
+                })
+                .await;
+            continue;
+        }
     }
 
     log_admission_outcome(engine, &catalogue);

@@ -1,0 +1,60 @@
+# Synthetic appointment-past-due plugin — out-of-process bundle
+# manifest.
+#
+# Exercises the boot-rehydration + Catchup-miss-policy path. On
+# the very first load() the plugin registers a OneShot appointment
+# for `now + 5s` and drops a marker file in {state_dir}. On
+# subsequent loads (marker present) the plugin does NOT re-issue
+# the appointment — the framework's appointment persistence layer
+# already holds the row. The acceptance scenario stops the steward
+# during the 5-second window, waits past the fire time, and
+# restarts; the framework rehydrates the now-past-due appointment
+# and the Catchup miss-policy fires it once on the first runtime
+# tick after boot. The plugin's `handle_request` records the
+# (single) fire to `{state_dir}/appointment-past-due-fires.log`.
+#
+# Used by T2.appointment-miss-policy-fire-once. Has no value
+# outside that scenario.
+
+[plugin]
+name = "org.evoframework.acceptance.appointment-past-due-plugin"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.appointment-past-due"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities]
+appointments = true
+
+[capabilities.respondent]
+request_types = ["appointment_fired"]
+response_budget_ms = 1000

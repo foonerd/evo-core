@@ -118,6 +118,13 @@ struct RegistryInner {
     /// split, mapped to the alias record naming the new ID(s).
     /// Append-only; entries are never removed.
     aliases: HashMap<String, AliasRecord>,
+    /// Per-subject runtime state contributed by plugins.
+    /// Keyed by canonical ID; value is the most recent JSON state
+    /// payload from `announce` (when carried) or `update_state`.
+    /// In-memory only as of v0.1.12.1 — durable persistence rides
+    /// v0.1.13. The watch runtime's `SubjectState` evaluator
+    /// queries this map via the projection engine.
+    states: HashMap<String, serde_json::Value>,
 }
 
 /// Append-only-violation tag.
@@ -426,6 +433,7 @@ impl SubjectRegistry {
                 addressings: HashMap::new(),
                 claims: Vec::new(),
                 aliases: HashMap::new(),
+                states: HashMap::new(),
             }),
         }
     }
@@ -507,6 +515,12 @@ impl SubjectRegistry {
         for ps in persisted_subjects {
             if ps.forgotten_at_ms.is_some() {
                 report.forgotten_subjects_seen += 1;
+                tracing::trace!(
+                    subject_id = %ps.id,
+                    subject_type = %ps.subject_type,
+                    forgotten_at_ms = ps.forgotten_at_ms.unwrap_or(0),
+                    "rehydrate: skipping forgotten subject row"
+                );
                 continue;
             }
             let mut addressings: Vec<AddressingRecord> = Vec::new();
@@ -523,6 +537,12 @@ impl SubjectRegistry {
                 inner.addressings.insert(addr, ps.id.clone());
                 report.live_addressings_loaded += 1;
             }
+            tracing::debug!(
+                subject_id = %ps.id,
+                subject_type = %ps.subject_type,
+                addressing_count = addressings.len(),
+                "rehydrate: loaded live subject"
+            );
             inner.subjects.insert(
                 ps.id.clone(),
                 SubjectRecord {
@@ -660,6 +680,35 @@ impl SubjectRegistry {
             .iter()
             .map(|(a, id)| (a.clone(), id.clone()))
             .collect()
+    }
+
+    /// Snapshot every addressing currently claimed by a specific
+    /// plugin, with the canonical id the addressing resolves to.
+    /// Order is unspecified; callers that need stability sort by
+    /// `(canonical_id, scheme, value)`.
+    ///
+    /// Used by the admission engine's drain stage to retract a
+    /// departing plugin's claims on the plugin's behalf — the
+    /// plugin's own `unload()`-driven retract path is unreliable
+    /// when the plugin process is already dead (systemd cgroup
+    /// SIGTERM, crash, kill, network drop on remote plugin), so
+    /// the steward sweeps the registry directly using this
+    /// snapshot. Lock held only long enough to clone the matching
+    /// addressing records; subsequent retract calls re-acquire.
+    pub fn addressings_claimed_by(
+        &self,
+        plugin: &str,
+    ) -> Vec<(ExternalAddressing, String)> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        let mut out = Vec::new();
+        for (canonical_id, record) in &guard.subjects {
+            for addr in &record.addressings {
+                if addr.claimant == plugin {
+                    out.push((addr.addressing.clone(), canonical_id.clone()));
+                }
+            }
+        }
+        out
     }
 
     /// Resolve an addressing to a canonical subject ID if known.
@@ -837,7 +886,61 @@ impl SubjectRegistry {
             }
         };
 
+        // Capture plugin-contributed runtime state when the
+        // announcement carries any. State is stored against the
+        // canonical id the announcement resolved to (Created or
+        // Updated outcomes); Conflict and NoChange outcomes
+        // intentionally skip state writes since the canonical id
+        // is ambiguous (Conflict) or no fact changed (NoChange).
+        if !announcement.state.is_null() {
+            let target_id = match &outcome {
+                AnnounceOutcome::Created(id) => Some(id.clone()),
+                AnnounceOutcome::Updated(id) => Some(id.clone()),
+                AnnounceOutcome::NoChange(_)
+                | AnnounceOutcome::Conflict { .. } => None,
+            };
+            if let Some(id) = target_id {
+                inner.states.insert(id, announcement.state.clone());
+            }
+        }
+
         Ok(outcome)
+    }
+
+    /// Update the in-memory runtime state of a subject without
+    /// re-announcing it. Used by the `update_subject_state` SDK
+    /// surface (and its wire op) for high-frequency state updates
+    /// where the addressing identity has not changed. No-op if
+    /// the canonical id is unknown.
+    ///
+    /// State is in-memory only as of v0.1.12.1; durable persistence
+    /// rides v0.1.13.
+    pub fn update_state(
+        &self,
+        canonical_id: &str,
+        state: serde_json::Value,
+    ) -> Result<(), StewardError> {
+        let mut inner = self.inner.lock().expect("registry mutex poisoned");
+        if !inner.subjects.contains_key(canonical_id) {
+            return Err(StewardError::Dispatch(format!(
+                "update_state: unknown canonical id {canonical_id}"
+            )));
+        }
+        if state.is_null() {
+            inner.states.remove(canonical_id);
+        } else {
+            inner.states.insert(canonical_id.to_string(), state);
+        }
+        Ok(())
+    }
+
+    /// Read the runtime state of a subject. Returns `None` for
+    /// subjects that have never had state contributed (state field
+    /// in announcement was null and `update_state` was never
+    /// called) and for unknown canonical ids.
+    pub fn state_of(&self, canonical_id: &str) -> Option<serde_json::Value> {
+        let inner = self.inner.lock().expect("registry mutex poisoned");
+        inner.states.get(canonical_id).cloned()
     }
 
     /// Retract an addressing a plugin previously asserted.
@@ -930,6 +1033,15 @@ impl SubjectRegistry {
                 .map(|r| r.subject_type.clone())
                 .expect("subject record must exist when should_forget is true");
             inner.subjects.remove(&id);
+            // Drop the per-subject runtime state alongside the
+            // record. The states map is in-memory only (state
+            // durability rides v0.1.13); leaving an entry behind
+            // would leak memory across the lifetime of the
+            // steward. Forget-then-re-announce mints a fresh
+            // canonical id, so a stale state entry under the
+            // retired id can never be observed by the new
+            // subject.
+            inner.states.remove(&id);
 
             // Append a tombstone alias entry so chain walkers see
             // "this canonical ID was forgotten, no successor"
@@ -1057,6 +1169,15 @@ impl SubjectRegistry {
                 .map(|r| r.subject_type.clone())
                 .expect("subject record must exist when should_forget is true");
             inner.subjects.remove(&id);
+            // Drop the per-subject runtime state alongside the
+            // record. The states map is in-memory only (state
+            // durability rides v0.1.13); leaving an entry behind
+            // would leak memory across the lifetime of the
+            // steward. Forget-then-re-announce mints a fresh
+            // canonical id, so a stale state entry under the
+            // retired id can never be observed by the new
+            // subject.
+            inner.states.remove(&id);
 
             // Tombstone discipline mirrors the regular retract path:
             // record an alias entry so describe_alias on a forgotten
@@ -1214,6 +1335,15 @@ impl SubjectRegistry {
 
         inner.subjects.remove(source_a_id);
         inner.subjects.remove(source_b_id);
+        // Drop runtime state from the retired source ids. The
+        // merge mints a fresh canonical id so prior state under
+        // either source is no longer reachable; leaving the
+        // entries behind would leak memory across the lifetime
+        // of the steward. The new merged record starts with no
+        // state; if the merging plugin needs to seed state on
+        // the new id, it issues a follow-up `update_state`.
+        inner.states.remove(source_a_id);
+        inner.states.remove(source_b_id);
         inner.subjects.insert(new_id.clone(), new_record);
 
         for ar in &merged_addressings {
@@ -1452,6 +1582,13 @@ impl SubjectRegistry {
         }
 
         inner.subjects.remove(source_id);
+        // Drop runtime state from the retired source id. The
+        // split mints fresh canonical ids per partition; prior
+        // state under the source is no longer reachable. The
+        // new partition records start with no state; the
+        // splitting plugin issues `update_state` against the
+        // new ids if it wants to seed them.
+        inner.states.remove(source_id);
 
         // One alias record for the source ID, carrying every new
         // canonical ID in partition order.
@@ -1902,6 +2039,63 @@ mod tests {
 
         let resolved = r.resolve(&addr("s", "v")).unwrap();
         assert_eq!(resolved, id);
+    }
+
+    #[test]
+    fn addressings_claimed_by_returns_only_matching_plugin() {
+        let r = SubjectRegistry::new();
+        // Plugin A claims two addressings on one subject.
+        r.announce(
+            &SubjectAnnouncement::new(
+                "track",
+                vec![addr("s", "a1"), addr("s", "a2")],
+            ),
+            "plugin.a",
+        )
+        .unwrap();
+        // Plugin B claims one addressing on a separate subject.
+        r.announce(
+            &SubjectAnnouncement::new("track", vec![addr("s", "b1")]),
+            "plugin.b",
+        )
+        .unwrap();
+
+        let a_claims = r.addressings_claimed_by("plugin.a");
+        let b_claims = r.addressings_claimed_by("plugin.b");
+        let unknown = r.addressings_claimed_by("plugin.never-existed");
+
+        let mut a_values: Vec<_> = a_claims
+            .iter()
+            .map(|(addr, _)| addr.value.clone())
+            .collect();
+        a_values.sort();
+        assert_eq!(a_values, vec!["a1".to_string(), "a2".to_string()]);
+        assert_eq!(b_claims.len(), 1);
+        assert_eq!(b_claims[0].0.value, "b1");
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn addressings_claimed_by_carries_canonical_id_for_drain_callers() {
+        // The admission engine's drain stage retracts via
+        // RegistrySubjectAnnouncer; for diagnostic logging it
+        // records the canonical id alongside each addressing.
+        // This test pins the (addressing, canonical_id)
+        // contract so a future return-shape change breaks
+        // loudly.
+        let r = SubjectRegistry::new();
+        let AnnounceOutcome::Created(id) = r
+            .announce(
+                &SubjectAnnouncement::new("track", vec![addr("s", "v1")]),
+                "plugin.a",
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        let claims = r.addressings_claimed_by("plugin.a");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].1, id);
     }
 
     #[test]
@@ -2757,6 +2951,7 @@ mod tests {
             addressings: HashMap::new(),
             claims: Vec::new(),
             aliases: HashMap::new(),
+            states: HashMap::new(),
         };
         let key = "collision-key".to_string();
         let record = AliasRecord {

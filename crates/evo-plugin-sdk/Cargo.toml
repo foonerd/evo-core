@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["contract", "wire"]
+default = ["contract", "wire", "privileges"]
 # The manifest module is always compiled; it has no optional dependencies
 # and is the SDK's foundation. Listed here for documentation.
 manifest = []
@@ -16,11 +16,9 @@ manifest = []
 # structured logging per docs/engineering/LOGGING.md.
 contract = ["dep:tracing"]
 # Wire protocol message types, JSON + CBOR codecs, and length-
-# prefixed framing over async I/O streams, per
-# docs/engineering/PLUGIN_CONTRACT.md sections 6, 9, and 10. Binary
-# payloads serialise as base64 strings in JSON and as native byte
-# strings in CBOR via the codec module's `is_human_readable`-aware
-# serde helper.
+# prefixed framing over async I/O streams. Binary payloads serialise as
+# base64 strings in JSON and as native byte strings in CBOR via the
+# codec module's `is_human_readable`-aware serde helper.
 wire = [
     "contract",
     "dep:serde_json",
@@ -28,6 +26,15 @@ wire = [
     "dep:base64",
     "dep:ciborium",
 ]
+# Plugin privileges contract types, YAML parser, and validator. The
+# JSON Schema at schemas/privileges.v1.json is the SINGLE source of
+# truth for structural rules: the Rust validator delegates structural
+# validation to the `jsonschema` crate against the embedded schema
+# bytes. Custom Rust code carries only the cross-field rules + best-
+# practice advisories that JSON Schema cannot express. Pulls
+# serde_json (already optional under `wire`) into the privileges
+# build path too.
+privileges = ["dep:serde_yaml", "dep:jsonschema", "dep:serde_json"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -48,6 +55,17 @@ base64 = { version = "0.22", optional = true }
 # bridge). Optional behind the `wire` feature so the manifest /
 # contract crates that don't speak the wire don't pull it in.
 ciborium = { version = "0.2", optional = true }
+# YAML parser for privileges.yaml records. serde_yaml is in
+# maintenance mode but remains the most-used Rust YAML implementation;
+# switching to a fork (serde_yml, serde_yaml_bw) is a one-line Cargo
+# change if a bug surfaces.
+serde_yaml = { version = "0.9", optional = true }
+# JSON Schema validator — the single source of truth for structural
+# rules in the privileges contract. The validator parses the embedded
+# privileges.v1.json schema bytes (via include_bytes!) and validates
+# the YAML payload against it. Custom Rust code carries only cross-
+# field rules + advisories that JSON Schema cannot express.
+jsonschema = { version = "0.18", optional = true, default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "io-util", "net"] }

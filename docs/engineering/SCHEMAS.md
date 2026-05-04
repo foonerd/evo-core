@@ -581,7 +581,7 @@ Every frame, in either direction:
 [4-byte big-endian length] [length bytes of UTF-8 JSON]
 ```
 
-Maximum frame size is 1 MiB. Zero-length frames are rejected. One JSON object per frame; no delimiters inside the payload.
+Maximum frame size is 64 MiB (matches the absolute hard ceiling on `prepare_for_live_reload` state blobs). Zero-length frames are rejected. One JSON object per frame; no delimiters inside the payload.
 
 #### 4.1.2 Request Shapes
 

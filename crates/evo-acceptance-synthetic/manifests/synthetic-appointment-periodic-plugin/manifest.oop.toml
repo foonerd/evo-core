@@ -1,0 +1,51 @@
+# Synthetic Periodic-appointment plugin — out-of-process bundle manifest.
+#
+# Sibling to synthetic-appointment-plugin (OneShot recurrence);
+# this plugin exercises AppointmentRecurrence::Periodic
+# { interval_ms = 2000 } with max_fires = 3. Each fire arrives at
+# the plugin's handle_request and writes one line to
+# {state_dir}/appointment-periodic-fires.log. Used by
+# T2.appointment-recurring; has no value outside that scenario.
+
+[plugin]
+name = "org.evoframework.acceptance.appointment-periodic-plugin"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.appointment-periodic"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities]
+appointments = true
+
+[capabilities.respondent]
+request_types = ["appointment_periodic_fired"]
+response_budget_ms = 1000

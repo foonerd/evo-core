@@ -431,6 +431,16 @@ pub enum RecurrenceError {
         /// The supplied expression.
         expr: String,
     },
+    /// `AppointmentRecurrence::Periodic { interval_ms }` was
+    /// configured with `interval_ms == 0`. Periodic appointments
+    /// must have a strictly positive period; zero would either
+    /// fire continuously or never and is an authoring mistake.
+    InvalidPeriodicInterval {
+        /// The offending interval (always 0 today; the field
+        /// shape is forward-compatible if a non-zero ceiling
+        /// is added later).
+        interval_ms: u64,
+    },
 }
 
 impl std::fmt::Display for RecurrenceError {
@@ -463,6 +473,13 @@ impl std::fmt::Display for RecurrenceError {
                     f,
                     "cron expression {expr:?} not supported by the v0.1.12 \
                      scheduler; use a structured recurrence variant"
+                )
+            }
+            Self::InvalidPeriodicInterval { interval_ms } => {
+                write!(
+                    f,
+                    "periodic recurrence interval_ms={interval_ms} is invalid; \
+                     must be > 0"
                 )
             }
         }
@@ -515,6 +532,25 @@ pub fn next_fire_after(
             return Err(RecurrenceError::CronNotSupported {
                 expr: expr.clone(),
             });
+        }
+        AppointmentRecurrence::Periodic { interval_ms } => {
+            if *interval_ms == 0 {
+                return Err(RecurrenceError::InvalidPeriodicInterval {
+                    interval_ms: 0,
+                });
+            }
+            // Periodic fires sit on a flat millisecond timeline:
+            // the next fire is exactly `interval_ms` after the
+            // current evaluation point. The caller is the
+            // post-fire reschedule path (`now_utc_ms` is the
+            // last-fire timestamp + 1 ms in `advance_after_fire`)
+            // for fires_completed > 0, and the create-time
+            // computation for fires_completed == 0; in both cases
+            // adding the period to `now_utc_ms` produces the
+            // intended next-fire instant. Saturating add guards
+            // against overflow at the u64 ceiling rather than
+            // wrapping silently.
+            Some(now_utc_ms.saturating_add(*interval_ms))
         }
         AppointmentRecurrence::Daily
         | AppointmentRecurrence::Weekdays
@@ -704,7 +740,8 @@ fn day_matches_recurrence(
 ) -> bool {
     match recurrence {
         AppointmentRecurrence::OneShot { .. }
-        | AppointmentRecurrence::Cron { .. } => true, // handled upstream
+        | AppointmentRecurrence::Cron { .. }
+        | AppointmentRecurrence::Periodic { .. } => true, // handled upstream
         AppointmentRecurrence::Daily => true,
         AppointmentRecurrence::Weekdays => {
             !matches!(date.weekday(), Weekday::Sat | Weekday::Sun)
@@ -770,6 +807,47 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+use crate::persistence::{
+    PersistedAppointment, PersistedAppointmentState, PersistenceError,
+    PersistenceStore,
+};
+
+/// Build a [`PersistedAppointment`] row for the supplied schedule
+/// inputs. Centralises the JSON serialisation of `spec` and
+/// `action` and the `created_at_ms` / `updated_at_ms` stamps so
+/// the runtime's `schedule` and `rehydrate_from` paths agree on
+/// the persisted shape.
+fn persisted_appointment_row(
+    creator: &str,
+    spec: &AppointmentSpec,
+    action: &AppointmentAction,
+    next_fire_at_ms: Option<u64>,
+    now_ms: u64,
+) -> PersistedAppointment {
+    let spec_json = serde_json::to_string(spec).unwrap_or_else(|_| {
+        // Serialisation of a struct whose every leaf is also
+        // Serialize cannot fail under serde_json's contract; the
+        // fallback exists so the function is total and the
+        // structural invariant is loud-failure on disk rather
+        // than a panic that takes the steward down.
+        "{}".to_string()
+    });
+    let action_json =
+        serde_json::to_string(action).unwrap_or_else(|_| "{}".to_string());
+    PersistedAppointment {
+        creator: creator.to_string(),
+        appointment_id: spec.appointment_id.clone(),
+        spec_json,
+        action_json,
+        state: PersistedAppointmentState::Pending,
+        next_fire_at_ms,
+        last_fired_at_ms: None,
+        fires_completed: 0,
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+    }
+}
+
 /// Compute current wall-clock UTC milliseconds.
 fn now_utc_ms() -> u64 {
     std::time::SystemTime::now()
@@ -796,6 +874,14 @@ pub struct AppointmentRuntime {
     bus: Arc<crate::happenings::HappeningBus>,
     clock_trust: crate::time_trust::SharedTimeTrust,
     rtc_wake: Option<Arc<dyn RtcWakeCallback>>,
+    /// Optional durable mirror for the in-memory ledger. When
+    /// populated the runtime writes through every schedule /
+    /// cancel / fire transition so a steward restart can
+    /// rehydrate the schedule via [`Self::rehydrate_from`].
+    /// Tests construct without persistence; production wires
+    /// the steward's [`crate::persistence::SqlitePersistenceStore`]
+    /// in via [`AppointmentRuntime::start_with_persistence`].
+    persistence: Option<Arc<dyn crate::persistence::PersistenceStore>>,
     /// Signals the scheduler loop to wake up and recompute its
     /// next sleep. Fired on schedule / cancel / clock-adjust.
     wakeup: Arc<Notify>,
@@ -835,6 +921,34 @@ impl AppointmentRuntime {
         clock_trust: crate::time_trust::SharedTimeTrust,
         rtc_wake: Option<Arc<dyn RtcWakeCallback>>,
     ) -> Arc<Self> {
+        Self::start_with_persistence(
+            ledger,
+            router,
+            bus,
+            clock_trust,
+            rtc_wake,
+            None,
+        )
+    }
+
+    /// Construct a runtime with a durable persistence backing.
+    ///
+    /// Mirrors [`Self::start`] but threads through an optional
+    /// [`crate::persistence::PersistenceStore`]. When attached the
+    /// runtime writes the appointment row on every schedule call,
+    /// updates it post-fire (or deletes on terminal transition),
+    /// and deletes on cancel — so a follow-up steward boot can
+    /// call [`Self::rehydrate_from`] to recover the schedule.
+    /// Production callers thread the steward's SQLite store in;
+    /// tests pass `None` and exercise the in-memory path only.
+    pub fn start_with_persistence(
+        ledger: Arc<AppointmentLedger>,
+        router: Arc<crate::router::PluginRouter>,
+        bus: Arc<crate::happenings::HappeningBus>,
+        clock_trust: crate::time_trust::SharedTimeTrust,
+        rtc_wake: Option<Arc<dyn RtcWakeCallback>>,
+        persistence: Option<Arc<dyn crate::persistence::PersistenceStore>>,
+    ) -> Arc<Self> {
         let wakeup = Arc::new(Notify::new());
         let runtime = Arc::new(Self {
             ledger,
@@ -842,6 +956,7 @@ impl AppointmentRuntime {
             bus,
             clock_trust,
             rtc_wake,
+            persistence,
             wakeup: Arc::clone(&wakeup),
             task: std::sync::Mutex::new(None),
         });
@@ -860,10 +975,12 @@ impl AppointmentRuntime {
     /// Schedule a new appointment. Computes the initial
     /// `next_fire`, refuses with the ledger's quota error if
     /// limits are hit or with a structured recurrence error if
-    /// the spec is malformed. Returns the computed
-    /// next_fire UTC millisecond timestamp on success (the
-    /// caller may surface this to the issuer).
-    pub fn schedule(
+    /// the spec is malformed. When durable persistence is
+    /// attached the row is mirrored to the `appointments` table
+    /// so a follow-up boot can rehydrate the schedule. Returns
+    /// the computed next_fire UTC millisecond timestamp on
+    /// success (the caller may surface this to the issuer).
+    pub async fn schedule(
         &self,
         creator: &str,
         spec: AppointmentSpec,
@@ -873,9 +990,32 @@ impl AppointmentRuntime {
         let next_ms = next_fire_after(&spec, now, 0)
             .map_err(AppointmentRuntimeError::Recurrence)?;
         let next_instant = next_ms.map(|ms| ms_to_instant(ms, now));
+        // Capture the persisted-row shape BEFORE moving spec /
+        // action into the ledger. Persistence is best-effort:
+        // a failure here is logged but does not refuse the
+        // schedule (the in-memory ledger remains authoritative
+        // for the lifetime of this boot; the cost of the
+        // persistence drop is a re-issue on the next boot,
+        // which the plugin will do anyway when it reloads).
+        let persisted_row = self.persistence.as_ref().map(|_| {
+            persisted_appointment_row(creator, &spec, &action, next_ms, now)
+        });
         self.ledger
             .schedule(creator, spec, action, next_instant)
             .map_err(AppointmentRuntimeError::Schedule)?;
+        if let (Some(persistence), Some(row)) =
+            (self.persistence.as_ref(), persisted_row.as_ref())
+        {
+            if let Err(e) = persistence.record_appointment(row).await {
+                tracing::warn!(
+                    creator = %row.creator,
+                    appointment_id = %row.appointment_id,
+                    error = %e,
+                    "appointment ledger: persistence write-through failed; \
+                     in-memory schedule remains authoritative"
+                );
+            }
+        }
         // Wake the loop so it re-evaluates with the new entry.
         self.wakeup.notify_one();
         // Re-program RTC wake to the new soonest pending wake.
@@ -894,6 +1034,23 @@ impl AppointmentRuntime {
     ) -> bool {
         let did_cancel = self.ledger.cancel(creator, appointment_id);
         if did_cancel {
+            // Mirror the cancel to durable storage so a
+            // follow-up boot rehydrates a schedule that
+            // matches the in-memory state.
+            if let Some(persistence) = self.persistence.as_ref() {
+                if let Err(e) = persistence
+                    .forget_appointment(creator, appointment_id)
+                    .await
+                {
+                    tracing::warn!(
+                        creator = %creator,
+                        appointment_id = %appointment_id,
+                        error = %e,
+                        "appointment ledger: cancel write-through failed; \
+                         next boot may rehydrate a stale row"
+                    );
+                }
+            }
             let _ = self
                 .bus
                 .emit_durable(
@@ -1050,6 +1207,17 @@ impl AppointmentRuntime {
             })
             .collect::<Vec<_>>();
 
+        // Per LOGGING.md §2 (each verb invocation fires at debug):
+        // appointment runtime tick is the verb-shaped boundary an
+        // operator inspects to confirm appointments are progressing.
+        // Trace-level for the per-tick scan, debug-level for actual
+        // firings (in fire_one).
+        tracing::trace!(
+            now_ms = now,
+            due_count = due.len(),
+            "appointment runtime: tick scan"
+        );
+
         for entry in due {
             self.fire_one(entry, now).await;
         }
@@ -1057,6 +1225,17 @@ impl AppointmentRuntime {
     }
 
     async fn fire_one(self: &Arc<Self>, entry: AppointmentEntry, now_ms: u64) {
+        // Per LOGGING.md §2: appointment fire is a verb invocation
+        // that drives a router::handle_request below; the debug
+        // pair brackets the firing decision (entry+outcome).
+        tracing::debug!(
+            creator = %entry.creator,
+            appointment_id = %entry.spec.appointment_id,
+            target_shelf = %entry.action.target_shelf,
+            request_type = %entry.action.request_type,
+            scheduled_for_ms = ?entry.next_fire.and_then(|i| instant_to_ms(i, now_ms)),
+            "appointment fire: invoking"
+        );
         // Time-trust gating: do not fire while the clock is
         // declared Untrusted. Apply per-appointment miss policy
         // here too — currently we mark Missed with a
@@ -1080,7 +1259,7 @@ impl AppointmentRuntime {
             AppointmentMissPolicy::Drop if delay_ms > 1000 => {
                 self.emit_missed(&entry, "drop_policy", scheduled_for_ms)
                     .await;
-                self.advance_after_fire(&entry, now_ms);
+                self.advance_after_fire(&entry, now_ms).await;
                 return;
             }
             AppointmentMissPolicy::CatchupWithinGrace { grace_ms }
@@ -1092,7 +1271,7 @@ impl AppointmentRuntime {
                     scheduled_for_ms,
                 )
                 .await;
-                self.advance_after_fire(&entry, now_ms);
+                self.advance_after_fire(&entry, now_ms).await;
                 return;
             }
             _ => {}
@@ -1117,6 +1296,15 @@ impl AppointmentRuntime {
             Err(e) => format!("error: {e}"),
         };
 
+        tracing::debug!(
+            creator = %entry.creator,
+            appointment_id = %entry.spec.appointment_id,
+            outcome = %outcome,
+            fired_at_ms = now_ms,
+            delay_ms,
+            "appointment fire: returned"
+        );
+
         // Emit Fired happening regardless of dispatch outcome —
         // consumers branch on the outcome string for audit.
         let _ = self
@@ -1130,21 +1318,139 @@ impl AppointmentRuntime {
             })
             .await;
 
-        self.advance_after_fire(&entry, now_ms);
+        self.advance_after_fire(&entry, now_ms).await;
     }
 
-    fn advance_after_fire(&self, entry: &AppointmentEntry, now_ms: u64) {
-        let next =
+    async fn advance_after_fire(&self, entry: &AppointmentEntry, now_ms: u64) {
+        let next_ms =
             next_fire_after(&entry.spec, now_ms + 1, entry.fires_completed + 1)
                 .ok()
-                .flatten()
-                .map(|ms| ms_to_instant(ms, now_ms));
+                .flatten();
+        let next_instant = next_ms.map(|ms| ms_to_instant(ms, now_ms));
         let _ = self.ledger.mark_fired(
             &entry.creator,
             &entry.spec.appointment_id,
             now_ms,
-            next,
+            next_instant,
         );
+        // Mirror the post-fire ledger transition to durable
+        // storage. Recurring entries with a fresh `next_fire`
+        // stay `Pending`; terminal entries (OneShot exhausted,
+        // recurring `max_fires` / `end_time_ms` hit) are deleted
+        // outright so the table tracks only the live schedule.
+        if let Some(persistence) = self.persistence.as_ref() {
+            let new_fires_completed = entry.fires_completed.saturating_add(1);
+            let result = if let Some(next) = next_ms {
+                persistence
+                    .update_appointment_after_fire(
+                        &entry.creator,
+                        &entry.spec.appointment_id,
+                        Some(next),
+                        now_ms,
+                        new_fires_completed,
+                        PersistedAppointmentState::Pending,
+                        now_ms,
+                    )
+                    .await
+            } else {
+                persistence
+                    .forget_appointment(
+                        &entry.creator,
+                        &entry.spec.appointment_id,
+                    )
+                    .await
+            };
+            if let Err(e) = result {
+                tracing::warn!(
+                    creator = %entry.creator,
+                    appointment_id = %entry.spec.appointment_id,
+                    error = %e,
+                    "appointment ledger: post-fire write-through failed; \
+                     next boot may rehydrate a stale row"
+                );
+            }
+        }
+    }
+
+    /// Replace the in-memory ledger with the rows the supplied
+    /// store returns from
+    /// [`PersistenceStore::list_pending_appointments`]. Called
+    /// once on boot so the freshly constructed runtime presents
+    /// the same schedule it had before the restart.
+    ///
+    /// The persisted `next_fire_at_ms` is wall-clock UTC; we
+    /// re-anchor it to the live `Instant` clock relative to the
+    /// boot's wall clock, so an appointment whose persisted
+    /// fire time is already past lands in the ledger with a
+    /// `next_fire` Instant that's already elapsed and the
+    /// runtime tick fires it under the Catchup miss-policy.
+    /// Terminal rows are pruned at write time and never appear
+    /// in the result; rows that fail to deserialise are skipped
+    /// with a debug log so a downgrade cannot crash the boot
+    /// path.
+    pub async fn rehydrate_from(
+        &self,
+        store: &dyn PersistenceStore,
+    ) -> Result<usize, PersistenceError> {
+        let rows = store.list_pending_appointments().await?;
+        let now = now_utc_ms();
+        let mut restored = 0usize;
+        for row in rows {
+            let spec: AppointmentSpec =
+                match serde_json::from_str(&row.spec_json) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!(
+                            creator = %row.creator,
+                            appointment_id = %row.appointment_id,
+                            error = %e,
+                            "skipping appointments row during rehydrate \
+                             (spec deserialise failed)"
+                        );
+                        continue;
+                    }
+                };
+            let action: AppointmentAction =
+                match serde_json::from_str(&row.action_json) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::debug!(
+                            creator = %row.creator,
+                            appointment_id = %row.appointment_id,
+                            error = %e,
+                            "skipping appointments row during rehydrate \
+                             (action deserialise failed)"
+                        );
+                        continue;
+                    }
+                };
+            let next_instant =
+                row.next_fire_at_ms.map(|ms| ms_to_instant(ms, now));
+            if let Err(e) =
+                self.ledger
+                    .schedule(&row.creator, spec, action, next_instant)
+            {
+                tracing::debug!(
+                    creator = %row.creator,
+                    appointment_id = %row.appointment_id,
+                    error = %e,
+                    "skipping appointments row during rehydrate \
+                     (ledger schedule refused)"
+                );
+                continue;
+            }
+            restored += 1;
+        }
+        // Wake the loop so the rehydrated schedule is acted on
+        // immediately — this is what fires past-due rows under
+        // the Catchup miss-policy.
+        self.wakeup.notify_one();
+        self.reprogram_rtc_wake();
+        tracing::info!(
+            restored,
+            "appointment runtime: rehydrated from persistence"
+        );
+        Ok(restored)
     }
 
     async fn emit_missed(
@@ -1363,6 +1669,83 @@ mod recurrence_tests {
             }
             other => panic!("expected CronNotSupported, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn periodic_first_fire_is_now_plus_interval() {
+        let spec = spec_with(AppointmentRecurrence::Periodic {
+            interval_ms: 60_000,
+        });
+        let now = ms("2026-06-01T00:00:00Z");
+        let next = next_fire_after(&spec, now, 0).unwrap();
+        assert_eq!(next, Some(now + 60_000));
+    }
+
+    #[test]
+    fn periodic_subsequent_fire_is_now_plus_interval() {
+        // The post-fire reschedule path passes
+        // `now_utc_ms = last_fire + 1` and
+        // `fires_completed = previous + 1`. The next fire
+        // should be exactly `interval_ms` later — Periodic does
+        // not enforce a calendar walk.
+        let spec = spec_with(AppointmentRecurrence::Periodic {
+            interval_ms: 60_000,
+        });
+        let last_fire = ms("2026-06-01T00:00:00Z");
+        let next = next_fire_after(&spec, last_fire + 1, 1).unwrap();
+        assert_eq!(next, Some(last_fire + 1 + 60_000));
+    }
+
+    #[test]
+    fn periodic_zero_interval_is_an_error() {
+        let spec =
+            spec_with(AppointmentRecurrence::Periodic { interval_ms: 0 });
+        let now = ms("2026-06-01T00:00:00Z");
+        match next_fire_after(&spec, now, 0) {
+            Err(RecurrenceError::InvalidPeriodicInterval {
+                interval_ms: 0,
+            }) => {}
+            other => {
+                panic!("expected InvalidPeriodicInterval, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn periodic_respects_max_fires() {
+        let mut spec = spec_with(AppointmentRecurrence::Periodic {
+            interval_ms: 60_000,
+        });
+        spec.max_fires = Some(2);
+        let now = ms("2026-06-01T00:00:00Z");
+        assert!(next_fire_after(&spec, now, 0).unwrap().is_some());
+        assert!(next_fire_after(&spec, now, 1).unwrap().is_some());
+        assert_eq!(next_fire_after(&spec, now, 2).unwrap(), None);
+    }
+
+    #[test]
+    fn periodic_respects_end_time_ms() {
+        let mut spec = spec_with(AppointmentRecurrence::Periodic {
+            interval_ms: 60_000,
+        });
+        let now = ms("2026-06-01T00:00:00Z");
+        spec.end_time_ms = Some(now + 30_000);
+        // First fire (now + 60s) is past end_time (now + 30s):
+        // terminates.
+        assert_eq!(next_fire_after(&spec, now, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn periodic_does_not_require_time_field() {
+        // The `time` field is unused for Periodic; setting it
+        // to None must not produce InvalidTimeOfDay because the
+        // calendar walk is bypassed.
+        let mut spec =
+            spec_with(AppointmentRecurrence::Periodic { interval_ms: 5_000 });
+        spec.time = None;
+        let now = ms("2026-06-01T00:00:00Z");
+        let next = next_fire_after(&spec, now, 0).unwrap();
+        assert_eq!(next, Some(now + 5_000));
     }
 
     #[test]

@@ -1,0 +1,24 @@
+[package]
+name = "evo-acceptance-distribution"
+description = "Acceptance-only distribution: the standard discovery-driven steward plus the synthetic reload plugin admitted in-process. Used by `T2.hot-reload-live-inproc` to exercise the framework's in-process Live-reload path (which skips the OOP spawn/terminate pair and passes the StateBlob directly between Plugin trait calls in the same process)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "evo-acceptance-distribution"
+path = "src/main.rs"
+
+[dependencies]
+evo = { path = "../evo" }
+evo-plugin-sdk = { path = "../evo-plugin-sdk" }
+evo-acceptance-synthetic = { path = "../evo-acceptance-synthetic" }
+
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true

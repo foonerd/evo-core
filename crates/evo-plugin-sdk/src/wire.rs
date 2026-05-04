@@ -60,10 +60,11 @@
 
 use crate::contract::factory::{InstanceAnnouncement, InstanceId};
 use crate::contract::{
-    AliasRecord, CustodyHandle, ExplicitRelationAssignment, ExternalAddressing,
+    AliasRecord, AppointmentAction, AppointmentId, AppointmentSpec,
+    CustodyHandle, ExplicitRelationAssignment, ExternalAddressing,
     HealthReport, HealthStatus, PluginDescription, RelationAssertion,
     RelationRetraction, ReportPriority, SplitRelationStrategy,
-    SubjectAnnouncement, SubjectQueryResult,
+    SubjectAnnouncement, SubjectQueryResult, WatchAction, WatchId, WatchSpec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -449,6 +450,24 @@ pub enum WireFrame {
         reason: Option<String>,
     },
 
+    /// Subject state update event. Plugin publishes a new runtime
+    /// state value for a subject it previously announced. The steward
+    /// resolves the addressing, replaces the stored state, and emits
+    /// a `SubjectStateChanged` happening carrying the previous and
+    /// new values.
+    UpdateSubjectState {
+        /// Protocol version.
+        v: u16,
+        /// Event's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Addressing of the subject whose state is being updated.
+        addressing: ExternalAddressing,
+        /// New state value. `null` clears the state.
+        state: serde_json::Value,
+    },
+
     /// Relation assertion event. Plugin claims an edge in the
     /// relation graph, per RELATIONS.md section 4.
     AssertRelation {
@@ -587,6 +606,37 @@ pub enum WireFrame {
         plugin: String,
         /// Lookup outcome.
         result: SubjectQueryResult,
+    },
+
+    /// `resolve_addressing` request. Asks the steward to resolve
+    /// an `ExternalAddressing` to its current canonical subject id.
+    /// Used by plugins that have just announced a subject and need
+    /// the steward-minted canonical id (for authoring
+    /// `WatchCondition::SubjectState { canonical_id, .. }` watches
+    /// against their own subject, primarily).
+    ResolveAddressing {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Addressing being resolved.
+        addressing: ExternalAddressing,
+    },
+
+    /// `resolve_addressing` response. Carries `Some(canonical_id)`
+    /// when the addressing is in the registry, `None` when it is
+    /// unknown.
+    ResolveAddressingResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The resolved canonical id, if any.
+        canonical_id: Option<String>,
     },
 
     // ---------------------------------------------------------------
@@ -967,6 +1017,157 @@ pub enum WireFrame {
     },
 
     // ---------------------------------------------------------------
+    // Plugin-originated PluginEvent emission (plugin -> steward).
+    // Mirrors the in-process [`crate::contract::HappeningEmitter`]
+    // surface across the wire so OOP plugins reach the same
+    // `bus.emit_durable` path as in-process ones. The steward
+    // replies with [`Self::EmitPluginEventResponse`] on success
+    // or [`Self::Error`] on refusal.
+    // ---------------------------------------------------------------
+    /// Plugin-originated PluginEvent emission request.
+    EmitPluginEvent {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical name of the emitting plugin.
+        plugin: String,
+        /// Plugin-defined event-type discriminator.
+        event_type: String,
+        /// Plugin-defined opaque payload.
+        payload: serde_json::Value,
+    },
+
+    /// Plugin-originated PluginEvent emission response. Empty on
+    /// success — the SDK trait method's return type is
+    /// `Result<(), ReportError>`.
+    EmitPluginEventResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    // ---------------------------------------------------------------
+    // Plugin-originated appointment scheduling (plugin -> steward).
+    // Mirrors the in-process [`crate::contract::AppointmentScheduler`]
+    // trait's surface across the wire so OOP plugins reach the same
+    // scheduling path as in-process ones. The steward replies with
+    // the matching `*Response` frame on success or [`Self::Error`]
+    // on refusal.
+    // ---------------------------------------------------------------
+    /// Plugin-originated appointment-create request.
+    CreateAppointment {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical name of the plugin issuing the request.
+        plugin: String,
+        /// The complete appointment specification.
+        spec: AppointmentSpec,
+        /// The action dispatched on every fire.
+        action: AppointmentAction,
+    },
+
+    /// Plugin-originated appointment-create response. Carries the
+    /// framework-minted [`AppointmentId`] so the plugin's
+    /// awaiting future resolves with the same shape it would
+    /// have received in-process.
+    CreateAppointmentResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The minted appointment id.
+        appointment_id: AppointmentId,
+    },
+
+    /// Plugin-originated appointment-cancel request.
+    CancelAppointment {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The appointment to cancel.
+        appointment_id: AppointmentId,
+    },
+
+    /// Plugin-originated appointment-cancel response. Empty on
+    /// success — the SDK trait method's return type is
+    /// `Result<(), ReportError>`.
+    CancelAppointmentResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    // ---------------------------------------------------------------
+    // Plugin-originated watch scheduling (plugin -> steward).
+    // Mirrors the in-process [`crate::contract::WatchScheduler`]
+    // trait's surface across the wire. Same shape as the appointment
+    // pair above; the framework's two scheduling primitives share
+    // their wire shape because their SDK trait surface is symmetric.
+    // ---------------------------------------------------------------
+    /// Plugin-originated watch-create request.
+    CreateWatch {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical name of the plugin issuing the request.
+        plugin: String,
+        /// The complete watch specification.
+        spec: WatchSpec,
+        /// The action dispatched on every match.
+        action: WatchAction,
+    },
+
+    /// Plugin-originated watch-create response. Carries the
+    /// framework-minted [`WatchId`].
+    CreateWatchResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The minted watch id.
+        watch_id: WatchId,
+    },
+
+    /// Plugin-originated watch-cancel request.
+    CancelWatch {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The watch to cancel.
+        watch_id: WatchId,
+    },
+
+    /// Plugin-originated watch-cancel response. Empty on success.
+    CancelWatchResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    // ---------------------------------------------------------------
     // Event acknowledgement (steward -> plugin). Sent in response to
     // a plugin-originated event frame (`AnnounceSubject`,
     // `RetractSubject`, `AssertRelation`, `RetractRelation`,
@@ -1035,6 +1236,7 @@ impl WireFrame {
             | Self::ReportState { v, cid, plugin, .. }
             | Self::AnnounceSubject { v, cid, plugin, .. }
             | Self::RetractSubject { v, cid, plugin, .. }
+            | Self::UpdateSubjectState { v, cid, plugin, .. }
             | Self::AssertRelation { v, cid, plugin, .. }
             | Self::RetractRelation { v, cid, plugin, .. }
             | Self::AnnounceInstance { v, cid, plugin, .. }
@@ -1046,6 +1248,8 @@ impl WireFrame {
             | Self::DescribeAliasResponse { v, cid, plugin, .. }
             | Self::DescribeSubject { v, cid, plugin, .. }
             | Self::DescribeSubjectResponse { v, cid, plugin, .. }
+            | Self::ResolveAddressing { v, cid, plugin, .. }
+            | Self::ResolveAddressingResponse { v, cid, plugin, .. }
             | Self::ForcedRetractAddressing { v, cid, plugin, .. }
             | Self::ForcedRetractAddressingResponse { v, cid, plugin }
             | Self::MergeSubjects { v, cid, plugin, .. }
@@ -1062,6 +1266,16 @@ impl WireFrame {
             | Self::FastPathDispatchResponse { v, cid, plugin }
             | Self::RequestUserInteraction { v, cid, plugin, .. }
             | Self::RequestUserInteractionResponse { v, cid, plugin, .. }
+            | Self::CreateAppointment { v, cid, plugin, .. }
+            | Self::CreateAppointmentResponse { v, cid, plugin, .. }
+            | Self::CancelAppointment { v, cid, plugin, .. }
+            | Self::CancelAppointmentResponse { v, cid, plugin }
+            | Self::CreateWatch { v, cid, plugin, .. }
+            | Self::CreateWatchResponse { v, cid, plugin, .. }
+            | Self::CancelWatch { v, cid, plugin, .. }
+            | Self::CancelWatchResponse { v, cid, plugin }
+            | Self::EmitPluginEvent { v, cid, plugin, .. }
+            | Self::EmitPluginEventResponse { v, cid, plugin }
             | Self::Error { v, cid, plugin, .. }
             | Self::EventAck { v, cid, plugin }
             | Self::Hello { v, cid, plugin, .. }
@@ -1102,6 +1316,7 @@ impl WireFrame {
             self,
             Self::DescribeAlias { .. }
                 | Self::DescribeSubject { .. }
+                | Self::ResolveAddressing { .. }
                 | Self::ForcedRetractAddressing { .. }
                 | Self::MergeSubjects { .. }
                 | Self::SplitSubject { .. }
@@ -1110,6 +1325,11 @@ impl WireFrame {
                 | Self::UnsuppressRelation { .. }
                 | Self::FastPathDispatch { .. }
                 | Self::RequestUserInteraction { .. }
+                | Self::CreateAppointment { .. }
+                | Self::CancelAppointment { .. }
+                | Self::CreateWatch { .. }
+                | Self::CancelWatch { .. }
+                | Self::EmitPluginEvent { .. }
         )
     }
 
@@ -1128,6 +1348,7 @@ impl WireFrame {
                 | Self::ReleaseCustodyResponse { .. }
                 | Self::DescribeAliasResponse { .. }
                 | Self::DescribeSubjectResponse { .. }
+                | Self::ResolveAddressingResponse { .. }
                 | Self::ForcedRetractAddressingResponse { .. }
                 | Self::MergeSubjectsResponse { .. }
                 | Self::SplitSubjectResponse { .. }
@@ -1137,6 +1358,11 @@ impl WireFrame {
                 | Self::PrepareForLiveReloadResponse { .. }
                 | Self::FastPathDispatchResponse { .. }
                 | Self::RequestUserInteractionResponse { .. }
+                | Self::CreateAppointmentResponse { .. }
+                | Self::CancelAppointmentResponse { .. }
+                | Self::CreateWatchResponse { .. }
+                | Self::CancelWatchResponse { .. }
+                | Self::EmitPluginEventResponse { .. }
         )
     }
 
@@ -1147,6 +1373,7 @@ impl WireFrame {
             Self::ReportState { .. }
                 | Self::AnnounceSubject { .. }
                 | Self::RetractSubject { .. }
+                | Self::UpdateSubjectState { .. }
                 | Self::AssertRelation { .. }
                 | Self::RetractRelation { .. }
                 | Self::AnnounceInstance { .. }
@@ -1665,6 +1892,7 @@ mod tests {
                 confidence: ClaimConfidence::Asserted,
                 reason: None,
             }],
+            state: serde_json::Value::Null,
             announced_at: SystemTime::UNIX_EPOCH
                 + std::time::Duration::from_secs(1_700_000_000),
         };
@@ -1687,6 +1915,23 @@ mod tests {
             plugin: sample_plugin(),
             addressing: sample_addressing(),
             reason: Some("file deleted".into()),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn update_subject_state_round_trip() {
+        let orig = WireFrame::UpdateSubjectState {
+            v: PROTOCOL_VERSION,
+            cid: 205,
+            plugin: sample_plugin(),
+            addressing: sample_addressing(),
+            state: serde_json::json!({
+                "playback_status": "playing",
+                "elapsed_ms": 12_345,
+            }),
         };
         let json = serde_json::to_string(&orig).unwrap();
         let back: WireFrame = serde_json::from_str(&json).unwrap();
@@ -2425,6 +2670,49 @@ mod tests {
         let back: WireFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(back, orig);
         assert!(orig.is_plugin_request());
+    }
+
+    #[test]
+    fn resolve_addressing_round_trip() {
+        let orig = WireFrame::ResolveAddressing {
+            v: PROTOCOL_VERSION,
+            cid: 700,
+            plugin: sample_plugin(),
+            addressing: sample_addressing(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"resolve_addressing""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_plugin_request());
+    }
+
+    #[test]
+    fn resolve_addressing_response_round_trip_some() {
+        let orig = WireFrame::ResolveAddressingResponse {
+            v: PROTOCOL_VERSION,
+            cid: 700,
+            plugin: sample_plugin(),
+            canonical_id: Some("subj-cccc-3333".to_string()),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"resolve_addressing_response""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_response());
+    }
+
+    #[test]
+    fn resolve_addressing_response_round_trip_none() {
+        let orig = WireFrame::ResolveAddressingResponse {
+            v: PROTOCOL_VERSION,
+            cid: 701,
+            plugin: sample_plugin(),
+            canonical_id: None,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
     }
 
     #[test]

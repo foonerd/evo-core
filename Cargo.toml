@@ -2,6 +2,9 @@
 resolver = "2"
 members = [
     "crates/evo",
+    "crates/evo-acceptance",
+    "crates/evo-acceptance-distribution",
+    "crates/evo-acceptance-synthetic",
     "crates/evo-coalesce-labels",
     "crates/evo-example-admin",
     "crates/evo-example-distribution",

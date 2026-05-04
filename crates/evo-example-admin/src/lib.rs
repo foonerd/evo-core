@@ -361,6 +361,11 @@ impl Plugin for AdminExamplePlugin {
         ctx: &'a LoadContext,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         async move {
+            tracing::debug!(
+                plugin = "org.evo.example.admin",
+                verb = "load",
+                "plugin verb invoking"
+            );
             let subject_admin = ctx.subject_admin.clone().ok_or_else(|| {
                 PluginError::Permanent(
                     "org.evo.example.admin requires capabilities.admin = true \
@@ -393,6 +398,11 @@ impl Plugin for AdminExamplePlugin {
         &mut self,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
         async move {
+            tracing::debug!(
+                plugin = "org.evo.example.admin",
+                verb = "unload",
+                "plugin verb invoking"
+            );
             self.subject_admin = None;
             self.relation_admin = None;
             self.loaded = false;
@@ -406,6 +416,11 @@ impl Plugin for AdminExamplePlugin {
 
     fn health_check(&self) -> impl Future<Output = HealthReport> + Send + '_ {
         async move {
+            tracing::debug!(
+                plugin = "org.evo.example.admin",
+                verb = "health_check",
+                "plugin verb invoking"
+            );
             if self.loaded {
                 HealthReport::healthy()
             } else {
@@ -421,6 +436,14 @@ impl Respondent for AdminExamplePlugin {
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {
+            tracing::debug!(
+                plugin = "org.evo.example.admin",
+                verb = "handle_request",
+                request_type = %req.request_type,
+                cid = req.correlation_id,
+                bytes = req.payload.len(),
+                "plugin verb invoking"
+            );
             if !self.loaded {
                 return Err(PluginError::Permanent(
                     "admin plugin not loaded".to_string(),

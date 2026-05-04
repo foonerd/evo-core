@@ -1,0 +1,62 @@
+# Synthetic Fast-Path warden — out-of-process bundle manifest.
+#
+# Admits as a singleton warden on the synthetic
+# `acceptance.fast-path` shelf. Declares two course-correct verbs,
+# both also fast-path eligible:
+#
+#   - `ping`: course_correct returns immediately; T2.fast-path-rtt
+#     uses this to verify the fast-path channel round-trips
+#     without tripping the budget.
+#   - `slow`: course_correct sleeps 500ms, deliberately exceeding
+#     the declared `fast_path_budget_ms = 100`; the framework
+#     times it out and refuses with subclass
+#     `fast_path_budget_exceeded`. T2.fast-path-budget-refused
+#     uses this.
+#
+# Used by T2.fast-path-rtt and T2.fast-path-budget-refused. Has
+# no value outside those scenarios.
+
+[plugin]
+name = "org.evoframework.acceptance.fast-path-warden"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.fast-path"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "warden"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities.warden]
+custody_domain = "acceptance"
+custody_exclusive = false
+course_correction_budget_ms = 1000
+custody_failure_mode = "abort"
+course_correct_verbs = ["ping", "slow"]
+fast_path_verbs = ["ping", "slow"]
+fast_path_budget_ms = 100

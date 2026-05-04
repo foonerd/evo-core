@@ -103,8 +103,19 @@ impl Manifest {
     /// Performs layers 1 and 2 of the validation cascade documented at module
     /// level: TOML parsing followed by schema validation.
     pub fn from_toml(input: &str) -> Result<Self, ManifestError> {
+        // Per LOGGING.md §2 ("individual message parse steps" fire at
+        // trace): manifest parse step. Trace-level so it doesn't
+        // pollute info/debug streams during normal admission.
+        tracing::trace!(
+            input_bytes = input.len(),
+            "manifest: from_toml parsing"
+        );
         let manifest: Manifest = toml::from_str(input)?;
         manifest.validate()?;
+        tracing::trace!(
+            plugin = %manifest.plugin.name,
+            "manifest: from_toml parsed"
+        );
         Ok(manifest)
     }
 
@@ -434,6 +445,29 @@ pub struct Lifecycle {
     /// influences admission or refusal decisions.
     #[serde(default)]
     pub recommended_essential: bool,
+    /// Per-plugin override for the framework's live-reload state
+    /// blob size cap, in bytes.
+    ///
+    /// When a plugin returns a state blob from
+    /// `prepare_for_live_reload` whose payload exceeds the
+    /// effective cap, the framework refuses the live-reload and
+    /// leaves the previous instance running. Resolution order:
+    ///
+    /// - When `live_blob_max` is set, the framework uses it as the
+    ///   per-plugin cap, clamped to the absolute hard ceiling
+    ///   ([`crate::contract::MAX_LIVE_RELOAD_BLOB_BYTES`], 64 MiB).
+    /// - When `live_blob_max` is unset, the framework uses the
+    ///   default soft cap
+    ///   ([`crate::contract::DEFAULT_LIVE_RELOAD_BLOB_BYTES`], 16 MiB).
+    /// - Regardless of declaration, blobs above the hard ceiling
+    ///   are always refused — at that scale the plugin should be
+    ///   using durable persistence rather than live-reload state
+    ///   transfer.
+    ///
+    /// **Bucket: Enforced.** The steward consults this at every
+    /// `Live` reload attempt to compute the effective cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_blob_max: Option<u64>,
 }
 
 fn default_true() -> bool {

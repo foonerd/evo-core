@@ -1,0 +1,56 @@
+# Synthetic appointment plugin — out-of-process bundle manifest.
+#
+# Registers a OneShot appointment 5 seconds into the future on every
+# load() and acts as its own dispatch target: when the appointment
+# fires, the framework dispatches request_type "appointment_fired"
+# against shelf "acceptance.appointment", which routes back to this
+# plugin's Respondent::handle_request. The plugin records each fire
+# to {state_dir}/appointment-fires.log so acceptance scenarios can
+# observe whether (and when) fires happened.
+#
+# Used by T2.appointment-fire to verify the framework's appointment
+# dispatch path end-to-end (registration → persistence → fire →
+# action dispatch → handle_request).
+
+[plugin]
+name = "org.evoframework.acceptance.appointment-plugin"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.appointment"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities]
+appointments = true
+
+[capabilities.respondent]
+request_types = ["appointment_fired"]
+response_budget_ms = 1000

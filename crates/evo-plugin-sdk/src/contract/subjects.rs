@@ -155,7 +155,7 @@ pub enum SubjectClaim {
 /// by announcing them together, the plugin asserts they refer to one
 /// subject. Explicit `SubjectClaim` entries add metadata (confidence,
 /// reason) to specific pairs.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SubjectAnnouncement {
     /// Subject type, must be declared in the catalogue.
     pub subject_type: String,
@@ -165,9 +165,30 @@ pub struct SubjectAnnouncement {
     /// announcement.
     #[serde(default)]
     pub claims: Vec<SubjectClaim>,
+    /// Optional plugin-contributed runtime state, surfaced on the
+    /// subject's projection as `SubjectProjection.state` and queryable
+    /// by `WatchCondition::SubjectState` watch predicates. The
+    /// framework does not interpret the structure; consumers and
+    /// watch authors agree on field names per subject_type. Default
+    /// is `null` (no state contributed); plugins update state without
+    /// re-announcing the full subject via the
+    /// `HappeningEmitter`-sibling `SubjectAnnouncer::update_state`
+    /// surface.
+    ///
+    /// Persistence across steward restarts is NOT yet implemented
+    /// (v0.1.12.1 scope is in-memory only); plugins re-announce
+    /// state on load.
+    #[serde(default, skip_serializing_if = "is_null_value")]
+    pub state: serde_json::Value,
     /// When the announcement was generated on the plugin side.
     pub announced_at: SystemTime,
 }
+
+fn is_null_value(v: &serde_json::Value) -> bool {
+    v.is_null()
+}
+
+impl Eq for SubjectAnnouncement {}
 
 impl SubjectAnnouncement {
     /// Construct an announcement with current time and no claims.
@@ -179,6 +200,7 @@ impl SubjectAnnouncement {
             subject_type: subject_type.into(),
             addressings,
             claims: Vec::new(),
+            state: serde_json::Value::Null,
             announced_at: SystemTime::now(),
         }
     }
@@ -186,6 +208,14 @@ impl SubjectAnnouncement {
     /// Add a claim to this announcement.
     pub fn with_claim(mut self, claim: SubjectClaim) -> Self {
         self.claims.push(claim);
+        self
+    }
+
+    /// Attach plugin-contributed runtime state to this announcement.
+    /// Surfaced on the subject's projection; queryable by
+    /// `WatchCondition::SubjectState` predicates.
+    pub fn with_state(mut self, state: serde_json::Value) -> Self {
+        self.state = state;
         self
     }
 }

@@ -1,0 +1,37 @@
+[package]
+name = "evo-acceptance"
+description = "Adaptive acceptance harness: runs T1-T5 tier scenarios against any target (arch + hardware capability descriptor) and emits a structured readiness report."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "evo_acceptance"
+path = "src/lib.rs"
+
+[[bin]]
+name = "evo-acceptance"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# Async runtime + process spawning for shelling out to ssh / local
+# scenario commands. The runtime stays multi-thread-capable so the
+# harness can fan out concurrent scenarios when the plan permits;
+# v1 runs scenarios sequentially per tier ordering.
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "macros", "time", "fs"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

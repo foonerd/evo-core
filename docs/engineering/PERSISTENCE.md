@@ -795,8 +795,8 @@ Content:
 [corruption]
 detected_at_ms = 1712345678901
 detection_method = "integrity_check"   # or "structural_check" or "foreign_key_violation"
-steward_version = "0.1.9"
-schema_version_observed = 3
+steward_version = "0.1.12"
+schema_version_observed = 13
 sqlite_version = "3.45.1"
 rusqlite_version = "0.31.0"
 
@@ -1264,11 +1264,16 @@ Tracked here so a reader of this document knows which sections describe shipped 
 | `PersistenceStore` trait and SQLite-backed `SqlitePersistenceStore` covering the subject-identity slice of section 7's schema (`subjects`, `subject_addressings`, `aliases`, `claim_log`). Trait carried on `StewardState`; `SqlitePersistenceStore` opened from `StewardConfig::persistence.path` (default `/var/lib/evo/state/evo.db`) by the steward binary. Migrations runner active. | Shipped. |
 | Durable happenings log (`happenings_log` table from migration 002) recording every emitted Happening with a monotonically increasing `seq`; consumers reconnect with a `since` cursor and the bus replays from the SQLite log when the in-memory ring no longer covers the gap. | Shipped. |
 | Pending-conflict surface (`pending_conflicts` table from migration 004) cross-linking each unresolved subject conflict with its addressings and canonical IDs; admin merge marks conflicts resolved as it lands. | Shipped. |
-| Boot-time orphan diagnostic. `PersistenceStore::count_subjects_by_type` powers a startup pass that diffs persisted subject types against the catalogue and emits per-orphan and summary `tracing::warn!` lines. | Shipped. |
-| Subject-registry write path routed through `PersistenceStore`. Every announce / retract / forget operation lands in SQLite before the in-memory registry returns success. | In progress: write path uses `record_subject_*` paths; full boot-time rehydration of the in-memory registry is the next slice. |
-| Relation graph durability (extends schema with `relations`, `relation_claimants`), write path through `PersistenceStore`, on-disk relation cardinality re-validation per section 13.4. | Roadmap. |
-| Custody ledger durability (extends schema with `custodies`, `custody_state`), custody write path, last-state snapshot persistence. | Roadmap. |
-| Admin ledger durability (extends schema with `admin_log`), admin operations recorded persistently, reversibility primitives walk the persisted log per section 14.5. | Roadmap. |
+| Boot-time orphan diagnostic. `PersistenceStore::count_subjects_by_type` powers a startup pass that diffs persisted subject types against the catalogue, emits per-orphan and summary `tracing::warn!` lines, and persists each discovered orphan into `pending_grammar_orphans` (migration 011) for operator-visible status. | Shipped. |
+| Subject-registry write path routed through `PersistenceStore`. Every announce / retract / forget operation lands in SQLite before the in-memory registry returns success. Boot rehydrates the in-memory registry from the persisted rows. | Shipped. |
+| Admin ledger durability (`admin_log` table from migration 006). Every admin operation (merge, split, release, suppress, unsuppress, course-correct, custody verbs) records persistently; reversibility primitives walk the persisted log per section 14.5. | Shipped. |
+| Custody ledger durability (`custodies` + `custody_state` tables from migration 007). Every custody handoff (`take_custody`, `course_correct`, `release_custody`, `mark_aborted`, `mark_degraded`) writes through to SQLite in the same transaction that mutates the in-memory ledger; boot rehydrates from the persisted rows. | Shipped. |
+| Relation graph durability (`relations` + `relation_claimants` tables from migration 008). Relation `assert`, `retract`, `forget`, `suppress`, `unsuppress` paths write through; boot rehydrates the in-memory graph from persisted rows. On-disk cardinality re-validation per section 13.4. | Shipped. |
+| Installed-plugins enable bit (`installed_plugins` table from migration 009). Per-plugin enable / disable flag survives steward restart and gates re-admission at boot. | Shipped. |
+| Per-pair reconciliation last-known-good (`reconciliation_state` table from migration 010). `record_reconciliation_state` persists each successful pair-apply outcome; re-issued to the warden on apply failure (rollback) and at boot (cross-restart resume). `forget_reconciliation_state` removes the row when the catalogue stops declaring the pair. | Shipped. |
+| Pending grammar orphans (`pending_grammar_orphans` table from migration 011). Boot diagnostic upserts each discovered orphan; status enum `pending` / `migrating` / `resolved` / `accepted` / `recovered` tracks operator decisions. Six trait methods cover the lifecycle. Subject-type migration (`migrate_grammar_orphans` verb) flips the row through `migrating` → `resolved`; `accept_grammar_orphans` records deliberate non-migration. | Shipped. |
+| Durable user-interaction prompts (`prompts` table from migration 012). Plugin-initiated prompts persist across steward restart; boot rehydration restores the in-memory `PromptLedger` and re-attaches plugins to their open prompts on `load()`. | Shipped. |
+| Durable appointments (`appointments` table from migration 013). `AppointmentRuntime` persists every scheduled fire; boot rehydration loads past-due rows and applies the per-appointment miss policy (`Drop` / `CatchupWithinGrace` / `Catchup`) on the first runtime tick. RTC-wake-arming hook fires for `must_wake_device = true` appointments when a distribution wires `RtcWakeCallback`. | Shipped. |
 | Trust re-verification on startup per section 12.1; `plugin_trust_snapshot` table; `trust_quarantine` audit entries. | Roadmap. |
 
-The shipped slice ships the trait, the SQLite implementation, the in-memory mock used by every steward-internal test, and a migrations directory (`crates/evo/migrations/{001_initial,002_happenings,003_meta,004_pending_conflicts}.sql`). The trait's method shape is schema-aware: each fabric operation maps to one transaction touching every affected table atomically, satisfying the multi-table durability promise from section 4.3. Future schema additions append new migration files rather than renumber; the `schema_version` table records what has been applied.
+The shipped slice ships the trait, the SQLite implementation, the in-memory mock used by every steward-internal test, and a migrations directory (`crates/evo/migrations/001_initial.sql` through `013_appointments.sql`). The trait's method shape is schema-aware: each fabric operation maps to one transaction touching every affected table atomically, satisfying the multi-table durability promise from section 4.3. Future schema additions append new migration files rather than renumber; the `schema_version` table records what has been applied.

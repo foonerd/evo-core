@@ -350,6 +350,20 @@ impl InstanceAnnouncer for RegistryInstanceAnnouncer {
         >,
     > {
         Box::pin(async move {
+            // Per LOGGING.md §2 (each verb invocation fires at debug):
+            // entry-debug for the announcer verb. The `info`-level
+            // lifecycle line is emitted by the SubjectRegistry on
+            // success a few stack frames below, so this debug is the
+            // verb-invocation marker an operator sees just before
+            // the registry-level info.
+            tracing::debug!(
+                plugin = %self.plugin_name,
+                verb = "announce_instance",
+                instance = %announcement.instance_id,
+                bytes = announcement.payload.len(),
+                "plugin verb invoking"
+            );
+
             // Policy gate: StartupOnly refuses announce after `load`
             // has returned. Dynamic and ShutdownOnly permit announce
             // any time during plugin lifetime.
@@ -390,6 +404,7 @@ impl InstanceAnnouncer for RegistryInstanceAnnouncer {
                 subject_type: self.target_shelf.clone(),
                 addressings: vec![addressing.clone()],
                 claims: Vec::new(),
+                state: serde_json::Value::Null,
                 announced_at: SystemTime::now(),
             };
 
@@ -502,6 +517,17 @@ impl InstanceAnnouncer for RegistryInstanceAnnouncer {
         >,
     > {
         Box::pin(async move {
+            // Per LOGGING.md §2 (each verb invocation fires at debug):
+            // entry-debug for the retract verb. Mirrors the announce
+            // path; lifecycle info comes from the SubjectRegistry on
+            // success.
+            tracing::debug!(
+                plugin = %self.plugin_name,
+                verb = "retract_instance",
+                instance = %instance_id,
+                "plugin verb invoking"
+            );
+
             // Policy gate: ShutdownOnly refuses retract during plugin
             // lifetime; the steward retracts every instance on
             // unload via the lifecycle-drain path.

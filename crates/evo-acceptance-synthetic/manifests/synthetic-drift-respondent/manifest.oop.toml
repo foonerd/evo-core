@@ -1,0 +1,51 @@
+# Synthetic drift respondent — out-of-process bundle manifest.
+#
+# This plugin exists solely to exercise the steward's manifest-vs-
+# describe drift-refusal path at admission time. The manifest below
+# declares request_types = ["drift_x"]; the runtime Plugin::describe()
+# returns ["drift_x", "drift_y"]. Admission MUST refuse the plugin
+# with a structured manifest-drift error.
+#
+# Bundle layout (mirrors the example-plugin packaging contract):
+# manifest.toml + plugin.bin + manifest.sig, packed as
+# org.evoframework.acceptance.drift-respondent-<version>-<target>.tar.gz.
+
+[plugin]
+name = "org.evoframework.acceptance.drift-respondent"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.drift"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities.respondent]
+request_types = ["drift_x"]
+response_budget_ms = 1000

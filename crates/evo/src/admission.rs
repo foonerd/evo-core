@@ -57,7 +57,8 @@ use crate::state::StewardState;
 use crate::subjects::SubjectRegistry;
 use evo_plugin_sdk::contract::factory::Factory;
 use evo_plugin_sdk::contract::{
-    HealthReport, InstanceAnnouncer, LoadContext, Respondent, Warden,
+    HealthReport, InstanceAnnouncer, LoadContext, Respondent, SubjectAnnouncer,
+    Warden,
 };
 use evo_plugin_sdk::manifest::{
     InstanceShape, InteractionShape, TransportKind,
@@ -68,6 +69,193 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
+
+use evo_plugin_sdk::contract::{
+    PluginError, StateBlob, DEFAULT_LIVE_RELOAD_BLOB_BYTES,
+    MAX_LIVE_RELOAD_BLOB_BYTES,
+};
+
+/// Resolve the effective live-reload state-blob cap for a plugin
+/// from its manifest, clamped to the framework's hard ceiling.
+///
+/// Resolution order:
+/// - When `lifecycle.live_blob_max` is set on the manifest, use it
+///   (clamped to [`MAX_LIVE_RELOAD_BLOB_BYTES`] so a manifest
+///   asking for more than the hard ceiling is bounded down).
+/// - When the field is unset, use [`DEFAULT_LIVE_RELOAD_BLOB_BYTES`]
+///   (16 MiB).
+fn effective_live_blob_cap(manifest: &Manifest) -> usize {
+    match manifest.lifecycle.live_blob_max {
+        Some(declared) => {
+            let declared = declared as usize;
+            declared.min(MAX_LIVE_RELOAD_BLOB_BYTES)
+        }
+        None => DEFAULT_LIVE_RELOAD_BLOB_BYTES,
+    }
+}
+
+/// Linux `sockaddr_un.sun_path` capacity. A bound, abstract, or
+/// path-named Unix socket whose path strictly exceeds this length
+/// (including the NUL terminator the kernel adds) fails at
+/// `bind(2)` with `ENAMETOOLONG` / "path must be shorter than
+/// SUN_LEN". Used to validate the live-reload successor socket path
+/// before spawn so the operator sees a clear admission-time refusal
+/// instead of an opaque "child exited before socket was ready".
+///
+/// 108 is the canonical Linux value (`linux/un.h`'s
+/// `UNIX_PATH_MAX`). Other Unices have larger limits but the
+/// framework targets Linux for OOP plugins per
+/// `BUILDING.md` so 108 is the binding constraint.
+const SUN_PATH_MAX: usize = 108;
+
+/// Build the live-reload successor's transient socket path with a
+/// compact, collision-free suffix that fits within Linux's
+/// [`SUN_PATH_MAX`] for plugin names up to 70 chars on
+/// `/var/run/evo` (and 74 on `/run/evo`). Replaces the older raw
+/// 19-digit nanosecond suffix scheme that overflowed `SUN_PATH_MAX`
+/// for plugin names beyond ~47 chars.
+///
+/// Suffix entropy: 6 hex chars from a process-monotonic atomic
+/// counter XORed with the low bits of the wall clock. The counter
+/// alone is monotonic per steward run (collision-free within one
+/// process up to 16,777,216 reloads); the XOR with wall-clock low
+/// bits diffuses collision probability across stewards on the same
+/// host. The successor's socket from the prior reload of the same
+/// plugin is best-effort unlinked at drain, so even on counter
+/// wrap the prior path is almost certainly gone.
+///
+/// Why 6 hex (24 bits) and not 8: with `/var/run/evo/plugins/` (21
+/// chars) and a 70-char plugin name, the fixed `.lr.` (4) +
+/// `{suffix}` + `.sock` (5) overhead must total ≤16 chars to keep
+/// the full path under `SUN_PATH_MAX-1 = 107`. 6-hex gives 15
+/// chars overhead leaving 1 char of headroom; 8-hex gives 17 and
+/// would overflow at 70 chars.
+fn live_reload_successor_socket_path(
+    runtime_dir: &Path,
+    plugin_name: &str,
+) -> Result<PathBuf, String> {
+    static RELOAD_SUFFIX_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let counter = RELOAD_SUFFIX_COUNTER
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let now_low = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let suffix = (counter ^ now_low) & 0xFF_FFFF;
+    // `.lr.` (live-reload) keeps the path human-greppable in
+    // `lsof` / `ss` output without burning the budget the legacy
+    // `.live-reload.` segment cost.
+    let path = runtime_dir.join(format!("{plugin_name}.lr.{suffix:06x}.sock"));
+    let path_len = path.as_os_str().len();
+    if path_len > SUN_PATH_MAX - 1 {
+        // -1 leaves room for the NUL the kernel appends. A path
+        // exactly at SUN_PATH_MAX would have no room for NUL and
+        // is rejected.
+        return Err(format!(
+            "live-reload successor socket path is {path_len} bytes, \
+             exceeds SUN_PATH_MAX-1 ({}) on Linux. Plugin name \
+             {plugin_name:?} ({} chars) is too long for the \
+             configured runtime_dir {:?}; use a shorter name or a \
+             shorter runtime_dir (e.g. /run/evo). Path was: {}",
+            SUN_PATH_MAX - 1,
+            plugin_name.len(),
+            runtime_dir.display(),
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+/// Invoke `Plugin::load` on the given handle, emitting a debug-entry
+/// log line, calling the plugin verb, and emitting a debug-return
+/// line carrying `duration_ms` + outcome before mapping any error to
+/// [`StewardError::Admission`]. Centralises the lifecycle-verb debug
+/// shape per `docs/engineering/LOGGING.md` §2 ("each verb invocation"
+/// fires at debug). One helper used at every call site so the shape
+/// is identical across the engine, and so future fields (span ids,
+/// trace ids) attach in one place.
+async fn invoke_plugin_load(
+    handle: &mut AdmittedHandle,
+    ctx: &LoadContext,
+    plugin_name: &str,
+) -> Result<(), StewardError> {
+    tracing::debug!(
+        plugin = %plugin_name,
+        verb = "load",
+        "plugin lifecycle verb invoking"
+    );
+    let start = Instant::now();
+    let result = handle.load(ctx).await;
+    tracing::debug!(
+        plugin = %plugin_name,
+        verb = "load",
+        duration_ms = start.elapsed().as_millis() as u64,
+        outcome = if result.is_ok() { "ok" } else { "err" },
+        "plugin lifecycle verb returned"
+    );
+    result.map_err(|e| {
+        StewardError::Admission(format!("{plugin_name}: load failed: {e}"))
+    })
+}
+
+/// Invoke `Plugin::load_with_state` (the live-reload reload variant)
+/// with the same debug-entry / debug-return pair as
+/// [`invoke_plugin_load`]. Live reload is a verb invocation in its
+/// own right per the §2 contract, distinct from cold load — so the
+/// `verb` field carries `"load_with_state"` and the helper returns
+/// the raw [`PluginError`] (not wrapped in `StewardError`) because
+/// the live-reload paths handle the error themselves (rollback,
+/// happening emission, cold-reload retry).
+async fn invoke_plugin_load_with_state(
+    handle: &mut AdmittedHandle,
+    ctx: &LoadContext,
+    blob: Option<StateBlob>,
+    plugin_name: &str,
+) -> Result<(), PluginError> {
+    tracing::debug!(
+        plugin = %plugin_name,
+        verb = "load_with_state",
+        blob_present = blob.is_some(),
+        "plugin lifecycle verb invoking"
+    );
+    let start = Instant::now();
+    let result = handle.load_with_state(ctx, blob).await;
+    tracing::debug!(
+        plugin = %plugin_name,
+        verb = "load_with_state",
+        duration_ms = start.elapsed().as_millis() as u64,
+        outcome = if result.is_ok() { "ok" } else { "err" },
+        "plugin lifecycle verb returned"
+    );
+    result
+}
+
+/// Invoke `Plugin::unload` with the same debug pair. Returns the
+/// raw [`PluginError`] because the engine's unload paths handle
+/// outcomes case-by-case (warn-and-continue during reload, demote-
+/// to-debug for already-closed wires during shutdown). No error
+/// wrapping happens here.
+async fn invoke_plugin_unload(
+    handle: &mut AdmittedHandle,
+    plugin_name: &str,
+) -> Result<(), PluginError> {
+    tracing::debug!(
+        plugin = %plugin_name,
+        verb = "unload",
+        "plugin lifecycle verb invoking"
+    );
+    let start = Instant::now();
+    let result = handle.unload().await;
+    tracing::debug!(
+        plugin = %plugin_name,
+        verb = "unload",
+        duration_ms = start.elapsed().as_millis() as u64,
+        outcome = if result.is_ok() { "ok" } else { "err" },
+        "plugin lifecycle verb returned"
+    );
+    result
+}
 
 /// The admission engine.
 ///
@@ -152,6 +340,13 @@ pub struct AdmissionEngine {
     /// [`crate::context::RouterWatchScheduler`] when its
     /// manifest declares `capabilities.watches = true`.
     watches_runtime: Option<Arc<crate::watches::WatchRuntime>>,
+    /// Plugin runtime directory used by `reload_plugin` to mint
+    /// successor sockets during OOP Live reloads. Populated via
+    /// [`Self::with_plugin_runtime_dir`]; engines built without
+    /// it refuse `reload_plugin` with a structured error so the
+    /// configuration omission surfaces loudly rather than
+    /// silently disabling the verb.
+    plugin_runtime_dir: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for AdmissionEngine {
@@ -198,7 +393,18 @@ impl AdmissionEngine {
             prompt_ledger: None,
             appointments_runtime: None,
             watches_runtime: None,
+            plugin_runtime_dir: None,
         }
+    }
+
+    /// Builder-style setter for the plugin runtime directory.
+    /// Required by [`Self::reload_plugin`] for OOP Live reloads
+    /// (each successor process mints a fresh socket under this
+    /// directory). Engines built without it refuse the verb with
+    /// a structured error.
+    pub fn with_plugin_runtime_dir(mut self, dir: PathBuf) -> Self {
+        self.plugin_runtime_dir = Some(dir);
+        self
     }
 
     /// Builder-style setter for the watches-runtime handle.
@@ -446,12 +652,7 @@ impl AdmissionEngine {
             self.appointments_runtime.clone(),
             self.watches_runtime.clone(),
         )?;
-        handle.load(&ctx).await.map_err(|e| {
-            StewardError::Admission(format!(
-                "{}: load failed: {}",
-                manifest.plugin.name, e
-            ))
-        })?;
+        invoke_plugin_load(&mut handle, &ctx, &manifest.plugin.name).await?;
 
         let kind_name = handle.kind_name();
         tracing::info!(
@@ -606,12 +807,7 @@ impl AdmissionEngine {
             self.appointments_runtime.clone(),
             self.watches_runtime.clone(),
         )?;
-        handle.load(&ctx).await.map_err(|e| {
-            StewardError::Admission(format!(
-                "{}: load failed: {}",
-                manifest.plugin.name, e
-            ))
-        })?;
+        invoke_plugin_load(&mut handle, &ctx, &manifest.plugin.name).await?;
 
         let kind_name = handle.kind_name();
         tracing::info!(
@@ -795,12 +991,7 @@ impl AdmissionEngine {
         ctx.instance_announcer =
             Arc::clone(&announcer) as Arc<dyn InstanceAnnouncer>;
 
-        handle.load(&ctx).await.map_err(|e| {
-            StewardError::Admission(format!(
-                "{}: load failed: {}",
-                manifest.plugin.name, e
-            ))
-        })?;
+        invoke_plugin_load(&mut handle, &ctx, &manifest.plugin.name).await?;
 
         // Flip the announcer's load_complete flag so any
         // RetractionPolicy::StartupOnly factory starts refusing
@@ -982,12 +1173,7 @@ impl AdmissionEngine {
         ctx.instance_announcer =
             Arc::clone(&announcer) as Arc<dyn InstanceAnnouncer>;
 
-        handle.load(&ctx).await.map_err(|e| {
-            StewardError::Admission(format!(
-                "{}: load failed: {}",
-                manifest.plugin.name, e
-            ))
-        })?;
+        invoke_plugin_load(&mut handle, &ctx, &manifest.plugin.name).await?;
 
         announcer.mark_load_complete();
 
@@ -1200,12 +1386,7 @@ impl AdmissionEngine {
             None
         };
 
-        handle.load(&ctx).await.map_err(|e| {
-            StewardError::Admission(format!(
-                "{}: load failed: {}",
-                manifest.plugin.name, e
-            ))
-        })?;
+        invoke_plugin_load(&mut handle, &ctx, &manifest.plugin.name).await?;
 
         if let Some(announcer) = &factory_announcer {
             announcer.mark_load_complete();
@@ -1416,12 +1597,7 @@ impl AdmissionEngine {
             None
         };
 
-        handle.load(&ctx).await.map_err(|e| {
-            StewardError::Admission(format!(
-                "{}: load failed: {}",
-                manifest.plugin.name, e
-            ))
-        })?;
+        invoke_plugin_load(&mut handle, &ctx, &manifest.plugin.name).await?;
 
         if let Some(announcer) = &factory_announcer {
             announcer.mark_load_complete();
@@ -1756,7 +1932,6 @@ impl AdmissionEngine {
     pub async fn reload_plugin(
         &mut self,
         plugin_name: &str,
-        runtime_dir: &std::path::Path,
     ) -> Result<(), StewardError> {
         // Look up the plugin by canonical name. The router is
         // keyed by shelf; the lookup walks the admission_order.
@@ -1805,10 +1980,22 @@ impl AdmissionEngine {
                 drop(entry);
                 match plugin_dir {
                     Some(dir) => {
+                        let runtime_dir = self
+                            .plugin_runtime_dir
+                            .clone()
+                            .ok_or_else(|| {
+                                StewardError::Dispatch(
+                                "reload_plugin: engine constructed without \
+                                 a plugin runtime directory; OOP Live \
+                                 reload requires it (set via \
+                                 AdmissionEngine::with_plugin_runtime_dir \
+                                 at construction)".to_string()
+                            )
+                            })?;
                         self.reload_plugin_oop_live(
                             plugin_name,
                             &dir,
-                            runtime_dir,
+                            &runtime_dir,
                             &entry_manifest,
                         )
                         .await
@@ -1876,10 +2063,20 @@ impl AdmissionEngine {
                     );
                 }
 
+                let runtime_dir =
+                    self.plugin_runtime_dir.clone().ok_or_else(|| {
+                        StewardError::Dispatch(
+                            "reload_plugin: engine constructed without a \
+                         plugin runtime directory; OOP Restart reload \
+                         requires it (set via AdmissionEngine::\
+                         with_plugin_runtime_dir at construction)"
+                                .to_string(),
+                        )
+                    })?;
                 // Re-admit from the same directory.
                 self.admit_out_of_process_from_directory(
                     &plugin_dir,
-                    runtime_dir,
+                    &runtime_dir,
                 )
                 .await
             }
@@ -1991,12 +2188,17 @@ impl AdmissionEngine {
         };
 
         let blob_bytes = blob.as_ref().map(|b| b.payload.len()).unwrap_or(0);
-        let max_bytes = evo_plugin_sdk::contract::MAX_LIVE_RELOAD_BLOB_BYTES;
+        let max_bytes = effective_live_blob_cap(manifest);
         if blob_bytes > max_bytes {
+            let cap_source = if manifest.lifecycle.live_blob_max.is_some() {
+                "per-manifest live_blob_max"
+            } else {
+                "default 16 MiB cap"
+            };
             let reason = format!(
-                "state blob {blob_bytes} bytes exceeds framework cap of \
-                 {max_bytes} bytes; plugin must use durable persistence \
-                 for state of this size"
+                "state blob {blob_bytes} bytes exceeds {cap_source} \
+                 of {max_bytes} bytes; plugin must use durable \
+                 persistence for state of this size"
             );
             let _ = self
                 .state
@@ -2024,7 +2226,7 @@ impl AdmissionEngine {
         // plugin back even when the previous state is misbehaving,
         // so a unload error is logged for operator visibility but
         // does not short-circuit the sequence.
-        if let Err(e) = handle.unload().await {
+        if let Err(e) = invoke_plugin_unload(handle, plugin_name).await {
             tracing::warn!(
                 plugin = %plugin_name,
                 error = %e,
@@ -2051,7 +2253,9 @@ impl AdmissionEngine {
             self.watches_runtime.clone(),
         )?;
 
-        match handle.load_with_state(&ctx, blob).await {
+        match invoke_plugin_load_with_state(handle, &ctx, blob, plugin_name)
+            .await
+        {
             Ok(()) => {
                 let blob_bytes_u64 = blob_bytes as u64;
                 let _ = self
@@ -2082,7 +2286,8 @@ impl AdmissionEngine {
                     "live-reload: load_with_state failed; rolling back \
                      to cold reload"
                 );
-                if let Err(e) = handle.unload().await {
+                if let Err(e) = invoke_plugin_unload(handle, plugin_name).await
+                {
                     tracing::warn!(
                         plugin = %plugin_name,
                         error = %e,
@@ -2090,7 +2295,13 @@ impl AdmissionEngine {
                          reported error; continuing with cold reload"
                     );
                 }
-                let cold_result = handle.load_with_state(&ctx, None).await;
+                let cold_result = invoke_plugin_load_with_state(
+                    handle,
+                    &ctx,
+                    None,
+                    plugin_name,
+                )
+                .await;
                 match cold_result {
                     Ok(()) => {
                         let reason = format!(
@@ -2265,11 +2476,17 @@ impl AdmissionEngine {
         };
 
         let blob_bytes = blob.as_ref().map(|b| b.payload.len()).unwrap_or(0);
-        let max_bytes = evo_plugin_sdk::contract::MAX_LIVE_RELOAD_BLOB_BYTES;
+        let max_bytes = effective_live_blob_cap(running_manifest);
         if blob_bytes > max_bytes {
+            let cap_source =
+                if running_manifest.lifecycle.live_blob_max.is_some() {
+                    "per-manifest live_blob_max"
+                } else {
+                    "default 16 MiB cap"
+                };
             let reason = format!(
-                "state blob {blob_bytes} bytes exceeds framework cap of \
-                 {max_bytes} bytes"
+                "state blob {blob_bytes} bytes exceeds {cap_source} \
+                 of {max_bytes} bytes"
             );
             let _ = self
                 .state
@@ -2476,14 +2693,11 @@ impl AdmissionEngine {
         // socket is best-effort cleaned up after drain; if
         // anything goes wrong the next reload's `remove_file` of
         // its own per-reload path catches it.
-        let now_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let socket_path = runtime_dir.join(format!(
-            "{}.live-reload.{now_nanos}.sock",
-            manifest.plugin.name
-        ));
+        let socket_path = live_reload_successor_socket_path(
+            runtime_dir,
+            &manifest.plugin.name,
+        )
+        .map_err(|e| ("socket_setup".to_string(), e))?;
         if socket_path.exists() {
             std::fs::remove_file(&socket_path)
                 .map_err(|e| ("socket_setup".to_string(), e.to_string()))?;
@@ -3060,6 +3274,28 @@ impl AdmissionEngine {
         // Stage 4: atomic swap.
         self.state.catalogue.store(Arc::clone(&new_catalogue));
 
+        // Stage 5: re-run the orphan diagnostic against the new
+        // catalogue's declared subject types. A reload that
+        // removes a subject_type declaration without first
+        // migrating the persisted rows of that type produces
+        // exactly the same operator-visible state as a fresh
+        // boot under that catalogue: pending_grammar_orphans
+        // upserted, SubjectGrammarOrphan happenings emitted.
+        // Without this stage T3.orphan-reload (and any future
+        // hot-catalogue-evolution flow) cannot observe orphans
+        // until the next steward restart.
+        let declared_types: std::collections::HashSet<String> = new_catalogue
+            .subjects
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        crate::grammar_migration::scan_grammar_orphans(
+            &self.state.persistence,
+            &self.state.bus,
+            &declared_types,
+        )
+        .await;
+
         let _ = self
             .state
             .bus
@@ -3461,12 +3697,44 @@ impl AdmissionEngine {
             drain_active_custodies(&self.router, custody_window).await;
 
         // Stage 3: drain plugins from the router and unload in parallel.
+        // The wire-unload path is best-effort: under
+        // KillMode=control-group the plugin processes share the
+        // service cgroup and receive SIGTERM at the same instant
+        // as the steward, so by the time this stage runs the
+        // wire connection may already be torn down. Every
+        // unload error path is logged inside unload_one_plugin
+        // and surfaces via the report's clean / killed counts.
         let entries = self.router.drain_in_reverse_admission_order();
         let plugins_total = entries.len();
+        let plugin_names: Vec<String> =
+            entries.iter().map(|e| e.name.clone()).collect();
 
         let (plugins_unloaded_cleanly, plugins_killed_after_deadline) =
             parallel_unload_with_deadline(entries, config.global_deadline)
                 .await;
+
+        // Stage 4: subject-claim sweep. The framework retracts every
+        // addressing each departing plugin claimed in the subject
+        // registry. Runs after wire-unload because a graceful
+        // unload may have retracted some claims via the plugin's
+        // own unload path; the sweep finds anything that survived
+        // (the common case under KillMode=control-group, where
+        // the plugin process exits before its unload() runs)
+        // and retracts them on the plugin's behalf so the
+        // durable subjects table, the in-memory registry, the
+        // happenings bus, and the conflict index all reflect the
+        // departure consistently. Without this sweep, every
+        // restart leaves orphaned subjects that surface as
+        // catalogue-orphan diagnostics on the next boot.
+        let claims_swept =
+            drain_plugin_subject_claims(&self.state, &plugin_names).await;
+        if claims_swept > 0 {
+            tracing::info!(
+                claims_swept,
+                plugins_in_drain = plugin_names.len(),
+                "subject-claim drain complete"
+            );
+        }
 
         // Stage 5: persistence flush. Persistence stores are not in
         // this branch; future work will flush bounded queues here
@@ -4059,6 +4327,112 @@ async fn parallel_unload_with_deadline(
     (unloaded, killed)
 }
 
+/// Stage 4 of shutdown drain: walk every departing plugin's
+/// claimed addressings in the subject registry and retract each
+/// on the plugin's behalf.
+///
+/// Runs AFTER wire-unload (Stage 3) so a graceful unload that
+/// successfully retracted claims via the plugin's own
+/// `unload()` path is observed first; whatever survived gets
+/// swept here. The common case under
+/// `KillMode=control-group` (systemd's default for service
+/// units) is that plugin processes share the steward's cgroup
+/// and receive SIGTERM at the same instant — they exit before
+/// the steward's wire-unload reaches them, so their claimed
+/// addressings sit unretracted in the registry. This sweep
+/// closes that gap.
+///
+/// Each retract goes through a freshly-constructed
+/// [`RegistrySubjectAnnouncer`] tagged with the departing
+/// plugin's name so the existing retract path's full
+/// machinery — happenings emission, durable persistence
+/// mirror, conflict-index updates — fires consistently. The
+/// alternative (calling [`SubjectRegistry::retract`] directly)
+/// would skip the cascade and leave the bus / persistence
+/// layer in a half-state.
+///
+/// Errors per addressing are logged at warn level (the most
+/// common error is "did not claim", expected when a plugin
+/// race-retracted via its wire-unload path before the sweep
+/// got there) and counted; the sweep does not abort on the
+/// first error. Returns the count of successfully retracted
+/// addressings.
+///
+/// Failure mode tolerance: if no plugin claimed any addressing
+/// the sweep is a no-op (early return; no log line). The
+/// addressings query is a single registry lock acquisition
+/// per plugin, bounded by O(subjects × addressings_per_subject).
+async fn drain_plugin_subject_claims(
+    state: &Arc<crate::state::StewardState>,
+    plugin_names: &[String],
+) -> usize {
+    let mut total_retracted = 0usize;
+    for plugin in plugin_names {
+        let claimed = state.subjects.addressings_claimed_by(plugin);
+        if claimed.is_empty() {
+            tracing::debug!(
+                plugin = %plugin,
+                "drain: plugin has no surviving addressing claims; skipping"
+            );
+            continue;
+        }
+        let count = claimed.len();
+        tracing::debug!(
+            plugin = %plugin,
+            count,
+            "drain: sweeping plugin's addressing claims"
+        );
+        let announcer = crate::context::RegistrySubjectAnnouncer::new(
+            Arc::clone(&state.subjects),
+            Arc::clone(&state.relations),
+            state.current_catalogue(),
+            Arc::clone(&state.bus),
+            plugin.clone(),
+        )
+        .with_persistence(Arc::clone(&state.persistence))
+        .with_conflict_index(Arc::clone(&state.conflict_index));
+        let mut retracted = 0usize;
+        for (addressing, canonical_id) in &claimed {
+            tracing::debug!(
+                plugin = %plugin,
+                scheme = %addressing.scheme,
+                value = %addressing.value,
+                canonical_id = %canonical_id,
+                "drain: retracting addressing"
+            );
+            match announcer
+                .retract(
+                    addressing.clone(),
+                    Some("steward drain: plugin departing".to_string()),
+                )
+                .await
+            {
+                Ok(()) => {
+                    retracted += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        plugin = %plugin,
+                        scheme = %addressing.scheme,
+                        value = %addressing.value,
+                        error = %e,
+                        "drain: addressing retract failed; \
+                         continuing sweep"
+                    );
+                }
+            }
+        }
+        total_retracted += retracted;
+        tracing::info!(
+            plugin = %plugin,
+            claims_total = count,
+            claims_retracted = retracted,
+            "drain: plugin claim sweep complete"
+        );
+    }
+    total_retracted
+}
+
 // Pre-admission validation lives in `admission/validation.rs`.
 // Callers reference the helpers as
 // `validation::check_manifest_prerequisites` and
@@ -4109,6 +4483,16 @@ fn build_load_context(
     appointments_runtime: Option<Arc<crate::appointments::AppointmentRuntime>>,
     watches_runtime: Option<Arc<crate::watches::WatchRuntime>>,
 ) -> Result<LoadContext, StewardError> {
+    // Every admit path (OOP discovery, in-process programmatic,
+    // factory) routes through this builder, so creating the state
+    // + credentials directories here closes the gap where the
+    // discovery-only `ensure_plugin_state_and_credentials` helper
+    // left in-process admissions with non-existent state_dir's
+    // and silently-failing log writes.
+    crate::plugin_discovery::ensure_plugin_state_and_credentials(
+        plugin_data_root,
+        &manifest.plugin.name,
+    )?;
     let state_dir = plugin_data_root.join(&manifest.plugin.name).join("state");
     let credentials_dir = plugin_data_root
         .join(&manifest.plugin.name)
@@ -4210,6 +4594,12 @@ fn build_load_context(
         )),
         user_interaction_requester: Arc::new(
             LoggingUserInteractionRequester::new(manifest.plugin.name.clone()),
+        ),
+        happening_emitter: Arc::new(
+            crate::context::RouterHappeningEmitter::new(
+                Arc::clone(&bus),
+                manifest.plugin.name.clone(),
+            ),
         ),
         subject_announcer: Arc::new(
             RegistrySubjectAnnouncer::new(
@@ -4493,13 +4883,39 @@ target_type = "album"
     /// stores. The default plugin data root and security policy
     /// match the engine's old `new()` defaults so existing test
     /// behaviour is preserved.
+    /// Process-static plugin data root for unit tests. A fresh
+    /// tempdir owned by a `OnceLock` so every test in the binary
+    /// shares a writable root without races on creation. The
+    /// production default `/var/lib/evo/plugins` is unwritable by
+    /// the test runner; pointing `AdmissionEngine` at this writable
+    /// root lets `build_load_context`'s state + credentials dir
+    /// creation succeed without poking at the production path.
+    /// Tests that need isolation between plugin names can either
+    /// use unique plugin names (the common case) or build their
+    /// own engine directly with a per-test tempdir.
+    fn test_plugin_data_root() -> PathBuf {
+        use std::sync::OnceLock;
+        static ROOT: OnceLock<PathBuf> = OnceLock::new();
+        ROOT.get_or_init(|| {
+            // The TempDir is intentionally leaked: it lives for the
+            // process. Tests don't enumerate the dir themselves;
+            // they admit plugins by unique name.
+            let dir = tempfile::tempdir()
+                .expect("test_plugin_data_root: cannot create tempdir");
+            let p = dir.path().to_path_buf();
+            std::mem::forget(dir);
+            p
+        })
+        .clone()
+    }
+
     fn test_engine_from_catalogue(
         catalogue: Arc<Catalogue>,
     ) -> AdmissionEngine {
         let state = StewardState::for_tests_with_catalogue(catalogue);
         AdmissionEngine::new(
             state,
-            PathBuf::from(crate::config::DEFAULT_PLUGIN_DATA_ROOT),
+            test_plugin_data_root(),
             std::path::PathBuf::new(),
             None,
             PluginsSecurityConfig::default(),
@@ -4520,7 +4936,7 @@ target_type = "album"
     fn engine_with_state(state: Arc<StewardState>) -> AdmissionEngine {
         AdmissionEngine::new(
             state,
-            PathBuf::from(crate::config::DEFAULT_PLUGIN_DATA_ROOT),
+            test_plugin_data_root(),
             std::path::PathBuf::new(),
             None,
             PluginsSecurityConfig::default(),
@@ -4536,7 +4952,7 @@ target_type = "album"
         let state = StewardState::for_tests_with_catalogue(catalogue);
         AdmissionEngine::new(
             state,
-            PathBuf::from(crate::config::DEFAULT_PLUGIN_DATA_ROOT),
+            test_plugin_data_root(),
             std::path::PathBuf::new(),
             Some(trust),
             PluginsSecurityConfig::default(),
@@ -4605,10 +5021,8 @@ response_budget_ms = 1000
     async fn reload_plugin_refuses_unknown_name() {
         let catalogue = test_catalogue();
         let mut engine = test_engine_from_catalogue(Arc::clone(&catalogue));
-        let runtime_dir = tempfile::tempdir().unwrap();
-        let r = engine
-            .reload_plugin("org.test.never-admitted", runtime_dir.path())
-            .await;
+        let _runtime_dir = tempfile::tempdir().unwrap();
+        let r = engine.reload_plugin("org.test.never-admitted").await;
         match r {
             Err(StewardError::Dispatch(msg)) => {
                 assert!(
@@ -4639,10 +5053,8 @@ response_budget_ms = 1000
             .await
             .unwrap();
 
-        let runtime_dir = tempfile::tempdir().unwrap();
-        let r = engine
-            .reload_plugin("org.test.ping", runtime_dir.path())
-            .await;
+        let _runtime_dir = tempfile::tempdir().unwrap();
+        let r = engine.reload_plugin("org.test.ping").await;
         match r {
             Err(StewardError::Dispatch(msg)) => {
                 assert!(
@@ -4872,9 +5284,9 @@ response_budget_ms = 1000
             .await
             .unwrap();
 
-        let runtime_dir = tempfile::tempdir().unwrap();
+        let _runtime_dir = tempfile::tempdir().unwrap();
         engine
-            .reload_plugin("org.test.ping", runtime_dir.path())
+            .reload_plugin("org.test.ping")
             .await
             .expect("live reload should succeed");
 
@@ -4914,9 +5326,9 @@ response_budget_ms = 1000
             .await
             .unwrap();
 
-        let runtime_dir = tempfile::tempdir().unwrap();
+        let _runtime_dir = tempfile::tempdir().unwrap();
         engine
-            .reload_plugin("org.test.ping", runtime_dir.path())
+            .reload_plugin("org.test.ping")
             .await
             .expect("live reload with empty state should succeed");
 
@@ -4950,10 +5362,8 @@ response_budget_ms = 1000
             .await
             .unwrap();
 
-        let runtime_dir = tempfile::tempdir().unwrap();
-        let r = engine
-            .reload_plugin("org.test.ping", runtime_dir.path())
-            .await;
+        let _runtime_dir = tempfile::tempdir().unwrap();
+        let r = engine.reload_plugin("org.test.ping").await;
         match r {
             Err(StewardError::Dispatch(msg)) => {
                 assert!(
@@ -4992,10 +5402,8 @@ response_budget_ms = 1000
             .await
             .unwrap();
 
-        let runtime_dir = tempfile::tempdir().unwrap();
-        let r = engine
-            .reload_plugin("org.test.ping", runtime_dir.path())
-            .await;
+        let _runtime_dir = tempfile::tempdir().unwrap();
+        let r = engine.reload_plugin("org.test.ping").await;
         match r {
             Err(StewardError::Dispatch(msg)) => {
                 assert!(
@@ -8831,6 +9239,7 @@ instance_ttl_seconds = 60
             subject_type: "test.ping".into(),
             addressings: vec![addressing.clone()],
             claims: Vec::new(),
+            state: serde_json::Value::Null,
             announced_at: std::time::SystemTime::now(),
         };
         engine
@@ -8920,6 +9329,7 @@ instance_ttl_seconds = 60
                 "/library/track-1.flac",
             )],
             claims: Vec::new(),
+            state: serde_json::Value::Null,
             announced_at: std::time::SystemTime::now(),
         };
         engine
@@ -8961,5 +9371,120 @@ instance_ttl_seconds = 60
                 });
             assert_eq!(engine.len(), 1);
         }
+    }
+
+    #[test]
+    fn live_blob_cap_unset_uses_default() {
+        let m = test_manifest("org.test.cap");
+        assert_eq!(m.lifecycle.live_blob_max, None);
+        assert_eq!(effective_live_blob_cap(&m), DEFAULT_LIVE_RELOAD_BLOB_BYTES);
+    }
+
+    #[test]
+    fn live_blob_cap_set_below_max_passes_through() {
+        let mut m = test_manifest("org.test.cap");
+        m.lifecycle.live_blob_max = Some(32 * 1024 * 1024);
+        assert_eq!(effective_live_blob_cap(&m), 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn live_blob_cap_set_above_hard_ceiling_clamps() {
+        let mut m = test_manifest("org.test.cap");
+        m.lifecycle.live_blob_max = Some(256 * 1024 * 1024);
+        assert_eq!(
+            effective_live_blob_cap(&m),
+            MAX_LIVE_RELOAD_BLOB_BYTES,
+            "manifest asking for more than the hard ceiling clamps down"
+        );
+    }
+
+    #[test]
+    fn live_blob_cap_set_at_hard_ceiling_passes_through() {
+        let mut m = test_manifest("org.test.cap");
+        m.lifecycle.live_blob_max = Some(MAX_LIVE_RELOAD_BLOB_BYTES as u64);
+        assert_eq!(effective_live_blob_cap(&m), MAX_LIVE_RELOAD_BLOB_BYTES);
+    }
+
+    #[test]
+    fn live_blob_cap_zero_is_a_zero_cap() {
+        let mut m = test_manifest("org.test.cap");
+        m.lifecycle.live_blob_max = Some(0);
+        assert_eq!(
+            effective_live_blob_cap(&m),
+            0,
+            "zero is a deliberate operator choice — refuse any non-empty \
+             blob — and the helper preserves it"
+        );
+    }
+
+    #[test]
+    fn live_reload_socket_path_typical_plugin_name_fits() {
+        let path = live_reload_successor_socket_path(
+            Path::new("/var/run/evo/plugins"),
+            "org.evoframework.acceptance.reload-plugin-raised-cap",
+        )
+        .expect("typical 52-char name must fit on /var/run/evo");
+        assert!(
+            path.as_os_str().len() < SUN_PATH_MAX,
+            "{} bytes >= SUN_PATH_MAX={}",
+            path.as_os_str().len(),
+            SUN_PATH_MAX
+        );
+        // Suffix scheme: `.lr.` + 8 hex + `.sock`.
+        let s = path.to_string_lossy();
+        assert!(s.contains(".lr."), "missing .lr. segment in {s}");
+        assert!(s.ends_with(".sock"), "missing .sock suffix in {s}");
+    }
+
+    #[test]
+    fn live_reload_socket_path_uniques_within_one_process() {
+        // Two consecutive calls with the same inputs must produce
+        // different paths. The atomic counter alone guarantees this;
+        // the wall-clock XOR is just for cross-process diffusion.
+        let a = live_reload_successor_socket_path(
+            Path::new("/var/run/evo/plugins"),
+            "org.test.example",
+        )
+        .unwrap();
+        let b = live_reload_successor_socket_path(
+            Path::new("/var/run/evo/plugins"),
+            "org.test.example",
+        )
+        .unwrap();
+        assert_ne!(a, b, "consecutive calls must produce distinct paths");
+    }
+
+    #[test]
+    fn live_reload_socket_path_refuses_overlong_name_with_clear_error() {
+        let very_long_name = "a".repeat(120);
+        let err = live_reload_successor_socket_path(
+            Path::new("/var/run/evo/plugins"),
+            &very_long_name,
+        )
+        .expect_err("overlong name must be rejected");
+        assert!(
+            err.contains("SUN_PATH_MAX"),
+            "error must name the constraint; got {err}"
+        );
+        assert!(
+            err.contains("120"),
+            "error must surface the offending name length; got {err}"
+        );
+    }
+
+    #[test]
+    fn live_reload_socket_path_supports_seventy_char_names_on_var_run_evo() {
+        // Engineering target: any reverse-DNS plugin name up to
+        // 70 chars must succeed on `/var/run/evo` (the systemd
+        // default on the project's primary target). 70 chars is
+        // ~10 chars of headroom over the typical reverse-DNS
+        // length of org.<vendor>.<product>.<role> ~ 60 chars.
+        let seventy = "o".repeat(70);
+        let path = live_reload_successor_socket_path(
+            Path::new("/var/run/evo/plugins"),
+            &seventy,
+        )
+        .expect("70-char name must fit on /var/run/evo per the bound");
+        assert!(path.as_os_str().len() < SUN_PATH_MAX);
     }
 }

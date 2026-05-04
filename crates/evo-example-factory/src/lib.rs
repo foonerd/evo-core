@@ -111,6 +111,11 @@ impl Plugin for ExampleFactoryPlugin {
         ctx: &'a LoadContext,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         async move {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                verb = "load",
+                "plugin verb invoking"
+            );
             tracing::info!(plugin = PLUGIN_NAME, "plugin load");
             for id in INSTANCE_IDS {
                 let announcement =
@@ -133,6 +138,11 @@ impl Plugin for ExampleFactoryPlugin {
         &mut self,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
         async move {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                verb = "unload",
+                "plugin verb invoking"
+            );
             tracing::info!(
                 plugin = PLUGIN_NAME,
                 requests = self.request_count,
@@ -145,6 +155,11 @@ impl Plugin for ExampleFactoryPlugin {
 
     fn health_check(&self) -> impl Future<Output = HealthReport> + Send + '_ {
         async move {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                verb = "health_check",
+                "plugin verb invoking"
+            );
             if self.loaded {
                 HealthReport::healthy()
             } else {
@@ -169,6 +184,14 @@ impl Respondent for ExampleFactoryPlugin {
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {
+            tracing::debug!(
+                plugin = PLUGIN_NAME,
+                verb = "handle_request",
+                request_type = %req.request_type,
+                cid = req.correlation_id,
+                bytes = req.payload.len(),
+                "plugin verb invoking"
+            );
             if !self.loaded {
                 return Err(PluginError::Permanent(
                     "factory plugin not loaded".to_string(),

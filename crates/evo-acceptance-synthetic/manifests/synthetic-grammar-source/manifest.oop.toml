@@ -1,0 +1,54 @@
+# Synthetic grammar-migration source plugin — out-of-process bundle
+# manifest.
+#
+# Admits as a singleton respondent on the synthetic
+# `acceptance.grammar-source` shelf. On load, announces N subjects
+# of type `acceptance.track-v1` with deterministic addressings
+# (`acc-track:N`, N ∈ [0, count)). The count is read from the
+# environment variable `EVO_ACCEPTANCE_GRAMMAR_COUNT` (default
+# 100); the same plugin binary covers the 100 / 1000 / 50000
+# scenarios with only a systemd drop-in changing the count.
+#
+# Used by T2.grammar-orphans-rename, T2.grammar-orphans-bulk-50k,
+# T2.grammar-orphans-resume-after-crash, T3.orphan-reload.
+# Has no value outside those scenarios.
+
+[plugin]
+name = "org.evoframework.acceptance.synthetic-grammar-source"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.grammar-source"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 64
+max_cpu_percent = 5
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities.respondent]
+request_types = ["never_called"]
+response_budget_ms = 1000

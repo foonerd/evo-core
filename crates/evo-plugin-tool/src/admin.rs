@@ -32,17 +32,22 @@ pub const DEFAULT_SOCKET_PATH: &str = "/run/evo/evo.sock";
 
 /// Hard cap on a single response frame. Mirrors the steward's
 /// frame-size cap so a runaway peer cannot exhaust the tool's
-/// memory while reading.
-const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+/// memory while reading. Pinned to the framework's hard ceiling
+/// on `prepare_for_live_reload` state blobs so admin verbs that
+/// proxy plugin lifecycle (e.g. reload-plugin) inherit the same
+/// envelope cap.
+const MAX_FRAME_SIZE: usize =
+    evo_plugin_sdk::contract::MAX_LIVE_RELOAD_BLOB_BYTES;
 
 /// Per-call deadline. Operator-issued admin ops are bounded
-/// operations (a plugin drain at most takes the steward's
-/// shutdown deadline); 30s is generous and surfaces a runtime
-/// hang as a structured timeout rather than the operator
-/// staring at a wedged terminal.
-const CALL_DEADLINE_SECS: u64 = 30;
+/// operations; 180 s covers the worst-case bounded operation
+/// (bulk grammar migration over a 50 k subject set) while still
+/// surfacing a true runtime hang as a structured timeout rather
+/// than the operator staring at a wedged terminal.
+const CALL_DEADLINE_SECS: u64 = 180;
 
 /// Source for the new manifest in the reload verbs.
+#[derive(Debug)]
 pub enum ReloadSource {
     Inline(String),
     Path(PathBuf),
@@ -93,6 +98,437 @@ pub fn uninstall(
     });
     let resp = call(socket, req)?;
     print_lifecycle_outcome(&resp)
+}
+
+/// Run the `describe-capabilities` subcommand. Sends
+/// `op = "describe_capabilities"` and prints the steward's
+/// `Capabilities` response.
+pub fn describe_capabilities(socket: &Path) -> Result<(), anyhow::Error> {
+    let req = serde_json::json!({"op": "describe_capabilities"});
+    let resp = call_with_caps(socket, &[], req)?;
+    print_describe_capabilities(&resp)
+}
+
+/// Run the `subscribe-happenings` streaming subcommand.
+///
+/// Connects, sends a `subscribe_happenings` op with the optional
+/// filter dimensions and `since` cursor, reads the
+/// `Subscribed { current_seq }` ack, then loops reading streamed
+/// `Happening { seq, happening }` frames. One JSON line per
+/// happening on stdout. Exits after `max_count` events OR
+/// `duration_secs` elapsed, whichever comes first. The first line
+/// of output is a structured ack: `subscribed: { current_seq: N }`.
+#[allow(clippy::too_many_arguments)]
+pub fn subscribe_happenings(
+    socket: &Path,
+    max_count: u64,
+    duration_secs: u64,
+    since: Option<u64>,
+    variants: Option<&str>,
+    plugins: Option<&str>,
+    shelves: Option<&str>,
+    coalesce_labels: Option<&str>,
+    coalesce_window_ms: Option<u32>,
+) -> Result<(), anyhow::Error> {
+    let socket = socket.to_path_buf();
+    let variants_vec = parse_csv_filter(variants);
+    let plugins_vec = parse_csv_filter(plugins);
+    let shelves_vec = parse_csv_filter(shelves);
+    let coalesce_labels_vec = parse_csv_filter(coalesce_labels);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let mut stream =
+            UnixStream::connect(&socket).await.with_context(|| {
+                format!("connecting to steward socket {}", socket.display())
+            })?;
+        // Build subscribe request. Filter dimensions are optional;
+        // empty arrays match the steward's no-op-filter shape.
+        let mut req = serde_json::json!({
+            "op": "subscribe_happenings",
+            "filter": {
+                "variants": variants_vec,
+                "plugins": plugins_vec,
+                "shelves": shelves_vec,
+            },
+        });
+        if let Some(seq) = since {
+            req["since"] = serde_json::json!(seq);
+        }
+        if !coalesce_labels_vec.is_empty() {
+            let mut coalesce = serde_json::json!({
+                "labels": coalesce_labels_vec,
+            });
+            if let Some(ms) = coalesce_window_ms {
+                coalesce["window_ms"] = serde_json::json!(ms);
+            }
+            req["coalesce"] = coalesce;
+        }
+        write_frame(&mut stream, &req).await?;
+
+        // Read the Subscribed ack.
+        let ack = read_frame(&mut stream).await?;
+        if let Some(err) = ack.get("error") {
+            return Err(format_error("subscribe_happenings", err));
+        }
+        let current_seq =
+            ack.get("current_seq").and_then(Value::as_u64).unwrap_or(0);
+        println!("{{\"subscribed\":true,\"current_seq\":{current_seq}}}");
+
+        // Stream events. Bounded by max_count + duration_secs.
+        let deadline =
+            std::time::Instant::now() + Duration::from_secs(duration_secs);
+        let mut received: u64 = 0;
+        while received < max_count {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline - now;
+            match tokio::time::timeout(remaining, read_frame(&mut stream)).await
+            {
+                Ok(Ok(frame)) => {
+                    if let Some(err) = frame.get("error") {
+                        return Err(format_error(
+                            "subscribe_happenings (stream)",
+                            err,
+                        ));
+                    }
+                    println!(
+                        "{}",
+                        serde_json::to_string(&frame).unwrap_or_else(|_| {
+                            "{\"error\":\"failed-to-serialise-frame\"}"
+                                .to_string()
+                        })
+                    );
+                    received += 1;
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => break, // duration timeout
+            }
+        }
+        eprintln!(
+            "subscribe-happenings: exit after {received} events / {} elapsed",
+            duration_secs
+        );
+        Ok(())
+    })
+}
+
+fn parse_csv_filter(input: Option<&str>) -> Vec<String> {
+    input
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Run the `warden fast-path-dispatch` subcommand. Connects to
+/// the steward's Fast Path UDS socket, sends a length-prefixed
+/// CBOR `FastPathRequest::Dispatch` frame, reads the response.
+/// Exit code reflects the dispatch outcome: Ok on `Dispatched`,
+/// Err on a structured `Error` response (verb-gate refusal,
+/// budget exceeded, no active custody, etc.).
+pub fn warden_fast_path_dispatch(
+    socket: &Path,
+    shelf: &str,
+    verb: &str,
+    handle_id: &str,
+    handle_started_at_ms: u64,
+    payload_b64: &str,
+    deadline_ms: Option<u32>,
+) -> Result<(), anyhow::Error> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    let payload = if payload_b64.is_empty() {
+        Vec::new()
+    } else {
+        B64.decode(payload_b64).context("decoding --payload-b64")?
+    };
+    let socket = socket.to_path_buf();
+    let shelf = shelf.to_string();
+    let verb = verb.to_string();
+    let handle_id = handle_id.to_string();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let req = evo::fast_path::FastPathRequest::Dispatch {
+            cid: 1,
+            shelf,
+            verb: verb.clone(),
+            payload,
+            handle_id: handle_id.clone(),
+            handle_started_at_ms,
+            deadline_ms,
+        };
+        let payload_bytes = evo_plugin_sdk::codec::encode_cbor_value(&req)
+            .map_err(|e| anyhow::anyhow!("encoding request: {e}"))?;
+        let mut stream =
+            UnixStream::connect(&socket).await.with_context(|| {
+                format!("connecting to fast-path socket {}", socket.display())
+            })?;
+        let len = (payload_bytes.len() as u32).to_be_bytes();
+        stream.write_all(&len).await?;
+        stream.write_all(&payload_bytes).await?;
+        let mut len_bytes = [0u8; 4];
+        stream.read_exact(&mut len_bytes).await?;
+        let size = u32::from_be_bytes(len_bytes) as usize;
+        if size > 64 * 1024 {
+            return Err(anyhow::anyhow!(
+                "fast-path response frame too large: {size} bytes"
+            ));
+        }
+        let mut buf = vec![0u8; size];
+        stream.read_exact(&mut buf).await?;
+        let resp: evo::fast_path::FastPathResponse =
+            evo_plugin_sdk::codec::decode_cbor_value(&buf)
+                .map_err(|e| anyhow::anyhow!("decoding response: {e}"))?;
+        match resp {
+            evo::fast_path::FastPathResponse::Dispatched { cid } => {
+                println!("fast-path dispatch accepted:");
+                println!("  cid:     {cid}");
+                println!("  verb:    {verb}");
+                println!("  handle:  {handle_id}");
+                Ok(())
+            }
+            evo::fast_path::FastPathResponse::Error {
+                cid,
+                class,
+                subclass,
+                message,
+            } => Err(anyhow::anyhow!(
+                "fast_path_dispatch refused: cid={cid} class={class} \
+                 subclass={subclass} message={message}"
+            )),
+        }
+    })
+}
+
+/// Run the bundled `warden course-correct` subcommand.
+///
+/// One-shot custody flow: `take_custody` to mint a handle, then
+/// `course_correct` with the supplied verb + payload, then
+/// `release_custody` to clean up. Exit code reflects the
+/// course-correction's outcome — Ok on accepted, Err on the
+/// framework's structured refusal (verb-gate, etc.).
+/// Take + release are best-effort: failures are logged but do
+/// not flip the exit code, since the test posture is "did the
+/// course-correction succeed or refuse?"
+pub fn warden_course_correct(
+    socket: &Path,
+    shelf: &str,
+    custody_type: &str,
+    custody_payload_b64: &str,
+    verb: &str,
+    payload_b64: &str,
+) -> Result<(), anyhow::Error> {
+    // Stage 1: take_custody. Refusal here is fatal — without a
+    // handle we can't even attempt the correction.
+    let take_req = serde_json::json!({
+        "op": "take_custody",
+        "shelf": shelf,
+        "custody_type": custody_type,
+        "payload_b64": custody_payload_b64,
+    });
+    let take_resp = call_with_caps(socket, &[], take_req)?;
+    if let Some(err) = take_resp.get("error") {
+        return Err(format_error("take_custody", err));
+    }
+    let handle = take_resp.get("handle").cloned().ok_or_else(|| {
+        anyhow::anyhow!("take_custody: response missing `handle` field")
+    })?;
+
+    // Stage 2: course_correct. This is the test's primary
+    // outcome.
+    let cc_req = serde_json::json!({
+        "op": "course_correct",
+        "shelf": shelf,
+        "handle": handle,
+        "correction_type": verb,
+        "payload_b64": payload_b64,
+    });
+    let cc_resp = call_with_caps(socket, &[], cc_req)?;
+    let cc_outcome = if let Some(err) = cc_resp.get("error") {
+        Err(format_error("course_correct", err))
+    } else {
+        let handle_id = cc_resp
+            .get("handle_id")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        println!("course correction accepted:");
+        println!("  shelf:     {shelf}");
+        println!("  handle:    {handle_id}");
+        println!("  verb:      {verb}");
+        Ok(())
+    };
+
+    // Stage 3: release_custody. Best-effort.
+    let rel_req = serde_json::json!({
+        "op": "release_custody",
+        "shelf": shelf,
+        "handle": handle,
+    });
+    if let Ok(rel_resp) = call_with_caps(socket, &[], rel_req) {
+        if let Some(err) = rel_resp.get("error") {
+            eprintln!(
+                "release_custody (best-effort): {}",
+                err.get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(no message)")
+            );
+        }
+    }
+
+    cc_outcome
+}
+
+/// Run the `warden take-custody` subcommand. Sends `take_custody`
+/// and prints the warden-minted handle to stdout in
+/// shell-friendly `key=value` form so a script can capture and
+/// pass `handle_id` / `handle_started_at_ms` to a follow-up
+/// `fast-path-dispatch` or `release-custody` call.
+pub fn warden_take_custody(
+    socket: &Path,
+    shelf: &str,
+    custody_type: &str,
+    custody_payload_b64: &str,
+) -> Result<(), anyhow::Error> {
+    let req = serde_json::json!({
+        "op": "take_custody",
+        "shelf": shelf,
+        "custody_type": custody_type,
+        "payload_b64": custody_payload_b64,
+    });
+    let resp = call_with_caps(socket, &[], req)?;
+    if let Some(err) = resp.get("error") {
+        return Err(format_error("take_custody", err));
+    }
+    let handle = resp.get("handle").ok_or_else(|| {
+        anyhow::anyhow!("take_custody: response missing `handle` field")
+    })?;
+    let handle_id =
+        handle.get("id").and_then(Value::as_str).ok_or_else(|| {
+            anyhow::anyhow!("take_custody: handle missing `id` field")
+        })?;
+    // CustodyHandle.started_at serialises as a SystemTime serde
+    // shape (`secs_since_epoch` + `nanos_since_epoch`). Convert
+    // to wall-clock milliseconds so the operator script can pass
+    // it verbatim to follow-up verbs that take ms.
+    let secs = handle
+        .get("started_at")
+        .and_then(|s| s.get("secs_since_epoch"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "take_custody: handle.started_at missing secs_since_epoch"
+            )
+        })?;
+    let nanos = handle
+        .get("started_at")
+        .and_then(|s| s.get("nanos_since_epoch"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let started_at_ms = secs.saturating_mul(1_000) + nanos / 1_000_000;
+    println!("custody taken:");
+    println!("  shelf={shelf}");
+    println!("  handle_id={handle_id}");
+    println!("  handle_started_at_ms={started_at_ms}");
+    Ok(())
+}
+
+/// Run the `warden release-custody` subcommand. Counterpart to
+/// `take-custody`; sends `release_custody` and prints a brief
+/// confirmation. The bundled `course-correct` verb releases
+/// automatically; this verb is for scripts driving the
+/// held-handle flow (fast-path, multi-step).
+pub fn warden_release_custody(
+    socket: &Path,
+    shelf: &str,
+    handle_id: &str,
+    handle_started_at_ms: u64,
+) -> Result<(), anyhow::Error> {
+    // Reconstruct the SystemTime serde shape the steward expects.
+    let secs = handle_started_at_ms / 1_000;
+    let nanos = (handle_started_at_ms % 1_000) * 1_000_000;
+    let req = serde_json::json!({
+        "op": "release_custody",
+        "shelf": shelf,
+        "handle": {
+            "id": handle_id,
+            "started_at": {
+                "secs_since_epoch": secs,
+                "nanos_since_epoch": nanos,
+            },
+        },
+    });
+    let resp = call_with_caps(socket, &[], req)?;
+    if let Some(err) = resp.get("error") {
+        return Err(format_error("release_custody", err));
+    }
+    println!("custody released:");
+    println!("  shelf={shelf}");
+    println!("  handle_id={handle_id}");
+    Ok(())
+}
+
+/// Run the `reload-plugin` subcommand. Sends
+/// `op = "reload_plugin"` and prints the steward's
+/// `PluginReloaded` response.
+pub fn reload_plugin(socket: &Path, plugin: &str) -> Result<(), anyhow::Error> {
+    let req = serde_json::json!({
+        "op": "reload_plugin",
+        "plugin": plugin,
+    });
+    let resp = call(socket, req)?;
+    print_plugin_reload(&resp)
+}
+
+/// Run the `prompt list` subcommand. Sends
+/// `op = "list_user_interactions"` and prints one line per open
+/// prompt. Requires the `user_interaction_responder` capability.
+pub fn prompt_list(socket: &Path) -> Result<(), anyhow::Error> {
+    let req = serde_json::json!({"op": "list_user_interactions"});
+    let resp = call_with_caps(socket, &["user_interaction_responder"], req)?;
+    print_prompt_list(&resp)
+}
+
+/// Run the `prompt answer-text` subcommand. Sends a Text-shaped
+/// `answer_user_interaction` and prints the result.
+pub fn prompt_answer_text(
+    socket: &Path,
+    plugin: &str,
+    prompt_id: &str,
+    value: &str,
+) -> Result<(), anyhow::Error> {
+    let req = serde_json::json!({
+        "op": "answer_user_interaction",
+        "plugin": plugin,
+        "prompt_id": prompt_id,
+        "response": {"kind": "text", "value": value},
+    });
+    let resp = call_with_caps(socket, &["user_interaction_responder"], req)?;
+    print_prompt_answer(&resp)
+}
+
+/// Run the `prompt cancel` subcommand. Sends
+/// `cancel_user_interaction` and prints the result.
+pub fn prompt_cancel(
+    socket: &Path,
+    plugin: &str,
+    prompt_id: &str,
+) -> Result<(), anyhow::Error> {
+    let req = serde_json::json!({
+        "op": "cancel_user_interaction",
+        "plugin": plugin,
+        "prompt_id": prompt_id,
+    });
+    let resp = call_with_caps(socket, &["user_interaction_responder"], req)?;
+    print_prompt_cancel(&resp)
 }
 
 /// Run the `purge-state` subcommand.
@@ -568,6 +1004,151 @@ fn find_plugin_entry<'a>(list: &'a Value, plugin: &str) -> Option<&'a Value> {
         .as_array()?
         .iter()
         .find(|entry| entry.get("name").and_then(Value::as_str) == Some(plugin))
+}
+
+/// Print a `UserInteractions` reply.
+fn print_prompt_list(resp: &Value) -> Result<(), anyhow::Error> {
+    if let Some(err) = resp.get("error") {
+        return Err(format_error("list_user_interactions", err));
+    }
+    let prompts =
+        resp.get("prompts")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "list_user_interactions: response missing `prompts` array"
+                )
+            })?;
+    if prompts.is_empty() {
+        println!("(no open prompts)");
+        return Ok(());
+    }
+    println!("open prompts:");
+    for entry in prompts {
+        let plugin = entry.get("plugin").and_then(Value::as_str).unwrap_or("?");
+        let prompt = entry.get("prompt").cloned().unwrap_or(Value::Null);
+        let prompt_id = prompt
+            .get("prompt_id")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let kind = prompt
+            .get("prompt_type")
+            .and_then(|t| t.get("kind"))
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        println!("  plugin={plugin} prompt_id={prompt_id} kind={kind}");
+    }
+    Ok(())
+}
+
+/// Print an `UserInteractionAnswered` reply.
+fn print_prompt_answer(resp: &Value) -> Result<(), anyhow::Error> {
+    if let Some(err) = resp.get("error") {
+        return Err(format_error("answer_user_interaction", err));
+    }
+    let plugin = resp
+        .get("plugin")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let prompt_id = resp
+        .get("prompt_id")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let answered = resp
+        .get("answered")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    println!("prompt answered:");
+    println!("  plugin:    {plugin}");
+    println!("  prompt_id: {prompt_id}");
+    println!("  answered:  {answered}");
+    Ok(())
+}
+
+/// Print an `UserInteractionCancelled` reply.
+fn print_prompt_cancel(resp: &Value) -> Result<(), anyhow::Error> {
+    if let Some(err) = resp.get("error") {
+        return Err(format_error("cancel_user_interaction", err));
+    }
+    let plugin = resp
+        .get("plugin")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let prompt_id = resp
+        .get("prompt_id")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let cancelled = resp
+        .get("cancelled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    println!("prompt cancelled:");
+    println!("  plugin:    {plugin}");
+    println!("  prompt_id: {prompt_id}");
+    println!("  cancelled: {cancelled}");
+    Ok(())
+}
+
+/// Print a `PluginReloaded` reply.
+fn print_plugin_reload(resp: &Value) -> Result<(), anyhow::Error> {
+    if let Some(err) = resp.get("error") {
+        return Err(format_error("reload_plugin", err));
+    }
+    let plugin = resp
+        .get("plugin")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let reloaded = resp
+        .get("plugin_reload")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    println!("plugin reloaded:");
+    println!("  plugin:   {plugin}");
+    println!("  reloaded: {reloaded}");
+    Ok(())
+}
+
+/// Print a `Capabilities` reply.
+fn print_describe_capabilities(resp: &Value) -> Result<(), anyhow::Error> {
+    if let Some(err) = resp.get("error") {
+        return Err(format_error("describe_capabilities", err));
+    }
+    let wire_version = resp
+        .get("wire_version")
+        .and_then(Value::as_u64)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let catalogue_source = resp
+        .get("catalogue_source")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let clock_trust = resp
+        .get("clock_trust")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let has_battery_rtc = resp
+        .get("has_battery_rtc")
+        .and_then(Value::as_bool)
+        .map(|b| b.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let ops_count = resp
+        .get("ops")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let features_count = resp
+        .get("features")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    println!("steward capabilities:");
+    println!("  wire_version:     {wire_version}");
+    println!("  catalogue_source: {catalogue_source}");
+    println!("  clock_trust:      {clock_trust}");
+    println!("  has_battery_rtc:  {has_battery_rtc}");
+    println!("  ops:              {ops_count} entries");
+    println!("  features:         {features_count} entries");
+    Ok(())
 }
 
 /// Print a `PluginLifecycle` reply.

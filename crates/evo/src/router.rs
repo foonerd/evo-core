@@ -689,6 +689,20 @@ impl PluginRouter {
         shelf: &str,
         mut request: Request,
     ) -> Result<Response, StewardError> {
+        // Per `docs/engineering/LOGGING.md` §2: every verb
+        // invocation emits debug. The router is the cross-plugin
+        // dispatch entry — every framework-mediated request from
+        // operator → plugin or plugin → plugin lands here. The
+        // payload body is excluded; consumers needing it filter
+        // by cid and inspect downstream debug logs in the
+        // plugin's wire-side announcer / handler.
+        tracing::debug!(
+            shelf = %shelf,
+            request_type = %request.request_type,
+            cid = request.correlation_id,
+            payload_len = request.payload.len(),
+            "router::handle_request: dispatching"
+        );
         let entry = self.lookup(shelf).ok_or_else(|| {
             StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
         })?;
@@ -802,10 +816,31 @@ impl PluginRouter {
                     )));
                 }
             };
-            warden
+            // Per LOGGING.md §2 (each verb invocation fires at debug):
+            // entry-debug for the warden's take_custody verb. The
+            // happening + info-level lifecycle line lands further
+            // down once the ledger row is written.
+            tracing::debug!(
+                plugin = %plugin_name,
+                shelf = %shelf_qualified,
+                custody_type = %custody_type_for_ledger,
+                cid = correlation_id,
+                "warden verb invoking" // verb: take_custody
+            );
+            let take_start = Instant::now();
+            let result = warden
                 .take_custody(assignment)
                 .await
-                .map_err(StewardError::from)?
+                .map_err(StewardError::from);
+            tracing::debug!(
+                plugin = %plugin_name,
+                shelf = %shelf_qualified,
+                cid = correlation_id,
+                duration_ms = take_start.elapsed().as_millis() as u64,
+                outcome = if result.is_ok() { "ok" } else { "err" },
+                "warden verb returned" // verb: take_custody
+            );
+            result?
         };
 
         ledger
@@ -1066,6 +1101,17 @@ impl PluginRouter {
             }
         };
 
+        // Per LOGGING.md §2: course_correct is a verb invocation;
+        // bracket with debug entry/return.
+        tracing::debug!(
+            shelf = %shelf,
+            handle_id = %handle.id,
+            correction_type = %correction.correction_type,
+            cid = correction.correlation_id,
+            deadline_ms = ?deadline_ms,
+            "warden verb invoking" // verb: course_correct
+        );
+        let cc_start = Instant::now();
         let result = match deadline_ms {
             Some(ms) => {
                 let dur = std::time::Duration::from_millis(u64::from(ms));
@@ -1091,6 +1137,12 @@ impl PluginRouter {
                 .await
                 .map_err(Into::into),
         };
+        tracing::debug!(
+            shelf = %shelf,
+            duration_ms = cc_start.elapsed().as_millis() as u64,
+            outcome = if result.is_ok() { "ok" } else { "err" },
+            "warden verb returned" // verb: course_correct
+        );
 
         // Drop the per-entry lock before any further .await
         // work (ledger mark + bus emit). The handle guard is no
@@ -1198,10 +1250,28 @@ impl PluginRouter {
                 }
             };
 
-            warden
+            // Per LOGGING.md §2: warden release_custody is a verb
+            // invocation; bracket with debug entry/return.
+            tracing::debug!(
+                plugin = %plugin_name,
+                shelf = %shelf,
+                handle_id = %handle.id,
+                "warden verb invoking" // verb: release_custody
+            );
+            let rel_start = Instant::now();
+            let rel_result = warden
                 .release_custody(handle)
                 .await
-                .map_err(StewardError::from)?;
+                .map_err(StewardError::from);
+            tracing::debug!(
+                plugin = %plugin_name,
+                shelf = %shelf,
+                handle_id = %handle_id,
+                duration_ms = rel_start.elapsed().as_millis() as u64,
+                outcome = if rel_result.is_ok() { "ok" } else { "err" },
+                "warden verb returned" // verb: release_custody
+            );
+            rel_result?;
         }
 
         ledger
@@ -1228,16 +1298,35 @@ impl PluginRouter {
 
     /// Run a health check against every admitted plugin, returning a
     /// vector of (plugin name, report) pairs in admission order.
+    ///
+    /// Per `docs/engineering/LOGGING.md` section 2 (each verb
+    /// invocation and each health check response fire at debug),
+    /// each per-plugin health-check call is wrapped in a debug-entry
+    /// and debug-return pair carrying `plugin`, `verb`,
+    /// `duration_ms`, and the reported `status`. Routes through
+    /// [`AdmittedHandle::health_check`] rather than matching on the
+    /// variant directly so future variant additions get the debug
+    /// coverage automatically.
     pub async fn health_check_all(&self) -> Vec<(String, HealthReport)> {
         let entries = self.entries_in_order();
         let mut out = Vec::with_capacity(entries.len());
         for entry in entries {
             let guard = entry.handle.lock().await;
             if let Some(handle) = guard.as_ref() {
-                let r = match handle {
-                    AdmittedHandle::Respondent(rp) => rp.health_check().await,
-                    AdmittedHandle::Warden(w) => w.health_check().await,
-                };
+                tracing::debug!(
+                    plugin = %entry.name,
+                    verb = "health_check",
+                    "plugin lifecycle verb invoking"
+                );
+                let start = std::time::Instant::now();
+                let r = handle.health_check().await;
+                tracing::debug!(
+                    plugin = %entry.name,
+                    verb = "health_check",
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    status = ?r.status,
+                    "plugin lifecycle verb returned"
+                );
                 out.push((entry.name.clone(), r));
             }
         }
@@ -1249,12 +1338,36 @@ impl PluginRouter {
 /// `unload` on a single drained entry. Lives here because it reads
 /// the entry's internal locks; the engine wraps it with child-reap
 /// logic.
+///
+/// Per `docs/engineering/LOGGING.md` §2 ("each verb invocation"
+/// fires at debug), the call is bracketed with a debug-entry +
+/// debug-return pair carrying `plugin`, `verb`, `duration_ms`, and
+/// outcome. Mirrors the `invoke_plugin_unload` helper used by the
+/// reload paths in `admission.rs`; the duplication exists because
+/// the drain path takes the handle out of the lock here whereas the
+/// reload paths hold a borrowed handle they retain across the call,
+/// so a single shared helper would require yielding the lock guard
+/// across an await boundary.
 pub async fn unload_handle(
     entry: &Arc<PluginEntry>,
 ) -> Result<(), PluginError> {
     let mut handle_guard = entry.handle.lock().await;
     if let Some(mut handle) = handle_guard.take() {
-        handle.unload().await
+        tracing::debug!(
+            plugin = %entry.name,
+            verb = "unload",
+            "plugin lifecycle verb invoking"
+        );
+        let start = std::time::Instant::now();
+        let result = handle.unload().await;
+        tracing::debug!(
+            plugin = %entry.name,
+            verb = "unload",
+            duration_ms = start.elapsed().as_millis() as u64,
+            outcome = if result.is_ok() { "ok" } else { "err" },
+            "plugin lifecycle verb returned"
+        );
+        result
     } else {
         Ok(())
     }

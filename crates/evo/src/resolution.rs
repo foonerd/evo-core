@@ -108,6 +108,17 @@ impl ResolutionLedger {
     /// Future persistence passes may surface write errors here;
     /// callers should not panic on success.
     pub fn record(&self, entry: ResolutionLogEntry) {
+        // Per LOGGING.md §2: resolve_claimants is an operator op; this
+        // ledger append is the audit trail. Debug-level entry per
+        // record so an operator running with debug enabled sees the
+        // resolution audit trail in real time.
+        tracing::debug!(
+            peer_uid = entry.peer_uid,
+            tokens_requested = entry.tokens_requested,
+            tokens_resolved = entry.tokens_resolved,
+            granted = entry.granted,
+            "resolution ledger: record"
+        );
         self.entries
             .lock()
             .expect("resolution ledger mutex poisoned")

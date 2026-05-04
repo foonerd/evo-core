@@ -149,6 +149,11 @@ impl Plugin for WardenPlugin {
         _ctx: &'a LoadContext,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         async move {
+            tracing::debug!(
+                plugin = "org.evo.example.warden",
+                verb = "load",
+                "plugin verb invoking"
+            );
             tracing::info!(plugin = "org.evo.example.warden", "plugin load");
             self.loaded = true;
             Ok(())
@@ -159,6 +164,11 @@ impl Plugin for WardenPlugin {
         &mut self,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
         async move {
+            tracing::debug!(
+                plugin = "org.evo.example.warden",
+                verb = "unload",
+                "plugin verb invoking"
+            );
             tracing::info!(
                 plugin = "org.evo.example.warden",
                 active = self.custodies.len(),
@@ -178,6 +188,11 @@ impl Plugin for WardenPlugin {
 
     fn health_check(&self) -> impl Future<Output = HealthReport> + Send + '_ {
         async move {
+            tracing::debug!(
+                plugin = "org.evo.example.warden",
+                verb = "health_check",
+                "plugin verb invoking"
+            );
             if self.loaded {
                 HealthReport::healthy()
             } else {
@@ -194,6 +209,13 @@ impl Warden for WardenPlugin {
     ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a
     {
         async move {
+            tracing::debug!(
+                plugin = "org.evo.example.warden",
+                verb = "take_custody",
+                custody_type = %assignment.custody_type,
+                cid = assignment.correlation_id,
+                "warden verb invoking"
+            );
             if !self.loaded {
                 return Err(PluginError::Permanent(
                     "warden plugin not loaded".to_string(),
@@ -259,6 +281,14 @@ impl Warden for WardenPlugin {
         correction: CourseCorrection,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         async move {
+            tracing::debug!(
+                plugin = "org.evo.example.warden",
+                verb = "course_correct",
+                handle = %handle.id,
+                correction_type = %correction.correction_type,
+                cid = correction.correlation_id,
+                "warden verb invoking"
+            );
             if !self.loaded {
                 return Err(PluginError::Permanent(
                     "warden plugin not loaded".to_string(),
@@ -298,6 +328,12 @@ impl Warden for WardenPlugin {
         handle: CustodyHandle,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         async move {
+            tracing::debug!(
+                plugin = "org.evo.example.warden",
+                verb = "release_custody",
+                handle = %handle.id,
+                "warden verb invoking"
+            );
             if !self.loaded {
                 return Err(PluginError::Permanent(
                     "warden plugin not loaded".to_string(),

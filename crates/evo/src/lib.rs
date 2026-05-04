@@ -42,7 +42,7 @@
 //!             .map_err(anyhow::Error::from)
 //!     })
 //! });
-//! evo::run(evo::RunOptions { args, admission }).await
+//! evo::run(evo::RunOptions::new(args, admission)).await
 //! # }
 //! ```
 //!
@@ -213,6 +213,21 @@ pub struct RunOptions {
     pub args: cli::Args,
     /// Plugin admission strategy. Default: [`discover_plugins`].
     pub admission: AdmissionSetup,
+    /// Optional distribution-supplied RTC wake hook. When `Some`,
+    /// the framework's `AppointmentRuntime` calls
+    /// [`appointments::RtcWakeCallback::program_wake`] every time
+    /// the next-pending must-wake appointment changes (or the wake
+    /// is cleared when no must-wake appointment is pending). When
+    /// `None`, must-wake-device appointments are best-effort —
+    /// they still fire if the device happens to be awake at their
+    /// scheduled time.
+    ///
+    /// The default `evo` binary leaves this absent because the
+    /// OS-level sleep / wake plumbing is distribution-specific
+    /// (Linux: `/sys/class/rtc/rtc0/wakealarm`; FreeBSD:
+    /// `/dev/rtc`; macOS: `pmset`). Distributions wire their own
+    /// adapter and pass it via [`Self::with_rtc_wake`].
+    pub rtc_wake: Option<Arc<dyn appointments::RtcWakeCallback>>,
 }
 
 impl RunOptions {
@@ -224,12 +239,27 @@ impl RunOptions {
         Self {
             args,
             admission: discover_plugins(),
+            rtc_wake: None,
         }
     }
 
     /// Construct [`RunOptions`] with an explicit admission strategy.
     pub fn new(args: cli::Args, admission: AdmissionSetup) -> Self {
-        Self { args, admission }
+        Self {
+            args,
+            admission,
+            rtc_wake: None,
+        }
+    }
+
+    /// Attach a distribution-supplied RTC wake adapter. See the
+    /// [`Self::rtc_wake`] field for semantics.
+    pub fn with_rtc_wake(
+        mut self,
+        rtc_wake: Arc<dyn appointments::RtcWakeCallback>,
+    ) -> Self {
+        self.rtc_wake = Some(rtc_wake);
+        self
     }
 }
 
@@ -247,7 +277,11 @@ impl RunOptions {
 /// this function from their own `main`. The shipped `evo` binary
 /// itself is a 12-line wrapper around `run(RunOptions::from_args(...))`.
 pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
-    let RunOptions { args, admission } = opts;
+    let RunOptions {
+        args,
+        admission,
+        rtc_wake,
+    } = opts;
 
     // Load the config. If --config was given, missing file is an
     // error; otherwise a missing default config silently falls back.
@@ -386,124 +420,12 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     // `recovered`. The diagnostic does not refuse boot.
     let declared_types: std::collections::HashSet<String> =
         catalogue.subjects.iter().map(|s| s.name.clone()).collect();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or_default();
-    match persistence.count_subjects_by_type().await {
-        Ok(persisted) => {
-            let mut orphan_types = 0usize;
-            let mut orphan_rows: u64 = 0;
-            // Collect the prior pending rows so we can detect
-            // types that have moved off the orphan list (the
-            // catalogue re-declared them between boots).
-            let prior = persistence
-                .list_pending_grammar_orphans()
-                .await
-                .unwrap_or_default();
-            let mut seen_types = std::collections::HashSet::<String>::new();
-            for (subject_type, count) in &persisted {
-                if !declared_types.contains(subject_type) {
-                    seen_types.insert(subject_type.clone());
-                    if let Err(e) = persistence
-                        .upsert_pending_grammar_orphan(
-                            subject_type,
-                            *count,
-                            now_ms,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            subject_type = %subject_type,
-                            "catalogue-orphan scan: upsert failed; \
-                             continuing"
-                        );
-                    }
-                    let first_observed = persistence
-                        .list_pending_grammar_orphans()
-                        .await
-                        .ok()
-                        .and_then(|rows| {
-                            rows.into_iter()
-                                .find(|r| r.subject_type == *subject_type)
-                                .map(|r| r.first_observed_at_ms)
-                        })
-                        .unwrap_or(now_ms);
-                    let _ = bus
-                        .emit_durable(
-                            happenings::Happening::SubjectGrammarOrphan {
-                                subject_type: subject_type.clone(),
-                                count: *count,
-                                first_observed_at_ms: first_observed,
-                                at: std::time::SystemTime::now(),
-                            },
-                        )
-                        .await;
-                    tracing::warn!(
-                        subject_type = %subject_type,
-                        count = *count,
-                        "catalogue orphan: persisted subjects of this type \
-                         remain in storage but the loaded catalogue no longer \
-                         declares the type; operator may issue \
-                         `migrate_grammar_orphans` or `accept_grammar_orphans`"
-                    );
-                    orphan_types += 1;
-                    orphan_rows += count;
-                }
-            }
-            // Recovery path: any prior row whose type re-appeared
-            // in the loaded catalogue (and is therefore not an
-            // orphan this boot) transitions to `recovered`.
-            for row in prior.iter() {
-                if !seen_types.contains(&row.subject_type)
-                    && declared_types.contains(&row.subject_type)
-                    && !matches!(
-                        row.status,
-                        crate::persistence::GrammarOrphanStatus::Recovered
-                    )
-                {
-                    if let Err(e) = persistence
-                        .mark_grammar_orphan_recovered(
-                            &row.subject_type,
-                            now_ms,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            subject_type = %row.subject_type,
-                            "catalogue-orphan scan: recovery transition \
-                             failed; continuing"
-                        );
-                    }
-                }
-            }
-            if orphan_types == 0 {
-                tracing::info!(
-                    declared_types = declared_types.len(),
-                    persisted_types = persisted.len(),
-                    "catalogue-orphan scan: no orphans"
-                );
-            } else {
-                tracing::warn!(
-                    orphan_types,
-                    orphan_rows,
-                    "catalogue-orphan scan: {} orphaned subject_type(s) \
-                     covering {} row(s); operator action recommended",
-                    orphan_types,
-                    orphan_rows
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "catalogue-orphan scan: persistence accessor failed; orphan \
-                 detection skipped this boot"
-            );
-        }
-    }
+    grammar_migration::scan_grammar_orphans(
+        &persistence,
+        &bus,
+        &declared_types,
+    )
+    .await;
 
     // If the catalogue load took a resilience fallback, emit the
     // structured signal exactly once at boot — before any plugin is
@@ -678,8 +600,22 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     // admits each plugin. The ledger backs the user-interaction
     // routing surface (plugin issues prompt, framework parks
     // the request future, consumer answers via the responder
-    // capability).
-    let prompt_ledger = Arc::new(prompts::PromptLedger::new());
+    // capability). Attach the persistence store so multi-stage
+    // interaction state survives a steward restart; the boot
+    // path below replays open rows from the `prompts` table
+    // back into the in-memory ledger.
+    let prompt_ledger = Arc::new(
+        prompts::PromptLedger::new().with_persistence(Arc::clone(&persistence)),
+    );
+    let restored = prompt_ledger
+        .rehydrate_from_persistence(persistence.as_ref())
+        .await?;
+    if restored > 0 {
+        tracing::info!(
+            restored,
+            "restored open prompts from durable backing on boot"
+        );
+    }
 
     // Construct the appointments + watches ledgers + runtimes
     // BEFORE running admission so plugins declaring
@@ -701,16 +637,18 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         Some(trust),
         config.plugins.security.clone(),
     )
-    .with_prompt_ledger(Arc::clone(&prompt_ledger));
+    .with_prompt_ledger(Arc::clone(&prompt_ledger))
+    .with_plugin_runtime_dir(config.plugins.runtime_dir.clone());
 
     let router = Arc::clone(engine.router());
 
-    let appointments = appointments::AppointmentRuntime::start(
+    let appointments = appointments::AppointmentRuntime::start_with_persistence(
         Arc::clone(&appointment_ledger),
         Arc::clone(&router),
         Arc::clone(&state.bus),
         Arc::clone(&time_trust_shared),
-        None,
+        rtc_wake.clone(),
+        Some(Arc::clone(&persistence)),
     );
     let watches_runtime = watches::WatchRuntime::start(
         Arc::clone(&watch_ledger),
@@ -724,6 +662,32 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         .with_watches(Arc::clone(&watches_runtime));
 
     admission(&mut engine, &config).await?;
+
+    // Rehydrate the appointment ledger from durable storage AFTER
+    // admission has run. The runtime tick fires any past-due
+    // entries under the Catchup miss-policy as soon as they
+    // appear in the ledger; doing this before admission would
+    // race the dispatch against plugin load and leave past-due
+    // fires hitting "no plugin on shelf". Doing it after
+    // admission means the routing table is populated when the
+    // tick fires.
+    //
+    // Plugins re-issuing the same appointment_id during their
+    // own load() have already overwritten the rehydrated row by
+    // this point (the framework's schedule path is
+    // upsert-shaped); plugins gating on a marker file leave the
+    // rehydrated row in place and this rehydrate call is the
+    // mechanism that makes the past-due fire happen.
+    if let Err(e) = appointments.rehydrate_from(persistence.as_ref()).await {
+        tracing::error!(
+            error = %e,
+            "appointment runtime rehydration failed; aborting boot to \
+             avoid serving an inconsistent in-memory view of durable state"
+        );
+        return Err(anyhow::anyhow!(
+            "appointment runtime rehydration failed: {e}"
+        ));
+    }
 
     // Construct a projection engine.
     let projections = Arc::new(
@@ -812,9 +776,22 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     .with_reconciliation(Arc::clone(&reconciliation))
     .with_prompt_ledger(Arc::clone(&prompt_ledger))
     .with_appointments(Arc::clone(&appointments))
-    .with_watches(Arc::clone(&watches_runtime));
+    .with_watches(Arc::clone(&watches_runtime))
+    // Activate the Fast Path accept loop alongside the slow-path
+    // server. Without this the framework refuses every fast-path
+    // dispatch with "no such file" because /run/evo/fast.sock
+    // never gets bound. Use the default config: socket at
+    // crate::fast_path::DEFAULT_FAST_PATH_SOCKET, empty allow-
+    // list (operator's `client_acl` policy decides who may
+    // negotiate `fast_path_admin` per the existing slow-path
+    // ACL contract).
+    .with_fast_path(fast_path::FastPathConfig::default());
 
-    tracing::warn!(socket = %socket_path.display(), "evo ready");
+    // Per LOGGING.md §2: "evo ready" is the steward's normal lifecycle
+    // entry point — exactly the info contract ("normal high-level
+    // lifecycle narrative"). It is not a recoverable anomaly the
+    // operator may want to know about (warn) or a fault (error).
+    tracing::info!(socket = %socket_path.display(), "evo ready");
 
     // Wait for either the server to exit (unlikely) or a shutdown signal.
     let shutdown_fut = shutdown::wait_for_signal();
@@ -912,6 +889,10 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         }
     }
 
-    tracing::warn!("evo exited");
+    // Per LOGGING.md §2: "evo exited" is the lifecycle endpoint —
+    // the steward has completed the shutdown drain and is returning
+    // to the operating system. Same info contract as "evo ready" at
+    // the top of run().
+    tracing::info!("evo exited");
     Ok(())
 }

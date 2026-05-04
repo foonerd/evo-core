@@ -1,0 +1,63 @@
+# Synthetic watch-Hysteresis plugin — out-of-process bundle manifest.
+#
+# Drives a numeric value through a hysteresis test sequence and
+# observes a Hysteresis-predicate watch firing on the two upward
+# edges. End-to-end:
+#
+#   1. announce subject (test-scheme, "hysteresis-target") with
+#      state={"value": 50.0}
+#   2. resolve addressing -> canonical id (Phase 1.I surface)
+#   3. register SubjectState watch on canonical id with predicate
+#      Hysteresis { field: "value", upper: 80.0, lower: 60.0 }
+#   4. schedule a Periodic appointment at 1s interval, max_fires=6
+#   5. on each fire, advance through the sequence
+#      [50, 85, 90, 70, 50, 85] via update_state
+#   6. record every WatchFired arrival to
+#      {state_dir}/watch-hysteresis-fires.log; expect exactly two
+#
+# Used by `T2.watch-hysteresis`. Has no value outside that
+# scenario.
+
+[plugin]
+name = "org.evoframework.acceptance.watch-hysteresis-plugin"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.watch-hysteresis"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities]
+appointments = true
+watches = true
+
+[capabilities.respondent]
+request_types = ["hysteresis_driver", "hysteresis_watch_fired"]
+response_budget_ms = 1000

@@ -186,6 +186,47 @@ impl UserInteractionRequester for LoggingUserInteractionRequester {
     }
 }
 
+/// A trivial happening emitter for test scaffolding. Logs each
+/// emitted PluginEvent and returns success without writing to a
+/// bus.
+///
+/// Production plugin LoadContexts get a `RouterHappeningEmitter`
+/// bound to the steward's actual bus; this stub keeps test
+/// LoadContexts simple and bus-free.
+#[derive(Debug)]
+pub struct LoggingHappeningEmitter {
+    plugin_name: String,
+}
+
+impl LoggingHappeningEmitter {
+    /// Construct an emitter tagged with a plugin name.
+    pub fn new(plugin_name: impl Into<String>) -> Self {
+        Self {
+            plugin_name: plugin_name.into(),
+        }
+    }
+}
+
+impl evo_plugin_sdk::contract::HappeningEmitter for LoggingHappeningEmitter {
+    fn emit_plugin_event<'a>(
+        &'a self,
+        event_type: String,
+        _payload: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let name = self.plugin_name.clone();
+        Box::pin(async move {
+            tracing::debug!(
+                plugin = %name,
+                event_type = %event_type,
+                "PluginEvent emitted on logging stub (test scaffolding); \
+                 no bus write"
+            );
+            Ok(())
+        })
+    }
+}
+
 /// A trivial custody state reporter that logs each report and returns
 /// success.
 #[derive(Debug)]
@@ -350,6 +391,19 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
         let conflicts = self.conflicts.clone();
         let plugin_name = self.plugin_name.clone();
         Box::pin(async move {
+            // Per LOGGING.md §2 (each verb invocation fires at debug):
+            // entry-debug for the announce verb. The lifecycle-info
+            // line ("SubjectRegistered" / "SubjectAddressingAdded" /
+            // ...) comes from the SubjectRegistry on success.
+            tracing::debug!(
+                plugin = %plugin_name,
+                verb = "announce_subject",
+                subject_type = %announcement.subject_type,
+                addressings = announcement.addressings.len(),
+                claims = announcement.claims.len(),
+                "plugin verb invoking"
+            );
+
             // Subject-type existence validation at announcement.
             // The announced subject type must correspond to a type
             // the catalogue declared; an undeclared type is refused
@@ -497,6 +551,18 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
         let persistence = self.persistence.clone();
         let conflicts = self.conflicts.clone();
         Box::pin(async move {
+            // Per LOGGING.md §2 (each verb invocation fires at debug):
+            // entry-debug for the retract verb. Lifecycle-info comes
+            // from the SubjectRegistry on success.
+            tracing::debug!(
+                plugin = %plugin_name,
+                verb = "retract_subject",
+                scheme = %addressing.scheme,
+                value = %addressing.value,
+                reason = ?reason,
+                "plugin verb invoking"
+            );
+
             // Resolve the addressing BEFORE retracting so the
             // persistence write knows which canonical_id to bind
             // the claim_log entry to. After retract the addressing
@@ -667,6 +733,82 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                     Ok(())
                 }
             }
+        })
+    }
+
+    fn update_state<'a>(
+        &'a self,
+        addressing: ExternalAddressing,
+        state: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        let bus = Arc::clone(&self.bus);
+        let plugin_name = self.plugin_name.clone();
+        Box::pin(async move {
+            // Resolve the addressing under the registry lock so the
+            // canonical id we ground the update on is the one live
+            // at request time. A subsequent merge / split / forget
+            // can race; the in-memory state map handles that on the
+            // read side via `state_of`.
+            let canonical_id = match registry.resolve(&addressing) {
+                Some(id) => id,
+                None => {
+                    return Err(ReportError::Invalid(format!(
+                        "update_state: unknown addressing {}:{}",
+                        addressing.scheme, addressing.value
+                    )));
+                }
+            };
+
+            // Authorisation: the calling plugin must hold a claim on
+            // this subject. Mirrors retract's posture — a plugin
+            // cannot mutate state on a subject it never announced.
+            let record = registry.describe(&canonical_id).ok_or_else(|| {
+                ReportError::Invalid(format!(
+                    "update_state: subject {canonical_id} \
+                         disappeared between resolve and describe"
+                ))
+            })?;
+            let owns_a_claim =
+                record.addressings.iter().any(|a| a.claimant == plugin_name);
+            if !owns_a_claim {
+                return Err(ReportError::Invalid(format!(
+                    "update_state: plugin {plugin_name} has no \
+                     claim on subject {canonical_id}"
+                )));
+            }
+
+            // Snapshot the previous state for the happening payload
+            // BEFORE writing the new value, so subscribers see the
+            // full transition. `state_of` returns `None` when no
+            // state has yet been published; surface that as `null`
+            // on the happening to keep the prev/new shape uniform.
+            let prev_state = registry
+                .state_of(&canonical_id)
+                .unwrap_or(serde_json::Value::Null);
+
+            registry
+                .update_state(&canonical_id, state.clone())
+                .map_err(|e| {
+                    ReportError::Invalid(format!("update_state: {e}"))
+                })?;
+
+            let at = SystemTime::now();
+            bus.emit_durable(Happening::SubjectStateChanged {
+                plugin: plugin_name,
+                canonical_id,
+                subject_type: record.subject_type,
+                prev_state,
+                new_state: state,
+                at,
+            })
+            .await
+            .map_err(|e| {
+                ReportError::Invalid(format!("persistence write failed: {e}"))
+            })?;
+
+            Ok(())
         })
     }
 }
@@ -3374,6 +3516,20 @@ impl SubjectQuerier for RegistrySubjectQuerier {
             }
         })
     }
+
+    fn resolve_addressing<'a>(
+        &'a self,
+        addressing: ExternalAddressing,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<String>, ReportError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let registry = Arc::clone(&self.registry);
+        Box::pin(async move { Ok(registry.resolve(&addressing)) })
+    }
 }
 
 /// In-process [`FastPathDispatcher`] backed by a shared
@@ -3480,6 +3636,7 @@ impl AppointmentScheduler for RouterAppointmentScheduler {
             let id = AppointmentId::new(spec.appointment_id.clone());
             runtime
                 .schedule(&creator, spec, action)
+                .await
                 .map(|_| id)
                 .map_err(|e| ReportError::Invalid(e.to_string()))
         })
@@ -3556,6 +3713,60 @@ impl WatchScheduler for RouterWatchScheduler {
         let runtime = Arc::clone(&self.runtime);
         Box::pin(async move {
             runtime.cancel(&creator, id.as_str(), &creator).await;
+            Ok(())
+        })
+    }
+}
+
+/// In-process [`evo_plugin_sdk::contract::HappeningEmitter`]
+/// backed by direct [`crate::happenings::HappeningBus`] access.
+/// Used by the admission engine to populate
+/// [`evo_plugin_sdk::contract::LoadContext::happening_emitter`]
+/// for in-process plugins; the wire-side equivalent is
+/// `WireHappeningEmitter` in the SDK's `host` module.
+///
+/// Binds emission to the plugin's canonical name so the framework
+/// stamps the `plugin` field on every emitted `PluginEvent` with
+/// the authoritative caller identity (the plugin can supply its
+/// own name, but the framework is the source of truth).
+#[derive(Debug)]
+pub struct RouterHappeningEmitter {
+    bus: Arc<crate::happenings::HappeningBus>,
+    plugin_name: String,
+}
+
+impl RouterHappeningEmitter {
+    /// Construct an emitter bound to the shared bus and a
+    /// plugin's canonical name.
+    pub fn new(
+        bus: Arc<crate::happenings::HappeningBus>,
+        plugin_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            bus,
+            plugin_name: plugin_name.into(),
+        }
+    }
+}
+
+impl evo_plugin_sdk::contract::HappeningEmitter for RouterHappeningEmitter {
+    fn emit_plugin_event<'a>(
+        &'a self,
+        event_type: String,
+        payload: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let bus = Arc::clone(&self.bus);
+        let plugin = self.plugin_name.clone();
+        Box::pin(async move {
+            bus.emit_durable(crate::happenings::Happening::PluginEvent {
+                plugin,
+                event_type,
+                payload,
+                at: std::time::SystemTime::now(),
+            })
+            .await
+            .map_err(|e| ReportError::Invalid(format!("{e}")))?;
             Ok(())
         })
     }
@@ -3786,6 +3997,138 @@ target_type = "*"
             .await;
         assert!(result.is_ok());
         assert_eq!(registry.subject_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_update_state_writes_state_and_emits_happening(
+    ) {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.state",
+        );
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("test-scheme", "tv")],
+            ))
+            .await
+            .unwrap();
+
+        let mut rx = bus.subscribe();
+
+        let new_state = serde_json::json!({"playback": "playing"});
+        announcer
+            .update_state(
+                ExternalAddressing::new("test-scheme", "tv"),
+                new_state.clone(),
+            )
+            .await
+            .unwrap();
+
+        let got = rx.try_recv().expect("state happening must be present");
+        match got {
+            Happening::SubjectStateChanged {
+                plugin,
+                subject_type,
+                prev_state,
+                new_state: emitted_new,
+                ..
+            } => {
+                assert_eq!(plugin, "org.test.state");
+                assert_eq!(subject_type, "track");
+                assert!(prev_state.is_null());
+                assert_eq!(emitted_new, new_state);
+            }
+            other => panic!("expected SubjectStateChanged, got {other:?}"),
+        }
+
+        let canonical_id = registry
+            .resolve(&ExternalAddressing::new("test-scheme", "tv"))
+            .expect("subject resolves");
+        assert_eq!(registry.state_of(&canonical_id), Some(new_state));
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_update_state_rejects_unknown_addressing(
+    ) {
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.state",
+        );
+
+        let result = announcer
+            .update_state(
+                ExternalAddressing::new("test-scheme", "missing"),
+                serde_json::json!({"x": 1}),
+            )
+            .await;
+        match result {
+            Err(ReportError::Invalid(msg)) => {
+                assert!(msg.contains("unknown addressing"), "got: {msg}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_update_state_rejects_non_claimant() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let owner = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.owner",
+        );
+        let intruder = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.intruder",
+        );
+
+        owner
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("test-scheme", "tv")],
+            ))
+            .await
+            .unwrap();
+
+        let result = intruder
+            .update_state(
+                ExternalAddressing::new("test-scheme", "tv"),
+                serde_json::json!({"x": 1}),
+            )
+            .await;
+        match result {
+            Err(ReportError::Invalid(msg)) => {
+                assert!(msg.contains("no claim"), "got: {msg}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -9044,6 +9387,43 @@ target_type = "*"
             .await
             .expect("describe_alias must succeed");
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn subject_querier_resolve_addressing_returns_canonical_id() {
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let addressing = ExternalAddressing::new("mpd-path", "/a.flac");
+        registry
+            .announce(
+                &SubjectAnnouncement::new("track", vec![addressing.clone()]),
+                "org.test.p1",
+            )
+            .unwrap();
+        let expected = registry
+            .resolve(&addressing)
+            .expect("registry resolves directly");
+
+        let querier = RegistrySubjectQuerier::new(Arc::clone(&registry));
+        let resolved = querier
+            .resolve_addressing(addressing)
+            .await
+            .expect("resolve_addressing must succeed")
+            .expect("known addressing resolves");
+        assert_eq!(resolved, expected);
+    }
+
+    #[tokio::test]
+    async fn subject_querier_resolve_addressing_returns_none_for_unknown() {
+        let registry = Arc::new(SubjectRegistry::new());
+        let querier = RegistrySubjectQuerier::new(registry);
+
+        let resolved = querier
+            .resolve_addressing(ExternalAddressing::new("mpd-path", "/missing"))
+            .await
+            .expect("resolve_addressing must succeed");
+        assert!(resolved.is_none());
     }
 
     #[tokio::test]

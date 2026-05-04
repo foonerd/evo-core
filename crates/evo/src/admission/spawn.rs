@@ -25,11 +25,71 @@
 
 use crate::error::StewardError;
 use crate::router::{take_child, unload_handle, PluginEntry};
+use evo_plugin_sdk::contract::PluginError;
 use std::path::Path;
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
 use tokio::process::Child;
+
+/// Classify a child-process exit status against the lifecycle
+/// contract. Returns `true` when the exit is a "normal-shutdown
+/// signal termination" — the expected outcome under systemd
+/// `KillMode=control-group` (cgroup-wide SIGTERM hits every
+/// plugin alongside the steward) and when the steward's own
+/// holdout-kill has fired SIGKILL after the unload deadline.
+///
+/// Per `docs/engineering/LOGGING.md` §2 these are debug-level
+/// events ("the lifecycle event itself"), not warn or error.
+/// Other signal terminations (SIGSEGV, SIGABRT, SIGBUS) ARE
+/// genuinely anomalous and stay at warn — they indicate plugin
+/// crashes the operator may want to notice.
+fn is_signal_terminated_normally(status: &ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        match status.signal() {
+            // SIGTERM (15): graceful termination — systemd
+            // `KillMode=control-group` default, manual `kill`.
+            // SIGINT (2): operator Ctrl-C in dev runs.
+            // SIGKILL (9): steward holdout-kill after unload
+            //   deadline elapsed, or operator force-kill.
+            // SIGHUP (1): controlling-terminal hangup, treated
+            //   as graceful by convention.
+            Some(15) | Some(2) | Some(9) | Some(1) => true,
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        false
+    }
+}
+
+/// Classify an unload-side `PluginError` as "expected because
+/// the plugin process is already gone" vs a real failure. The
+/// canonical expected case is a Fatal-class wire-disconnected
+/// error: the plugin received SIGTERM (cgroup-wide), exited,
+/// closed its end of the wire, and the steward's wire-unload
+/// reaches a closed socket. Other wire-disconnected sources
+/// (plugin crashed mid-run, network drop on a future remote
+/// transport) share the same shape and the same lifecycle
+/// meaning — the wire-unload is moot because the plugin is
+/// gone, not because the unload is broken.
+///
+/// Returns `true` for the expected case so the caller can
+/// downgrade the log level from error to debug per the
+/// LOGGING.md contract.
+fn is_unload_wire_already_closed(err: &PluginError) -> bool {
+    matches!(
+        err,
+        PluginError::Fatal { context, .. }
+            if context.contains("wire unload")
+                && context.contains("wire disconnected")
+    )
+}
 
 /// Timeout for child process exit during shutdown. After this elapses
 /// the steward stops waiting politely and kills the child.
@@ -89,6 +149,25 @@ pub(crate) async fn wait_for_socket_ready(
 ///
 /// All errors are logged; none are propagated. The child is either
 /// reaped cleanly or forcibly killed, in both cases leaving no zombie.
+///
+/// Log-level discipline (per `docs/engineering/LOGGING.md` §2):
+///
+/// - **Clean exit (status 0):** info — normal lifecycle narrative.
+/// - **Killed by SIGTERM / SIGINT / SIGKILL:** debug — the
+///   *expected* outcome under systemd `KillMode=control-group`
+///   (cgroup-wide SIGTERM hits every plugin alongside the
+///   steward), or when the steward's own holdout-kill fired.
+///   These exits are not anomalies the operator needs to
+///   notice; they are the lifecycle event itself.
+/// - **Killed by another signal (SIGSEGV, SIGABRT, etc.):**
+///   warn — recoverable anomaly worth noticing (the plugin
+///   crashed; admission may restart it on operator action).
+/// - **Non-zero exit code (not signal):** warn — the plugin
+///   returned a non-zero exit status of its own accord;
+///   investigate.
+/// - **Wait syscall failure or kill failure:** error —
+///   genuinely broken (the OS or steward couldn't observe /
+///   control the child).
 pub(crate) async fn wait_or_kill_child(name: &str, child: &mut Child) {
     match tokio::time::timeout(CHILD_SHUTDOWN_TIMEOUT, child.wait()).await {
         Ok(Ok(status)) => {
@@ -96,6 +175,14 @@ pub(crate) async fn wait_or_kill_child(name: &str, child: &mut Child) {
                 tracing::info!(
                     plugin = %name,
                     "plugin child exited cleanly"
+                );
+            } else if is_signal_terminated_normally(&status) {
+                tracing::debug!(
+                    plugin = %name,
+                    ?status,
+                    "plugin child terminated by expected signal \
+                     (cgroup SIGTERM, steward holdout-kill, or \
+                     equivalent); not an error"
                 );
             } else {
                 tracing::warn!(
@@ -162,6 +249,28 @@ pub(crate) async fn unload_one_plugin(
 
     match &unload_result {
         Ok(()) => tracing::info!(plugin = %name, "plugin unloaded"),
+        Err(e) if is_unload_wire_already_closed(e) => {
+            // Expected lifecycle event: the plugin process is
+            // already gone (cgroup SIGTERM, crash, network
+            // drop on a future remote transport), so the
+            // wire-unload reached a closed socket. Per
+            // `docs/engineering/LOGGING.md` §2 this is a
+            // debug-level event ("the lifecycle event
+            // itself"), not error or warn — there is nothing
+            // for the operator to do. The subsequent
+            // `wait_or_kill_child` call reaps the already-
+            // dead child; the framework's claim sweep
+            // (admission drain stage 4) cleans up the
+            // plugin's registry claims regardless.
+            tracing::debug!(
+                plugin = %name,
+                error = %e,
+                "plugin already exited before wire-unload reached \
+                 it; wire-unload was a no-op (this is the \
+                 expected outcome under systemd \
+                 KillMode=control-group)"
+            );
+        }
         Err(e) => tracing::error!(
             plugin = %name,
             error = %e,
@@ -203,4 +312,83 @@ pub(crate) async fn kill_holdout_child(name: &str, entry: &Arc<PluginEntry>) {
     }
     // Reap so we do not leak a zombie even on kill failure.
     let _ = child.wait().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unload_wire_already_closed_classifier_recognises_canonical_shape() {
+        // The wire-disconnected case the steward hits during
+        // shutdown: PluginError::Fatal { context: "wire unload:
+        // wire disconnected", source: ... }.
+        let err = PluginError::fatal(
+            "wire unload: wire disconnected",
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "wire connection closed",
+            ),
+        );
+        assert!(is_unload_wire_already_closed(&err));
+    }
+
+    #[test]
+    fn unload_wire_already_closed_classifier_rejects_other_fatal_contexts() {
+        // A different fatal context (e.g. plugin returned a
+        // genuine fatal error from its own unload) is NOT the
+        // expected case and must remain at error log level.
+        let err = PluginError::fatal(
+            "plugin unload returned fatal",
+            std::io::Error::other("internal panic"),
+        );
+        assert!(!is_unload_wire_already_closed(&err));
+    }
+
+    #[test]
+    fn unload_wire_already_closed_classifier_rejects_non_fatal() {
+        // A Permanent error from the plugin's unload is its
+        // own kind of refusal and stays at error.
+        let err = PluginError::Permanent("some refusal".into());
+        assert!(!is_unload_wire_already_closed(&err));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_terminated_normally_recognises_sigterm() {
+        use std::os::unix::process::ExitStatusExt;
+        // Status 15 = WIFSIGNALED with signal 15 (SIGTERM):
+        // the canonical shutdown signal under systemd
+        // KillMode=control-group.
+        let status = ExitStatus::from_raw(15);
+        assert!(is_signal_terminated_normally(&status));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_terminated_normally_recognises_sigkill() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = ExitStatus::from_raw(9);
+        assert!(is_signal_terminated_normally(&status));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_terminated_normally_rejects_segv() {
+        use std::os::unix::process::ExitStatusExt;
+        // Status 11 = WIFSIGNALED with signal 11 (SIGSEGV):
+        // genuine crash; stays at warn.
+        let status = ExitStatus::from_raw(11);
+        assert!(!is_signal_terminated_normally(&status));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_terminated_normally_rejects_non_zero_exit_code() {
+        use std::os::unix::process::ExitStatusExt;
+        // Plugin exited via exit(1) — not a signal, just a
+        // non-zero exit code. Anomalous; stays at warn.
+        let status = ExitStatus::from_raw(1 << 8);
+        assert!(!is_signal_terminated_normally(&status));
+    }
 }

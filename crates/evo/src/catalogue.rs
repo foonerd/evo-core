@@ -398,8 +398,27 @@ impl Catalogue {
     /// built-in unable to parse) is impossible by construction
     /// because `cargo build` validates the embedded content.
     pub fn load_with_fallback(configured: &Path, lkg: &Path) -> LoadOutcome {
+        // Per LOGGING.md §2 ("catalogue overlay merge decisions"
+        // fire at debug): emit a debug per attempted tier so an
+        // operator with debug enabled sees exactly which tier was
+        // tried, what the outcome was, and why a fallback fired.
+        tracing::debug!(
+            tier = "configured",
+            path = %configured.display(),
+            "catalogue load: attempting tier"
+        );
         match Self::load(configured) {
             Ok(catalogue) => {
+                tracing::debug!(
+                    tier = "configured",
+                    racks = catalogue.racks.len(),
+                    shelves = catalogue
+                        .racks
+                        .iter()
+                        .map(|r| r.shelves.len())
+                        .sum::<usize>(),
+                    "catalogue load: tier accepted"
+                );
                 // Mirror the operator-authored bytes to the LKG
                 // shadow. Failure to mirror is logged but does not
                 // refuse the boot — the configured tier already
@@ -412,40 +431,65 @@ impl Catalogue {
                     mirror_error: mirror_result.err(),
                 }
             }
-            Err(configured_err) => match Self::load(lkg) {
-                Ok(catalogue) => LoadOutcome {
-                    catalogue,
-                    source: CatalogueSource::Lkg,
-                    reason: Some(format!(
-                        "configured catalogue at {} failed to load: {}",
-                        configured.display(),
-                        configured_err
-                    )),
-                    mirror_error: None,
-                },
-                Err(lkg_err) => {
-                    // Built-in is compile-time validated; expect-on-
-                    // parse here is a structural invariant, not a
-                    // runtime risk.
-                    let catalogue = Self::from_toml(BUILTIN_SKELETON).expect(
-                        "built-in skeleton catalogue must parse \
+            Err(configured_err) => {
+                tracing::debug!(
+                    tier = "configured",
+                    error = %configured_err,
+                    "catalogue load: tier rejected; falling through"
+                );
+                tracing::debug!(
+                    tier = "lkg",
+                    path = %lkg.display(),
+                    "catalogue load: attempting tier"
+                );
+                match Self::load(lkg) {
+                    Ok(catalogue) => {
+                        tracing::debug!(
+                            tier = "lkg",
+                            racks = catalogue.racks.len(),
+                            "catalogue load: tier accepted"
+                        );
+                        LoadOutcome {
+                            catalogue,
+                            source: CatalogueSource::Lkg,
+                            reason: Some(format!(
+                                "configured catalogue at {} failed to load: {}",
+                                configured.display(),
+                                configured_err
+                            )),
+                            mirror_error: None,
+                        }
+                    }
+                    Err(lkg_err) => {
+                        tracing::debug!(
+                            tier = "lkg",
+                            error = %lkg_err,
+                            "catalogue load: tier rejected; falling through to built-in"
+                        );
+                        // Built-in is compile-time validated; expect-on-
+                        // parse here is a structural invariant, not a
+                        // runtime risk.
+                        let catalogue = Self::from_toml(BUILTIN_SKELETON)
+                            .expect(
+                                "built-in skeleton catalogue must parse \
                              (compile-time validated)",
-                    );
-                    LoadOutcome {
-                        catalogue,
-                        source: CatalogueSource::Builtin,
-                        reason: Some(format!(
-                            "configured catalogue at {} failed to \
+                            );
+                        LoadOutcome {
+                            catalogue,
+                            source: CatalogueSource::Builtin,
+                            reason: Some(format!(
+                                "configured catalogue at {} failed to \
                              load: {}; LKG shadow at {} failed: {}",
-                            configured.display(),
-                            configured_err,
-                            lkg.display(),
-                            lkg_err
-                        )),
-                        mirror_error: None,
+                                configured.display(),
+                                configured_err,
+                                lkg.display(),
+                                lkg_err
+                            )),
+                            mirror_error: None,
+                        }
                     }
                 }
-            },
+            }
         }
     }
 

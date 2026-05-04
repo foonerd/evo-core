@@ -64,7 +64,7 @@ Three families, each answering a different question about the rack:
 
 `domain` racks hold the product's actual work: audio, networking, storage, metadata, kiosk, library. These are the racks that make this device that device rather than a different one.
 
-`coordination` racks originate instructions from time (appointments) or observed conditions (watches). They are domain-agnostic infrastructure for wiring up "when X happens, do Y" logic. Both of these racks are reserved in `CONCEPT.md` section 2; the steward does not yet wire the appointments engine or the watches engine.
+`coordination` racks originate instructions from time (appointments) or observed conditions (watches). They are domain-agnostic infrastructure for wiring up "when X happens, do Y" logic. The steward ships both engines: `AppointmentRuntime` covers `OneShot` / `Daily` / `Weekdays` / `Weekends` / `Weekly` / `Monthly` / `Yearly` recurrence with DST-aware Local timezone arithmetic; `WatchRuntime` evaluates `HappeningMatch` and `Composite` over `HappeningMatch` predicates fully, with `SubjectState` predicates wire-stable but pending the projection-engine integration. See `STEWARD.md` §12.1.
 
 `infrastructure` racks hold knowledge about the fabric itself: observability, identity, lifecycle. These change rarely and are typically the same across distributions.
 

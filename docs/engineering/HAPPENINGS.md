@@ -434,7 +434,7 @@ Server-side filtering ships today as the `filter` field on `op = "subscribe_happ
 
 ### 11.3 Aggregation / Coalescing
 
-A warden that emits state reports at 10 Hz produces 10 happenings per second per custody. For subscribers that care only about coarse transitions, coalescing (emit at most one `CustodyStateReported` per handle per 100 ms) would reduce noise. Plausible future enhancement; not essential for current workloads.
+Per-subscriber coalescing ships today: `subscribe_happenings` accepts `coalesce_labels` (a list of label names that define group identity) and `coalesce_window_ms` (the dedup window). Within a window, repeats with the same label tuple collapse to the most recent emission; static labels and flattened object keys are documented in section 5.2 above. A warden that emits state reports at 10 Hz can be subscribed-to with `coalesce_labels = ["variant", "handle_id"]` and a 100 ms window so the subscriber sees coarse transitions without forcing every subscriber to share the policy. Cross-subscriber coalescing (a single bus-wide collapse rule) is not on the roadmap; per-subscriber is the right boundary because policy-by-subscriber composes without coordinating consumers.
 
 ### 11.4 Persistence / Observability Integration
 

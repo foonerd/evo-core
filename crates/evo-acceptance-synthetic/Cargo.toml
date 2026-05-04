@@ -1,0 +1,115 @@
+[package]
+name = "evo-acceptance-synthetic"
+description = "Synthetic plugins purpose-built for the evo acceptance test plan. Each plugin exists to exercise one specific framework behaviour from the acceptance harness; production builds never embed them, production trust roots never sign them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "synthetic-drift-respondent-wire"
+path = "src/bin/synthetic-drift-respondent-wire.rs"
+
+[[bin]]
+name = "synthetic-appointment-plugin-wire"
+path = "src/bin/synthetic-appointment-plugin-wire.rs"
+
+[[bin]]
+name = "synthetic-watch-plugin-wire"
+path = "src/bin/synthetic-watch-plugin-wire.rs"
+
+[[bin]]
+name = "synthetic-prompt-plugin-wire"
+path = "src/bin/synthetic-prompt-plugin-wire.rs"
+
+[[bin]]
+name = "synthetic-reload-plugin-wire"
+path = "src/bin/synthetic-reload-plugin-wire.rs"
+
+[[bin]]
+name = "synthetic-skew-plugin-wire"
+path = "src/bin/synthetic-skew-plugin-wire.rs"
+
+[[bin]]
+name = "synthetic-flight-rack-plugin-wire"
+path = "src/bin/synthetic-flight-rack-plugin-wire.rs"
+
+[[bin]]
+name = "synthetic-watch-subject-state-plugin-wire"
+path = "src/bin/synthetic-watch-subject-state-plugin-wire.rs"
+
+[[bin]]
+name = "synthetic-watch-hysteresis-plugin-wire"
+path = "src/bin/synthetic-watch-hysteresis-plugin-wire.rs"
+
+[[bin]]
+name = "synthetic-appointment-periodic-plugin-wire"
+path = "src/bin/synthetic-appointment-periodic-plugin-wire.rs"
+
+[[bin]]
+name = "synthetic-prompt-multistage-plugin-wire"
+path = "src/bin/synthetic-prompt-multistage-plugin-wire.rs"
+
+[[bin]]
+name = "synthetic-fast-path-warden-wire"
+path = "src/bin/synthetic-fast-path-warden-wire.rs"
+
+[[bin]]
+name = "synthetic-warden-wire"
+path = "src/bin/synthetic-warden-wire.rs"
+
+[[bin]]
+name = "synthetic-watch-cooldown-burst-plugin-wire"
+path = "src/bin/synthetic-watch-cooldown-burst-plugin-wire.rs"
+
+[[bin]]
+name = "synthetic-appointment-past-due-plugin-wire"
+path = "src/bin/synthetic-appointment-past-due-plugin-wire.rs"
+
+[[bin]]
+name = "synthetic-composer-wire"
+path = "src/bin/synthetic-composer-wire.rs"
+
+[[bin]]
+name = "synthetic-delivery-warden-wire"
+path = "src/bin/synthetic-delivery-warden-wire.rs"
+
+[[bin]]
+name = "synthetic-grammar-source-wire"
+path = "src/bin/synthetic-grammar-source-wire.rs"
+
+[[bin]]
+name = "synthetic-coalescing-source-wire"
+path = "src/bin/synthetic-coalescing-source-wire.rs"
+
+[[bin]]
+name = "synthetic-appointment-wake-plugin-wire"
+path = "src/bin/synthetic-appointment-wake-plugin-wire.rs"
+
+[[bin]]
+name = "synthetic-fast-path-bench"
+path = "src/bin/synthetic-fast-path-bench.rs"
+
+[dependencies]
+evo = { path = "../evo" }
+evo-plugin-sdk = { path = "../evo-plugin-sdk" }
+semver = { version = "1", features = ["serde"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "signal",
+    "time",
+] }
+anyhow = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,50 @@
+# Synthetic multi-stage prompt persistence plugin —
+# out-of-process bundle manifest.
+#
+# Issues a Text prompt with a long timeout (90s) and session_id
+# "ms-test" on every load(). Used to test the durable prompt
+# ledger + boot-time rehydration landed in Phase 1.H: the scenario
+# stops the steward mid-prompt, restarts, and asserts the prompt
+# survives + the operator can still answer it post-restart.
+#
+# Used by `T3.uir-persist`. Has no value outside that scenario.
+
+[plugin]
+name = "org.evoframework.acceptance.prompt-multistage-plugin"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.prompt-multistage"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities.respondent]
+request_types = ["never_called"]
+response_budget_ms = 1000

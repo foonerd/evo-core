@@ -60,6 +60,13 @@ arc-swap = "1.7"
 # and the two are deliberately separate crypto concerns.
 blake3 = "1.5"
 
+# Watch evaluator's `StatePredicate::Regex` arm compiles patterns
+# from the SDK contract at evaluation time. The SDK already pulls
+# regex for create-time validation; the steward pulls it
+# independently so the runtime path doesn't depend on any private
+# SDK internals.
+regex = "1"
+
 # Persistence: SQLite via the synchronous rusqlite API.
 # `bundled` compiles SQLite from vendored C source so every target
 # behaves identically regardless of host packaging; `blob` and

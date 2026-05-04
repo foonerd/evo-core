@@ -25,6 +25,12 @@ Thumbs.db
 .env
 .env.local
 
+# Acceptance harness — machine-specific overlays (host, ssh user,
+# ssh key path). The committed target descriptors carry public-shape
+# capabilities only; connection details live in a sibling
+# `<target>.local.toml` overlay loaded at runtime. Never commit.
+acceptance/targets/*.local.toml
+
 # Generated documentation
 /book/
 /docs/_build/

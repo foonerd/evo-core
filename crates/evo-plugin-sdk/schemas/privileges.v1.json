@@ -1,0 +1,269 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://evoframework.org/schemas/privileges.v1.json",
+  "title": "Plugin Privileges Contract (v1.0)",
+  "description": "Declarative privilege contract for an evo plugin or framework surface. One file per surface (plugin / steward / distribution-bootstrap). Travels with the plugin through every admission path. The framework refuses to admit any surface whose declared contract diverges from host provisioning in either direction (under-provisioning OR over-provisioning).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "plugin",
+    "owner",
+    "isolation",
+    "capability_intent",
+    "required_binaries",
+    "required_kernel_modules",
+    "required_system_services",
+    "verification",
+    "host_provisioning"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "Schema major.minor. Breaking changes increment major; additive changes increment minor. Deprecation precedes removal by at least one minor release.",
+      "type": "string",
+      "const": "1.0"
+    },
+    "plugin": {
+      "description": "Namespaced plugin / surface identifier (e.g. 'org.evoframework.network.nm', 'org.evoframework.steward', 'org.evoframework.distribution.audio').",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+      "minLength": 3
+    },
+    "owner": {
+      "description": "Team / individual / organisation accountable for this surface's contract.",
+      "type": "string",
+      "minLength": 1
+    },
+    "isolation": {
+      "description": "How this surface runs relative to the steward identity. 'oop' = its own systemd unit with isolated identity; 'in_process' = loaded into the steward (privileges union into steward identity, audited as the higher-trust class).",
+      "type": "string",
+      "enum": ["oop", "in_process"]
+    },
+    "capability_intent": {
+      "description": "What the surface needs to do, in domain terms. Each entry is one independently-testable intent. The framework grants the OS-level privileges that satisfy each intent's access_path.",
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "type": "object",
+        "required": ["id", "need", "access_path", "failure_mode"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Stable identifier for this intent within the surface. lowercase_snake_case.",
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "need": {
+            "description": "Human-readable description of what the surface needs to do.",
+            "type": "string",
+            "minLength": 1
+          },
+          "access_path": {
+            "description": "Mechanism class through which the intent is satisfied. Examples: 'dbus/polkit', 'filesystem/state', 'network/outbound', 'alsa/control', 'gpio/sysfs', 'systemd/unit-control'.",
+            "type": "string",
+            "minLength": 1
+          },
+          "failure_mode": {
+            "description": "What happens when permission is absent at runtime. MUST be non-panic and observable. Example: 'degraded status; no-panic; structured event emitted'.",
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "required_binaries": {
+      "description": "External executables the surface invokes at runtime. The admission-time parity gate verifies presence + minimum version on the host.",
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "type": "object",
+        "required": ["name", "failure_mode"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "description": "Binary name as it appears on PATH (e.g. 'nmcli', 'mpd', 'ffmpeg'). Path-like values not permitted; use PATH lookup.",
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.+-]+$"
+          },
+          "min_version": {
+            "description": "Minimum acceptable version, semver-shaped. Optional. The framework calls the binary's --version (or equivalent) and compares.",
+            "type": "string"
+          },
+          "failure_mode": {
+            "description": "What happens when the binary is missing or below min_version. MUST be non-panic. Example: 'refuse to start; reason logged'.",
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "required_kernel_modules": {
+      "description": "Kernel modules that must be loaded (or loadable) for the surface to function. Each entry is the module name as 'modprobe' / '/proc/modules' would report it.",
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_]+$"
+      }
+    },
+    "required_system_services": {
+      "description": "systemd unit names the surface depends on (e.g. 'mpd.service', 'NetworkManager.service'). The admission-time parity gate verifies each is loadable.",
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_.@-]+\\.(service|socket|timer|target|path|mount)$"
+      }
+    },
+    "verification": {
+      "description": "Read-only commands the framework runs as the surface's declared service identity to confirm the contract is satisfied. Failure = admission refusal.",
+      "type": "object",
+      "required": ["commands", "expected"],
+      "additionalProperties": false,
+      "properties": {
+        "commands": {
+          "description": "Shell commands. MUST be read-only. The framework runs each in a transient unit under the declared identity and confirms exit 0.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "expected": {
+          "description": "Human-readable expectations the commands collectively confirm. Used in admission-failure messages and audit reports.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "host_provisioning": {
+      "description": "Per-distribution OS-level provisioning the surface needs. Keys are distribution names (lowercase, e.g. 'debian', 'fedora', 'alpine'). Each block declares the systemd unit shape, polkit drop-in, and any additional Linux capabilities. Required for isolation='oop'; optional and advisory for isolation='in_process' (in-process privileges union into the steward record).",
+      "type": "object",
+      "minProperties": 0,
+      "patternProperties": {
+        "^[a-z][a-z0-9_-]*$": {
+          "type": "object",
+          "required": ["systemd", "capabilities", "sudoers"],
+          "additionalProperties": false,
+          "properties": {
+            "systemd": {
+              "description": "systemd unit identity + sandboxing for this surface on this distribution.",
+              "type": "object",
+              "required": [
+                "SupplementaryGroups",
+                "CapabilityBoundingSet",
+                "AmbientCapabilities"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "User": {
+                  "description": "Service identity. Optional. When present: 'dynamic' selects DynamicUser=yes; a named user persists state across restarts. When absent: the installer determines per distribution policy (typically the operator's first user at uid >= 1000), and the runtime parity check resolves to whatever the deployed unit declares. Keeping User absent at framework / distribution-bootstrap level is the appliance-class default; vendor distributions that pre-bake a service user pin a name explicitly.",
+                  "type": "string",
+                  "pattern": "^(dynamic|[a-z_][a-z0-9_-]*)$"
+                },
+                "SupplementaryGroups": {
+                  "description": "Supplementary groups granted to the service identity. Reference-counted at uninstall: groups shared across surviving plugins persist; groups unique to this surface are removed.",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[a-z_][a-z0-9_-]*$"
+                  }
+                },
+                "CapabilityBoundingSet": {
+                  "description": "Linux capabilities the unit MAY receive (upper bound). Empty = no capabilities permitted.",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^CAP_[A-Z_]+$"
+                  }
+                },
+                "AmbientCapabilities": {
+                  "description": "Linux capabilities the unit starts with (subset of CapabilityBoundingSet).",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^CAP_[A-Z_]+$"
+                  }
+                },
+                "ProtectSystem": {
+                  "description": "systemd ProtectSystem= value. Optional; default 'strict'.",
+                  "type": "string",
+                  "enum": ["yes", "no", "full", "strict"]
+                },
+                "ProtectHome": {
+                  "description": "systemd ProtectHome= value. Optional; default 'yes'.",
+                  "type": "string",
+                  "enum": ["yes", "no", "read-only", "tmpfs"]
+                },
+                "ReadWritePaths": {
+                  "description": "Filesystem paths the unit may read/write. Restrict tightly; broad paths are over-provisioning.",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "ReadOnlyPaths": {
+                  "description": "Filesystem paths the unit may read but not write.",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "NoNewPrivileges": {
+                  "description": "systemd NoNewPrivileges= value. Optional; default true. Setting false requires explicit justification at audit.",
+                  "type": "boolean"
+                }
+              }
+            },
+            "polkit": {
+              "description": "polkit drop-in granting authorisation for the surface's identity. Omit if no polkit-mediated actions are needed.",
+              "type": "object",
+              "required": ["policy_file", "required_actions"],
+              "additionalProperties": false,
+              "properties": {
+                "policy_file": {
+                  "description": "Filename for the drop-in (placed in /etc/polkit-1/rules.d/ by the distribution-provided unit-installer). Convention: '50-evo-<plugin-id>.rules'.",
+                  "type": "string",
+                  "pattern": "^[0-9]{2}-evo-[a-z0-9._-]+\\.rules$"
+                },
+                "required_actions": {
+                  "description": "polkit action identifiers the drop-in authorises (e.g. 'org.freedesktop.NetworkManager.*'). Wildcards permitted at the trailing component.",
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            },
+            "capabilities": {
+              "description": "Additional Linux capabilities outside CapabilityBoundingSet (legacy / explicit grants). SHOULD be empty; non-empty entries are flagged at audit for justification.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^CAP_[A-Z_]+$"
+              }
+            },
+            "sudoers": {
+              "description": "Explicit sudoers entries for this surface. SHOULD be empty for runtime plugin paths (per ADR-0087 Pillar I + ADR-0084 §4 grant-mechanism order). Non-empty entries are flagged at audit and require explicit operator/CLI-only justification.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

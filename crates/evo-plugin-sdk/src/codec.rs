@@ -54,9 +54,16 @@ use crate::wire::WireFrame;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Maximum frame payload size: 1 MiB. Matches the client-facing socket
-/// server in the steward and guards against oversized frame attacks.
-pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
+/// Maximum frame payload size: 64 MiB. Matches the client-facing
+/// socket server in the steward and the absolute hard ceiling on
+/// `prepare_for_live_reload` state blobs
+/// ([`crate::contract::MAX_LIVE_RELOAD_BLOB_BYTES`]); a peer that
+/// declares more than this in the length prefix is rejected before
+/// the steward allocates the receive buffer. The cap is the
+/// deliberate ceiling on how much a single OOP wire request /
+/// response can carry — anything larger should ride durable
+/// persistence or a chunked bulk-transfer surface (not implemented).
+pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
 /// Stable wire-name for the JSON codec, as it appears in
 /// [`crate::wire::WireFrame::Hello::codecs`] and
@@ -347,6 +354,16 @@ where
     W: AsyncWrite + Unpin,
 {
     let payload = encode(codec, frame)?;
+    // Per LOGGING.md §2 ("individual message parse steps" fire at
+    // trace): emit a per-frame trace record on the encode side
+    // showing the codec, frame variant, and encoded byte count.
+    // Off by default; chasing wire issues turns it on.
+    tracing::trace!(
+        codec = ?codec,
+        frame_variant = std::any::type_name_of_val(frame),
+        bytes = payload.len(),
+        "wire codec: write_frame encoded"
+    );
     if payload.len() > MAX_FRAME_SIZE {
         return Err(WireError::FrameTooLarge {
             size: payload.len(),
@@ -392,7 +409,24 @@ where
     }
     let mut buf = vec![0u8; size];
     reader.read_exact(&mut buf).await?;
-    decode(codec, &buf)
+    let result = decode(codec, &buf);
+    // Per LOGGING.md §2 ("individual message parse steps" fire at
+    // trace): per-frame decode trace.
+    match &result {
+        Ok(frame) => tracing::trace!(
+            codec = ?codec,
+            frame_variant = std::any::type_name_of_val(frame),
+            bytes = size,
+            "wire codec: read_frame decoded"
+        ),
+        Err(e) => tracing::trace!(
+            codec = ?codec,
+            bytes = size,
+            error = %e,
+            "wire codec: read_frame decode failed"
+        ),
+    }
+    result
 }
 
 /// Write one framed JSON message to an async writer.
@@ -573,9 +607,58 @@ mod tests {
         assert!(matches!(err, WireError::FrameTooLarge { .. }));
     }
 
+    #[tokio::test]
+    async fn round_trip_under_cap_succeeds_for_medium_large_payload() {
+        // 32 MiB payload — under the 64 MiB cap, far above the
+        // legacy 1 MiB cap. Validates the cap raise actually lets
+        // medium-large frames cross the wire end-to-end.
+        let size = 32 * 1024 * 1024;
+        let payload = vec![b'a'; size];
+        let frame_in = WireFrame::ReportState {
+            v: PROTOCOL_VERSION,
+            cid: 7,
+            plugin: "org.test.large".into(),
+            payload: payload.clone(),
+            priority: crate::contract::ReportPriority::Normal,
+        };
+
+        // Use a duplex with enough buffer to hold the encoded
+        // frame in transit; otherwise write_all would block on
+        // the reader.
+        let (mut client, mut server) = tokio::io::duplex(size * 3);
+        let frame_for_writer = frame_in.clone();
+        let writer = tokio::spawn(async move {
+            write_frame_json(&mut client, &frame_for_writer)
+                .await
+                .unwrap();
+            client.shutdown().await.unwrap();
+        });
+        let frame_out = read_frame_json(&mut server).await.unwrap();
+        writer.await.unwrap();
+        match frame_out {
+            WireFrame::ReportState { payload: out, .. } => {
+                assert_eq!(out.len(), size);
+                assert_eq!(out, payload);
+            }
+            other => panic!("expected ReportState, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn max_frame_size_is_one_mib() {
-        assert_eq!(MAX_FRAME_SIZE, 1024 * 1024);
+    fn max_frame_size_is_sixty_four_mib() {
+        // Pinned to the absolute hard ceiling on
+        // prepare_for_live_reload state blobs so the wire transport
+        // can carry the largest StateBlob the framework would ever
+        // admit. Any change to either constant must move both
+        // together — a wire cap below the blob cap renders the
+        // upper end of the blob cap unreachable.
+        assert_eq!(MAX_FRAME_SIZE, 64 * 1024 * 1024);
+        assert_eq!(
+            MAX_FRAME_SIZE,
+            crate::contract::MAX_LIVE_RELOAD_BLOB_BYTES,
+            "wire MAX_FRAME_SIZE must equal MAX_LIVE_RELOAD_BLOB_BYTES; \
+             admission's cap depends on the wire being able to carry it"
+        );
     }
 
     #[test]

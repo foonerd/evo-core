@@ -490,6 +490,10 @@ The fabric's notification stream (per `CONCEPT.md`) carries subject events along
 | Happening | Fired when |
 |-----------|------------|
 | `SubjectConflictDetected` | Reconciliation encountered a conflict it could not resolve automatically. Carries the plugin, the addressings involved, the canonical IDs they each resolve to, and the timestamp. The registry also records the conflict in the `pending_conflicts` table (migration 004); admin merge cross-links and marks the conflict resolved on close. |
+| `SubjectMigrated` | One subject's `subject_type` migrated through `migrate_grammar_orphans`. Carries `old_id`, `new_id`, `from_type`, `to_type`, `migration_id`. Emitted per subject for forensic auditability, with the same emission ordering as `SubjectMerged` / `SubjectSplit` (BEFORE the relation-graph rewrite). Subscribers that do not want the per-subject stream collapse via coalesce labels (`["variant", "from_type", "to_type", "migration_id"]`). |
+| `SubjectGrammarOrphan` | The boot-time orphan diagnostic discovered subjects whose declared type no longer resolves in the current catalogue. Carries the orphan type, count, and first / last samples. The boot diagnostic also upserts each discovered orphan into `pending_grammar_orphans` (migration 011) for operator-visible status. |
+| `GrammarMigrationProgress` | Per-batch progress event emitted by `migrate_grammar_orphans` so operators can observe long-running migrations without polling. |
+| `GrammarOrphansAccepted` | Operator deliberately recorded a non-migration decision against an orphan type via `accept_grammar_orphans`. |
 
 **Roadmap variants** (named here for cross-reference; not yet on the bus):
 
@@ -498,7 +502,6 @@ The fabric's notification stream (per `CONCEPT.md`) carries subject events along
 | `SubjectAnnounced` | A new canonical ID is minted at first registry insertion. Today subscribers infer "new subject" by observing the first projection. Roadmap expansion per `HAPPENINGS.md` §3.3. |
 | `SubjectAddressingAdded` | An existing subject gains a new addressing. Tracing-only today. |
 | `SubjectAddressingRemoved` | An addressing is removed from a subject (plugin retraction, operator forget). Tracing-only today. |
-| `SubjectTypeChanged` | An operator override changed a subject's declared type. Roadmap expansion alongside subject-type correction per section 11. |
 
 Happenings are the primary mechanism by which consumers stay current with subject state. Projections are point-in-time; happenings let consumers invalidate cached projections when the underlying subject changes.
 

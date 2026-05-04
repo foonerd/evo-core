@@ -1,0 +1,58 @@
+# Synthetic watch-cooldown-burst plugin — out-of-process bundle
+# manifest.
+#
+# Registers BOTH a Periodic appointment (the bursting trigger
+# source) and a Level-triggered watch with a 1s cooldown. The
+# appointment fires every 200ms for 5 fires (~1 second total
+# burst), each emitting an `appointment_fired` happening. The
+# watch's `WatchTrigger::Level { cooldown_ms = 1000 }` lets the
+# first matching event through (no cooldown active) and suppresses
+# the rest while the cooldown holds. After the burst the plugin's
+# log records 5 appointment fires + exactly 1 watch fire.
+#
+# Used by T2.watch-cooldown-debounce to verify the Level-trigger
+# cooldown discipline at the watches.rs evaluator boundary.
+
+[plugin]
+name = "org.evoframework.acceptance.watch-cooldown-burst-plugin"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.watch-cooldown-burst"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities]
+appointments = true
+watches = true
+
+[capabilities.respondent]
+request_types = ["appointment_fired", "watch_fired"]
+response_budget_ms = 1000
