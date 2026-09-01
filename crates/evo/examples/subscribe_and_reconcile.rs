@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Consumer-facing example: connect, describe capabilities, list
 //! subjects, subscribe to happenings, and reconcile via `seq`.
 //!

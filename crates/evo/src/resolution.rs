@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Audit ledger for claimant-token resolution requests.
 //!
 //! Every `op = "resolve_claimants"` call is recorded here, whether

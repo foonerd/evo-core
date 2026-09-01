@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end integration tests for `evo-plugin-tool`.
 //!
 //! Drives the compiled binary via `std::process::Command`, not via
@@ -73,8 +76,30 @@ request_types = ["echo"]
 response_budget_ms = 1000
 "#;
 
+/// Minimal, schema-valid privileges.yaml declaring
+/// `has_os_dependencies: false`. Required alongside every manifest
+/// so the tool's compulsory install-time OS-dependency parity gate
+/// (evo_plugin_sdk::privileges::enforce_os_dependency_parity)
+/// finds a contract to read and returns Ok immediately.
+const PRIVILEGES_MINIMAL: &str = r#"schema_version: "1.0"
+plugin: org.example.echo
+owner: evo-plugin-tool-tests
+isolation: oop
+has_os_dependencies: false
+capability_intent: []
+required_binaries: []
+required_kernel_modules: []
+required_system_services: []
+verification:
+  commands: ["true"]
+  expected: ["fixture: parity gate reads empty required_* vectors"]
+host_provisioning: {}
+"#;
+
 fn write_bundle(plugin_dir: &Path) {
     std::fs::write(plugin_dir.join("manifest.toml"), MANIFEST_STANDARD)
+        .unwrap();
+    std::fs::write(plugin_dir.join("privileges.yaml"), PRIVILEGES_MINIMAL)
         .unwrap();
     // Shebang content is irrelevant (the tool never execs plugin.bin);
     // the +x bit is the contract we assert across pack/extract/install.

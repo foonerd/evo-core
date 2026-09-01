@@ -1,0 +1,54 @@
+# Synthetic subject-state-persistence plugin — out-of-process
+# bundle manifest. Exercises subject-state durable persistence
+# end-to-end.
+#
+# On the very first load() the plugin announces a subject with a
+# non-null state payload and writes a marker file to {state_dir}.
+# On subsequent loads the marker is present and the plugin skips
+# re-announcement — the framework's `subject_states` durable
+# mirror carries the state across restarts. The acceptance
+# scenario verifies the row written on first restart survives the
+# second restart and that the boot log shows the rehydration line.
+#
+# Used by T2.subject-state-survives-restart. Has no value outside
+# that scenario.
+
+[plugin]
+name = "org.evoframework.acceptance.subject-state-persistence-plugin"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.subject-state-persistence"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 16
+max_cpu_percent = 1
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities.respondent]
+request_types = ["noop"]
+response_budget_ms = 1000

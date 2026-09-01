@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Load `*.pem` + `*.meta.toml` from two directories.
 //!
 //! Each loaded key is validated against its sidecar before being

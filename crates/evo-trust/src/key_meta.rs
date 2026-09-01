@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! `*.meta.toml` sidecar for a trust `.pem` public key.
 //!
 //! ## Schema

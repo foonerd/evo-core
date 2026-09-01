@@ -1,0 +1,67 @@
+schema_version: "1.0"
+plugin: com.example.audio.composition
+owner: example-author
+isolation: oop
+
+# Set true when the plugin depends on any host-side OS package
+# (binary, kernel module, system service). The compulsory
+# parity gate at install-time and admission-time reads this
+# field FIRST: true + a missing required_binary = HARD FAIL.
+has_os_dependencies: false
+
+# ARCHETYPE: audio_composition
+#
+# A DSP filter / equaliser / crossover plugin that transforms an
+# audio stream in the framework's playback pipeline. Consumes PCM
+# from one pipeline slot and produces PCM into the next. Typical
+# examples: parametric EQ, room-correction filter, upsampler,
+# format converter, loudness-normaliser, dither / re-sampler.
+#
+# TAILOR before shipping:
+#   - `plugin` — replace with the reverse-DNS canonical id for
+#     your plugin.
+#   - `owner` — the accountable team / individual / organisation.
+#   - `verification.commands` — read-only shell commands that
+#     confirm the host actually satisfies the intents. Every entry
+#     must exit 0 as the plugin's declared service identity.
+#   - `host_provisioning.<distro>` — most DSP plugins do NOT need
+#     supplementary groups, capabilities, polkit, or sudoers. The
+#     shipped defaults keep the plugin sandboxed to state only.
+
+capability_intent:
+  - id: audio_transform
+    need: read one audio pipeline slot, apply a DSP transform, write the result into the next slot. Pure in-memory transform; no device access.
+    access_path: framework/pipeline
+    failure_mode: pass audio through untransformed and emit a structured event; no panic, no clipping, no silence.
+  - id: state_storage
+    need: write per-plugin state directory to persist filter coefficients, calibration profiles, and any operator-tuned parameters.
+    access_path: filesystem/state
+    failure_mode: fall back to shipped defaults; structured event; no panic.
+
+required_binaries: []
+
+required_kernel_modules: []
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+    - "test -r /var/lib/evo"
+  expected:
+    - state directory exists as the declared service identity
+    - state directory is readable
+
+host_provisioning:
+  debian:
+    systemd:
+      SupplementaryGroups: []
+      CapabilityBoundingSet: []
+      AmbientCapabilities: []
+      ProtectSystem: strict
+      ProtectHome: "yes"
+      ReadWritePaths:
+        - /var/lib/evo/plugins/com.example.audio.composition/state
+      NoNewPrivileges: true
+    capabilities: []
+    sudoers: []

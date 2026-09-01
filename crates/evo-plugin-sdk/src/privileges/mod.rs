@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Plugin privileges contract — Rust types, YAML parser, and validator.
 //!
 //! Each plugin / framework surface ships a `privileges.yaml` declaring its
@@ -24,10 +27,31 @@
 
 #![allow(missing_docs)]
 
+mod parity_gate;
+mod probe;
+mod remediation;
+mod resolution;
 mod schema;
 mod types;
 mod validator;
 
+pub use parity_gate::{
+    enforce_os_dependency_parity, MissingPrerequisite, ParityFailure,
+};
+pub use probe::{
+    run_probes, run_probes_with_counts, which, AccessMode, BinaryPresentProbe,
+    FilesystemAccessProbe, Probe, ProbeOutcome, ProbePlan, SudoersCommandProbe,
+    DEFAULT_PROBE_TIMEOUT,
+};
+pub use remediation::{
+    hint_for_missing_binary, hint_for_missing_group, hint_for_missing_module,
+    hint_for_missing_service, hint_for_polkit, parse_os_release_id,
+    DistroFamily, RemediationHint, RemediationList,
+};
+pub use resolution::{
+    CapabilityResolution, CapabilityResolutionMap, CapabilityResolutionMapExt,
+    ResolutionCounts,
+};
 pub use schema::SCHEMA_V1_BYTES;
 pub use types::{
     CapabilityIntent, HostProvisioning, HostProvisioningBlock, Isolation,

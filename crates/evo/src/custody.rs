@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! The custody ledger.
 //!
 //! Tracks every custody the steward has handed to a warden: the warden

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Exit status codes (PLUGIN_TOOL.md section 8): 0=ok, 1=usage, 2=trust/sig, 3=io, 4=network
 
 use std::io;

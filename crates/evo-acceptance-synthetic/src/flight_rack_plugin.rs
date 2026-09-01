@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Synthetic flight-rack plugin.
 //!
 //! Admits as a respondent on the `flight_mode.bluetooth` shelf and
@@ -161,7 +164,7 @@ impl Plugin for FlightRackPlugin {
 
 impl Respondent for FlightRackPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {
@@ -257,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn flight_mode_set_then_query_round_trips() {
-        let mut p = FlightRackPlugin::new();
+        let p = FlightRackPlugin::new();
         let set = Request {
             request_type: "flight_mode.set".to_string(),
             payload: serde_json::to_vec(&serde_json::json!({"on": true}))
@@ -265,6 +268,8 @@ mod tests {
             correlation_id: 1,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let resp = p.handle_request(&set).await.expect("set returns ok");
         let body: serde_json::Value =
@@ -277,6 +282,8 @@ mod tests {
             correlation_id: 2,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let resp = p.handle_request(&query).await.expect("query returns ok");
         let body: serde_json::Value =
@@ -286,7 +293,7 @@ mod tests {
 
     #[tokio::test]
     async fn flight_mode_set_off_round_trips() {
-        let mut p = FlightRackPlugin::new();
+        let p = FlightRackPlugin::new();
         let set = Request {
             request_type: "flight_mode.set".to_string(),
             payload: serde_json::to_vec(&serde_json::json!({"on": false}))
@@ -294,6 +301,8 @@ mod tests {
             correlation_id: 1,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let resp = p.handle_request(&set).await.expect("set returns ok");
         let body: serde_json::Value =
@@ -303,13 +312,15 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_request_type_refuses() {
-        let mut p = FlightRackPlugin::new();
+        let p = FlightRackPlugin::new();
         let req = Request {
             request_type: "nope".to_string(),
             payload: vec![],
             correlation_id: 1,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let err = p
             .handle_request(&req)

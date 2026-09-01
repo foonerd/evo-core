@@ -1,0 +1,44 @@
+[package]
+name = "evo-shadow-crypt"
+description = "Local-only /etc/shadow password verification for the evo framework. Wraps libcrypt's crypt_r(3) via runtime dynamic-load (libloading) so every hash format libcrypt supports — yescrypt, SHA-512-crypt, SHA-256-crypt, MD5-crypt, bcrypt — verifies identically. No PAM stack, no network authority reachable at any layer. Linux-only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# libc is needed for the C-string / c_void types the crypt_r(3)
+# FFI call signature carries. Already in the workspace dep graph
+# via evo-os-clock; declaring here does not expand it.
+libc = "0.2"
+# libloading resolves libcrypt.so.1 at runtime. Chosen over
+# `#[link(name = "crypt")]` compile-time linkage so cross-builds
+# to aarch64 + x86_64 do not need per-arch libcrypt-dev packages
+# on the host sysroot. libcrypt.so.1 is present on every Debian
+# target as part of the base install.
+libloading = "0.8"
+# thiserror provides #[derive(Error)] for the VerifyError public
+# error type, matching the error-derivation style used across
+# the rest of the workspace.
+thiserror = "1"
+
+[dev-dependencies]
+
+# This crate intentionally does NOT inherit the workspace lints
+# posture (`unsafe_code = "forbid"`). It relaxes that to `deny`
+# so a single tightly-scoped FFI wrapper for `crypt_r(3)` can
+# `#[allow(unsafe_code)]` the syscall transition. Same pattern
+# as evo-os-clock (adjtimex(2)).
+#
+# The unsafe surface is exactly one function in src/lib.rs
+# (`call_crypt_r`), documented with the libcrypt ABI contract:
+# the phrase + setting are NUL-terminated C strings, the
+# `crypt_data` buffer is a stack-owned zeroed block, the
+# returned pointer is copied out via `CStr::from_ptr` and
+# lifetime-scoped to the caller before the data buffer drops.
+# A reader can find every use of `unsafe` in this crate by
+# grepping `unsafe` in src/lib.rs.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"

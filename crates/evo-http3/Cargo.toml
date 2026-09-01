@@ -1,0 +1,39 @@
+[package]
+name = "evo-http3"
+description = "HTTP/3 + QUIC runtime mount for the steward. Binds a quinn QUIC listener with h3 framing and routes every request through the same WireOpDispatcher seam the gRPC and GraphQL substrates consume; the canonical wire-protocol schema is the single source of truth across all four projections."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["enabled"]
+enabled = [
+    "dep:quinn",
+    "dep:h3",
+    "dep:h3-quinn",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:bytes",
+    "dep:http",
+    "dep:evo-tls-certs",
+]
+
+[dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "net"] }
+tracing = "0.1"
+thiserror = "1"
+
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+bytes = { version = "1", optional = true }
+http = { version = "1", optional = true }
+evo-tls-certs = { path = "../evo-tls-certs", optional = true }
+
+[lints]
+workspace = true

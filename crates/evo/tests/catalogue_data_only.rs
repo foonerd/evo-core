@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Invariant: parsing a catalogue is data-only.
 //!
 //! The catalogue is TOML-as-data. Loading a catalogue MUST NOT

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Synthetic appointment-past-due plugin.
 //!
 //! Exercises the boot-rehydration + Catchup-miss-policy path the
@@ -230,7 +233,7 @@ impl Plugin for AppointmentPastDuePlugin {
 
 impl Respondent for AppointmentPastDuePlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {

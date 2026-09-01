@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! `evo-acceptance` CLI: thin clap wrapper around the runner.
 
 use std::path::PathBuf;
@@ -34,7 +37,7 @@ enum Cmd {
         /// Path to the scenario plan (TOML).
         #[arg(long)]
         plan: PathBuf,
-        /// Release tag this run covers, e.g. v0.1.12.
+        /// Release tag this run covers, e.g. vMAJOR.MINOR.PATCH.
         #[arg(long)]
         release: String,
         /// Release-candidate ordinal (1, 2, ...).

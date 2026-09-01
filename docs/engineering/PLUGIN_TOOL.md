@@ -1,6 +1,6 @@
 # evo-plugin-tool (implementation contract)
 
-Status: **normative** for `crates/evo-plugin-tool` (`lint` / `sign` / `verify` / `pack` / `install` implemented in v1; this document is the long-term build contract, and a future crate `README` may still defer here).
+Status: **normative** for `crates/evo-plugin-tool` (`lint` / `sign` / `verify` / `pack` / `install` implemented in v1; this document is the long-term build contract, and a future crate `README` may still point here).
 Audience: evo-core implementers, packagers, CI and UI integrators. Packaging narrative remains in `PLUGIN_PACKAGING.md` sections 7 and 9.
 
 The steward binary is `evo` (`/opt/evo/bin/evo`). The SDK CLI is **`evo-plugin-tool`** in the same directory, built from the workspace crate of the same name. It **must** call **`evo_trust`’s** signing and verification **APIs** (not reimplemented message formats).

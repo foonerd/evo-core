@@ -1,0 +1,19 @@
+[package]
+name = "evo-primitives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Framework-foundational primitives extracted from the evo crate so that domain-tier crates (audio, multi-room, etc.) can depend on them without importing the framework runtime. Domain crates must never import evo; evo and the domain crates both import evo-primitives."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+

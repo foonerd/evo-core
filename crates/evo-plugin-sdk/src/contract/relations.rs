@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Relation assertion types.
 //!
 //! Carries the data types plugins use to assert and retract relations

@@ -11,6 +11,16 @@ repository.workspace = true
 name = "evo"
 path = "src/main.rs"
 
+# Schema-driven SDK generator. Reads the canonical wire schema
+# (`evo::projection_schema::canonical_schema`) and emits five
+# packaged client SDKs (TypeScript, Swift, Kotlin, Python,
+# Rust) into the configured output directory. Operators invoke
+# it from CI / release scripts to produce the SDK artefacts the
+# vendor distribution publishes.
+[[bin]]
+name = "evo-sdk-gen"
+path = "src/bin/evo-sdk-gen.rs"
+
 # Consumer-facing worked example: connect, describe capabilities,
 # snapshot via list_subjects, then subscribe with `since` set to the
 # snapshot's `current_seq`. See examples/subscribe_and_reconcile.rs
@@ -22,11 +32,38 @@ path = "examples/subscribe_and_reconcile.rs"
 
 [dependencies]
 evo-plugin-sdk = { path = "../evo-plugin-sdk" }
+evo-primitives = { path = "../evo-primitives" }
+evo-projection-core = { path = "../evo-projection-core" }
 evo-trust = { path = "../evo-trust" }
 evo-os-clock = { path = "../evo-os-clock" }
 evo-coalesce-labels = { path = "../evo-coalesce-labels" }
+evo-auth-bearer = { path = "../evo-auth-bearer" }
+evo-graphql = { path = "../evo-graphql" }
+evo-grpc = { path = "../evo-grpc" }
+evo-http3 = { path = "../evo-http3" }
+evo-observatory = { path = "../evo-observatory" }
+evo-otel-export = { path = "../evo-otel-export" }
+evo-runtime-http = { path = "../evo-runtime-http" }
+evo-tls-certs = { path = "../evo-tls-certs" }
+evo-sdk-genkit = { path = "../evo-sdk-genkit" }
+evo-sdk-kotlin = { path = "../evo-sdk-kotlin" }
+evo-sdk-python = { path = "../evo-sdk-python" }
+evo-sdk-rust = { path = "../evo-sdk-rust" }
+evo-sdk-swift = { path = "../evo-sdk-swift" }
+evo-sdk-typescript = { path = "../evo-sdk-typescript" }
+evo-witness = { path = "../evo-witness" }
+async-trait = "0.1"
+# `http::StatusCode` — needed by `error_class_to_http_status`
+# which maps the SDK's ErrorClass to the HTTP status the
+# wire-honesty path returns for framework-classified refusals.
+# Version pinned to match evo-runtime-http (the transport crate
+# whose Dispatcher trait consumes the same StatusCode type).
+http = "1"
+ed25519-dalek = { version = "2.1", features = ["std"] }
 
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -36,6 +73,11 @@ clap = { version = "4", features = ["derive"] }
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Non-blocking writer wrapper used by `logging::init` to keep
+# fmt-layer write syscalls off the realtime audio runtime when
+# the journald layer is unavailable. Spawns a dedicated worker
+# thread; the `WorkerGuard` returned by `init` owns its lifetime.
+tracing-appender = "0.2"
 
 # Calendar / wall-clock arithmetic for the appointments
 # scheduler. `clock` enables `chrono::Local::now()` (libc
@@ -46,13 +88,48 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 base64 = "0.22"
+# Cryptographically random material for step-up auth session
+# tokens. The privileged-session token is 32 random bytes encoded
+# URL-safe base64; the OS rng (default `thread_rng`) backs it.
+rand = "0.8"
+# argon2id password-hash verification powers the framework's
+# default operator credential backend (`SharedSecretAuthService`).
+# argon2id is the OWASP-recommended password-hashing primitive;
+# constant-time verification is delegated to the `password-hash`
+# crate's `PasswordVerifier::verify_password` contract.
+# Vendor distributions that plug in PAM / LDAP / WebAuthn skip
+# this dependency at runtime — the trait is the contract, not
+# this default implementation.
+argon2 = "0.5"
 semver = { version = "1", features = ["serde"] }
+# SHA-256 powers credential-key hashing in the credential vault
+# primitive (so the substrate stores the operator-visible key's
+# hex-encoded hash, never the key string itself). evo-trust pulls
+# sha2 transitively for plugin-bundle signing; this direct dep
+# makes the credential-vault use site explicit at the dependency
+# level.
+sha2 = "0.10"
+# Cross-platform file-mtime touch for the asset cache's
+# approximate-LRU eviction sweep. The cache touches every
+# read so the eviction picker can sort by recency without
+# threading an in-process access-time map.
+filetime = "0.2"
 uuid = { version = "1", features = ["v4"] }
 # Lock-free Arc swap used by per-plugin entries to publish updated
 # enforcement policies and manifests when reload-manifest swaps
 # them. Reads on the dispatch path stay lock-free; writes happen
 # only at admission and reload time.
 arc-swap = "1.7"
+if-addrs = "0.13"
+# Unprivileged ICMP echo for the presence correlator's Stalled-vs-Absent
+# distinction. socket2 wraps `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)`
+# which works without CAP_NET_RAW on Linux hosts whose `ping_group_range`
+# sysctl admits the steward's group (default-wide on Debian / Pi OS).
+socket2 = "0.5"
+# OS hostname read at first-boot for the domain-tier display_name
+# seed (per the hybrid hostname-seed model). Single function shape;
+# pure Rust; no platform surprises.
+gethostname = "0.5"
 
 # BLAKE3 powers claimant-token derivation. Pulled here (not via
 # evo-trust) because the steward derives tokens for every admitted
@@ -78,13 +155,65 @@ rusqlite = { version = "0.31", features = ["bundled", "blob", "serde_json"] }
 # blocked.
 deadpool-sqlite = "0.8"
 
+# Plugin-stage watcher reads dropped bundles from a stage
+# directory and feeds them through the admission gate. Bundle
+# format is the same .tar.gz / .tar.xz / .zip evo-plugin-tool
+# produces. Versions matched to evo-plugin-tool's archive deps
+# so the two extraction paths behave identically.
+tar = "0.4"
+flate2 = "1"
+xz2 = { version = "0.1", features = ["static"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+# HTTPS fetcher for the operator-issued install-plugin-from-url
+# wire op. Same crate + features as evo-plugin-tool's install
+# path so the two delivery surfaces behave identically. rustls
+# feature avoids OpenSSL link dependencies on cross-compile
+# targets.
+ureq = "2.9"
+
+# Pure-Rust mDNS Service Discovery daemon. Powers the
+# multi-room peer discovery substrate — advertises the local
+# device under `_evo._tcp.local.` with a TXT record carrying
+# device id + display name + vendor + capability flags +
+# public-key fingerprint, browses for other evo nodes on the
+# same broadcast domain, surfaces add / update / remove events.
+# `bundled` is unused; the crate has no system-library
+# dependency.
+mdns-sd = "0.19"
+
+# crossbeam channels bridge the synchronous mdns-sd event
+# stream into our tokio runtime via a blocking-task forwarder.
+# Pulled directly here (not transitively via mdns-sd) because
+# the bridge code lives in `discovery.rs` and we want the
+# import to be explicit at the dep level.
+crossbeam-channel = "0.5"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 tracing-journald = "0.3"
+# nix + evo-shadow-crypt back the ShadowAuthService implementation
+# (crates/evo/src/auth_shadow.rs). Linux only because /etc/shadow
+# is the only backing the substrate resolves against; PAM,
+# winbind, sssd, and every other pluggable path are refused by
+# construction (local-only invariant).
+#
+# evo-shadow-crypt is a sibling workspace crate wrapping
+# libcrypt's crypt_r(3) via runtime dynamic-load (libloading).
+# Every hash format libcrypt supports — yescrypt, SHA-512-crypt,
+# SHA-256-crypt, MD5-crypt, bcrypt — verifies identically. The
+# framework does not force a specific format on /etc/shadow;
+# OS-standard password rotation via `passwd` keeps working
+# across distribution defaults.
+nix = { version = "0.30", default-features = false, features = ["user"] }
+evo-shadow-crypt = { path = "../evo-shadow-crypt" }
 
 [dev-dependencies]
 evo-example-echo = { path = "../evo-example-echo" }
+evo-tls-certs = { path = "../evo-tls-certs" }
 tempfile = "3"
 proptest = "1"
+rand_core = { version = "0.6", features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
 
 # Loom model-checking tests for the router's lookup-clone-drop
 # discipline live in the stand-alone `crates/evo-loom` crate, NOT in

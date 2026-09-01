@@ -1,0 +1,24 @@
+# Paths excluded from the public squashed-and-scrubbed snapshot
+# at promote time. The promote script reads this file and
+# `rm -rf` each path from the staging tree before the squashed
+# commit is built.
+#
+# One path per line, repo-relative, no globs (the script may
+# extend with glob support later).
+#
+# Comments (#) and blank lines are ignored.
+
+# Internal journal (when merged into eng as a subtree).
+evo-internal/
+
+# Loom model-checking harness — workspace-excluded crate that
+# requires a global rustc cfg flag and is not part of the
+# user-facing build matrix.
+crates/evo-loom/
+
+# Acceptance readiness reports + JSON sidecars produced by the
+# harness against eng-internal targets (Pi 5 prototype, etc.).
+# The reports name machine-specific paths and quote command
+# output; they belong to the eng repo's release-cut audit trail,
+# not to the public source surface.
+reports/

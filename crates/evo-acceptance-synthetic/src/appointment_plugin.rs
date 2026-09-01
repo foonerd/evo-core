@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Synthetic appointment plugin.
 //!
 //! On `load`, registers a single OneShot appointment 5 seconds in
@@ -197,7 +200,7 @@ impl Plugin for AppointmentPlugin {
 
 impl Respondent for AppointmentPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {

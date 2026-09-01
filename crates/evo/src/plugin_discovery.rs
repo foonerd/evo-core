@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Walk configured plugin search roots, skip unsupported manifests, and
 //! admit out-of-process singletons. See `PLUGIN_PACKAGING.md` for
 //! directory layout.
@@ -84,9 +87,10 @@ pub async fn discover_and_admit(
                 plugin = %manifest.plugin.name,
                 version = %manifest.plugin.version,
                 shelf = %manifest.target.shelf,
-                instance = ?manifest.kind.instance,
-                interaction = ?manifest.kind.interaction,
-                transport = ?manifest.transport.kind,
+                artefact_kind = ?manifest.plugin.kind,
+                instance = ?manifest.kind.as_ref().map(|k| k.instance),
+                interaction = ?manifest.kind.as_ref().map(|k| k.interaction),
+                transport = ?manifest.transport.as_ref().map(|t| t.kind),
                 trust_class = ?manifest.trust.class,
                 "discovery: manifest parsed"
             );
@@ -146,7 +150,8 @@ pub async fn discover_and_admit(
         tracing::debug!(
             plugin = %name,
             path = %dir.display(),
-            transport = ?manifest.transport.kind,
+            artefact_kind = ?manifest.plugin.kind,
+            transport = ?manifest.transport.as_ref().map(|t| t.kind),
             "discovery: evaluating plugin for admission"
         );
 
@@ -157,7 +162,7 @@ pub async fn discover_and_admit(
             tracing::info!(
                 plugin = %name,
                 path = %dir.display(),
-                "skipping plugin: operator-disabled"
+                "skipping plugin {name}: operator-disabled"
             );
             let _ = engine
                 .happening_bus()
@@ -170,42 +175,65 @@ pub async fn discover_and_admit(
             continue;
         }
 
-        // Factory admission gating lives in the admission engine.
-        // Discovery surfaces every parseable manifest; admission
-        // produces the structured refusal so operators see a
-        // consistent error shape regardless of the entry point.
-        if manifest.transport.kind != TransportKind::OutOfProcess {
-            tracing::warn!(
+        // Dispatch by plugin kind. Functional manifests flow
+        // through `admit_out_of_process_from_directory`;
+        // artefact manifests (theme / ui_shell /
+        // widget_kind_pack) flow through
+        // `admit_artefact_from_directory`. Per-plugin
+        // admission failure is non-fatal at startup so the
+        // steward stays up to let the operator recover from
+        // a misbehaving bundle.
+        let admission_result = if manifest.plugin.kind
+            == evo_plugin_sdk::manifest::ArtefactKind::Functional
+        {
+            let Some(transport) = manifest.transport.as_ref() else {
+                tracing::warn!(
+                    plugin = %name,
+                    path = %dir.display(),
+                    "skipping plugin {name}: functional manifest has no \
+                     [transport] section (validation would have caught \
+                     this; reaching here means the manifest evolved \
+                     between parse and dispatch)"
+                );
+                continue;
+            };
+            if transport.kind != TransportKind::OutOfProcess {
+                let tk = transport.kind;
+                tracing::warn!(
+                    plugin = %name,
+                    path = %dir.display(),
+                    transport_kind = ?tk,
+                    "skipping plugin {name}: transport is not out-of-process (transport_kind={tk:?})"
+                );
+                continue;
+            }
+
+            ensure_plugin_state_and_credentials(
+                engine.plugin_data_root(),
+                &name,
+            )?;
+            engine
+                .admit_out_of_process_from_directory(
+                    dir.as_path(),
+                    &config.plugins.runtime_dir,
+                )
+                .await
+        } else {
+            tracing::debug!(
                 plugin = %name,
                 path = %dir.display(),
-                ?manifest.transport.kind,
-                "skipping plugin: transport is not out-of-process"
+                artefact_kind = ?manifest.plugin.kind,
+                "dispatching to artefact admission"
             );
-            continue;
-        }
+            engine.admit_artefact_from_directory(dir.as_path()).await
+        };
 
-        ensure_plugin_state_and_credentials(engine.plugin_data_root(), &name)?;
-        // Per-plugin admission failure is non-fatal at startup. The
-        // steward must stay up so the operator can restore catalogue
-        // state, remove the misbehaving plugin, or otherwise recover
-        // — particularly under the catalogue-resilience degraded-boot
-        // path (corrupted catalogue + LKG → built-in skeleton, which
-        // necessarily declares fewer shelves than the live plugin
-        // set). Skip + structured happening + continue, mirroring
-        // the operator-disabled and transport-mismatch skip paths
-        // above.
-        if let Err(e) = engine
-            .admit_out_of_process_from_directory(
-                dir.as_path(),
-                &config.plugins.runtime_dir,
-            )
-            .await
-        {
+        if let Err(e) = admission_result {
             tracing::warn!(
                 plugin = %name,
                 path = %dir.display(),
                 error = %e,
-                "skipping plugin: admission failed"
+                "skipping plugin {name}: admission failed ({e})"
             );
             let _ = engine
                 .happening_bus()

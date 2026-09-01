@@ -25,6 +25,10 @@ Exactly one of `plugin.bin` / `plugin.so` / `plugin.wasm` must be present for a 
 
 Format: TOML. Consistent with evo's broader TOML discipline.
 
+The manifest's `plugin.kind` field selects between two manifest shapes: **functional** plugins (the historical executable-plugin shape — code that loads and responds to verbs) and **UI artefact** plugins (theme / ui_shell / widget_kind_pack — static asset bundles that render rather than execute). The functional shape is the default; artefact shapes opt in via the `kind` field.
+
+### 2.1 Functional plugin manifest
+
 Minimum schema:
 
 ```toml
@@ -32,6 +36,7 @@ Minimum schema:
 name = "org.example.myplugin"         # Reverse-DNS canonical name.
 version = "0.1.0"                     # Semver.
 contract = 1                          # Plugin contract version this targets.
+kind = "functional"                   # Optional. Default. See §2.3 for artefact kinds.
 
 [target]
 shelf = "metadata.providers"          # Fully qualified shelf target.
@@ -67,6 +72,8 @@ restart_budget = 5                    # Max restarts per hour before giving up.
 [capabilities]
 # Plugin-kind-specific declarations. Examples below.
 ```
+
+The four executable-only sections — `[kind]`, `[transport]`, `[resources]`, `[lifecycle]` — are required for functional plugins and **forbidden** for artefact plugins. Functional manifests omitting any of the four refuse with `MissingExecutableSection`; artefact manifests declaring any of them refuse with `UnexpectedExecutableSection`.
 
 Respondent-specific:
 
@@ -111,6 +118,222 @@ admin = true
 ```
 
 Additional sections may be declared by specific shelves' shapes. The steward validates the full manifest against the target shelf's published schema before admission.
+
+### 2.1.1 Multi-stocking plugins
+
+A plugin's manifest may declare more than one stocking when one runtime substrate (shared connection, shared namespace, coupled lifecycle) carries multiple operator-facing surfaces. The `[target]` block is syntactic sugar for one stocking; the `[[stockings]]` array declares N stockings, each shelf-scoped with its own role and verb partition. The convergence rule mirrors the UI-tier `[[ui.stocks]]` shape: legacy single-shelf manifests auto-derive a one-stocking representation; multi-shelf plugins declare their stockings explicitly.
+
+Multi-stocking form:
+
+```toml
+[plugin]
+name = "org.example.media.warden"
+version = "0.1.0"
+contract = 1
+
+# Either [target] OR [[stockings]], never both. The legacy
+# [target] form auto-derives a single stocking on parse.
+
+[[stockings]]
+shelf = "media.playback"
+shape = 1
+role  = "warden"
+request_types = ["play_now", "play", "pause", "next"]
+
+[[stockings]]
+shelf = "media.queue"
+shape = 1
+role  = "respondent"
+request_types = ["queue.get", "queue.enqueue", "queue.remove"]
+
+[[stockings]]
+shelf = "media.library"
+shape = 1
+role  = "respondent"
+request_types = ["library.list_sources", "library.browse"]
+
+[kind]
+instance    = "singleton"
+interaction = "warden"        # consistent with the warden stocking's role
+
+[capabilities.respondent]
+# Union of every stocking's request_types. The intersection across
+# any two stockings MUST be empty: one verb belongs to one stocking.
+request_types = [
+    "play_now", "play", "pause", "next",
+    "queue.get", "queue.enqueue", "queue.remove",
+    "library.list_sources", "library.browse",
+]
+response_budget_ms = 2000
+```
+
+Each stocking carries:
+
+- `shelf` — fully qualified shelf name (`<rack>.<shelf>`). Must resolve in the loaded catalogue at admission. One stocking per shelf at admission time; cross-plugin occupancy is refused.
+- `shape` — the shelf-shape version this stocking satisfies. Strict equality with the catalogue shelf's current `shape` OR membership in its `shape_supports` list.
+- `role` — `warden` / `respondent` / `composer` / `factory`. Must be consistent with the plugin's `[kind].interaction`: a `warden` role requires `interaction = "warden"`; a `respondent` role requires `interaction ∈ {respondent, warden}` (a warden plugin may hold respondent stockings on its non-custody shelves).
+- `request_types` — the subset of the plugin's `capabilities.respondent.request_types` that dispatch under this stocking. The union across all stockings MUST equal the plugin's full set; the intersection across any pair MUST be empty.
+
+Admission across the declared stocking set is transactional: a plugin declaring N stockings receives all N or none. If any stocking fails its pre-flight checks (shelf does not resolve in the catalogue, shape mismatch, cross-plugin occupancy, role/interaction inconsistency, partition violation), the admission rolls back and the plugin does not enter the router.
+
+#### When to declare multiple stockings
+
+Multi-stocking is permitted only when all three carving criteria hold:
+
+1. **Shared substrate.** The stockings depend on a single runtime substrate whose duplication would multiply cost, produce races, or break correctness. Examples: an MPD plugin whose queue + playlist + favourites + library shelves share one MPD connection and one stored-playlist namespace; a `udevd`-driven enumerator whose USB-audio + USB-storage + USB-network shelves share one kernel uevent subscription.
+2. **Coupled lifecycle.** The stockings' load / unload / reload lifecycles are coupled at the substrate layer (one stocking cannot reload independently of the others without violating substrate invariants).
+3. **Distinct operator-facing concerns.** Each stocking presents a distinct operator-facing contract (queue ≠ library ≠ playlist) with its own subjects, charter, and verb namespace. The plurality at the shelf grain is not just internal modularity dressed up as shelves — operators see and reason about each shelf separately.
+
+A manifest that ships multi-stocking against poor criteria (e.g. splitting a single concern into two shelves purely for code modularity) is a design-review concern, not a framework refusal. The framework admits the manifest if the structural rules above hold; the criteria are an authoring discipline.
+
+### 2.2 Artefact kind taxonomy
+
+The `plugin.kind` field is closed. Four variants:
+
+| Kind | Shape | Loaded by | Section required |
+|------|-------|-----------|------------------|
+| `functional` | Executable plugin (the historical shape) | `admit_*` paths via the router | `[kind]` + `[transport]` + `[resources]` + `[lifecycle]` |
+| `theme` | Visual token + asset bundle | `admit_theme` into `ThemeRegistry` | `[theme]` |
+| `ui_shell` | Complete UI bundle (web / native) | `admit_ui_shell` into `UiShellRegistry` | `[ui_shell]` |
+| `widget_kind_pack` | One or more widget renderers | `admit_widget_kind_pack` into `WidgetKindPackRegistry` (kinds folded into `WidgetKindRegistry`) | `[widgets]` plus `size_envelopes.toml` + `a11y.toml` side files |
+
+The kind ↔ section invariant is total: functional manifests MUST omit `[theme]` / `[ui_shell]` / `[widgets]`; artefact manifests MUST omit `[kind]` / `[transport]` / `[resources]` / `[lifecycle]` AND MUST carry exactly the section matching their kind. Validation refuses with structured `MissingArtefactSection` / `UnexpectedArtefactSection` / `MissingExecutableSection` / `UnexpectedExecutableSection` errors naming the offending section.
+
+Artefact kinds ship through the same admission gauntlet as functional plugins: same `[trust]` and `[prerequisites]` blocks, same signature verification (with the artefact-specific signing payload — see §5), same trust-class enforcement, same `bundled_roots` policy at uninstall time. The only structural difference is what gets dispatched at admission and what registry holds the result.
+
+### 2.3 Theme manifest
+
+```toml
+[plugin]
+name = "com.vendor.theme.midnight"
+version = "0.1.0"
+contract = 1
+kind = "theme"
+
+[target]
+shelf = "system.appearance.themes"
+shape = 1
+
+[trust]
+class = "unprivileged"
+
+[prerequisites]
+evo_min_version = "0.1.13"
+os_family = "any"
+
+[theme]
+display_name = "Midnight"
+variants = ["dark", "high-contrast"]      # Optional list of supported variants.
+
+[theme.tokens]
+brand_primary = "#1ABCFF"                 # Token vocabulary is open; admission validates
+spacing_unit = 8                          # field shape only, not token vocabulary.
+
+[theme.assets]
+logo_png = "assets/logo.png"              # Bundle-relative paths; resolved at render.
+
+[theme.overrides]
+"evo.prompt.confirm" = "overrides/confirm.css"   # Optional widget-specific overrides.
+
+[theme.compliance]
+contrast = "aaa"                          # Theme-level contrast assertion.
+```
+
+`[theme.tokens]` carries `BTreeMap<String, toml::Value>` so colour, spacing, opacity, and other token shapes coexist in one section. The framework records the section verbatim; the renderer interprets it.
+
+### 2.4 UI shell manifest
+
+```toml
+[plugin]
+name = "com.vendor.shell.kiosk"
+version = "0.1.0"
+contract = 1
+kind = "ui_shell"
+
+[target]
+shelf = "system.ui.shell"
+shape = 1
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.13"
+os_family = "any"
+
+[ui_shell]
+display_name = "Kiosk shell"
+shell_type = "web_bundle"                 # web_bundle | native_bundle | embedded
+entry_point = "index.html"                # Bundle-relative; resolved at render.
+required_widget_kinds = ["evo.*", "audio.eq.*"]   # Glob patterns.
+supports_themes = true
+supports_offline = false
+min_evo_version = "0.1.13"
+
+[ui_shell.manifest_assets]
+"icons/192x192" = "assets/icon-192.png"   # Optional manifest-asset map for PWA shells.
+
+[ui_shell.service_worker]                 # Optional service-worker block.
+path = "sw.js"
+scope = "/"
+```
+
+### 2.5 Widget kind pack manifest
+
+```toml
+[plugin]
+name = "com.vendor.widgets.audio"
+version = "0.1.0"
+contract = 1
+kind = "widget_kind_pack"
+
+[target]
+shelf = "system.ui.widgets"
+shape = 1
+
+[trust]
+class = "unprivileged"
+
+[prerequisites]
+evo_min_version = "0.1.13"
+os_family = "any"
+
+[widgets]
+provides = ["audio.eq.parametric", "audio.spectrum.live"]
+size_envelopes_path = "size_envelopes.toml"
+accessibility_declarations_path = "a11y.toml"
+```
+
+`provides` is the canonical list of widget-kind ids. The two side files MUST contain entries with exact set equality to this list — admission refuses on any mismatch. Both files use the kind id as the map key:
+
+`size_envelopes.toml`:
+
+```toml
+["audio.eq.parametric"]
+id = "audio.eq.parametric"               # MUST equal the map key.
+min_size = "third"
+ideal_size = "half"
+max_size = "full"
+mode = "inline"
+schema_version = 1
+```
+
+`a11y.toml`:
+
+```toml
+["audio.eq.parametric"]
+kind_id = "audio.eq.parametric"          # MUST equal the map key.
+aria_role = "slider"
+aria_label_source = "label_prop"         # label_prop | inner_text | localised_key
+contrast = "aaa"                         # aaa | aa
+keyboard = { focusable = true, interactions = [] }
+screen_reader = { announces = ["audio.eq.band.gain.changed"] }
+motion = { animates = false, honours_prefers_reduced_motion = true }
+```
+
+`WidgetAccessibilityDeclaration` carries the AAA contract surface the renderer enforces: ARIA role, label source, keyboard semantics (focusable + per-key interactions), screen-reader announcement keys, contrast level, motion sensitivity. Cross-field invariant: `motion.animates && !motion.honours_prefers_reduced_motion` refuses — animating widgets MUST honour the operator's reduced-motion preference.
+
+Widget pack admission is all-or-nothing: kinds register into `WidgetKindRegistry`, the pack records into `WidgetKindPackRegistry`, and any per-kind failure rolls back the entire pack so the registries never hold a half-installed pack. Unadmission rolls every contributed kind back; an unadmitted pack's kinds disappear from the registry atomically.
 
 ### Enforcement scope
 

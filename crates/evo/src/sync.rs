@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Shape model of the router's table-of-`Arc`s synchronisation core.
 //!
 //! The full [`PluginRouter`](crate::router::PluginRouter) carries

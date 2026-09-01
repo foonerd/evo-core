@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! CI-time helpers for plugin authors.
 //!
 //! The framework's admission engine refuses to admit a plugin

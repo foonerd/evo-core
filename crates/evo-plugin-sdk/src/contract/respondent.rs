@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! The respondent trait and its supporting types.
 
 use crate::contract::error::PluginError;
@@ -14,13 +17,19 @@ use std::time::Instant;
 ///
 /// ## Concurrency
 ///
-/// The steward may call `handle_request` concurrently. Plugins must
-/// tolerate interleaved calls. Internal state that needs protection uses
-/// standard `tokio::sync::Mutex` / `RwLock` patterns. The `&mut self` on
-/// the method signature is cooperative: the steward wraps the plugin in
-/// an appropriate synchronisation primitive if it needs to serialise
-/// calls, or clones state out for concurrent execution if the plugin is
-/// designed for it.
+/// The steward calls `handle_request` concurrently. Plugins MUST
+/// tolerate interleaved calls: the framework spawns a task per
+/// inbound request and dispatches without holding a per-plugin
+/// lock across the await. Internal state that needs protection
+/// uses standard interior-mutability patterns (`Arc<Mutex>` /
+/// `Arc<RwLock>` / atomics) — the `&self` on the method
+/// signature is enforced by the framework, not merely
+/// cooperative.
+///
+/// This retires the older sequential-dispatch shape that held the
+/// router's per-entry mutex across the entire `handle_request`
+/// await. Long-await bodies (credential prompts, network I/O)
+/// no longer freeze peer verbs on the same shelf.
 ///
 /// ## Cancellation
 ///
@@ -37,8 +46,13 @@ pub trait Respondent: Plugin {
     /// The request carries a deadline if the originator specified one; the
     /// plugin should honour it for cooperative cancellation via
     /// `tokio::time::timeout` or similar.
+    ///
+    /// Takes `&self` so the framework can dispatch concurrent
+    /// requests to the same plugin instance without holding a
+    /// per-plugin lock across the await. Plugin state that must be
+    /// mutated during a request uses interior mutability.
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a;
 }
@@ -48,7 +62,7 @@ pub trait Respondent: Plugin {
 /// Payload is opaque bytes at the contract level. The wire protocol
 /// carries transport-level framing; the shelf shape defines the
 /// on-the-wire content. Plugins deserialise per the shelf's schema.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Request {
     /// Request type identifier. Must be one of the strings the plugin
     /// declared in its manifest's `capabilities.respondent.request_types`
@@ -74,6 +88,38 @@ pub struct Request {
     /// the plugin's responsibility (the plugin's own announce/retract
     /// bookkeeping is the source of truth for live instances).
     pub instance_id: Option<String>,
+    /// Capability scope the framework dispatcher verified the
+    /// principal holds before forwarding this request to the plugin.
+    ///
+    /// **Set by the framework only — plugins MUST NOT write this
+    /// field.** The dispatcher consults the plugin's manifest
+    /// (`capabilities.respondent.verb_capabilities[request_type]`) and
+    /// records the verified scope string here when the declaration is
+    /// [`VerbCapability::Read`](crate::manifest::VerbCapability::Read) /
+    /// [`Write`](crate::manifest::VerbCapability::Write) /
+    /// [`StepUp`](crate::manifest::VerbCapability::StepUp). `None` when
+    /// the verb's manifest entry is [`VerbCapability::None`] or absent
+    /// (the legacy default; the verb accepts anonymous dispatches).
+    ///
+    /// Plugins use this field for structured logging
+    /// (`tracing::info!(scope = ?req.principal_scope, ...)`) and audit
+    /// correlation only. Plugins MUST NOT re-check the principal
+    /// against this field — the framework dispatcher's check is the
+    /// authoritative gate, and re-checking inside the plugin would
+    /// split the policy across two layers.
+    #[doc(hidden)]
+    pub principal_scope: Option<String>,
+    /// `true` when the framework dispatcher verified the principal
+    /// holds an active step-up auth session for the verb's declared
+    /// scope before forwarding this request.
+    ///
+    /// **Set by the framework only — plugins MUST NOT write this
+    /// field.** Always `false` for verbs whose manifest declaration
+    /// is not [`VerbCapability::StepUp`](crate::manifest::VerbCapability::StepUp).
+    /// Plugins use this field for structured logging only; the gate
+    /// itself was already enforced by the dispatcher.
+    #[doc(hidden)]
+    pub has_step_up: bool,
 }
 
 impl Request {
@@ -139,6 +185,8 @@ mod tests {
             deadline: None,
 
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let resp = Response::for_request(&req, vec![1, 2, 3]);
         assert_eq!(resp.correlation_id, 42);
@@ -154,6 +202,8 @@ mod tests {
             deadline: None,
 
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         assert!(req.remaining().is_none());
         assert!(!req.is_past_deadline());
@@ -167,6 +217,8 @@ mod tests {
             correlation_id: 1,
             deadline: Some(Instant::now() + Duration::from_secs(10)),
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let remaining = req.remaining().unwrap();
         assert!(remaining > Duration::from_secs(5));
@@ -181,6 +233,8 @@ mod tests {
             correlation_id: 1,
             deadline: Some(Instant::now() - Duration::from_secs(1)),
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         assert_eq!(req.remaining().unwrap(), Duration::ZERO);
         assert!(req.is_past_deadline());

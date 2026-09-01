@@ -1,0 +1,19 @@
+[package]
+name = "evo-projection-http3"
+description = "HTTP/3 + WebTransport projection of the wire-protocol schema. Reuses the REST endpoint shape for Request-class ops (HTTP/3 carries HTTP semantics verbatim over QUIC) and adds a WebTransport bidirectional-stream surface for Subscribe-class ops. The runtime mount that stitches the projection onto a concrete HTTP/3 server (h3 + h3-webtransport) consumes the in-memory endpoint table."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+evo-projection-core = { path = "../evo-projection-core" }
+evo-projection-rest = { path = "../evo-projection-rest" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

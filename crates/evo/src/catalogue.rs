@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! The catalogue: racks, shelves, subject types, and relation
 //! predicate declarations.
 //!
@@ -40,8 +43,10 @@
 //! type-constraint checks on assert, subject-type existence on
 //! announce.
 
-use crate::error::StewardError;
+use evo_primitives::Cardinality;
 use serde::{Deserialize, Serialize};
+
+use crate::error::StewardError;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -220,24 +225,10 @@ pub struct SubjectType {
     pub description: String,
 }
 
-/// Cardinality constraint on one side of a relation predicate, per
-/// `RELATIONS.md` section 3.2. Cardinality violations emit warnings
-/// rather than rejecting assertions.
-#[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Cardinality {
-    /// Exactly one subject on this side.
-    ExactlyOne,
-    /// At most one subject on this side; zero is allowed.
-    AtMostOne,
-    /// At least one subject on this side; upper bound unconstrained.
-    AtLeastOne,
-    /// No constraint.
-    #[default]
-    Many,
-}
+// `Cardinality` lives in the foundation crate `evo-primitives`
+// so domain-tier crates can reach it without importing the
+// framework runtime. Re-exported below for back-compat with
+// the established `crate::catalogue::Cardinality` import path.
 
 /// A constraint on which subject types may appear on one side of a
 /// relation. Accepts either a single type name (e.g. `"track"`) or a

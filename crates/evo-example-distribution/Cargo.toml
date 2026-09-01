@@ -4,7 +4,11 @@ description = "Reference skeleton for an `evo-device-<vendor>` distribution. Com
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# Pedagogical reference distribution skeleton — Apache 2.0 so
+# vendors / plugin authors can copy / adapt the patterns. Note:
+# compiled binaries link the BSL-licensed `evo` crate; the source
+# remains permissive.
+license = "Apache-2.0"
 repository.workspace = true
 
 [[bin]]

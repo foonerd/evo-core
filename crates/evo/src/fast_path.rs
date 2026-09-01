@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Fast Path channel: a separate Unix-domain socket for the
 //! latency-bounded operator-tactile dispatch surface (volume,
 //! mute, pause, hardware-input forwarding).
@@ -29,9 +32,10 @@
 //! FIFO-fair, so a Fast Path arrival waits behind any slow-path
 //! call already in queue. Worst case: a slow-path call's
 //! `course_correction_budget_ms` plus the Fast Path's own
-//! budget. For the v0.1.12 audio targets this is acceptable
-//! because slow-path course_correct calls on the same warden
-//! are rare; a dedicated priority lane lands in a follow-up.
+//! budget. This is acceptable for the current audio reference
+//! workload because slow-path course_correct calls on the same
+//! warden are rare; a dedicated priority lane is a future
+//! extension.
 //!
 //! ## CBOR-only framing
 //!

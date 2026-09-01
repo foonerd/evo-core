@@ -1,0 +1,26 @@
+[package]
+name = "evo-multiroom-sdk"
+description = "Multi-room domain SDK. Exposes the contract surface plugins consume when they participate in evo's multi-room substrate: the `MultiroomSubstrateHandle` trait, the typed shapes (`Role`, `RoleChange`, `GroupRecord`, `GroupChange`), and the broadcast-receiver wrappers. Extracted out of `evo-plugin-sdk` so the universal plugin SDK stays domain-agnostic; multi-room-aware plugins import this crate explicitly. The framework crate (`evo`) has no production dependency on this crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Permissive ecosystem layer — overrides the workspace default
+# (BUSL-1.1) so plugin authors building against the multi-room
+# SDK face no licensing restrictions, matching the parent
+# evo-plugin-sdk.
+license = "Apache-2.0"
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+# Base `sync` feature pulled in unconditionally so the
+# trait's `broadcast::Receiver` channel wrappers compile
+# without a feature gate. Matches the parent SDK's posture.
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+serde_json = "1"

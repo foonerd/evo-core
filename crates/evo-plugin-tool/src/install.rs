@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! `install` - Strategy B: obtain bundle, `verify`, promote into `search_root`.
 //!
 //! Atomicity (PLUGIN_TOOL.md section 3, normative): failing operations
@@ -57,6 +60,19 @@ pub fn run(
     let b = crate::bundle::load_out_of_process_bundle(&bundle)
         .with_context(|| "reload bundle for install path")?;
     let name = b.manifest.plugin.name;
+
+    // Compulsory OS-dependency parity check — every install path
+    // reads has_os_dependencies from the bundle's privileges.yaml
+    // and refuses HARD when the boolean is true and any declared
+    // required_binary is absent on the host. No warn mode, no
+    // degrade mode, no bypass flag: the distribution installer is
+    // responsible for bringing OS packages before this tool is
+    // invoked, and promoting a bundle whose runtime prerequisites
+    // are unmet would strand it in the search_root and fail
+    // admission with no operator-actionable remedy.
+    enforce_prerequisites(&bundle)
+        .with_context(|| "compulsory OS-dependency parity check")?;
+
     if !to.is_dir() {
         fs::create_dir_all(to)
             .with_context(|| format!("create search root {}", to.display()))?;
@@ -112,6 +128,36 @@ pub fn run(
 
 fn is_url(s: &str) -> bool {
     s.starts_with("http://") || s.starts_with("https://")
+}
+
+/// Read the bundle's `privileges.yaml` and enforce the compulsory
+/// OS-dependency parity gate. Missing file is a HARD FAIL: every
+/// admissible bundle carries a privileges record per the plugin
+/// packaging contract.
+fn enforce_prerequisites(bundle: &Path) -> Result<(), anyhow::Error> {
+    use evo_plugin_sdk::privileges::{
+        enforce_os_dependency_parity, PrivilegesV1,
+    };
+    let yaml_path = bundle.join("privileges.yaml");
+    let yaml = fs::read_to_string(&yaml_path).with_context(|| {
+        format!(
+            "read privileges.yaml at {} — every plugin bundle MUST ship a privileges contract",
+            yaml_path.display()
+        )
+    })?;
+    let record = PrivilegesV1::from_yaml(&yaml).with_context(|| {
+        format!("parse privileges.yaml at {}", yaml_path.display())
+    })?;
+    record.validate().with_context(|| {
+        format!(
+            "validate privileges.yaml at {} — the semantic gate must pass before parity",
+            yaml_path.display()
+        )
+    })?;
+    if let Err(failure) = enforce_os_dependency_parity(&record) {
+        anyhow::bail!("{failure}");
+    }
+    Ok(())
 }
 
 fn obtain_bundle(

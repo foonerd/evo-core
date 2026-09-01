@@ -1,0 +1,173 @@
+# v0.1.13 scenario plan — incremental coverage for v0.1.13 deliverables.
+#
+# v0.1.12.toml remains the bed-test plan for cross-release coverage
+# (T1 smoke through T5 fault-injection); this v0.1.13 plan adds
+# scenarios specific to v0.1.13 deliverables as their implementations
+# land. Each lock contributes its own scenarios here and the plan
+# grows additively through the cycle; scope is one-way (only grows).
+#
+# Scenarios that require synthetic test fixtures (bundle staged at
+# `/var/lib/evo-acceptance-fixtures/...`, capability advertised on the
+# target descriptor, etc.) declare `requires_capability =
+# "test_fixture_<name>"` and skip with reason on targets that do not
+# advertise the fixture.
+#
+# Default per-scenario timeout is 300s.
+
+release = "v0.1.13"
+coverage_note = "v0.1.13 lock-specific scenarios; bed-test cross-release coverage continues in v0.1.12.toml. Plan grows additively as locks implement and corresponding fixtures stage."
+
+# ============================================================
+# T2 — Framework / SDK contract behaviour
+# ============================================================
+
+[[scenarios]]
+id = "T2.subject-state-survives-crash"
+tier = "T2"
+description = """
+Validates subject-state durable persistence as a crash-recovery
+guarantee. The framework exposes `SubjectAnnouncement.state` on
+the wire and `SubjectProjection.state` on the projection surface;
+the durable mirror in the `subject_states` table is the storage
+contract that backs both.
+
+What the framework guarantees: if the steward dies *unexpectedly*
+(SIGKILL, panic, OOM kill, power loss — no shutdown handlers
+fire), the subject identity rows + state rows persist on disk,
+and on the next boot the framework's
+`SubjectRegistry::rehydrate_states_from` restores the in-memory
+state map before admission opens.
+
+What the framework deliberately does NOT guarantee: that subject
+state survives a *graceful* restart without the plugin
+re-announcing. The admission drain path retracts the plugin's
+claimed addressings on graceful unload; if the plugin was the
+last claimant the subject is forgotten, and the persisted state
+row is cleared symmetrically. This is correct cleanup discipline
+(no orphan state for forgotten subjects); the durable-persistence
+contract is therefore scoped to crashes, not to graceful
+unload+reload.
+
+The scenario tests the crash path:
+
+1. Install the synthetic plugin bundle.
+2. Restart the steward (first load runs; the plugin announces a
+   subject of type `acceptance_subject_state_track` with state
+   `{"counter":1,"marker":"subject-state-persistence-fixture"}`;
+   the framework write-through populates `subject_states`).
+3. SIGKILL the steward (`systemctl kill --signal=SIGKILL evo`).
+   No shutdown handlers fire — the subject identity row +
+   subject_states row + plugin's `registered` marker all stay
+   on disk.
+4. `reset-failed` then `start` evo. On boot the framework reads
+   `subjects` (rehydrate_from), then `subject_states`
+   (rehydrate_states_from). The plugin's load() sees the
+   `registered` marker and skips re-announcement — proving the
+   in-memory state map was populated from persistence, not from
+   a fresh announce.
+
+Asserts:
+
+1. After the first restart, `subject_states` contains exactly
+   one row whose `subject_id` joins to a live subject of type
+   `acceptance_subject_state_track`, with `state_json` matching
+   the expected payload byte-for-byte.
+2. After the SIGKILL+start, the journalctl output for the second
+   boot carries `subject state map rehydrated from persistence
+   loaded=1` (the row was rehydrated, not freshly written).
+3. The `subject_states` row is still present and unchanged after
+   the second boot.
+4. The plugin's verification log shows `phase=first` once (from
+   the first load) and `phase=subsequent` at least once (from the
+   reload after SIGKILL — proving the plugin saw the marker, did
+   NOT re-announce, and the state in memory came from rehydration).
+
+Failure analysis by assertion: (1) the write-through path; (2)
+the boot rehydration call site or its ordering vs admission;
+(3) the rehydration accidentally clobbering rows; (4) the marker
+discipline / plugin-side state-dir survival across SIGKILL.
+"""
+command = """
+set -eo pipefail
+set -x
+exec 2>&1
+PLUGIN=org.evoframework.acceptance.subject-state-persistence-plugin
+BUNDLE=/var/lib/evo-acceptance-fixtures/synthetic-subject-state-persistence-bundle.tar.gz
+CAT=/opt/evo/catalogue/default.toml
+BAK=/tmp/evo-cat-subject-state-persistence.bak
+DB=/var/lib/evo/state/evo.db
+PLUGIN_STATE=/var/lib/evo/plugins/$PLUGIN/state
+LOG=$PLUGIN_STATE/subject-state-persistence-loads.log
+EXPECTED='{"counter":1,"marker":"subject-state-persistence-fixture"}'
+sudo cp $CAT $BAK
+trap 'sudo systemctl reset-failed evo 2>/dev/null || true; sudo rm -rf /var/lib/evo/plugins/$PLUGIN; sudo cp $BAK $CAT; sudo systemctl restart evo; sleep 3' EXIT
+cat <<EOF | sudo tee -a $CAT > /dev/null
+
+[[racks]]
+name = "acceptance"
+family = "domain"
+kinds = ["registrar"]
+charter = "Synthetic acceptance-only racks."
+
+[[racks.shelves]]
+name = "subject-state-persistence"
+shape = 1
+description = "Synthetic shelf for subject-state-persistence scenario."
+
+[[subjects]]
+name = "acceptance_subject_state_track"
+EOF
+evo-plugin-tool install $BUNDLE --to /var/lib/evo/plugins 2>&1 | grep -q "installed to /var/lib/evo/plugins/$PLUGIN"
+sudo systemctl restart evo
+sleep 4
+
+# Assertion 1: subject_states row present with the expected payload.
+ROW1=$(sudo sqlite3 $DB "SELECT ss.state_json FROM subject_states ss JOIN subjects s ON s.id = ss.subject_id WHERE s.subject_type='acceptance_subject_state_track' AND s.forgotten_at_ms IS NULL;")
+echo "after first restart, subject_states.state_json: $ROW1"
+test "$ROW1" = "$EXPECTED"
+
+# Capture the journal cursor before the SIGKILL + start so the
+# rehydration assertion (2) does not race against the first boot's log.
+CURSOR_AT=$(date +%s)
+
+# SIGKILL the steward — no shutdown handlers fire, so the
+# graceful-unload claim-retract path does NOT cascade into
+# subject-forget + state-clear. Both subjects and subject_states
+# rows persist on disk. systemd marks the unit failed;
+# reset-failed clears the failed state so `start` is accepted.
+sudo systemctl kill --signal=SIGKILL evo
+sleep 2
+sudo systemctl reset-failed evo
+sudo systemctl start evo
+sleep 4
+
+# Assertion 2: post-SIGKILL boot journal carries rehydration info
+# line with loaded>=1.
+REHYD=$(sudo journalctl -u evo --since "@$CURSOR_AT" --no-pager 2>/dev/null | grep -E 'subject state map rehydrated' | tail -1)
+echo "rehydration line: $REHYD"
+LOADED=$(echo "$REHYD" | grep -oE 'loaded=[0-9]+' | cut -d= -f2)
+echo "loaded count: $LOADED"
+test -n "$LOADED"
+test "$LOADED" -ge 1
+
+# Assertion 3: subject_states row still present post-SIGKILL+start.
+ROW2=$(sudo sqlite3 $DB "SELECT ss.state_json FROM subject_states ss JOIN subjects s ON s.id = ss.subject_id WHERE s.subject_type='acceptance_subject_state_track' AND s.forgotten_at_ms IS NULL;")
+echo "after SIGKILL+start, subject_states.state_json: $ROW2"
+test "$ROW2" = "$EXPECTED"
+
+# Assertion 4: plugin verification log shows phase=first once and
+# phase=subsequent at least once.
+echo "=== plugin verification log ==="
+sudo cat $LOG 2>&1
+FIRST=$(sudo grep -c '^phase=first$' $LOG)
+SUBSEQUENT=$(sudo grep -c '^phase=subsequent$' $LOG)
+echo "phase=first count:      $FIRST"
+echo "phase=subsequent count: $SUBSEQUENT"
+test "$FIRST" = "1"
+test "$SUBSEQUENT" -ge "1"
+"""
+requires_capability = "test_fixture_subject_state_persistence"
+timeout_secs = 120
+assertions = [
+    { kind = "exit_code", expected = 0 },
+]

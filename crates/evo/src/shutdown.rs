@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Graceful shutdown on signal.
 //!
 //! [`wait_for_signal`] returns a future that resolves on the first

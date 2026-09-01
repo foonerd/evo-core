@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end out-of-process admission integration test.
 //!
 //! Spawns the `echo-wire` binary as a child process listening on a
@@ -252,6 +255,8 @@ async fn out_of_process_echo_admission_and_request() {
         deadline: None,
 
         instance_id: None,
+        principal_scope: None,
+        has_step_up: false,
     };
     let resp = tokio::time::timeout(
         REQUEST_TIMEOUT,
@@ -305,6 +310,8 @@ async fn out_of_process_echo_handles_multiple_requests() {
             deadline: None,
 
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let resp = tokio::time::timeout(
             REQUEST_TIMEOUT,

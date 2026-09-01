@@ -1,6 +1,10 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Steward error type.
 
 use crate::error_taxonomy::{ApiError, ErrorClass};
+use evo_plugin_sdk::contract::PluginError;
 use evo_plugin_sdk::manifest::TrustClass;
 use thiserror::Error;
 
@@ -84,6 +88,40 @@ pub enum StewardError {
         /// ([`evo_trust::ADMIN_MINIMUM_TRUST`]).
         minimum: TrustClass,
     },
+
+    /// Admission refused because the plugin's manifest declares
+    /// a `[dependencies].required` entry that is not currently
+    /// admitted on the router (or is admitted with a version
+    /// outside the declared semver requirement).
+    #[error(
+        "missing required dependency: plugin {plugin_name:?} requires \
+         {dependency_name:?} ({detail})"
+    )]
+    MissingRequiredDependency {
+        /// Canonical name of the plugin whose admission is
+        /// being attempted.
+        plugin_name: String,
+        /// Canonical name of the missing required dependency.
+        dependency_name: String,
+        /// Why the dependency check failed (free-form detail
+        /// surfaced to operator diagnostics).
+        detail: String,
+    },
+
+    /// Admission refused because a plugin currently admitted on
+    /// the router is in this plugin's `[dependencies]
+    /// .conflicts_with` list. The two plugins cannot coexist.
+    #[error(
+        "conflicting plugin present: {plugin_name:?} declares conflict with \
+         {conflicting_name:?} which is currently admitted"
+    )]
+    ConflictingPluginPresent {
+        /// Canonical name of the plugin whose admission is
+        /// being attempted.
+        plugin_name: String,
+        /// Canonical name of the admitted plugin that conflicts.
+        conflicting_name: String,
+    },
 }
 
 impl StewardError {
@@ -135,6 +173,12 @@ impl StewardError {
             Self::Plugin(e) => e.class(),
             Self::Toml { .. } => ErrorClass::Misconfiguration,
             Self::AdminTrustTooLow { .. } => ErrorClass::TrustViolation,
+            Self::MissingRequiredDependency { .. } => {
+                ErrorClass::ContractViolation
+            }
+            Self::ConflictingPluginPresent { .. } => {
+                ErrorClass::ContractViolation
+            }
             Self::Persistence(_) => ErrorClass::Internal,
         }
     }
@@ -176,6 +220,18 @@ pub fn classify_dispatch(msg: &str) -> ErrorClass {
 
 impl From<&StewardError> for ApiError {
     fn from(e: &StewardError) -> Self {
+        // WithSubclass already carries the operator-facing class,
+        // subclass, and bare message. Do not wrap through
+        // StewardError/PluginError Display ("plugin error: …").
+        if let StewardError::Plugin(PluginError::WithSubclass {
+            class,
+            subclass,
+            message,
+        }) = e
+        {
+            return ApiError::new(*class, message.clone())
+                .with_subclass(subclass.clone());
+        }
         let mut err = ApiError::new(e.classify(), e.to_string());
         // Surface structured fields on classes that already carry
         // them so consumers can act without parsing the message.
@@ -205,7 +261,6 @@ impl From<StewardError> for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use evo_plugin_sdk::contract::PluginError;
 
     // ----- Step 1: StewardError::Plugin defers to PluginError::class -----
     //
@@ -347,5 +402,32 @@ mod tests {
         );
         let api: ApiError = (&e).into();
         assert_eq!(api.class, ErrorClass::Unavailable);
+    }
+
+    // ----- WithSubclass surfaces cleanly on the operator wire -----
+
+    #[test]
+    fn api_error_from_with_subclass_is_clean_and_structured() {
+        let e = StewardError::Plugin(PluginError::WithSubclass {
+            class: ErrorClass::PermissionDenied,
+            subclass: "no_responder_available".into(),
+            message: "network.share mutation refused: no responder".into(),
+        });
+        let api: ApiError = (&e).into();
+        assert_eq!(api.class, ErrorClass::PermissionDenied);
+        assert_eq!(api.message, "network.share mutation refused: no responder");
+        assert!(
+            !api.message.contains("plugin error:")
+                && !api.message.contains("permanent error:")
+                && !api.message.contains("transient error:"),
+            "ApiError message must not wrap StewardError/PluginError Display; got {:?}",
+            api.message
+        );
+        let subclass = api
+            .details
+            .as_ref()
+            .and_then(|d| d.get("subclass"))
+            .and_then(|v| v.as_str());
+        assert_eq!(subclass, Some("no_responder_available"));
     }
 }

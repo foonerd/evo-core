@@ -741,7 +741,7 @@ assertions = [
 [[scenarios]]
 id = "T2.appointment-miss-policy-fire-once"
 tier = "T2"
-description = "Synthetic plugin's first load() registers a OneShot for `now + 5s` (Catchup miss-policy) and writes a marker to its state_dir; subsequent loads skip re-registration. Scenario installs the bundle, restarts the steward (first load fires the registration), waits 2 s (less than the fire window), stops the steward, waits another 8 s so the appointment is past-due by ~5 s, restarts the steward. The framework's appointment runtime rehydrates the past-due row from the durable `appointments` table (Phase 1.Q), the Catchup miss-policy fires it once on the first runtime tick after boot, and the dispatch loops back to the plugin's handle_request which records the (single) fire. Asserts exactly one fire entry in the log AND the fire timestamp falls after the second steward boot."
+description = "Synthetic plugin's first load() registers a OneShot for `now + 5s` (Catchup miss-policy) and writes a marker to its state_dir; subsequent loads skip re-registration. Scenario installs the bundle, restarts the steward (first load fires the registration), waits 2 s (less than the fire window), stops the steward, waits another 8 s so the appointment is past-due by ~5 s, restarts the steward. The framework's appointment runtime rehydrates the past-due row from the durable `appointments` table, the Catchup miss-policy fires it once on the first runtime tick after boot, and the dispatch loops back to the plugin's handle_request which records the (single) fire. Asserts exactly one fire entry in the log AND the fire timestamp falls after the second steward boot."
 command = """
 set -eo pipefail
 PLUGIN=org.evoframework.acceptance.appointment-past-due-plugin
@@ -810,13 +810,13 @@ SystemTime conversion which re-reads `Instant::now()` between
 directions.
 
 Exercises the framework contract surface only; the OS-level
-suspend/resume plumbing (which on Pi 5 is hardware-blocked
-pending Broadcom SDRAM PHY firmware) is the distribution's
+suspend/resume plumbing (which on some SBC targets is
+hardware-blocked pending firmware) is the distribution's
 responsibility — its `RtcWakeCallback` impl wires
 `/sys/class/rtc/rtc0/wakealarm` or whatever the platform
-exposes. Pi 5 does support wake-from-halt via Mechanism 2
-(POWER_OFF_ON_HALT EEPROM flag); that path is exercised at the
-distribution level.
+exposes. On targets that gate suspend-to-RAM but do support
+wake-from-halt (e.g. via a POWER_OFF_ON_HALT EEPROM flag), that
+path is exercised at the distribution level.
 """
 command = """
 set -eo pipefail
@@ -2803,7 +2803,7 @@ assertions = [
 [[scenarios]]
 id = "T3.uir-persist"
 tier = "T3"
-description = "Plugin issues a Text prompt with session_id='ms-test' and a 90s timeout. Scenario stops the steward mid-prompt — the prompt's durable row in the prompts table survives. Restart triggers Phase 1.H boot rehydration, restoring the open prompt to the in-memory ledger; the plugin re-loads and re-issues with the same prompt_id (re-issue semantics replace the existing row, install a fresh awaiter). Operator answers post-restart; outcome flows to the plugin's new awaiter; plugin records 'outcome=answered value=…' to the outcome log. End-to-end: durable persistence + boot rehydration + re-issue semantics + answer continuity."
+description = "Plugin issues a Text prompt with session_id='ms-test' and a 90s timeout. Scenario stops the steward mid-prompt — the prompt's durable row in the prompts table survives. Restart triggers boot rehydration, restoring the open prompt to the in-memory ledger; the plugin re-loads and re-issues with the same prompt_id (re-issue semantics replace the existing row, install a fresh awaiter). Operator answers post-restart; outcome flows to the plugin's new awaiter; plugin records 'outcome=answered value=…' to the outcome log. End-to-end: durable persistence + boot rehydration + re-issue semantics + answer continuity."
 command = """
 set -eo pipefail
 PLUGIN=org.evoframework.acceptance.prompt-multistage-plugin
@@ -2837,8 +2837,8 @@ evo-plugin-tool admin prompt list --socket=/run/evo/evo.sock 2>&1 | grep -q "pro
 sudo systemctl stop evo
 sleep 1
 sudo sqlite3 $DB "SELECT count(*) FROM prompts WHERE plugin = '$PLUGIN' AND state = 'open';" | grep -q "^1$"
-# 3. Restart the steward — Phase 1.H boot rehydration restores the
-#    in-memory ledger, and the plugin's load() re-issues with the
+# 3. Restart the steward — boot rehydration restores the in-memory
+#    prompt ledger, and the plugin's load() re-issues with the
 #    same prompt_id, re-attaching to the existing row.
 sudo systemctl start evo
 sleep 4
@@ -3057,7 +3057,7 @@ description = """
 Storage-class-scaled high-rate burst with coalescer + durability
 + memory invariants. The plan's design target (10k events/sec ×
 60s = 600,000 events) presumes direct-attached NVMe (~10μs
-fsync). On the Pi 5 prototype's USB-SSD, every `emit_durable`
+fsync). On a reference aarch64 prototype's USB-SSD, every `emit_durable`
 fsync via `record_happening` measures ~20ms (PRAGMA
 synchronous=FULL), capping sustained rate at ~50 events/sec.
 The scenario scales `EVO_ACCEPTANCE_COALESCING_COUNT` to 2000 so
@@ -3329,13 +3329,13 @@ tier = "T4"
 description = """
 Steward idle with no client traffic; samples RSS every 30 s and
 asserts memory growth bounded over the soak window. Plan target:
-4 hours; Pi-5-scaled to 10 minutes so the scenario fits a single
+4 hours; SBC-scaled to 10 minutes so the scenario fits a single
 autonomous test run while still surfacing leaks larger than
 ~5 MB/min. The contract bound (<50 MB) is preserved as an
-absolute test (not rate-based) so a Pi 5 run that captures the
+absolute test (not rate-based) so an SBC run that captures the
 contract's primary concern (sustained leak) passes; a
 pathological leak still fails the same bound. Full 4-hour
-validation moves to extended-rig runs in a future test pass per
+validation moves to extended runs in a future test pass per
 the user's directive.
 """
 command = """
@@ -3396,13 +3396,13 @@ describe-capabilities probes run in parallel for the full
 migration window; per-call latency is recorded. Asserts: (1)
 migration completes correctly (50k v2 rows + 50k type_migrated
 aliases, zero v1 rows); (2) probe ran throughout (>100 calls);
-(3) p99 stayed within the contract bound (<2s on Pi 5 USB-SSD
-— relaxed from the plan's 500 ms because the per-batch
-single-fsync-per-batch cost is the binding constraint here;
-amd64/NVMe will tighten); (4) steward responsive at end.
-Pi 5 result on commit landing: p99 = 3 ms (167× under bound)
-because describe-capabilities doesn't touch the subjects
-table — proves the per-shelf mutex + multi-connection
+(3) p99 stayed within the contract bound (<2s on aarch64 with
+USB-attached SSD — relaxed from the plan's 500 ms because the
+per-batch single-fsync-per-batch cost is the binding constraint
+here; amd64/NVMe will tighten); (4) steward responsive at end.
+Reference-target result on commit landing: p99 = 3 ms (167×
+under bound) because describe-capabilities doesn't touch the
+subjects table — proves the per-shelf mutex + multi-connection
 deadpool keeps non-conflicting verbs cheap during bulk writes.
 """
 command = """
@@ -3508,8 +3508,8 @@ alive at end.
 The `ping` verb is declared in both `course_correct_verbs` and
 `fast_path_verbs` on the synthetic fast-path warden, returns
 immediately, and is well under the 100 ms `fast_path_budget_ms`.
-Pi 5 result on commit landing: 14,134 ops/sec (14× target),
-p50 = 66 μs, p99 = 82 μs.
+Reference-target result on commit landing: 14,134 ops/sec (14×
+target), p50 = 66 μs, p99 = 82 μs.
 """
 command = """
 set -eo pipefail

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Plugin error types.
 //!
 //! [`PluginError`] is the canonical error returned by every plugin contract
@@ -81,6 +84,35 @@ pub enum PluginError {
         #[source]
         source: Box<dyn StdError + Send + Sync>,
     },
+
+    /// A structured wire error the plugin surfaces end-to-end through
+    /// the framework's error taxonomy. Distinct from
+    /// [`Self::Transient`] / [`Self::Permanent`] whose `Display` wraps
+    /// the message with a `"transient error:"` / `"permanent error:"`
+    /// prefix — this variant's `message` reaches the wire unwrapped,
+    /// and the `subclass` populates the wire envelope's
+    /// `details.subclass` field so operator surfaces can render the
+    /// specific copy the plugin intends.
+    ///
+    /// Use this when a plugin has a distinct wire subclass the
+    /// framework's `Transient` / `Permanent` classification would
+    /// otherwise lose (e.g. `no_responder_available` on a shares
+    /// mutation refused because no prompt-responder session is
+    /// connected — the operator UI needs the specific subclass to
+    /// render "no answering client" rather than a generic transient
+    /// error).
+    #[error("{message}")]
+    WithSubclass {
+        /// Top-level wire error class the framework surfaces.
+        class: crate::error_taxonomy::ErrorClass,
+        /// Structured subclass token. Populates
+        /// `details.subclass` on the wire envelope. Stable across
+        /// releases per the framework's error taxonomy convention.
+        subclass: String,
+        /// Operator-readable message. Reaches the wire unwrapped
+        /// (no `"transient error:"` / `"permanent error:"` prefix).
+        message: String,
+    },
 }
 
 impl PluginError {
@@ -153,6 +185,7 @@ impl PluginError {
             }
             PluginError::Internal { .. } => ErrorClass::Internal,
             PluginError::Fatal { .. } => ErrorClass::Internal,
+            PluginError::WithSubclass { class, .. } => *class,
         }
     }
 }

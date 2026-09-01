@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Discrepancy rules — compares the target descriptor's declared
 //! capabilities against the inspector findings and surfaces
 //! mismatches.

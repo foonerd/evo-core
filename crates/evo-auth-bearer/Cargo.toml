@@ -1,0 +1,25 @@
+[package]
+name = "evo-auth-bearer"
+description = "Capability-scoped bearer-token substrate. Issues ed25519-signed tokens carrying a typed capability set, validates them against the wire-protocol schema's CapabilityRequirement declarations, and maintains a revocation list. Every projection (REST / WebSocket / gRPC / GraphQL / HTTP/3) consumes the validator to gate dispatch against operator credentials."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+evo-observatory = { path = "../evo-observatory" }
+evo-projection-core = { path = "../evo-projection-core" }
+ed25519-dalek = { version = "2.1", features = ["std", "rand_core"] }
+rand_core = { version = "0.6", features = ["std"] }
+sha2 = "0.10"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

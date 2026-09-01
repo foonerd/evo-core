@@ -11,8 +11,8 @@
 -- before the restart.
 --
 -- Without this table the framework loses every scheduled
--- appointment on every steward restart — the v0.1.12 closure-debt
--- gap T2.appointment-miss-policy-fire-once exposed.
+-- appointment on every steward restart, breaking the
+-- T2.appointment-miss-policy-fire-once invariant.
 --
 -- Columns:
 --

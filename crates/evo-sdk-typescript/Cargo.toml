@@ -1,0 +1,21 @@
+[package]
+name = "evo-sdk-typescript"
+description = "TypeScript client SDK generator. Walks the canonical wire schema via evo-sdk-genkit and emits a multi-file TypeScript SDK with typed module classes, the top-level EvoClient, shared types, and the transport boilerplate. The runtime mount consumes the rendered file set and writes it under evo-ui-eng's packages/wire-client/ for npm publication."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# The TypeScript SDK generator emits Apache-2.0 client code by
+# convention — the per-language SDKs are permissively licensed
+# so third-party integrators consume them without copyleft
+# entanglement. The generator crate itself (this Rust crate)
+# stays on the workspace default (BUSL-1.1); the headers it
+# emits on every generated `.ts` file declare Apache-2.0.
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+evo-projection-core = { path = "../evo-projection-core" }
+evo-sdk-genkit = { path = "../evo-sdk-genkit" }
+
+[lints]
+workspace = true

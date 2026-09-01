@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Plugin-initiated user-interaction routing: prompt registry +
 //! synthetic addressing scheme.
 //!
@@ -50,12 +53,16 @@
 //! Rows whose deadline already elapsed are transitioned to
 //! `TimedOut` during rehydration rather than re-inserted.
 
+use crate::happenings::{Happening, HappeningBus, UiShelfChange};
 use crate::persistence::{
     PersistedPromptState, PersistenceError, PersistenceStore,
 };
+use crate::ui_registry::AdmittedStockingsStore;
+use crate::ui_tier1::{widget_kind_for_prompt_type, PROMPTS_ACTIVE_SHELF_ID};
 use evo_plugin_sdk::contract::{
     PromptCanceller, PromptOutcome, PromptRequest, PromptState,
 };
+use evo_plugin_sdk::ui::{UiSize, UiStocking};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -193,6 +200,19 @@ pub struct PromptLedger {
     /// Tests that don't care about persistence pass `None`
     /// (the ledger stays in-memory only).
     persistence: Option<Arc<dyn PersistenceStore>>,
+    /// Optional UI admitted-stockings store. When attached,
+    /// every prompt issue auto-stocks a `UiStocking` on the
+    /// `prompts.active` shelf with the matching widget kind;
+    /// every prompt resolution forgets it. The reactive
+    /// substrate emits a `UiShelfChanged` happening on each
+    /// transition so connected UI clients re-render without
+    /// polling. Tests that don't care about UI surfaces pass
+    /// `None`; behaviour is otherwise unchanged.
+    ui_admitted: Option<Arc<AdmittedStockingsStore>>,
+    /// Optional happenings bus. Required alongside
+    /// [`Self::ui_admitted`] for the reactive emission to
+    /// fire; without it the store is updated silently.
+    happenings: Option<Arc<HappeningBus>>,
 }
 
 impl PromptLedger {
@@ -203,6 +223,8 @@ impl PromptLedger {
             responder: Mutex::new(None),
             waiters: Mutex::new(HashMap::new()),
             persistence: None,
+            ui_admitted: None,
+            happenings: None,
         }
     }
 
@@ -214,6 +236,26 @@ impl PromptLedger {
         store: Arc<dyn PersistenceStore>,
     ) -> Self {
         self.persistence = Some(store);
+        self
+    }
+
+    /// Attach the UI admitted-stockings store so every prompt
+    /// issue auto-stocks the `prompts.active` shelf and every
+    /// resolution forgets the stocking. Pair with
+    /// [`Self::with_happenings`] for the reactive emission;
+    /// without the bus the store updates silently.
+    pub fn with_ui_admitted(
+        mut self,
+        store: Arc<AdmittedStockingsStore>,
+    ) -> Self {
+        self.ui_admitted = Some(store);
+        self
+    }
+
+    /// Attach the happenings bus so the auto-stocking path
+    /// emits `UiShelfChanged` on each transition.
+    pub fn with_happenings(mut self, bus: Arc<HappeningBus>) -> Self {
+        self.happenings = Some(bus);
         self
     }
 
@@ -235,11 +277,37 @@ impl PromptLedger {
         let mut guard =
             self.responder.lock().expect("responder mutex poisoned");
         match *guard {
-            Some(existing) if existing == connection => Ok(()),
+            Some(existing) if existing == connection => {
+                // LOGGING.md §2: info — lifecycle narrative on
+                // idempotent same-holder re-claim (mid-session
+                // renegotiate).
+                tracing::info!(
+                    connection_id = connection.0,
+                    "user_interaction_responder re-claim by current holder (idempotent)"
+                );
+                Ok(())
+            }
             Some(existing) => {
+                // LOGGING.md §2: info — lifecycle narrative on
+                // refused claim. A caller diagnosing "granted: []"
+                // sees this + the holder's id and can correlate
+                // with the earlier claim log.
+                tracing::info!(
+                    requested_by = connection.0,
+                    held_by = existing.0,
+                    "user_interaction_responder claim refused (slot held)"
+                );
                 Err(ResponderClaimError::AlreadyHeld { by: existing })
             }
             None => {
+                // LOGGING.md §2: info — lifecycle narrative on
+                // first-holder claim. This is the anchor entry
+                // paired with a later `release` at the end of
+                // the session.
+                tracing::info!(
+                    connection_id = connection.0,
+                    "user_interaction_responder claim granted"
+                );
                 *guard = Some(connection);
                 Ok(())
             }
@@ -257,6 +325,15 @@ impl PromptLedger {
             self.responder.lock().expect("responder mutex poisoned");
         if let Some(existing) = *guard {
             if existing == connection {
+                // LOGGING.md §2: info — lifecycle narrative on
+                // effective release. Idempotent-no-op paths
+                // stay silent because those are debug-class
+                // (a caller might legitimately double-release
+                // and neither event carries operator meaning).
+                tracing::info!(
+                    connection_id = connection.0,
+                    "user_interaction_responder released"
+                );
                 *guard = None;
             }
         }
@@ -287,6 +364,13 @@ impl PromptLedger {
         effective_timeout: Duration,
     ) -> Instant {
         let key = (plugin.to_string(), request.prompt_id.clone());
+        // Capture identity for the UI auto-stocking path
+        // before any move-consuming spawn block downstream
+        // borrows or moves `request`.
+        let ui_widget_kind =
+            widget_kind_for_prompt_type(&request.prompt_type).to_string();
+        let ui_prompt_id = request.prompt_id.clone();
+        let ui_priority = request.priority;
         let deadline = Instant::now() + effective_timeout;
         let entry = PromptEntry {
             plugin: plugin.to_string(),
@@ -352,6 +436,35 @@ impl PromptLedger {
                 }
             });
         }
+
+        // Auto-stock the prompts.active shelf with the
+        // matching widget kind. The reactive emission fires
+        // a UiShelfChanged happening so connected UI clients
+        // re-render without polling. We've already captured
+        // the widget kind + prompt id before the
+        // persistence-spawn block (which moves `request`).
+        if let (Some(admitted), Some(bus)) =
+            (self.ui_admitted.as_ref(), self.happenings.as_ref())
+        {
+            let admitted = Arc::clone(admitted);
+            let bus = Arc::clone(bus);
+            let plugin_for_task = plugin.to_string();
+            let widget_kind = ui_widget_kind.clone();
+            let prompt_id = ui_prompt_id.clone();
+            let priority = ui_priority;
+            tokio::spawn(async move {
+                stock_prompt_widget(
+                    &admitted,
+                    &bus,
+                    &plugin_for_task,
+                    &widget_kind,
+                    &prompt_id,
+                    priority,
+                )
+                .await;
+            });
+        }
+
         deadline
     }
 
@@ -415,6 +528,28 @@ impl PromptLedger {
             // applies; only the wake-up signal is lost.
             let _ = tx.send(outcome);
         }
+
+        // Forget the auto-stocked widget. The reactive
+        // emission fires UiShelfChanged so connected UI
+        // clients dismiss the prompt overlay.
+        if let (Some(admitted), Some(bus)) =
+            (self.ui_admitted.as_ref(), self.happenings.as_ref())
+        {
+            let admitted = Arc::clone(admitted);
+            let bus = Arc::clone(bus);
+            let plugin_for_task = plugin.to_string();
+            let prompt_id_for_task = prompt_id.to_string();
+            tokio::spawn(async move {
+                unstock_prompt_widget(
+                    &admitted,
+                    &bus,
+                    &plugin_for_task,
+                    &prompt_id_for_task,
+                )
+                .await;
+            });
+        }
+
         true
     }
 
@@ -650,6 +785,102 @@ impl PromptLedger {
     }
 }
 
+/// Auto-stock the `prompts.active` shelf with one
+/// `evo.prompt.<kind>` widget tagged by `prompt_id` so the
+/// resolution path can match-and-remove. Emits a
+/// `UiShelfChanged` happening on the durable bus.
+///
+/// `prompt_id` is recorded in the stocking's `parameters`
+/// map so [`unstock_prompt_widget`] can identify it without
+/// a side index.
+async fn stock_prompt_widget(
+    admitted: &Arc<AdmittedStockingsStore>,
+    bus: &Arc<HappeningBus>,
+    plugin: &str,
+    widget_kind: &str,
+    prompt_id: &str,
+    priority: Option<evo_plugin_sdk::ui::UiStockingPriority>,
+) {
+    let mut parameters = std::collections::BTreeMap::new();
+    parameters.insert(
+        "prompt_id".to_string(),
+        toml::Value::String(prompt_id.to_string()),
+    );
+    let stocking = UiStocking {
+        ui_shelf: PROMPTS_ACTIVE_SHELF_ID.to_string(),
+        widget: widget_kind.to_string(),
+        size: UiSize::Full,
+        mode: None,
+        responsive: std::collections::BTreeMap::new(),
+        parameters,
+        schema_version: 1,
+        priority,
+    };
+    let after_count = admitted.add_stocking(plugin, stocking).await;
+    let change = if after_count == 1 {
+        UiShelfChange::Stocked
+    } else {
+        UiShelfChange::Restocked
+    };
+    let _ = bus
+        .emit_durable(Happening::UiShelfChanged {
+            shelf: PROMPTS_ACTIVE_SHELF_ID.to_string(),
+            plugin: plugin.to_string(),
+            change,
+            stockings_after: after_count as u32,
+            at: std::time::SystemTime::now(),
+        })
+        .await;
+}
+
+/// Forget the auto-stocked widget for `prompt_id`. Matches
+/// by `parameters["prompt_id"]` so concurrent prompts on
+/// the same shelf coexist cleanly. Emits a `UiShelfChanged`
+/// happening with `Withdrawn` (last on shelf for this
+/// plugin) or `Restocked` (more remain).
+async fn unstock_prompt_widget(
+    admitted: &Arc<AdmittedStockingsStore>,
+    bus: &Arc<HappeningBus>,
+    plugin: &str,
+    prompt_id: &str,
+) {
+    let prompt_id_owned = prompt_id.to_string();
+    let removed = admitted
+        .remove_stocking_matching(plugin, |s| {
+            if s.ui_shelf != PROMPTS_ACTIVE_SHELF_ID {
+                return false;
+            }
+            match s.parameters.get("prompt_id") {
+                Some(toml::Value::String(v)) => v == &prompt_id_owned,
+                _ => false,
+            }
+        })
+        .await;
+    if removed.is_empty() {
+        // No-op: the prompt was never auto-stocked (test
+        // harness), or the stocking was already cleaned.
+        return;
+    }
+    let after_count = admitted
+        .count_on_shelf_excluding(PROMPTS_ACTIVE_SHELF_ID, "")
+        .await;
+    let plugin_after = admitted.get(plugin).await.map(|v| v.len()).unwrap_or(0);
+    let change = if plugin_after == 0 {
+        UiShelfChange::Withdrawn
+    } else {
+        UiShelfChange::Restocked
+    };
+    let _ = bus
+        .emit_durable(Happening::UiShelfChanged {
+            shelf: PROMPTS_ACTIVE_SHELF_ID.to_string(),
+            plugin: plugin.to_string(),
+            change,
+            stockings_after: after_count as u32,
+            at: std::time::SystemTime::now(),
+        })
+        .await;
+}
+
 /// Wall-clock millisecond timestamp now. Returns 0 if the
 /// clock predates UNIX epoch (which never happens in practice
 /// on a deployed steward; the fallback keeps the helper total).
@@ -697,6 +928,7 @@ mod tests {
             retention_hint: None,
             error_context: None,
             previous_answer: None,
+            priority: None,
         }
     }
 
@@ -1058,10 +1290,10 @@ mod tests {
 
     // ---------------------------------------------------------------
     // Persistence + rehydration tests. Cover the durable backing
-    // wired in for v0.1.13: every issue / state transition must
-    // mirror to the store, and a fresh ledger seeded with the
-    // store's open rows must reconstruct the live ledger surface
-    // (multi-stage interaction restore on steward restart).
+    // wired in: every issue / state transition must mirror to
+    // the store, and a fresh ledger seeded with the store's open
+    // rows must reconstruct the live ledger surface (multi-stage
+    // interaction restore on steward restart).
     // ---------------------------------------------------------------
 
     use crate::persistence::{MemoryPersistenceStore, PersistedPromptState};

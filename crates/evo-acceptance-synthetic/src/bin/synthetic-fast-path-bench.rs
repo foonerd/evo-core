@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Fast-path throughput bench. Opens one persistent connection
 //! to the steward's `/run/evo/fast.sock`, then issues
 //! `FastPathRequest::Dispatch` frames in a tight loop for the

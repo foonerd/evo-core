@@ -149,6 +149,29 @@ Watches fire instructions on CONDITIONS observed via the bus. Sibling primitive 
 | `GrammarMigrationProgress` | Per-batch progress event during a migration. Subscribers on dashboards collapse via coalesce labels (`["variant", "migration_id"]`) to latest-only. | `migration_id`, `from_type`, `completed`, `remaining`, `batch_index` |
 | `GrammarOrphansAccepted` | Operator deliberately accepted the orphans of a type via `accept_grammar_orphans`. Suppresses the boot diagnostic warning while the row stays accepted. | `subject_type`, `reason` |
 
+**UI shelf stockings**
+
+| Variant | Trigger | Carries (besides `at`) |
+|---------|---------|------------------------|
+| `UiShelfChanged` | A plugin's UI stockings on one shelf were admitted, replaced (manifest reload, capability re-evaluation), or withdrawn (plugin removal / reload that drops the shelf). UI clients subscribe with `variants = ["ui_shelf_changed"]` and observe the shelf-keyed feed; an explicit `--coalesce-labels variant,shelf` collapses bursty admission storms into one delivered envelope per shelf within the window. | `shelf`, `plugin`, `change` (`stocked` / `restocked` / `withdrawn`), `stockings_after` |
+
+**UI artefact lifecycle**
+
+UI artefacts (`theme`, `ui_shell`, `widget_kind_pack` plugin kinds) admit through dedicated paths and live in dedicated registries. Connected UI clients subscribe by variant name and consume the per-kind feeds to track the available-set and react to operator-driven activations. Active-selection events fire whether or not the value changed (re-issuing `activate_theme` against the already-active theme refreshes `principal` + `at` and emits a same-`previous`-and-`current` event); subscribers can de-duplicate cheaply.
+
+| Variant | Trigger | Carries (besides `at`) |
+|---------|---------|------------------------|
+| `UiThemeAdmitted` | A theme bundle admits into the framework's theme registry via `admit_theme`. UI clients track the available-themes set in real time. | `plugin`, `version` |
+| `UiShellAdmitted` | A UI shell bundle admits into the shell registry via `admit_ui_shell`. Mirror of `UiThemeAdmitted`. | `plugin`, `version` |
+| `UiWidgetPackAdmitted` | A widget kind pack admits via `admit_widget_kind_pack`: its declared kinds folded into the framework's widget-kind registry, the pack's metadata + a11y declarations recorded. UI clients invalidate widget resolution caches when the available kind set changes; `kind_count` lets subscribers sanity-check the cumulative population. | `plugin`, `version`, `kind_count` |
+| `UiThemeUnadmitted` | A theme is removed from the registry (operator uninstall, replacement reload). Paired with `UiThemeAdmitted`. If the unadmitted theme was the active one, a separate `UiActiveThemeChanged` fires FIRST (active-selection auto-clear) so subscribers see the active swap before the available-set drop. | `plugin` |
+| `UiShellUnadmitted` | A shell is removed from the registry. Mirror of `UiThemeUnadmitted` for the `ui_shell` slot. | `plugin` |
+| `UiWidgetPackUnadmitted` | A widget kind pack is removed: its declared kinds rolled back from the widget-kind registry. UI clients invalidate matching resolution caches. `kind_count` reflects what was actually rolled back this pass. | `plugin`, `kind_count` |
+| `UiActiveThemeChanged` | The active-theme selection changed via `activate_theme` (or via auto-clear during `unadmit_theme` when the unadmitted theme was the active one). `previous` and `current` are each the canonical plugin name when set, or `null` for "no theme active" — covering activate / clear / swap / re-activate-same-name uniformly. | `previous` (`Option<String>`), `current` (`Option<String>`), `principal` |
+| `UiActiveShellChanged` | The active-UI-shell selection changed. Mirror of `UiActiveThemeChanged` for the `ui_shell` slot. Operator-driven shell swaps cause connected UI clients to load the new entry-point bundle on the next frame. | `previous`, `current`, `principal` |
+
+The artefact admission events name the contributing plugin in `plugin_owner_for_filter`, so subscribers filtering by plugin see them. The active-selection events are framework-level (no single plugin owns the change) and surface only to subscribers who target them by variant name.
+
 Every variant carries identifying fields so subscribers can correlate happenings with ledger records (custody) or with the registry / graph (subject and relation). `admin_plugin` distinguishes the privileged actor from the `target_plugin` whose claim was modified.
 
 ### 3.2 Ordering Across Cascade Sequences
@@ -430,7 +453,7 @@ Categories on the roadmap (see 3.3). The pattern is mechanically simple: add a v
 
 ### 11.2 Per-rack or Per-subject Filtering
 
-Server-side filtering ships today as the `filter` field on `op = "subscribe_happenings"`: variants / plugins / shelves dimensions, AND'd, applied on both replay and live paths (`CLIENT_API.md` §4.5). Per-subject push subscription ships as `op = "subscribe_subject"` (`CLIENT_API.md` §4.10), which uses an `affects_subject(canonical_id)` predicate over every `Happening` variant to decide when to re-project. Per-rack subscription is the remaining design space; not justified yet.
+Server-side filtering ships today as the `filter` field on `op = "subscribe_happenings"`: variants / plugins / shelves / subject_types / subject_types_deny dimensions, AND'd, applied on both replay and live paths and on both the Unix-socket and HTTPS/WS dispatchers (`CLIENT_API.md` §4.5). The subject-type dimensions are scoped to `subject_state_changed` happenings (non-state-changed variants pass them trivially); they let a consumer narrow a high-rate subject stream — e.g. drop `audio_playback_spectrum_frame` while keeping `audio_playback_now_playing` — without enumerating every subject to keep. Per-subject push subscription ships as `op = "subscribe_subject"` (`CLIENT_API.md` §4.10), which uses an `affects_subject(canonical_id)` predicate over every `Happening` variant to decide when to re-project. Per-rack subscription is the remaining design space; not justified yet.
 
 ### 11.3 Aggregation / Coalescing
 

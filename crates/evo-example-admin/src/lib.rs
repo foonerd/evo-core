@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! # evo-example-admin
 //!
 //! Example administration plugin for evo. Stocks
@@ -432,7 +435,7 @@ impl Plugin for AdminExamplePlugin {
 
 impl Respondent for AdminExamplePlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {
@@ -691,7 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_request_rejects_before_load() {
-        let mut p = AdminExamplePlugin::new();
+        let p = AdminExamplePlugin::new();
         let req = Request {
             request_type: REQ_RETRACT_ADDRESSING.into(),
             payload: b"{}".to_vec(),
@@ -699,6 +702,8 @@ mod tests {
             deadline: None,
 
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let e = p.handle_request(&req).await.unwrap_err();
         assert!(matches!(e, PluginError::Permanent(_)));

@@ -1,0 +1,15 @@
+[package]
+name = "evo-sdk-swift"
+description = "Swift client SDK generator. Walks the canonical wire schema via evo-sdk-genkit and emits a multi-file Swift Package SDK with typed per-domain classes, the top-level EvoClient, shared types, and a Transport protocol. The runtime mount consumes the rendered file set and writes it under the Swift package source tree for SwiftPM publication."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+evo-projection-core = { path = "../evo-projection-core" }
+evo-sdk-genkit = { path = "../evo-sdk-genkit" }
+
+[lints]
+workspace = true

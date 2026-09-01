@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! # evo-example-warden
 //!
 //! Example singleton warden plugin for evo. Accepts custodies, emits a
@@ -419,7 +422,7 @@ mod tests {
         assert_eq!(m.plugin.name, "org.evo.example.warden");
         assert_eq!(m.plugin.contract, 1);
         assert_eq!(
-            m.kind.interaction,
+            m.require_kind().interaction,
             evo_plugin_sdk::manifest::InteractionShape::Warden
         );
     }

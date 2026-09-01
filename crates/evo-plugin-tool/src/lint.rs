@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! `lint` — schema validation and basic presence checks.
 
 use std::path::Path;

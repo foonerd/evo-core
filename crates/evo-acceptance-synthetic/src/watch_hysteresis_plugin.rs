@@ -1,10 +1,12 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Synthetic watch-Hysteresis plugin.
 //!
 //! Exercises the `StatePredicate::Hysteresis` arm of the watch
-//! evaluator landed in Phase 1.C.3. The plugin drives a numeric
-//! value through a fixed sequence designed to test the
-//! upper-edge / silence-in-band / reset-below-lower / re-fire
-//! transitions:
+//! evaluator. The plugin drives a numeric value through a fixed
+//! sequence designed to test the upper-edge / silence-in-band /
+//! reset-below-lower / re-fire transitions:
 //!
 //!   sequence = [50.0, 85.0, 90.0, 70.0, 50.0, 85.0]
 //!   thresholds = { upper = 80.0, lower = 60.0 }
@@ -351,7 +353,7 @@ impl Plugin for WatchHysteresisPlugin {
 
 impl Respondent for WatchHysteresisPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {

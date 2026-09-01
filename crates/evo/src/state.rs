@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Immutable handle bag shared across the steward.
 //!
 //! Built once at boot, held as `Arc<StewardState>` by the components
@@ -17,8 +20,9 @@
 //! `StewardState::builder` constructs it from the per-store
 //! components admission and dispatch consume.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use evo_auth_bearer::{BearerTokenIssuer, CredentialStore, RevocationList};
 use thiserror::Error;
 
 use crate::admin::AdminLedger;
@@ -47,7 +51,10 @@ use crate::subjects::SubjectRegistry;
 /// boot configuration (the per-plugin data root, plugin-trust state,
 /// per-class spawn identities) are deliberately excluded: the bag
 /// describes shared stores, not dispatch or configuration.
-#[derive(Debug)]
+///
+/// `Debug` is implemented manually so the `bearer_token_issuer`
+/// field's underlying ed25519 signing key never reaches a formatter.
+/// The field renders as `<set>` / `<unset>` instead.
 pub struct StewardState {
     /// The catalogue the steward administers. Loaded at boot and
     /// swappable by operator-issued reload_catalogue calls. Wrapped
@@ -97,6 +104,66 @@ pub struct StewardState {
     /// projection engine reads from it without an additional
     /// store query at composition time.
     pub conflict_index: Arc<SubjectConflictIndex>,
+    /// Operator bearer-token issuer for the HTTPS / WS projection.
+    /// Populated post-boot by the HTTPS substrate (see
+    /// `https_boot::boot_https`) so the SSH-required operator-mint
+    /// wire-op (`mint_bearer_token`) can sign tokens through the
+    /// same per-device signing key that the WS layer's validator
+    /// verifies against. `None` when HTTPS boot did not run or
+    /// failed; the mint wire-op refuses with a descriptive error
+    /// in that state.
+    pub bearer_token_issuer: OnceLock<Arc<BearerTokenIssuer>>,
+    /// Operator credential inventory store. Each minted
+    /// bearer token persists a [`evo_auth_bearer::CredentialRecord`]
+    /// here so the operator can list, revoke, and audit
+    /// credentials through `list_bearer_tokens` /
+    /// `revoke_bearer_token` / `reset_credentials_to_open`
+    /// wire ops without depending on what tokens the operator
+    /// happened to capture from the mint flow.
+    pub credential_store: OnceLock<Arc<CredentialStore>>,
+    /// Live revocation list the bearer-token validator
+    /// consults on every request. Populated post-boot by the
+    /// HTTPS substrate from `revoked.json` so revocations
+    /// survive steward restarts; the `revoke_bearer_token`
+    /// wire op writes through to both this list and the
+    /// persistent file.
+    pub revocation_list: OnceLock<Arc<RevocationList>>,
+    /// Framework credential vault — the single per-plugin-scoped
+    /// credential store the operator UI writes into via the
+    /// `credential_put` / `credential_delete` / `credential_list_keys`
+    /// wire ops and plugins read via `LoadContext.credential_vault`.
+    /// Populated at boot when the steward wires
+    /// `AdmissionEngine::with_credential_vault`; test harnesses
+    /// leave it empty and the wire-op handlers surface a structured
+    /// `vault_unavailable` refusal.
+    pub credential_vault: OnceLock<Arc<crate::credentials::CredentialVault>>,
+    /// Central per-plugin credential-change bus. Every admitted
+    /// plugin has an entry keyed by canonical name; the operator-
+    /// facing `credential_put` / `credential_delete` handlers
+    /// publish on this bus after a successful vault mutation, and
+    /// every currently-subscribed
+    /// [`evo_plugin_sdk::contract::context::CredentialVaultHandle::subscribe_changes`]
+    /// receiver (in-process reactor or OOP forwarder task)
+    /// observes the event and re-resolves in place. Always
+    /// populated (default-constructed) so the wire-op handlers
+    /// never need an existence check.
+    pub credential_change_bus: Arc<crate::credentials::CredentialChangeBus>,
+    /// Per-online-provider config store — the operator's live
+    /// per-provider enable/disable + priority state the multi-
+    /// source metadata cascade consults. Populated at boot once
+    /// the persistence layer is available; test harnesses leave
+    /// it empty and wire-op handlers surface a structured
+    /// `provider_store_unavailable` refusal.
+    pub online_provider_config_store:
+        OnceLock<Arc<crate::online_providers::OnlineProviderConfigStore>>,
+    /// Global bus for online-provider config changes. The
+    /// operator-facing set-enabled / set-priority wire-op
+    /// handlers publish on this bus after a successful upsert;
+    /// every plugin reactor consuming online-provider config
+    /// subscribes and re-resolves its local view in place. Always
+    /// populated (default-constructed).
+    pub online_provider_config_bus:
+        Arc<crate::online_providers::OnlineProviderConfigBus>,
 }
 
 impl StewardState {
@@ -118,6 +185,46 @@ impl StewardState {
     /// reload_catalogue swaps it.
     pub fn current_catalogue(&self) -> Arc<Catalogue> {
         self.catalogue.load_full()
+    }
+}
+
+impl std::fmt::Debug for StewardState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StewardState")
+            .field("catalogue", &self.catalogue)
+            .field("subjects", &self.subjects)
+            .field("relations", &self.relations)
+            .field("custody", &self.custody)
+            .field("bus", &self.bus)
+            .field("admin", &self.admin)
+            .field("persistence", &self.persistence)
+            .field("claimant_issuer", &self.claimant_issuer)
+            .field("conflict_index", &self.conflict_index)
+            .field(
+                "bearer_token_issuer",
+                &if self.bearer_token_issuer.get().is_some() {
+                    "<set>"
+                } else {
+                    "<unset>"
+                },
+            )
+            .field(
+                "credential_store",
+                &if self.credential_store.get().is_some() {
+                    "<set>"
+                } else {
+                    "<unset>"
+                },
+            )
+            .field(
+                "revocation_list",
+                &if self.revocation_list.get().is_some() {
+                    "<set>"
+                } else {
+                    "<unset>"
+                },
+            )
+            .finish()
     }
 }
 
@@ -231,6 +338,17 @@ impl StewardStateBuilder {
             conflict_index: self
                 .conflict_index
                 .unwrap_or_else(|| Arc::new(SubjectConflictIndex::new())),
+            bearer_token_issuer: OnceLock::new(),
+            credential_store: OnceLock::new(),
+            revocation_list: OnceLock::new(),
+            credential_vault: OnceLock::new(),
+            credential_change_bus: Arc::new(
+                crate::credentials::CredentialChangeBus::new(),
+            ),
+            online_provider_config_store: OnceLock::new(),
+            online_provider_config_bus: Arc::new(
+                crate::online_providers::OnlineProviderConfigBus::new(),
+            ),
         }))
     }
 }
@@ -266,6 +384,17 @@ impl StewardState {
                 crate::persistence::MemoryPersistenceStore::new(),
             ),
             conflict_index: Arc::new(SubjectConflictIndex::new()),
+            bearer_token_issuer: OnceLock::new(),
+            credential_store: OnceLock::new(),
+            revocation_list: OnceLock::new(),
+            credential_vault: OnceLock::new(),
+            credential_change_bus: Arc::new(
+                crate::credentials::CredentialChangeBus::new(),
+            ),
+            online_provider_config_store: OnceLock::new(),
+            online_provider_config_bus: Arc::new(
+                crate::online_providers::OnlineProviderConfigBus::new(),
+            ),
         })
     }
 }

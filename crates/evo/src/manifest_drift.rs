@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Admission-time manifest-drift detection — re-export of the
 //! SDK-side comparator plus framework-side tests.
 //!

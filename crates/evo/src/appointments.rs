@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Appointments: time-driven instructions.
 //!
 //! Plugins schedule actions via the SDK's
@@ -11,9 +14,8 @@
 //! (`AppointmentLedger`), the synthetic addressing scheme
 //! constant, and the addressing-value helper. The scheduler
 //! runtime — recurrence evaluation, RTC-wake programming,
-//! `ClockAdjusted` re-evaluation, action dispatch — lands in a
-//! follow-up commit alongside this one in the v0.1.12 release
-//! sequence.
+//! `ClockAdjusted` re-evaluation, action dispatch — lives in
+//! sibling modules.
 //!
 //! # Identity
 //!
@@ -464,14 +466,14 @@ impl std::fmt::Display for RecurrenceError {
             Self::AnchoredZoneNotSupported { zone } => {
                 write!(
                     f,
-                    "anchored zone {zone:?} is not supported by the v0.1.12 \
+                    "anchored zone {zone:?} is not supported by the current \
                      scheduler; use Utc or Local"
                 )
             }
             Self::CronNotSupported { expr } => {
                 write!(
                     f,
-                    "cron expression {expr:?} not supported by the v0.1.12 \
+                    "cron expression {expr:?} not supported by the current \
                      scheduler; use a structured recurrence variant"
                 )
             }
@@ -882,6 +884,22 @@ pub struct AppointmentRuntime {
     /// the steward's [`crate::persistence::SqlitePersistenceStore`]
     /// in via [`AppointmentRuntime::start_with_persistence`].
     persistence: Option<Arc<dyn crate::persistence::PersistenceStore>>,
+    /// Optional framework-internal fire handler. When set, a
+    /// fire whose `creator` starts with the framework-reserved
+    /// prefix (`evo.`) is delivered to this handler instead of
+    /// being routed through the plugin router. Plugin-owned
+    /// fires (creators without the reserved prefix) flow
+    /// through the router as before.
+    ///
+    /// Wired by the steward boot via
+    /// [`Self::set_framework_fire_handler`] after the runtime
+    /// and the consumer subsystem (e.g. plan engine) have both
+    /// been constructed. Defaults to `None`, which preserves
+    /// pre-hook behaviour for tests and lightweight integrations
+    /// that don't need framework-internal scheduling.
+    framework_handler: std::sync::Mutex<
+        Option<Arc<dyn crate::framework_dispatch::FrameworkFireHandler>>,
+    >,
     /// Signals the scheduler loop to wake up and recompute its
     /// next sleep. Fired on schedule / cancel / clock-adjust.
     wakeup: Arc<Notify>,
@@ -957,6 +975,7 @@ impl AppointmentRuntime {
             clock_trust,
             rtc_wake,
             persistence,
+            framework_handler: std::sync::Mutex::new(None),
             wakeup: Arc::clone(&wakeup),
             task: std::sync::Mutex::new(None),
         });
@@ -970,6 +989,27 @@ impl AppointmentRuntime {
     /// Borrow the underlying ledger. Used by wire-op handlers.
     pub fn ledger(&self) -> &Arc<AppointmentLedger> {
         &self.ledger
+    }
+
+    /// Install the framework-internal fire handler. Future
+    /// fires whose `creator` starts with the framework-reserved
+    /// prefix (`evo.`) will be delivered to this handler
+    /// instead of routed through the plugin router. Plugin-owned
+    /// fires are unaffected.
+    ///
+    /// Idempotent: re-calling replaces the handler. Pass `None`
+    /// to clear the slot (test-only path; production wiring
+    /// installs once at boot).
+    pub fn set_framework_fire_handler(
+        &self,
+        handler: Option<
+            Arc<dyn crate::framework_dispatch::FrameworkFireHandler>,
+        >,
+    ) {
+        *self
+            .framework_handler
+            .lock()
+            .expect("framework_handler mutex poisoned") = handler;
     }
 
     /// Schedule a new appointment. Computes the initial
@@ -1277,23 +1317,53 @@ impl AppointmentRuntime {
             _ => {}
         }
 
-        // Dispatch via the router. Map outcome to the
-        // dispatch_outcome string the happening carries.
-        let request = evo_plugin_sdk::contract::Request {
-            request_type: entry.action.request_type.clone(),
-            payload: serde_json::to_vec(&entry.action.payload)
-                .unwrap_or_default(),
-            correlation_id: 0,
-            deadline: None,
-            instance_id: None,
-        };
-        let outcome = match self
-            .router
-            .handle_request(&entry.action.target_shelf, request)
-            .await
+        // Dispatch. Framework-reserved creator (prefix `evo.`)
+        // with a handler installed routes to the handler;
+        // everything else routes through the plugin router as
+        // before. The handler returning is the fire-processed
+        // signal — the runtime continues post-fire state
+        // advance regardless. Snapshot the handler under the
+        // mutex, drop the guard, then await — never hold a
+        // std::sync::Mutex across await.
+        let framework_handler = if entry
+            .creator
+            .starts_with(crate::framework_dispatch::FRAMEWORK_CREATOR_PREFIX)
         {
-            Ok(_) => "ok".to_string(),
-            Err(e) => format!("error: {e}"),
+            self.framework_handler
+                .lock()
+                .expect("framework_handler mutex poisoned")
+                .clone()
+        } else {
+            None
+        };
+        let outcome = if let Some(handler) = framework_handler {
+            handler
+                .on_appointment_fire(
+                    &entry.creator,
+                    &entry.spec.appointment_id,
+                    &entry.action,
+                )
+                .await;
+            "ok".to_string()
+        } else {
+            let request = evo_plugin_sdk::contract::Request {
+                request_type: entry.action.request_type.clone(),
+                payload: serde_json::to_vec(&entry.action.payload)
+                    .unwrap_or_default(),
+                correlation_id: 0,
+                deadline: None,
+                instance_id: None,
+                principal_scope: None,
+                has_step_up: false,
+            };
+            match self
+                .router
+                .handle_request(&entry.action.target_shelf, request)
+                .await
+            {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("error: {e}"),
+            }
         };
 
         tracing::debug!(

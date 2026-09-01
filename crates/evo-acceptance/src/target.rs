@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Target descriptor — declares an acceptance target's identity,
 //! connection model, and hardware capability surface.
 //!
@@ -7,10 +10,10 @@
 //! `<name>.local.toml` overlay that is gitignored and never
 //! committed.
 //!
-//! Committed shape (`pi5-prototype.toml`):
+//! Committed shape (`aarch64-validation.toml`):
 //!
 //! ```toml
-//! name = "pi5-prototype"
+//! name = "aarch64-validation"
 //! arch = "aarch64-unknown-linux-gnu"
 //! connection_type = "ssh"
 //!
@@ -24,7 +27,7 @@
 //! name = "audio_jack"
 //! ```
 //!
-//! Local overlay (`pi5-prototype.local.toml`, gitignored):
+//! Local overlay (`aarch64-validation.local.toml`, gitignored):
 //!
 //! ```toml
 //! [ssh]

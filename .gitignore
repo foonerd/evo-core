@@ -83,3 +83,10 @@ CLAUDE.local.md
 # excludes the directory and everything below it without
 # affecting an unrelated file that might share the basename.
 .evo-internal/
+
+# `evo-sdk-gen` writes its per-language outputs here. The
+# generator binary regenerates them deterministically from the
+# canonical wire schema, so the directory is a build artefact
+# rather than committed source — vendor / plugin authors run
+# the generator on their own to obtain typed bindings.
+/sdks/

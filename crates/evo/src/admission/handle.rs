@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! The [`AdmittedHandle`] enum: a single heterogeneous handle for any
 //! admitted plugin.
 //!
@@ -11,7 +14,9 @@
 //! and surface a structured error if the shelf's plugin kind does not
 //! match the caller's request.
 
-use super::erasure::{ErasedRespondent, ErasedWarden};
+use super::erasure::{
+    ErasedRespondent, ErasedWarden, ErasedWardenAndRespondent,
+};
 use evo_plugin_sdk::contract::{
     HealthReport, LoadContext, PluginDescription, PluginError, StateBlob,
 };
@@ -36,6 +41,17 @@ pub enum AdmittedHandle {
     /// [`ErasedWarden::take_custody`], [`ErasedWarden::course_correct`],
     /// [`ErasedWarden::release_custody`].
     Warden(Box<dyn ErasedWarden>),
+    /// A warden plugin that ALSO exposes a respondent
+    /// surface. Routes course_correct / take_custody /
+    /// release_custody through the warden path; routes
+    /// handle_request through the respondent path. Both
+    /// surfaces dispatch to the same underlying plugin
+    /// instance — internal state stays consistent across
+    /// the two dispatch planes. Canonical case: an audio
+    /// playback warden that owns one or more music URI
+    /// schemes and answers source-verb dispatches
+    /// targeting them.
+    WardenWithRespondent(Box<dyn ErasedWardenAndRespondent>),
 }
 
 impl AdmittedHandle {
@@ -44,6 +60,21 @@ impl AdmittedHandle {
         match self {
             Self::Respondent(r) => r.describe().await,
             Self::Warden(w) => w.describe().await,
+            Self::WardenWithRespondent(wr) => wr.as_warden().describe().await,
+        }
+    }
+
+    /// Dispatch to the inner plugin's `probe_plans`. Synchronous
+    /// — the engine reads the plugin's declared PPAG probes,
+    /// runs them, and stamps the resulting
+    /// [`CapabilityResolutionMap`](evo_plugin_sdk::privileges::CapabilityResolutionMap)
+    /// onto [`LoadContext::capabilities`] before invoking
+    /// [`load`](Self::load).
+    pub fn probe_plans(&self) -> Vec<evo_plugin_sdk::privileges::ProbePlan> {
+        match self {
+            Self::Respondent(r) => r.probe_plans(),
+            Self::Warden(w) => w.probe_plans(),
+            Self::WardenWithRespondent(wr) => wr.as_warden().probe_plans(),
         }
     }
 
@@ -52,6 +83,9 @@ impl AdmittedHandle {
         match self {
             Self::Respondent(r) => r.load(ctx).await,
             Self::Warden(w) => w.load(ctx).await,
+            Self::WardenWithRespondent(wr) => {
+                wr.as_warden_mut().load(ctx).await
+            }
         }
     }
 
@@ -60,6 +94,7 @@ impl AdmittedHandle {
         match self {
             Self::Respondent(r) => r.unload().await,
             Self::Warden(w) => w.unload().await,
+            Self::WardenWithRespondent(wr) => wr.as_warden_mut().unload().await,
         }
     }
 
@@ -68,6 +103,9 @@ impl AdmittedHandle {
         match self {
             Self::Respondent(r) => r.health_check().await,
             Self::Warden(w) => w.health_check().await,
+            Self::WardenWithRespondent(wr) => {
+                wr.as_warden().health_check().await
+            }
         }
     }
 
@@ -80,6 +118,9 @@ impl AdmittedHandle {
         match self {
             Self::Respondent(r) => r.prepare_for_live_reload().await,
             Self::Warden(w) => w.prepare_for_live_reload().await,
+            Self::WardenWithRespondent(wr) => {
+                wr.as_warden().prepare_for_live_reload().await
+            }
         }
     }
 
@@ -94,6 +135,9 @@ impl AdmittedHandle {
         match self {
             Self::Respondent(r) => r.load_with_state(ctx, blob).await,
             Self::Warden(w) => w.load_with_state(ctx, blob).await,
+            Self::WardenWithRespondent(wr) => {
+                wr.as_warden_mut().load_with_state(ctx, blob).await
+            }
         }
     }
 
@@ -102,6 +146,7 @@ impl AdmittedHandle {
         match self {
             Self::Respondent(_) => "respondent",
             Self::Warden(_) => "warden",
+            Self::WardenWithRespondent(_) => "warden+respondent",
         }
     }
 }

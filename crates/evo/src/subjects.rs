@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! The subject registry.
 //!
 //! Implements the contract specified in `docs/engineering/SUBJECTS.md`.
@@ -39,7 +42,7 @@
 //!   transparently follow them on resolve; chasing the alias is
 //!   an explicit consumer step.
 //!
-//! ## What's deferred
+//! ## What's not in the current registry
 //!
 //! - Persistence to disk (section 13).
 //! - Full reconciliation algorithm (section 9.4).
@@ -70,6 +73,31 @@
 //! the internal Mutex coordinates mutations.
 
 use crate::error::StewardError;
+
+/// Maximum byte size of a subject-state JSON payload, enforced at the
+/// registry boundary. Subject state is operator-trusted (announced by
+/// admitted plugins) but unbounded payloads would exhaust device memory
+/// (especially at the MCU / Pi 0 hardware tier of the framework's
+/// hardware-tier-aware deployment posture). Plugins exceeding this cap
+/// receive an explicit error; the framework refuses the write rather
+/// than truncating, so plugin authors learn to keep state slim.
+///
+/// 512 KiB accommodates operator-visible state classes that legitimately
+/// carry many rows (audio playback queue with per-track metadata,
+/// library-triage sets, plugin-inventory-with-details) alongside the
+/// MCU-tier telemetry the original 64 KiB cap was sized for. The queue
+/// case in particular routinely exceeds 64 KiB once a device has a
+/// hundred+ tracks with full metadata — hitting the cap means the
+/// operator UI shows a stale queue until the payload happens to fit,
+/// which is a silent-stale-state defect.
+///
+/// Ceiling reasoning: the wire-frame budget in `wire_codec.rs` is
+/// itself 4 MiB, so 512 KiB stays well under the wire ceiling; a
+/// plugin author that pushes a payload over 512 KiB is doing something
+/// wrong architecturally (pagination, streaming, or on-demand fetch)
+/// and deserves the explicit error rather than a silent truncation.
+pub const SUBJECT_STATE_MAX_BYTES: usize = 512 * 1024;
+
 use evo_plugin_sdk::contract::{
     AliasKind, AliasRecord, CanonicalSubjectId, ClaimConfidence,
     ExternalAddressing, SubjectAnnouncement, SubjectClaim,
@@ -77,7 +105,22 @@ use evo_plugin_sdk::contract::{
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::SystemTime;
+use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
+
+/// Capacity of the broadcast channel that re-publishes every
+/// subject-state change to subscribed plugins. Sized at one
+/// minute of high-frequency updates at 60 Hz (~3600 frames)
+/// rounded down; subscribers that fall behind by more than
+/// this see `Lagged` errors and rejoin at the live frame
+/// rather than blocking the writer.
+const SUBJECT_STATE_BROADCAST_CAPACITY: usize = 4096;
+
+/// Re-export the SDK's subject-state update type so the
+/// framework-internal broadcast carries the same shape the
+/// plugin consumer side sees. Keeps the type aligned across
+/// the SDK boundary without an adapter step.
+pub use evo_plugin_sdk::contract::SubjectStateUpdate;
 
 /// The subject registry.
 ///
@@ -87,6 +130,10 @@ use uuid::Uuid;
 /// callback supplied in their `LoadContext`.
 pub struct SubjectRegistry {
     inner: Mutex<RegistryInner>,
+    state_change_tx: broadcast::Sender<SubjectStateUpdate>,
+    /// Per-subject-type subscription-interest counters. Backs
+    /// the produce-iff-consumed substrate.
+    interest_slots: tokio::sync::RwLock<HashMap<String, watch::Sender<u32>>>,
 }
 
 impl std::fmt::Debug for SubjectRegistry {
@@ -121,9 +168,10 @@ struct RegistryInner {
     /// Per-subject runtime state contributed by plugins.
     /// Keyed by canonical ID; value is the most recent JSON state
     /// payload from `announce` (when carried) or `update_state`.
-    /// In-memory only as of v0.1.12.1 — durable persistence rides
-    /// v0.1.13. The watch runtime's `SubjectState` evaluator
-    /// queries this map via the projection engine.
+    /// Mirrored durably to the `subject_states` table so the map
+    /// survives a steward restart. The watch runtime's
+    /// `SubjectState` evaluator queries this map via the projection
+    /// engine.
     states: HashMap<String, serde_json::Value>,
 }
 
@@ -427,6 +475,8 @@ impl Default for SubjectRegistry {
 impl SubjectRegistry {
     /// Construct an empty registry.
     pub fn new() -> Self {
+        let (state_change_tx, _) =
+            broadcast::channel(SUBJECT_STATE_BROADCAST_CAPACITY);
         Self {
             inner: Mutex::new(RegistryInner {
                 subjects: HashMap::new(),
@@ -435,7 +485,205 @@ impl SubjectRegistry {
                 aliases: HashMap::new(),
                 states: HashMap::new(),
             }),
+            state_change_tx,
+            interest_slots: tokio::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Current subscription-interest count for a subject_type.
+    pub async fn interest_count(&self, subject_type: &str) -> u32 {
+        let slots = self.interest_slots.read().await;
+        slots.get(subject_type).map(|s| *s.borrow()).unwrap_or(0)
+    }
+
+    /// Watch::Receiver primed with the current count. Fires on
+    /// every subscribe / unsubscribe transition.
+    pub async fn interest_receiver(
+        &self,
+        subject_type: &str,
+    ) -> watch::Receiver<u32> {
+        {
+            let slots = self.interest_slots.read().await;
+            if let Some(tx) = slots.get(subject_type) {
+                return tx.subscribe();
+            }
+        }
+        let mut slots = self.interest_slots.write().await;
+        let tx = slots
+            .entry(subject_type.to_string())
+            .or_insert_with(|| watch::channel(0u32).0);
+        tx.subscribe()
+    }
+
+    /// Increment count for subject_type. Returns new count.
+    /// Also publishes the new count on the framework-owned
+    /// `system_subscription_interest` subject so producer plugins
+    /// subscribing to it via SubjectStateSubscriber see the
+    /// transition on the wire.
+    pub async fn increment_interest(&self, subject_type: &str) -> u32 {
+        // `watch::Sender::send()` returns Err and DOES NOT update
+        // the internal value when there are zero active receivers
+        // — silent tokio behaviour that broke the F3-step3 counter
+        // in earlier iterations (every increment read prev=0 because
+        // the previous send never took effect). `send_replace()` is
+        // the correct primitive: updates the internal value AND
+        // notifies receivers, regardless of receiver presence.
+        let new_count = {
+            let mut slots = self.interest_slots.write().await;
+            let tx = slots
+                .entry(subject_type.to_string())
+                .or_insert_with(|| watch::channel(0u32).0);
+            let prev = *tx.borrow();
+            let new_count = prev.saturating_add(1);
+            let _ = tx.send_replace(new_count);
+            new_count
+        };
+        self.publish_interest_state(subject_type, new_count);
+        new_count
+    }
+
+    /// Idempotently ensure the per-type interest counter for
+    /// `subject_type` exists AND its wire subject is announced
+    /// at `{ count: 0, at_ms: 0 }` if not already present.
+    ///
+    /// Producer plugins call this on load (via
+    /// [`crate::context::RegistrySubjectAnnouncer::seed_interest_zero`],
+    /// which the SDK's [`evo_plugin_sdk::contract::SubjectAnnouncer::seed_interest_zero`]
+    /// trait method delegates to) so their own
+    /// `interest_subscriber` resolves on first attempt without
+    /// the resolve-retry loop that would otherwise spin until
+    /// the first consumer arrives and triggers the lazy-announce.
+    ///
+    /// Safe to call repeatedly:
+    /// - if the interest slot already exists, its count is left
+    ///   at whatever value it holds (do NOT reset to zero — a
+    ///   consumer might already have incremented it between the
+    ///   slot creation and this call);
+    /// - if the wire subject already exists (a consumer already
+    ///   triggered the lazy-announce), `publish_interest_state`
+    ///   is skipped so we don't overwrite a real count with 0.
+    pub async fn seed_interest_zero(&self, subject_type: &str) {
+        // Ensure the in-memory slot exists at zero. If a slot
+        // already exists we leave its count alone — a consumer
+        // that raced ahead of the seed must not have its
+        // increment clobbered back to 0.
+        {
+            let mut slots = self.interest_slots.write().await;
+            slots
+                .entry(subject_type.to_string())
+                .or_insert_with(|| watch::channel(0u32).0);
+        }
+        // Announce the per-type interest subject at `{count:0}`
+        // if it does not already exist. `publish_interest_state`
+        // is idempotent w.r.t. the announce step (resolve check
+        // gates the announce), and its update_state is a no-op
+        // overwrite when the state already matches. If a
+        // consumer already incremented, publish_interest_state
+        // will have set count>0 already; calling here with 0
+        // would clobber it, so we only publish when there was
+        // no prior addressing.
+        let addressing = ExternalAddressing::new(
+            "evo.system",
+            format!("subscription_interest.{subject_type}"),
+        );
+        if self.resolve(&addressing).is_none() {
+            self.publish_interest_state(subject_type, 0);
+        }
+    }
+
+    /// Decrement count for subject_type (saturates at 0).
+    pub async fn decrement_interest(&self, subject_type: &str) -> u32 {
+        let new_count = {
+            let mut slots = self.interest_slots.write().await;
+            let tx = match slots.get_mut(subject_type) {
+                Some(tx) => tx,
+                None => return 0,
+            };
+            let prev = *tx.borrow();
+            let new_count = prev.saturating_sub(1);
+            let _ = tx.send_replace(new_count);
+            new_count
+        };
+        self.publish_interest_state(subject_type, new_count);
+        new_count
+    }
+
+    /// Publish the current interest count for a subject_type
+    /// via a PER-TYPE framework-owned subject at addressing
+    /// `evo.system:subscription_interest.<subject_type>`.
+    /// Each subject_type owns its own subject + its own state so
+    /// concurrent transitions on different types cannot
+    /// last-write-wins each other. Producer plugins subscribe
+    /// to their own type's subject via the standard
+    /// SubjectStateSubscriber primitive and see every transition
+    /// on their type without filtering another type's writes.
+    ///
+    /// Subject is announced lazily on first publish so a new
+    /// producer subject_type does not need a framework-boot
+    /// change. `announce` is idempotent — re-announcing an
+    /// existing addressing leaves the canonical_id unchanged.
+    fn publish_interest_state(&self, subject_type: &str, count: u32) {
+        let addressing = ExternalAddressing::new(
+            "evo.system",
+            format!("subscription_interest.{subject_type}"),
+        );
+        if self.resolve(&addressing).is_none() {
+            let announcement = SubjectAnnouncement::new(
+                "system_subscription_interest",
+                vec![addressing.clone()],
+            );
+            if let Err(e) = self.announce(&announcement, "framework.system") {
+                tracing::debug!(
+                    subject_type,
+                    error = %e,
+                    "lazy-announce for per-type interest subject failed; \
+                     in-memory count still updates via interest_receiver"
+                );
+                return;
+            }
+        }
+        let canonical_id = match self.resolve(&addressing) {
+            Some(id) => id,
+            None => return,
+        };
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let state = serde_json::json!({
+            "subject_type": subject_type,
+            "count": count,
+            "at_ms": at_ms,
+        });
+        let _ = self.update_state(&canonical_id, state);
+    }
+
+    /// Subscribe to the broadcast stream of every subject-state
+    /// change observed by the registry. Returns a
+    /// [`broadcast::Receiver`] that yields one
+    /// [`SubjectStateUpdate`] per [`Self::update_state`] or
+    /// [`Self::announce`]-with-state call across the entire
+    /// registry. Plugin-side consumers filter by canonical id
+    /// through the SDK adapter.
+    ///
+    /// Slow consumers see `Lagged` and rejoin at the live frame.
+    /// Slow consumers never block the writer.
+    pub fn subscribe_state_changes(
+        &self,
+    ) -> broadcast::Receiver<SubjectStateUpdate> {
+        self.state_change_tx.subscribe()
+    }
+
+    /// Re-publish a state change after the registry mutex has
+    /// been released. Callers within mutation paths assemble
+    /// the [`SubjectStateUpdate`] while holding the mutex (so
+    /// the subject_type + timestamp are coherent), drop the
+    /// mutex, then call this method to broadcast.
+    fn broadcast_state_change(&self, update: SubjectStateUpdate) {
+        // send() returns Err when no receivers are subscribed;
+        // the substrate continues to track state changes
+        // correctly regardless of whether anyone is listening.
+        let _ = self.state_change_tx.send(update);
     }
 
     /// Rebuild the registry's in-memory state from the durable
@@ -602,6 +850,91 @@ impl SubjectRegistry {
         Ok(report)
     }
 
+    /// Rebuild the registry's in-memory subject-state map from the
+    /// durable `subject_states` table at boot.
+    ///
+    /// Called by the steward boot path AFTER `rehydrate_from` has
+    /// populated the live `subjects` map and BEFORE the admission
+    /// engine opens. Loading state before admission opens means
+    /// projections / watch evaluators that reference rehydrated state
+    /// see consistent values from the first plugin-load forward;
+    /// post-admission rehydration would surface a transient empty-
+    /// then-restored window that watches would observe as a state
+    /// transition, generating spurious fires.
+    ///
+    /// Filters out persisted rows whose `subject_id` is not present in
+    /// the live `subjects` map (defensive: a subject forgotten /
+    /// merged / split before its state row was cleaned up would
+    /// otherwise resurrect orphan state). Stale rows are logged at
+    /// debug and skipped; cleanup of stale rows is a follow-on
+    /// concern, not a boot-blocker.
+    pub async fn rehydrate_states_from(
+        &self,
+        store: &dyn crate::persistence::PersistenceStore,
+    ) -> Result<RehydrateStatesReport, StewardError> {
+        let persisted_states =
+            store.load_all_subject_states().await.map_err(|e| {
+                StewardError::Dispatch(format!(
+                    "rehydrate_states_from: load_all_subject_states failed: {e}"
+                ))
+            })?;
+
+        let mut loaded = 0usize;
+        let mut skipped_orphan = 0usize;
+        let mut skipped_oversize = 0usize;
+        let mut skipped_decode_error = 0usize;
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .expect("registry mutex poisoned at rehydrate_states_from");
+            for row in persisted_states {
+                if !inner.subjects.contains_key(&row.subject_id) {
+                    tracing::debug!(
+                        subject_id = %row.subject_id,
+                        "rehydrate_states_from: orphan persisted state \
+                         (subject not in live map); skipping"
+                    );
+                    skipped_orphan += 1;
+                    continue;
+                }
+                if row.state_json.len() > SUBJECT_STATE_MAX_BYTES {
+                    tracing::debug!(
+                        subject_id = %row.subject_id,
+                        bytes = row.state_json.len(),
+                        cap = SUBJECT_STATE_MAX_BYTES,
+                        "rehydrate_states_from: persisted state exceeds \
+                         current cap; skipping (was within cap when written)"
+                    );
+                    skipped_oversize += 1;
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(&row.state_json)
+                {
+                    Ok(value) => {
+                        inner.states.insert(row.subject_id, value);
+                        loaded += 1;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            subject_id = %row.subject_id,
+                            error = %e,
+                            "rehydrate_states_from: failed to deserialise \
+                             persisted state; skipping"
+                        );
+                        skipped_decode_error += 1;
+                    }
+                }
+            }
+        }
+        Ok(RehydrateStatesReport {
+            loaded,
+            skipped_orphan,
+            skipped_oversize,
+            skipped_decode_error,
+        })
+    }
+
     /// Current number of canonical subjects in the registry.
     pub fn subject_count(&self) -> usize {
         self.inner
@@ -755,6 +1088,7 @@ impl SubjectRegistry {
 
         let mut inner = self.inner.lock().expect("registry mutex poisoned");
         let now = SystemTime::now();
+        let mut broadcast_update: Option<SubjectStateUpdate> = None;
 
         // Which addressings already resolve, and to which canonical IDs.
         let mut resolved: Vec<(ExternalAddressing, String)> = Vec::new();
@@ -899,9 +1233,32 @@ impl SubjectRegistry {
                 AnnounceOutcome::NoChange(_)
                 | AnnounceOutcome::Conflict { .. } => None,
             };
-            if let Some(id) = target_id {
+            if let Some(id) = target_id.clone() {
                 inner.states.insert(id, announcement.state.clone());
             }
+            // Capture broadcast input while still under the
+            // mutex, so subject_type is coherent with the
+            // freshly-inserted state.
+            broadcast_update = target_id.and_then(|id| {
+                inner.subjects.get(&id).map(|rec| SubjectStateUpdate {
+                    canonical_id: id,
+                    subject_type: rec.subject_type.clone(),
+                    state: if announcement.state.is_null() {
+                        None
+                    } else {
+                        Some(announcement.state.clone())
+                    },
+                    modified_at_ms: system_time_to_ms(SystemTime::now()),
+                })
+            });
+        }
+
+        // Drop the registry mutex before re-publishing the
+        // state change, so subscriber tasks consuming the
+        // broadcast cannot deadlock against the writer.
+        drop(inner);
+        if let Some(update) = broadcast_update {
+            self.broadcast_state_change(update);
         }
 
         Ok(outcome)
@@ -913,24 +1270,42 @@ impl SubjectRegistry {
     /// where the addressing identity has not changed. No-op if
     /// the canonical id is unknown.
     ///
-    /// State is in-memory only as of v0.1.12.1; durable persistence
-    /// rides v0.1.13.
+    /// The wiring layer mirrors the new state into the
+    /// `subject_states` durable table so the map survives a
+    /// steward restart.
     pub fn update_state(
         &self,
         canonical_id: &str,
         state: serde_json::Value,
     ) -> Result<(), StewardError> {
-        let mut inner = self.inner.lock().expect("registry mutex poisoned");
-        if !inner.subjects.contains_key(canonical_id) {
-            return Err(StewardError::Dispatch(format!(
-                "update_state: unknown canonical id {canonical_id}"
-            )));
-        }
-        if state.is_null() {
-            inner.states.remove(canonical_id);
-        } else {
-            inner.states.insert(canonical_id.to_string(), state);
-        }
+        let update = {
+            let mut inner = self.inner.lock().expect("registry mutex poisoned");
+            let record = match inner.subjects.get(canonical_id) {
+                Some(r) => r.clone(),
+                None => {
+                    return Err(StewardError::Dispatch(format!(
+                        "update_state: unknown canonical id {canonical_id}"
+                    )));
+                }
+            };
+            let broadcast_state = if state.is_null() {
+                inner.states.remove(canonical_id);
+                None
+            } else {
+                inner.states.insert(canonical_id.to_string(), state.clone());
+                Some(state)
+            };
+            SubjectStateUpdate {
+                canonical_id: canonical_id.to_string(),
+                subject_type: record.subject_type,
+                state: broadcast_state,
+                modified_at_ms: system_time_to_ms(SystemTime::now()),
+            }
+        };
+        // Re-publish AFTER releasing the mutex so subscriber
+        // tasks consuming the broadcast cannot deadlock against
+        // the registry's writer.
+        self.broadcast_state_change(update);
         Ok(())
     }
 
@@ -1035,7 +1410,7 @@ impl SubjectRegistry {
             inner.subjects.remove(&id);
             // Drop the per-subject runtime state alongside the
             // record. The states map is in-memory only (state
-            // durability rides v0.1.13); leaving an entry behind
+            // durability is a future extension); leaving an entry behind
             // would leak memory across the lifetime of the
             // steward. Forget-then-re-announce mints a fresh
             // canonical id, so a stale state entry under the
@@ -1171,7 +1546,7 @@ impl SubjectRegistry {
             inner.subjects.remove(&id);
             // Drop the per-subject runtime state alongside the
             // record. The states map is in-memory only (state
-            // durability rides v0.1.13); leaving an entry behind
+            // durability is a future extension); leaving an entry behind
             // would leak memory across the lifetime of the
             // steward. Forget-then-re-announce mints a fresh
             // canonical id, so a stale state entry under the
@@ -1712,6 +2087,36 @@ pub struct RehydrateReport {
     /// `AliasKind::TypeMigrated` records reassembled (one
     /// record per migrated id, with `new_ids` length 1).
     pub type_migrated_aliases_loaded: usize,
+}
+
+/// Outcome of [`SubjectRegistry::rehydrate_states_from`].
+///
+/// Each field counts a class of persisted `subject_states` row the
+/// boot path encountered. The steward emits a debug line summarising
+/// these counts; an operator diagnosing a restart that lost state can
+/// use the counts to tell whether the loss is data-shape (orphan,
+/// oversize, decode error) or genuine state-was-never-persisted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RehydrateStatesReport {
+    /// Persisted state rows successfully restored to the in-memory
+    /// `states` map.
+    pub loaded: usize,
+    /// Persisted state rows whose `subject_id` was not present in
+    /// the live `subjects` map (subject was forgotten / merged /
+    /// split before the state row was cleaned up). Skipped, not
+    /// resurrected.
+    pub skipped_orphan: usize,
+    /// Persisted state rows whose `state_json.len()` exceeds the
+    /// current `SUBJECT_STATE_MAX_BYTES` cap. Possible if the cap
+    /// was lowered between the write that produced the row and the
+    /// boot that loaded it. Skipped to keep the in-memory budget
+    /// honest.
+    pub skipped_oversize: usize,
+    /// Persisted state rows whose `state_json` failed to deserialise
+    /// as a `serde_json::Value`. Possible only if the persistence
+    /// row was tampered with externally (the writer always emits
+    /// well-formed JSON via `serde_json::to_string`).
+    pub skipped_decode_error: usize,
 }
 
 fn claim_to_kind_and_reason(
@@ -3016,6 +3421,62 @@ mod tests {
         assert_eq!(alias.reason.as_deref(), Some("operator cleanup"));
     }
 
+    #[tokio::test]
+    async fn rehydrate_states_skips_oversize_persisted_row() {
+        // Boot rehydration applies SUBJECT_STATE_MAX_BYTES at the
+        // read boundary so a row that exceeds the *current* cap
+        // (because the cap was lowered between write and boot) is
+        // skipped rather than admitted into the in-memory map. The
+        // rehydration report's skipped_oversize counter increments;
+        // loaded does not.
+        use crate::persistence::{
+            AnnounceRecord, MemoryPersistenceStore, PersistenceStore,
+        };
+
+        let store: std::sync::Arc<dyn PersistenceStore> =
+            std::sync::Arc::new(MemoryPersistenceStore::new());
+
+        // Live subject so the row is not classified as orphan.
+        let subject_id = "live-uuid";
+        let addrs = [addr("scheme.x", "value-1")];
+        store
+            .record_subject_announce(AnnounceRecord {
+                canonical_id: subject_id,
+                subject_type: "track",
+                addressings: &addrs,
+                claimant: "p1",
+                claims: &[],
+                at_ms: 100,
+            })
+            .await
+            .unwrap();
+
+        // Persist a state row whose JSON length exceeds the cap.
+        // The persistence layer takes any &str; the cap is enforced
+        // at announce/update_state on the way in and at rehydrate on
+        // the way out. Going around the in-process cap here mirrors
+        // the cap-was-lowered-between-runs case the rehydrate guard
+        // exists to handle.
+        let oversize_json =
+            format!("\"{}\"", "q".repeat(SUBJECT_STATE_MAX_BYTES + 1));
+        store
+            .record_subject_state(subject_id, &oversize_json, 200)
+            .await
+            .unwrap();
+
+        let registry = SubjectRegistry::new();
+        registry.rehydrate_from(store.as_ref()).await.unwrap();
+        let report = registry
+            .rehydrate_states_from(store.as_ref())
+            .await
+            .unwrap();
+
+        assert_eq!(report.loaded, 0, "oversize row must not load");
+        assert_eq!(report.skipped_oversize, 1);
+        assert_eq!(report.skipped_orphan, 0);
+        assert_eq!(report.skipped_decode_error, 0);
+    }
+
     #[test]
     fn forced_retract_last_addressing_records_tombstone_alias() {
         // The privileged forced-retract path that ends in
@@ -3047,5 +3508,131 @@ mod tests {
         assert!(alias.new_ids.is_empty());
         assert_eq!(alias.admin_plugin, "p.admin");
         assert_eq!(alias.reason.as_deref(), Some("admin sweep"));
+    }
+
+    #[tokio::test]
+    async fn interest_starts_at_zero_for_unknown_subject_type() {
+        let r = SubjectRegistry::new();
+        assert_eq!(
+            r.interest_count("audio_playback_spectrum_frame").await,
+            0,
+            "unknown subject type must report count=0, not create a slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn increment_then_decrement_returns_to_zero() {
+        let r = SubjectRegistry::new();
+        assert_eq!(r.increment_interest("t").await, 1);
+        assert_eq!(r.increment_interest("t").await, 2);
+        assert_eq!(r.increment_interest("t").await, 3);
+        assert_eq!(r.decrement_interest("t").await, 2);
+        assert_eq!(r.decrement_interest("t").await, 1);
+        assert_eq!(r.decrement_interest("t").await, 0);
+        assert_eq!(
+            r.interest_count("t").await,
+            0,
+            "counter must return to zero after equal inc/dec"
+        );
+    }
+
+    #[tokio::test]
+    async fn decrement_saturates_at_zero() {
+        let r = SubjectRegistry::new();
+        let _ = r.increment_interest("t").await;
+        assert_eq!(r.decrement_interest("t").await, 0);
+        // Under-run must not underflow to u32::MAX; saturates.
+        assert_eq!(r.decrement_interest("t").await, 0);
+        assert_eq!(r.decrement_interest("t").await, 0);
+    }
+
+    #[tokio::test]
+    async fn per_type_counters_are_isolated() {
+        // Per-type isolation invariant: concurrent transitions
+        // on different subject_types must not affect each other.
+        // Each subject_type owns its own counter + its own
+        // interest subject at
+        // `evo.system:subscription_interest.<subject_type>`, so
+        // a write on one type never last-write-wins another.
+        let r = SubjectRegistry::new();
+        let _ = r.increment_interest("a").await;
+        let _ = r.increment_interest("a").await;
+        let _ = r.increment_interest("b").await;
+        assert_eq!(r.interest_count("a").await, 2);
+        assert_eq!(r.interest_count("b").await, 1);
+        let _ = r.decrement_interest("a").await;
+        assert_eq!(r.interest_count("a").await, 1);
+        assert_eq!(
+            r.interest_count("b").await,
+            1,
+            "decrement on 'a' must not touch 'b'"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_interest_zero_creates_slot_and_leaves_count_at_zero() {
+        let r = SubjectRegistry::new();
+        r.seed_interest_zero("t").await;
+        assert_eq!(
+            r.interest_count("t").await,
+            0,
+            "seed on a never-touched type establishes the slot at zero"
+        );
+        // Follow-up increment still goes 0 → 1, not 1 → 2 (seed
+        // did not double-count).
+        assert_eq!(r.increment_interest("t").await, 1);
+    }
+
+    #[tokio::test]
+    async fn seed_interest_zero_is_idempotent_and_does_not_clobber_existing_count(
+    ) {
+        // Race scenario: a consumer arrives BEFORE the producer
+        // plugin gets a chance to call seed_interest_zero. The
+        // consumer's increment must not be clobbered back to 0
+        // by the late seed.
+        let r = SubjectRegistry::new();
+        assert_eq!(r.increment_interest("t").await, 1);
+        assert_eq!(r.increment_interest("t").await, 2);
+        r.seed_interest_zero("t").await; // late seed
+        assert_eq!(
+            r.interest_count("t").await,
+            2,
+            "seed after existing count must preserve the count, not reset"
+        );
+        // And decrement still counts down from the preserved
+        // value, not from zero.
+        assert_eq!(r.decrement_interest("t").await, 1);
+        assert_eq!(r.decrement_interest("t").await, 0);
+    }
+
+    #[tokio::test]
+    async fn seed_interest_zero_can_be_called_repeatedly_without_effect() {
+        let r = SubjectRegistry::new();
+        r.seed_interest_zero("t").await;
+        r.seed_interest_zero("t").await;
+        r.seed_interest_zero("t").await;
+        assert_eq!(r.interest_count("t").await, 0);
+        assert_eq!(r.increment_interest("t").await, 1);
+        r.seed_interest_zero("t").await; // still no clobber
+        assert_eq!(r.interest_count("t").await, 1);
+    }
+
+    #[tokio::test]
+    async fn interest_receiver_watches_transitions() {
+        // The receiver a producer's interest_subscriber holds
+        // sees the count transitions the framework's counter
+        // primitives push. Proves the watch::Sender::send_replace
+        // path is wired end-to-end.
+        let r = SubjectRegistry::new();
+        let mut rx = r.interest_receiver("t").await;
+        assert_eq!(*rx.borrow(), 0, "receiver starts at initial value");
+        let _ = r.increment_interest("t").await;
+        // send_replace notifies receivers regardless of whether
+        // they were subscribed at send time; changed() unblocks.
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), 1);
+        let _ = r.decrement_interest("t").await;
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), 0);
     }
 }

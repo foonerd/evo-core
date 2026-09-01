@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! `/etc/evo/revocations.toml` — install-digest list and
 //! key-fingerprint list.
 //!

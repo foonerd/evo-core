@@ -1,0 +1,15 @@
+[package]
+name = "evo-projection-graphql"
+description = "GraphQL projection of the wire-protocol schema. Emits the canonical `.graphqls` schema file content (Query / Mutation / Subscription root types) from the canonical schema; the runtime mount that stitches the projection onto a concrete GraphQL server (async-graphql) consumes the emitted schema."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+evo-projection-core = { path = "../evo-projection-core" }
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

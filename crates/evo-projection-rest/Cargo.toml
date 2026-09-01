@@ -1,0 +1,18 @@
+[package]
+name = "evo-projection-rest"
+description = "REST projection of the wire-protocol schema. Generates endpoint bindings (HTTP method + path) for every WireOp in the canonical schema. The in-memory endpoint table is consumed by the runtime mount that stitches the projection onto a concrete HTTP listener (axum + tower)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+evo-projection-core = { path = "../evo-projection-core" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

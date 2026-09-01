@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Connection — the harness's mechanism for executing a scenario
 //! command on the target. SSH is the default for remote targets;
 //! local-exec is for in-process or co-located dev-box runs.

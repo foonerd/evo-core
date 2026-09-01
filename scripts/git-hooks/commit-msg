@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+#
+# git commit-msg hook — fail-fast guard against journal-voice
+# / engineering-identifier leaks in commit messages.
+#
+# Mirrors scripts/preflight/check-public-leaks.sh's seven pattern
+# classes against the proposed commit message at the moment
+# `git commit` runs. Refuses the commit (exits 1) if any match.
+#
+# Activation:
+#
+#   From the repo root:
+#
+#     git config core.hooksPath scripts/git-hooks
+#
+#   That tells git to use scripts/git-hooks/* as its hooks
+#   directory for this clone. The in-tree script is the canonical
+#   version; activation is a one-shot per-clone step (git stores
+#   the hooksPath in .git/config which is not shared across
+#   clones, so every fresh clone needs to run the line above).
+#
+# Bypass:
+#
+#   This hook fires from `git commit`. Bypassing it (`git commit
+#   --no-verify`) is forbidden by project discipline; the gate
+#   exists because the discipline keeps slipping without it.
+#
+# Pattern source of truth:
+#
+#   These patterns mirror scripts/preflight/check-public-leaks.sh.
+#   When that script grows a new pattern class, mirror it here.
+
+set -eo pipefail
+
+MSG_FILE="$1"
+
+# Strip git's `#`-prefixed comment lines before scanning so the
+# template's commented-out diff-summary section does not produce
+# false matches. The hook receives the file containing the
+# author's message + the commented template; only the author's
+# actual lines should be scanned.
+SCRATCH="$(mktemp)"
+trap 'rm -f "$SCRATCH"' EXIT
+grep -v '^#' "$MSG_FILE" > "$SCRATCH" || true
+
+declare -a FAILURES=()
+
+scan_pattern() {
+    local label="$1"
+    local pattern="$2"
+    local hits
+    hits=$(grep -niE "${pattern}" "$SCRATCH" || true)
+    if [[ -n "${hits}" ]]; then
+        FAILURES+=("=== ${label} ===")
+        FAILURES+=("${hits}")
+        FAILURES+=("")
+    fi
+}
+
+# Pattern 1: ADR-XXXX (case-insensitive on the prefix).
+scan_pattern \
+    "ADR identifiers — rewrite the commit subject/body descriptively" \
+    '[Aa][Dd][Rr]-[0-9]{3,}'
+
+# Pattern 2: engineering-side document filenames.
+scan_pattern \
+    "Engineering-side document filenames" \
+    '\b(SESSION_LOG|RISKS|PARKED_DECISIONS|V0\.[0-9]+\.[0-9]+_SCOPE|VENDOR_EXTENSION_OPTIONS)\b'
+
+# Pattern 3: release-prep narrative term.
+scan_pattern \
+    "Release-prep narrative term 'closure-debt'" \
+    'closure-debt|closure debt'
+
+# Pattern 4: buildout-phase identifiers.
+scan_pattern \
+    "Buildout-phase identifiers (Phase X.Y) — rewrite descriptively" \
+    'Phase [0-9]+\.[A-Za-z0-9]+|Phase [A-Z]\.[0-9]+'
+
+# Pattern 5: parked-decision identifiers.
+scan_pattern \
+    "Parked-decision identifiers (PD-NNN) — rewrite descriptively" \
+    '\bPD-[0-9]+\b'
+
+# Pattern 6: risk-register identifiers (3+ digits to avoid version-style).
+scan_pattern \
+    "Risk-register identifiers (R-NNN)" \
+    '\bR-[0-9]{3,}\b'
+
+# Pattern 7: GAPS document references.
+scan_pattern \
+    "GAPS document references" \
+    '\bGAPS\b'
+
+if [[ ${#FAILURES[@]} -gt 0 ]]; then
+    echo
+    echo "COMMIT-MSG CHECK FAILED."
+    echo
+    echo "The proposed commit message contains engineering-side"
+    echo "identifiers or release-prep narrative. Rewrite the message"
+    echo "to describe the change in framework-behaviour terms (state"
+    echo "what changed, not which engineering doc / phase / risk-id"
+    echo "the change relates to). Same standard as scripts/preflight/"
+    echo "check-public-leaks.sh applies to source files."
+    echo
+    printf '%s\n' "${FAILURES[@]}"
+    echo
+    echo "Edit the message and run \`git commit\` again."
+    echo "Bypass (--no-verify) is forbidden by project discipline."
+    exit 1
+fi

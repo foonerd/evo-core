@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! # evo-example-factory
 //!
 //! Example factory respondent plugin for evo. Announces a small set of
@@ -66,7 +69,10 @@ pub fn manifest() -> Manifest {
 #[derive(Debug, Default)]
 pub struct ExampleFactoryPlugin {
     loaded: bool,
-    request_count: u64,
+    /// Diagnostic counter. Interior-mutable atomic so
+    /// `handle_request` stays `&self` under the framework's
+    /// concurrent-dispatch contract.
+    request_count: std::sync::atomic::AtomicU64,
 }
 
 impl ExampleFactoryPlugin {
@@ -78,6 +84,7 @@ impl ExampleFactoryPlugin {
     /// Number of requests handled since `load`.
     pub fn request_count(&self) -> u64 {
         self.request_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -145,7 +152,7 @@ impl Plugin for ExampleFactoryPlugin {
             );
             tracing::info!(
                 plugin = PLUGIN_NAME,
-                requests = self.request_count,
+                requests = self.request_count(),
                 "plugin unload"
             );
             self.loaded = false;
@@ -180,7 +187,7 @@ impl Factory for ExampleFactoryPlugin {
 
 impl Respondent for ExampleFactoryPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {
@@ -203,7 +210,8 @@ impl Respondent for ExampleFactoryPlugin {
                     req.request_type
                 )));
             }
-            self.request_count += 1;
+            self.request_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(Response::for_request(req, req.payload.clone()))
         }
     }

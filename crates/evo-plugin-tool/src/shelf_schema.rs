@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! `validate-shelf-schema` subcommand.
 //!
 //! Walks a schemas tree (the in-tree `dist/catalogue/schemas/`
@@ -127,11 +130,25 @@ fn walk_for_toml(
                 .and_then(|s| s.to_str())
                 .map(|s| s.eq_ignore_ascii_case("toml"))
                 .unwrap_or(false)
+            && !is_rack_metadata_file(&path)
         {
             out.push(path);
         }
     }
     Ok(())
+}
+
+/// Rack metadata files (`_rack.toml`) sit alongside shelf
+/// schemas in the schemas tree but are NOT shelf schemas —
+/// they declare rack-level identity + description and have
+/// no `schema_version` / `shape` / `requests` /
+/// `course_correct_verbs` fields. The walker skips them so
+/// the validator only sees real shelf schemas.
+fn is_rack_metadata_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.eq_ignore_ascii_case("_rack.toml"))
+        .unwrap_or(false)
 }
 
 fn relative_to(root: &Path, file: &Path) -> PathBuf {
@@ -166,10 +183,20 @@ struct ShelfSchema {
     rack: String,
     shelf: String,
     shape: u32,
+    /// Shelf shape kind. `"respondent"` (default when
+    /// absent) declares `requests`; `"warden"` declares
+    /// `course_correct_verbs`. Other values are refused.
+    #[serde(default)]
+    shape_kind: Option<String>,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
     requests: Vec<ShelfRequest>,
+    /// Warden-shape: list of `course_correct` verbs the
+    /// shelf accepts. Mutually exclusive with `requests` —
+    /// validation refuses a schema that declares both.
+    #[serde(default)]
+    course_correct_verbs: Vec<String>,
     #[serde(default)]
     acceptance: Vec<ShelfAcceptance>,
 }
@@ -208,24 +235,89 @@ impl ShelfSchema {
         if self.shelf.trim().is_empty() {
             return Err(anyhow!("shelf must be a non-empty string"));
         }
-        if self.requests.is_empty() {
-            return Err(anyhow!(
-                "schema declares zero request types; a shelf with no \
-                 requests is unaddressable"
-            ));
-        }
-        let mut seen = std::collections::HashSet::<&str>::new();
-        for req in &self.requests {
-            if req.request_type.trim().is_empty() {
-                return Err(anyhow!("request_type entries must be non-empty"));
+
+        // Dispatch on shape_kind. The two shape families
+        // declare their addressable surface in different
+        // fields and are mutually exclusive: a respondent
+        // declares `requests`, a warden declares
+        // `course_correct_verbs`. A schema declaring both
+        // or neither is malformed.
+        let shape_kind = self
+            .shape_kind
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("respondent");
+        match shape_kind {
+            "respondent" => {
+                if !self.course_correct_verbs.is_empty() {
+                    return Err(anyhow!(
+                        "respondent-shape schema declares \
+                         `course_correct_verbs` (only valid on warden \
+                         shape); remove the field or set \
+                         `shape_kind = \"warden\"`"
+                    ));
+                }
+                if self.requests.is_empty() {
+                    return Err(anyhow!(
+                        "respondent-shape schema declares zero request \
+                         types; a shelf with no requests is \
+                         unaddressable"
+                    ));
+                }
+                let mut seen = std::collections::HashSet::<&str>::new();
+                for req in &self.requests {
+                    if req.request_type.trim().is_empty() {
+                        return Err(anyhow!(
+                            "request_type entries must be non-empty"
+                        ));
+                    }
+                    if !seen.insert(req.request_type.as_str()) {
+                        return Err(anyhow!(
+                            "duplicate request_type {:?}",
+                            req.request_type
+                        ));
+                    }
+                }
             }
-            if !seen.insert(req.request_type.as_str()) {
+            "warden" => {
+                if !self.requests.is_empty() {
+                    return Err(anyhow!(
+                        "warden-shape schema declares `requests` (only \
+                         valid on respondent shape); remove the field or \
+                         set `shape_kind = \"respondent\"`"
+                    ));
+                }
+                if self.course_correct_verbs.is_empty() {
+                    return Err(anyhow!(
+                        "warden-shape schema declares zero \
+                         `course_correct_verbs`; a warden with no verbs \
+                         is unaddressable"
+                    ));
+                }
+                let mut seen = std::collections::HashSet::<&str>::new();
+                for verb in &self.course_correct_verbs {
+                    if verb.trim().is_empty() {
+                        return Err(anyhow!(
+                            "course_correct_verbs entries must be \
+                             non-empty"
+                        ));
+                    }
+                    if !seen.insert(verb.as_str()) {
+                        return Err(anyhow!(
+                            "duplicate course_correct verb {verb:?}"
+                        ));
+                    }
+                }
+            }
+            other => {
                 return Err(anyhow!(
-                    "duplicate request_type {:?}",
-                    req.request_type
+                    "unknown shape_kind {other:?}; expected \"respondent\" \
+                     or \"warden\""
                 ));
             }
         }
+
         for acc in &self.acceptance {
             if acc.name.trim().is_empty() {
                 return Err(anyhow!(
@@ -374,5 +466,178 @@ shape = 1
         let tmp = TempDir::new().unwrap();
         validate(Some(tmp.path()))
             .expect("empty tree exits 0 with friendly message");
+    }
+
+    // ---------------------------------------------------------
+    // F5 — schema validator drift coverage. The walker must
+    // skip `_rack.toml` files (rack metadata, not shelf
+    // schemas), the warden shape must validate when
+    // `shape_kind = "warden"` declares `course_correct_verbs`,
+    // and the two shape families must be mutually exclusive.
+    // ---------------------------------------------------------
+
+    fn warden_schema() -> &'static str {
+        r#"
+schema_version = 1
+rack = "audio"
+shelf = "playback"
+shape = 1
+shape_kind = "warden"
+
+course_correct_verbs = ["play", "pause", "stop"]
+"#
+    }
+
+    fn rack_metadata() -> &'static str {
+        r#"
+rack = "audio"
+namespace = "org.evoframework"
+description = "Brand-neutral audio rack."
+"#
+    }
+
+    #[test]
+    fn validate_passes_on_warden_shape() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "org.evoframework/audio/playback.v1.toml",
+            warden_schema(),
+        );
+        validate(Some(tmp.path())).expect("warden schema must validate");
+    }
+
+    #[test]
+    fn validate_skips_rack_metadata_file() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "org.evoframework/audio/_rack.toml",
+            rack_metadata(),
+        );
+        // No shelf schemas in tree; _rack.toml is skipped.
+        // The walker produces zero files; validate() exits OK
+        // with a "tree is empty" message.
+        validate(Some(tmp.path())).expect("_rack.toml must be skipped");
+    }
+
+    #[test]
+    fn validate_walks_rack_alongside_shelf_schemas() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "org.evoframework/audio/_rack.toml",
+            rack_metadata(),
+        );
+        write_file(
+            tmp.path(),
+            "org.evoframework/audio/playback.v1.toml",
+            warden_schema(),
+        );
+        write_file(
+            tmp.path(),
+            "org.evoframework/audio/composition.v1.toml",
+            good_schema(),
+        );
+        validate(Some(tmp.path()))
+            .expect("rack + warden + respondent tree validates together");
+    }
+
+    #[test]
+    fn validate_fails_on_warden_with_no_verbs() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "audio/playback.v1.toml",
+            r#"
+schema_version = 1
+rack = "audio"
+shelf = "playback"
+shape = 1
+shape_kind = "warden"
+"#,
+        );
+        let err = validate(Some(tmp.path())).unwrap_err();
+        assert!(err.to_string().contains("schema file(s) failed"));
+    }
+
+    #[test]
+    fn validate_fails_on_warden_with_requests_field() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "audio/playback.v1.toml",
+            r#"
+schema_version = 1
+rack = "audio"
+shelf = "playback"
+shape = 1
+shape_kind = "warden"
+course_correct_verbs = ["play"]
+
+[[requests]]
+request_type = "play"
+"#,
+        );
+        let err = validate(Some(tmp.path())).unwrap_err();
+        assert!(err.to_string().contains("schema file(s) failed"));
+    }
+
+    #[test]
+    fn validate_fails_on_respondent_with_course_correct_verbs() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "audio/composition.v1.toml",
+            r#"
+schema_version = 1
+rack = "audio"
+shelf = "composition"
+shape = 1
+course_correct_verbs = ["nope"]
+
+[[requests]]
+request_type = "select_mode"
+"#,
+        );
+        let err = validate(Some(tmp.path())).unwrap_err();
+        assert!(err.to_string().contains("schema file(s) failed"));
+    }
+
+    #[test]
+    fn validate_fails_on_unknown_shape_kind() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "audio/playback.v1.toml",
+            r#"
+schema_version = 1
+rack = "audio"
+shelf = "playback"
+shape = 1
+shape_kind = "rumpelstiltskin"
+"#,
+        );
+        let err = validate(Some(tmp.path())).unwrap_err();
+        assert!(err.to_string().contains("schema file(s) failed"));
+    }
+
+    #[test]
+    fn validate_fails_on_duplicate_course_correct_verb() {
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "audio/playback.v1.toml",
+            r#"
+schema_version = 1
+rack = "audio"
+shelf = "playback"
+shape = 1
+shape_kind = "warden"
+course_correct_verbs = ["play", "play"]
+"#,
+        );
+        let err = validate(Some(tmp.path())).unwrap_err();
+        assert!(err.to_string().contains("schema file(s) failed"));
     }
 }

@@ -1,0 +1,27 @@
+# cut-release.example.toml
+#
+# Example configuration for scripts/release/cut-release.sh.
+# Copy to a private location (paths are internal) and pass via --config.
+
+[repos.evo-catalogue-schemas]
+eng = "/path/to/evo-catalogue-schemas"
+artefacts = "/path/to/evo-catalogue-schemas-artefacts"
+
+[repos.evo-core]
+eng = "/path/to/evo-core-eng"
+public = "/path/to/evo-core"
+
+[repos.evo-device-audio]
+eng = "/path/to/evo-device-audio"
+public = "/path/to/evo-device-audio-public"
+artefacts = "/path/to/evo-device-audio-artefacts"
+
+[repos.evo-device-audio-ui]
+eng = "/path/to/evo-ui-eng"
+public = "/path/to/evo-device-audio-ui"
+artefacts = "/path/to/evo-device-audio-ui-artefacts"
+
+[signing]
+release_key = "/path/to/evo-core-release-signing-private.pem"
+acceptance_key = "/path/to/evo-acceptance-signing-private.pem"
+acceptance_public_key = "/path/to/evo-acceptance-signing-public.pem"

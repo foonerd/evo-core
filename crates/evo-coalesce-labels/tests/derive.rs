@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Integration tests for `#[derive(CoalesceLabels)]`.
 //!
 //! Exercises the macro against representative enum shapes — named

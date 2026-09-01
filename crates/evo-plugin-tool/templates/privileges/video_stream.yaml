@@ -1,0 +1,68 @@
+schema_version: "1.0"
+plugin: com.example.video.stream
+owner: example-author
+isolation: oop
+
+# Set true when the plugin depends on any host-side OS package
+# (binary, kernel module, system service). The compulsory
+# parity gate at install-time and admission-time reads this
+# field FIRST: true + a missing required_binary = HARD FAIL.
+has_os_dependencies: false
+
+# ARCHETYPE: video_stream
+#
+# A plugin that consumes a live video stream (RTSP camera,
+# HLS feed, WebRTC ingest) and surfaces it into the
+# framework's display / notification pipeline. Typical use:
+# doorbell preview, security-camera glance, room-monitor tile
+# on the operator surface.
+#
+# TAILOR before shipping:
+#   - `plugin` — replace with the reverse-DNS canonical id for
+#     your plugin (e.g. `com.acme.camera.reolink-rtsp`).
+#   - `owner` — the accountable team / individual / organisation.
+#   - `required_binaries` — if you shell out to `ffmpeg` for
+#     transcoding, add it to `required_binaries` with a minimum
+#     version. Native Rust decoders (openh264 / dav1d bindings)
+#     leave this empty.
+#   - `verification.commands` — read-only shell commands that
+#     confirm the host actually satisfies the intents. Every entry
+#     must exit 0 as the plugin's declared service identity.
+
+capability_intent:
+  - id: stream_ingest
+    need: pull a live video stream over the network (RTSP / HLS / WebRTC) from a configured source URL and decode into frames the framework's display pipeline can render.
+    access_path: network/outbound
+    failure_mode: report unavailable stream; structured event carries the transport error class; no panic; the display pipeline shows a placeholder tile.
+  - id: state_storage
+    need: write per-plugin state directory to persist per-source authentication, transient session state, and last-frame thumbnails for the operator surface.
+    access_path: filesystem/state
+    failure_mode: fall back to no-thumbnail mode; structured event; no panic.
+
+required_binaries: []
+
+required_kernel_modules: []
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+    - "test -w /var/lib/evo"
+  expected:
+    - state directory exists
+    - state directory is writable as the declared service identity
+
+host_provisioning:
+  debian:
+    systemd:
+      SupplementaryGroups: []
+      CapabilityBoundingSet: []
+      AmbientCapabilities: []
+      ProtectSystem: strict
+      ProtectHome: "yes"
+      ReadWritePaths:
+        - /var/lib/evo/plugins/com.example.video.stream/state
+      NoNewPrivileges: true
+    capabilities: []
+    sudoers: []

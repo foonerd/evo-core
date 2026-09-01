@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! The factory trait and its supporting types.
 
 use crate::contract::plugin::Plugin;

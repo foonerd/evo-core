@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Operator policy for client-API capabilities.
 //!
 //! The client API exposes a small set of named, per-connection
@@ -325,6 +328,31 @@ pub struct WatchesAdminPolicy {
     pub allow_gids: Vec<u32>,
 }
 
+/// Per-capability policy block for the operator-issued plan
+/// management surface (`plans_admin`). Mirrors
+/// [`PluginsAdminPolicy`] in shape and semantics.
+///
+/// Gates the operator wire op `fire_plan` (and follow-on plan
+/// management ops). Plans driven by the framework's trigger
+/// engines (appointments / watches / plan-chain) do not consult
+/// this policy — those paths run inside the framework and never
+/// cross the wire.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlansAdminPolicy {
+    /// When `true`, any local-socket peer whose UID matches the
+    /// steward's UID is granted `plans_admin`. Default-derived
+    /// consistently with the other admin policies.
+    #[serde(default)]
+    pub allow_local: Option<bool>,
+    /// Explicit UIDs that may negotiate `plans_admin`.
+    #[serde(default)]
+    pub allow_uids: Vec<u32>,
+    /// Explicit GIDs that may negotiate `plans_admin`.
+    #[serde(default)]
+    pub allow_gids: Vec<u32>,
+}
+
 /// Per-capability policy block for the operator-issued
 /// subject-grammar migration surface (`grammar_admin`).
 /// Mirrors [`PluginsAdminPolicy`] in shape and semantics.
@@ -374,6 +402,8 @@ struct ClientAclCapabilities {
     watches_admin: WatchesAdminPolicy,
     #[serde(default)]
     grammar_admin: GrammarAdminPolicy,
+    #[serde(default)]
+    plans_admin: PlansAdminPolicy,
 }
 
 /// Loaded, immutable client-API ACL.
@@ -393,6 +423,7 @@ pub struct ClientAcl {
     appointments_admin: AppointmentsAdminPolicy,
     watches_admin: WatchesAdminPolicy,
     grammar_admin: GrammarAdminPolicy,
+    plans_admin: PlansAdminPolicy,
     /// Source path the ACL was loaded from, for diagnostics. `None`
     /// when constructed via [`ClientAcl::default`] or when the
     /// default-path file was absent and the defaults applied.
@@ -452,6 +483,7 @@ impl ClientAcl {
             appointments_admin: file.capabilities.appointments_admin,
             watches_admin: file.capabilities.watches_admin,
             grammar_admin: file.capabilities.grammar_admin,
+            plans_admin: file.capabilities.plans_admin,
             source,
         })
     }
@@ -757,6 +789,49 @@ impl ClientAcl {
     /// Return the parsed `grammar_admin` policy.
     pub fn grammar_admin_policy(&self) -> &GrammarAdminPolicy {
         &self.grammar_admin
+    }
+
+    /// Return the parsed `plans_admin` policy.
+    pub fn plans_admin_policy(&self) -> &PlansAdminPolicy {
+        &self.plans_admin
+    }
+
+    /// Decide whether a connection from `peer` may negotiate the
+    /// `plans_admin` capability. Mirrors
+    /// [`Self::allows_appointments_admin`].
+    pub fn allows_plans_admin(
+        &self,
+        peer: PeerCredentials,
+        steward: StewardIdentity,
+    ) -> bool {
+        let policy = &self.plans_admin;
+
+        let allow_local = policy.allow_local.unwrap_or(
+            policy.allow_uids.is_empty() && policy.allow_gids.is_empty(),
+        );
+
+        if allow_local {
+            if let (Some(peer_uid), Some(steward_uid)) = (peer.uid, steward.uid)
+            {
+                if peer_uid == steward_uid {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(peer_uid) = peer.uid {
+            if policy.allow_uids.contains(&peer_uid) {
+                return true;
+            }
+        }
+
+        if let Some(peer_gid) = peer.gid {
+            if policy.allow_gids.contains(&peer_gid) {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Decide whether a connection from `peer` may negotiate the

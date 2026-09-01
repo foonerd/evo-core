@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Inspect subcommand orchestrator: runs all inspectors against
 //! the target, captures findings, runs basic discrepancy rules
 //! that compare declared capabilities against detected hardware

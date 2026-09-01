@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rust types modelling the privileges contract v1.0.
 //!
 //! Types match `schemas/privileges.v1.json` field-for-field. Serde
@@ -27,6 +30,21 @@ pub struct PrivilegesV1 {
 
     /// How this surface runs relative to the steward identity.
     pub isolation: Isolation,
+
+    /// Compulsory truthful declaration: does this surface depend on
+    /// external OS packages (binary, kernel module, or system service)
+    /// that must be present on the host BEFORE admission can succeed?
+    ///
+    /// `true` — the installer is responsible for bringing every package
+    /// named in `required_binaries` / `required_kernel_modules` /
+    /// `required_system_services`. Install-time and admission-time
+    /// parity gates read this field FIRST and refuse HARD with a
+    /// structured error when `true` and any declared binary is absent.
+    ///
+    /// `false` — the surface is self-contained; no host packages are
+    /// required. `false` combined with any non-empty required_*
+    /// vector is a lint error caught by [`PrivilegesV1::validate`].
+    pub has_os_dependencies: bool,
 
     /// What the surface needs to do, in domain terms.
     pub capability_intent: Vec<CapabilityIntent>,

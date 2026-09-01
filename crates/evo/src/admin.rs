@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Admin audit ledger.
 //!
 //! The [`AdminLedger`] records every privileged administration

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! `verify` — trust/authorisation (wrapper around
 //! `verify_out_of_process_bundle`) plus optional manifest-drift
 //! detection against a pre-extracted `describe()` JSON.

@@ -1,0 +1,42 @@
+[package]
+name = "evo-graphql"
+description = "GraphQL runtime mount for the steward. Projects the canonical wire-protocol schema into an async-graphql Schema whose `dispatch(opId, payloadJson)` mutation routes wire ops through the same dispatcher the HTTPS and gRPC listeners consume."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["enabled"]
+enabled = [
+    "dep:async-graphql",
+    "dep:async-graphql-axum",
+    "dep:async-graphql-derive",
+    "dep:async-graphql-parser",
+    "dep:async-graphql-value",
+    "dep:axum",
+]
+
+[dependencies]
+async-graphql = { version = "=7.0.16", optional = true }
+async-graphql-axum = { version = "=7.0.16", optional = true }
+# Sub-crate pins: async-graphql's own manifest declares its
+# sub-crates via non-exact version ranges. When the MSRV-aware
+# resolver has a wider compatible set (as of 7.2.x it does),
+# it picks 7.2.x for parser/derive/value alongside 7.0.16 for
+# the core lib — but 7.2.x's derive macros expect fields on
+# 7.2.x's parser types that don't exist in 7.0.16, so the
+# combined resolution fails to compile. Explicit `=7.0.16`
+# pins here keep the sub-crates in lockstep with the core lib.
+async-graphql-derive = { version = "=7.0.16", optional = true }
+async-graphql-parser = { version = "=7.0.16", optional = true }
+async-graphql-value = { version = "=7.0.16", optional = true }
+axum = { version = "0.7", default-features = false, features = ["http1", "http2", "json", "tokio"], optional = true }
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "net"] }
+tracing = "0.1"
+thiserror = "1"
+
+[lints]
+workspace = true

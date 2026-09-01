@@ -128,6 +128,18 @@ Heuristics:
 - A shelf corresponds to one **consumer question** - "what metadata providers are available?", "what mounts are active?". If a consumer question cannot be answered by querying one shelf, the shelves are probably misaligned.
 - Singleton shelves (exactly one plugin) and multi-contributor shelves (many plugins) are both valid. The shape, not the shelf, determines what the consumer can expect.
 
+### 4.4 Stockings — How Plugins Occupy Shelves
+
+A **stocking** is the typed relationship between a plugin and a shelf — "this plugin stocks this shelf with this shape, handling this subset of the plugin's verbs." A plugin may hold one stocking (the conventional case, expressed by the legacy `[target]` manifest block) or multiple stockings (one runtime substrate carrying several operator-facing shelves, expressed by the `[[stockings]]` array).
+
+The single-occupancy invariant runs **at the stocking level**, not the plugin level: each shelf has at most one stocking at admission time. A plugin holding multiple stockings claims each of its shelves exclusively against other plugins; another plugin cannot stock the same shelf while the first plugin is admitted. The router's `by_shelf` table preserves this — one shelf, one stocking, one occupant — independent of how many shelves any given plugin occupies.
+
+The dispatcher routes verbs through the stocking: a request arrives with a `(shelf, request_type)` pair; the router looks up the stocking for that shelf; the stocking's `request_types` partition tells the dispatcher whether the verb is valid on this shelf; the verb dispatches to the plugin process the stocking holds. Two plugins cannot stock the same shelf, and one verb cannot belong to two stockings of the same plugin.
+
+**Catalogue declaration is independent of stocking admission.** A shelf declared in `<rack>.toml` is admitted by the catalogue parser whether or not any plugin stocks it. The shelf becomes operator-facing when a stocking claims it. Vendor distributions and community plugins may declare shelves whose stockings land in a later admission cycle, or whose stockings exist only in vendor-distribution-tier plugins.
+
+For the manifest shape (`[target]` vs. `[[stockings]]`), the partition discipline, and the three carving criteria (shared substrate, coupled lifecycle, distinct operator-facing concerns), see `PLUGIN_PACKAGING.md` §2.1.1 "Multi-stocking plugins".
+
 ## 5. Subject Types
 
 Subject types declare the kinds of things the fabric has opinions about. A `track`, an `album`, a `storage_root`, a `playlist`. Plugins announce subjects of these types via the subject registry (see `SUBJECTS.md`); the steward refuses announcements of types the catalogue does not declare.
@@ -442,7 +454,7 @@ target_cardinality = "at_most_one"
 inverse = "album_of"
 ```
 
-A full working catalogue exercising every core function lives in the `evo-device-audio` repository — the reference generic device for the audio domain. Vendor distributions adopt that catalogue (or layer on top of it) per their product needs; `evo-device-volumio` is one such vendor distribution.
+A full working catalogue exercising every core function lives in the `evo-device-audio` repository — the reference generic device for the audio domain. Vendor distributions adopt that catalogue (or layer on top of it) per their product needs.
 
 ## 12. Further Reading
 

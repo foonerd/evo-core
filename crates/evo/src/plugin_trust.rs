@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Load trust keys, revocations, and options from [`StewardConfig`]
 //! for the `plugin_trust` argument of
 //! [`crate::admission::AdmissionEngine::new`].

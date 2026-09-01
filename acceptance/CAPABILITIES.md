@@ -44,7 +44,7 @@ Software / OS-level capabilities exposed by the target's environment.
 | `storage_microsd` | A microSD card slot is present and accessible |
 | `storage_usb` | At least one USB mass-storage device is plugged in and mountable |
 | `storage_sata` | A SATA-attached drive (HAT or onboard) is present |
-| `storage_nvme` | An NVMe drive is present (Pi 5 NVMe HAT, x86 m.2, etc.) |
+| `storage_nvme` | An NVMe drive is present (NVMe HAT on SBC, x86 m.2, etc.) |
 | `storage_iscsi` | iSCSI initiator is configured and a target is reachable |
 | `storage_cdrom` | A CD/DVD optical drive is present |
 | `storage_emmc` | Embedded MMC is the boot device |

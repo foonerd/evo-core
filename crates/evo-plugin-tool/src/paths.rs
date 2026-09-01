@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Default FHS-style paths; align with `StewardConfig` and `PLUGIN_TOOL.md`.
 
 use std::path::PathBuf;

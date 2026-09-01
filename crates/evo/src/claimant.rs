@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Claimant tokens for plugin-identity privacy.
 //!
 //! Plugins are identified to consumers by an opaque, steward-issued
@@ -47,9 +50,10 @@
 //! the persistence layer is reset; a true uninstall+reinstall
 //! produces a new `instance_id` and thus a new token regardless.
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
+
+use evo_primitives::ClaimantToken;
 
 // Re-exporting under this name so call sites inside the crate read as
 // `ClaimantToken::from_string` rather than `ClaimantToken(...)`. The
@@ -61,56 +65,12 @@ use std::sync::RwLock;
 /// ASCII characters (URL-safe, no padding).
 const TOKEN_DIGEST_LEN: usize = 16;
 
-/// Opaque, steward-issued identifier for a plugin in cross-boundary
-/// surfaces (projections, happenings).
-///
-/// Stable across the plugin's lifetime in one steward instance;
-/// rotates on uninstall+reinstall (because the inputs change). Two
-/// tokens compare equal iff they identify the same plugin within
-/// one steward instance.
-///
-/// The wrapped string is the base64 (URL-safe, no padding) encoding
-/// of the truncated BLAKE3 digest. Consumers SHOULD NOT depend on
-/// the encoding format: treat the token as opaque and compare by
-/// exact-string equality only.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct ClaimantToken(String);
-
-impl ClaimantToken {
-    /// Build a token from a pre-encoded string. Primarily for
-    /// reconstructing tokens read from the wire or persistence;
-    /// production tokens are minted via [`derive_token`].
-    pub fn from_string(s: String) -> Self {
-        Self(s)
-    }
-
-    /// View the token as a string slice (for serialisation, log
-    /// output, hashmap keys).
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Move the token's inner string out for callers that need to
-    /// own it (e.g. building a HashMap key).
-    pub fn into_string(self) -> String {
-        self.0
-    }
-}
-
-impl std::fmt::Display for ClaimantToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl AsRef<str> for ClaimantToken {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
+// `ClaimantToken` — the opaque, steward-issued plugin identifier
+// used across happenings, projections, and wire envelopes —
+// lives in the foundation crate `evo-primitives`. Imported at the
+// top of this module; the `derive_token` minting function below
+// constructs values via `ClaimantToken::from_string` on the
+// base64-encoded truncated BLAKE3 digest.
 
 /// Mint a [`ClaimantToken`] for a plugin.
 ///
@@ -141,7 +101,7 @@ pub fn derive_token(plugin_name: &str, instance_id: &str) -> ClaimantToken {
 
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-    ClaimantToken(URL_SAFE_NO_PAD.encode(digest))
+    ClaimantToken::from_string(URL_SAFE_NO_PAD.encode(digest))
 }
 
 /// One row in the issuer's reverse-lookup index, recording the

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Orchestrator: walk the plan in tier order, execute each scenario
 //! against the connection, collect per-scenario outcomes, hand them
 //! to the report module.

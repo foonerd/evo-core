@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Per-subscriber happenings coalescer.
 //!
 //! Subscribers declaring a `coalesce` config on

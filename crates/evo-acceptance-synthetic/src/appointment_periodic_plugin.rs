@@ -1,10 +1,13 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Synthetic Periodic-appointment plugin.
 //!
 //! Sibling to `appointment_plugin` which exercises the OneShot
 //! recurrence; this plugin exercises
-//! `AppointmentRecurrence::Periodic { interval_ms }` (the variant
-//! landed in Phase 1.G). Schedules a 2s-interval recurrence with
-//! `max_fires = 3` and records each dispatch arrival to
+//! `AppointmentRecurrence::Periodic { interval_ms }`. Schedules a
+//! 2s-interval recurrence with `max_fires = 3` and records each
+//! dispatch arrival to
 //! `{state_dir}/appointment-periodic-fires.log`. The acceptance
 //! scenario waits past the 6s sequence + dispatch propagation and
 //! asserts exactly three entries.
@@ -183,7 +186,7 @@ impl Plugin for AppointmentPeriodicPlugin {
 
 impl Respondent for AppointmentPeriodicPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {

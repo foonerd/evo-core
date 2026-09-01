@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! # evo-acceptance-synthetic
 //!
 //! Synthetic plugins purpose-built for the evo acceptance test plan.
@@ -47,10 +50,12 @@ pub mod prompt_multistage_plugin;
 pub mod prompt_plugin;
 pub mod reload_plugin;
 pub mod skew_plugin;
+pub mod subject_state_persistence_plugin;
 pub mod synthetic_coalescing_source;
 pub mod synthetic_composer;
 pub mod synthetic_delivery_warden;
 pub mod synthetic_grammar_source;
+pub mod synthetic_test_source;
 pub mod synthetic_warden;
 pub mod watch_cooldown_burst_plugin;
 pub mod watch_hysteresis_plugin;
@@ -68,10 +73,12 @@ pub use prompt_multistage_plugin::PromptMultistagePlugin;
 pub use prompt_plugin::PromptPlugin;
 pub use reload_plugin::ReloadPlugin;
 pub use skew_plugin::SkewPlugin;
+pub use subject_state_persistence_plugin::SubjectStatePersistencePlugin;
 pub use synthetic_coalescing_source::SyntheticCoalescingSourcePlugin;
 pub use synthetic_composer::SyntheticComposerPlugin;
 pub use synthetic_delivery_warden::SyntheticDeliveryWardenPlugin;
 pub use synthetic_grammar_source::SyntheticGrammarSourcePlugin;
+pub use synthetic_test_source::SyntheticTestSourcePlugin;
 pub use synthetic_warden::SyntheticWardenPlugin;
 pub use watch_cooldown_burst_plugin::WatchCooldownBurstPlugin;
 pub use watch_hysteresis_plugin::WatchHysteresisPlugin;

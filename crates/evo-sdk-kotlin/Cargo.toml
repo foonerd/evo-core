@@ -1,0 +1,15 @@
+[package]
+name = "evo-sdk-kotlin"
+description = "Kotlin client SDK generator. Emits a multi-file Kotlin package with `suspend fun` for one-shot dispatch, `Flow<*>` for subscriptions, data classes for shared types, and an interface for Transport."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+evo-projection-core = { path = "../evo-projection-core" }
+evo-sdk-genkit = { path = "../evo-sdk-genkit" }
+
+[lints]
+workspace = true

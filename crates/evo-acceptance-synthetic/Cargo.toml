@@ -87,8 +87,16 @@ name = "synthetic-coalescing-source-wire"
 path = "src/bin/synthetic-coalescing-source-wire.rs"
 
 [[bin]]
+name = "synthetic-test-source-wire"
+path = "src/bin/synthetic-test-source-wire.rs"
+
+[[bin]]
 name = "synthetic-appointment-wake-plugin-wire"
 path = "src/bin/synthetic-appointment-wake-plugin-wire.rs"
+
+[[bin]]
+name = "synthetic-subject-state-persistence-plugin-wire"
+path = "src/bin/synthetic-subject-state-persistence-plugin-wire.rs"
 
 [[bin]]
 name = "synthetic-fast-path-bench"

@@ -1,0 +1,37 @@
+[package]
+name = "evo-grpc"
+description = "gRPC runtime mount for the steward. Builds a tonic-based service whose canonical dispatch RPC routes wire ops into the same steward dispatcher the HTTPS and UDS listeners consume; the .proto contract is payload-agnostic so adding a new wire op does not require a proto migration."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["enabled"]
+# When the `enabled` feature is off, every public type compiles
+# to a stub and the heavy tonic / prost dependency tree is
+# excluded. Default on for production builds; SBC builds may
+# opt out to trim the dep graph.
+enabled = ["dep:tonic", "dep:prost"]
+
+[dependencies]
+tonic = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport", "router"], optional = true }
+prost = { version = "0.13", optional = true }
+tokio = { version = "1", features = ["macros", "rt", "sync", "net"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tracing = "0.1"
+thiserror = "1"
+async-trait = "0.1"
+
+[build-dependencies]
+tonic-build = { version = "0.12", default-features = false, features = ["prost", "transport"] }
+# Ships a pre-built protoc binary so we don't depend on a system
+# `apt-get install protobuf-compiler` on every build host.
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true

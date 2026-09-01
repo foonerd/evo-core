@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Trust root loading, install digests, ed25519 plugin signatures, and
 //! revocations. See `docs/engineering/PLUGIN_PACKAGING.md` section 5.
 //!
@@ -27,22 +30,26 @@ mod verify;
 
 pub use canonical::{canonicalise, CanonicalError};
 pub use digest::{
-    format_digest_sha256_hex, install_digest, parse_digest_sha256_hex,
-    signing_message, SIGNING_PAYLOAD_VERSION_V1,
+    content_tree_digest, format_digest_sha256_hex, install_digest,
+    install_digest_artefact, parse_digest_sha256_hex, signing_message,
+    signing_message_artefact, SIGNING_PAYLOAD_VERSION_V1,
+    SIGNING_PAYLOAD_VERSION_V2_ARTEFACT,
 };
 pub use error::TrustError;
 pub use key_meta::{Authorisation, KeyMeta, KeyRole, KeySection};
 pub use matchers::effective_trust_class;
 pub use matchers::name_matches_prefixes;
 pub use release_root::{
-    role_for_artefact_kind, verify_release_signature, ReleaseKeyMeta,
-    ReleaseKeySection, ReleaseRole, ReleaseTrustKey,
+    load_release_trust_dir, role_for_artefact_kind, verify_release_signature,
+    ReleaseKeyMeta, ReleaseKeySection, ReleaseRole, ReleaseTrustKey,
 };
 pub use revocation::RevocationSet;
 pub use trust_root::{load_trust_root, read_signature_file, TrustKey};
 pub use verify::{
+    verify_artefact_bundle, verify_artefact_bundle_at,
     verify_out_of_process_bundle, verify_out_of_process_bundle_at,
-    OutOfProcessBundleRef, TrustOptions, TrustOutcome, MIN_ROTATION_OVERLAP,
+    ArtefactBundleRef, OutOfProcessBundleRef, TrustOptions, TrustOutcome,
+    MIN_ROTATION_OVERLAP,
 };
 
 use evo_plugin_sdk::manifest::TrustClass;

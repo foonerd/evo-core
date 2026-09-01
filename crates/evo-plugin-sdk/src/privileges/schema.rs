@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Embedded JSON Schema bytes for v1.0 of the privileges contract.
 //!
 //! The schema file at `schemas/privileges.v1.json` is the authoritative

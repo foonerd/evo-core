@@ -4,7 +4,11 @@ description = "Plugin signing digest, ed25519 verification, trust root and revoc
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# Permissive ecosystem layer — cryptographic primitive surface
+# (PEM parsing, ed25519 verification, manifest digest, release-trust
+# loader). Anyone building plugin / release-channel verification
+# tooling consumes this; permissive licensing is required.
+license = "Apache-2.0"
 repository.workspace = true
 
 [dependencies]

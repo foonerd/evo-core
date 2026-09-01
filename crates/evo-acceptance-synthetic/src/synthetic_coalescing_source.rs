@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Synthetic happenings-burst source plugin.
 //!
 //! Respondent on the synthetic `acceptance.coalescing-source`
@@ -267,7 +270,7 @@ impl Plugin for SyntheticCoalescingSourcePlugin {
 
 impl Respondent for SyntheticCoalescingSourcePlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         _req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {

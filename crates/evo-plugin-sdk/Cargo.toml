@@ -4,7 +4,10 @@ description = "SDK for authoring plugins on the evo steward fabric."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# Permissive ecosystem layer — overrides the workspace default
+# (BUSL-1.1) so plugin authors building against the SDK have no
+# licensing restrictions.
+license = "Apache-2.0"
 repository.workspace = true
 
 [features]
@@ -22,9 +25,31 @@ contract = ["dep:tracing"]
 wire = [
     "contract",
     "dep:serde_json",
-    "dep:tokio",
+    "tokio/io-util",
+    "tokio/net",
+    "tokio/rt",
+    # `rt-multi-thread` is required by the `_and_exit`
+    # convenience wrappers in `host`, which build a
+    # multi-threaded runtime so the OOP plugin binary can
+    # bound its shutdown drain via `Runtime::shutdown_timeout`
+    # and hard-exit via `std::process::exit`. Prior art:
+    # nginx / systemd / most Rust daemons that spawn
+    # background work follow this shape on SIGTERM.
+    "tokio/rt-multi-thread",
+    # `time` powers the bounded shutdown-drain via
+    # `tokio::time::timeout` (writer_task drain in serve* and
+    # `unload_with_timeout` in the frame dispatch paths).
+    "tokio/time",
+    # `macros` supplies `tokio::select!` for the priority-vs-event
+    # writer_loop drain.
+    "tokio/macros",
     "dep:base64",
     "dep:ciborium",
+    # `tracing-subscriber` powers the `wire_logging::init` helper
+    # every OOP wire binary calls. Feature-gated to `wire` so
+    # in-process SDK consumers (manifest / privileges validators,
+    # etc.) do not pull the subscriber stack.
+    "dep:tracing-subscriber",
 ]
 # Plugin privileges contract types, YAML parser, and validator. The
 # JSON Schema at schemas/privileges.v1.json is the SINGLE source of
@@ -34,7 +59,12 @@ wire = [
 # practice advisories that JSON Schema cannot express. Pulls
 # serde_json (already optional under `wire`) into the privileges
 # build path too.
-privileges = ["dep:serde_yaml", "dep:jsonschema", "dep:serde_json"]
+privileges = [
+    "dep:serde_yaml",
+    "dep:jsonschema",
+    "dep:serde_json",
+    "dep:nix",
+]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -44,9 +74,23 @@ semver = { version = "1", features = ["serde"] }
 regex = "1"
 once_cell = "1"
 evo-coalesce-labels = { path = "../evo-coalesce-labels" }
+# Multi-room domain SDK. Hosts the `MultiroomSubstrateHandle`
+# trait + typed shapes (`Role`, `RoleChange`, `GroupRecord`,
+# `GroupChange`) that previously lived in this crate's
+# `multiroom_substrate` module. The module path
+# `evo_plugin_sdk::multiroom_substrate::*` is preserved as a
+# re-export so existing plugins compile without import edits;
+# multi-room-aware plugins may also depend on
+# `evo-multiroom-sdk` directly.
+evo-multiroom-sdk = { path = "../evo-multiroom-sdk" }
 tracing = { version = "0.1", optional = true }
 serde_json = { version = "1", optional = true }
-tokio = { version = "1", features = ["io-util", "net", "sync", "rt"], optional = true }
+# Base `sync` feature pulled in unconditionally so the
+# `LoadContext.capabilities_watch` reactive channel and other
+# always-available sync primitives (Notify, oneshot) are
+# usable from any SDK-consuming binary without a feature gate.
+# The wire feature adds io-util / net / rt on top.
+tokio = { version = "1", features = ["sync"] }
 base64 = { version = "0.22", optional = true }
 # CBOR codec dispatched on the wire alongside JSON. ciborium is the
 # RFC-8949-conformant, serde-driven CBOR implementation maintained by
@@ -66,10 +110,33 @@ serde_yaml = { version = "0.9", optional = true }
 # the YAML payload against it. Custom Rust code carries only cross-
 # field rules + advisories that JSON Schema cannot express.
 jsonschema = { version = "0.18", optional = true, default-features = false }
+# Safe POSIX syscall wrappers for the privileges-feature probe
+# module's access(2) + geteuid() calls. The SDK forbids
+# `unsafe_code` crate-wide; nix is the maintained safe wrapper
+# layer over libc that lets us run those syscalls without
+# carrying unsafe blocks in this crate. Feature-gated to
+# `privileges` so non-privileges builds skip the dep entirely.
+nix = { version = "0.30", optional = true, default-features = false, features = ["fs", "user"] }
+# `tracing-subscriber` — installed by `wire_logging::init` in
+# out-of-process wire binaries. `env-filter` gives the RUST_LOG-
+# style directive parser; `fmt` gives the human-readable
+# stderr renderer. Optional behind `wire` so non-wire consumers
+# do not pull it in.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "io-util", "net"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "io-util", "net", "time"] }
 proptest = "1"
+# JSON round-trip tests for wire-safe type shapes
+# (`admission::AdmissionStateEnvelope`, etc.). `serde_json` is
+# also an optional runtime dep under the `wire` feature; the
+# dev-dep line keeps tests running under `cargo test` without
+# requiring `--all-features`.
+serde_json = "1"
+# Unique tempdir per probe test so the filesystem-access tests
+# do not collide on a shared path. Hermetic; no fixture lingers
+# across runs.
+tempfile = "3"
 
 [lints]
 workspace = true

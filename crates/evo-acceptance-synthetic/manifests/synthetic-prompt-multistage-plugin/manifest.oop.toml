@@ -3,9 +3,9 @@
 #
 # Issues a Text prompt with a long timeout (90s) and session_id
 # "ms-test" on every load(). Used to test the durable prompt
-# ledger + boot-time rehydration landed in Phase 1.H: the scenario
-# stops the steward mid-prompt, restarts, and asserts the prompt
-# survives + the operator can still answer it post-restart.
+# ledger + boot-time rehydration: the scenario stops the steward
+# mid-prompt, restarts, and asserts the prompt survives + the
+# operator can still answer it post-restart.
 #
 # Used by `T3.uir-persist`. Has no value outside that scenario.
 

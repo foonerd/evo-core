@@ -1,0 +1,66 @@
+# Synthetic test source plugin — out-of-process bundle manifest.
+#
+# Admits as a singleton respondent on the synthetic
+# `acceptance.test-source` shelf, owning the `evo-test` URI scheme
+# through `[capabilities.source]`. Exists to drive end-to-end
+# verification of the source-plugin admission + dispatch +
+# AudioPlaybackEnded chain from real plan firings on hardware.
+#
+# Behaviour summary:
+#
+# - On `play_now { uri }` and `play_now_collection { uris }`: logs
+#   the URIs to a per-fire event log, then schedules a typed
+#   `Happening::AudioPlaybackEnded` emission after a configurable
+#   delay (default 250 ms). This lets a plan with
+#   `SegmentDuration::UntilCompletion` see natural end-of-playback
+#   without depending on real audio rendering.
+# - On `stop`: returns success. The framework's source-verb
+#   dispatcher releases custody and emits `AudioPlaybackEnded`
+#   automatically — the plugin does not emit it itself in this
+#   path (avoids double-emission).
+#
+# Used by the plan-firing-on-hardware acceptance scenarios.
+# Has no value outside the framework's own end-to-end verification.
+
+[plugin]
+name = "org.evoframework.acceptance.synthetic-test-source"
+version = "0.1.0"
+contract = 1
+
+[target]
+shelf = "acceptance.test-source"
+shape = 1
+
+[kind]
+instance = "singleton"
+interaction = "respondent"
+
+[transport]
+type = "out-of-process"
+exec = "plugin.bin"
+
+[trust]
+class = "platform"
+
+[prerequisites]
+evo_min_version = "0.1.0"
+os_family = "any"
+outbound_network = false
+filesystem_scopes = []
+
+[resources]
+max_memory_mb = 64
+max_cpu_percent = 5
+
+[lifecycle]
+hot_reload = "restart"
+autostart = true
+restart_on_crash = false
+restart_budget = 0
+
+[capabilities.respondent]
+request_types = ["play_now", "play_now_collection", "stop"]
+response_budget_ms = 1000
+
+[capabilities.source]
+uri_schemes = ["evo-test"]

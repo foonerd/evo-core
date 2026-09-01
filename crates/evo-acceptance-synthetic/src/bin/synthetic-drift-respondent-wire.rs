@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Out-of-process wire wrapper for the synthetic drift respondent.
 //!
 //! Listens on the Unix socket given as its sole positional argument

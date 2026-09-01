@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Synthetic appointment-with-must-wake-device plugin.
 //!
 //! Like [`crate::appointment_plugin::AppointmentPlugin`] but the
@@ -13,9 +16,9 @@
 //! framework's wake-arming contract — the framework programs
 //! the OS RTC wake at `(scheduled_fire_ms - wake_pre_arm_ms)`
 //! for each must-wake appointment — without depending on
-//! OS-level suspend/resume plumbing (Pi 5 + 6.12 kernel does
-//! not currently support suspend-to-RAM; the user-supplied
-//! distribution adapter would on a platform that does).
+//! OS-level suspend/resume plumbing (which is unavailable on
+//! some targets; the user-supplied distribution adapter would
+//! provide it on a platform that does).
 //!
 //! Used by `T2.appointment-wake-device` and `T3.appt-time-wake`.
 //! Has no value outside those scenarios.
@@ -228,7 +231,7 @@ impl Plugin for AppointmentWakePlugin {
 
 impl Respondent for AppointmentWakePlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {

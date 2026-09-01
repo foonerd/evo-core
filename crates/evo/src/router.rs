@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Per-request plugin routing.
 //!
 //! Holds the table of admitted plugins keyed by the shelves they
@@ -123,13 +126,36 @@ use crate::state::StewardState;
 pub struct PluginEntry {
     /// Canonical plugin name, per the manifest.
     pub name: String,
-    /// Fully-qualified shelf this plugin occupies (`<rack>.<shelf>`).
+    /// Primary fully-qualified shelf this plugin occupies
+    /// (`<rack>.<shelf>`). For single-shelf plugins this is the
+    /// sole occupancy; for multi-stocking plugins it is the
+    /// primary stocking's shelf (warden role preferred; else the
+    /// first stocking in manifest declaration order). See
+    /// [`Self::stockings`] for the canonical multi-stocking view.
     pub shelf: String,
+    /// Multi-stocking declaration: one entry per shelf this plugin
+    /// occupies. Single-shelf plugins have a one-element vector;
+    /// multi-stocking plugins have N elements, one per
+    /// occupied shelf, each carrying its own per-shelf
+    /// `request_types` partition. The router's `by_shelf` map
+    /// indexes each stocking's shelf to the same `Arc<PluginEntry>`;
+    /// dispatch through a shelf consults the matching stocking
+    /// entry for per-shelf verb routing.
+    pub stockings: Vec<evo_plugin_sdk::manifest::Stocking>,
     /// Type-erased lifecycle / dispatch handle. `None` after
-    /// [`unload_handle`] takes it during drain. Behind a
-    /// [`tokio::sync::Mutex`] so dispatch can `.await` while
-    /// holding the per-entry lock without blocking the runtime.
-    pub handle: AsyncMutex<Option<AdmittedHandle>>,
+    /// [`unload_handle`] takes it during drain.
+    ///
+    /// Behind a [`tokio::sync::RwLock`] so concurrent
+    /// [`handle_request`] calls on the same plugin can hold a
+    /// shared read guard across the plugin's `.await` — the
+    /// framework's concurrent-dispatch contract (LAYER A retired,
+    /// see the "Concurrency" section in
+    /// [`evo_plugin_sdk::contract::Respondent`]).
+    ///
+    /// Lifecycle operations (load / unload / prepare_for_live_reload)
+    /// take the write lock, which naturally barriers against
+    /// every in-flight read.
+    pub handle: tokio::sync::RwLock<Option<AdmittedHandle>>,
     /// Optional child process owned by the steward (set by the
     /// engine after a successful spawn-from-directory). Reaped during
     /// drain.
@@ -153,6 +179,17 @@ pub struct PluginEntry {
     /// this field.
     pub manifest:
         std::sync::Mutex<Option<Arc<evo_plugin_sdk::manifest::Manifest>>>,
+    /// Per-admission hot-tightening re-probe task. Owns the
+    /// `tokio::sync::watch` sender that publishes the live
+    /// resolution map to plugins subscribing via
+    /// `LoadContext::capabilities_watch`. `None` for plugins
+    /// that declared no probes, for OOP wires until the
+    /// codec gains a `GetProbePlans` op, and for legacy
+    /// admission paths (test fixtures via [`Self::new`]).
+    /// Behind an async mutex so [`unload_handle`] can `take`
+    /// it during drain and call its async `shutdown` without
+    /// blocking other dispatch on this entry.
+    pub reprobe: AsyncMutex<Option<crate::admission::reprobe::ReprobeTask>>,
 }
 
 /// Manifest-derived enforcement state attached to every admitted
@@ -233,6 +270,33 @@ pub struct EnforcementPolicy {
     /// dispatch every 20 ms when this map declares
     /// `volume_set = 20`).
     pub fast_path_coalesce_ms: Option<std::collections::BTreeMap<String, u32>>,
+    /// Per-respondent-verb capability declarations from the
+    /// manifest's `[capabilities.respondent.verb_capabilities]`
+    /// map. Empty for legacy manifests that did not declare any;
+    /// the dispatcher treats an absent or `VerbCapability::None`
+    /// entry as anonymous-OK (legacy behaviour preserved).
+    ///
+    /// Consulted by [`crate::server::handle_plugin_request`] before
+    /// it forwards a request through this router; a failed gate
+    /// check refuses with the structured `permission_denied` error
+    /// and never reaches the plugin.
+    pub respondent_verb_capabilities: std::collections::BTreeMap<
+        String,
+        evo_plugin_sdk::manifest::VerbCapability,
+    >,
+    /// Per-warden-verb capability declarations from the manifest's
+    /// `[capabilities.warden.verb_capabilities]` map. Empty for
+    /// legacy manifests. Recorded here for forward-compat; gate
+    /// enforcement on the warden course-correct surface lands as
+    /// a follow-on in the same release once the warden dispatch
+    /// path threads principal state in parallel to the respondent
+    /// dispatch path. The map is populated from the manifest now
+    /// so the policy carries a complete view; tooling and
+    /// validation consume it ahead of the dispatch wiring.
+    pub warden_verb_capabilities: std::collections::BTreeMap<
+        String,
+        evo_plugin_sdk::manifest::VerbCapability,
+    >,
 }
 
 impl EnforcementPolicy {
@@ -252,6 +316,8 @@ impl EnforcementPolicy {
             allowed_fast_path_verbs: None,
             fast_path_budget_ms: None,
             fast_path_coalesce_ms: None,
+            respondent_verb_capabilities: std::collections::BTreeMap::new(),
+            warden_verb_capabilities: std::collections::BTreeMap::new(),
         }
     }
 
@@ -276,9 +342,13 @@ impl EnforcementPolicy {
         let mut allowed_fast_path_verbs = None;
         let mut fast_path_budget_ms = None;
         let mut fast_path_coalesce_ms = None;
+        let mut respondent_verb_capabilities =
+            std::collections::BTreeMap::new();
+        let mut warden_verb_capabilities = std::collections::BTreeMap::new();
         if let Some(r) = manifest.capabilities.respondent.as_ref() {
             allowed_request_types = Some(r.request_types.clone());
             default_request_deadline_ms = Some(r.response_budget_ms);
+            respondent_verb_capabilities = r.verb_capabilities.clone();
         }
         if let Some(w) = manifest.capabilities.warden.as_ref() {
             course_correction_deadline_ms = Some(w.course_correction_budget_ms);
@@ -300,6 +370,7 @@ impl EnforcementPolicy {
                 }
             });
             fast_path_coalesce_ms = w.fast_path_coalesce_ms.clone();
+            warden_verb_capabilities = w.verb_capabilities.clone();
         }
         Self {
             allowed_request_types,
@@ -310,6 +381,8 @@ impl EnforcementPolicy {
             allowed_fast_path_verbs,
             fast_path_budget_ms,
             fast_path_coalesce_ms,
+            respondent_verb_capabilities,
+            warden_verb_capabilities,
         }
     }
 
@@ -370,11 +443,65 @@ impl PluginEntry {
         Self {
             name,
             shelf,
-            handle: AsyncMutex::new(Some(handle)),
+            stockings: Vec::new(),
+            handle: tokio::sync::RwLock::new(Some(handle)),
             child: AsyncMutex::new(None),
             policy: ArcSwap::from_pointee(policy),
             manifest: std::sync::Mutex::new(None),
+            reprobe: AsyncMutex::new(None),
         }
+    }
+
+    /// Builder-style setter for the multi-stocking declaration.
+    /// Admission paths that admit a plugin under the Stocking primitive's
+    /// Stocking primitive call this with the manifest's
+    /// `stockings` vec (always non-empty post-normalisation; a
+    /// single-shelf plugin has a one-element vec).
+    pub fn with_stockings(
+        mut self,
+        stockings: Vec<evo_plugin_sdk::manifest::Stocking>,
+    ) -> Self {
+        self.stockings = stockings;
+        self
+    }
+
+    /// Find the stocking record that owns the given shelf. Returns
+    /// `None` when the shelf is not one of this plugin's stockings;
+    /// in single-stocking back-compat builds where
+    /// [`Self::stockings`] was never populated, returns `None` and
+    /// the caller's per-shelf partition check falls through to the
+    /// plugin-level enforcement policy.
+    pub fn stocking_on(
+        &self,
+        shelf: &str,
+    ) -> Option<&evo_plugin_sdk::manifest::Stocking> {
+        self.stockings.iter().find(|s| s.shelf == shelf)
+    }
+
+    /// Builder-style setter for the per-admission re-probe
+    /// task. Admission paths that ran the hot-tightening
+    /// installer call this to attach the spawned task; on
+    /// plugin unload the engine takes it back via
+    /// [`Self::take_reprobe`] and awaits a clean shutdown.
+    pub fn with_reprobe(
+        self,
+        task: Option<crate::admission::reprobe::ReprobeTask>,
+    ) -> Self {
+        *self
+            .reprobe
+            .try_lock()
+            .expect("reprobe mutex must be uncontended at construction") = task;
+        self
+    }
+
+    /// Take the per-admission re-probe task for shutdown.
+    /// Called by the engine's unload path before dropping
+    /// the handle so the task's tokio JoinHandle can be
+    /// awaited rather than leaked.
+    pub async fn take_reprobe(
+        &self,
+    ) -> Option<crate::admission::reprobe::ReprobeTask> {
+        self.reprobe.lock().await.take()
     }
 
     /// Builder-style setter for the full manifest. Admission
@@ -424,8 +551,13 @@ impl std::fmt::Debug for PluginEntry {
 /// Mutable inner state of the router: the table of admitted
 /// plugins. Behind the router's [`RwLock`].
 struct RouterInner {
-    /// Map of fully-qualified shelf name -> admitted plugin entry.
-    by_shelf: HashMap<String, Arc<PluginEntry>>,
+    /// Map of fully-qualified shelf name -> admitted plugin
+    /// entries. Multi-occupant respondent shelves carry a Vec
+    /// of partitioned occupants (each owning a disjoint
+    /// request_type set per the Stocking primitive); single-
+    /// occupant shelves still resolve via this Vec (length 1)
+    /// so the data shape is uniform.
+    by_shelf: HashMap<String, Vec<Arc<PluginEntry>>>,
     /// Admission order, for reverse-order shutdown.
     admission_order: Vec<String>,
 }
@@ -515,6 +647,77 @@ impl PluginRouter {
             .contains_key(shelf)
     }
 
+    /// Return `Some(message)` when admitting a new plugin on
+    /// `shelf` with the supplied `role` + `verbs` would conflict
+    /// with the shelf's existing occupants. Returns `None` when
+    /// admission would succeed.
+    ///
+    /// Mirrors the partition gate in [`Self::insert_stockings`]
+    /// so the admission engine can refuse the OOP wire-process
+    /// spawn before it occurs. The pre-check is advisory; the
+    /// authoritative refusal lives in `insert_stockings`.
+    ///
+    /// Conflict rules:
+    /// - Warden side (incoming or existing) refuses
+    ///   co-occupation absolutely.
+    /// - Two respondents co-occupy if their verb sets are
+    ///   disjoint; overlap on any verb refuses.
+    /// - Empty `stockings` on the existing occupant (legacy
+    ///   `[target]` form) is treated as exclusive for backward
+    ///   compat.
+    pub fn would_conflict_with_admission(
+        &self,
+        shelf: &str,
+        role: evo_plugin_sdk::manifest::StockingRole,
+        verbs: &[String],
+    ) -> Option<String> {
+        let inner = self.inner.read().expect("router inner poisoned");
+        let occupants = inner.by_shelf.get(shelf)?;
+        for existing in occupants {
+            let existing_role = existing
+                .stockings
+                .iter()
+                .find(|s| s.shelf == shelf)
+                .map(|s| s.role)
+                .unwrap_or(role);
+            if matches!(
+                existing_role,
+                evo_plugin_sdk::manifest::StockingRole::Warden
+            ) || matches!(
+                role,
+                evo_plugin_sdk::manifest::StockingRole::Warden
+            ) {
+                return Some(format!(
+                    "shelf {shelf} occupied by {} (warden — no co-occupation)",
+                    existing.name
+                ));
+            }
+            if existing.stockings.is_empty() {
+                return Some(format!(
+                    "shelf {shelf} occupied by {} (legacy form; upgrade to [[stockings]] to co-occupy)",
+                    existing.name
+                ));
+            }
+            if let Some(es) =
+                existing.stockings.iter().find(|s| s.shelf == shelf)
+            {
+                let incoming: std::collections::HashSet<&str> =
+                    verbs.iter().map(String::as_str).collect();
+                if let Some(overlap) = es
+                    .request_types
+                    .iter()
+                    .find(|v| incoming.contains(v.as_str()))
+                {
+                    return Some(format!(
+                        "shelf {shelf} occupied by {} (verb {overlap:?} overlap)",
+                        existing.name
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     /// Returns `true` iff the named plugin is currently admitted on
     /// any shelf.
     ///
@@ -535,7 +738,7 @@ impl PluginRouter {
         inner
             .by_shelf
             .values()
-            .any(|entry| entry.name == plugin_name)
+            .any(|occupants| occupants.iter().any(|e| e.name == plugin_name))
     }
 
     /// Insert a freshly-admitted plugin into the routing table.
@@ -551,6 +754,17 @@ impl PluginRouter {
     /// already checks this earlier in admission, so reaching here
     /// with a duplicate is an internal bug.
     pub fn insert(&self, entry: Arc<PluginEntry>) -> Result<(), StewardError> {
+        // Stocking primitive: any entry carrying a stockings declaration
+        // (one OR many) routes through the partition-aware
+        // `insert_stockings` path. Single-stocking entries
+        // benefit from the multi-occupant compatibility check
+        // (verb-disjoint respondent co-occupation) the
+        // transactional path performs. Legacy `[target]` form
+        // entries (stockings vec empty) take the strict
+        // single-occupant path below.
+        if !entry.stockings.is_empty() {
+            return self.insert_stockings(entry);
+        }
         let mut inner = self.inner.write().expect("router inner poisoned");
         let shelf = entry.shelf.clone();
         if inner.by_shelf.contains_key(&shelf) {
@@ -559,19 +773,151 @@ impl PluginRouter {
                 entry.name, shelf
             )));
         }
-        inner.by_shelf.insert(shelf.clone(), entry);
+        inner.by_shelf.insert(shelf.clone(), vec![entry]);
         inner.admission_order.push(shelf);
         Ok(())
     }
 
-    /// Attach a steward-owned child process to a previously-inserted
-    /// entry. Used by
+    /// Insert a multi-stocking plugin per the Stocking primitive's transactional
+    /// admission contract. Iterates `entry.stockings` and inserts
+    /// each shelf → entry into the router's table; if any shelf is
+    /// already occupied by a *different* plugin, rolls back every
+    /// insert performed in this call and returns the offending
+    /// shelf in the error message.
+    ///
+    /// The primary shelf at [`PluginEntry::shelf`] MUST appear in
+    /// `entry.stockings`; the implementation does not separately
+    /// insert it. Single-stocking plugins continue to call
+    /// [`Self::insert`]; the multi-stocking path is engaged only
+    /// from admission paths that detected `manifest.stockings.len()
+    /// > 1`.
+    ///
+    /// Rollback semantics: on the first conflict, every shelf
+    /// inserted in this call (in declaration order) is removed
+    /// from both `by_shelf` and the tail of `admission_order`.
+    /// Cross-task concurrent admission against the same shelf is
+    /// serialised by the single write-lock held for the entire
+    /// transaction.
+    pub fn insert_stockings(
+        &self,
+        entry: Arc<PluginEntry>,
+    ) -> Result<(), StewardError> {
+        if entry.stockings.is_empty() {
+            return Err(StewardError::Admission(format!(
+                "{}: insert_stockings called with empty stockings vec",
+                entry.name
+            )));
+        }
+        let mut inner = self.inner.write().expect("router inner poisoned");
+        let mut inserted: Vec<String> =
+            Vec::with_capacity(entry.stockings.len());
+        for stocking in &entry.stockings {
+            // Multi-occupant compatibility check. Two plugins
+            // co-occupy a respondent shelf as long as their
+            // stockings own disjoint verb sets — the
+            // partition gate at dispatch time then routes each
+            // verb to the plugin that declared it. Warden
+            // stockings remain strictly single-occupant
+            // because state-mutating wardens require a single
+            // truth path per shelf.
+            if let Some(occupants) = inner.by_shelf.get(&stocking.shelf) {
+                let our_role = stocking.role;
+                let mut overlap_with: Option<String> = None;
+                for existing in occupants {
+                    let existing_stocking = existing
+                        .stockings
+                        .iter()
+                        .find(|s| s.shelf == stocking.shelf);
+                    let existing_role =
+                        existing_stocking.map(|s| s.role).unwrap_or(our_role);
+                    // Warden side of either occupation refuses
+                    // co-occupation. Multi-occupant warden
+                    // shelves are not coherent.
+                    if matches!(
+                        existing_role,
+                        evo_plugin_sdk::manifest::StockingRole::Warden
+                    ) || matches!(
+                        our_role,
+                        evo_plugin_sdk::manifest::StockingRole::Warden
+                    ) {
+                        overlap_with = Some(existing.name.clone());
+                        break;
+                    }
+                    // Respondent + respondent. Refuse only if
+                    // the verb sets overlap; otherwise the
+                    // partition gate at dispatch time handles
+                    // the route.
+                    if let Some(es) = existing_stocking {
+                        let our_verbs: std::collections::HashSet<&str> =
+                            stocking
+                                .request_types
+                                .iter()
+                                .map(String::as_str)
+                                .collect();
+                        let overlap_verb = es
+                            .request_types
+                            .iter()
+                            .find(|v| our_verbs.contains(v.as_str()))
+                            .cloned();
+                        if let Some(v) = overlap_verb {
+                            overlap_with = Some(format!(
+                                "{} (verb {:?} overlap)",
+                                existing.name, v
+                            ));
+                            break;
+                        }
+                    }
+                }
+                if let Some(conflicting) = overlap_with {
+                    for shelf in &inserted {
+                        if let Some(occ) = inner.by_shelf.get_mut(shelf) {
+                            occ.retain(|e| !Arc::ptr_eq(e, &entry));
+                            if occ.is_empty() {
+                                inner.by_shelf.remove(shelf);
+                            }
+                        }
+                        if let Some(pos) = inner
+                            .admission_order
+                            .iter()
+                            .rposition(|s| s == shelf)
+                        {
+                            inner.admission_order.remove(pos);
+                        }
+                    }
+                    return Err(StewardError::Admission(format!(
+                        "{}: shelf {} already occupied by {}",
+                        entry.name, stocking.shelf, conflicting
+                    )));
+                }
+            }
+            inner
+                .by_shelf
+                .entry(stocking.shelf.clone())
+                .or_default()
+                .push(entry.clone());
+            inner.admission_order.push(stocking.shelf.clone());
+            inserted.push(stocking.shelf.clone());
+        }
+        Ok(())
+    }
+
+    /// Attach a steward-owned child process to the previously-
+    /// inserted entry for `plugin_name`. Used by
     /// [`AdmissionEngine::admit_out_of_process_from_directory`](crate::admission::AdmissionEngine::admit_out_of_process_from_directory)
     /// after a successful spawn.
     ///
-    /// Returns `false` if no entry is admitted on the given shelf.
-    pub async fn attach_child(&self, shelf: &str, child: Child) -> bool {
-        let entry = match self.lookup(shelf) {
+    /// Disambiguates by plugin name so multi-occupant respondent
+    /// shelves do not cross-attach a freshly-admitted plugin's
+    /// child handle onto a sibling occupant's entry — the
+    /// previous incarnation of this method routed by shelf only
+    /// and `Command::kill_on_drop(true)` therefore killed the
+    /// sibling's live process when the second co-occupant
+    /// admitted.
+    ///
+    /// Returns `false` if no entry under that name is currently
+    /// admitted.
+    pub async fn attach_child(&self, plugin_name: &str, child: Child) -> bool {
+        let entry = match self.lookup_by_name(plugin_name) {
             Some(e) => e,
             None => return false,
         };
@@ -580,12 +926,72 @@ impl PluginRouter {
         true
     }
 
-    /// Look up a plugin entry, cloning the `Arc` so the caller
-    /// holds the entry independently of the router's read lock.
-    /// Returns `None` if no plugin is admitted on the given shelf.
+    /// Look up the FIRST plugin admitted on the given shelf.
+    /// Returns `None` if no plugin is admitted there.
+    ///
+    /// For single-occupant shelves this is the only occupant.
+    /// For multi-occupant respondent shelves it returns the
+    /// first admission-order occupant — callers that need to
+    /// disambiguate by verb MUST use [`Self::lookup_for_verb`]
+    /// instead. Custody / lifecycle paths use this method
+    /// because a warden shelf is structurally single-occupant.
     pub fn lookup(&self, shelf: &str) -> Option<Arc<PluginEntry>> {
         let inner = self.inner.read().expect("router inner poisoned");
-        inner.by_shelf.get(shelf).map(Arc::clone)
+        inner
+            .by_shelf
+            .get(shelf)
+            .and_then(|occupants| occupants.first().map(Arc::clone))
+    }
+
+    /// Look up the plugin admitted on the given shelf whose
+    /// stocking owns the requested verb. Returns `None` if no
+    /// such plugin is admitted.
+    ///
+    /// On single-occupant shelves this resolves to the same
+    /// entry [`Self::lookup`] would return. On multi-occupant
+    /// respondent shelves it disambiguates by walking each
+    /// occupant's stocking for the shelf and returning the one
+    /// whose `request_types` list contains the verb. The
+    /// partition gate at admission time ensures at most one
+    /// occupant per `(shelf, verb)` pair.
+    pub fn lookup_for_verb(
+        &self,
+        shelf: &str,
+        verb: &str,
+    ) -> Option<Arc<PluginEntry>> {
+        let inner = self.inner.read().expect("router inner poisoned");
+        let occupants = inner.by_shelf.get(shelf)?;
+        for entry in occupants {
+            // A plugin admitted via single-stocking [`Self::insert`]
+            // has an empty stockings vec; for those entries every
+            // verb the plugin handles is structurally owned by the
+            // single stocking, so we fall through to the first
+            // (and only) occupant.
+            if entry.stockings.is_empty() {
+                return Some(Arc::clone(entry));
+            }
+            if let Some(s) = entry.stockings.iter().find(|s| s.shelf == shelf) {
+                if s.request_types.iter().any(|v| v == verb) {
+                    return Some(Arc::clone(entry));
+                }
+            }
+        }
+        None
+    }
+
+    /// All plugins admitted on the given shelf, in admission
+    /// order. Returns an empty vec when no plugin is admitted.
+    ///
+    /// Used by diagnostic / discovery surfaces that present
+    /// every occupant of a shelf (e.g. operator UI's "providers
+    /// on this shelf" view).
+    pub fn occupants_of(&self, shelf: &str) -> Vec<Arc<PluginEntry>> {
+        let inner = self.inner.read().expect("router inner poisoned");
+        inner
+            .by_shelf
+            .get(shelf)
+            .map(|v| v.iter().map(Arc::clone).collect())
+            .unwrap_or_default()
     }
 
     /// Snapshot of the admission order, cloned out of the read lock
@@ -605,53 +1011,94 @@ impl PluginRouter {
     /// duration of every plugin's `health_check`.
     pub fn entries_in_order(&self) -> Vec<Arc<PluginEntry>> {
         let inner = self.inner.read().expect("router inner poisoned");
+        let mut seen: std::collections::HashSet<*const PluginEntry> =
+            std::collections::HashSet::new();
         inner
             .admission_order
             .iter()
-            .filter_map(|s| inner.by_shelf.get(s).map(Arc::clone))
+            .flat_map(|s| {
+                inner.by_shelf.get(s).map(|v| v.as_slice()).unwrap_or(&[])
+            })
+            .filter_map(|e| {
+                if seen.insert(Arc::as_ptr(e)) {
+                    Some(Arc::clone(e))
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
     /// Look up the entry by canonical plugin name. Returns
     /// `None` if no plugin with that name is admitted.
-    /// O(n) over admitted plugins; the routing table is keyed
-    /// by shelf, not by plugin name, so a name-based lookup
-    /// walks the admission_order. Used by the hot-reload path
-    /// where the operator names the plugin rather than the
-    /// shelf.
     pub fn lookup_by_name(&self, name: &str) -> Option<Arc<PluginEntry>> {
         let inner = self.inner.read().expect("router inner poisoned");
-        inner
-            .by_shelf
-            .values()
-            .find(|e| e.name == name)
-            .map(Arc::clone)
+        for occupants in inner.by_shelf.values() {
+            if let Some(entry) = occupants.iter().find(|e| e.name == name) {
+                return Some(Arc::clone(entry));
+            }
+        }
+        None
     }
 
-    /// Remove the entry on the given shelf and return it, or
-    /// `None` if no plugin is admitted there. Used by the
-    /// hot-reload path to evict a single plugin without
-    /// draining the rest of the routing table.
+    /// Remove a specific plugin from the routing table.
+    ///
+    /// The plugin is identified by name; every shelf it occupies
+    /// is evicted (multi-stocking primitive invariant). Returns
+    /// the evicted Arc when found, `None` otherwise.
     ///
     /// The caller is responsible for unloading the returned
     /// entry's handle and reaping its child process; this method
     /// only updates the routing table.
     pub fn remove(&self, shelf: &str) -> Option<Arc<PluginEntry>> {
         let mut inner = self.inner.write().expect("router inner poisoned");
-        let entry = inner.by_shelf.remove(shelf)?;
-        inner.admission_order.retain(|s| s != shelf);
+        // Find the entry to evict by walking the shelf's
+        // occupants (single-occupant shelves trivially resolve;
+        // multi-occupant shelves under multi-occupant Stocking
+        // — currently used by the artwork.providers shelf —
+        // need name-based disambiguation, but operators name
+        // shelves not plugin pairs, so we evict the FIRST
+        // occupant if the shelf carries any).
+        let entry = inner
+            .by_shelf
+            .get(shelf)
+            .and_then(|occupants| occupants.first().cloned())?;
+        let plugin_name = entry.name.clone();
+        // Evict every shelf this plugin occupies — admission is
+        // plugin-wide, not per-shelf.
+        for stocking_shelf in entry
+            .stockings
+            .iter()
+            .map(|s| s.shelf.clone())
+            .collect::<Vec<_>>()
+        {
+            if let Some(occupants) = inner.by_shelf.get_mut(&stocking_shelf) {
+                occupants.retain(|e| e.name != plugin_name);
+                if occupants.is_empty() {
+                    inner.by_shelf.remove(&stocking_shelf);
+                    inner.admission_order.retain(|s| s != &stocking_shelf);
+                }
+            }
+        }
+        // Single-stocking-via-[`Self::insert`] entries don't
+        // carry a stockings vec; ensure the shelf is cleared
+        // for that path too.
+        if let Some(occupants) = inner.by_shelf.get_mut(shelf) {
+            occupants.retain(|e| e.name != plugin_name);
+            if occupants.is_empty() {
+                inner.by_shelf.remove(shelf);
+                inner.admission_order.retain(|s| s != shelf);
+            }
+        }
         Some(entry)
     }
 
     /// Atomically replace the entry on `shelf` with `entry`,
-    /// returning the previous occupant. Used by the OOP live-reload
-    /// path: a freshly-loaded plugin process takes over the shelf
-    /// in a single write-lock acquisition, with no observable
-    /// "no plugin on shelf" gap between the old and new entries.
-    /// `entry`'s shelf must equal `shelf`; the admission order
-    /// records the new entry in the old one's slot rather than
-    /// re-pushing it to the tail (preserving the relative ordering
-    /// for shutdown).
+    /// returning the previous occupant. Used by the OOP live-
+    /// reload path. Operates on single-occupant shelves; multi-
+    /// occupant shelves disambiguate the slot by name (the
+    /// reload swaps in the new entry under the existing
+    /// occupant's name, leaving sibling occupants in place).
     pub fn replace_in_place(
         &self,
         shelf: &str,
@@ -659,21 +1106,35 @@ impl PluginRouter {
     ) -> Option<Arc<PluginEntry>> {
         debug_assert_eq!(entry.shelf, shelf, "replace shelf mismatch");
         let mut inner = self.inner.write().expect("router inner poisoned");
-        inner.by_shelf.insert(shelf.to_string(), entry)
+        let occupants = inner.by_shelf.entry(shelf.to_string()).or_default();
+        if let Some(pos) = occupants.iter().position(|e| e.name == entry.name) {
+            let prev = std::mem::replace(&mut occupants[pos], entry);
+            return Some(prev);
+        }
+        // No matching occupant — install as the sole occupant
+        // (matches the single-occupant legacy semantics).
+        occupants.clear();
+        occupants.push(entry);
+        None
     }
 
     /// Drain the routing table, returning every admitted plugin
-    /// entry in **reverse** admission order (LIFO). Used by
-    /// [`AdmissionEngine::shutdown`](crate::admission::AdmissionEngine::shutdown)
-    /// for orderly drain.
-    ///
-    /// After this call the router is empty.
+    /// entry in **reverse** admission order (LIFO).
     pub fn drain_in_reverse_admission_order(&self) -> Vec<Arc<PluginEntry>> {
         let mut inner = self.inner.write().expect("router inner poisoned");
-        let mut entries = Vec::with_capacity(inner.admission_order.len());
+        let mut entries: Vec<Arc<PluginEntry>> = Vec::new();
+        let mut seen: std::collections::HashSet<*const PluginEntry> =
+            std::collections::HashSet::new();
+        // Walk admission_order in reverse — last admitted shelves
+        // drain first per LIFO discipline. Drain each shelf's
+        // occupants in occupant order.
         while let Some(shelf) = inner.admission_order.pop() {
-            if let Some(entry) = inner.by_shelf.remove(&shelf) {
-                entries.push(entry);
+            if let Some(occupants) = inner.by_shelf.remove(&shelf) {
+                for entry in occupants {
+                    if seen.insert(Arc::as_ptr(&entry)) {
+                        entries.push(entry);
+                    }
+                }
             }
         }
         entries
@@ -703,9 +1164,20 @@ impl PluginRouter {
             payload_len = request.payload.len(),
             "router::handle_request: dispatching"
         );
-        let entry = self.lookup(shelf).ok_or_else(|| {
-            StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
-        })?;
+        // Verb-aware lookup. Multi-occupant respondent shelves
+        // route each verb to its declaring plugin; single-
+        // occupant shelves trivially resolve to their sole
+        // occupant. Falls back to first-occupant lookup so a
+        // verb not stocked on the shelf surfaces as the
+        // dispatcher's structured "did not declare request_type"
+        // refusal below rather than a "no plugin on shelf"
+        // false-positive.
+        let entry = self
+            .lookup_for_verb(shelf, &request.request_type)
+            .or_else(|| self.lookup(shelf))
+            .ok_or_else(|| {
+                StewardError::Dispatch(format!("no plugin on shelf: {shelf}"))
+            })?;
 
         // Snapshot the current enforcement policy for the duration
         // of this dispatch; reload_manifest may swap the policy
@@ -739,8 +1211,16 @@ impl PluginRouter {
             }
         }
 
-        let mut handle_guard = entry.handle.lock().await;
-        let handle = handle_guard.as_mut().ok_or_else(|| {
+        // Shared read guard: many concurrent handle_request calls
+        // on the same plugin hold read guards simultaneously so
+        // one caller awaiting a credential prompt does not freeze
+        // peer reads on the same shelf. Lifecycle operations
+        // (load / unload) take the write lock and barrier against
+        // every in-flight read. Respondent::handle_request is `&self`
+        // under the framework's concurrent-dispatch contract, so
+        // dispatch through the read guard is safe.
+        let handle_guard = entry.handle.read().await;
+        let handle = handle_guard.as_ref().ok_or_else(|| {
             StewardError::Dispatch(format!(
                 "plugin on shelf {shelf} has been unloaded"
             ))
@@ -749,6 +1229,11 @@ impl PluginRouter {
             AdmittedHandle::Respondent(r) => {
                 r.handle_request(&request).await.map_err(Into::into)
             }
+            AdmittedHandle::WardenWithRespondent(wr) => wr
+                .as_respondent()
+                .handle_request(&request)
+                .await
+                .map_err(Into::into),
             AdmittedHandle::Warden(_) => Err(StewardError::Dispatch(format!(
                 "handle_request on shelf {shelf}: plugin is a warden, \
                  not a respondent"
@@ -801,18 +1286,23 @@ impl PluginRouter {
         };
 
         let handle: CustodyHandle = {
-            let mut handle_guard = entry.handle.lock().await;
+            // Warden take_custody remains &mut self on the trait so
+            // take the write guard. The guard barriers against every
+            // in-flight respondent read on this entry.
+            let mut handle_guard = entry.handle.write().await;
             let admitted = handle_guard.as_mut().ok_or_else(|| {
                 StewardError::Dispatch(format!(
                     "plugin on shelf {shelf} has been unloaded"
                 ))
             })?;
-            let warden = match admitted {
-                AdmittedHandle::Warden(w) => w,
+            let warden: &mut dyn crate::admission::ErasedWarden = match admitted
+            {
+                AdmittedHandle::Warden(w) => w.as_mut(),
+                AdmittedHandle::WardenWithRespondent(wr) => wr.as_warden_mut(),
                 AdmittedHandle::Respondent(_) => {
                     return Err(StewardError::Dispatch(format!(
                         "take_custody on shelf {shelf}: plugin is a \
-                         respondent, not a warden"
+                             respondent, not a warden"
                     )));
                 }
             };
@@ -1085,18 +1575,21 @@ impl PluginRouter {
         let plugin_name = entry.name.clone();
         let shelf_qualified = entry.shelf.clone();
 
-        let mut handle_guard = entry.handle.lock().await;
+        // Warden course_correct remains &mut self on the trait so
+        // take the write guard.
+        let mut handle_guard = entry.handle.write().await;
         let admitted = handle_guard.as_mut().ok_or_else(|| {
             StewardError::Dispatch(format!(
                 "plugin on shelf {shelf} has been unloaded"
             ))
         })?;
-        let warden = match admitted {
-            AdmittedHandle::Warden(w) => w,
+        let warden: &mut dyn crate::admission::ErasedWarden = match admitted {
+            AdmittedHandle::Warden(w) => w.as_mut(),
+            AdmittedHandle::WardenWithRespondent(wr) => wr.as_warden_mut(),
             AdmittedHandle::Respondent(_) => {
                 return Err(StewardError::Dispatch(format!(
                     "course_correct on shelf {shelf}: plugin is a \
-                     respondent, not a warden"
+                         respondent, not a warden"
                 )));
             }
         };
@@ -1234,18 +1727,22 @@ impl PluginRouter {
         let handle_id = handle.id.clone();
 
         {
-            let mut handle_guard = entry.handle.lock().await;
+            // Warden release_custody remains &mut self on the trait
+            // so take the write guard.
+            let mut handle_guard = entry.handle.write().await;
             let admitted = handle_guard.as_mut().ok_or_else(|| {
                 StewardError::Dispatch(format!(
                     "plugin on shelf {shelf} has been unloaded"
                 ))
             })?;
-            let warden = match admitted {
-                AdmittedHandle::Warden(w) => w,
+            let warden: &mut dyn crate::admission::ErasedWarden = match admitted
+            {
+                AdmittedHandle::Warden(w) => w.as_mut(),
+                AdmittedHandle::WardenWithRespondent(wr) => wr.as_warden_mut(),
                 AdmittedHandle::Respondent(_) => {
                     return Err(StewardError::Dispatch(format!(
                         "release_custody on shelf {shelf}: plugin is a \
-                         respondent, not a warden"
+                             respondent, not a warden"
                     )));
                 }
             };
@@ -1311,7 +1808,10 @@ impl PluginRouter {
         let entries = self.entries_in_order();
         let mut out = Vec::with_capacity(entries.len());
         for entry in entries {
-            let guard = entry.handle.lock().await;
+            // health_check on both Plugin and Warden traits is
+            // &self; take a read guard so a health sweep does not
+            // stall an in-flight handle_request on the same entry.
+            let guard = entry.handle.read().await;
             if let Some(handle) = guard.as_ref() {
                 tracing::debug!(
                     plugin = %entry.name,
@@ -1351,7 +1851,20 @@ impl PluginRouter {
 pub async fn unload_handle(
     entry: &Arc<PluginEntry>,
 ) -> Result<(), PluginError> {
-    let mut handle_guard = entry.handle.lock().await;
+    // Stop the hot-tightening re-probe task BEFORE invoking
+    // `Plugin::unload` so the task does not race against the
+    // plugin's teardown (a tick might otherwise observe a
+    // partially-released sudoers drop-in or filesystem path
+    // mid-unload and publish a spurious resolution change).
+    if let Some(task) = entry.take_reprobe().await {
+        task.shutdown().await;
+    }
+
+    // Lifecycle: unload takes the write guard so it barriers
+    // against every in-flight read (respondent handle_request) on
+    // this entry. Take-out clears the slot; a subsequent dispatch
+    // sees `None` and refuses with `has been unloaded`.
+    let mut handle_guard = entry.handle.write().await;
     if let Some(mut handle) = handle_guard.take() {
         tracing::debug!(
             plugin = %entry.name,
@@ -1451,7 +1964,7 @@ mod tests {
 
     impl Respondent for EchoRespondent {
         fn handle_request<'a>(
-            &'a mut self,
+            &'a self,
             req: &'a Request,
         ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a
         {
@@ -1681,6 +2194,8 @@ mod tests {
             deadline: None,
 
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let resp = r.handle_request("test.ping", req).await.unwrap();
         assert_eq!(resp.payload, b"hi");
@@ -1707,6 +2222,8 @@ mod tests {
             deadline: None,
 
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let res = r.handle_request("test.ping", req).await;
         match res {
@@ -1742,6 +2259,8 @@ mod tests {
             deadline: None,
 
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let resp = r.handle_request("test.ping", req).await.unwrap();
         assert_eq!(resp.payload, b"hi");
@@ -1910,7 +2429,7 @@ mod tests {
         }
         impl Respondent for DeadlineCapturingRespondent {
             fn handle_request<'a>(
-                &'a mut self,
+                &'a self,
                 req: &'a Request,
             ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a
             {
@@ -1956,6 +2475,8 @@ mod tests {
                 deadline: None,
 
                 instance_id: None,
+                principal_scope: None,
+                has_step_up: false,
             },
         )
         .await
@@ -1999,6 +2520,8 @@ mod tests {
             deadline: Some(explicit),
 
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         // EchoRespondent doesn't observe deadlines but still serves
         // OK — this test asserts the dispatch succeeds without
@@ -2017,6 +2540,8 @@ mod tests {
             deadline: None,
 
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let res = r.handle_request("missing", req).await;
         assert!(matches!(res, Err(StewardError::Dispatch(_))));
@@ -2033,6 +2558,8 @@ mod tests {
             deadline: None,
 
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let res = r.handle_request("test.custody", req).await;
         assert!(matches!(res, Err(StewardError::Dispatch(_))));
@@ -2990,5 +3517,397 @@ course_correct_verbs = [{verbs_list}]
             }
             other => panic!("expected refusal, got {other:?}"),
         }
+    }
+
+    // ----- Multi-stocking router tests -----
+
+    fn make_stocking(
+        shelf: &str,
+        role: evo_plugin_sdk::manifest::StockingRole,
+        verbs: &[&str],
+    ) -> evo_plugin_sdk::manifest::Stocking {
+        evo_plugin_sdk::manifest::Stocking {
+            shelf: shelf.into(),
+            shape: 1,
+            role,
+            request_types: verbs.iter().map(|s| (*s).into()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_stocking_admits_atomically_across_all_shelves() {
+        let router = PluginRouter::new(StewardState::for_tests());
+
+        let stockings = vec![
+            make_stocking(
+                "audio.playback",
+                evo_plugin_sdk::manifest::StockingRole::Warden,
+                &["play"],
+            ),
+            make_stocking(
+                "audio.queue",
+                evo_plugin_sdk::manifest::StockingRole::Respondent,
+                &["queue.get_queue"],
+            ),
+            make_stocking(
+                "audio.library",
+                evo_plugin_sdk::manifest::StockingRole::Respondent,
+                &["library.list_sources"],
+            ),
+        ];
+
+        let w: Box<dyn ErasedWarden> =
+            Box::new(WardenAdapter::new(EchoWarden {
+                name: "playback.media".into(),
+            }));
+        let entry = Arc::new(
+            PluginEntry::new(
+                "playback.media".into(),
+                "audio.playback".into(),
+                AdmittedHandle::Warden(w),
+            )
+            .with_stockings(stockings.clone()),
+        );
+
+        router.insert(entry).expect("multi-stocking admits");
+
+        // All three shelves point to the same plugin.
+        assert!(router.lookup("audio.playback").is_some());
+        assert!(router.lookup("audio.queue").is_some());
+        assert!(router.lookup("audio.library").is_some());
+
+        // The plugin's stocking_on() reflects the partition.
+        let e = router.lookup("audio.queue").unwrap();
+        let s = e.stocking_on("audio.queue").unwrap();
+        assert_eq!(s.request_types, vec!["queue.get_queue"]);
+    }
+
+    #[tokio::test]
+    async fn multi_occupant_respondent_shelf_admits_disjoint_verbs() {
+        // Multi-occupant respondent shelf: two respondent plugins co-occupy
+        // one shelf as long as their verb sets are disjoint.
+        // The partition gate routes each verb to its declaring
+        // plugin. Models the artwork.providers shelf:
+        // artwork.local owns artwork.resolve;
+        // artwork.online owns artwork.resolve_online.
+        let router = PluginRouter::new(StewardState::for_tests());
+
+        let local_stockings = vec![make_stocking(
+            "artwork.providers",
+            evo_plugin_sdk::manifest::StockingRole::Respondent,
+            &["artwork.resolve"],
+        )];
+        let r1: Box<dyn ErasedRespondent> =
+            Box::new(RespondentAdapter::new(EchoRespondent {
+                name: "artwork.local".into(),
+            }));
+        let local = Arc::new(
+            PluginEntry::new(
+                "artwork.local".into(),
+                "artwork.providers".into(),
+                AdmittedHandle::Respondent(r1),
+            )
+            .with_stockings(local_stockings),
+        );
+        router.insert(local).expect("local admits");
+
+        let online_stockings = vec![make_stocking(
+            "artwork.providers",
+            evo_plugin_sdk::manifest::StockingRole::Respondent,
+            &["artwork.resolve_online"],
+        )];
+        let r2: Box<dyn ErasedRespondent> =
+            Box::new(RespondentAdapter::new(EchoRespondent {
+                name: "artwork.online".into(),
+            }));
+        let online = Arc::new(
+            PluginEntry::new(
+                "artwork.online".into(),
+                "artwork.providers".into(),
+                AdmittedHandle::Respondent(r2),
+            )
+            .with_stockings(online_stockings),
+        );
+        router
+            .insert(online)
+            .expect("online co-occupies on disjoint verb");
+
+        // Verb-aware lookup routes each verb to its declaring
+        // plugin.
+        let local_for_resolve = router
+            .lookup_for_verb("artwork.providers", "artwork.resolve")
+            .expect("artwork.resolve routes to local");
+        assert_eq!(local_for_resolve.name, "artwork.local");
+
+        let online_for_resolve_online = router
+            .lookup_for_verb("artwork.providers", "artwork.resolve_online")
+            .expect("artwork.resolve_online routes to online");
+        assert_eq!(online_for_resolve_online.name, "artwork.online");
+
+        // Unknown verb on the shelf returns None.
+        assert!(router
+            .lookup_for_verb("artwork.providers", "no.such.verb")
+            .is_none());
+
+        // occupants_of returns both plugins in admission order.
+        let occ = router.occupants_of("artwork.providers");
+        assert_eq!(occ.len(), 2);
+        assert_eq!(occ[0].name, "artwork.local");
+        assert_eq!(occ[1].name, "artwork.online");
+    }
+
+    #[tokio::test]
+    async fn attach_child_routes_by_plugin_name_not_first_occupant() {
+        // Regression for: when the artwork.providers shelf carried
+        // both artwork.local + artwork.online, the admission engine
+        // attached the second co-occupant's spawned Child handle to
+        // the FIRST occupant's entry slot (because attach_child used
+        // shelf-based lookup). With Command::kill_on_drop(true) on
+        // spawn, the displaced predecessor Child was dropped and the
+        // first occupant's wire process was SIGKILL'd.
+        //
+        // This test pins the name-routed attach: a fake Child stand-in
+        // attached under each name must land in THAT plugin's slot,
+        // not on a sibling's slot.
+        let router = PluginRouter::new(StewardState::for_tests());
+        let first_stockings = vec![make_stocking(
+            "shared.shelf",
+            evo_plugin_sdk::manifest::StockingRole::Respondent,
+            &["verb.first"],
+        )];
+        let r1: Box<dyn ErasedRespondent> =
+            Box::new(RespondentAdapter::new(EchoRespondent {
+                name: "first".into(),
+            }));
+        let first = Arc::new(
+            PluginEntry::new(
+                "first".into(),
+                "shared.shelf".into(),
+                AdmittedHandle::Respondent(r1),
+            )
+            .with_stockings(first_stockings),
+        );
+        router.insert(first).expect("first admits");
+
+        let second_stockings = vec![make_stocking(
+            "shared.shelf",
+            evo_plugin_sdk::manifest::StockingRole::Respondent,
+            &["verb.second"],
+        )];
+        let r2: Box<dyn ErasedRespondent> =
+            Box::new(RespondentAdapter::new(EchoRespondent {
+                name: "second".into(),
+            }));
+        let second = Arc::new(
+            PluginEntry::new(
+                "second".into(),
+                "shared.shelf".into(),
+                AdmittedHandle::Respondent(r2),
+            )
+            .with_stockings(second_stockings),
+        );
+        router.insert(second).expect("second co-occupies");
+
+        // Spawn two `Child` handles to use as attach inputs. We use
+        // `true` because the binary is a near-zero-cost universal
+        // success — the test only cares about Child identity, not
+        // process behavior.
+        let c1 = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawn child 1");
+        let c2 = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawn child 2");
+
+        assert!(router.attach_child("first", c1).await);
+        assert!(router.attach_child("second", c2).await);
+
+        // first.child is Some; second.child is Some; neither
+        // entry's slot got cross-attached to the other.
+        let first_e = router.lookup_by_name("first").unwrap();
+        let second_e = router.lookup_by_name("second").unwrap();
+        assert!(
+            first_e.child.lock().await.is_some(),
+            "first occupant retained its own child"
+        );
+        assert!(
+            second_e.child.lock().await.is_some(),
+            "second occupant attached its own child"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_occupant_respondent_shelf_refuses_overlapping_verbs() {
+        // Two respondent plugins claiming the same shelf with
+        // overlapping verbs MUST be refused — the framework
+        // cannot dispatch a verb to two occupants.
+        let router = PluginRouter::new(StewardState::for_tests());
+
+        let first_stockings = vec![make_stocking(
+            "shared",
+            evo_plugin_sdk::manifest::StockingRole::Respondent,
+            &["verb.shared", "verb.first"],
+        )];
+        let r1: Box<dyn ErasedRespondent> =
+            Box::new(RespondentAdapter::new(EchoRespondent {
+                name: "first".into(),
+            }));
+        let first = Arc::new(
+            PluginEntry::new(
+                "first".into(),
+                "shared".into(),
+                AdmittedHandle::Respondent(r1),
+            )
+            .with_stockings(first_stockings),
+        );
+        router.insert(first).expect("first admits");
+
+        let second_stockings = vec![make_stocking(
+            "shared",
+            evo_plugin_sdk::manifest::StockingRole::Respondent,
+            &["verb.second", "verb.shared"], // overlap on verb.shared
+        )];
+        let r2: Box<dyn ErasedRespondent> =
+            Box::new(RespondentAdapter::new(EchoRespondent {
+                name: "second".into(),
+            }));
+        let second = Arc::new(
+            PluginEntry::new(
+                "second".into(),
+                "shared".into(),
+                AdmittedHandle::Respondent(r2),
+            )
+            .with_stockings(second_stockings),
+        );
+        let err = router.insert(second).expect_err("verb overlap refused");
+        assert!(
+            err.to_string().contains("verb"),
+            "error names verb overlap: {err}"
+        );
+
+        // first remains the sole occupant.
+        let occ = router.occupants_of("shared");
+        assert_eq!(occ.len(), 1);
+        assert_eq!(occ[0].name, "first");
+    }
+
+    #[tokio::test]
+    async fn multi_occupant_refuses_warden_co_occupation() {
+        // Warden shelves remain strictly single-occupant —
+        // multi-occupant warden semantics are not coherent
+        // (state-mutating wardens require a single truth path).
+        let router = PluginRouter::new(StewardState::for_tests());
+
+        let first_stockings = vec![make_stocking(
+            "shared",
+            evo_plugin_sdk::manifest::StockingRole::Warden,
+            &["custody.take"],
+        )];
+        let w1: Box<dyn ErasedWarden> =
+            Box::new(WardenAdapter::new(EchoWarden {
+                name: "first".into(),
+            }));
+        let first = Arc::new(
+            PluginEntry::new(
+                "first".into(),
+                "shared".into(),
+                AdmittedHandle::Warden(w1),
+            )
+            .with_stockings(first_stockings),
+        );
+        router.insert(first).expect("first warden admits");
+
+        let second_stockings = vec![make_stocking(
+            "shared",
+            evo_plugin_sdk::manifest::StockingRole::Respondent,
+            &["verb.read"], // disjoint verb — would normally admit
+        )];
+        let r2: Box<dyn ErasedRespondent> =
+            Box::new(RespondentAdapter::new(EchoRespondent {
+                name: "second".into(),
+            }));
+        let second = Arc::new(
+            PluginEntry::new(
+                "second".into(),
+                "shared".into(),
+                AdmittedHandle::Respondent(r2),
+            )
+            .with_stockings(second_stockings),
+        );
+        assert!(
+            router.insert(second).is_err(),
+            "respondent co-occupation of warden shelf refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_stocking_rolls_back_on_cross_plugin_conflict() {
+        let router = PluginRouter::new(StewardState::for_tests());
+
+        // First plugin claims audio.queue.
+        let first_stockings = vec![make_stocking(
+            "audio.queue",
+            evo_plugin_sdk::manifest::StockingRole::Respondent,
+            &["queue.get_queue"],
+        )];
+        let r: Box<dyn ErasedRespondent> =
+            Box::new(RespondentAdapter::new(EchoRespondent {
+                name: "first".into(),
+            }));
+        let first = Arc::new(
+            PluginEntry::new(
+                "first".into(),
+                "audio.queue".into(),
+                AdmittedHandle::Respondent(r),
+            )
+            .with_stockings(first_stockings),
+        );
+        router.insert(first).expect("first plugin admits");
+
+        // Second plugin tries to claim audio.playback + audio.queue.
+        // The audio.queue claim must trip the rollback; both
+        // intended shelves must remain free of the second plugin.
+        let second_stockings = vec![
+            make_stocking(
+                "audio.playback",
+                evo_plugin_sdk::manifest::StockingRole::Warden,
+                &["play"],
+            ),
+            make_stocking(
+                "audio.queue",
+                evo_plugin_sdk::manifest::StockingRole::Respondent,
+                &["queue.get_queue"],
+            ),
+        ];
+        let w: Box<dyn ErasedWarden> =
+            Box::new(WardenAdapter::new(EchoWarden {
+                name: "second".into(),
+            }));
+        let second = Arc::new(
+            PluginEntry::new(
+                "second".into(),
+                "audio.playback".into(),
+                AdmittedHandle::Warden(w),
+            )
+            .with_stockings(second_stockings),
+        );
+        let err = router.insert(second).expect_err("second plugin refused");
+        match err {
+            StewardError::Admission(msg) => {
+                assert!(
+                    msg.contains("audio.queue")
+                        && msg.contains("already occupied"),
+                    "expected admission refusal on audio.queue; got: {msg}"
+                );
+            }
+            other => panic!("expected Admission error, got {other:?}"),
+        }
+
+        // audio.playback was NOT successfully grabbed by `second`
+        // (transactional rollback); the only admitted plugin is
+        // `first` on `audio.queue`.
+        assert!(router.lookup("audio.playback").is_none());
+        let still_first = router.lookup("audio.queue").unwrap();
+        assert_eq!(still_first.name, "first");
     }
 }

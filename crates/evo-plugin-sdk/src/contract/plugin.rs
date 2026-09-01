@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! The base plugin trait and its supporting types.
 
 use crate::contract::context::LoadContext;
@@ -135,6 +138,49 @@ pub trait Plugin: Send + Sync {
         _blob: Option<StateBlob>,
     ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
         self.load(ctx)
+    }
+
+    /// Declare the [`ProbePlan`]s the plugin wants the
+    /// framework's Privilege Preflight Admission Gate (PPAG)
+    /// to run at admission time. Default: empty Vec.
+    ///
+    /// Returned plans are executed BEFORE [`Plugin::load`].
+    /// The framework runs each probe (read-only, non-
+    /// escalating), aggregates outcomes into a
+    /// [`CapabilityResolutionMap`], and stamps the map on
+    /// [`LoadContext::capabilities`] so `load`'s body picks
+    /// the right runtime strategy without re-probing the
+    /// host.
+    ///
+    /// Plugins author the probes in Rust because the probe
+    /// types ([`SudoersCommandProbe`],
+    /// [`FilesystemAccessProbe`], [`BinaryPresentProbe`])
+    /// are SDK types — no schema bump or yaml extension
+    /// needed. The plugin's `privileges.yaml` declares the
+    /// human-readable intent surface (id / need /
+    /// access_path / failure_mode); this method declares the
+    /// matching machine-readable probe spec. Authors keep
+    /// the two in lockstep by convention (the intent.id is
+    /// the [`ProbePlan::intent_id`] field).
+    ///
+    /// Plugins without privileges contracts return the
+    /// default empty Vec and observe the no-op
+    /// `CapabilityResolutionMap::new()` at load.
+    ///
+    /// [`ProbePlan`]: crate::privileges::ProbePlan
+    /// [`CapabilityResolutionMap`]:
+    /// crate::privileges::CapabilityResolutionMap
+    /// [`SudoersCommandProbe`]:
+    /// crate::privileges::SudoersCommandProbe
+    /// [`FilesystemAccessProbe`]:
+    /// crate::privileges::FilesystemAccessProbe
+    /// [`BinaryPresentProbe`]:
+    /// crate::privileges::BinaryPresentProbe
+    /// [`LoadContext::capabilities`]:
+    /// crate::contract::LoadContext::capabilities
+    #[cfg(feature = "privileges")]
+    fn probe_plans(&self) -> Vec<crate::privileges::ProbePlan> {
+        Vec::new()
     }
 }
 

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Integration tests for `evo_trust::verify_out_of_process_bundle`.
 //!
 //! Exercises the full signature / authorisation / revocation pipeline

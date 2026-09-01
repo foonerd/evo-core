@@ -1,0 +1,50 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
+syntax = "proto3";
+
+package evo.v1;
+
+// The steward's canonical wire-op dispatcher exposed as a gRPC
+// service. The contract is payload-agnostic: every wire op
+// flows through the same `Dispatch` RPC with its op id +
+// JSON-encoded request payload, and the response carries the
+// JSON-encoded response payload. The wire-protocol schema —
+// authored once and projected into REST, WS, gRPC, GraphQL,
+// HTTP/3 — drives the payload contract; adding a new wire op
+// does not require a `.proto` migration.
+service Dispatcher {
+  // Generic wire-op dispatch.
+  rpc Dispatch(WireOpRequest) returns (WireOpResponse);
+
+  // Capability probe. Returns the same JSON the HTTPS
+  // /api/v1/describe_capabilities endpoint serves — payload
+  // bytes so gRPC consumers don't drift from REST consumers.
+  rpc DescribeCapabilities(Empty) returns (WireOpResponse);
+}
+
+message Empty {}
+
+message WireOpRequest {
+  // Canonical wire op id (snake_case). Examples:
+  // "describe_capabilities", "list_plugins", "reload_catalogue".
+  string op_id = 1;
+
+  // JSON-encoded request payload bytes. Empty for ops with no
+  // parameters.
+  bytes payload_json = 2;
+
+  // Optional bearer token (base64) presented for capability
+  // gating. Empty for anonymous ops.
+  string bearer_token = 3;
+}
+
+message WireOpResponse {
+  // JSON-encoded response payload bytes.
+  bytes response_json = 1;
+
+  // Whether the response represents an error response shape
+  // (the steward's structured ApiError envelope). False
+  // indicates a success response of the op's typed shape.
+  bool is_error = 2;
+}

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Per-pair reconciliation loop: framework-driven compose-and-apply.
 //!
 //! Each catalogue-declared `[[reconciliation_pairs]]` entry gets
@@ -415,6 +418,8 @@ impl ReconciliationCoordinator {
             correlation_id: 0,
             deadline: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let compose_resp = match self
             .router

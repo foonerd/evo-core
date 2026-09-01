@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end test for steward-managed out-of-process warden
 //! admission.
 //!
@@ -162,6 +165,33 @@ custody_failure_mode = "abort"
 
     std::fs::write(plugin_dir.join("manifest.toml"), manifest_text)
         .expect("writing test manifest.toml");
+    write_privileges(plugin_dir, "org.evo.example.warden");
+}
+
+/// Write a minimal `privileges.yaml` next to the manifest so the
+/// steward's compulsory admission-time OS-dependency parity gate
+/// finds the record it requires. `has_os_dependencies: false`
+/// matches the warden's actual runtime footprint (no external
+/// binaries), so the gate returns Ok immediately.
+fn write_privileges(plugin_dir: &std::path::Path, plugin_name: &str) {
+    let yaml = format!(
+        r#"schema_version: "1.0"
+plugin: {plugin_name}
+owner: evo-framework-core
+isolation: oop
+has_os_dependencies: false
+capability_intent: []
+required_binaries: []
+required_kernel_modules: []
+required_system_services: []
+verification:
+  commands: ["true"]
+  expected: ["fixture: parity gate reads empty required_* vectors"]
+host_provisioning: {{}}
+"#
+    );
+    std::fs::write(plugin_dir.join("privileges.yaml"), yaml)
+        .expect("writing test privileges.yaml");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

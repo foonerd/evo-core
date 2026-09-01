@@ -1,0 +1,14 @@
+[package]
+name = "evo-projection-grpc"
+description = "gRPC projection of the wire-protocol schema. Emits the canonical `.proto` file content (service Evo { ... } + message types) from the canonical schema; the runtime mount that stitches the projection onto a concrete gRPC server (tonic + tonic-build) consumes the emitted proto."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+evo-projection-core = { path = "../evo-projection-core" }
+
+[lints]
+workspace = true

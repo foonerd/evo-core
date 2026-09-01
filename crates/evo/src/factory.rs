@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Steward-side `InstanceAnnouncer` implementation for factory plugins.
 //!
 //! Factory plugins announce variable-cardinality single-claimant
@@ -559,8 +562,9 @@ impl InstanceAnnouncer for RegistryInstanceAnnouncer {
 
             // Drop the addressing the registry minted on announce.
             // The subject collapses if it was the only claimant
-            // (which is always true for factory-minted subjects in
-            // v0.1.11; multi-claimant factory subjects are deferred).
+            // (which is always true for factory-minted subjects
+            // currently; multi-claimant factory subjects are
+            // not in the current substrate).
             let addressing = ExternalAddressing::new(
                 FACTORY_INSTANCE_SCHEME,
                 addressing_value(&self.plugin_name, &instance_id),

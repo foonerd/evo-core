@@ -1,0 +1,68 @@
+schema_version: "1.0"
+plugin: com.example.mqtt.bridge
+owner: example-author
+isolation: oop
+
+# Set true when the plugin depends on any host-side OS package
+# (binary, kernel module, system service). The compulsory
+# parity gate at install-time and admission-time reads this
+# field FIRST: true + a missing required_binary = HARD FAIL.
+has_os_dependencies: false
+
+# ARCHETYPE: mqtt_bridge
+#
+# A plugin that bridges the framework to an MQTT broker for
+# sensor telemetry, home-automation integrations, or presence
+# broadcast. Subscribes to configured topics and publishes to
+# others. Typical use: react to Home Assistant events; expose
+# now-playing state to a dashboard; consume room-occupancy
+# sensors to drive auto-standby.
+#
+# TAILOR before shipping:
+#   - `plugin` — replace with the reverse-DNS canonical id for
+#     your plugin (e.g. `com.acme.mqtt.home-assistant`).
+#   - `owner` — the accountable team / individual / organisation.
+#   - `verification.commands` — read-only shell commands that
+#     confirm the host actually satisfies the intents. Every entry
+#     must exit 0 as the plugin's declared service identity.
+#   - If your broker requires client certificates, add a
+#     `ReadOnlyPaths` entry for `/etc/evo/plugins/<plugin-id>/certs`
+#     under `host_provisioning`.
+
+capability_intent:
+  - id: broker_connect
+    need: connect to a configured MQTT broker over TCP or TLS (typically 1883 / 8883) to publish and subscribe.
+    access_path: network/outbound
+    failure_mode: retry with backoff; expose disconnected state via structured event; no panic.
+  - id: state_storage
+    need: write per-plugin state directory to persist broker credentials, retained-message replay cursor, and subscription-topology snapshots.
+    access_path: filesystem/state
+    failure_mode: fall back to no-persistence mode (reconnects re-subscribe from config); structured event; no panic.
+
+required_binaries: []
+
+required_kernel_modules: []
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+    - "test -w /var/lib/evo"
+  expected:
+    - state directory exists
+    - state directory is writable as the declared service identity
+
+host_provisioning:
+  debian:
+    systemd:
+      SupplementaryGroups: []
+      CapabilityBoundingSet: []
+      AmbientCapabilities: []
+      ProtectSystem: strict
+      ProtectHome: "yes"
+      ReadWritePaths:
+        - /var/lib/evo/plugins/com.example.mqtt.bridge/state
+      NoNewPrivileges: true
+    capabilities: []
+    sudoers: []

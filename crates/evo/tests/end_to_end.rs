@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! End-to-end integration tests for the steward skeleton.
 //!
 //! Start a steward in the same process, connect a client to its Unix
@@ -1550,6 +1553,7 @@ async fn build_negotiation_harness(
         Arc::clone(&resolution_ledger),
         evo::catalogue::CatalogueSource::Configured,
         evo::time_trust::new_shared(),
+        evo::time_trust::new_shared_last_step(),
         false,
     );
 

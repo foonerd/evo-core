@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Steward-side implementations of the SDK callback traits.
 //!
 //! When the steward admits a plugin it calls `Plugin::load` with a
@@ -30,11 +33,17 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use evo_primitives::Cardinality;
+
 use crate::admin::{AdminLedger, AdminLogEntry, AdminLogKind};
-use crate::catalogue::{Cardinality, Catalogue};
+use crate::catalogue::Catalogue;
 use crate::happenings::{
     CardinalityViolationSide, Happening, HappeningBus, ReassignedClaimKind,
     RelationForgottenReason,
+};
+use crate::ledger::{
+    LedgerPrimitive, LifecycleEntry, LifecycleEventType, LifecycleOutcome,
+    LifecycleTarget,
 };
 use crate::persistence::PersistenceStore;
 use crate::projections::SubjectConflictIndex;
@@ -47,6 +56,115 @@ use crate::subjects::{
     AnnounceOutcome, ForcedRetractAddressingOutcome, SubjectRegistry,
     SubjectRetractOutcome,
 };
+
+/// Stable wire-string identifier for a [`LifecycleEventType`].
+/// Used as the `event_type` field on the
+/// [`Happening::PluginEvent`] companion that the wrapper emits
+/// alongside each ledger append. Plugin authors and observability
+/// tooling bind to these strings; changing one is a wire-breaking
+/// change for consumers.
+fn lifecycle_event_type_wire_str(
+    event_type: LifecycleEventType,
+) -> &'static str {
+    match event_type {
+        LifecycleEventType::StreamOpened => "evo.streams.opened",
+        LifecycleEventType::StreamClosed => "evo.streams.closed",
+        LifecycleEventType::NotificationSent => "evo.notifications.sent",
+        LifecycleEventType::NotificationCancelled => {
+            "evo.notifications.cancelled"
+        }
+        LifecycleEventType::MetadataQueryDispatched => {
+            "evo.metadata.query_dispatched"
+        }
+        LifecycleEventType::MetadataProviderTimedOut => {
+            "evo.metadata.provider_timed_out"
+        }
+        LifecycleEventType::MetadataProviderFailed => {
+            "evo.metadata.provider_failed"
+        }
+        LifecycleEventType::VerbDispatched => "evo.verbs.dispatched",
+        LifecycleEventType::PublisherTrustGranted => {
+            "evo.publisher_trust.granted"
+        }
+        LifecycleEventType::PublisherTrustRevoked => {
+            "evo.publisher_trust.revoked"
+        }
+        LifecycleEventType::StepUpAuthAttempted => "evo.auth.step_up_attempted",
+        LifecycleEventType::OperationExecuted => "evo.operation.executed",
+        LifecycleEventType::OperationDenied => "evo.operation.denied",
+    }
+}
+
+/// Append a lifecycle entry to both observability planes — the
+/// happenings bus (live observability) and the audit-grade ledger
+/// (forensic record). Best-effort: failures on either plane are
+/// logged via tracing and swallowed; the plugin's primary
+/// operation already succeeded by the time this helper runs, and
+/// telemetry write failures must never propagate as plugin-visible
+/// errors.
+///
+/// Source-plugin attribution: the `plugin_name` argument is taken
+/// from the wrapper's bound name (the plugin's canonical identity),
+/// not from any plugin-supplied payload field. Plugins cannot spoof
+/// another plugin's identity in either plane.
+async fn record_lifecycle_dual_plane(
+    hap: Option<&Arc<HappeningBus>>,
+    ledger: Option<&Arc<LedgerPrimitive>>,
+    plugin_name: &str,
+    event_type: LifecycleEventType,
+    target: LifecycleTarget,
+    outcome: LifecycleOutcome,
+    payload: serde_json::Value,
+) {
+    let recorded_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    if let Some(ledger) = ledger {
+        let entry = LifecycleEntry {
+            event_type,
+            source_plugin: plugin_name.to_string(),
+            target: target.clone(),
+            recorded_at_ms,
+            outcome: outcome.clone(),
+            payload: payload.clone(),
+        };
+        if let Err(e) = ledger.append_lifecycle(&entry).await {
+            tracing::warn!(
+                plugin = %plugin_name,
+                event_type = ?event_type,
+                error = %e,
+                "lifecycle ledger write failed; primary op already succeeded",
+            );
+        }
+    }
+
+    if let Some(bus) = hap {
+        let event_type_str = lifecycle_event_type_wire_str(event_type);
+        let happening_payload = serde_json::json!({
+            "target": target,
+            "outcome": outcome,
+            "payload": payload,
+        });
+        if let Err(e) = bus
+            .emit_durable(Happening::PluginEvent {
+                plugin: plugin_name.to_string(),
+                event_type: event_type_str.to_string(),
+                payload: happening_payload,
+                at: SystemTime::now(),
+            })
+            .await
+        {
+            tracing::warn!(
+                plugin = %plugin_name,
+                event_type = %event_type_str,
+                error = %e,
+                "lifecycle happening emit failed; primary op already succeeded",
+            );
+        }
+    }
+}
 
 /// A trivial state reporter that logs each report and returns success.
 ///
@@ -221,6 +339,23 @@ impl evo_plugin_sdk::contract::HappeningEmitter for LoggingHappeningEmitter {
                 event_type = %event_type,
                 "PluginEvent emitted on logging stub (test scaffolding); \
                  no bus write"
+            );
+            Ok(())
+        })
+    }
+
+    fn emit_audio_playback_ended<'a>(
+        &'a self,
+        claim_uri: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let name = self.plugin_name.clone();
+        Box::pin(async move {
+            tracing::debug!(
+                plugin = %name,
+                claim_uri = ?claim_uri,
+                "AudioPlaybackEnded emitted on logging stub \
+                 (test scaffolding); no bus write"
             );
             Ok(())
         })
@@ -404,6 +539,29 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                 "plugin verb invoking"
             );
 
+            // Subject-state size cap. State payloads
+            // are operator-trusted but unbounded payloads would
+            // exhaust device memory at MCU / Pi 0 hardware tiers.
+            // Refuse oversized state at the registry boundary; the
+            // plugin learns to keep state slim. Performed before the
+            // catalogue check so the SerdeJson serialise cost is paid
+            // only when the announcement is otherwise plausible (the
+            // catalogue check is cheap; if it fails the announcement
+            // is rejected anyway). Null state is the no-state
+            // sentinel and bypasses the cap.
+            if !announcement.state.is_null() {
+                let state_len = serde_json::to_string(&announcement.state)
+                    .map(|s| s.len())
+                    .unwrap_or(usize::MAX);
+                if state_len > crate::subjects::SUBJECT_STATE_MAX_BYTES {
+                    return Err(ReportError::Invalid(format!(
+                        "subject state payload {state_len} bytes exceeds \
+                         cap of {} bytes",
+                        crate::subjects::SUBJECT_STATE_MAX_BYTES,
+                    )));
+                }
+            }
+
             // Subject-type existence validation at announcement.
             // The announced subject type must correspond to a type
             // the catalogue declared; an undeclared type is refused
@@ -472,6 +630,48 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                                 "subject announce persist failed: {e}"
                             ))
                         })?;
+
+                    // Subject-state durable mirror. Writes the
+                    // announced `SubjectAnnouncement.state` payload
+                    // through to the `subject_states` table so it
+                    // survives a steward restart. Only writes when
+                    // the announcement carries non-null state and the
+                    // outcome resolved a canonical id (Created or
+                    // Updated; NoChange and Conflict skip per the
+                    // sync registry's own discipline).
+                    let writes_state = !announcement.state.is_null()
+                        && matches!(
+                            outcome,
+                            AnnounceOutcome::Created(_)
+                                | AnnounceOutcome::Updated(_)
+                        );
+                    if writes_state {
+                        match serde_json::to_string(&announcement.state) {
+                            Ok(state_json) => {
+                                store
+                                    .record_subject_state(
+                                        canonical_id,
+                                        &state_json,
+                                        at_ms,
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        ReportError::Invalid(format!(
+                                            "subject state persist failed: {e}"
+                                        ))
+                                    })?;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    subject_id = %canonical_id,
+                                    error = %e,
+                                    "subject state serialise failed; \
+                                     in-memory state retained but won't \
+                                     survive restart"
+                                );
+                            }
+                        }
+                    }
                 }
             }
 
@@ -632,7 +832,11 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                     //    claim_log entry. Runs before the happening
                     //    emission so a subscriber reacting by
                     //    querying `describe_alias` always sees the
-                    //    tombstone in place.
+                    //    tombstone in place. Also clear any
+                    //    persisted subject-state row: the
+                    //    sync registry already removed the in-memory
+                    //    state when it forgot the subject; the
+                    //    persistence row needs the symmetric delete.
                     if let Some(store) = persistence.as_ref() {
                         store
                             .record_subject_forget(
@@ -645,6 +849,14 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                             .map_err(|e| {
                                 ReportError::Invalid(format!(
                                     "subject forget persist failed: {e}"
+                                ))
+                            })?;
+                        store
+                            .forget_subject_state(&canonical_id)
+                            .await
+                            .map_err(|e| {
+                                ReportError::Invalid(format!(
+                                    "subject state forget persist failed: {e}"
                                 ))
                             })?;
                     }
@@ -742,10 +954,67 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
         state: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
     {
+        self.update_state_inner(addressing, state, true)
+    }
+
+    fn update_state_volatile<'a>(
+        &'a self,
+        addressing: ExternalAddressing,
+        state: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        self.update_state_inner(addressing, state, false)
+    }
+
+    fn seed_interest_zero<'a>(
+        &'a self,
+        subject_type: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let registry = Arc::clone(&self.registry);
+        Box::pin(async move {
+            registry.seed_interest_zero(&subject_type).await;
+            Ok(())
+        })
+    }
+}
+
+impl RegistrySubjectAnnouncer {
+    /// Shared body for `update_state` and `update_state_volatile`.
+    /// Same authorisation, in-memory update, and happenings
+    /// emission; the `persist_durable` flag gates whether the new
+    /// state is mirrored into the durable `subject_states` table.
+    /// Volatile subjects (high-rate telemetry — spectrum frames,
+    /// VU-meter samples) skip the mirror; the wire semantics are
+    /// otherwise identical.
+    fn update_state_inner<'a>(
+        &'a self,
+        addressing: ExternalAddressing,
+        state: serde_json::Value,
+        persist_durable: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
         let registry = Arc::clone(&self.registry);
         let bus = Arc::clone(&self.bus);
         let plugin_name = self.plugin_name.clone();
+        let persistence = self.persistence.clone();
         Box::pin(async move {
+            // Subject-state size cap. Same cap as
+            // announce. Null state is the no-state sentinel and
+            // bypasses the cap (it clears the row).
+            if !state.is_null() {
+                let state_len = serde_json::to_string(&state)
+                    .map(|s| s.len())
+                    .unwrap_or(usize::MAX);
+                if state_len > crate::subjects::SUBJECT_STATE_MAX_BYTES {
+                    return Err(ReportError::Invalid(format!(
+                        "subject state payload {state_len} bytes exceeds \
+                         cap of {} bytes",
+                        crate::subjects::SUBJECT_STATE_MAX_BYTES,
+                    )));
+                }
+            }
+
             // Resolve the addressing under the registry lock so the
             // canonical id we ground the update on is the one live
             // at request time. A subsequent merge / split / forget
@@ -793,6 +1062,58 @@ impl SubjectAnnouncer for RegistrySubjectAnnouncer {
                 .map_err(|e| {
                     ReportError::Invalid(format!("update_state: {e}"))
                 })?;
+
+            // Subject-state durable mirror. Null state
+            // clears the persisted row; non-null state upserts. The
+            // write happens before the bus emit so a subscriber that
+            // reacts to `SubjectStateChanged` by querying durable
+            // state sees consistent values.
+            //
+            // Volatile subjects (spectrum frames et al.) skip the
+            // mirror entirely — the in-memory update above is the
+            // only durable trace of the value change on the
+            // steward side, and the wire happening emitted below
+            // is the operator-visible signal.
+            if persist_durable {
+                if let Some(store) = persistence.as_ref() {
+                    let at_ms = system_time_to_ms(SystemTime::now());
+                    if state.is_null() {
+                        store
+                            .forget_subject_state(&canonical_id)
+                            .await
+                            .map_err(|e| {
+                                ReportError::Invalid(format!(
+                                    "subject state forget persist failed: {e}"
+                                ))
+                            })?;
+                    } else {
+                        match serde_json::to_string(&state) {
+                            Ok(state_json) => {
+                                store
+                                    .record_subject_state(
+                                        &canonical_id,
+                                        &state_json,
+                                        at_ms,
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        ReportError::Invalid(format!(
+                                            "subject state persist failed: {e}"
+                                        ))
+                                    })?;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    subject_id = %canonical_id,
+                                    error = %e,
+                                    "subject state serialise failed; in-memory \
+                                     state retained but won't survive restart"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
 
             let at = SystemTime::now();
             bus.emit_durable(Happening::SubjectStateChanged {
@@ -3770,6 +4091,1433 @@ impl evo_plugin_sdk::contract::HappeningEmitter for RouterHappeningEmitter {
             Ok(())
         })
     }
+
+    fn emit_audio_playback_ended<'a>(
+        &'a self,
+        claim_uri: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        let bus = Arc::clone(&self.bus);
+        let source_plugin = self.plugin_name.clone();
+        Box::pin(async move {
+            bus.emit_durable(
+                crate::happenings::Happening::AudioPlaybackEnded {
+                    source_plugin,
+                    claim_uri,
+                    at: std::time::SystemTime::now(),
+                },
+            )
+            .await
+            .map_err(|e| ReportError::Invalid(format!("{e}")))?;
+            Ok(())
+        })
+    }
+}
+
+/// In-process [`evo_plugin_sdk::contract::Scheduler`] backed by a
+/// shared [`crate::scheduler::SchedulerRuntime`]. Used by the
+/// admission engine to populate
+/// [`evo_plugin_sdk::contract::LoadContext::scheduler`] for plugins
+/// whose manifest declares `capabilities.scheduler = true`.
+///
+/// The wrapper binds the dispatcher to the plugin's canonical
+/// name so every task is namespaced under that creator label;
+/// `list` returns only the calling plugin's schedules. Plugins
+/// see their own `task_id` namespace and cannot enumerate or
+/// cancel another plugin's schedules through the SDK surface.
+#[derive(Debug)]
+pub struct RouterScheduler {
+    runtime: Arc<crate::scheduler::SchedulerRuntime>,
+    plugin_name: String,
+}
+
+impl RouterScheduler {
+    /// Construct a scheduler bound to the shared runtime and a
+    /// plugin's canonical name. The name is used as the creator
+    /// label on every task the plugin schedules.
+    pub fn new(
+        runtime: Arc<crate::scheduler::SchedulerRuntime>,
+        plugin_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            runtime,
+            plugin_name: plugin_name.into(),
+        }
+    }
+
+    /// Borrow the bound plugin name.
+    pub fn plugin_name(&self) -> &str {
+        &self.plugin_name
+    }
+}
+
+fn scheduler_error_to_sdk(
+    err: evo_plugin_sdk::contract::SchedulerError,
+) -> evo_plugin_sdk::contract::SchedulerError {
+    err
+}
+
+impl evo_plugin_sdk::contract::Scheduler for RouterScheduler {
+    fn schedule<'a>(
+        &'a self,
+        spec: evo_plugin_sdk::contract::ScheduleSpec,
+        action: evo_plugin_sdk::contract::ScheduleAction,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        evo_plugin_sdk::contract::ScheduleHandle,
+                        evo_plugin_sdk::contract::SchedulerError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let runtime = Arc::clone(&self.runtime);
+        let creator = self.plugin_name.clone();
+        Box::pin(async move {
+            runtime
+                .schedule(&creator, spec, action)
+                .await
+                .map_err(scheduler_error_to_sdk)
+        })
+    }
+
+    fn cancel<'a>(
+        &'a self,
+        handle: evo_plugin_sdk::contract::ScheduleHandle,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        (),
+                        evo_plugin_sdk::contract::SchedulerError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let runtime = Arc::clone(&self.runtime);
+        let creator = self.plugin_name.clone();
+        Box::pin(async move {
+            runtime
+                .cancel(&creator, handle.as_str())
+                .await
+                .map_err(scheduler_error_to_sdk)
+        })
+    }
+
+    fn query<'a>(
+        &'a self,
+        handle: evo_plugin_sdk::contract::ScheduleHandle,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        evo_plugin_sdk::contract::ScheduleState,
+                        evo_plugin_sdk::contract::SchedulerError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let runtime = Arc::clone(&self.runtime);
+        let creator = self.plugin_name.clone();
+        Box::pin(async move {
+            runtime.query(&creator, handle.as_str()).ok_or_else(|| {
+                evo_plugin_sdk::contract::SchedulerError::NotFound(
+                    handle.to_string(),
+                )
+            })
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<evo_plugin_sdk::contract::ScheduleSummary>,
+                        evo_plugin_sdk::contract::SchedulerError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let runtime = Arc::clone(&self.runtime);
+        let creator = self.plugin_name.clone();
+        Box::pin(async move { Ok(runtime.list_by_creator(&creator)) })
+    }
+}
+
+/// In-process [`evo_plugin_sdk::contract::StreamHost`] backed by a
+/// shared [`crate::streams::StreamCoordinator`]. Used by the
+/// admission engine to populate
+/// [`evo_plugin_sdk::contract::LoadContext::streams`] for plugins
+/// whose manifest declares `capabilities.streams = true`.
+///
+/// The wrapper translates the SDK trait's id-only contract
+/// (`open` returns the same `StreamId`, `emit` and `close` accept
+/// just the id) onto the coordinator's `StreamHandle`-based
+/// surface internally; the plugin never sees a `StreamHandle`.
+#[derive(Debug)]
+pub struct CoordinatorStreamHost {
+    coordinator: Arc<crate::streams::StreamCoordinator>,
+    plugin_name: String,
+    hap: Option<Arc<HappeningBus>>,
+    ledger: Option<Arc<LedgerPrimitive>>,
+}
+
+impl CoordinatorStreamHost {
+    /// Construct a host bound to the shared coordinator and a
+    /// plugin's canonical name. The name is preserved for future
+    /// per-producer attribution; the in-process surface does not
+    /// yet record it on emit, but the storage shape is already
+    /// in place for the wire-op handler to attribute frames per
+    /// connection.
+    pub fn new(
+        coordinator: Arc<crate::streams::StreamCoordinator>,
+        plugin_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            coordinator,
+            plugin_name: plugin_name.into(),
+            hap: None,
+            ledger: None,
+        }
+    }
+
+    /// Builder-style setter for the dual-plane lifecycle telemetry
+    /// handles. Production admission flows attach both
+    /// (`HappeningBus` for live observability, `LedgerPrimitive`
+    /// for the audit-grade forensic record). Tests that exercise
+    /// only the primary surface omit telemetry; the wrapper is a
+    /// no-op on each plane when its handle is `None`.
+    pub fn with_telemetry(
+        mut self,
+        hap: Arc<HappeningBus>,
+        ledger: Arc<LedgerPrimitive>,
+    ) -> Self {
+        self.hap = Some(hap);
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// Borrow the plugin name this host is bound to.
+    pub fn plugin_name(&self) -> &str {
+        &self.plugin_name
+    }
+}
+
+impl evo_plugin_sdk::contract::StreamHost for CoordinatorStreamHost {
+    fn open<'a>(
+        &'a self,
+        stream_id: evo_plugin_sdk::contract::StreamId,
+        spec: evo_plugin_sdk::contract::StreamSpec,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        evo_plugin_sdk::contract::StreamId,
+                        evo_plugin_sdk::contract::StreamError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let coordinator = Arc::clone(&self.coordinator);
+        let hap = self.hap.clone();
+        let ledger = self.ledger.clone();
+        let plugin_name = self.plugin_name.clone();
+        Box::pin(async move {
+            coordinator.open(stream_id.clone(), spec.clone())?;
+            // Lifecycle telemetry: forensic payload carries the
+            // stream's spec at open so a forensic analyst can
+            // reconstruct what the producer announced (schema,
+            // codecs, max_rate_hz, accepted backpressure
+            // policies) without consulting plugin-side logs.
+            let payload = serde_json::json!({
+                "schema": spec.schema,
+                "codecs": spec.codecs,
+                "max_rate_hz": spec.max_rate_hz,
+                "typical_payload_bytes": spec.typical_payload_bytes,
+                "backpressure_policies": spec
+                    .backpressure_policies
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>(),
+            });
+            record_lifecycle_dual_plane(
+                hap.as_ref(),
+                ledger.as_ref(),
+                &plugin_name,
+                LifecycleEventType::StreamOpened,
+                LifecycleTarget::Stream {
+                    stream_id: stream_id.to_string(),
+                },
+                LifecycleOutcome::Success,
+                payload,
+            )
+            .await;
+            Ok(stream_id)
+        })
+    }
+
+    fn emit<'a>(
+        &'a self,
+        stream_id: evo_plugin_sdk::contract::StreamId,
+        produced_at_ns: u64,
+        codec: String,
+        payload: Vec<u8>,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        evo_plugin_sdk::contract::EmitResult,
+                        evo_plugin_sdk::contract::StreamError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let coordinator = Arc::clone(&self.coordinator);
+        Box::pin(async move {
+            let handle = crate::streams::StreamHandle::for_id(stream_id);
+            coordinator.emit(&handle, produced_at_ns, codec, payload)
+        })
+    }
+
+    fn close<'a>(
+        &'a self,
+        stream_id: evo_plugin_sdk::contract::StreamId,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<(), evo_plugin_sdk::contract::StreamError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let coordinator = Arc::clone(&self.coordinator);
+        let hap = self.hap.clone();
+        let ledger = self.ledger.clone();
+        let plugin_name = self.plugin_name.clone();
+        let stream_id_str = stream_id.to_string();
+        Box::pin(async move {
+            let handle = crate::streams::StreamHandle::for_id(stream_id);
+            coordinator.close(&handle)?;
+            record_lifecycle_dual_plane(
+                hap.as_ref(),
+                ledger.as_ref(),
+                &plugin_name,
+                LifecycleEventType::StreamClosed,
+                LifecycleTarget::Stream {
+                    stream_id: stream_id_str,
+                },
+                LifecycleOutcome::Success,
+                serde_json::json!({}),
+            )
+            .await;
+            Ok(())
+        })
+    }
+}
+
+/// [`evo_plugin_sdk::contract::NotificationEmitter`] implementation
+/// that forwards trait calls to the `system.notifications` shelf via
+/// the framework's [`ShelfRequestDispatcher`]. The reference plugin
+/// stocking that shelf
+/// (`org.evoframework.system.notifications`) owns the actual
+/// dispatcher state (active list + operator base mode + quiet-hours
+/// policy + group coalescing); this adapter only serialises the
+/// trait call into the shelf's declared verb payload, dispatches it,
+/// and translates the response back to the trait's return type.
+///
+/// The adapter is populated on every plugin's
+/// [`evo_plugin_sdk::contract::LoadContext::notifications`] when the
+/// plugin's manifest declares `capabilities.notifications = true`
+/// AND the admission engine was configured with a
+/// `ShelfRequestDispatcher` (production boot always is). Plugins
+/// that did not opt in see `None` on the load context and calls
+/// panic on unwrap, matching the pattern the other capability-gated
+/// context handles use.
+///
+/// ## Source-plugin attribution
+///
+/// The trait surface accepts a [`Notification`] whose
+/// `source_plugin` field the plugin supplies. This adapter records
+/// the caller's canonical name on construction and overwrites
+/// `notification.source_plugin` with it before serialisation. A
+/// plugin cannot spoof another plugin's canonical name on the
+/// operator's notifications tray (the shelf plugin trusts the
+/// payload; framework enforces the value here).
+///
+/// ## Error mapping
+///
+/// [`ShelfDispatchError`] flattens onto [`NotificationError`]:
+///
+/// - `NoPluginOnShelf` / `VerbNotStockedOnShelf` → `Invalid(msg)`
+///   with a message naming the shelf/verb — plugin author knows the
+///   notifications plugin was not admitted or the shelf shape has
+///   drifted.
+/// - `Permanent{detail}` / `Transient{detail}` /
+///   `SubstrateFailure{detail}` → `Invalid(detail)`.
+/// - `DeadlineExceeded{budget_ms}` → `Invalid("deadline exceeded")`.
+///
+/// Cancelling an unknown handle would normally surface as
+/// `NotificationError::HandleNotFound`, but the reference plugin
+/// treats cancel as idempotent (returns success for unknown handles
+/// per the shelf's `cancel-verb-idempotent` acceptance criterion),
+/// so this adapter never observes the variant from that plugin. The
+/// variant is preserved on the trait surface so alternate back-ends
+/// under vendor namespaces may raise it if they choose.
+pub struct VerbDispatchNotificationEmitter {
+    dispatcher: Arc<dyn evo_plugin_sdk::contract::ShelfRequestDispatcher>,
+    plugin_name: String,
+}
+
+impl std::fmt::Debug for VerbDispatchNotificationEmitter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerbDispatchNotificationEmitter")
+            .field("plugin_name", &self.plugin_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VerbDispatchNotificationEmitter {
+    /// Construct an adapter bound to the shared shelf-request
+    /// dispatcher and a plugin's canonical name.
+    pub fn new(
+        dispatcher: Arc<dyn evo_plugin_sdk::contract::ShelfRequestDispatcher>,
+        plugin_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            dispatcher,
+            plugin_name: plugin_name.into(),
+        }
+    }
+
+    /// Borrow the plugin name this adapter is bound to.
+    pub fn plugin_name(&self) -> &str {
+        &self.plugin_name
+    }
+}
+
+/// Wire-shape request the notifications plugin's `system.notifications.send`
+/// verb deserialises. Kept private — plugin authors interact through
+/// the SDK trait, not the wire envelope.
+#[derive(serde::Serialize)]
+struct VerbSendRequest {
+    notification: evo_plugin_sdk::contract::Notification,
+}
+
+/// Wire-shape response the notifications plugin's `system.notifications.send`
+/// verb serialises. Kept private for the same reason.
+#[derive(serde::Deserialize)]
+struct VerbSendResponse {
+    handle: u64,
+    /// Present but unused at the adapter — the trait surface does
+    /// not expose the resolved mode. Consumers who need it read the
+    /// `system_notifications_active` subject instead.
+    #[serde(default)]
+    #[allow(dead_code)]
+    resolved_mode: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct VerbCancelRequest {
+    handle: u64,
+}
+
+fn shelf_dispatch_error_to_notification_error(
+    e: evo_plugin_sdk::contract::ShelfDispatchError,
+) -> evo_plugin_sdk::contract::NotificationError {
+    use evo_plugin_sdk::contract::{NotificationError, ShelfDispatchError};
+    match e {
+        ShelfDispatchError::NoPluginOnShelf { shelf } => {
+            NotificationError::Invalid(format!(
+                "notifications: no plugin on shelf {shelf:?} \
+                 (the reference plugin org.evoframework.system.notifications \
+                 may not be admitted)"
+            ))
+        }
+        ShelfDispatchError::VerbNotStockedOnShelf {
+            shelf,
+            request_type,
+        } => NotificationError::Invalid(format!(
+            "notifications: verb {request_type:?} not stocked on shelf \
+                 {shelf:?}"
+        )),
+        ShelfDispatchError::Permanent { detail }
+        | ShelfDispatchError::Transient { detail }
+        | ShelfDispatchError::SubstrateFailure { detail } => {
+            NotificationError::Invalid(detail)
+        }
+        ShelfDispatchError::DeadlineExceeded { budget_ms } => {
+            NotificationError::Invalid(format!(
+                "notifications: dispatch deadline exceeded (budget \
+                 {budget_ms}ms)"
+            ))
+        }
+    }
+}
+
+impl evo_plugin_sdk::contract::NotificationEmitter
+    for VerbDispatchNotificationEmitter
+{
+    fn send<'a>(
+        &'a self,
+        mut notification: evo_plugin_sdk::contract::Notification,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        evo_plugin_sdk::contract::NotificationHandle,
+                        evo_plugin_sdk::contract::NotificationError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let plugin_name = self.plugin_name.clone();
+        Box::pin(async move {
+            // Source-plugin attribution: overwrite whatever the
+            // caller set with the plugin's canonical name.
+            notification.source_plugin = plugin_name;
+            let payload_bytes =
+                serde_json::to_vec(&VerbSendRequest { notification }).map_err(
+                    |e| {
+                        evo_plugin_sdk::contract::NotificationError::Invalid(
+                            format!(
+                                "notifications: serialise send payload: {e}"
+                            ),
+                        )
+                    },
+                )?;
+            let response_bytes = self
+                .dispatcher
+                .dispatch(
+                    "system.notifications",
+                    "system.notifications.send",
+                    payload_bytes,
+                    None,
+                )
+                .await
+                .map_err(shelf_dispatch_error_to_notification_error)?;
+            let response: VerbSendResponse =
+                serde_json::from_slice(&response_bytes).map_err(|e| {
+                    evo_plugin_sdk::contract::NotificationError::Invalid(
+                        format!("notifications: parse send response: {e}"),
+                    )
+                })?;
+            Ok(evo_plugin_sdk::contract::NotificationHandle::from_raw(
+                response.handle,
+            ))
+        })
+    }
+
+    fn cancel<'a>(
+        &'a self,
+        handle: evo_plugin_sdk::contract::NotificationHandle,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        (),
+                        evo_plugin_sdk::contract::NotificationError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let payload_bytes = serde_json::to_vec(&VerbCancelRequest {
+                handle: handle.raw(),
+            })
+            .map_err(|e| {
+                evo_plugin_sdk::contract::NotificationError::Invalid(format!(
+                    "notifications: serialise cancel payload: {e}"
+                ))
+            })?;
+            self.dispatcher
+                .dispatch(
+                    "system.notifications",
+                    "system.notifications.cancel",
+                    payload_bytes,
+                    None,
+                )
+                .await
+                .map_err(shelf_dispatch_error_to_notification_error)?;
+            Ok(())
+        })
+    }
+}
+
+/// In-process [`evo_plugin_sdk::contract::MetadataConsumer`]
+/// backed by a shared [`crate::metadata::MetadataChain`]. Used by
+/// the admission engine to populate
+/// [`evo_plugin_sdk::contract::LoadContext::metadata`] for plugins
+/// whose manifest declares `capabilities.metadata = true`.
+///
+/// The wrapper translates the chain's
+/// [`crate::metadata::ChainError`] onto the SDK-level
+/// [`evo_plugin_sdk::contract::MetadataError`] surface so plugins
+/// see a single error type across the producer / consumer
+/// boundaries (the producer side already returns `MetadataError`).
+#[derive(Debug)]
+pub struct ChainMetadataConsumer {
+    chain: Arc<crate::metadata::MetadataChain>,
+    plugin_name: String,
+    hap: Option<Arc<HappeningBus>>,
+    ledger: Option<Arc<LedgerPrimitive>>,
+}
+
+impl ChainMetadataConsumer {
+    /// Construct a consumer bound to the shared chain and the
+    /// plugin's canonical name. The name is preserved for future
+    /// per-consumer attribution; the in-process surface does not
+    /// yet record it on dispatch, but the storage shape is in
+    /// place for the wire-op handler to attribute queries per
+    /// connection.
+    pub fn new(
+        chain: Arc<crate::metadata::MetadataChain>,
+        plugin_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            chain,
+            plugin_name: plugin_name.into(),
+            hap: None,
+            ledger: None,
+        }
+    }
+
+    /// Builder-style setter for the dual-plane lifecycle telemetry
+    /// handles. See [`CoordinatorStreamHost::with_telemetry`] for
+    /// the symmetric pattern across the wiring-layer wrappers.
+    pub fn with_telemetry(
+        mut self,
+        hap: Arc<HappeningBus>,
+        ledger: Arc<LedgerPrimitive>,
+    ) -> Self {
+        self.hap = Some(hap);
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// Borrow the plugin name this consumer is bound to.
+    pub fn plugin_name(&self) -> &str {
+        &self.plugin_name
+    }
+}
+
+fn chain_error_to_sdk(
+    err: crate::metadata::ChainError,
+) -> evo_plugin_sdk::contract::MetadataError {
+    use evo_plugin_sdk::contract::MetadataError;
+    match err {
+        crate::metadata::ChainError::NoProviders => {
+            MetadataError::Provider("no providers registered".into())
+        }
+        crate::metadata::ChainError::Invalid(s) => MetadataError::Invalid(s),
+        crate::metadata::ChainError::Provider(e) => e,
+    }
+}
+
+impl evo_plugin_sdk::contract::MetadataConsumer for ChainMetadataConsumer {
+    fn execute_query<'a>(
+        &'a self,
+        query: evo_plugin_sdk::contract::Query,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        evo_plugin_sdk::contract::ResultStream,
+                        evo_plugin_sdk::contract::MetadataError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let chain = Arc::clone(&self.chain);
+        let hap = self.hap.clone();
+        let ledger = self.ledger.clone();
+        let plugin_name = self.plugin_name.clone();
+        Box::pin(async move {
+            // Cache-key digest of the canonical query form is the
+            // forensic identifier the analyst joins on across
+            // dispatched / timed-out / failed entries that share
+            // the same query.
+            let query_digest = crate::metadata::canonical_query_digest(&query);
+            let result = chain
+                .execute_query(&query)
+                .await
+                .map_err(chain_error_to_sdk);
+
+            match &result {
+                Ok(stream) => {
+                    // Per-provider status summary in the dispatch
+                    // entry's payload — the forensic analyst sees
+                    // who returned, who timed out, who failed,
+                    // and whether the result was cache-served.
+                    let provider_summary: Vec<serde_json::Value> = stream
+                        .provider_status
+                        .iter()
+                        .map(|(pid, status)| {
+                            serde_json::json!({
+                                "provider_id": pid.to_string(),
+                                "status": status,
+                            })
+                        })
+                        .collect();
+                    let dispatch_payload = serde_json::json!({
+                        "items_returned": stream.items.len(),
+                        "partial": stream.partial,
+                        "from_cache": stream.from_cache,
+                        "cache_stale": stream.cache_stale,
+                        "providers": provider_summary,
+                    });
+                    record_lifecycle_dual_plane(
+                        hap.as_ref(),
+                        ledger.as_ref(),
+                        &plugin_name,
+                        LifecycleEventType::MetadataQueryDispatched,
+                        LifecycleTarget::MetadataQuery {
+                            query_digest: query_digest.clone(),
+                        },
+                        LifecycleOutcome::Success,
+                        dispatch_payload,
+                    )
+                    .await;
+
+                    // Per-provider failure / timeout entries land
+                    // alongside the dispatch entry, not in place
+                    // of it. A single query that hits five
+                    // providers (one timeout, one failure) emits
+                    // three telemetry rows: one
+                    // MetadataQueryDispatched, one
+                    // MetadataProviderTimedOut, one
+                    // MetadataProviderFailed. The dispatch row
+                    // references all five providers in payload;
+                    // the per-provider rows give the analyst a
+                    // direct hit on the misbehaving provider.
+                    for (pid, status) in &stream.provider_status {
+                        match status {
+                            evo_plugin_sdk::contract::ProviderStatus::TimedOut => {
+                                record_lifecycle_dual_plane(
+                                    hap.as_ref(),
+                                    ledger.as_ref(),
+                                    &plugin_name,
+                                    LifecycleEventType::MetadataProviderTimedOut,
+                                    LifecycleTarget::MetadataProvider {
+                                        provider_id: pid.to_string(),
+                                    },
+                                    LifecycleOutcome::Failed {
+                                        reason: "deadline exceeded".into(),
+                                    },
+                                    serde_json::json!({
+                                        "query_digest": query_digest,
+                                        "deadline_ms": chain
+                                            .config()
+                                            .provider_deadline
+                                            .as_millis() as u64,
+                                    }),
+                                )
+                                .await;
+                            }
+                            evo_plugin_sdk::contract::ProviderStatus::Failed { reason } => {
+                                record_lifecycle_dual_plane(
+                                    hap.as_ref(),
+                                    ledger.as_ref(),
+                                    &plugin_name,
+                                    LifecycleEventType::MetadataProviderFailed,
+                                    LifecycleTarget::MetadataProvider {
+                                        provider_id: pid.to_string(),
+                                    },
+                                    LifecycleOutcome::Failed {
+                                        reason: reason.clone(),
+                                    },
+                                    serde_json::json!({
+                                        "query_digest": query_digest,
+                                    }),
+                                )
+                                .await;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(e) => {
+                    record_lifecycle_dual_plane(
+                        hap.as_ref(),
+                        ledger.as_ref(),
+                        &plugin_name,
+                        LifecycleEventType::MetadataQueryDispatched,
+                        LifecycleTarget::MetadataQuery { query_digest },
+                        LifecycleOutcome::Failed {
+                            reason: e.to_string(),
+                        },
+                        serde_json::json!({}),
+                    )
+                    .await;
+                }
+            }
+            result
+        })
+    }
+
+    fn get_item<'a>(
+        &'a self,
+        provider_id: evo_plugin_sdk::contract::ProviderId,
+        uri: evo_plugin_sdk::contract::ItemUri,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        evo_plugin_sdk::contract::ProviderItem,
+                        evo_plugin_sdk::contract::MetadataError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let chain = Arc::clone(&self.chain);
+        Box::pin(async move {
+            chain
+                .get_item(&provider_id, &uri)
+                .await
+                .map_err(chain_error_to_sdk)
+        })
+    }
+
+    fn enrich<'a>(
+        &'a self,
+        refs: Vec<evo_plugin_sdk::contract::EnrichmentRef>,
+        fields: Vec<evo_plugin_sdk::contract::FieldName>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = evo_plugin_sdk::contract::EnrichmentBatch>
+                + Send
+                + 'a,
+        >,
+    > {
+        let chain = Arc::clone(&self.chain);
+        Box::pin(async move { chain.enrich(&refs, &fields).await })
+    }
+}
+
+/// Framework-side implementation of
+/// [`evo_plugin_sdk::contract::SubjectStateSubscriber`] backed
+/// by the in-memory [`SubjectRegistry`]. Subscribes to the
+/// registry's bus-wide state-change broadcast and wraps each
+/// receiver into an SDK-typed
+/// [`evo_plugin_sdk::contract::SubjectStateStream`] filtered to
+/// the canonical id the plugin asked about.
+///
+/// One instance per registry; cheap to clone (holds only an
+/// `Arc<SubjectRegistry>`). The admission engine threads one
+/// instance into every plugin's `LoadContext` whose manifest
+/// declares `capabilities.subscribe_subjects = true`.
+pub struct RegistrySubjectStateSubscriber {
+    registry: Arc<SubjectRegistry>,
+}
+
+impl RegistrySubjectStateSubscriber {
+    /// Construct against a shared [`SubjectRegistry`].
+    pub fn new(registry: Arc<SubjectRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+impl evo_plugin_sdk::contract::SubjectStateSubscriber
+    for RegistrySubjectStateSubscriber
+{
+    fn subscribe_subject<'a>(
+        &'a self,
+        canonical_id: String,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        evo_plugin_sdk::contract::SubjectStateStream,
+                        evo_plugin_sdk::ReportError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let registry = Arc::clone(&self.registry);
+        Box::pin(async move {
+            // The framework's broadcast item type is re-exported
+            // from the SDK, so the receiver type matches the
+            // SDK's SubjectStateStream constructor without an
+            // adapter step.
+            let rx = registry.subscribe_state_changes();
+            Ok(evo_plugin_sdk::contract::SubjectStateStream::new(
+                rx,
+                canonical_id,
+            ))
+        })
+    }
+
+    fn current_state<'a>(
+        &'a self,
+        canonical_id: String,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Option<serde_json::Value>,
+                        evo_plugin_sdk::ReportError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let registry = Arc::clone(&self.registry);
+        Box::pin(async move { Ok(registry.state_of(&canonical_id)) })
+    }
+}
+
+/// Framework-side adapter binding
+/// [`crate::audio_plane::AudioPlaneRuntime`] to the plugin SDK's
+/// [`evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle`]
+/// trait. The admission engine wraps the shared runtime in one
+/// of these per plugin whose manifest declares
+/// `capabilities.audio_plane = true` and populates
+/// `LoadContext::audio_plane` so the plugin can fan audio
+/// frames out to multi-room receivers + subscribe to incoming
+/// frames from a source-host peer.
+pub struct RuntimeAudioPlaneHandle {
+    runtime: Arc<crate::audio_plane::AudioPlaneRuntime>,
+    /// Group store the audio plane consults when fanning frames
+    /// out. Kept as a direct handle on this wrapper so the
+    /// SDK-side `upsert_group` method (used by source-host
+    /// plugins to instantiate their group from operator config)
+    /// reaches the same store the runtime reads from.
+    group_store: Arc<crate::groups::GroupStore>,
+}
+
+impl RuntimeAudioPlaneHandle {
+    /// Construct against a shared [`crate::audio_plane::AudioPlaneRuntime`]
+    /// + the framework's [`crate::groups::GroupStore`].
+    pub fn new(
+        runtime: Arc<crate::audio_plane::AudioPlaneRuntime>,
+        group_store: Arc<crate::groups::GroupStore>,
+    ) -> Self {
+        Self {
+            runtime,
+            group_store,
+        }
+    }
+}
+
+impl evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle
+    for RuntimeAudioPlaneHandle
+{
+    fn subscribe_audio_frames<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        evo_plugin_sdk::contract::audio_plane::AudioFrameStream,
+                        evo_plugin_sdk::contract::PluginError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            // The framework's broadcast item type re-exports the
+            // SDK's AudioFrameReceived, so the receiver matches
+            // the SDK's AudioFrameStream constructor without an
+            // adapter step.
+            let rx = runtime.subscribe_audio_frames();
+            Ok(
+                evo_plugin_sdk::contract::audio_plane::AudioFrameStream::new(
+                    rx,
+                ),
+            )
+        })
+    }
+
+    fn fan_out_audio_frame<'a>(
+        &'a self,
+        group_id: String,
+        frame: evo_plugin_sdk::contract::audio_plane::AudioFrameSeed,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), evo_plugin_sdk::contract::PluginError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            // Map the SDK envelope to the runtime's seed type.
+            // The runtime's fan_out_audio_frame consumes its
+            // own AudioFrameSeed; the SDK type carries the same
+            // fields so the conversion is a trivial struct
+            // re-pack.
+            let seed = crate::audio_plane::AudioFrameSeed {
+                sequence: frame.sequence,
+                presentation_time_ms: frame.presentation_time_ms,
+                codec: frame.codec,
+                rate_hz: frame.rate_hz,
+                channels: frame.channels,
+                payload_b64: frame.payload_b64,
+            };
+            runtime.fan_out_audio_frame(&group_id, seed).await;
+            Ok(())
+        })
+    }
+
+    fn upsert_group<'a>(
+        &'a self,
+        group_id: String,
+        display_name: String,
+        members: Vec<String>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), evo_plugin_sdk::contract::PluginError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let group_store = Arc::clone(&self.group_store);
+        Box::pin(async move {
+            group_store
+                .upsert_with_id(&group_id, &display_name, &members)
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    evo_plugin_sdk::contract::PluginError::Permanent(format!(
+                        "upsert_group({group_id}) failed: {e}"
+                    ))
+                })?;
+            Ok(())
+        })
+    }
+
+    fn dial_peer<'a>(
+        &'a self,
+        addr: String,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), evo_plugin_sdk::contract::PluginError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            let sock = addr.parse::<std::net::SocketAddr>().map_err(|e| {
+                evo_plugin_sdk::contract::PluginError::Permanent(format!(
+                    "dial_peer({addr}) address parse failed: {e}"
+                ))
+            })?;
+            runtime.dial_peer(sock).await.map_err(|e| {
+                evo_plugin_sdk::contract::PluginError::Permanent(format!(
+                    "dial_peer({addr}) failed: {e}"
+                ))
+            })
+        })
+    }
+
+    fn close_outbound_connections<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), evo_plugin_sdk::contract::PluginError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            runtime.close_outbound_connections().await;
+            Ok(())
+        })
+    }
+
+    fn subscribe_frame_send_events<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        evo_plugin_sdk::contract::audio_plane::FrameSendEventStream,
+                        evo_plugin_sdk::contract::PluginError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >{
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            let rx = runtime.subscribe_frame_send_events();
+            Ok(
+                evo_plugin_sdk::contract::audio_plane::FrameSendEventStream::new(
+                    rx,
+                ),
+            )
+        })
+    }
+
+    fn report_frame_trace<'a>(
+        &'a self,
+        report: evo_plugin_sdk::contract::audio_plane::ReceiverFrameTraceReport,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(), evo_plugin_sdk::contract::PluginError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            runtime.route_frame_trace_report(report).await;
+            Ok(())
+        })
+    }
+
+    fn subscribe_frame_trace_reports<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        evo_plugin_sdk::contract::audio_plane::FrameTraceReportStream,
+                        evo_plugin_sdk::contract::PluginError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    >{
+        let runtime = Arc::clone(&self.runtime);
+        Box::pin(async move {
+            let rx = runtime.subscribe_frame_trace_reports();
+            Ok(
+                evo_plugin_sdk::contract::audio_plane::FrameTraceReportStream::new(
+                    rx,
+                ),
+            )
+        })
+    }
+
+    fn monotonic_ns(&self) -> u64 {
+        self.runtime.monotonic_ns()
+    }
+
+    fn local_device_id(&self) -> String {
+        self.runtime.local_device_id().to_string()
+    }
+}
+
+/// Per-plugin scoped handle to the framework's [`CredentialVault`].
+///
+/// Binds the plugin's canonical id at construction time so every
+/// method operates on this plugin's rows only. Plugins receive
+/// one of these on their [`LoadContext::credential_vault`] slot.
+///
+/// See [`crate::credentials::CredentialVault`] for the underlying
+/// primitive contract.
+pub struct PluginScopedCredentialVault {
+    vault: Arc<crate::credentials::CredentialVault>,
+    plugin_id: String,
+    user_interaction: Arc<dyn evo_plugin_sdk::UserInteractionRequester>,
+    plugin_display_name: String,
+    /// Broadcast the framework publishes on when a `credential_put`
+    /// / `credential_delete` wire op touches this plugin's rows.
+    /// The trait's `subscribe_changes` hands the plugin a
+    /// `Receiver` off this bus so the plugin can re-resolve
+    /// provider clients in place without a lifecycle teardown.
+    change_bus: tokio::sync::broadcast::Sender<
+        evo_plugin_sdk::contract::context::CredentialChangeEvent,
+    >,
+}
+
+impl PluginScopedCredentialVault {
+    /// Construct a per-plugin scoped handle. The `plugin_id` is
+    /// bound at construction; the plugin's methods cannot address
+    /// any other plugin's rows.
+    ///
+    /// `plugin_display_name` is a human-readable label used in
+    /// the operator prompt raised by `request_from_operator`.
+    ///
+    /// `change_bus` is the broadcast the framework publishes on
+    /// when this plugin's credentials are mutated via the
+    /// operator-facing `credential_put` / `credential_delete`
+    /// wire ops. Callers looking up the central-bus sender for
+    /// this plugin pass it here; test callers that never
+    /// exercise change delivery MAY pass a freshly-constructed
+    /// sender whose subscribers observe no publishes.
+    pub fn new(
+        vault: Arc<crate::credentials::CredentialVault>,
+        plugin_id: impl Into<String>,
+        user_interaction: Arc<dyn evo_plugin_sdk::UserInteractionRequester>,
+        plugin_display_name: impl Into<String>,
+        change_bus: tokio::sync::broadcast::Sender<
+            evo_plugin_sdk::contract::context::CredentialChangeEvent,
+        >,
+    ) -> Self {
+        Self {
+            vault,
+            plugin_id: plugin_id.into(),
+            user_interaction,
+            plugin_display_name: plugin_display_name.into(),
+            change_bus,
+        }
+    }
+
+    /// The plugin id this handle is bound to. Used by the
+    /// framework's central credential-change bus to route
+    /// operator-gesture publishes to the correct scoped handle.
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    /// Sender end of the change bus. The framework publishes on
+    /// this end when a credential mutation touches this plugin's
+    /// rows; every currently-active
+    /// [`CredentialVaultHandle::subscribe_changes`] receiver on
+    /// this handle observes the event.
+    pub fn change_bus(
+        &self,
+    ) -> &tokio::sync::broadcast::Sender<
+        evo_plugin_sdk::contract::context::CredentialChangeEvent,
+    > {
+        &self.change_bus
+    }
+
+    fn map_sdk_metadata(
+        m: &evo_plugin_sdk::contract::context::CredentialMetadata,
+    ) -> crate::credentials::CredentialMetadata {
+        crate::credentials::CredentialMetadata {
+            display_name: m.display_name.clone(),
+            expires_at_ms: m.expires_at_ms,
+            uninstall_policy: match m.uninstall_policy {
+                evo_plugin_sdk::contract::context::UninstallPolicy::Purge => {
+                    crate::credentials::UninstallPolicy::Purge
+                }
+                evo_plugin_sdk::contract::context::UninstallPolicy::PreserveForReinstall => {
+                    crate::credentials::UninstallPolicy::PreserveForReinstall
+                }
+                evo_plugin_sdk::contract::context::UninstallPolicy::PromptOperator => {
+                    crate::credentials::UninstallPolicy::PromptOperator
+                }
+            },
+        }
+    }
+
+    fn map_evo_metadata(
+        m: crate::credentials::CredentialMetadata,
+    ) -> evo_plugin_sdk::contract::context::CredentialMetadata {
+        evo_plugin_sdk::contract::context::CredentialMetadata {
+            display_name: m.display_name,
+            expires_at_ms: m.expires_at_ms,
+            uninstall_policy: match m.uninstall_policy {
+                crate::credentials::UninstallPolicy::Purge => {
+                    evo_plugin_sdk::contract::context::UninstallPolicy::Purge
+                }
+                crate::credentials::UninstallPolicy::PreserveForReinstall => {
+                    evo_plugin_sdk::contract::context::UninstallPolicy::PreserveForReinstall
+                }
+                crate::credentials::UninstallPolicy::PromptOperator => {
+                    evo_plugin_sdk::contract::context::UninstallPolicy::PromptOperator
+                }
+            },
+        }
+    }
+
+    fn map_error(
+        e: crate::credentials::CredentialError,
+    ) -> evo_plugin_sdk::contract::context::CredentialVaultError {
+        use evo_plugin_sdk::contract::context::CredentialVaultError as E;
+        match e {
+            crate::credentials::CredentialError::Invalid(s) => E::Invalid(s),
+            crate::credentials::CredentialError::AlgorithmMismatch {
+                stored_algorithm,
+                configured_algorithm,
+                ..
+            } => E::AlgorithmMismatch {
+                stored_algorithm,
+                configured_algorithm,
+            },
+            crate::credentials::CredentialError::UnknownUninstallPolicy(s) => {
+                E::Persistence(format!("unknown uninstall_policy: {s}"))
+            }
+            crate::credentials::CredentialError::Persistence(e) => {
+                E::Persistence(format!("{e}"))
+            }
+        }
+    }
+}
+
+impl evo_plugin_sdk::contract::context::CredentialVaultHandle
+    for PluginScopedCredentialVault
+{
+    fn fetch<'a>(
+        &'a self,
+        key: String,
+    ) -> evo_plugin_sdk::contract::context::CredentialFetchFuture<'a> {
+        Box::pin(async move {
+            self.vault
+                .fetch(&self.plugin_id, &key)
+                .await
+                .map_err(Self::map_error)
+        })
+    }
+
+    fn store<'a>(
+        &'a self,
+        key: String,
+        value: Vec<u8>,
+        metadata: evo_plugin_sdk::contract::context::CredentialMetadata,
+    ) -> evo_plugin_sdk::contract::context::CredentialMutateFuture<'a> {
+        Box::pin(async move {
+            let evo_meta = Self::map_sdk_metadata(&metadata);
+            self.vault
+                .store(&self.plugin_id, &key, &value, evo_meta)
+                .await
+                .map_err(Self::map_error)
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        key: String,
+    ) -> evo_plugin_sdk::contract::context::CredentialMutateFuture<'a> {
+        Box::pin(async move {
+            self.vault
+                .delete(&self.plugin_id, &key)
+                .await
+                .map_err(Self::map_error)
+        })
+    }
+
+    fn list_keys<'a>(
+        &'a self,
+    ) -> evo_plugin_sdk::contract::context::CredentialListingsFuture<'a> {
+        Box::pin(async move {
+            let rows = self
+                .vault
+                .list_keys(&self.plugin_id)
+                .await
+                .map_err(Self::map_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|row| {
+                    evo_plugin_sdk::contract::context::CredentialListing {
+                        key_hash: row.key_hash,
+                        metadata: Self::map_evo_metadata(row.metadata),
+                        created_at_ms: row.created_at_ms,
+                        updated_at_ms: row.updated_at_ms,
+                    }
+                })
+                .collect())
+        })
+    }
+
+    fn subscribe_changes(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<
+        evo_plugin_sdk::contract::context::CredentialChangeEvent,
+    > {
+        self.change_bus.subscribe()
+    }
+
+    fn request_from_operator<'a>(
+        &'a self,
+        key: String,
+        prompt_text: String,
+        metadata: evo_plugin_sdk::contract::context::CredentialMetadata,
+    ) -> evo_plugin_sdk::contract::context::CredentialRequestFuture<'a> {
+        Box::pin(async move {
+            use evo_plugin_sdk::contract::context::CredentialVaultError as E;
+            // First try the vault.
+            if let Some(value) = self
+                .vault
+                .fetch(&self.plugin_id, &key)
+                .await
+                .map_err(Self::map_error)?
+            {
+                return Ok(value);
+            }
+            // Missing — prompt the operator.
+            let prompt_id = format!(
+                "{}/credential/{}",
+                self.plugin_id,
+                sanitize_prompt_id_fragment(&key),
+            );
+            let prompt = evo_plugin_sdk::contract::PromptRequest {
+                prompt_id: prompt_id.clone(),
+                prompt_type: evo_plugin_sdk::contract::PromptType::Password {
+                    label: format!(
+                        "{} — {}",
+                        self.plugin_display_name, prompt_text
+                    ),
+                },
+                timeout_ms: None,
+                session_id: None,
+                retention_hint: None,
+                error_context: None,
+                previous_answer: None,
+                priority: None,
+            };
+            let outcome = self
+                .user_interaction
+                .request_user_interaction(prompt)
+                .await
+                .map_err(|e| {
+                    E::PromptDeclined(format!("interaction refused: {e}"))
+                })?;
+            let value = match outcome {
+                evo_plugin_sdk::contract::PromptOutcome::Answered {
+                    response,
+                    ..
+                } => match response {
+                    evo_plugin_sdk::contract::PromptResponse::Password {
+                        value,
+                    } => value,
+                    other => {
+                        return Err(E::PromptDeclined(format!(
+                            "unexpected prompt response variant: {other:?}"
+                        )));
+                    }
+                },
+                evo_plugin_sdk::contract::PromptOutcome::Cancelled { by } => {
+                    return Err(E::PromptDeclined(format!(
+                        "prompt cancelled by {by:?}"
+                    )));
+                }
+                evo_plugin_sdk::contract::PromptOutcome::TimedOut => {
+                    return Err(E::PromptDeclined("prompt timed out".into()));
+                }
+            };
+            // Store then return.
+            let evo_meta = Self::map_sdk_metadata(&metadata);
+            let value_bytes = value.as_bytes().to_vec();
+            self.vault
+                .store(&self.plugin_id, &key, &value_bytes, evo_meta)
+                .await
+                .map_err(Self::map_error)?;
+            Ok(value_bytes)
+        })
+    }
+}
+
+fn sanitize_prompt_id_fragment(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
 }
 
 #[cfg(test)]
@@ -3847,6 +5595,7 @@ mod tests {
             retention_hint: None,
             error_context: None,
             previous_answer: None,
+            priority: None,
         };
         let res = r.request_user_interaction(prompt).await;
         assert!(matches!(res, Err(ReportError::Invalid(_))));
@@ -4000,6 +5749,134 @@ target_type = "*"
     }
 
     #[tokio::test]
+    async fn registry_subject_announcer_update_state_persists_when_durable() {
+        use crate::persistence::{MemoryPersistenceStore, PersistenceStore};
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let persistence: Arc<dyn PersistenceStore> =
+            Arc::new(MemoryPersistenceStore::default());
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.persist",
+        )
+        .with_persistence(Arc::clone(&persistence));
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("test-scheme", "tv")],
+            ))
+            .await
+            .unwrap();
+
+        // Non-volatile update MUST hit the durable store.
+        announcer
+            .update_state(
+                ExternalAddressing::new("test-scheme", "tv"),
+                serde_json::json!({"n": 1}),
+            )
+            .await
+            .unwrap();
+
+        let canonical_id = registry
+            .resolve(&ExternalAddressing::new("test-scheme", "tv"))
+            .unwrap();
+        let persisted =
+            persistence.load_subject_state(&canonical_id).await.unwrap();
+        assert!(
+            persisted.is_some(),
+            "non-volatile update_state MUST persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_update_state_volatile_skips_persist_and_still_emits(
+    ) {
+        // Property under regression: `update_state_volatile` MUST
+        // skip the durable subject_states mirror while preserving
+        // in-memory update + SubjectStateChanged happening emission.
+        // Closes the disk-burn class for high-rate telemetry subjects
+        // (spectrum frames, VU-meter samples). A 30 Hz emitter running
+        // through the non-volatile path would issue ~108k sqlite writes
+        // per hour of playback for zero operator-visible payoff.
+        use crate::persistence::{MemoryPersistenceStore, PersistenceStore};
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let persistence: Arc<dyn PersistenceStore> =
+            Arc::new(MemoryPersistenceStore::default());
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.volatile",
+        )
+        .with_persistence(Arc::clone(&persistence));
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("test-scheme", "vol")],
+            ))
+            .await
+            .unwrap();
+
+        let mut rx = bus.subscribe();
+
+        let new_state = serde_json::json!({"bins": 64, "channels": 1});
+        announcer
+            .update_state_volatile(
+                ExternalAddressing::new("test-scheme", "vol"),
+                new_state.clone(),
+            )
+            .await
+            .unwrap();
+
+        // In-memory state updated.
+        let canonical_id = registry
+            .resolve(&ExternalAddressing::new("test-scheme", "vol"))
+            .unwrap();
+        assert_eq!(
+            registry.state_of(&canonical_id),
+            Some(new_state.clone()),
+            "in-memory state MUST update on volatile path"
+        );
+
+        // Happening emitted.
+        let got = rx.try_recv().expect("state happening must be present");
+        match got {
+            Happening::SubjectStateChanged {
+                plugin,
+                subject_type,
+                new_state: emitted_new,
+                ..
+            } => {
+                assert_eq!(plugin, "org.test.volatile");
+                assert_eq!(subject_type, "track");
+                assert_eq!(emitted_new, new_state);
+            }
+            other => panic!("expected SubjectStateChanged, got {other:?}"),
+        }
+
+        // Durable store MUST NOT carry the volatile payload.
+        let persisted =
+            persistence.load_subject_state(&canonical_id).await.unwrap();
+        assert!(
+            persisted.is_none(),
+            "volatile update_state MUST NOT persist to subject_states"
+        );
+    }
+
+    #[tokio::test]
     async fn registry_subject_announcer_update_state_writes_state_and_emits_happening(
     ) {
         use evo_plugin_sdk::contract::SubjectAnnouncement;
@@ -4129,6 +6006,146 @@ target_type = "*"
             }
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_announce_refuses_oversized_state() {
+        // The 64 KiB cap on subject state fires at the announce
+        // boundary so an announcement carrying >SUBJECT_STATE_MAX_BYTES
+        // of serialised state is refused with ReportError::Invalid
+        // before the catalogue check, before the registry write, and
+        // before any persistence write. Null state is the no-state
+        // sentinel and bypasses the cap.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.oversize",
+        );
+
+        // Build a state payload whose serialised length is just over
+        // the cap. JSON-encoding a string of N ASCII chars produces
+        // N+2 bytes (the surrounding quotes); ask for cap+1 chars so
+        // the encoded length lands at cap+3 — over the cap, regardless
+        // of the small constants.
+        let oversized =
+            "x".repeat(crate::subjects::SUBJECT_STATE_MAX_BYTES + 1);
+        let announcement = SubjectAnnouncement::new(
+            "track",
+            vec![ExternalAddressing::new("test-scheme", "tv")],
+        )
+        .with_state(serde_json::Value::String(oversized));
+
+        let result = announcer.announce(announcement).await;
+        match result {
+            Err(ReportError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("subject state payload")
+                        && msg.contains("exceeds")
+                        && msg.contains(&format!(
+                            "cap of {} bytes",
+                            crate::subjects::SUBJECT_STATE_MAX_BYTES
+                        )),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Invalid (oversize), got {other:?}"),
+        }
+
+        // Refusal at the boundary leaves the registry untouched.
+        assert_eq!(registry.subject_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_announce_at_cap_boundary_accepted() {
+        // A state payload that fits exactly at SUBJECT_STATE_MAX_BYTES
+        // is admitted (the cap is `>`, not `>=`).
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.atcap",
+        );
+
+        // Serialised JSON for a string of N ASCII chars is N+2 bytes.
+        // Pick N so encoded length is exactly cap.
+        let at_cap_chars = crate::subjects::SUBJECT_STATE_MAX_BYTES - 2;
+        let payload = "y".repeat(at_cap_chars);
+        let announcement = SubjectAnnouncement::new(
+            "track",
+            vec![ExternalAddressing::new("test-scheme", "atcap")],
+        )
+        .with_state(serde_json::Value::String(payload));
+
+        announcer.announce(announcement).await.unwrap();
+        assert_eq!(registry.subject_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_subject_announcer_update_state_refuses_oversized() {
+        // Same cap on the update_state path. A subject already
+        // exists with null state; an attempt to update_state with a
+        // payload exceeding the cap is refused; in-memory state
+        // remains null and the subject row remains unchanged.
+        use evo_plugin_sdk::contract::SubjectAnnouncement;
+
+        let registry = Arc::new(SubjectRegistry::new());
+        let graph = Arc::new(RelationGraph::new());
+        let catalogue = Arc::new(subjects_only_catalogue());
+        let bus = Arc::new(HappeningBus::new());
+        let announcer = RegistrySubjectAnnouncer::new(
+            Arc::clone(&registry),
+            Arc::clone(&graph),
+            Arc::clone(&catalogue),
+            Arc::clone(&bus),
+            "org.test.upd-oversize",
+        );
+        announcer
+            .announce(SubjectAnnouncement::new(
+                "track",
+                vec![ExternalAddressing::new("test-scheme", "u")],
+            ))
+            .await
+            .unwrap();
+
+        let oversized =
+            "z".repeat(crate::subjects::SUBJECT_STATE_MAX_BYTES + 1);
+        let result = announcer
+            .update_state(
+                ExternalAddressing::new("test-scheme", "u"),
+                serde_json::Value::String(oversized),
+            )
+            .await;
+        match result {
+            Err(ReportError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("subject state payload")
+                        && msg.contains("exceeds"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Invalid (oversize), got {other:?}"),
+        }
+
+        // In-memory state untouched.
+        let canonical_id = registry
+            .resolve(&ExternalAddressing::new("test-scheme", "u"))
+            .expect("subject resolves");
+        assert!(registry.state_of(&canonical_id).is_none());
     }
 
     #[tokio::test]
@@ -4620,7 +6637,7 @@ target_type = "*"
     }
 
     // -----------------------------------------------------------------
-    // Gap [26] (deferred-from-[25] half): type-constraint
+    // Gap [26] (split off from gap [25]): type-constraint
     // enforcement at assertion.
     //
     // The predicate declares source_type = "track", target_type =
@@ -5909,7 +7926,7 @@ target_type = "*"
 
     impl evo_plugin_sdk::contract::Respondent for AdminTestRespondent {
         fn handle_request<'a>(
-            &'a mut self,
+            &'a self,
             req: &'a evo_plugin_sdk::contract::Request,
         ) -> impl Future<
             Output = Result<
@@ -10060,5 +12077,537 @@ target_type = "*"
         assert_eq!(rehydrated[0].detected_at_ms, captured.detected_at_ms);
         assert!(rehydrated[0].resolved_at_ms.is_none());
         assert!(rehydrated[0].resolution_kind.is_none());
+    }
+
+    // ---------------- CoordinatorStreamHost ----------------
+
+    #[tokio::test]
+    async fn coordinator_stream_host_open_emit_close_round_trip() {
+        use evo_plugin_sdk::contract::{
+            BackpressurePolicy, EmitResult, StreamHost, StreamId, StreamSpec,
+        };
+
+        let coordinator = Arc::new(crate::streams::StreamCoordinator::new());
+        let host = CoordinatorStreamHost::new(
+            Arc::clone(&coordinator),
+            "org.test.producer",
+        );
+        let stream_id = StreamId::new("audio.spectrum.org.test").unwrap();
+        let spec = StreamSpec {
+            schema: "audio.spectrum.v1".into(),
+            codecs: vec!["json".into()],
+            max_rate_hz: 60,
+            typical_payload_bytes: 256,
+            backpressure_policies: vec![BackpressurePolicy::DropOldest],
+        };
+
+        let returned_id = host
+            .open(stream_id.clone(), spec.clone())
+            .await
+            .expect("open succeeds");
+        assert_eq!(returned_id, stream_id);
+
+        // Subscribe a consumer at the coordinator level so the
+        // emit is fanned out (and not just NoConsumers'd).
+        let mut rx = coordinator
+            .subscribe(&stream_id, BackpressurePolicy::DropOldest)
+            .expect("subscribe");
+
+        let result = host
+            .emit(
+                stream_id.clone(),
+                42,
+                "json".into(),
+                br#"{"hello":1}"#.to_vec(),
+            )
+            .await
+            .expect("emit succeeds");
+        assert!(matches!(
+            result,
+            EmitResult::Queued { .. } | EmitResult::Dropped { .. }
+        ));
+        let frame = rx.recv().await.expect("frame arrives");
+        assert_eq!(frame.codec, "json");
+        assert_eq!(frame.payload, br#"{"hello":1}"#);
+
+        host.close(stream_id.clone()).await.expect("close succeeds");
+    }
+
+    #[tokio::test]
+    async fn coordinator_stream_host_emit_on_unopened_returns_closed() {
+        use evo_plugin_sdk::contract::{StreamError, StreamHost, StreamId};
+
+        let coordinator = Arc::new(crate::streams::StreamCoordinator::new());
+        let host = CoordinatorStreamHost::new(
+            Arc::clone(&coordinator),
+            "org.test.producer",
+        );
+        let stream_id = StreamId::new("never.opened").unwrap();
+        let err = host
+            .emit(stream_id.clone(), 0, "json".into(), b"{}".to_vec())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StreamError::Closed(_)));
+    }
+
+    #[test]
+    fn coordinator_stream_host_preserves_plugin_name() {
+        let coordinator = Arc::new(crate::streams::StreamCoordinator::new());
+        let host = CoordinatorStreamHost::new(coordinator, "org.test.named");
+        assert_eq!(host.plugin_name(), "org.test.named");
+    }
+
+    // ---------------- ChainMetadataConsumer ----------------
+
+    use evo_plugin_sdk::contract::{
+        Enrichment, EnrichmentRef, FieldName as SdkFieldName,
+        FieldOperatorSupport, FieldValue, Filter, FilterOperator,
+        ItemUri as SdkItemUri, MetadataError as SdkMetadataError,
+        MetadataProvider as SdkMetadataProvider, NamedField as SdkNamedField,
+        ProviderCapabilities, ProviderId as SdkProviderId,
+        ProviderItem as SdkProviderItem, Query as SdkQuery,
+        ResultPage as SdkResultPage, SubQuery as SdkSubQuery,
+    };
+
+    fn caps_for(provider_id: &str) -> ProviderCapabilities {
+        ProviderCapabilities {
+            provider_id: SdkProviderId::new(provider_id).unwrap(),
+            indexed_fields: vec![SdkFieldName::new("title").unwrap()],
+            filter_operators: vec![FieldOperatorSupport {
+                field: SdkFieldName::new("title").unwrap(),
+                operators: vec![FilterOperator::Eq],
+            }],
+            sort_fields: vec![],
+            join_fields: vec![],
+            supports_full_text_search: false,
+            supports_pagination: false,
+            estimated_response_ms: 5,
+        }
+    }
+
+    struct StubProvider {
+        caps: ProviderCapabilities,
+        item: SdkProviderItem,
+    }
+
+    impl SdkMetadataProvider for StubProvider {
+        fn declare_capabilities(&self) -> ProviderCapabilities {
+            self.caps.clone()
+        }
+
+        fn execute_query<'a>(
+            &'a self,
+            _sub: &'a SdkSubQuery,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<SdkResultPage, SdkMetadataError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let item = self.item.clone();
+            Box::pin(async move {
+                Ok(SdkResultPage {
+                    items: vec![item],
+                    has_more: false,
+                    total_estimate: None,
+                    next_cursor: None,
+                })
+            })
+        }
+
+        fn get_item<'a>(
+            &'a self,
+            _uri: &'a SdkItemUri,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<SdkProviderItem, SdkMetadataError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let item = self.item.clone();
+            Box::pin(async move { Ok(item) })
+        }
+
+        fn enrich<'a>(
+            &'a self,
+            _refs: &'a [EnrichmentRef],
+            _fields: &'a [SdkFieldName],
+        ) -> Pin<Box<dyn Future<Output = Vec<Enrichment>> + Send + 'a>>
+        {
+            Box::pin(async move { Vec::new() })
+        }
+    }
+
+    fn fixture_item(provider: &str, title: &str) -> SdkProviderItem {
+        SdkProviderItem {
+            uri: SdkItemUri::new(format!("{provider}://1")).unwrap(),
+            fields: vec![SdkNamedField {
+                name: SdkFieldName::new("title").unwrap(),
+                value: FieldValue::str(title),
+            }],
+            join_keys: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_metadata_consumer_execute_query_round_trips() {
+        use evo_plugin_sdk::contract::MetadataConsumer;
+        let chain = Arc::new(crate::metadata::MetadataChain::new());
+        chain.register_provider(Arc::new(StubProvider {
+            caps: caps_for("org.test.provider"),
+            item: fixture_item("local", "Birdland"),
+        }));
+        let consumer =
+            ChainMetadataConsumer::new(Arc::clone(&chain), "org.test.consumer");
+
+        let query = SdkQuery {
+            filter: Filter::Eq {
+                field: SdkFieldName::new("title").unwrap(),
+                value: FieldValue::str("Birdland"),
+            },
+            sort: vec![],
+            limit: None,
+            offset: None,
+            include_fields: vec![],
+            deduplicate_by: vec![],
+        };
+        let stream = consumer
+            .execute_query(query)
+            .await
+            .expect("execute_query succeeds");
+        assert_eq!(stream.items.len(), 1);
+        assert_eq!(stream.items[0].uri.as_str(), "local://1");
+        assert!(!stream.from_cache);
+    }
+
+    #[tokio::test]
+    async fn chain_metadata_consumer_no_providers_maps_to_provider_error() {
+        use evo_plugin_sdk::contract::{MetadataConsumer, MetadataError};
+        let chain = Arc::new(crate::metadata::MetadataChain::new());
+        let consumer = ChainMetadataConsumer::new(chain, "org.test");
+        let query = SdkQuery {
+            filter: Filter::Eq {
+                field: SdkFieldName::new("title").unwrap(),
+                value: FieldValue::str("x"),
+            },
+            sort: vec![],
+            limit: None,
+            offset: None,
+            include_fields: vec![],
+            deduplicate_by: vec![],
+        };
+        let err = consumer.execute_query(query).await.unwrap_err();
+        // ChainError::NoProviders maps to MetadataError::Provider
+        // (descriptive message); plugins see a single error
+        // surface across the consumer / producer boundaries.
+        assert!(matches!(err, MetadataError::Provider(_)));
+    }
+
+    #[tokio::test]
+    async fn chain_metadata_consumer_get_item_routes_through() {
+        use evo_plugin_sdk::contract::MetadataConsumer;
+        let chain = Arc::new(crate::metadata::MetadataChain::new());
+        chain.register_provider(Arc::new(StubProvider {
+            caps: caps_for("org.test.provider"),
+            item: fixture_item("local", "Birdland"),
+        }));
+        let consumer = ChainMetadataConsumer::new(chain, "org.test.consumer");
+
+        let item = consumer
+            .get_item(
+                SdkProviderId::new("org.test.provider").unwrap(),
+                SdkItemUri::new("local://1").unwrap(),
+            )
+            .await
+            .expect("get_item succeeds");
+        assert_eq!(item.uri.as_str(), "local://1");
+        assert_eq!(item.fields.len(), 1);
+    }
+
+    #[test]
+    fn chain_metadata_consumer_preserves_plugin_name() {
+        let chain = Arc::new(crate::metadata::MetadataChain::new());
+        let consumer = ChainMetadataConsumer::new(chain, "org.test.named");
+        assert_eq!(consumer.plugin_name(), "org.test.named");
+    }
+
+    // ---------------- Dual-plane lifecycle telemetry ----------------
+    //
+    // Each wrapper writes lifecycle events to two planes when
+    // telemetry is configured:
+    //
+    // - The happenings bus carries a `Happening::PluginEvent`
+    //   with a stable `event_type` wire string per
+    //   `LifecycleEventType`. Live observability subscribers see
+    //   the event within milliseconds.
+    // - The audit-grade ledger carries a signed `LifecycleEntry`
+    //   in `evo.lifecycle`. Forensic analysts query for it later.
+    //
+    // The tests below pin both planes for every event_type the
+    // wrappers emit. Adding a new event_type without an
+    // accompanying test is impossible: the test asserts the exact
+    // emitted variant against the ledger row's deserialised
+    // payload.
+
+    use crate::happenings::HappeningBus;
+    use crate::ledger::{
+        LedgerPrimitive, LifecycleEntry, LifecycleEventType, LifecycleTarget,
+        LEDGER_LIFECYCLE,
+    };
+    use crate::persistence::{
+        LedgerEntryFilter, MemoryPersistenceStore, PersistenceStore,
+    };
+
+    fn telemetry_setup() -> (
+        Arc<HappeningBus>,
+        Arc<LedgerPrimitive>,
+        Arc<dyn PersistenceStore>,
+    ) {
+        let persistence: Arc<dyn PersistenceStore> =
+            Arc::new(MemoryPersistenceStore::new());
+        let bus = Arc::new(HappeningBus::new());
+        let ledger = Arc::new(LedgerPrimitive::with_no_op_crypto(Arc::clone(
+            &persistence,
+        )));
+        (bus, ledger, persistence)
+    }
+
+    async fn lifecycle_entries(
+        persistence: &Arc<dyn PersistenceStore>,
+    ) -> Vec<LifecycleEntry> {
+        let rows = persistence
+            .query_ledger_entries(LedgerEntryFilter {
+                ledger_id: LEDGER_LIFECYCLE,
+                time_range: None,
+                subject_plugin: None,
+                include_withdrawn: true,
+            })
+            .await
+            .expect("query lifecycle entries");
+        rows.into_iter()
+            .map(|row| {
+                serde_json::from_str::<LifecycleEntry>(&row.payload_json)
+                    .expect("lifecycle payload deserialises")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn streams_dual_plane_writes_open_and_close() {
+        use evo_plugin_sdk::contract::{
+            BackpressurePolicy, StreamHost, StreamId, StreamSpec,
+        };
+
+        let (bus, ledger, persistence) = telemetry_setup();
+        let mut subscriber = bus.subscribe();
+        let coordinator = Arc::new(crate::streams::StreamCoordinator::new());
+        let host = CoordinatorStreamHost::new(
+            Arc::clone(&coordinator),
+            "org.test.attributed",
+        )
+        .with_telemetry(Arc::clone(&bus), Arc::clone(&ledger));
+        let stream_id = StreamId::new("audio.spectrum.test").unwrap();
+        let spec = StreamSpec {
+            schema: "audio.spectrum.v1".into(),
+            codecs: vec!["json".into()],
+            max_rate_hz: 60,
+            typical_payload_bytes: 256,
+            backpressure_policies: vec![BackpressurePolicy::DropOldest],
+        };
+
+        host.open(stream_id.clone(), spec).await.unwrap();
+        host.close(stream_id.clone()).await.unwrap();
+
+        // Ledger plane: two entries — opened, then closed.
+        let entries = lifecycle_entries(&persistence).await;
+        assert_eq!(entries.len(), 2, "ledger captured open + close");
+        assert_eq!(entries[0].event_type, LifecycleEventType::StreamOpened);
+        assert_eq!(entries[1].event_type, LifecycleEventType::StreamClosed);
+        // Source-plugin attribution preserved in both rows.
+        assert_eq!(entries[0].source_plugin, "org.test.attributed");
+        assert_eq!(entries[1].source_plugin, "org.test.attributed");
+        // Open payload carries forensic provenance.
+        assert_eq!(
+            entries[0].payload.get("schema").and_then(|v| v.as_str()),
+            Some("audio.spectrum.v1")
+        );
+        assert_eq!(
+            entries[0]
+                .payload
+                .get("max_rate_hz")
+                .and_then(|v| v.as_u64()),
+            Some(60)
+        );
+        // Open target carries the stream id.
+        match &entries[0].target {
+            LifecycleTarget::Stream { stream_id } => {
+                assert_eq!(stream_id, "audio.spectrum.test");
+            }
+            other => panic!("expected Stream target, got {other:?}"),
+        }
+
+        // Happenings plane: two PluginEvents with stable event_type
+        // wire strings.
+        let mut event_types = Vec::new();
+        while let Ok(h) = subscriber.try_recv() {
+            if let Happening::PluginEvent {
+                event_type, plugin, ..
+            } = h
+            {
+                assert_eq!(plugin, "org.test.attributed");
+                event_types.push(event_type);
+            }
+        }
+        assert!(event_types.iter().any(|s| s == "evo.streams.opened"));
+        assert!(event_types.iter().any(|s| s == "evo.streams.closed"));
+    }
+
+    #[tokio::test]
+    async fn metadata_dual_plane_writes_query_and_provider_failure() {
+        use evo_plugin_sdk::contract::MetadataConsumer;
+
+        let (bus, ledger, persistence) = telemetry_setup();
+        let chain = Arc::new(crate::metadata::MetadataChain::new());
+        // Register one stub provider that succeeds.
+        chain.register_provider(Arc::new(StubProvider {
+            caps: caps_for("org.test.provider"),
+            item: fixture_item("local", "Birdland"),
+        }));
+        let consumer = ChainMetadataConsumer::new(
+            Arc::clone(&chain),
+            "org.test.attributed",
+        )
+        .with_telemetry(Arc::clone(&bus), Arc::clone(&ledger));
+
+        let query = SdkQuery {
+            filter: Filter::Eq {
+                field: SdkFieldName::new("title").unwrap(),
+                value: FieldValue::str("Birdland"),
+            },
+            sort: vec![],
+            limit: None,
+            offset: None,
+            include_fields: vec![],
+            deduplicate_by: vec![],
+        };
+        consumer.execute_query(query).await.unwrap();
+
+        let entries = lifecycle_entries(&persistence).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "successful query emits one dispatch entry, no per-provider \
+             failure entries"
+        );
+        assert_eq!(
+            entries[0].event_type,
+            LifecycleEventType::MetadataQueryDispatched
+        );
+        assert_eq!(entries[0].source_plugin, "org.test.attributed");
+        // Dispatch payload carries the per-provider summary.
+        assert!(entries[0].payload.get("providers").is_some());
+        assert!(entries[0].payload.get("from_cache").is_some());
+        match &entries[0].target {
+            LifecycleTarget::MetadataQuery { query_digest } => {
+                assert!(!query_digest.is_empty());
+            }
+            other => panic!("expected MetadataQuery target, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn telemetry_unset_falls_back_to_no_op() {
+        // When telemetry is not configured, lifecycle events are a
+        // no-op on both planes. The primary operation succeeds
+        // unchanged. This is the test-fixture path: tests that
+        // exercise the primary surface only do not need to wire
+        // telemetry.
+        use evo_plugin_sdk::contract::{
+            BackpressurePolicy, StreamHost, StreamId, StreamSpec,
+        };
+
+        let coordinator = Arc::new(crate::streams::StreamCoordinator::new());
+        let host =
+            CoordinatorStreamHost::new(coordinator, "org.test.no_telemetry");
+        let stream_id = StreamId::new("audio.test").unwrap();
+        let spec = StreamSpec {
+            schema: "audio.spectrum.v1".into(),
+            codecs: vec!["json".into()],
+            max_rate_hz: 60,
+            typical_payload_bytes: 256,
+            backpressure_policies: vec![BackpressurePolicy::DropOldest],
+        };
+        // Primary op succeeds; no panic, no telemetry write.
+        host.open(stream_id, spec).await.unwrap();
+    }
+
+    /// Verify `RouterHappeningEmitter::emit_audio_playback_ended`
+    /// produces a `Happening::AudioPlaybackEnded` on the bus,
+    /// stamped with the bound plugin name as the authoritative
+    /// `source_plugin` field — plugins do not get to lie about
+    /// who they are.
+    #[tokio::test]
+    async fn router_happening_emitter_emits_typed_audio_playback_ended() {
+        use evo_plugin_sdk::contract::HappeningEmitter;
+        let bus = Arc::new(crate::happenings::HappeningBus::new());
+        let mut rx = bus.subscribe();
+        let emitter = RouterHappeningEmitter::new(
+            Arc::clone(&bus),
+            "org.test.source.alpha",
+        );
+
+        emitter
+            .emit_audio_playback_ended(Some("evo-test:track:42".to_string()))
+            .await
+            .expect("emit succeeds");
+
+        let happening = rx.recv().await.expect("happening on bus");
+        match happening {
+            crate::happenings::Happening::AudioPlaybackEnded {
+                source_plugin,
+                claim_uri,
+                ..
+            } => {
+                assert_eq!(source_plugin, "org.test.source.alpha");
+                assert_eq!(claim_uri, Some("evo-test:track:42".to_string()));
+            }
+            other => {
+                panic!("expected AudioPlaybackEnded, got {other:?}")
+            }
+        }
+    }
+
+    /// `claim_uri = None` is a valid shape — plugins that don't
+    /// track per-claim state pass `None`. The bus emission still
+    /// succeeds.
+    #[tokio::test]
+    async fn router_happening_emitter_audio_playback_ended_without_uri() {
+        use evo_plugin_sdk::contract::HappeningEmitter;
+        let bus = Arc::new(crate::happenings::HappeningBus::new());
+        let mut rx = bus.subscribe();
+        let emitter = RouterHappeningEmitter::new(
+            Arc::clone(&bus),
+            "org.test.source.beta",
+        );
+
+        emitter
+            .emit_audio_playback_ended(None)
+            .await
+            .expect("emit succeeds");
+
+        let happening = rx.recv().await.expect("happening on bus");
+        if let crate::happenings::Happening::AudioPlaybackEnded {
+            source_plugin,
+            claim_uri,
+            ..
+        } = happening
+        {
+            assert_eq!(source_plugin, "org.test.source.beta");
+            assert_eq!(claim_uri, None);
+        } else {
+            panic!("expected AudioPlaybackEnded variant");
+        }
     }
 }

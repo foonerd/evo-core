@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! # evo-plugin-sdk
 //!
 //! SDK for authoring plugins on the evo steward fabric.
@@ -72,11 +75,25 @@
 /// without hardcoding a string that drifts on every workspace bump.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod admission;
+pub mod audio;
 pub mod drift;
 pub mod error;
 pub mod error_taxonomy;
 pub mod happenings;
 pub mod manifest;
+/// Multi-room substrate contract types — re-exported from the
+/// dedicated [`evo_multiroom_sdk`] crate. The module path
+/// `evo_plugin_sdk::multiroom_substrate::*` keeps working for
+/// existing plugins; new code may depend on the
+/// `evo-multiroom-sdk` crate directly. The framework's
+/// universal plugin SDK stays domain-agnostic — multi-room
+/// types live in their own crate that signals domain-tier
+/// ownership.
+pub use evo_multiroom_sdk as multiroom_substrate;
+pub mod ui;
+pub mod update;
+pub mod widget_pack;
 
 #[cfg(feature = "contract")]
 pub mod contract;
@@ -90,6 +107,8 @@ pub mod codec;
 pub mod host;
 #[cfg(feature = "wire")]
 pub mod wire;
+#[cfg(feature = "wire")]
+pub mod wire_logging;
 
 pub use error::ManifestError;
 pub use error_taxonomy::ErrorClass;

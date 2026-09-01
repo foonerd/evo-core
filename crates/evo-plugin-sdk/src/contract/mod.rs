@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Plugin contract types.
 //!
 //! This module implements the Rust-side view of the plugin contract
@@ -68,33 +71,75 @@
 //! locks, no leaked resources. This is the cooperative cancellation
 //! discipline industrial async systems rely on.
 
+pub mod asset_cache;
+pub mod audio_plane;
+pub mod audio_routing;
 pub mod context;
+pub mod disposition;
 pub mod error;
 pub mod factory;
+pub mod metadata;
+pub mod notifications;
+pub mod plans;
 pub mod plugin;
 pub mod relations;
 pub mod respondent;
+pub mod shelf_dispatch;
+pub mod source_verbs;
+pub mod streams;
 pub mod subjects;
 pub mod warden;
 
+pub use asset_cache::{AssetCache, AssetCacheError, AssetFetcher};
+pub use audio_plane::{
+    AudioFrameReceived, AudioFrameSeed, AudioFrameStream,
+    AudioFrameStreamError, AudioPlaneHandle, FrameSendEvent,
+    FrameSendEventStream, FrameTraceReport, FrameTraceReportStream,
+    ReceiverFrameTraceReport,
+};
 pub use context::{
     AppointmentAction, AppointmentId, AppointmentMissPolicy,
     AppointmentRecurrence, AppointmentScheduler, AppointmentSpec,
     AppointmentState, AppointmentTimeZone, CallDeadline, CompositeOp,
     CustodyStateReporter, DateTimeKind, DayOfWeek, FastPathDispatcher,
-    HappeningEmitter, InstanceAnnouncer, LoadContext, PromptCanceller,
-    PromptField, PromptOption, PromptOutcome, PromptRequest, PromptResponse,
-    PromptState, PromptType, RelationAdmin, RelationAnnouncer, ReportError,
-    ReportPriority, RetentionHint, StatePredicate, StateReporter, SubjectAdmin,
-    SubjectAnnouncer, SubjectQuerier, UserInteractionRequester, WatchAction,
-    WatchCondition, WatchHappeningFilter, WatchId, WatchScheduler, WatchSpec,
-    WatchState, WatchTrigger, DEFAULT_APPOINTMENT_MISS_GRACE_MS,
-    DEFAULT_PROMPT_TIMEOUT_MS, DEFAULT_WATCH_MAX_COMPOSITE_DEPTH,
-    MAX_PROMPT_TIMEOUT_MS,
+    FireOutcome, FirstFire, HappeningEmitter, InstanceAnnouncer, LoadContext,
+    OpenMechanism, PowerBehaviour, PromptCanceller, PromptField, PromptOption,
+    PromptOutcome, PromptRequest, PromptResponse, PromptState, PromptType,
+    QrFormat, QrPolicy, RelationAdmin, RelationAnnouncer, ReportError,
+    ReportPriority, RetentionHint, RetryPolicy, ScheduleAction, ScheduleHandle,
+    ScheduleSpec, ScheduleState, ScheduleSummary, ScheduleTrigger, Scheduler,
+    SchedulerError, StatePredicate, StateReporter, SubjectAdmin,
+    SubjectAnnouncer, SubjectQuerier, SubjectStateSubscriber,
+    UserInteractionRequester, WatchAction, WatchCondition,
+    WatchHappeningFilter, WatchId, WatchScheduler, WatchSpec, WatchState,
+    WatchTrigger, DEFAULT_APPOINTMENT_MISS_GRACE_MS, DEFAULT_PROMPT_TIMEOUT_MS,
+    DEFAULT_WATCH_MAX_COMPOSITE_DEPTH, MAX_PROMPT_TIMEOUT_MS,
+};
+pub use disposition::{
+    Disposition, DispositionAction, DispositionKind, DispositionRun,
+    RecoveryHint,
 };
 pub use error::PluginError;
 pub use factory::{
     Factory, InstanceAnnouncement, InstanceId, RetractionPolicy,
+};
+pub use metadata::{
+    Enrichment, EnrichmentBatch, EnrichmentRef, FieldName,
+    FieldOperatorSupport, FieldProvenance, FieldValue, Filter, FilterOperator,
+    ItemUri, JoinKeyName, MergedItem, MetadataConsumer, MetadataError,
+    MetadataProvider, NamedField, NamedJoinKey, ProviderCapabilities,
+    ProviderId, ProviderItem, ProviderStatus, Query, RangeValue, ResultPage,
+    ResultStream, SortDirection, SortKey, SubQuery,
+};
+pub use notifications::{
+    AudioPayload, Notification, NotificationAction, NotificationEmitter,
+    NotificationError, NotificationGroupId, NotificationHandle,
+    NotificationLevel, NotificationMode, NotificationPriority,
+};
+pub use plans::{
+    Authorship, ClockTime, DayMask, FadeKind, FadeSpec, OnComplete, Plan,
+    PlanError, PlanId, PlanSegment, PlanTrigger, SegmentContent,
+    SegmentDuration, TransitionType,
 };
 pub use plugin::{
     BuildInfo, HealthCheck, HealthReport, HealthStatus, Plugin,
@@ -103,10 +148,20 @@ pub use plugin::{
 };
 pub use relations::{RelationAssertion, RelationRetraction};
 pub use respondent::{Request, Respondent, Response};
+pub use shelf_dispatch::{
+    ShelfDispatchError, ShelfDispatchFuture, ShelfRequestDispatcher,
+};
+pub use source_verbs::{ResumeState, SourceVerb, TransportState};
+pub use streams::{
+    negotiate_format, BackpressurePolicy, EmitResult, FormatOffer,
+    FormatPreference, NegotiatedFormat, StreamError, StreamFrame, StreamHost,
+    StreamId, StreamSpec,
+};
 pub use subjects::{
     AliasKind, AliasRecord, CanonicalSubjectId, ClaimConfidence,
     ExplicitRelationAssignment, ExternalAddressing, SplitRelationStrategy,
     SubjectAddressingRecord, SubjectAnnouncement, SubjectClaim,
-    SubjectQueryResult, SubjectRecord,
+    SubjectQueryResult, SubjectRecord, SubjectStateStream,
+    SubjectStateStreamError, SubjectStateUpdate,
 };
 pub use warden::{Assignment, CourseCorrection, CustodyHandle, Warden};

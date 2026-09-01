@@ -1,0 +1,75 @@
+schema_version: "1.0"
+plugin: com.example.metadata.provider
+owner: example-author
+isolation: oop
+
+# Set true when the plugin depends on any host-side OS package
+# (binary, kernel module, system service). The compulsory
+# parity gate at install-time and admission-time reads this
+# field FIRST: true + a missing required_binary = HARD FAIL.
+has_os_dependencies: false
+
+# ARCHETYPE: metadata_provider
+#
+# A plugin that supplies metadata (artist bios, album reviews,
+# lyrics, tags, artwork) for a source's tracks. Two common
+# shapes: local (reads embedded tags from files, computes
+# fingerprints) or network (queries MusicBrainz / Last.fm /
+# Discogs / equivalent over HTTPS with an API key).
+#
+# TAILOR before shipping:
+#   - `plugin` — replace with the reverse-DNS canonical id for
+#     your plugin.
+#   - `owner` — the accountable team / individual / organisation.
+#   - If your provider is NETWORK-based, keep the `network_lookup`
+#     intent below and its verification. If your provider is
+#     LOCAL-only, delete `network_lookup` and its verification.
+#   - `verification.commands` — read-only shell commands that
+#     confirm the host actually satisfies the intents. Every entry
+#     must exit 0 as the plugin's declared service identity.
+#   - `host_provisioning.<distro>.systemd.ReadOnlyPaths` — narrow
+#     to the media roots you actually read for local metadata.
+
+capability_intent:
+  - id: media_library_read
+    need: read declared media library roots to extract embedded metadata (tags, embedded art, replaygain, chapter markers) for the framework's catalogue.
+    access_path: filesystem/library
+    failure_mode: report no metadata for unreachable roots; structured event names the root; no panic.
+  - id: network_lookup
+    need: fetch supplementary metadata (bios, reviews, external artwork) from third-party HTTPS APIs using a configured API key or OAuth token.
+    access_path: network/outbound
+    failure_mode: return locally-cached results only; structured event; no panic.
+  - id: state_storage
+    need: write per-plugin state directory to cache fetched metadata, rate-limit counters, and per-track fingerprints.
+    access_path: filesystem/state
+    failure_mode: degrade to no-cache mode (every query hits the source); structured event; no panic.
+
+required_binaries: []
+
+required_kernel_modules: []
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+    - "test -r /var/lib/evo"
+  expected:
+    - state directory exists as the declared service identity
+    - state directory is readable
+
+host_provisioning:
+  debian:
+    systemd:
+      SupplementaryGroups: []
+      CapabilityBoundingSet: []
+      AmbientCapabilities: []
+      ProtectSystem: strict
+      ProtectHome: "yes"
+      ReadWritePaths:
+        - /var/lib/evo/plugins/com.example.metadata.provider/state
+      ReadOnlyPaths:
+        - /var/lib/evo/music
+      NoNewPrivileges: true
+    capabilities: []
+    sudoers: []

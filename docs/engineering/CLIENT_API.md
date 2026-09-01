@@ -554,16 +554,18 @@ Or, with a cursor for replay-then-live:
 { "op": "subscribe_happenings", "since": 1234 }
 ```
 
-Or, with a server-side filter narrowing the stream to specific variants, plugins, or shelves:
+Or, with a server-side filter narrowing the stream to specific variants, plugins, shelves, or subject types:
 
 ```json
 {
   "op": "subscribe_happenings",
   "since": 1234,
   "filter": {
-    "variants": ["custody_taken", "custody_released"],
+    "variants": ["custody_taken", "subject_state_changed"],
     "plugins": ["org.example.warden"],
-    "shelves": ["audio.playback"]
+    "shelves": ["audio.playback"],
+    "subject_types": ["audio_playback_now_playing", "audio_playback_stream_format"],
+    "subject_types_deny": ["audio_playback_spectrum_frame"]
   }
 }
 ```
@@ -579,8 +581,12 @@ Filter dimensions:
 | `variants` | The happening's `type` field (e.g. `custody_taken`, `subject_forgotten`). |
 | `plugins` | The happening's primary plugin: the `plugin` field on actor-and-subject variants (custody, conflict-detected); the `target_plugin` field on forced-retract variants; the `admin_plugin` field on admin-actor-only variants (merge, split, suppress, claim-reassign). |
 | `shelves` | The happening's `shelf` field, present on custody-touching variants only (`custody_taken`, `custody_aborted`, `custody_degraded`). Other variants do not carry shelf information and are rejected when the `shelves` filter is set. |
+| `subject_types` | Allow-list of subject-type strings (e.g. `audio_playback_now_playing`). Applied to `subject_state_changed` happenings only; non-state-changed variants pass this dimension trivially. Use to scope a high-frequency stream to the specific subjects a consumer renders. |
+| `subject_types_deny` | Deny-list of subject-type strings, evaluated after the allow-list. Applied to `subject_state_changed` happenings only; non-state-changed variants pass trivially. Use to drop a high-rate subject (e.g. `audio_playback_spectrum_frame`) without enumerating every subject to keep. |
 
-The filter wire shape rejects unknown fields at parse time: a typo on a dimension key (`varient` instead of `variants`) aborts the subscribe with a structured `protocol_violation` rather than silently default-zeroing the dimension.
+`subject_types` and `subject_types_deny` compose: a subject passes when (allow is empty OR subject is in allow) AND subject is not in deny. The allow-list narrows the stream; the deny-list excises within whatever survives.
+
+The filter wire shape rejects unknown fields at parse time: a typo on a dimension key (`varient` instead of `variants`) aborts the subscribe with a structured `protocol_violation` rather than silently default-zeroing the dimension. The HTTPS/WS dispatcher applies the same filter parser and the same `accepts()` predicate as the Unix-socket path — the filter takes effect end-to-end on both transports.
 
 A consumer reconnecting after a transient drop passes its last-observed `seq` as `since` and resumes cleanly. Cross-restart resume is supported: the bus's seq counter is durable, so a `since` smaller than the steward's pre-restart current seq still resolves through the persisted window. If `since` is older than the durable retention window, the replay query returns whatever survives — older events are simply not included, and the consumer is responsible for falling back to a snapshot-style query (e.g. `list_active_custodies`) pinned to `current_seq` if a complete picture is required.
 
@@ -931,13 +937,34 @@ Three ops manage the per-pair compose-and-apply loop the framework drives for de
 
 ### 4.14 User-interaction routing ops
 
-Three ops route plugin-initiated user prompts to a consumer connection holding the `user_interaction_responder` capability (single-claimer, first-claimer-wins). Plugins call `request_user_interaction(...)` via the SDK; the framework parks the request on the prompt ledger, the responder consumer answers via `answer_user_interaction`, and the plugin's awaiting future resolves.
+Four ops route plugin-initiated user prompts to a consumer connection holding the `user_interaction_responder` capability (single-claimer, first-claimer-wins). Plugins call `request_user_interaction(...)` via the SDK; the framework parks the request on the prompt ledger, the responder consumer answers via `answer_user_interaction`, and the plugin's awaiting future resolves.
 
 - **`list_user_interactions`** returns every prompt currently in `Open` state: `[{ "plugin": "...", "prompt": <PromptRequest> }]`.
 - **`answer_user_interaction { plugin, prompt_id, response, retain_for? }`** transitions the prompt to `Answered` and resolves the plugin's awaiting future with the typed response.
 - **`cancel_user_interaction { plugin, prompt_id }`** transitions the prompt to `Cancelled` (consumer attribution) and resolves the plugin's future with the cancellation outcome.
+- **`release_user_interaction_responder`** releases the responder slot the calling bearer currently holds, so a different bearer may claim without waiting for token TTL. Idempotent by construction — the ledger's release is same-holder-only clear, so calling from a bearer that does not hold the slot (either because a different bearer holds it, or because the slot is already vacant) is a no-op. Returns `{ "responder_released": true }` in every case. Intended use: the operator UI calls this on explicit log-out or on tab-close.
 
-All three gated by `user_interaction_responder`. Refusals: `user_interaction_responder_not_granted`, `prompt_not_found`, `responder_already_assigned` (negotiate-time refusal when another connection holds the capability).
+All four gated by `user_interaction_responder`. Refusals:
+
+- `user_interaction_responder_not_granted` — the connection does not carry the responder capability at all.
+- `responder_slot_unclaimed` — the connection carries the capability but no session has called `negotiate` to claim the slot; list/answer/cancel refuse. (Release does not refuse on this axis — it is idempotent when the slot is vacant.)
+- `responder_slot_held_by_other` — the connection carries the capability but a different session holds the slot; list/answer/cancel refuse. (Release does not refuse on this axis either.)
+- `responder_already_assigned` — negotiate-time refusal when another connection already holds the slot.
+- `prompt_not_found` — answer/cancel refuse when the `(plugin, prompt_id)` pair is unknown or already terminal.
+
+On the HTTPS-arriving transport the single-responder identity is the bearer token: two ops carrying the same bearer share one slot claim (idempotent same-holder re-claim on renegotiate); two different bearers minted for the responder role are correctly refused as different claimants. Release semantics on that transport are bounded by bearer TTL rather than steward lifetime, and the explicit `release_user_interaction_responder` op above short-circuits the TTL wait on operator log-out.
+
+**Minimal working browser-responder mint.** The responder ops above gate on `user_interaction_responder`, but the reactive path the responder consumer needs to track live prompt state relies on `subscribe_happenings`, which itself gates on `read:subjects` (the happenings bus carries subject-state changes). A responder session that mints with only `--scope user_interaction_responder` seeds the prompt list once via `list_user_interactions` and never sees updates. The minimal working mint is therefore two scopes:
+
+```
+evo-plugin-tool admin auth mint-bearer-token \
+    --reason "operator UI browser session" \
+    --ttl-seconds 3600 \
+    --scope user_interaction_responder \
+    --scope subjects
+```
+
+`--scope subjects` intersects the operator bootstrap set's `Read("subjects")` capability into the issued token; combined with the responder scope, the session covers negotiate + all four responder ops + the subscribe path.
 
 ### 4.15 Appointment admin ops
 
@@ -963,7 +990,23 @@ Four ops manage condition-driven instructions. Plugins schedule watches via the 
 
 Refusals: `watches_admin_not_granted`, `watches_not_configured`, `bad_spec` (invalid recurrence, level cooldown < 1000 ms, composite-Not arity, composite tree depth), `quota_exceeded`.
 
-### 4.17 Subject-grammar migration ops
+### 4.17 UI artefact ops
+
+Five ops surface the UI artefact substrate to operator surfaces. The framework admits three artefact kinds (`theme` / `ui_shell` / `widget_kind_pack`) into dedicated registries (`ThemeRegistry` / `UiShellRegistry` / `WidgetKindPackRegistry`); these ops let operators query the admitted set, drive active-selection, and observe the rendered UI vocabulary.
+
+- **`describe_ui_stockings { shelf_filter? }`** returns every admitted UI stocking across every plugin: `[{ plugin, ui_shelf, widget, size, mode?, schema_version }]`. Optional `shelf_filter` narrows to one shelf id. Read-only; no capability negotiation. Refuses with `ui_admitted_store_not_configured` (Internal class) if the store is absent (test harness without a UI surface).
+
+- **`activate_theme { plugin_name, step_up_token? }`** activates the named theme (or clears the slot when `plugin_name` is `null`). Capability-gated by `plugins_admin`, step-up-aware. Returns `{ "active_ui_selection_set": true, "slot": "theme", "active_plugin_name": <string|null> }`. Refusals: `plugins_admin_not_granted`, `step_up_required` / `step_up_invalid`, `theme_not_admitted` (NotFound class — plugin name not in the theme registry), `active_ui_selection_runtime_not_configured`, `persistence_write_failed`. Persisted across steward restart via the `active_ui_selection` SQLite table; rehydrated at boot before any UI client connects. On every successful set, fires `Happening::UiActiveThemeChanged { previous, current, principal, at }` so subscribers re-render reactively.
+
+- **`activate_ui_shell { plugin_name, step_up_token? }`** mirrors `activate_theme` for the `ui_shell` slot. Same gate, same refusal taxonomy (with `ui_shell_not_admitted` instead of `theme_not_admitted`), same persistence + happening surface (`UiActiveShellChanged`).
+
+- **`describe_active_ui_selection`** returns the active theme + active UI shell plugin names: `{ "theme": <string|null>, "ui_shell": <string|null> }`. Read-only; no capability negotiation. Refuses with `active_ui_selection_runtime_not_configured` (Internal) if the runtime is absent.
+
+The CLI wraps these as `evo-plugin-tool admin describe-ui-stockings` / `activate-theme {--plugin <name> | --clear}` / `activate-ui-shell {--plugin <name> | --clear}` / `describe-active-ui-selection` (see `PLUGIN_TOOL.md`).
+
+Active-selection auto-clear discipline: when an artefact is unadmitted (`uninstall_plugin` against a theme / ui_shell name), if the unadmitted artefact is currently active, the framework clears the matching slot FIRST (firing `UiActiveThemeChanged` / `UiActiveShellChanged` with `current: null`), THEN the unadmission proceeds (firing `UiThemeUnadmitted` / `UiShellUnadmitted`). Subscribers see clear-then-drop ordering so the renderer never asks for a no-longer-admitted bundle.
+
+### 4.18 Subject-grammar migration ops
 
 Three ops manage orphan subject types — subjects whose `subject_type` is no longer declared in the loaded catalogue. See `CATALOGUE.md` §5.3 for the boot diagnostic and `SUBJECTS.md` for the `TypeMigrated` alias kind. All three gated by the `grammar_admin` capability.
 
@@ -1931,9 +1974,9 @@ The steward's admission-engine mutex is held briefly per request (section 9 of `
 
 Things this protocol deliberately does not do:
 
-- **Authentication.** Connection implies trust. The distribution chooses who can open the socket via filesystem permissions.
-- **Transport encryption.** Unix sockets are local; no TLS on the core protocol.
-- **TCP transport on the core protocol.** The steward's client socket stays Unix-local. Cross-machine access is implemented by a **bridge plugin** that terminates the Unix socket locally and exposes its own remote interface (HTTP, WebSocket, MQTT, gRPC, whatever the scenario demands). This keeps the core trusted boundary simple while leaving remote access fully available. See `FRONTEND.md` for the bridge pattern and the technology choices it enables.
+- **Authentication.** Connection to the **UDS** slow-path implies trust; the distribution chooses who can open the socket via filesystem permissions. Network envelopes (HTTPS, gRPC, GraphQL, HTTP/3) gate every request on a capability-scoped bearer token (and optionally a fresh step-up ticket, an mTLS client cert, and/or an OIDC JWT). See `TRANSPORTS.md` §3 for the network-envelope authentication primitives.
+- **Transport encryption.** Unix sockets are local; no TLS on the core protocol. Network envelopes terminate TLS (HTTPS / HTTP/3 reuse the same `HotReloadCertResolver`-managed bundle from the device-CA, ACME, or a manually-installed cert).
+- **Network transports on the core protocol.** The framework natively projects the canonical wire-protocol schema into multiple network envelopes — HTTPS (REST + WebSocket), gRPC, GraphQL, HTTP/3 + QUIC — each routing through the same `Server::dispatch_http_wire_op` adapter the UDS listener consumes. Every envelope is opt-in via its own env var. See `TRANSPORTS.md` for the full multi-projection-runtime contract. `FRONTEND.md` documents the legacy bridge-plugin pattern for distributions that still want one (the framework's native projections supersede that posture at the framework tier; bridge plugins remain useful for protocols outside the framework's lock set, e.g. MQTT, MIDI, plain-TCP framed wire formats).
 - **Multiple requests in flight per connection.** One request at a time; pipeline across connections.
 - **Server push for non-streaming ops.** Only `subscribe_happenings` streams.
 - **Schema negotiation.** The op discriminator, response shapes, and error format are part of the steward's version contract. Distributions pin a steward version and the shapes are fixed.

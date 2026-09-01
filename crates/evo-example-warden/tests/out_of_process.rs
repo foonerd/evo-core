@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end out-of-process warden admission integration test.
 //!
 //! Spawns the `warden-wire` binary as a child process listening on a

@@ -13,7 +13,8 @@ Happenings (the fabric's notification stream per `CONCEPT.md`) are distinct from
 All evo code uses the [`tracing`](https://crates.io/crates/tracing) ecosystem.
 
 - Crates emit events via `tracing` macros (`error!`, `warn!`, `info!`, `debug!`, `trace!`).
-- The steward installs a `tracing-subscriber` registry with layers for stderr (human-readable) and journald (structured).
+- The steward installs a `tracing-subscriber` registry with exactly one emission layer per process. When the steward is running under systemd with a reachable journald socket, that layer is `tracing-journald` (structured journal records). When journald is unavailable (non-systemd host, container without journald, non-root without journald access), the steward falls back to `tracing-subscriber`'s `fmt` layer writing to stderr. The two surfaces are mutually exclusive — running both simultaneously double-emits every event (the stderr text gets captured into journald by systemd, alongside the structured record from `tracing-journald`), wasting journal capacity and CPU.
+- The stderr fallback writer is wrapped in `tracing_appender::non_blocking`. Write syscalls happen on a dedicated worker thread; high-frequency tracing sources cannot block the calling thread on a slow stderr consumer. The non-blocking writer's `WorkerGuard` is owned by the steward entrypoint for the program lifetime.
 - Dependencies that use the older `log` crate are bridged via `tracing-log`.
 
 Plugins depend on `tracing` directly rather than through an `evo-plugin-sdk` re-export. The SDK documents the supported `tracing` major version. This avoids version lock-in across the ecosystem.
@@ -35,6 +36,8 @@ Discipline:
 - Level selection is a contract. A module emitting `error` for a recoverable condition, or `info` for a per-request event, is violating the contract.
 - Each log call names its level deliberately. "I was not sure which level to use" is a signal the call site needs more thought, not a default.
 
+Third-party dependencies bridged via `log` do not always match this taxonomy. In particular, media parsers (`lofty`, `symphonia`, and others) emit `log::warn!` for recoverable demuxer conditions — frame-header retries, missing VBR headers, tag-block skip-and-continue — that the parser then handles transparently. Those messages fail the `warn` contract: they are not operator-actionable. Section 3 documents the baseline `EnvFilter` directive evo installs to keep them out of the default surface while leaving them one `RUST_LOG` override away for triage.
+
 ## 3. Default Log Level
 
 The default log level on a production device is `warn`.
@@ -45,19 +48,57 @@ Configuration precedence, highest wins:
 
 1. The `RUST_LOG` environment variable, if set. Standard `tracing_subscriber::EnvFilter` syntax.
 2. The `log_level` field in `/etc/evo/evo.toml`, if set. One of `error`, `warn`, `info`, `debug`, `trace`.
-3. Default: `warn`.
+3. Baseline directive: `warn,lofty=error` (see below).
 
 Operators who want the narrative set `log_level = "info"` in `/etc/evo/evo.toml` or `RUST_LOG=info` in the service environment.
 
 Developers on a dev machine typically run with `RUST_LOG=info` or with per-crate filters like `RUST_LOG=evo_plugin_sdk=debug,info`.
 
+### Baseline directive
+
+When no operator override is set (no `RUST_LOG`, no valid `log_level` in `evo.toml`, no `--log-level` on the steward CLI), evo installs a small `EnvFilter` directive rather than the bare word `warn`. The exact string is exported from the plugin SDK as `evo_plugin_sdk::wire_logging::DEFAULT_WIRE_ENV_FILTER` and today reads:
+
+```text
+warn,lofty=error
+```
+
+The `warn` half is the production floor for first-party crates. The `lofty=error` half is a documented quiet on the audio-tag parser's `log::warn!` calls for recoverable demuxer conditions (frame-header retries, missing VBR headers, tag-block skip-and-continue), per Section 2. Lofty errors — parse-refused, IO-refused — still surface. New noisy log-bridged dependencies are added to this directive as they are discovered; the change lands in one place and both the steward and every out-of-process wire binary inherit it.
+
+Operators who need the muted output for triage set `RUST_LOG=lofty=warn` (or any wider directive) — an operator-set `RUST_LOG` fully replaces the baseline directive; the baseline is not merged onto the override.
+
+Two implementation points install this baseline:
+
+- `evo::logging::resolve_filter` (the steward).
+- `evo_plugin_sdk::wire_logging::init` (every out-of-process wire binary).
+
+Both read from the same SDK-owned constant. Any change to the baseline lands in the SDK and both surfaces update on the next build.
+
 ## 4. Log Format
 
-The steward installs two subscriber layers that see the same events:
+Exactly one emission layer is active per process. The two formats below describe the two layers; the steward picks one at startup per Section 1.
 
-### Stderr layer (human-readable)
+### Journald layer (structured) — default under systemd
 
-For operators tailing `journalctl -u evo` or running evo on a dev machine. `tracing-subscriber`'s `fmt` layer with default format:
+When the steward is running under systemd with a reachable journald socket, the active layer is `tracing-journald`. Every event becomes a structured journal entry with:
+
+- Standard journald fields (`MESSAGE`, `PRIORITY`, `_SYSTEMD_UNIT`, etc.). `MESSAGE` carries the event's static message string.
+- `EVO_TARGET` = the tracing target.
+- One journald field per structured event field, prefixed `EVO_` and uppercased (e.g. `EVO_PLUGIN=com.fiio.dacs`, `EVO_TRUST_CLASS=standard`).
+
+Default `journalctl -u evo` output renders the `MESSAGE` field only, mirroring how systemd's own native services render. To see structured fields:
+
+```shell
+journalctl -u evo -o verbose       # per-event field listing
+journalctl -u evo -o json | jq .   # structured machine-readable form
+journalctl -u evo -o short-precise # short form with high-resolution timestamps
+journalctl EVO_PLUGIN=com.fiio.dacs # filter every event for one plugin
+```
+
+Operators reading the journal pick the form that fits the task; for fleet-scale analysis the JSON output is the canonical surface.
+
+### Stderr layer (human-readable) — fallback when journald is unavailable
+
+When journald is unreachable (non-systemd host, container without journald, non-root without journald access), the steward falls back to `tracing-subscriber`'s `fmt` layer writing to stderr. Default format:
 
 ```
 2026-04-22T14:32:10.123Z  INFO evo::admission: plugin admitted plugin=com.fiio.dacs trust_class=standard
@@ -72,15 +113,15 @@ Fields:
 - Event message.
 - Structured fields, space-separated, `key=value` format.
 
-### Journald layer (structured)
+The writer is wrapped in `tracing_appender::non_blocking`. Write syscalls happen on a dedicated worker thread, so a slow stderr consumer cannot block the steward's realtime tasks (audio scheduling, fabric event dispatch, etc.). The non-blocking writer's `WorkerGuard` is held by the steward entrypoint for the lifetime of the process; dropping it flushes pending writes and stops the worker.
 
-For programmatic consumption and for cross-referencing by systemd tooling. `tracing-journald` layer. Every event becomes a journal entry with:
+### Why the two are mutually exclusive
 
-- Standard journald fields (`MESSAGE`, `PRIORITY`, `_SYSTEMD_UNIT`, etc.).
-- `EVO_TARGET` = the tracing target.
-- One journald field per structured event field, prefixed `EVO_` and uppercased (e.g. `EVO_PLUGIN=com.fiio.dacs`, `EVO_TRUST_CLASS=standard`).
+Running `tracing-journald` and `fmt`-stderr at the same time double-emits every event: once as a native journald record (via `sd_journal_send`), and once as a captured-stderr text line (systemd routes stderr into journald with `MESSAGE` set to the line and `_TRANSPORT=stdout`). Both copies land in the journal under the same service unit. The journal then carries two copies of every log line — wasting capacity, doubling per-event CPU and syscall cost, and (in the case of high-frequency tracing on a real-time path) producing self-DoS conditions where logging contends with the realtime workload it was meant to observe. The exclusive-layer rule is the engineering-grade resolution.
 
-This lets operators query `journalctl EVO_PLUGIN=com.fiio.dacs` to see all events concerning one plugin, regardless of level.
+### High-frequency observability is NOT a logging concern
+
+Per-frame, per-tick, or per-message tracing emissions belong in the published-subject substrate (see `HAPPENINGS.md` and the subject substrate documented under each shelf's contract), not the log surface. The log surface is for the narrative of the system's lifecycle — admissions, transitions, errors, warnings. A trace point that emits at >10 Hz under any realistic workload should be at `trace!` level (off by default; gated behind `RUST_LOG=...=trace` for ad-hoc debugging) AND should also have a structured-subject surface for canonical operator consumption. Wire-op-backed snapshots over the structured subject are the right shape; the log mirror is at most a debugging convenience. Crate authors flagging a need for high-frequency logging should pause and ask whether a published subject is the right surface instead.
 
 ## 5. Log Targets and Identification
 
@@ -88,7 +129,7 @@ Targets identify the origin of an event. Evo uses the default tracing behaviour:
 
 - No textual prefix. Lines do not start with `[EVO]` or similar. The target already identifies origin.
 - Crate names own their own target prefix. `evo-plugin-sdk` logs from `evo_plugin_sdk::*` targets. The steward logs from `evo::*` targets (or module paths under it).
-- Dependencies log under their own targets. `tokio::*`, `reqwest::*`, etc. are filtered through the same `tracing` subscriber and can be selectively quieted via `RUST_LOG` if they are noisy.
+- Dependencies log under their own targets. `tokio::*`, `reqwest::*`, `lofty::*`, etc. are filtered through the same `tracing` subscriber. `log`-crate emissions from these deps are bridged into `tracing` by `tracing_log::LogTracer`, which `tracing_subscriber::fmt::init` installs — bridged records carry the dep's own target verbatim (`lofty`, `symphonia`, …), so `EnvFilter` directives written against those targets take effect. Section 3's baseline directive uses this to keep known-noisy deps quiet without silencing them everywhere; operators quiet or unquiet others via `RUST_LOG` on a per-target basis.
 
 ## 6. Structured Fields
 

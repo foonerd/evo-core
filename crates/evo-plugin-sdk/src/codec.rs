@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Wire codec: JSON / CBOR encoding and length-prefixed framing.
 //!
 //! Implements sections 6 and 9 of `docs/engineering/PLUGIN_CONTRACT.md`.
@@ -755,6 +758,8 @@ mod tests {
             payload: vec![0u8, 1, 2, b'"', b'\n', 0xFF, 0xFE],
             deadline_ms: Some(5_000),
             instance_id: Some("inst-7".into()),
+            principal_scope: None,
+            has_step_up: false,
         };
         let bytes = encode_cbor(&frame).unwrap();
         let back = decode_cbor(&bytes).unwrap();
@@ -777,6 +782,8 @@ mod tests {
             payload: b"hello".to_vec(),
             deadline_ms: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let bytes = encode_cbor(&frame).unwrap();
         // `0x45 68 65 6c 6c 6f` = byte string len 5 of "hello".

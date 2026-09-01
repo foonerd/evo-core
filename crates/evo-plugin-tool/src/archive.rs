@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! `tar.gz` / `tar.xz` / `zip` as in `PLUGIN_PACKAGING` §9.
 //!
 //! On Unix, all three formats preserve the permission bits of files

@@ -29,3 +29,19 @@
 
 [resolver]
 incompatible-rust-versions = "fallback"
+
+# Cross-compile linker selections per BUILDING.md §8.
+# These match the documented native cross-compile recipes; keeping them
+# here makes `cargo build --target <triple>` work out of the box on a
+# host that has the matching cross-gcc installed (the recipes document
+# the apt packages: `gcc-aarch64-linux-gnu`, `gcc-arm-linux-gnueabihf`).
+# The blocks are no-ops for builds that target the host triple.
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+
+[target.arm-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"

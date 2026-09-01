@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Steward configuration.
 //!
 //! The steward reads `/etc/evo/evo.toml` at startup. All fields have
@@ -54,6 +57,14 @@ pub const DEFAULT_PERSISTENCE_PATH: &str = "/var/lib/evo/state/evo.db";
 /// `credentials/` (see `PLUGIN_PACKAGING.md`).
 pub const DEFAULT_PLUGIN_DATA_ROOT: &str = "/var/lib/evo/plugins";
 
+/// Default root directory for listening-plan TOML files. One file
+/// per plan, named `<plan_id>.toml`. Operator-editable; vendor
+/// distributions ship plans here as part of their package payload.
+/// The plan engine reads at boot, applies file-level changes at
+/// register / unregister, and stages atomic writes via tempfile
+/// rename so external readers never observe a half-written file.
+pub const DEFAULT_PLAN_STORAGE_ROOT: &str = "/var/lib/evo/plans";
+
 /// Default runtime directory for out-of-process plugin sockets.
 ///
 /// Aligns with FHS: runtime state (sockets, pidfiles) lives under
@@ -79,6 +90,19 @@ pub const DEFAULT_PLUGINS_CONFIG_DIR: &str = "/etc/evo/plugins.d";
 /// earlier one).
 const DEFAULT_PLUGIN_SEARCH_ROOTS: [&str; 2] =
     ["/opt/evo/plugins", "/var/lib/evo/plugins"];
+
+/// Default "bundled roots" list — search-root prefixes whose
+/// admitted plugins are classified as `bundled` (factory-installed,
+/// shipped in the distribution image). Removal of a plugin whose
+/// bundle directory is rooted under any of these refuses with
+/// `bundled_plugin_not_removable`. Disable / re-enable / state-
+/// purge remain available — the policy applies only to remove.
+///
+/// Defaults to the vendor distribution path (`/opt/evo/plugins`).
+/// `/var/lib/evo/plugins` is intentionally excluded because the
+/// stage watcher writes admitted bundles there; an operator who
+/// installs a plugin post-image MUST be able to remove it.
+const DEFAULT_PLUGIN_BUNDLED_ROOTS: [&str; 1] = ["/opt/evo/plugins"];
 
 /// Package-shipped trust directory (`/opt/evo/trust/*.pem`). See
 /// `PLUGIN_PACKAGING.md` section 5.
@@ -140,6 +164,21 @@ pub struct StewardConfig {
     /// reality plus poll cadence.
     #[serde(default)]
     pub time_trust: TimeTrustSection,
+    /// Listening-plans engine settings — where the framework
+    /// reads / writes plan TOML files.
+    #[serde(default)]
+    pub plans: PlansSection,
+    /// Multi-room substrate settings — mDNS-SD discovery
+    /// enable / disable, the advertised control-plane port,
+    /// peer-TTL window. Vendors enable additional capabilities
+    /// here as their plugins admit.
+    #[serde(default)]
+    pub multiroom: MultiroomSection,
+    /// Three-channel update model — release-trust directory
+    /// the steward loads at boot, and per-source channel
+    /// configuration the framework's default sources consume.
+    #[serde(default)]
+    pub updates: UpdatesSection,
 }
 
 impl StewardConfig {
@@ -208,6 +247,16 @@ pub struct StewardSection {
     /// requests.
     #[serde(default = "default_socket_path")]
     pub socket_path: PathBuf,
+
+    /// Optional vendor-distribution identifier (e.g. `volumio`,
+    /// `audiophile-os`). Recorded once at first-boot device
+    /// identity generation; durable across reinstall via the
+    /// substrate row. Subsequent boots inherit the recorded
+    /// value — config drift cannot rotate it. Framework
+    /// builds leave this `None`; vendor distributions set it
+    /// in their bundled config.
+    #[serde(default)]
+    pub vendor_id: Option<String>,
 }
 
 impl Default for StewardSection {
@@ -215,6 +264,7 @@ impl Default for StewardSection {
         Self {
             log_level: default_log_level(),
             socket_path: default_socket_path(),
+            vendor_id: None,
         }
     }
 }
@@ -384,6 +434,195 @@ fn default_time_trust_poll_interval_secs() -> u64 {
     crate::time_trust::DEFAULT_POLL_INTERVAL_SECS
 }
 
+/// `[plans]` section. Listening-plans engine settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlansSection {
+    /// Root directory for listening-plan TOML files. One file
+    /// per plan, named `<plan_id>.toml`. Operator-editable;
+    /// vendor distributions ship plans here. The plan engine
+    /// creates the directory at boot if it does not exist.
+    /// Default: [`DEFAULT_PLAN_STORAGE_ROOT`]
+    /// (`/var/lib/evo/plans`).
+    #[serde(default = "default_plan_storage_root")]
+    pub storage_root: PathBuf,
+    /// Path to the vendor-authored first-boot wizard plan
+    /// TOML. The wizard plan is the same shape as a listening
+    /// plan but carries a `first_boot` trigger and a
+    /// `preempt = true` declaration; the steward's boot wiring
+    /// fires it at startup when persisted wizard-state reports
+    /// the wizard has not completed.
+    ///
+    /// Empty (`None` on disk) disables the first-boot wizard —
+    /// useful for re-imaged devices that have already been
+    /// configured elsewhere or for headless service-style
+    /// deployments that never present a wizard UI.
+    ///
+    /// Operator-editable; vendor distributions ship this file
+    /// pointing at their stock wizard.toml. Path is consumed
+    /// by the wizard loader at boot.
+    #[serde(default)]
+    pub wizard_path: Option<PathBuf>,
+}
+
+impl Default for PlansSection {
+    fn default() -> Self {
+        Self {
+            storage_root: PathBuf::from(DEFAULT_PLAN_STORAGE_ROOT),
+            wizard_path: None,
+        }
+    }
+}
+
+fn default_plan_storage_root() -> PathBuf {
+    PathBuf::from(DEFAULT_PLAN_STORAGE_ROOT)
+}
+
+/// `[multiroom]` section.
+///
+/// Tunes the mDNS-SD discovery substrate that powers the
+/// multi-room native protocol. Defaults are sensible for a
+/// connected appliance that wants to advertise itself
+/// immediately and discover peers within a five-minute
+/// window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MultiroomSection {
+    /// Whether mDNS-SD discovery is enabled. When `false`,
+    /// the runtime is constructed but never started — the
+    /// device neither advertises itself nor browses for
+    /// peers. Default: `true`.
+    #[serde(default = "default_multiroom_enabled")]
+    pub discovery_enabled: bool,
+    /// Reserved control-plane TCP port advertised in the
+    /// SRV record. The actual TCP listener that backs this
+    /// port is established by a later multi-room sub-
+    /// primitive; the discovery advertisement refers ahead
+    /// to that port so peer nodes can pre-populate their
+    /// connection target. Default: `7331`.
+    #[serde(default = "default_multiroom_control_port")]
+    pub control_port: u16,
+    /// Time window (seconds) after which a peer that has
+    /// not re-announced is considered lost. The TTL prune
+    /// loop deletes the row from the substrate and emits a
+    /// `peer_lost` happening. Default: `300` (5 minutes).
+    #[serde(default = "default_multiroom_peer_ttl_seconds")]
+    pub peer_ttl_seconds: u64,
+    /// Cadence (seconds) of the TTL prune loop. Default:
+    /// `30`.
+    #[serde(default = "default_multiroom_prune_interval_seconds")]
+    pub prune_interval_seconds: u64,
+}
+
+impl Default for MultiroomSection {
+    fn default() -> Self {
+        Self {
+            discovery_enabled: default_multiroom_enabled(),
+            control_port: default_multiroom_control_port(),
+            peer_ttl_seconds: default_multiroom_peer_ttl_seconds(),
+            prune_interval_seconds: default_multiroom_prune_interval_seconds(),
+        }
+    }
+}
+
+fn default_multiroom_enabled() -> bool {
+    true
+}
+
+fn default_multiroom_control_port() -> u16 {
+    7331
+}
+
+fn default_multiroom_peer_ttl_seconds() -> u64 {
+    300
+}
+
+fn default_multiroom_prune_interval_seconds() -> u64 {
+    30
+}
+
+/// `[updates]` section. Three-channel update model
+/// configuration — release-trust directory + per-source
+/// channel pointers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdatesSection {
+    /// Directory the steward walks at boot to load
+    /// release-tier trust roots (sidecar `<keyname>.pem` +
+    /// `<keyname>.meta.toml` pairs, role declared via
+    /// `release_role` in the sidecar). Empty / missing means
+    /// no release-trust roots are configured — the framework
+    /// admits zero release-channel updates until the operator
+    /// provisions a key. Default:
+    /// [`DEFAULT_RELEASE_TRUST_DIR`]
+    /// (`/etc/evo/release-trust.d`).
+    #[serde(default = "default_release_trust_dir")]
+    pub release_trust_dir: PathBuf,
+    /// `[updates.core]` — framework steward update source.
+    #[serde(default)]
+    pub core: UpdatesCoreSection,
+}
+
+impl Default for UpdatesSection {
+    fn default() -> Self {
+        Self {
+            release_trust_dir: default_release_trust_dir(),
+            core: UpdatesCoreSection::default(),
+        }
+    }
+}
+
+/// Default release-trust directory.
+pub const DEFAULT_RELEASE_TRUST_DIR: &str = "/etc/evo/release-trust.d";
+
+fn default_release_trust_dir() -> PathBuf {
+    PathBuf::from(DEFAULT_RELEASE_TRUST_DIR)
+}
+
+/// `[updates.core]` — the framework's `"core"` UpdateSource
+/// (steward binary updates served from a release channel).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdatesCoreSection {
+    /// Whether the source is registered. When `false` the
+    /// framework constructs no `core` source — useful for
+    /// vendor distributions that ship their own steward
+    /// update plumbing. Default: `true`.
+    #[serde(default = "default_updates_core_enabled")]
+    pub enabled: bool,
+    /// Base URL the source fetches from. The source appends
+    /// `/<target>/build-info.toml` (and `.sig`, and per-binary
+    /// paths) to this. Vendor distributions override to point
+    /// at their own release channel. Empty default — the
+    /// framework reference build does not bundle a hard-coded
+    /// upstream; the operator or distribution sets this.
+    #[serde(default)]
+    pub channel_base: Option<String>,
+    /// Stage directory the source writes the fetched steward
+    /// binary into before triggering the graceful restart.
+    /// Default: [`DEFAULT_CORE_STAGE_DIR`]
+    /// (`/var/lib/evo/staged`).
+    #[serde(default = "default_core_stage_dir")]
+    pub stage_dir: PathBuf,
+}
+
+impl Default for UpdatesCoreSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_updates_core_enabled(),
+            channel_base: None,
+            stage_dir: default_core_stage_dir(),
+        }
+    }
+}
+
+fn default_updates_core_enabled() -> bool {
+    true
+}
+
+/// Default stage directory for fetched steward binaries.
+pub const DEFAULT_CORE_STAGE_DIR: &str = "/var/lib/evo/staged";
+
+fn default_core_stage_dir() -> PathBuf {
+    PathBuf::from(DEFAULT_CORE_STAGE_DIR)
+}
+
 /// `[plugins]` section.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginsSection {
@@ -420,6 +659,16 @@ pub struct PluginsSection {
     /// then [`DEFAULT_PLUGIN_DATA_ROOT`].
     #[serde(default = "default_plugin_search_roots")]
     pub search_roots: Vec<PathBuf>,
+    /// Search-root prefixes whose admitted plugins are classified
+    /// as `bundled` for lifecycle-policy purposes. Removal of a
+    /// plugin whose bundle directory is rooted under any of these
+    /// refuses with the `bundled_plugin_not_removable` subclass.
+    /// Disable / re-enable / state-purge remain available
+    /// regardless. Defaults to `/opt/evo/plugins` only —
+    /// `/var/lib/evo/plugins` is intentionally `admitted` so
+    /// operator-installed plugins are removable.
+    #[serde(default = "default_plugin_bundled_roots")]
+    pub bundled_roots: Vec<PathBuf>,
     /// Directory of `*.pem` public keys (package-shipped; union with
     /// [`Self::trust_dir_etc`]). See `PLUGIN_PACKAGING.md` section 5.
     #[serde(default = "default_trust_dir_opt")]
@@ -455,6 +704,73 @@ pub struct PluginsSection {
     /// indefinitely).
     #[serde(default = "default_factory_orphan_grace_secs")]
     pub factory_orphan_grace_secs: u64,
+    /// Stage-directory watcher configuration. The stage directory
+    /// is a write-only drop target for operators (drop a signed
+    /// bundle here; the framework polls, validates, and admits
+    /// through the same admission gate as boot-time discovery).
+    /// One gate, no bypass.
+    #[serde(default)]
+    pub stage: PluginsStageConfig,
+}
+
+/// Plugin-stage watcher configuration.
+///
+/// The framework polls `dir` on a `poll_interval_secs` cadence
+/// for new bundles. When a bundle's size has been stable for two
+/// consecutive ticks (operator's write completed), the framework
+/// extracts the archive, copies the bundle directory into
+/// `plugin_data_root`, and admits it through the same admission
+/// gate as boot-time discovery. Successful admission consumes
+/// the staged archive. Failed admission moves the archive to
+/// `<dir>/rejected/<reason-slug>/<filename>` plus a sibling
+/// `.reason.txt` file describing the failure.
+///
+/// Setting `dir` to a path that is not writable by the steward
+/// service user means the watcher cannot consume / move
+/// archives; operator setup must grant the steward user write
+/// access to the stage directory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsStageConfig {
+    /// Stage directory the framework watches. Default:
+    /// `<plugin_data_root>/stage`. Setting this to a path
+    /// outside `plugin_data_root` is supported; the watcher
+    /// reads from this directory regardless of where it sits.
+    #[serde(default = "default_plugins_stage_dir")]
+    pub dir: PathBuf,
+    /// Polling interval in seconds. Default: 1 second.
+    /// Operators with sub-second drop sensitivity tighten this
+    /// at the cost of more idle wakeups; operators with
+    /// patience-tolerant workflows can relax it.
+    #[serde(default = "default_plugins_stage_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// When `false`, the watcher never starts; the stage dir is
+    /// not polled. Default: `true`.
+    #[serde(default = "default_true_bool")]
+    pub enabled: bool,
+}
+
+impl Default for PluginsStageConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_plugins_stage_dir(),
+            poll_interval_secs: default_plugins_stage_poll_interval_secs(),
+            enabled: true,
+        }
+    }
+}
+
+/// Default stage directory: `<DEFAULT_PLUGIN_DATA_ROOT>/stage`.
+pub fn default_plugins_stage_dir() -> PathBuf {
+    PathBuf::from(DEFAULT_PLUGIN_DATA_ROOT).join("stage")
+}
+
+fn default_plugins_stage_poll_interval_secs() -> u64 {
+    1
+}
+
+fn default_true_bool() -> bool {
+    true
 }
 
 fn default_plugin_data_root_path() -> PathBuf {
@@ -471,6 +787,13 @@ fn default_plugins_config_dir() -> PathBuf {
 
 fn default_plugin_search_roots() -> Vec<PathBuf> {
     DEFAULT_PLUGIN_SEARCH_ROOTS
+        .iter()
+        .map(|s| PathBuf::from(*s))
+        .collect()
+}
+
+fn default_plugin_bundled_roots() -> Vec<PathBuf> {
+    DEFAULT_PLUGIN_BUNDLED_ROOTS
         .iter()
         .map(|s| PathBuf::from(*s))
         .collect()
@@ -507,12 +830,14 @@ impl Default for PluginsSection {
             runtime_dir: default_plugin_runtime_dir(),
             config_dir: default_plugins_config_dir(),
             search_roots: default_plugin_search_roots(),
+            bundled_roots: default_plugin_bundled_roots(),
             trust_dir_opt: default_trust_dir_opt(),
             trust_dir_etc: default_trust_dir_etc(),
             revocations_path: default_revocations_path(),
             degrade_trust: default_degrade_trust(),
             security: PluginsSecurityConfig::default(),
             factory_orphan_grace_secs: default_factory_orphan_grace_secs(),
+            stage: PluginsStageConfig::default(),
         }
     }
 }

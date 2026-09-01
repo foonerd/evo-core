@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Scenario plan — a per-release file that lists the T1-T5 tier
 //! scenarios. Authored by deciders alongside the release; the
 //! harness consumes it as data.
@@ -11,7 +14,7 @@ use crate::scenario::Scenario;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioPlan {
-    /// Release this plan covers, e.g. "v0.1.12".
+    /// Release this plan covers, e.g. "vMAJOR.MINOR.PATCH".
     pub release: String,
     /// One-line description of the plan's coverage scope.
     #[serde(default)]

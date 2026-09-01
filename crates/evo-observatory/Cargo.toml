@@ -1,0 +1,26 @@
+[package]
+name = "evo-observatory"
+description = "Substrate-level structural observability — the Owl. Every dispatch, every TLS handshake, every cert event, every capability decision is captured as a typed Observation carrying a causal span chain. The substrate runs on a bounded lock-free ring buffer; producers push at single-AMO cost on the hot path; consumers read at query time via the recent-window and span-tree reconstruction APIs. Compile-time feature gate makes the whole substrate zero-cost when disabled."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["enabled"]
+# When the `enabled` feature is off, every public entry point compiles
+# to a no-op and the `Observatory` struct holds no allocations. The
+# substrate is paid for only when it is mounted.
+enabled = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+[lints]
+workspace = true

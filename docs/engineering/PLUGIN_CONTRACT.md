@@ -30,6 +30,12 @@ RESPONDENT: handles discrete request-response exchanges. Stateless from the stew
 
 WARDEN: takes custody of sustained work (playback, mount, connection, session, display surface). Reports state continuously, accepts course corrections, releases custody on instruction or failure.
 
+### Plugin kind is orthogonal to shelf occupancy
+
+A plugin kind names the interaction shape and instance shape of the plugin **process**. It does NOT pin the plugin to a single shelf. A plugin's manifest may stock one shelf (the conventional case, declared via the legacy `[target]` block) or multiple shelves (the multi-stocking case, declared via the `[[stockings]]` array per `PLUGIN_PACKAGING.md` §2.1.1). The framework's single-occupancy invariant runs at the stocking level — each shelf has at most one stocking at admission time — not at the plugin level.
+
+A Singleton Warden plugin may hold its primary warden stocking on one shelf and respondent stockings on adjacent shelves whose runtime substrate it already owns (e.g. a playback warden whose MPD substrate also carries queue / playlist / library respondent surfaces). The plugin's `kind.interaction` must be consistent with every stocking's `role`: a `warden` interaction permits both `warden` and `respondent` stocking roles; a `respondent` interaction permits only `respondent` stocking roles. A plugin's manifest declares the union of its stockings' verbs in `capabilities.respondent.request_types`; each stocking carries a disjoint partition of that union under its own `request_types` field; the dispatcher routes a wire request via the stocking whose shelf the request names.
+
 ## 2. Core Verbs (all plugins)
 
 | Verb | Direction | Purpose |
@@ -332,6 +338,7 @@ Plugins declare in their manifest whether they support hot reload. Three values:
 - Identity claims in messages match the manifest. Forgery closes the connection.
 - Instance announcements from factories are reversible by retractions with the same instance identity.
 - Custody state reports from wardens are truthful. A warden that reports "playing" when silent has violated the contract.
+- **Wire-shape defaults must be truth-derived or `null`.** Every field a plugin emits on a subject's state envelope (or any operator-visible payload) MUST either reflect upstream truth or serialise as JSON `null` (mapped from `Option::None` in the implementation). The pattern "set the field to `0` / empty-string / empty-array so the consumer sees a well-formed payload" is forbidden: it makes the consumer unable to distinguish *known to be zero* from *not known yet*. A subject envelope that hardcodes a placeholder zero on unknown values has violated the operator-truth contract — and is the same class of failure as a warden that reports "playing" when silent. Catalogue acceptance rows ({shelf}.v{N}.toml) MAY pin per-field instances of this invariant for shelves where the pattern has been a recurring failure mode.
 
 ## 16. Versioning
 

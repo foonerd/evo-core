@@ -2,7 +2,7 @@
 
 Target descriptors and scenario plans for the `evo-acceptance` harness.
 
-This directory ships publicly as a worked example. The framework's own pi5-prototype target descriptor and the v0.1.12 scenario plan are present so adopters building a distribution can read a complete, runnable example before authoring their own.
+This directory ships publicly as a worked example. The framework's own aarch64-validation target descriptor and per-release scenario plans are present so adopters building a distribution can read a complete, runnable example before authoring their own.
 
 Three audiences:
 
@@ -27,10 +27,10 @@ The committed `targets/<name>.toml` carries the literal sentinel `REPLACE_ME` in
 
 `acceptance/targets/*.local.toml` is gitignored (see the workspace `.gitignore`). Never commit a `.local.toml`.
 
-Worked example for `pi5-prototype`:
+Worked example for `aarch64-validation`:
 
 ```toml
-# acceptance/targets/pi5-prototype.local.toml
+# acceptance/targets/aarch64-validation.local.toml
 [ssh]
 host     = "10.0.0.42"
 user     = "lab-user"
@@ -43,16 +43,16 @@ Only the fields that differ from the base need to appear in the overlay; missing
 
 ```bash
 cargo run -p evo-acceptance -- inspect \
-    --target=acceptance/targets/pi5-prototype.toml \
-    --output=/tmp/pi5-inspection.md \
-    --output-json=/tmp/pi5-inspection.json
+    --target=acceptance/targets/aarch64-validation.toml \
+    --output=/tmp/aarch64-inspection.md \
+    --output-json=/tmp/aarch64-inspection.json
 
 cargo run -p evo-acceptance -- run \
-    --target=acceptance/targets/pi5-prototype.toml \
-    --plan=acceptance/plans/v0.1.12.toml \
-    --release=v0.1.12 \
+    --target=acceptance/targets/aarch64-validation.toml \
+    --plan=acceptance/plans/vMAJOR.MINOR.PATCH.toml \
+    --release=vMAJOR.MINOR.PATCH \
     --rc=1 \
-    --output=/tmp/v0.1.12-rc.1-pi5-readiness.md
+    --output=/tmp/vMAJOR.MINOR.PATCH-rc.1-readiness.md
 ```
 
 The harness reads target + plan as data; the runner sequences scenarios in tier order; the report module emits a Markdown readiness report (`run` subcommand) or a Markdown inspection report (`inspect` subcommand) plus an optional JSON sidecar for machine consumption.

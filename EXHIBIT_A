@@ -1,0 +1,43 @@
+EXHIBIT A — Business Source License Parameters
+
+This file makes the Business Source License 1.1 parameters for the
+evo framework conspicuous in their own document, in addition to
+their inline appearance at the top of the LICENSE file in this
+repository. The LICENSE file is the operative source of truth; this
+EXHIBIT_A is provided for clarity and ease of reference.
+
+The Licensed Work in this repository is the source code of the evo
+framework / steward / runtime (the `evo` crate and the supporting
+crates other than those that carry their own LICENSE override file
+in their subdirectory).
+
+Subdirectories of this repository that ship their own LICENSE file
+(for example crates/evo-plugin-sdk, crates/evo-plugin-tool,
+crates/evo-trust, crates/evo-coalesce-labels, and the
+crates/evo-example-* tree) are NOT subject to the Business Source
+License; their LICENSE files declare the applicable terms (Apache
+License, Version 2.0, in the cases listed).
+
+Parameters (verbatim from LICENSE):
+
+Licensor              Just a Nerd
+Licensed Work         evo (the framework / steward / runtime),
+                      version 0.1.13 or later. The Licensed Work is
+                      (c) 2026 Just a Nerd.
+Additional Use Grant  See LICENSE for the full grant. Summary: plugin
+                      development against the evo Plugin SDK, internal
+                      evaluation, non-production deployment, education,
+                      and non-commercial personal use are permitted.
+                      Hosted-service offering of the Licensed Work to
+                      third parties, and incorporation of the Licensed
+                      Work into a commercial product or service
+                      distributed to third parties, require separate
+                      written agreement from the Licensor.
+Change Date           Four years from the date the Licensed Work is
+                      published.
+Change License        Apache License, Version 2.0.
+
+After the Change Date for any given release of the Licensed Work,
+that release becomes available under the Change License. Newer
+releases continue under the Business Source License until their own
+Change Dates elapse.

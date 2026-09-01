@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Version-skew classification per the K8s-style `+/- 1 minor`
 //! policy.
 //!

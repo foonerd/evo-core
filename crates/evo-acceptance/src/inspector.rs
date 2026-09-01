@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Inspectors — pre-flight target introspection.
 //!
 //! Each inspector runs one introspection command on the target,
@@ -32,9 +35,9 @@ pub enum Inspector {
     /// `i2cdetect -y <bus>` for each bus the kernel exposes.
     /// Discovers buses via `ls /sys/class/i2c-dev/`.
     I2cBuses,
-    /// `cat /boot/firmware/config.txt` (Pi 5) with fallback to
-    /// `/boot/config.txt` (older Pi). Returns empty stdout on
-    /// non-Pi targets.
+    /// `cat /boot/firmware/config.txt` with fallback to
+    /// `/boot/config.txt` (older SBC layouts). Returns empty stdout
+    /// on targets without an SBC boot-config file.
     BootConfig,
     /// `cat /proc/cmdline` — running kernel's command line.
     KernelCmdline,

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Invariant: canonical IDs are never reused.
 //!
 //! Every canonical-ID-minting operation produces a fresh ID, and

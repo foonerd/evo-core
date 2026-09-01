@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Safe wrapper around Linux `adjtimex(2)`.
 //!
 //! ## Kernel ABI contract

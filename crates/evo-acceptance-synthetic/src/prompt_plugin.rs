@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Synthetic prompt plugin.
 //!
 //! Issues a `Text` prompt with a 5-second timeout from a
@@ -127,6 +130,7 @@ impl Plugin for PromptPlugin {
                 retention_hint: None,
                 error_context: None,
                 previous_answer: None,
+                priority: None,
             };
 
             // Spawn the prompt issuer. load() returns immediately
@@ -185,7 +189,7 @@ impl Plugin for PromptPlugin {
 
 impl Respondent for PromptPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         _req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Manifest-drift detection.
 //!
 //! Compares a plugin's manifest declarations against its runtime

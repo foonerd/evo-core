@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Readiness report — Markdown output with a fixed ten-section
 //! layout. Sections §3-§7 are auto-populated from scenario outcomes.
 //! Sections §1, §2, §8, §9, §10 are stubbed for decider authoring.

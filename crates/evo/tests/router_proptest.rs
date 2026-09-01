@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Property tests pinning the [`PluginRouter`]'s table-state
 //! invariants and the lookup-clone-drop discipline at the
 //! public-surface level.
@@ -109,7 +112,7 @@ impl Plugin for ProbeRespondent {
 
 impl Respondent for ProbeRespondent {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move { Ok(Response::for_request(req, req.payload.clone())) }

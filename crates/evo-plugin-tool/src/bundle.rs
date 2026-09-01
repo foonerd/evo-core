@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Load a plugin directory and resolve paths the same way the steward does.
 
 use std::path::{Path, PathBuf};
@@ -22,15 +25,25 @@ pub fn load_out_of_process_bundle(
     let manifest = Manifest::from_toml(&text)
         .map_err(|e| anyhow::anyhow!("{}: {e}", manifest_path.display()))?;
 
-    if manifest.transport.kind != TransportKind::OutOfProcess {
+    let transport = manifest.transport.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}: manifest declares plugin.kind = {:?}; \
+             only functional plugins carry a [transport] block \
+             that load_out_of_process_bundle can resolve",
+            plugin_dir.display(),
+            manifest.plugin.kind
+        )
+    })?;
+
+    if transport.kind != TransportKind::OutOfProcess {
         return Err(anyhow::anyhow!(
             "{}: only out-of-process bundles are supported; manifest has {:?}",
             plugin_dir.display(),
-            manifest.transport.kind
+            transport.kind
         ));
     }
 
-    let raw = Path::new(&manifest.transport.exec);
+    let raw = Path::new(&transport.exec);
     let exec_path = if raw.is_absolute() {
         raw.to_path_buf()
     } else {

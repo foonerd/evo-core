@@ -1,0 +1,16 @@
+[package]
+name = "evo-projection-ws"
+description = "WebSocket projection of the wire-protocol schema. Generates the typed frame envelope, the per-op frame-class classifier (request vs subscription), and the in-memory dispatch table the runtime mount consults. The runtime mount that stitches the projection onto a concrete WS listener (axum + tokio-tungstenite) consumes the dispatch table."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+evo-projection-core = { path = "../evo-projection-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

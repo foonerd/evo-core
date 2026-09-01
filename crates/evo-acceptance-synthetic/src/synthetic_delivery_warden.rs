@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Synthetic reconciliation delivery warden plugin.
 //!
 //! Warden on the synthetic `acceptance.delivery` shelf. Receives

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Synthetic drift respondent.
 //!
 //! Declares `request_types = ["drift_x"]` in its embedded manifest;
@@ -125,7 +128,7 @@ impl Plugin for DriftRespondent {
 
 impl Respondent for DriftRespondent {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         _req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         // The plugin must never reach handle_request — admission is

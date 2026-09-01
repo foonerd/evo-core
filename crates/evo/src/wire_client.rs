@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Steward-side wire client for out-of-process plugins.
 //!
 //! Mirror of `evo_plugin_sdk::host::serve`: where the SDK hosts a plugin
@@ -73,6 +76,7 @@ use evo_plugin_sdk::contract::{
     FastPathDispatcher, HealthReport, InstanceAnnouncer, LoadContext,
     PluginDescription, PluginError, RelationAdmin, RelationAnnouncer, Request,
     Response, StateReporter, SubjectAdmin, SubjectAnnouncer, SubjectQuerier,
+    SubjectStateSubscriber,
 };
 use evo_plugin_sdk::wire::{
     WireFrame, FEATURE_VERSION_MAX, FEATURE_VERSION_MIN, PROTOCOL_VERSION,
@@ -257,6 +261,138 @@ pub struct EventSink {
     /// each prompt and spawns a waiter that fires the response
     /// frame when the prompt completes.
     pub prompt_ledger: Option<Arc<crate::prompts::PromptLedger>>,
+    /// Where to route plugin-initiated multi-room substrate
+    /// read requests
+    /// (`GetMultiroomRole` / `ListMultiroomExplicitRoles` /
+    /// `GetMultiroomGroup` / `ListMultiroomGroups` /
+    /// `ListMultiroomGroupsForDevice`). `None` when the engine
+    /// was constructed without an in-process substrate handle
+    /// (test harnesses, no-multiroom dev builds); in that case
+    /// the reader task replies to each request with a
+    /// `MultiroomSubstrateError::NotConfigured`-shaped response
+    /// frame rather than tearing the connection down. `Some`
+    /// for the production path; the steward's installer
+    /// stamps the framework's `MultiroomSubstrateAdapter`
+    /// (the same handle that backs in-process
+    /// `LoadContext::multiroom_substrate`).
+    pub multiroom_substrate: Option<
+        Arc<dyn evo_plugin_sdk::multiroom_substrate::MultiroomSubstrateHandle>,
+    >,
+    /// Where to route plugin-initiated `asset_cache_get` /
+    /// `asset_cache_put` frames. The framework's content-
+    /// addressed [`AssetCache`] is shared between in-process
+    /// and out-of-process plugins so artwork-emission, browse
+    /// thumbnails, podcast covers, and the multi-room
+    /// artwork-propagation path all hit the same store. `None`
+    /// when the engine was constructed without an asset cache
+    /// (test harnesses, degraded boot); in that case the reader
+    /// replies with a structured `Error` frame rather than
+    /// tearing the connection down. `Some` for the production
+    /// path; the steward's installer stamps the framework's
+    /// `FilesystemAssetCache`.
+    pub asset_cache: Option<Arc<dyn evo_plugin_sdk::contract::AssetCache>>,
+    /// Where to route plugin-initiated `ShelfDispatchRequest`
+    /// frames. Always populated; the server-side adapter
+    /// dispatches the request through the steward's dispatch
+    /// infrastructure. The adapter enforces caller-scoped
+    /// principals so OOP plugins cannot issue shelf-dispatch
+    /// calls with the broad `"plugin-system"` principal.
+    pub shelf_request_dispatcher:
+        Option<Arc<dyn evo_plugin_sdk::contract::ShelfRequestDispatcher>>,
+    /// Where to route plugin-initiated audio-plane request
+    /// verbs (`AudioPlaneFanOutFrame` / `AudioPlaneUpsertGroup`
+    /// / `AudioPlaneDialPeer` /
+    /// `AudioPlaneCloseOutboundConnections` /
+    /// `AudioPlaneReportFrameTrace`). `None` when the engine
+    /// was constructed without an audio-plane runtime or the
+    /// plugin's manifest does not declare
+    /// `capabilities.audio_plane = true`; in that case the
+    /// reader task replies with a structured `Error` frame
+    /// rather than tearing down. `Some` for the production
+    /// path; the steward's installer stamps the local
+    /// `RuntimeAudioPlaneHandle`.
+    pub audio_plane: Option<
+        Arc<dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle>,
+    >,
+    /// Where to route plugin-initiated `subscribe_subject` /
+    /// `unsubscribe_subject` / `current_state` requests. `None`
+    /// when the plugin's manifest does not declare
+    /// `capabilities.subscribe_subjects = true`; in that case
+    /// the reader task replies to each request with a
+    /// structured `Error` frame (capability denied) rather
+    /// than tearing the connection down. `Some` for the
+    /// production path; the steward stamps the framework's
+    /// `RegistrySubjectStateSubscriber` (the same handle that
+    /// backs in-process `LoadContext::subject_state_subscriber`).
+    pub subject_state_subscriber: Option<Arc<dyn SubjectStateSubscriber>>,
+    /// Per-connection registry of active subscription forwarders.
+    /// Keyed by canonical subject id; each value is a oneshot
+    /// sender the forwarder task awaits — sending `()` (or
+    /// dropping the sender on connection teardown) cancels the
+    /// forwarder. The map is mutated only inside
+    /// `forward_plugin_request`'s `SubscribeSubject` /
+    /// `UnsubscribeSubject` arms; the forwarder task removes
+    /// its own entry on exit so connection-drop cleanup leaves
+    /// no dangling rows.
+    pub subscription_forwarders:
+        Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    /// Where to route plugin-initiated `open_stream` / `emit_stream`
+    /// / `close_stream` requests onto the framework's shared
+    /// [`crate::streams::StreamCoordinator`]. `None` when the
+    /// plugin's manifest did not declare
+    /// `capabilities.streams = true`; the reader task then replies
+    /// with a structured `Error` frame so the plugin observes the
+    /// manifest-level refusal rather than a silent drop.
+    /// `Some(host)` for plugins whose manifest opted in.
+    pub stream_host:
+        Option<Arc<dyn evo_plugin_sdk::contract::streams::StreamHost>>,
+    /// Where to route plugin-initiated `send_notification` /
+    /// `cancel_notification` requests. The field's implementation
+    /// (`Arc<dyn NotificationEmitter>`) is populated by the
+    /// admission engine when the plugin's manifest declares
+    /// `capabilities.notifications = true`. `None` otherwise; the
+    /// reader task then replies with a structured `Error` frame so
+    /// the plugin observes the manifest-level refusal rather than
+    /// a silent drop. `Some(emitter)` for plugins whose manifest
+    /// opted in.
+    pub notification_emitter: Option<
+        Arc<dyn evo_plugin_sdk::contract::notifications::NotificationEmitter>,
+    >,
+    /// Where to route plugin-initiated `execute_metadata_query` /
+    /// `get_metadata_item` / `enrich_metadata` requests onto the
+    /// framework's shared [`crate::context::ChainMetadataConsumer`]
+    /// (backed by the runtime's `MetadataChain`). `None` when the
+    /// plugin's manifest did not declare
+    /// `capabilities.metadata = true`; the reader task then replies
+    /// with a structured `Error` frame so the plugin observes the
+    /// manifest-level refusal rather than a silent drop.
+    /// `Some(consumer)` for plugins whose manifest opted in.
+    pub metadata_consumer:
+        Option<Arc<dyn evo_plugin_sdk::contract::MetadataConsumer>>,
+    /// Where to route plugin-initiated `credential_fetch` /
+    /// `credential_store` / `credential_delete` /
+    /// `credential_list_keys` requests. Bound at admission time to
+    /// the framework's `PluginScopedCredentialVault` for this
+    /// plugin — the wire envelope's plugin name is validated
+    /// against the connection's identity by the reader task, so
+    /// the handle is inherently per-plugin and cannot be steered
+    /// to another plugin's rows. `None` when the steward was
+    /// built without a credential vault (test harnesses,
+    /// degraded boot); the reader task then replies with a
+    /// structured `vault_unavailable` `Error` frame per request.
+    pub credential_vault: Option<
+        Arc<dyn evo_plugin_sdk::contract::context::CredentialVaultHandle>,
+    >,
+    /// Where to route plugin-initiated
+    /// `online_provider_config_list` requests. Bound at admission
+    /// to the framework's `SharedOnlineProviderConfigHandle`;
+    /// serves the operator's current per-provider config from
+    /// the store. `None` when the steward was built without the
+    /// store; the reader task then replies with a structured
+    /// `provider_config_unavailable` `Error` frame.
+    pub online_provider_config: Option<
+        Arc<dyn evo_plugin_sdk::contract::context::OnlineProviderConfigHandle>,
+    >,
     /// Canonical plugin name owning this connection. Stamped on
     /// the prompt ledger as the prompt's originating plugin.
     /// Cloned out of the LoadContext at admission time.
@@ -278,6 +414,13 @@ impl fmt::Debug for EventSink {
                     .map(|_| "<Arc<dyn CustodyStateReporter>>"),
             )
             .field("subject_querier", &"<Arc<dyn SubjectQuerier>>")
+            .field(
+                "subject_state_subscriber",
+                &self
+                    .subject_state_subscriber
+                    .as_ref()
+                    .map(|_| "<Arc<dyn SubjectStateSubscriber>>"),
+            )
             .finish()
     }
 }
@@ -332,6 +475,1003 @@ impl fmt::Debug for WireClient {
             )
             .field("alive", &self.alive.load(Ordering::Acquire))
             .finish()
+    }
+}
+
+/// Cloneable handle the OOP-admission audio-routing forwarder
+/// uses to push `WireFrame::AudioRoutingStateChanged` frames
+/// onto a [`WireClient`]'s outbound channel.
+///
+/// The forwarder is a callback registered on the framework's
+/// local `Arc<dyn AudioRouting>` for the admitted plugin; the
+/// callback fires synchronously inside the framework's
+/// reconciliation engine on every topology rewire. Cloning the
+/// outbound `Sender` and the cid counter into this small handle
+/// lets the callback close over only what it needs and stay
+/// `Fn + Send + Sync` without requiring a reference to the full
+/// `WireClient` (which is not `Clone`).
+///
+/// Frames are pushed with `try_send`: if the outbound channel
+/// is at capacity (default 32, per [`OUTBOUND_CHANNEL_CAPACITY`])
+/// the frame is dropped and a warning is logged. Audio rewires
+/// happen at human / hardware cadence, well below the channel
+/// drain rate, so backpressure here means something has gone
+/// very wrong elsewhere; surfacing it loudly is the right
+/// behaviour.
+#[derive(Clone, Debug)]
+pub struct AudioRoutingForwarderSink {
+    out_tx: mpsc::Sender<WireFrame>,
+    cid: Arc<AtomicU64>,
+    plugin_name: String,
+}
+
+impl AudioRoutingForwarderSink {
+    /// Push a state-change frame onto the outbound channel.
+    /// Non-blocking; drops the frame and logs a warning if the
+    /// channel is full.
+    pub fn push(
+        &self,
+        resolved: Option<
+            evo_plugin_sdk::contract::audio_routing::ResolvedRouting,
+        >,
+        reason: String,
+    ) {
+        let cid = self.cid.fetch_add(1, Ordering::Relaxed);
+        let frame = WireFrame::AudioRoutingStateChanged {
+            v: PROTOCOL_VERSION,
+            cid,
+            plugin: self.plugin_name.clone(),
+            resolved,
+            reason,
+        };
+        if let Err(e) = self.out_tx.try_send(frame) {
+            tracing::warn!(
+                plugin = %self.plugin_name,
+                error = %e,
+                "audio_routing_state_changed forwarder: outbound channel \
+                 full or closed, dropping frame"
+            );
+        }
+    }
+}
+
+/// Cloneable handle the OOP-admission multi-room substrate
+/// forwarder uses to push `WireFrame::MultiroomRoleChanged` /
+/// `WireFrame::MultiroomGroupChanged` frames.
+///
+/// Mirrors [`AudioRoutingForwarderSink`]'s shape: the
+/// underlying `WireClient` is not `Clone`, so we clone its
+/// outbound sender, the cid counter, and the plugin name into
+/// this lightweight handle that the framework's forwarder
+/// task owns. The forwarder subscribes to the local
+/// [`MultiroomSubstrateHandle`](evo_plugin_sdk::multiroom_substrate::MultiroomSubstrateHandle)'s
+/// broadcast channels at admission and republishes every event
+/// onto this sink, which `try_send`s it on the OOP plugin's
+/// outbound channel.
+#[derive(Clone, Debug)]
+pub struct MultiroomSubstrateForwarderSink {
+    out_tx: mpsc::Sender<WireFrame>,
+    cid: Arc<AtomicU64>,
+    plugin_name: String,
+}
+
+impl MultiroomSubstrateForwarderSink {
+    /// Push a role-change event onto the outbound channel.
+    /// Non-blocking; drops the frame and logs a warning if the
+    /// channel is full or has closed.
+    pub fn push_role_change(
+        &self,
+        change: evo_plugin_sdk::multiroom_substrate::RoleChange,
+    ) {
+        let cid = self.cid.fetch_add(1, Ordering::Relaxed);
+        let frame = WireFrame::MultiroomRoleChanged {
+            v: PROTOCOL_VERSION,
+            cid,
+            plugin: self.plugin_name.clone(),
+            change,
+        };
+        if let Err(e) = self.out_tx.try_send(frame) {
+            tracing::warn!(
+                plugin = %self.plugin_name,
+                error = %e,
+                "multiroom_role_changed forwarder: outbound channel full or \
+                 closed, dropping event"
+            );
+        }
+    }
+
+    /// Push a group-change event onto the outbound channel.
+    /// Non-blocking; same drop-and-warn semantics as
+    /// [`Self::push_role_change`].
+    pub fn push_group_change(
+        &self,
+        change: evo_plugin_sdk::multiroom_substrate::GroupChange,
+    ) {
+        let cid = self.cid.fetch_add(1, Ordering::Relaxed);
+        let frame = WireFrame::MultiroomGroupChanged {
+            v: PROTOCOL_VERSION,
+            cid,
+            plugin: self.plugin_name.clone(),
+            change,
+        };
+        if let Err(e) = self.out_tx.try_send(frame) {
+            tracing::warn!(
+                plugin = %self.plugin_name,
+                error = %e,
+                "multiroom_group_changed forwarder: outbound channel full or \
+                 closed, dropping event"
+            );
+        }
+    }
+
+    /// Indicates whether the outbound channel is still alive.
+    /// The forwarder task uses this to exit once the WireClient
+    /// has torn down.
+    pub fn is_closed(&self) -> bool {
+        self.out_tx.is_closed()
+    }
+}
+
+/// Mint a multi-room substrate forwarder sink from a
+/// [`WireClient`]. Same shape as
+/// [`WireClient::audio_routing_forwarder_sink`].
+impl WireClient {
+    /// Mint a [`MultiroomSubstrateForwarderSink`] that pushes
+    /// role / group change events onto this client's outbound
+    /// channel. Used by the framework's OOP admission code to
+    /// install the multi-room substrate forwarder.
+    pub fn multiroom_substrate_forwarder_sink(
+        &self,
+    ) -> MultiroomSubstrateForwarderSink {
+        MultiroomSubstrateForwarderSink {
+            out_tx: self.out_tx.clone(),
+            cid: Arc::clone(&self.cid),
+            plugin_name: self.plugin_name.clone(),
+        }
+    }
+}
+
+/// Install the OOP-admission multi-room substrate forwarder
+/// for a freshly-admitted plugin.
+///
+/// Spawns one tokio task per change stream (role + group). Each
+/// task drains its broadcast receiver via `recv().await` and
+/// republishes the event through the supplied sink. The task
+/// exits cleanly when the receiver closes (substrate teardown)
+/// or the sink's outbound channel closes (plugin disconnect).
+/// `RecvError::Lagged` is rendered as a warning and the loop
+/// continues; the framework's drop-oldest policy means the
+/// subscriber's perspective of the substrate is best-effort
+/// and a plugin that needs a fully-current view re-reads via
+/// the `list_*` request verbs.
+///
+/// Returns the [`tokio::task::JoinHandle`] pair (`role_task`,
+/// `group_task`) so callers can join / abort during teardown.
+pub fn install_multiroom_substrate_forwarder(
+    substrate: Arc<
+        dyn evo_plugin_sdk::multiroom_substrate::MultiroomSubstrateHandle,
+    >,
+    sink: MultiroomSubstrateForwarderSink,
+) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+    let role_rx = substrate.subscribe_role_changes();
+    let group_rx = substrate.subscribe_group_changes();
+    let sink_for_role = sink.clone();
+    let sink_for_group = sink;
+    let role_task = tokio::spawn(async move {
+        let mut role_rx = role_rx;
+        loop {
+            if sink_for_role.is_closed() {
+                return;
+            }
+            match role_rx.recv().await {
+                Ok(change) => sink_for_role.push_role_change(change),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        plugin = %sink_for_role.plugin_name,
+                        skipped = n,
+                        "multiroom role-change forwarder lagged; dropping events"
+                    );
+                }
+            }
+        }
+    });
+    let group_task = tokio::spawn(async move {
+        let mut group_rx = group_rx;
+        loop {
+            if sink_for_group.is_closed() {
+                return;
+            }
+            match group_rx.recv().await {
+                Ok(change) => sink_for_group.push_group_change(change),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        plugin = %sink_for_group.plugin_name,
+                        skipped = n,
+                        "multiroom group-change forwarder lagged; dropping events"
+                    );
+                }
+            }
+        }
+    });
+    (role_task, group_task)
+}
+
+/// Cloneable handle the OOP-admission credential-change
+/// forwarder uses to push [`WireFrame::CredentialSetChanged`]
+/// frames onto a [`WireClient`]'s outbound channel. Mirrors
+/// [`AudioRoutingForwarderSink`] /
+/// [`MultiroomSubstrateForwarderSink`] in shape.
+#[derive(Clone, Debug)]
+pub struct CredentialChangeForwarderSink {
+    out_tx: mpsc::Sender<WireFrame>,
+    cid: Arc<AtomicU64>,
+    plugin_name: String,
+}
+
+impl CredentialChangeForwarderSink {
+    /// Push a credential-change frame onto the outbound channel.
+    /// Non-blocking; drops the frame and logs a warning if the
+    /// channel is full or closed. Operator gestures happen at
+    /// human cadence (a save-key click every few seconds at
+    /// most); backpressure here means something is very wrong
+    /// elsewhere, so a warn is the right level.
+    pub fn push(
+        &self,
+        event: evo_plugin_sdk::contract::context::CredentialChangeEvent,
+    ) {
+        let cid = self.cid.fetch_add(1, Ordering::Relaxed);
+        let frame = WireFrame::CredentialSetChanged {
+            v: PROTOCOL_VERSION,
+            cid,
+            plugin: self.plugin_name.clone(),
+            changed_keys: event.changed_keys,
+            kind: event.kind,
+        };
+        if let Err(e) = self.out_tx.try_send(frame) {
+            tracing::warn!(
+                plugin = %self.plugin_name,
+                error = %e,
+                "credential_set_changed forwarder: outbound channel full or \
+                 closed, dropping event"
+            );
+        }
+    }
+
+    /// Indicates whether the outbound channel is still alive.
+    /// The forwarder task uses this to exit once the WireClient
+    /// has torn down.
+    pub fn is_closed(&self) -> bool {
+        self.out_tx.is_closed()
+    }
+}
+
+impl WireClient {
+    /// Mint a [`CredentialChangeForwarderSink`] that pushes
+    /// credential-change events onto this client's outbound
+    /// channel. Used by the framework's OOP admission code to
+    /// install the credential-vault forwarder.
+    pub fn credential_change_forwarder_sink(
+        &self,
+    ) -> CredentialChangeForwarderSink {
+        CredentialChangeForwarderSink {
+            out_tx: self.out_tx.clone(),
+            cid: Arc::clone(&self.cid),
+            plugin_name: self.plugin_name.clone(),
+        }
+    }
+}
+
+/// Install the OOP-admission credential-change forwarder for a
+/// freshly-admitted plugin. Subscribes to the plugin's own
+/// broadcast on the framework's central
+/// [`crate::credentials::CredentialChangeBus`] and republishes
+/// every event as a [`WireFrame::CredentialSetChanged`] frame
+/// through the supplied sink. Exits cleanly when the sink's
+/// outbound channel closes (plugin disconnect) or the bus's
+/// sender drops (steward teardown). `RecvError::Lagged` is
+/// rendered as a warning and the loop continues.
+pub fn install_credential_change_forwarder(
+    bus: Arc<crate::credentials::CredentialChangeBus>,
+    plugin_id: String,
+    sink: CredentialChangeForwarderSink,
+) {
+    let mut rx = bus.sender_for(&plugin_id).subscribe();
+    // Task is detached; the JoinHandle drops immediately. The
+    // spawned task keeps running until the wire connection or the
+    // central bus's sender closes.
+    let _forwarder = tokio::spawn(async move {
+        loop {
+            if sink.is_closed() {
+                return;
+            }
+            match rx.recv().await {
+                Ok(event) => sink.push(event),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        plugin = %sink.plugin_name,
+                        skipped = n,
+                        "credential-change forwarder lagged; dropping events"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Cloneable handle the OOP-admission online-provider-config
+/// forwarder uses to push
+/// [`WireFrame::OnlineProviderConfigChanged`] frames onto a
+/// [`WireClient`]'s outbound channel.
+#[derive(Clone, Debug)]
+pub struct OnlineProviderConfigForwarderSink {
+    out_tx: mpsc::Sender<WireFrame>,
+    cid: Arc<AtomicU64>,
+    plugin_name: String,
+}
+
+impl OnlineProviderConfigForwarderSink {
+    /// Push an online-provider-config change frame onto the
+    /// outbound channel. Same non-blocking + warn-on-full
+    /// semantics as the credential forwarder.
+    pub fn push(
+        &self,
+        event: crate::online_providers::OnlineProviderConfigChangeEvent,
+    ) {
+        let cid = self.cid.fetch_add(1, Ordering::Relaxed);
+        let frame = WireFrame::OnlineProviderConfigChanged {
+            v: PROTOCOL_VERSION,
+            cid,
+            plugin: self.plugin_name.clone(),
+            provider_id: event.provider_id,
+            enabled: event.enabled,
+            priority: event.priority,
+        };
+        if let Err(e) = self.out_tx.try_send(frame) {
+            tracing::warn!(
+                plugin = %self.plugin_name,
+                error = %e,
+                "online_provider_config_changed forwarder: outbound channel \
+                 full or closed, dropping event"
+            );
+        }
+    }
+
+    /// Indicates whether the outbound channel is still alive.
+    pub fn is_closed(&self) -> bool {
+        self.out_tx.is_closed()
+    }
+}
+
+impl WireClient {
+    /// Mint an [`OnlineProviderConfigForwarderSink`] that pushes
+    /// online-provider-config change events onto this client's
+    /// outbound channel.
+    pub fn online_provider_config_forwarder_sink(
+        &self,
+    ) -> OnlineProviderConfigForwarderSink {
+        OnlineProviderConfigForwarderSink {
+            out_tx: self.out_tx.clone(),
+            cid: Arc::clone(&self.cid),
+            plugin_name: self.plugin_name.clone(),
+        }
+    }
+}
+
+/// Install the OOP-admission online-provider-config forwarder
+/// for a freshly-admitted plugin. Subscribes to the framework's
+/// [`crate::online_providers::OnlineProviderConfigBus`] and
+/// republishes every event as a
+/// [`WireFrame::OnlineProviderConfigChanged`] frame through the
+/// supplied sink. Same shape as
+/// [`install_credential_change_forwarder`].
+pub fn install_online_provider_config_forwarder(
+    bus: Arc<crate::online_providers::OnlineProviderConfigBus>,
+    sink: OnlineProviderConfigForwarderSink,
+) {
+    let mut rx = bus.subscribe();
+    let _forwarder = tokio::spawn(async move {
+        loop {
+            if sink.is_closed() {
+                return;
+            }
+            match rx.recv().await {
+                Ok(event) => sink.push(event),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        plugin = %sink.plugin_name,
+                        skipped = n,
+                        "online-provider-config forwarder lagged; dropping events"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Cloneable handle the OOP-admission audio-plane forwarder
+/// uses to push audio-plane wire frames. Mirrors
+/// [`AudioRoutingForwarderSink`] /
+/// [`MultiroomSubstrateForwarderSink`] in shape.
+#[derive(Clone, Debug)]
+pub struct AudioPlaneForwarderSink {
+    out_tx: mpsc::Sender<WireFrame>,
+    cid: Arc<AtomicU64>,
+    plugin_name: String,
+}
+
+impl AudioPlaneForwarderSink {
+    /// Push the one-time initial-state frame anchoring
+    /// `monotonic_ns` + `local_device_id` on the SDK proxy.
+    pub fn push_init(
+        &self,
+        framework_monotonic_ns: u64,
+        local_device_id: String,
+    ) {
+        let cid = self.cid.fetch_add(1, Ordering::Relaxed);
+        let frame = WireFrame::AudioPlaneInit {
+            v: PROTOCOL_VERSION,
+            cid,
+            plugin: self.plugin_name.clone(),
+            framework_monotonic_ns,
+            local_device_id,
+        };
+        if let Err(e) = self.out_tx.try_send(frame) {
+            // LOGGING.md §2: debug (per-forwarder outbound-channel
+            // closure is normal plugin-unload lifecycle, not a
+            // recoverable anomaly worth operator attention).
+            tracing::debug!(
+                plugin = %self.plugin_name,
+                error = %e,
+                "audio_plane_init forwarder: outbound channel closed; dropping"
+            );
+        }
+    }
+
+    /// Push a received-frame event.
+    pub fn push_frame_received(
+        &self,
+        frame: evo_plugin_sdk::contract::audio_plane::AudioFrameReceived,
+    ) {
+        let cid = self.cid.fetch_add(1, Ordering::Relaxed);
+        let wire = WireFrame::AudioPlaneFrameReceived {
+            v: PROTOCOL_VERSION,
+            cid,
+            plugin: self.plugin_name.clone(),
+            frame,
+        };
+        if let Err(e) = self.out_tx.try_send(wire) {
+            // LOGGING.md §2: debug (per-forwarder outbound-channel
+            // closure is normal plugin-unload lifecycle; frame-full
+            // pressure is transient backpressure the subscriber will
+            // catch up on — neither is a recoverable anomaly worth
+            // operator attention).
+            tracing::debug!(
+                plugin = %self.plugin_name,
+                error = %e,
+                "audio_plane_frame_received forwarder: outbound channel \
+                 full or closed; dropping frame"
+            );
+        }
+    }
+
+    /// Push a frame-send observation.
+    pub fn push_frame_send_event(
+        &self,
+        event: evo_plugin_sdk::contract::audio_plane::FrameSendEvent,
+    ) {
+        let cid = self.cid.fetch_add(1, Ordering::Relaxed);
+        let wire = WireFrame::AudioPlaneFrameSendEvent {
+            v: PROTOCOL_VERSION,
+            cid,
+            plugin: self.plugin_name.clone(),
+            event,
+        };
+        if let Err(e) = self.out_tx.try_send(wire) {
+            // LOGGING.md §2: debug (per-forwarder outbound-channel
+            // closure is normal plugin-unload lifecycle; frame-full
+            // pressure is transient backpressure the subscriber will
+            // catch up on — neither is a recoverable anomaly worth
+            // operator attention).
+            tracing::debug!(
+                plugin = %self.plugin_name,
+                error = %e,
+                "audio_plane_frame_send_event forwarder: outbound channel \
+                 full or closed; dropping event"
+            );
+        }
+    }
+
+    /// Push a frame-trace back-report.
+    pub fn push_frame_trace_report(
+        &self,
+        report: evo_plugin_sdk::contract::audio_plane::FrameTraceReport,
+    ) {
+        let cid = self.cid.fetch_add(1, Ordering::Relaxed);
+        let wire = WireFrame::AudioPlaneFrameTraceReport {
+            v: PROTOCOL_VERSION,
+            cid,
+            plugin: self.plugin_name.clone(),
+            report,
+        };
+        if let Err(e) = self.out_tx.try_send(wire) {
+            // LOGGING.md §2: debug (per-forwarder outbound-channel
+            // closure is normal plugin-unload lifecycle; frame-full
+            // pressure is transient backpressure the subscriber will
+            // catch up on — neither is a recoverable anomaly worth
+            // operator attention).
+            tracing::debug!(
+                plugin = %self.plugin_name,
+                error = %e,
+                "audio_plane_frame_trace_report forwarder: outbound channel \
+                 full or closed; dropping report"
+            );
+        }
+    }
+
+    /// Whether the underlying outbound channel is still alive.
+    pub fn is_closed(&self) -> bool {
+        self.out_tx.is_closed()
+    }
+}
+
+impl WireClient {
+    /// Mint an [`AudioPlaneForwarderSink`] from this client.
+    pub fn audio_plane_forwarder_sink(&self) -> AudioPlaneForwarderSink {
+        AudioPlaneForwarderSink {
+            out_tx: self.out_tx.clone(),
+            cid: Arc::clone(&self.cid),
+            plugin_name: self.plugin_name.clone(),
+        }
+    }
+}
+
+/// Install the OOP-admission audio-plane forwarder. Pushes the
+/// initial-state frame and spawns three tokio tasks subscribed
+/// to the local audio-plane handle's three streams.
+pub async fn install_audio_plane_forwarder(
+    handle: Arc<dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle>,
+    sink: AudioPlaneForwarderSink,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    sink.push_init(handle.monotonic_ns(), handle.local_device_id());
+
+    let frame_stream = handle
+        .subscribe_audio_frames()
+        .await
+        .expect("audio-plane subscribe_audio_frames");
+    let send_event_stream = handle
+        .subscribe_frame_send_events()
+        .await
+        .expect("audio-plane subscribe_frame_send_events");
+    let trace_report_stream = handle
+        .subscribe_frame_trace_reports()
+        .await
+        .expect("audio-plane subscribe_frame_trace_reports");
+    let sink_a = sink.clone();
+    let sink_b = sink.clone();
+    let sink_c = sink;
+    let frame_task = tokio::spawn(async move {
+        let mut stream = frame_stream;
+        loop {
+            if sink_a.is_closed() {
+                return;
+            }
+            match stream.recv().await {
+                Ok(frame) => sink_a.push_frame_received(frame),
+                Err(
+                    evo_plugin_sdk::contract::audio_plane::AudioFrameStreamError::Closed,
+                ) => return,
+                Err(
+                    evo_plugin_sdk::contract::audio_plane::AudioFrameStreamError::Lagged { dropped },
+                ) => {
+                    // LOGGING.md §2: warn (recoverable anomaly — the
+                    // subscriber missed `dropped` frames because the
+                    // broadcast channel overflowed; the operator wants
+                    // to know because frames are audible data).
+                    tracing::warn!(
+                        plugin = %sink_a.plugin_name,
+                        dropped,
+                        "audio_plane frame-received forwarder lagged"
+                    );
+                }
+            }
+        }
+    });
+    let send_event_task = tokio::spawn(async move {
+        let mut stream = send_event_stream;
+        loop {
+            if sink_b.is_closed() {
+                return;
+            }
+            match stream.recv().await {
+                Ok(ev) => sink_b.push_frame_send_event(ev),
+                Err(
+                    evo_plugin_sdk::contract::audio_plane::AudioFrameStreamError::Closed,
+                ) => return,
+                Err(
+                    evo_plugin_sdk::contract::audio_plane::AudioFrameStreamError::Lagged { dropped },
+                ) => {
+                    // LOGGING.md §2: warn (recoverable anomaly — the
+                    // subscriber missed `dropped` frame-send events;
+                    // the operator wants to know because these events
+                    // drive frame-trace correlation).
+                    tracing::warn!(
+                        plugin = %sink_b.plugin_name,
+                        dropped,
+                        "audio_plane frame-send-event forwarder lagged"
+                    );
+                }
+            }
+        }
+    });
+    let trace_report_task = tokio::spawn(async move {
+        let mut stream = trace_report_stream;
+        loop {
+            if sink_c.is_closed() {
+                return;
+            }
+            match stream.recv().await {
+                Ok(rep) => sink_c.push_frame_trace_report(rep),
+                Err(
+                    evo_plugin_sdk::contract::audio_plane::AudioFrameStreamError::Closed,
+                ) => return,
+                Err(
+                    evo_plugin_sdk::contract::audio_plane::AudioFrameStreamError::Lagged { dropped },
+                ) => {
+                    // LOGGING.md §2: warn (recoverable anomaly — the
+                    // subscriber missed `dropped` trace reports; the
+                    // operator wants to know because trace visibility
+                    // matters for peer-timing diagnostics).
+                    tracing::warn!(
+                        plugin = %sink_c.plugin_name,
+                        dropped,
+                        "audio_plane frame-trace-report forwarder lagged"
+                    );
+                }
+            }
+        }
+    });
+    (frame_task, send_event_task, trace_report_task)
+}
+
+/// Render a refusal frame for audio-plane request verbs when
+/// the connection's sink has no audio-plane handle.
+fn audio_plane_capability_denied_error(
+    v: u16,
+    cid: u64,
+    plugin: String,
+    op: &str,
+) -> WireFrame {
+    WireFrame::Error {
+        v,
+        cid,
+        plugin,
+        class: ErrorClass::PermissionDenied,
+        message: format!(
+            "{op}: this plugin's manifest does not declare \
+             capabilities.audio_plane = true (or the framework was \
+             constructed without an audio-plane runtime)"
+        ),
+        details: Some(serde_json::json!({
+            "subclass": "audio_plane_capability_not_declared"
+        })),
+    }
+}
+
+/// Map a plugin-side `PluginError` returned by an audio-plane
+/// trait call into a structured wire `Error` frame.
+fn plugin_error_to_wire_error(
+    v: u16,
+    cid: u64,
+    plugin: String,
+    op: &str,
+    err: evo_plugin_sdk::contract::PluginError,
+) -> WireFrame {
+    use evo_plugin_sdk::contract::PluginError;
+
+    // WithSubclass carries the full class + subclass + clean
+    // message the plugin intends the wire caller to see. Do NOT
+    // wrap the message with the `{op}:` prefix (the plugin's
+    // message is already operator-authoritative) and DO populate
+    // the wire envelope's `details.subclass` from the variant so
+    // subclass is carried intact through the plugin error chain
+    // to the wire, with the nested-prefix prose flattened.
+    if let PluginError::WithSubclass {
+        class,
+        subclass,
+        message,
+    } = &err
+    {
+        return WireFrame::Error {
+            v,
+            cid,
+            plugin,
+            class: *class,
+            message: message.clone(),
+            details: Some(serde_json::json!({
+                "subclass": subclass,
+                "op": op,
+            })),
+        };
+    }
+
+    let class = match &err {
+        PluginError::Transient(_) | PluginError::Timeout { .. } => {
+            ErrorClass::Transient
+        }
+        PluginError::Unauthorized(_) => ErrorClass::PermissionDenied,
+        PluginError::ResourceExhausted { .. } => ErrorClass::ResourceExhausted,
+        PluginError::Fatal { .. } => ErrorClass::Internal,
+        PluginError::Internal { .. } | PluginError::Permanent(_) => {
+            ErrorClass::ContractViolation
+        }
+        // PluginError is `#[non_exhaustive]`; future variants
+        // default to ContractViolation as the safe shape.
+        _ => ErrorClass::ContractViolation,
+    };
+    WireFrame::Error {
+        v,
+        cid,
+        plugin,
+        class,
+        message: format!("{op}: {err}"),
+        details: None,
+    }
+}
+
+/// Render a refusal frame for stream request verbs when the
+/// connection's sink has no stream host installed.
+fn streams_capability_denied_error(
+    v: u16,
+    cid: u64,
+    plugin: String,
+    op: &str,
+) -> WireFrame {
+    WireFrame::Error {
+        v,
+        cid,
+        plugin,
+        class: ErrorClass::PermissionDenied,
+        message: format!(
+            "{op}: this plugin's manifest does not declare \
+             capabilities.streams = true (or the framework was \
+             constructed without a stream coordinator)"
+        ),
+        details: Some(serde_json::json!({
+            "subclass": "streams_capability_not_declared"
+        })),
+    }
+}
+
+/// Map a plugin-side `StreamError` returned by a
+/// [`evo_plugin_sdk::contract::streams::StreamHost`] trait call
+/// into a structured wire `Error` frame. The class mapping
+/// preserves the operator-facing severity:
+///
+/// - `Invalid` maps to `ContractViolation` (caller-side error).
+/// - `Closed` maps to `NotFound` (the stream slot is gone; the
+///   caller should re-`open` before further emits).
+/// - `UnsupportedBackpressure` + `IncompatibleFormat` map to
+///   `ContractViolation` (the consumer's requested shape does not
+///   match the producer's offer).
+fn stream_error_to_wire_error(
+    v: u16,
+    cid: u64,
+    plugin: String,
+    op: &str,
+    err: evo_plugin_sdk::contract::streams::StreamError,
+) -> WireFrame {
+    use evo_plugin_sdk::contract::streams::StreamError;
+    let class = match &err {
+        StreamError::Invalid(_) => ErrorClass::ContractViolation,
+        StreamError::Closed(_) => ErrorClass::NotFound,
+        StreamError::UnsupportedBackpressure { .. }
+        | StreamError::IncompatibleFormat { .. } => {
+            ErrorClass::ContractViolation
+        }
+        // `#[non_exhaustive]`; future variants default to
+        // ContractViolation as the safe shape.
+        _ => ErrorClass::ContractViolation,
+    };
+    WireFrame::Error {
+        v,
+        cid,
+        plugin,
+        class,
+        message: format!("{op}: {err}"),
+        details: None,
+    }
+}
+
+/// Render a refusal frame for notification request verbs when the
+/// connection's sink has no notification emitter installed.
+fn notifications_capability_denied_error(
+    v: u16,
+    cid: u64,
+    plugin: String,
+    op: &str,
+) -> WireFrame {
+    WireFrame::Error {
+        v,
+        cid,
+        plugin,
+        class: ErrorClass::PermissionDenied,
+        message: format!(
+            "{op}: this plugin's manifest does not declare \
+             capabilities.notifications = true (or the framework \
+             was constructed without a notification dispatcher)"
+        ),
+        details: Some(serde_json::json!({
+            "subclass": "notifications_capability_not_declared"
+        })),
+    }
+}
+
+/// Map a plugin-side `NotificationError` returned by a
+/// [`evo_plugin_sdk::contract::notifications::NotificationEmitter`]
+/// trait call into a structured wire `Error` frame:
+///
+/// - `Invalid` maps to `ContractViolation` (caller-side error).
+/// - `HandleNotFound` maps to `NotFound` (the cancel refers to
+///   a handle the dispatcher no longer holds).
+fn notification_error_to_wire_error(
+    v: u16,
+    cid: u64,
+    plugin: String,
+    op: &str,
+    err: evo_plugin_sdk::contract::notifications::NotificationError,
+) -> WireFrame {
+    use evo_plugin_sdk::contract::notifications::NotificationError;
+    let class = match &err {
+        NotificationError::Invalid(_) => ErrorClass::ContractViolation,
+        NotificationError::HandleNotFound(_) => ErrorClass::NotFound,
+        // `#[non_exhaustive]`; future variants default to
+        // ContractViolation as the safe shape.
+        _ => ErrorClass::ContractViolation,
+    };
+    WireFrame::Error {
+        v,
+        cid,
+        plugin,
+        class,
+        message: format!("{op}: {err}"),
+        details: None,
+    }
+}
+
+/// Render a refusal frame for metadata request verbs when the
+/// connection's sink has no metadata consumer installed.
+fn metadata_capability_denied_error(
+    v: u16,
+    cid: u64,
+    plugin: String,
+    op: &str,
+) -> WireFrame {
+    WireFrame::Error {
+        v,
+        cid,
+        plugin,
+        class: ErrorClass::PermissionDenied,
+        message: format!(
+            "{op}: this plugin's manifest does not declare \
+             capabilities.metadata = true (or the framework was \
+             constructed without a metadata chain)"
+        ),
+        details: Some(serde_json::json!({
+            "subclass": "metadata_capability_not_declared"
+        })),
+    }
+}
+
+/// Map a plugin-side `MetadataError` returned by a
+/// [`evo_plugin_sdk::contract::MetadataConsumer`] trait call into
+/// a structured wire `Error` frame:
+///
+/// - `Invalid` maps to `ContractViolation` (caller-side error).
+/// - `Unsupported` maps to `ContractViolation` (the caller asked
+///   for a shape the provider did not declare it can honour).
+/// - `Provider` maps to `Internal` (the provider itself failed).
+/// - `Timeout` maps to `Unavailable` (the provider missed its
+///   deadline; retry with different providers may succeed).
+/// - `NotFound` maps to `NotFound` (`get_item` returned no rows).
+fn metadata_error_to_wire_error(
+    v: u16,
+    cid: u64,
+    plugin: String,
+    op: &str,
+    err: evo_plugin_sdk::contract::metadata::MetadataError,
+) -> WireFrame {
+    use evo_plugin_sdk::contract::metadata::MetadataError;
+    let class = match &err {
+        MetadataError::Invalid(_) | MetadataError::Unsupported(_) => {
+            ErrorClass::ContractViolation
+        }
+        MetadataError::Provider(_) => ErrorClass::Internal,
+        MetadataError::Timeout => ErrorClass::Unavailable,
+        MetadataError::NotFound => ErrorClass::NotFound,
+    };
+    WireFrame::Error {
+        v,
+        cid,
+        plugin,
+        class,
+        message: format!("{op}: {err}"),
+        details: None,
+    }
+}
+
+/// Structured `Error` frame for credential wire ops the steward
+/// cannot serve because the vault was never wired (test
+/// harnesses, degraded boot). Matches the shape the server-side
+/// operator wire ops emit for the same failure mode so operator-
+/// facing and plugin-facing surfaces read symmetrically.
+fn credential_vault_unavailable_error(
+    v: u16,
+    cid: u64,
+    plugin: String,
+    op: &str,
+) -> WireFrame {
+    WireFrame::Error {
+        v,
+        cid,
+        plugin,
+        class: ErrorClass::Internal,
+        message: format!("{op}: credential vault not wired on this steward"),
+        details: Some(serde_json::json!({
+            "subclass": "vault_unavailable"
+        })),
+    }
+}
+
+/// Map a plugin-side `CredentialVaultError` returned by a
+/// [`evo_plugin_sdk::contract::context::CredentialVaultHandle`]
+/// call into a structured wire `Error` frame:
+///
+/// - `Invalid` maps to `ContractViolation` (caller-side error).
+/// - `Persistence` maps to `Internal` (substrate failure).
+/// - `PromptDeclined` maps to `Unavailable` (operator refused to
+///   answer the prompt; retry may succeed).
+/// - `AlgorithmMismatch` maps to `Internal` (downgrade protection
+///   refused an older-algorithm row; operator escalation needed).
+fn credential_vault_error_to_wire_error(
+    v: u16,
+    cid: u64,
+    plugin: String,
+    op: &str,
+    err: evo_plugin_sdk::contract::context::CredentialVaultError,
+) -> WireFrame {
+    use evo_plugin_sdk::contract::context::CredentialVaultError as E;
+    let (class, subclass) = match &err {
+        E::Invalid(_) => (ErrorClass::ContractViolation, "invalid"),
+        E::Persistence(_) => (ErrorClass::Internal, "persistence"),
+        E::PromptDeclined(_) => (ErrorClass::Unavailable, "prompt_declined"),
+        E::AlgorithmMismatch { .. } => {
+            (ErrorClass::Internal, "algorithm_mismatch")
+        }
+        // CredentialVaultError is `#[non_exhaustive]`; a future
+        // variant that is not yet mapped falls through to Internal
+        // with a generic subclass so the plugin still sees a
+        // structured refusal rather than a decode failure.
+        _ => (ErrorClass::Internal, "credential_vault_error"),
+    };
+    WireFrame::Error {
+        v,
+        cid,
+        plugin,
+        class,
+        message: format!("{op}: {err}"),
+        details: Some(serde_json::json!({ "subclass": subclass })),
     }
 }
 
@@ -422,6 +1562,22 @@ impl WireClient {
     /// Allocate a fresh correlation ID for an outbound request.
     pub fn next_cid(&self) -> u64 {
         self.cid.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Mint a forwarder sink the OOP-admission audio-routing
+    /// forwarder owns. Cloning the outbound sender, cid counter,
+    /// and plugin name into a small `Clone` handle lets the
+    /// forwarder callback push
+    /// `WireFrame::AudioRoutingStateChanged` frames without
+    /// holding a reference to the `WireClient` itself (which is
+    /// not `Clone` because it owns the reader and writer
+    /// JoinHandles).
+    pub fn audio_routing_forwarder_sink(&self) -> AudioRoutingForwarderSink {
+        AudioRoutingForwarderSink {
+            out_tx: self.out_tx.clone(),
+            cid: Arc::clone(&self.cid),
+            plugin_name: self.plugin_name.clone(),
+        }
     }
 
     /// Install callbacks that the reader task will invoke when event
@@ -698,6 +1854,8 @@ impl WireClient {
             payload: req.payload.clone(),
             deadline_ms,
             instance_id: req.instance_id.clone(),
+            principal_scope: None,
+            has_step_up: false,
         };
         match self.request(cid, frame).await? {
             WireFrame::HandleRequestResponse { payload, .. } => Ok(Response {
@@ -1157,6 +2315,30 @@ async fn handle_inbound_frame(
                 "response arrived for unknown cid; dropping"
             );
         }
+    } else if frame.is_event_ack() {
+        // Plugin's ack of a steward-emitted event frame (e.g.
+        // the audio-routing state-change push the OOP
+        // forwarder fires synchronously inside
+        // `AudioRoutingRuntime::publish_topology`). The
+        // framework does not await these acks today — the
+        // forwarder's `AudioRoutingForwarderSink::push` is
+        // fire-and-forget — so the pending map carries no
+        // matching entry. Log + drop is the correct shape;
+        // tearing the connection down (the fall-through arm's
+        // protocol-violation path) would have wrecked the
+        // load/unload cycle for any audio-capable OOP plugin.
+        let maybe_sender = {
+            let mut p = pending.lock().expect("pending mutex poisoned");
+            p.remove(&cid)
+        };
+        if let Some(sender) = maybe_sender {
+            let _ = sender.send(Ok(frame));
+        } else {
+            tracing::trace!(
+                cid = cid,
+                "event_ack arrived for unknown cid; dropping (fire-and-forget event)"
+            );
+        }
     } else if frame.is_event() {
         let sink = {
             let guard = event_sink.lock().expect("event sink mutex poisoned");
@@ -1341,6 +2523,126 @@ async fn forward_plugin_request(
                 message: format!("resolve_addressing: {e}"),
                 details: report_error_details(&e),
             },
+        },
+
+        // ----- SubjectStateSubscriber verbs -----
+        // The plugin-side `WireSubjectStateSubscriber` de-duplicates
+        // `subscribe_subject` calls per canonical id, so the steward
+        // expects at most one active subscription per (connection,
+        // canonical_id) pair. A second `SubscribeSubject` for an
+        // already-subscribed id is treated as idempotent (return the
+        // ack; do not spawn a duplicate forwarder) rather than as a
+        // protocol violation: plugins reconnecting after a transient
+        // disconnect rebuild their subscriber state and reissuing the
+        // same subscribe carries no contract risk on the steward side.
+        WireFrame::SubscribeSubject {
+            v,
+            cid,
+            plugin,
+            canonical_id,
+        } => match sink.subject_state_subscriber.as_ref() {
+            Some(subscriber) => {
+                let already_present = {
+                    let map = sink
+                        .subscription_forwarders
+                        .lock()
+                        .expect("subscription_forwarders mutex poisoned");
+                    map.contains_key(&canonical_id)
+                };
+                if already_present {
+                    WireFrame::SubscribeSubjectResponse {
+                        v,
+                        cid,
+                        plugin,
+                        canonical_id,
+                    }
+                } else {
+                    match subscriber
+                        .subscribe_subject(canonical_id.clone())
+                        .await
+                    {
+                        Ok(stream) => {
+                            let (cancel_tx, cancel_rx) = oneshot::channel();
+                            {
+                                let mut map = sink
+                                    .subscription_forwarders
+                                    .lock()
+                                    .expect(
+                                        "subscription_forwarders mutex poisoned",
+                                    );
+                                map.insert(canonical_id.clone(), cancel_tx);
+                            }
+                            spawn_subject_state_forwarder(
+                                canonical_id.clone(),
+                                plugin.clone(),
+                                stream,
+                                cancel_rx,
+                                Arc::clone(&sink.subscription_forwarders),
+                                out_tx.clone(),
+                            );
+                            WireFrame::SubscribeSubjectResponse {
+                                v,
+                                cid,
+                                plugin,
+                                canonical_id,
+                            }
+                        }
+                        Err(e) => WireFrame::Error {
+                            v,
+                            cid,
+                            plugin,
+                            class: e.class(),
+                            message: format!("subscribe_subject: {e}"),
+                            details: report_error_details(&e),
+                        },
+                    }
+                }
+            }
+            None => subscribe_capability_denied_error(v, cid, plugin),
+        },
+        WireFrame::UnsubscribeSubject {
+            v,
+            cid,
+            plugin,
+            canonical_id,
+        } => {
+            let cancel_tx = {
+                let mut map = sink
+                    .subscription_forwarders
+                    .lock()
+                    .expect("subscription_forwarders mutex poisoned");
+                map.remove(&canonical_id)
+            };
+            if let Some(cancel_tx) = cancel_tx {
+                let _ = cancel_tx.send(());
+            }
+            WireFrame::UnsubscribeSubjectResponse { v, cid, plugin }
+        }
+        WireFrame::CurrentState {
+            v,
+            cid,
+            plugin,
+            canonical_id,
+        } => match sink.subject_state_subscriber.as_ref() {
+            Some(subscriber) => {
+                match subscriber.current_state(canonical_id).await {
+                    Ok(state) => WireFrame::CurrentStateResponse {
+                        v,
+                        cid,
+                        plugin,
+                        state,
+                    },
+                    Err(e) => WireFrame::Error {
+                        v,
+                        cid,
+                        plugin,
+                        class: e.class(),
+                        message: format!("current_state: {e}"),
+                        details: report_error_details(&e),
+                    },
+                }
+            }
+            None => subscribe_capability_denied_error(v, cid, plugin),
         },
 
         // ----- Admin verbs (SubjectAdmin) -----
@@ -1551,6 +2853,29 @@ async fn forward_plugin_request(
             },
         },
 
+        WireFrame::EmitAudioPlaybackEnded {
+            v,
+            cid,
+            plugin,
+            claim_uri,
+        } => match sink
+            .happening_emitter
+            .emit_audio_playback_ended(claim_uri)
+            .await
+        {
+            Ok(()) => {
+                WireFrame::EmitAudioPlaybackEndedResponse { v, cid, plugin }
+            }
+            Err(e) => WireFrame::Error {
+                v,
+                cid,
+                plugin,
+                class: e.class(),
+                message: format!("emit_audio_playback_ended: {e}"),
+                details: report_error_details(&e),
+            },
+        },
+
         WireFrame::CreateAppointment {
             v,
             cid,
@@ -1697,6 +3022,222 @@ async fn forward_plugin_request(
             },
         },
 
+        // ----- Asset cache (plugin -> steward) -----
+        WireFrame::AssetCacheGet { v, cid, plugin, content_hash } => {
+            match sink.asset_cache.as_ref() {
+                Some(cache) => match cache.get(&content_hash).await {
+                    Ok(Some(bytes)) => WireFrame::AssetCacheGetResponse {
+                        v,
+                        cid,
+                        plugin,
+                        found: true,
+                        bytes,
+                    },
+                    Ok(None) => WireFrame::AssetCacheGetResponse {
+                        v,
+                        cid,
+                        plugin,
+                        found: false,
+                        bytes: Vec::new(),
+                    },
+                    Err(e) => WireFrame::Error {
+                        v,
+                        cid,
+                        plugin,
+                        class: ErrorClass::Internal,
+                        message: format!("asset_cache_get: {e}"),
+                        details: Some(serde_json::json!({
+                            "subclass": "io",
+                        })),
+                    },
+                },
+                None => WireFrame::Error {
+                    v,
+                    cid,
+                    plugin,
+                    class: ErrorClass::Internal,
+                    message: "asset_cache_get: steward has no asset cache wired".into(),
+                    details: Some(serde_json::json!({
+                        "subclass": "not_configured",
+                    })),
+                },
+            }
+        }
+        WireFrame::AssetCachePut { v, cid, plugin, content_hash, bytes } => {
+            match sink.asset_cache.as_ref() {
+                Some(cache) => match cache.put(&content_hash, bytes).await {
+                    Ok(()) => WireFrame::AssetCachePutResponse { v, cid, plugin },
+                    Err(e) => {
+                        use evo_plugin_sdk::contract::AssetCacheError;
+                        let details = match &e {
+                            AssetCacheError::HashMismatch {
+                                expected,
+                                actual,
+                            } => serde_json::json!({
+                                "subclass": "hash_mismatch",
+                                "expected": expected,
+                                "actual": actual,
+                            }),
+                            _ => serde_json::json!({ "subclass": "io" }),
+                        };
+                        WireFrame::Error {
+                            v,
+                            cid,
+                            plugin,
+                            class: ErrorClass::Internal,
+                            message: format!("asset_cache_put: {e}"),
+                            details: Some(details),
+                        }
+                    }
+                },
+                None => WireFrame::Error {
+                    v,
+                    cid,
+                    plugin,
+                    class: ErrorClass::Internal,
+                    message: "asset_cache_put: steward has no asset cache wired".into(),
+                    details: Some(serde_json::json!({
+                        "subclass": "not_configured",
+                    })),
+                },
+            }
+        }
+
+        WireFrame::AssetCacheDelete {
+            v,
+            cid,
+            plugin,
+            content_hash,
+        } => match sink.asset_cache.as_ref() {
+            Some(cache) => match cache.delete(&content_hash).await {
+                Ok(existed) => WireFrame::AssetCacheDeleteResponse {
+                    v,
+                    cid,
+                    plugin,
+                    existed,
+                },
+                Err(e) => {
+                    use evo_plugin_sdk::contract::AssetCacheError;
+                    let details = match &e {
+                        AssetCacheError::InvalidContentHash(bad) => {
+                            serde_json::json!({
+                                "subclass": "invalid_hash",
+                                "content_hash": bad,
+                            })
+                        }
+                        _ => serde_json::json!({ "subclass": "io" }),
+                    };
+                    WireFrame::Error {
+                        v,
+                        cid,
+                        plugin,
+                        class: ErrorClass::Internal,
+                        message: format!("asset_cache_delete: {e}"),
+                        details: Some(details),
+                    }
+                }
+            },
+            None => WireFrame::Error {
+                v,
+                cid,
+                plugin,
+                class: ErrorClass::Internal,
+                message: "asset_cache_delete: steward has no asset cache wired"
+                    .into(),
+                details: Some(serde_json::json!({
+                    "subclass": "not_configured",
+                })),
+            },
+        },
+
+        // ----- Shelf dispatch (plugin -> steward -> destination plugin) -----
+        WireFrame::ShelfDispatchRequest {
+            v,
+            cid,
+            plugin,
+            shelf,
+            request_type,
+            payload,
+            instance_id,
+        } => match sink.shelf_request_dispatcher.as_ref() {
+            Some(dispatcher) => {
+                // Caller-scoped principal: use the plugin name
+                // stamped on the wire frame (connection identity)
+                // rather than the in-process `"plugin-system"`
+                // principal. See shelf_dispatcher.rs module docs.
+                match dispatcher
+                    .dispatch_as_caller(
+                        &plugin,
+                        &shelf,
+                        &request_type,
+                        payload,
+                        instance_id.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(response_payload) => WireFrame::ShelfDispatchResponse {
+                        v,
+                        cid,
+                        plugin,
+                        payload: response_payload,
+                    },
+                    Err(e) => {
+                        use evo_plugin_sdk::contract::ShelfDispatchError;
+                        let details = match &e {
+                            ShelfDispatchError::NoPluginOnShelf { shelf } => {
+                                serde_json::json!({
+                                    "subclass": "no_plugin_on_shelf",
+                                    "shelf": shelf,
+                                })
+                            }
+                            ShelfDispatchError::VerbNotStockedOnShelf {
+                                shelf,
+                                request_type,
+                            } => serde_json::json!({
+                                "subclass": "verb_not_stocked_on_shelf",
+                                "shelf": shelf,
+                                "request_type": request_type,
+                            }),
+                            ShelfDispatchError::Permanent { .. } => {
+                                serde_json::json!({ "subclass": "permanent" })
+                            }
+                            ShelfDispatchError::Transient { .. } => {
+                                serde_json::json!({ "subclass": "transient" })
+                            }
+                            ShelfDispatchError::DeadlineExceeded { budget_ms } => {
+                                serde_json::json!({
+                                    "subclass": "deadline_exceeded",
+                                    "budget_ms": budget_ms,
+                                })
+                            }
+                            ShelfDispatchError::SubstrateFailure { .. } => {
+                                serde_json::json!({ "subclass": "substrate_failure" })
+                            }
+                        };
+                        WireFrame::Error {
+                            v,
+                            cid,
+                            plugin,
+                            class: ErrorClass::Internal,
+                            message: format!("shelf_dispatch: {e}"),
+                            details: Some(details),
+                        }
+                    }
+                }
+            }
+            None => WireFrame::Error {
+                v,
+                cid,
+                plugin,
+                class: ErrorClass::Internal,
+                message: "shelf_dispatch: steward has no shelf dispatcher wired"
+                    .into(),
+                details: Some(serde_json::json!({
+                    "subclass": "not_configured",
+                })),
+            },
+        },
+
         WireFrame::FastPathDispatch {
             v,
             cid,
@@ -1748,6 +3289,644 @@ async fn forward_plugin_request(
                 })),
             },
         },
+
+        // ----- Multi-room substrate read verbs -----
+        WireFrame::GetMultiroomRole {
+            v,
+            cid,
+            plugin,
+            device_id,
+        } => match sink.multiroom_substrate.as_ref() {
+            Some(handle) => {
+                let result = handle.get_role(&device_id).await;
+                WireFrame::GetMultiroomRoleResponse {
+                    v,
+                    cid,
+                    plugin,
+                    result,
+                }
+            }
+            None => WireFrame::GetMultiroomRoleResponse {
+                v,
+                cid,
+                plugin,
+                result: Err(evo_plugin_sdk::multiroom_substrate::MultiroomSubstrateError::NotConfigured),
+            },
+        },
+        WireFrame::ListMultiroomExplicitRoles { v, cid, plugin } => {
+            match sink.multiroom_substrate.as_ref() {
+                Some(handle) => {
+                    let result = handle.list_explicit_roles().await;
+                    WireFrame::ListMultiroomExplicitRolesResponse {
+                        v,
+                        cid,
+                        plugin,
+                        result,
+                    }
+                }
+                None => WireFrame::ListMultiroomExplicitRolesResponse {
+                    v,
+                    cid,
+                    plugin,
+                    result: Err(evo_plugin_sdk::multiroom_substrate::MultiroomSubstrateError::NotConfigured),
+                },
+            }
+        }
+        WireFrame::GetMultiroomGroup {
+            v,
+            cid,
+            plugin,
+            group_id,
+        } => match sink.multiroom_substrate.as_ref() {
+            Some(handle) => {
+                let result = handle.get_group(&group_id).await;
+                WireFrame::GetMultiroomGroupResponse {
+                    v,
+                    cid,
+                    plugin,
+                    result,
+                }
+            }
+            None => WireFrame::GetMultiroomGroupResponse {
+                v,
+                cid,
+                plugin,
+                result: Err(evo_plugin_sdk::multiroom_substrate::MultiroomSubstrateError::NotConfigured),
+            },
+        },
+        WireFrame::ListMultiroomGroups { v, cid, plugin } => {
+            match sink.multiroom_substrate.as_ref() {
+                Some(handle) => {
+                    let result = handle.list_groups().await;
+                    WireFrame::ListMultiroomGroupsResponse {
+                        v,
+                        cid,
+                        plugin,
+                        result,
+                    }
+                }
+                None => WireFrame::ListMultiroomGroupsResponse {
+                    v,
+                    cid,
+                    plugin,
+                    result: Err(evo_plugin_sdk::multiroom_substrate::MultiroomSubstrateError::NotConfigured),
+                },
+            }
+        }
+        WireFrame::ListMultiroomGroupsForDevice {
+            v,
+            cid,
+            plugin,
+            device_id,
+        } => match sink.multiroom_substrate.as_ref() {
+            Some(handle) => {
+                let result = handle.list_groups_for_device(&device_id).await;
+                WireFrame::ListMultiroomGroupsForDeviceResponse {
+                    v,
+                    cid,
+                    plugin,
+                    result,
+                }
+            }
+            None => WireFrame::ListMultiroomGroupsForDeviceResponse {
+                v,
+                cid,
+                plugin,
+                result: Err(evo_plugin_sdk::multiroom_substrate::MultiroomSubstrateError::NotConfigured),
+            },
+        },
+
+        // ----- Audio-plane request verbs -----
+        WireFrame::AudioPlaneFanOutFrame {
+            v,
+            cid,
+            plugin,
+            group_id,
+            frame,
+        } => match sink.audio_plane.as_ref() {
+            Some(handle) => match handle
+                .fan_out_audio_frame(group_id, frame)
+                .await
+            {
+                Ok(()) => {
+                    WireFrame::AudioPlaneFanOutFrameResponse { v, cid, plugin }
+                }
+                Err(e) => plugin_error_to_wire_error(
+                    v,
+                    cid,
+                    plugin,
+                    "fan_out_audio_frame",
+                    e,
+                ),
+            },
+            None => audio_plane_capability_denied_error(
+                v,
+                cid,
+                plugin,
+                "fan_out_audio_frame",
+            ),
+        },
+        WireFrame::AudioPlaneUpsertGroup {
+            v,
+            cid,
+            plugin,
+            group_id,
+            display_name,
+            members,
+        } => match sink.audio_plane.as_ref() {
+            Some(handle) => match handle
+                .upsert_group(group_id, display_name, members)
+                .await
+            {
+                Ok(()) => {
+                    WireFrame::AudioPlaneUpsertGroupResponse { v, cid, plugin }
+                }
+                Err(e) => plugin_error_to_wire_error(
+                    v,
+                    cid,
+                    plugin,
+                    "upsert_group",
+                    e,
+                ),
+            },
+            None => audio_plane_capability_denied_error(
+                v,
+                cid,
+                plugin,
+                "upsert_group",
+            ),
+        },
+        WireFrame::AudioPlaneDialPeer {
+            v,
+            cid,
+            plugin,
+            addr,
+        } => match sink.audio_plane.as_ref() {
+            Some(handle) => match handle.dial_peer(addr).await {
+                Ok(()) => {
+                    WireFrame::AudioPlaneDialPeerResponse { v, cid, plugin }
+                }
+                Err(e) => {
+                    plugin_error_to_wire_error(v, cid, plugin, "dial_peer", e)
+                }
+            },
+            None => audio_plane_capability_denied_error(
+                v, cid, plugin, "dial_peer",
+            ),
+        },
+        WireFrame::AudioPlaneCloseOutboundConnections {
+            v,
+            cid,
+            plugin,
+        } => match sink.audio_plane.as_ref() {
+            Some(handle) => match handle.close_outbound_connections().await {
+                Ok(()) => {
+                    WireFrame::AudioPlaneCloseOutboundConnectionsResponse {
+                        v,
+                        cid,
+                        plugin,
+                    }
+                }
+                Err(e) => plugin_error_to_wire_error(
+                    v,
+                    cid,
+                    plugin,
+                    "close_outbound_connections",
+                    e,
+                ),
+            },
+            None => audio_plane_capability_denied_error(
+                v,
+                cid,
+                plugin,
+                "close_outbound_connections",
+            ),
+        },
+        WireFrame::AudioPlaneReportFrameTrace {
+            v,
+            cid,
+            plugin,
+            report,
+        } => match sink.audio_plane.as_ref() {
+            Some(handle) => match handle.report_frame_trace(report).await {
+                Ok(()) => WireFrame::AudioPlaneReportFrameTraceResponse {
+                    v,
+                    cid,
+                    plugin,
+                },
+                Err(e) => plugin_error_to_wire_error(
+                    v,
+                    cid,
+                    plugin,
+                    "report_frame_trace",
+                    e,
+                ),
+            },
+            None => audio_plane_capability_denied_error(
+                v,
+                cid,
+                plugin,
+                "report_frame_trace",
+            ),
+        },
+
+        // ----- StreamHost verbs -----
+        // Manifest gate: `capabilities.streams = true` populates
+        // `sink.stream_host`; opt-out plugins observe a structured
+        // Error frame naming the manifest-level refusal.
+        WireFrame::OpenStream {
+            v,
+            cid,
+            plugin,
+            stream_id,
+            spec,
+        } => match sink.stream_host.as_ref() {
+            Some(host) => match host.open(stream_id, spec).await {
+                Ok(stream_id) => WireFrame::OpenStreamResponse {
+                    v,
+                    cid,
+                    plugin,
+                    stream_id,
+                },
+                Err(e) => stream_error_to_wire_error(
+                    v,
+                    cid,
+                    plugin,
+                    "open_stream",
+                    e,
+                ),
+            },
+            None => streams_capability_denied_error(
+                v,
+                cid,
+                plugin,
+                "open_stream",
+            ),
+        },
+        WireFrame::EmitStream {
+            v,
+            cid,
+            plugin,
+            stream_id,
+            produced_at_ns,
+            codec,
+            payload,
+        } => match sink.stream_host.as_ref() {
+            Some(host) => {
+                match host
+                    .emit(stream_id, produced_at_ns, codec, payload)
+                    .await
+                {
+                    Ok(emit_result) => WireFrame::EmitStreamResponse {
+                        v,
+                        cid,
+                        plugin,
+                        emit_result,
+                    },
+                    Err(e) => stream_error_to_wire_error(
+                        v,
+                        cid,
+                        plugin,
+                        "emit_stream",
+                        e,
+                    ),
+                }
+            }
+            None => streams_capability_denied_error(
+                v,
+                cid,
+                plugin,
+                "emit_stream",
+            ),
+        },
+        WireFrame::CloseStream {
+            v,
+            cid,
+            plugin,
+            stream_id,
+        } => match sink.stream_host.as_ref() {
+            Some(host) => match host.close(stream_id).await {
+                Ok(()) => WireFrame::CloseStreamResponse { v, cid, plugin },
+                Err(e) => stream_error_to_wire_error(
+                    v,
+                    cid,
+                    plugin,
+                    "close_stream",
+                    e,
+                ),
+            },
+            None => streams_capability_denied_error(
+                v,
+                cid,
+                plugin,
+                "close_stream",
+            ),
+        },
+
+        // ----- NotificationEmitter verbs -----
+        // Manifest gate: `capabilities.notifications = true` populates
+        // `sink.notification_emitter`; opt-out plugins observe a
+        // structured Error frame naming the manifest-level refusal.
+        WireFrame::SendNotification {
+            v,
+            cid,
+            plugin,
+            notification,
+        } => match sink.notification_emitter.as_ref() {
+            Some(emitter) => match emitter.send(notification).await {
+                Ok(handle) => WireFrame::SendNotificationResponse {
+                    v,
+                    cid,
+                    plugin,
+                    handle,
+                },
+                Err(e) => notification_error_to_wire_error(
+                    v,
+                    cid,
+                    plugin,
+                    "send_notification",
+                    e,
+                ),
+            },
+            None => notifications_capability_denied_error(
+                v,
+                cid,
+                plugin,
+                "send_notification",
+            ),
+        },
+        WireFrame::CancelNotification {
+            v,
+            cid,
+            plugin,
+            handle,
+        } => match sink.notification_emitter.as_ref() {
+            Some(emitter) => match emitter.cancel(handle).await {
+                Ok(()) => WireFrame::CancelNotificationResponse {
+                    v,
+                    cid,
+                    plugin,
+                },
+                Err(e) => notification_error_to_wire_error(
+                    v,
+                    cid,
+                    plugin,
+                    "cancel_notification",
+                    e,
+                ),
+            },
+            None => notifications_capability_denied_error(
+                v,
+                cid,
+                plugin,
+                "cancel_notification",
+            ),
+        },
+
+        // ----- MetadataConsumer verbs -----
+        // Manifest gate: `capabilities.metadata = true` populates
+        // `sink.metadata_consumer`; opt-out plugins observe a
+        // structured Error frame naming the manifest-level refusal.
+        WireFrame::ExecuteMetadataQuery {
+            v,
+            cid,
+            plugin,
+            query,
+        } => match sink.metadata_consumer.as_ref() {
+            Some(consumer) => match consumer.execute_query(query).await {
+                Ok(result) => WireFrame::ExecuteMetadataQueryResponse {
+                    v,
+                    cid,
+                    plugin,
+                    result,
+                },
+                Err(e) => metadata_error_to_wire_error(
+                    v,
+                    cid,
+                    plugin,
+                    "execute_metadata_query",
+                    e,
+                ),
+            },
+            None => metadata_capability_denied_error(
+                v,
+                cid,
+                plugin,
+                "execute_metadata_query",
+            ),
+        },
+        WireFrame::GetMetadataItem {
+            v,
+            cid,
+            plugin,
+            provider_id,
+            uri,
+        } => match sink.metadata_consumer.as_ref() {
+            Some(consumer) => match consumer.get_item(provider_id, uri).await {
+                Ok(item) => WireFrame::GetMetadataItemResponse {
+                    v,
+                    cid,
+                    plugin,
+                    item,
+                },
+                Err(e) => metadata_error_to_wire_error(
+                    v,
+                    cid,
+                    plugin,
+                    "get_metadata_item",
+                    e,
+                ),
+            },
+            None => metadata_capability_denied_error(
+                v,
+                cid,
+                plugin,
+                "get_metadata_item",
+            ),
+        },
+        WireFrame::EnrichMetadata {
+            v,
+            cid,
+            plugin,
+            refs,
+            fields,
+        } => match sink.metadata_consumer.as_ref() {
+            Some(consumer) => {
+                let batch = consumer.enrich(refs, fields).await;
+                WireFrame::EnrichMetadataResponse {
+                    v,
+                    cid,
+                    plugin,
+                    batch,
+                }
+            }
+            None => metadata_capability_denied_error(
+                v,
+                cid,
+                plugin,
+                "enrich_metadata",
+            ),
+        },
+
+        // ----- CredentialVault verbs (plugin -> steward) -----
+        // The sink's `credential_vault` slot is bound at admission
+        // to the framework's `PluginScopedCredentialVault` for
+        // this plugin; the wire envelope's plugin name is
+        // validated against the connection's identity by the
+        // reader task, so the handle is inherently per-plugin.
+        // Callers cannot steer to another plugin's rows via these
+        // frames. `None` when the steward booted without a vault;
+        // the reader replies with `vault_unavailable` per verb.
+        WireFrame::CredentialFetch { v, cid, plugin, key } => {
+            match sink.credential_vault.as_ref() {
+                Some(vault) => match vault.fetch(key).await {
+                    Ok(Some(value)) => WireFrame::CredentialFetchResponse {
+                        v,
+                        cid,
+                        plugin,
+                        found: true,
+                        value,
+                    },
+                    Ok(None) => WireFrame::CredentialFetchResponse {
+                        v,
+                        cid,
+                        plugin,
+                        found: false,
+                        value: Vec::new(),
+                    },
+                    Err(e) => credential_vault_error_to_wire_error(
+                        v,
+                        cid,
+                        plugin,
+                        "credential_fetch",
+                        e,
+                    ),
+                },
+                None => credential_vault_unavailable_error(
+                    v,
+                    cid,
+                    plugin,
+                    "credential_fetch",
+                ),
+            }
+        }
+        WireFrame::CredentialStore {
+            v,
+            cid,
+            plugin,
+            key,
+            value,
+            metadata,
+        } => match sink.credential_vault.as_ref() {
+            Some(vault) => {
+                match vault.store(key, value, metadata).await {
+                    Ok(()) => WireFrame::CredentialStoreResponse {
+                        v,
+                        cid,
+                        plugin,
+                    },
+                    Err(e) => credential_vault_error_to_wire_error(
+                        v,
+                        cid,
+                        plugin,
+                        "credential_store",
+                        e,
+                    ),
+                }
+            }
+            None => credential_vault_unavailable_error(
+                v,
+                cid,
+                plugin,
+                "credential_store",
+            ),
+        },
+        WireFrame::CredentialDelete { v, cid, plugin, key } => {
+            match sink.credential_vault.as_ref() {
+                Some(vault) => match vault.delete(key).await {
+                    Ok(()) => WireFrame::CredentialDeleteResponse {
+                        v,
+                        cid,
+                        plugin,
+                    },
+                    Err(e) => credential_vault_error_to_wire_error(
+                        v,
+                        cid,
+                        plugin,
+                        "credential_delete",
+                        e,
+                    ),
+                },
+                None => credential_vault_unavailable_error(
+                    v,
+                    cid,
+                    plugin,
+                    "credential_delete",
+                ),
+            }
+        }
+        WireFrame::CredentialListKeys { v, cid, plugin } => {
+            match sink.credential_vault.as_ref() {
+                Some(vault) => match vault.list_keys().await {
+                    Ok(listings) => WireFrame::CredentialListKeysResponse {
+                        v,
+                        cid,
+                        plugin,
+                        listings,
+                    },
+                    Err(e) => credential_vault_error_to_wire_error(
+                        v,
+                        cid,
+                        plugin,
+                        "credential_list_keys",
+                        e,
+                    ),
+                },
+                None => credential_vault_unavailable_error(
+                    v,
+                    cid,
+                    plugin,
+                    "credential_list_keys",
+                ),
+            }
+        }
+        WireFrame::OnlineProviderConfigList { v, cid, plugin } => {
+            match sink.online_provider_config.as_ref() {
+                Some(handle) => match handle.list_all().await {
+                    Ok(configs) => WireFrame::OnlineProviderConfigListResponse {
+                        v,
+                        cid,
+                        plugin,
+                        configs,
+                    },
+                    Err(e) => WireFrame::Error {
+                        v,
+                        cid,
+                        plugin,
+                        class: ErrorClass::Internal,
+                        message: format!(
+                            "online_provider_config_list: store list failed: {e}"
+                        ),
+                        details: Some(serde_json::json!({
+                            "subclass": "provider_config_list_failed",
+                        })),
+                    },
+                },
+                None => WireFrame::Error {
+                    v,
+                    cid,
+                    plugin,
+                    class: ErrorClass::Internal,
+                    message:
+                        "online_provider_config_list: provider config store \
+                         not wired on this steward"
+                            .into(),
+                    details: Some(serde_json::json!({
+                        "subclass": "provider_config_unavailable",
+                    })),
+                },
+            }
+        }
 
         other => {
             // Should never happen: caller guards on
@@ -1822,6 +4001,58 @@ async fn forward_request_user_interaction(
             return;
         }
     };
+
+    // Fast-refuse when no session currently holds the
+    // user-interaction-responder slot. Without this check the
+    // ledger parks the prompt and the caller waits for the
+    // per-prompt tokio::time::sleep to fire (default 60 s), which
+    // presents to the operator as "add held open indefinitely".
+    // Fast-refusal short-circuits before ledger.issue_with_waiter
+    // so the plugin's request_user_interaction future resolves in
+    // the current tokio poll rather than waiting for the TTL to
+    // burn.
+    //
+    // The message starts with the subclass token so the plugin
+    // SDK's message → ReportError::Invalid mapping (host.rs
+    // await_event_response) preserves the classification for
+    // plugin-side pattern-match. The details field also carries
+    // the subclass for any consumer that reads the structured
+    // wire error directly.
+    //
+    // Distinct from `prompt_ledger_not_configured`: that subclass
+    // means the steward has no prompt substrate at all (build
+    // defect); this subclass means the substrate is in place but
+    // no session is currently connected to answer.
+    if ledger.current_responder().is_none() {
+        let effective_ms = prompt
+            .timeout_ms
+            .unwrap_or(evo_plugin_sdk::contract::DEFAULT_PROMPT_TIMEOUT_MS);
+        let frame = WireFrame::Error {
+            v,
+            cid,
+            plugin,
+            class: ErrorClass::PermissionDenied,
+            message: format!(
+                "no_responder_available: no user-interaction responder \
+                 session is currently connected; the prompt cannot be \
+                 answered. The framework refuses fast rather than \
+                 parking the prompt for its {effective_ms}ms TTL and \
+                 returning TimedOut. Retry after a session claims the \
+                 responder slot."
+            ),
+            details: Some(serde_json::json!({
+                "subclass": "no_responder_available",
+                "prompt_ttl_ms": effective_ms,
+            })),
+        };
+        if out_tx.send(frame).await.is_err() {
+            tracing::warn!(
+                "writer task closed before no_responder_available refusal \
+                 could be sent"
+            );
+        }
+        return;
+    }
 
     // Compute the effective timeout: declared value clamped at
     // [DEFAULT_PROMPT_TIMEOUT_MS .. MAX_PROMPT_TIMEOUT_MS].
@@ -1980,6 +4211,131 @@ fn admin_capability_denied_error(
     }
 }
 
+/// Build a capability-denied error for plugins that send
+/// `SubscribeSubject` / `UnsubscribeSubject` / `CurrentState`
+/// without declaring `capabilities.subscribe_subjects = true` in
+/// their manifest. The framework's admission engine refuses to
+/// populate `LoadContext::subject_state_subscriber` for those
+/// plugins, so the EventSink's slot is `None` and the wire
+/// dispatch surface refuses with this structured error rather
+/// than tearing the connection down.
+fn subscribe_capability_denied_error(
+    v: u16,
+    cid: u64,
+    plugin: String,
+) -> WireFrame {
+    WireFrame::Error {
+        v,
+        cid,
+        plugin,
+        class: ErrorClass::PermissionDenied,
+        message: "subscribe_subjects capability not granted to this plugin"
+            .to_string(),
+        details: None,
+    }
+}
+
+/// Spawn a per-subscription forwarder task that translates
+/// [`evo_plugin_sdk::contract::SubjectStateUpdate`] events from
+/// the steward's in-process registry into outbound
+/// [`WireFrame::SubjectStateUpdatePush`] frames on the plugin
+/// connection.
+///
+/// The task races the stream against a oneshot cancel channel:
+/// `UnsubscribeSubject` fires the cancel; a closed `out_tx`
+/// (writer task gone) breaks the loop; a closed stream (registry
+/// shutdown) breaks the loop. On exit the task removes its own
+/// entry from `subscription_forwarders` so connection-drop
+/// cleanup leaves no dangling rows. The map's cancel-sender side
+/// is dropped when its entry is removed; the task does not need
+/// to await its own removal.
+///
+/// `Lagged` errors from the broadcast bus are logged at warn
+/// level and the loop continues — the underlying
+/// [`broadcast::Receiver`] rejoins the live frame after a lag
+/// signal, so the subscription stays alive and the plugin
+/// observes future updates. Plugins that need to recover the
+/// dropped updates can call [`current_state`] to resync.
+fn spawn_subject_state_forwarder(
+    canonical_id: String,
+    plugin: String,
+    mut stream: evo_plugin_sdk::contract::SubjectStateStream,
+    mut cancel_rx: oneshot::Receiver<()>,
+    forwarders: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    out_tx: mpsc::Sender<WireFrame>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut cancel_rx => {
+                    tracing::debug!(
+                        plugin = %plugin,
+                        canonical_id = %canonical_id,
+                        "subject-state forwarder: cancelled \
+                         by unsubscribe"
+                    );
+                    break;
+                }
+                recv = stream.recv() => match recv {
+                    Ok(update) => {
+                        let frame = WireFrame::SubjectStateUpdatePush {
+                            v: PROTOCOL_VERSION,
+                            plugin: plugin.clone(),
+                            canonical_id: update.canonical_id,
+                            subject_type: update.subject_type,
+                            state: update.state,
+                            modified_at_ms: update.modified_at_ms,
+                        };
+                        if out_tx.send(frame).await.is_err() {
+                            tracing::debug!(
+                                plugin = %plugin,
+                                canonical_id = %canonical_id,
+                                "subject-state forwarder: outbound \
+                                 channel closed; exiting"
+                            );
+                            break;
+                        }
+                    }
+                    Err(evo_plugin_sdk::contract::SubjectStateStreamError::Lagged { dropped }) => {
+                        // LOGGING.md §2: warn (recoverable anomaly —
+                        // subscriber missed `dropped` state updates
+                        // because the registry broadcast overflowed;
+                        // the operator wants to know because state
+                        // gaps affect observability guarantees).
+                        tracing::warn!(
+                            plugin = %plugin,
+                            canonical_id = %canonical_id,
+                            dropped,
+                            "subject-state forwarder: registry \
+                             broadcast lagged; rejoining live frame"
+                        );
+                        continue;
+                    }
+                    Err(evo_plugin_sdk::contract::SubjectStateStreamError::Closed) => {
+                        tracing::debug!(
+                            plugin = %plugin,
+                            canonical_id = %canonical_id,
+                            "subject-state forwarder: registry \
+                             broadcast closed; exiting"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        // Self-clean: remove our entry from the registry on exit.
+        // The remove() is a no-op if `UnsubscribeSubject` already
+        // pulled the entry before firing cancel_rx, or if the
+        // EventSink has been dropped (writer task closed the
+        // connection and the Arc to forwarders is the last
+        // surviving reference held by this task).
+        let mut map = forwarders
+            .lock()
+            .expect("subscription_forwarders mutex poisoned");
+        map.remove(&canonical_id);
+    });
+}
+
 /// Stub querier installed when a wire-backed `LoadContext` carries
 /// no querier (typical for test harnesses that do not populate the
 /// field). Returns `NotFound` / `None` for every query so the wire
@@ -2051,14 +4407,19 @@ async fn forward_event(
 ) {
     let (_v, cid, peer_plugin) = frame.envelope();
     let plugin = peer_plugin.to_string();
-    // Per `docs/engineering/LOGGING.md` §2: every plugin-emitted
-    // event gets a debug entry so an engineer can trace the
-    // narrative — which plugin emitted which event, in what
-    // order, with what cid. Heavy payload bodies are excluded
-    // (the per-handler debug surface in announcer / state
-    // reporter call sites covers payload content where it
-    // matters).
-    tracing::debug!(
+    // Per `docs/engineering/LOGGING.md` §2: `forward_event` runs
+    // on the hot per-frame path — every announce, every report,
+    // every subscriber broadcast lands here. That is firehose
+    // volume on a long-running steward (tens of frames per
+    // second across the admitted plugin set), so the narrative
+    // entry lives at TRACE, not DEBUG. An engineer wanting the
+    // narrative enables `evo=trace` for the diagnostic session;
+    // a debug-level run remains scoped to lifecycle + admission
+    // events that a long-running install can sustain without
+    // exhausting journal storage. Heavy payload bodies are
+    // excluded; payload content lives at the per-handler debug
+    // surface (announcer / state reporter) where it matters.
+    tracing::trace!(
         op = variant_name(&frame),
         cid,
         plugin = %plugin,
@@ -2077,8 +4438,19 @@ async fn forward_event(
             addressing, reason, ..
         } => sink.subject_announcer.retract(addressing, reason).await,
         WireFrame::UpdateSubjectState {
-            addressing, state, ..
-        } => sink.subject_announcer.update_state(addressing, state).await,
+            addressing,
+            state,
+            volatile,
+            ..
+        } => {
+            if volatile {
+                sink.subject_announcer
+                    .update_state_volatile(addressing, state)
+                    .await
+            } else {
+                sink.subject_announcer.update_state(addressing, state).await
+            }
+        }
         WireFrame::AssertRelation { assertion, .. } => {
             sink.relation_announcer.assert(assertion).await
         }
@@ -2273,6 +4645,144 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::EmitPluginEventResponse { .. } => {
             "emit_plugin_event_response"
         }
+        WireFrame::EmitAudioPlaybackEnded { .. } => "emit_audio_playback_ended",
+        WireFrame::EmitAudioPlaybackEndedResponse { .. } => {
+            "emit_audio_playback_ended_response"
+        }
+        WireFrame::AudioRoutingStateChanged { .. } => {
+            "audio_routing_state_changed"
+        }
+        WireFrame::GetMultiroomRole { .. } => "get_multiroom_role",
+        WireFrame::GetMultiroomRoleResponse { .. } => {
+            "get_multiroom_role_response"
+        }
+        WireFrame::ListMultiroomExplicitRoles { .. } => {
+            "list_multiroom_explicit_roles"
+        }
+        WireFrame::ListMultiroomExplicitRolesResponse { .. } => {
+            "list_multiroom_explicit_roles_response"
+        }
+        WireFrame::GetMultiroomGroup { .. } => "get_multiroom_group",
+        WireFrame::GetMultiroomGroupResponse { .. } => {
+            "get_multiroom_group_response"
+        }
+        WireFrame::ListMultiroomGroups { .. } => "list_multiroom_groups",
+        WireFrame::ListMultiroomGroupsResponse { .. } => {
+            "list_multiroom_groups_response"
+        }
+        WireFrame::ListMultiroomGroupsForDevice { .. } => {
+            "list_multiroom_groups_for_device"
+        }
+        WireFrame::ListMultiroomGroupsForDeviceResponse { .. } => {
+            "list_multiroom_groups_for_device_response"
+        }
+        WireFrame::MultiroomRoleChanged { .. } => "multiroom_role_changed",
+        WireFrame::MultiroomGroupChanged { .. } => "multiroom_group_changed",
+        WireFrame::AudioPlaneInit { .. } => "audio_plane_init",
+        WireFrame::AudioPlaneFanOutFrame { .. } => "audio_plane_fan_out_frame",
+        WireFrame::AudioPlaneFanOutFrameResponse { .. } => {
+            "audio_plane_fan_out_frame_response"
+        }
+        WireFrame::AudioPlaneUpsertGroup { .. } => "audio_plane_upsert_group",
+        WireFrame::AudioPlaneUpsertGroupResponse { .. } => {
+            "audio_plane_upsert_group_response"
+        }
+        WireFrame::AudioPlaneDialPeer { .. } => "audio_plane_dial_peer",
+        WireFrame::AudioPlaneDialPeerResponse { .. } => {
+            "audio_plane_dial_peer_response"
+        }
+        WireFrame::AudioPlaneCloseOutboundConnections { .. } => {
+            "audio_plane_close_outbound_connections"
+        }
+        WireFrame::AudioPlaneCloseOutboundConnectionsResponse { .. } => {
+            "audio_plane_close_outbound_connections_response"
+        }
+        WireFrame::AudioPlaneReportFrameTrace { .. } => {
+            "audio_plane_report_frame_trace"
+        }
+        WireFrame::AudioPlaneReportFrameTraceResponse { .. } => {
+            "audio_plane_report_frame_trace_response"
+        }
+        WireFrame::AudioPlaneFrameReceived { .. } => {
+            "audio_plane_frame_received"
+        }
+        WireFrame::AudioPlaneFrameSendEvent { .. } => {
+            "audio_plane_frame_send_event"
+        }
+        WireFrame::AudioPlaneFrameTraceReport { .. } => {
+            "audio_plane_frame_trace_report"
+        }
+        WireFrame::SubscribeSubject { .. } => "subscribe_subject",
+        WireFrame::SubscribeSubjectResponse { .. } => {
+            "subscribe_subject_response"
+        }
+        WireFrame::UnsubscribeSubject { .. } => "unsubscribe_subject",
+        WireFrame::UnsubscribeSubjectResponse { .. } => {
+            "unsubscribe_subject_response"
+        }
+        WireFrame::CurrentState { .. } => "current_state",
+        WireFrame::CurrentStateResponse { .. } => "current_state_response",
+        WireFrame::SubjectStateUpdatePush { .. } => "subject_state_update_push",
+        WireFrame::AssetCacheGet { .. } => "asset_cache_get",
+        WireFrame::AssetCacheGetResponse { .. } => "asset_cache_get_response",
+        WireFrame::AssetCachePut { .. } => "asset_cache_put",
+        WireFrame::AssetCachePutResponse { .. } => "asset_cache_put_response",
+        WireFrame::AssetCacheDelete { .. } => "asset_cache_delete",
+        WireFrame::AssetCacheDeleteResponse { .. } => {
+            "asset_cache_delete_response"
+        }
+        WireFrame::ShelfDispatchRequest { .. } => "shelf_dispatch_request",
+        WireFrame::ShelfDispatchResponse { .. } => "shelf_dispatch_response",
+        WireFrame::OpenStream { .. } => "open_stream",
+        WireFrame::OpenStreamResponse { .. } => "open_stream_response",
+        WireFrame::EmitStream { .. } => "emit_stream",
+        WireFrame::EmitStreamResponse { .. } => "emit_stream_response",
+        WireFrame::CloseStream { .. } => "close_stream",
+        WireFrame::CloseStreamResponse { .. } => "close_stream_response",
+        WireFrame::SendNotification { .. } => "send_notification",
+        WireFrame::SendNotificationResponse { .. } => {
+            "send_notification_response"
+        }
+        WireFrame::CancelNotification { .. } => "cancel_notification",
+        WireFrame::CancelNotificationResponse { .. } => {
+            "cancel_notification_response"
+        }
+        WireFrame::ExecuteMetadataQuery { .. } => "execute_metadata_query",
+        WireFrame::ExecuteMetadataQueryResponse { .. } => {
+            "execute_metadata_query_response"
+        }
+        WireFrame::GetMetadataItem { .. } => "get_metadata_item",
+        WireFrame::GetMetadataItemResponse { .. } => {
+            "get_metadata_item_response"
+        }
+        WireFrame::EnrichMetadata { .. } => "enrich_metadata",
+        WireFrame::EnrichMetadataResponse { .. } => "enrich_metadata_response",
+        WireFrame::CredentialFetch { .. } => "credential_fetch",
+        WireFrame::CredentialFetchResponse { .. } => {
+            "credential_fetch_response"
+        }
+        WireFrame::CredentialStore { .. } => "credential_store",
+        WireFrame::CredentialStoreResponse { .. } => {
+            "credential_store_response"
+        }
+        WireFrame::CredentialDelete { .. } => "credential_delete",
+        WireFrame::CredentialDeleteResponse { .. } => {
+            "credential_delete_response"
+        }
+        WireFrame::CredentialListKeys { .. } => "credential_list_keys",
+        WireFrame::CredentialListKeysResponse { .. } => {
+            "credential_list_keys_response"
+        }
+        WireFrame::CredentialSetChanged { .. } => "credential_set_changed",
+        WireFrame::OnlineProviderConfigList { .. } => {
+            "online_provider_config_list"
+        }
+        WireFrame::OnlineProviderConfigListResponse { .. } => {
+            "online_provider_config_list_response"
+        }
+        WireFrame::OnlineProviderConfigChanged { .. } => {
+            "online_provider_config_changed"
+        }
     }
 }
 
@@ -2392,13 +4902,13 @@ impl StdError for RemoteErrorSource {}
 /// Map a wire-client error to a plugin error for reporting back
 /// through the admission engine.
 ///
-/// The `details` envelope carried by `PluginReturnedError` (and
-/// originally by the wire `Error` frame) is preserved on the resulting
-/// `PluginError`'s message: when present, the structured subclass and
-/// extras append after the human message. The downstream taxonomy
-/// translation in `error.rs` parses neither shape; this preserves the
-/// signal in the operator-facing log without changing the
-/// `PluginError` enum shape.
+/// When the peer's `Error` frame carries `details.subclass`, restore
+/// [`PluginError::WithSubclass`] with the bare wire message. Stuffing
+/// subclass into the Permanent message string is not a substitute —
+/// `ApiError` and operator UIs key on the structured variant.
+///
+/// Frames without a subclass keep the prior Permanent / fatal mapping;
+/// non-subclass `details` remain appended to the message for logs.
 fn wire_error_to_plugin_error(
     err: WireClientError,
     context: &'static str,
@@ -2409,6 +4919,18 @@ fn wire_error_to_plugin_error(
             class,
             details,
         } => {
+            if let Some(subclass) = details
+                .as_ref()
+                .and_then(|d| d.get("subclass"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+            {
+                return PluginError::WithSubclass {
+                    class,
+                    subclass,
+                    message,
+                };
+            }
             let composed = match details {
                 Some(d) => format!("{message} (details={d})"),
                 None => message,
@@ -2437,6 +4959,16 @@ impl crate::admission::ErasedRespondent for WireRespondent {
     ) -> Pin<Box<dyn Future<Output = PluginDescription> + Send + '_>> {
         let desc = self.cached_description.clone();
         Box::pin(async move { desc })
+    }
+
+    fn probe_plans(&self) -> Vec<evo_plugin_sdk::privileges::ProbePlan> {
+        // Out-of-process plugins do not yet ship probe plans
+        // across the wire. The wire codec gains a
+        // `GetProbePlans` op in a later cut; until then OOP
+        // plugins observe an empty `CapabilityResolutionMap`
+        // on the framework side and fall back to their own
+        // legacy detection inside the plugin process.
+        Vec::new()
     }
 
     fn load<'a>(
@@ -2472,6 +5004,17 @@ impl crate::admission::ErasedRespondent for WireRespondent {
                 appointment_scheduler: ctx.appointments.clone(),
                 watch_scheduler: ctx.watches.clone(),
                 prompt_ledger: self.prompt_ledger.clone(),
+                multiroom_substrate: ctx.multiroom_substrate.clone(),
+                asset_cache: ctx.asset_cache.clone(),
+                shelf_request_dispatcher: ctx.shelf_request_dispatcher.clone(),
+                audio_plane: ctx.audio_plane.clone(),
+                subject_state_subscriber: ctx.subject_state_subscriber.clone(),
+                subscription_forwarders: Arc::new(Mutex::new(HashMap::new())),
+                stream_host: ctx.streams.clone(),
+                notification_emitter: ctx.notifications.clone(),
+                metadata_consumer: ctx.metadata.clone(),
+                credential_vault: ctx.credential_vault.clone(),
+                online_provider_config: ctx.online_provider_config.clone(),
                 plugin_name: self.client.plugin_name().to_string(),
             });
 
@@ -2546,7 +5089,7 @@ impl crate::admission::ErasedRespondent for WireRespondent {
     }
 
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> Pin<Box<dyn Future<Output = Result<Response, PluginError>> + Send + 'a>>
     {
@@ -2557,6 +5100,8 @@ impl crate::admission::ErasedRespondent for WireRespondent {
                 correlation_id: req.correlation_id,
                 deadline: req.deadline,
                 instance_id: req.instance_id.clone(),
+                principal_scope: None,
+                has_step_up: false,
             };
             match self.client.handle_request(owned).await {
                 Ok(r) => Ok(r),
@@ -2619,6 +5164,17 @@ impl crate::admission::ErasedRespondent for WireRespondent {
                 appointment_scheduler: ctx.appointments.clone(),
                 watch_scheduler: ctx.watches.clone(),
                 prompt_ledger: self.prompt_ledger.clone(),
+                multiroom_substrate: ctx.multiroom_substrate.clone(),
+                asset_cache: ctx.asset_cache.clone(),
+                shelf_request_dispatcher: ctx.shelf_request_dispatcher.clone(),
+                audio_plane: ctx.audio_plane.clone(),
+                subject_state_subscriber: ctx.subject_state_subscriber.clone(),
+                subscription_forwarders: Arc::new(Mutex::new(HashMap::new())),
+                stream_host: ctx.streams.clone(),
+                notification_emitter: ctx.notifications.clone(),
+                metadata_consumer: ctx.metadata.clone(),
+                credential_vault: ctx.credential_vault.clone(),
+                online_provider_config: ctx.online_provider_config.clone(),
                 plugin_name: self.client.plugin_name().to_string(),
             });
 
@@ -2785,6 +5341,16 @@ impl crate::admission::ErasedWarden for WireWarden {
         Box::pin(async move { desc })
     }
 
+    fn probe_plans(&self) -> Vec<evo_plugin_sdk::privileges::ProbePlan> {
+        // Out-of-process plugins do not yet ship probe plans
+        // across the wire. The wire codec gains a
+        // `GetProbePlans` op in a later cut; until then OOP
+        // plugins observe an empty `CapabilityResolutionMap`
+        // on the framework side and fall back to their own
+        // legacy detection inside the plugin process.
+        Vec::new()
+    }
+
     fn load<'a>(
         &'a mut self,
         ctx: &'a LoadContext,
@@ -2827,6 +5393,17 @@ impl crate::admission::ErasedWarden for WireWarden {
                 appointment_scheduler: ctx.appointments.clone(),
                 watch_scheduler: ctx.watches.clone(),
                 prompt_ledger: self.prompt_ledger.clone(),
+                multiroom_substrate: ctx.multiroom_substrate.clone(),
+                asset_cache: ctx.asset_cache.clone(),
+                shelf_request_dispatcher: ctx.shelf_request_dispatcher.clone(),
+                audio_plane: ctx.audio_plane.clone(),
+                subject_state_subscriber: ctx.subject_state_subscriber.clone(),
+                subscription_forwarders: Arc::new(Mutex::new(HashMap::new())),
+                stream_host: ctx.streams.clone(),
+                notification_emitter: ctx.notifications.clone(),
+                metadata_consumer: ctx.metadata.clone(),
+                credential_vault: ctx.credential_vault.clone(),
+                online_provider_config: ctx.online_provider_config.clone(),
                 plugin_name: self.client.plugin_name().to_string(),
             });
 
@@ -3028,6 +5605,17 @@ impl crate::admission::ErasedWarden for WireWarden {
                 appointment_scheduler: ctx.appointments.clone(),
                 watch_scheduler: ctx.watches.clone(),
                 prompt_ledger: self.prompt_ledger.clone(),
+                multiroom_substrate: ctx.multiroom_substrate.clone(),
+                asset_cache: ctx.asset_cache.clone(),
+                shelf_request_dispatcher: ctx.shelf_request_dispatcher.clone(),
+                audio_plane: ctx.audio_plane.clone(),
+                subject_state_subscriber: ctx.subject_state_subscriber.clone(),
+                subscription_forwarders: Arc::new(Mutex::new(HashMap::new())),
+                stream_host: ctx.streams.clone(),
+                notification_emitter: ctx.notifications.clone(),
+                metadata_consumer: ctx.metadata.clone(),
+                credential_vault: ctx.credential_vault.clone(),
+                online_provider_config: ctx.online_provider_config.clone(),
                 plugin_name: self.client.plugin_name().to_string(),
             });
 
@@ -3065,6 +5653,286 @@ impl crate::admission::ErasedWarden for WireWarden {
                 }
             }
         })
+    }
+}
+
+// =====================================================================
+// WireWardenAndRespondent: adapter implementing
+// ErasedWardenAndRespondent over a single WireClient connection. The
+// plugin's wire binary must use the SDK's run_oop_warden_with_respondent
+// entry (or equivalent) so the binary's dispatch loop accepts both
+// HandleRequest and warden frames. Lifecycle methods (describe / load /
+// unload / health_check) dispatch ONCE through the wrapped WireWarden;
+// the respondent surface's handle_request bypasses any duplicate
+// lifecycle by going straight to the underlying WireClient.
+// =====================================================================
+
+/// Wire-side adapter for plugins that implement BOTH the Warden and
+/// Respondent contracts on the OOP transport. Counterpart to the
+/// in-process `WardenAndRespondentAdapter`; both surfaces dispatch
+/// to the SAME plugin instance over the same wire connection — the
+/// plugin's wire binary serves both frame classes through the SDK's
+/// `serve_combined` dispatch loop.
+pub struct WireWardenAndRespondent {
+    inner: WireWarden,
+}
+
+impl fmt::Debug for WireWardenAndRespondent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WireWardenAndRespondent")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl WireWardenAndRespondent {
+    /// Connect over the supplied reader and writer. Builds on
+    /// [`WireWarden::connect`] — the lifecycle + custody surfaces
+    /// come from the wrapped WireWarden; the respondent surface
+    /// goes straight to the underlying [`WireClient`].
+    pub async fn connect<R, W>(
+        reader: R,
+        writer: W,
+        plugin_name: String,
+        ledger: Arc<CustodyLedger>,
+        bus: Arc<HappeningBus>,
+    ) -> Result<Self, WireClientError>
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        let inner =
+            WireWarden::connect(reader, writer, plugin_name, ledger, bus)
+                .await?;
+        Ok(Self { inner })
+    }
+
+    /// Stamp a prompt ledger handle on this adapter. Mirrors
+    /// [`WireWarden::set_prompt_ledger`].
+    pub fn set_prompt_ledger(
+        &mut self,
+        ledger: Arc<crate::prompts::PromptLedger>,
+    ) {
+        self.inner.set_prompt_ledger(ledger);
+    }
+
+    /// Borrow the cached plugin description.
+    pub fn description(&self) -> &PluginDescription {
+        self.inner.description()
+    }
+
+    /// Borrow the underlying wire client. Used by OOP admission
+    /// to mint an [`AudioRoutingForwarderSink`] for the
+    /// audio-routing state-change forwarder.
+    pub fn client(&self) -> &WireClient {
+        self.inner.client()
+    }
+}
+
+impl crate::admission::ErasedWarden for WireWardenAndRespondent {
+    fn describe(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = PluginDescription> + Send + '_>> {
+        crate::admission::ErasedWarden::describe(&self.inner)
+    }
+
+    fn probe_plans(&self) -> Vec<evo_plugin_sdk::privileges::ProbePlan> {
+        crate::admission::ErasedWarden::probe_plans(&self.inner)
+    }
+
+    fn load<'a>(
+        &'a mut self,
+        ctx: &'a LoadContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
+        crate::admission::ErasedWarden::load(&mut self.inner, ctx)
+    }
+
+    fn unload(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + '_>>
+    {
+        crate::admission::ErasedWarden::unload(&mut self.inner)
+    }
+
+    fn health_check(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = HealthReport> + Send + '_>> {
+        crate::admission::ErasedWarden::health_check(&self.inner)
+    }
+
+    fn take_custody<'a>(
+        &'a mut self,
+        assignment: Assignment,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a,
+        >,
+    > {
+        crate::admission::ErasedWarden::take_custody(
+            &mut self.inner,
+            assignment,
+        )
+    }
+
+    fn course_correct<'a>(
+        &'a mut self,
+        handle: &'a CustodyHandle,
+        correction: CourseCorrection,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
+        crate::admission::ErasedWarden::course_correct(
+            &mut self.inner,
+            handle,
+            correction,
+        )
+    }
+
+    fn release_custody<'a>(
+        &'a mut self,
+        handle: CustodyHandle,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
+        crate::admission::ErasedWarden::release_custody(&mut self.inner, handle)
+    }
+
+    fn prepare_for_live_reload(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Option<evo_plugin_sdk::contract::StateBlob>,
+                        PluginError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        crate::admission::ErasedWarden::prepare_for_live_reload(&self.inner)
+    }
+
+    fn load_with_state<'a>(
+        &'a mut self,
+        ctx: &'a LoadContext,
+        blob: Option<evo_plugin_sdk::contract::StateBlob>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
+        crate::admission::ErasedWarden::load_with_state(
+            &mut self.inner,
+            ctx,
+            blob,
+        )
+    }
+}
+
+impl crate::admission::ErasedRespondent for WireWardenAndRespondent {
+    fn describe(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = PluginDescription> + Send + '_>> {
+        crate::admission::ErasedWarden::describe(&self.inner)
+    }
+
+    fn probe_plans(&self) -> Vec<evo_plugin_sdk::privileges::ProbePlan> {
+        crate::admission::ErasedWarden::probe_plans(&self.inner)
+    }
+
+    fn load<'a>(
+        &'a mut self,
+        ctx: &'a LoadContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
+        crate::admission::ErasedWarden::load(&mut self.inner, ctx)
+    }
+
+    fn unload(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + '_>>
+    {
+        crate::admission::ErasedWarden::unload(&mut self.inner)
+    }
+
+    fn health_check(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = HealthReport> + Send + '_>> {
+        crate::admission::ErasedWarden::health_check(&self.inner)
+    }
+
+    fn handle_request<'a>(
+        &'a self,
+        req: &'a Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, PluginError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // Mirror WireRespondent::handle_request: clone the
+            // request into the owned shape the wire client takes,
+            // delegate, map wire errors to PluginError.
+            let owned = Request {
+                request_type: req.request_type.clone(),
+                payload: req.payload.clone(),
+                correlation_id: req.correlation_id,
+                deadline: req.deadline,
+                instance_id: req.instance_id.clone(),
+                principal_scope: None,
+                has_step_up: false,
+            };
+            match self.inner.client().handle_request(owned).await {
+                Ok(r) => Ok(r),
+                Err(e) => Err(wire_error_to_plugin_error(
+                    e,
+                    "wire handle_request (combined)",
+                )),
+            }
+        })
+    }
+
+    fn prepare_for_live_reload(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Option<evo_plugin_sdk::contract::StateBlob>,
+                        PluginError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        crate::admission::ErasedWarden::prepare_for_live_reload(&self.inner)
+    }
+
+    fn load_with_state<'a>(
+        &'a mut self,
+        ctx: &'a LoadContext,
+        blob: Option<evo_plugin_sdk::contract::StateBlob>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>
+    {
+        crate::admission::ErasedWarden::load_with_state(
+            &mut self.inner,
+            ctx,
+            blob,
+        )
+    }
+}
+
+impl crate::admission::ErasedWardenAndRespondent for WireWardenAndRespondent {
+    fn as_respondent_mut(
+        &mut self,
+    ) -> &mut dyn crate::admission::ErasedRespondent {
+        self
+    }
+
+    fn as_warden_mut(&mut self) -> &mut dyn crate::admission::ErasedWarden {
+        self
+    }
+
+    fn as_respondent(&self) -> &dyn crate::admission::ErasedRespondent {
+        self
+    }
+
+    fn as_warden(&self) -> &dyn crate::admission::ErasedWarden {
+        self
     }
 }
 
@@ -3382,7 +6250,7 @@ mod tests {
 
     impl Respondent for TestPlugin {
         fn handle_request<'a>(
-            &'a mut self,
+            &'a self,
             req: &'a Request,
         ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a
         {
@@ -3539,6 +6407,8 @@ mod tests {
             deadline: None,
 
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let err = respondent.handle_request(&req).await.unwrap_err();
         assert!(err.is_fatal(), "expected fatal error, got {err:?}");
@@ -3656,6 +6526,8 @@ mod tests {
             deadline: None,
 
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let resp = respondent.handle_request(&req).await.unwrap();
         assert_eq!(resp.payload, b"hello");
@@ -3810,6 +6682,25 @@ target_type = "album"
             ),
             appointments: None,
             watches: None,
+            streams: None,
+            notifications: None,
+            metadata: None,
+            scheduler: None,
+            audio_routing: None,
+            subject_state_subscriber: None,
+            audio_plane: None,
+            asset_cache: None,
+            multiroom_substrate: None,
+            shelf_request_dispatcher: None,
+            credential_vault: None,
+            online_provider_config: None,
+            capabilities: Arc::new(
+                evo_plugin_sdk::privileges::CapabilityResolutionMap::new(),
+            ),
+            // Test harnesses bypass the framework's re-probe
+            // task wiring; `None` is the do-nothing default
+            // every harness path agrees on.
+            capabilities_watch: None,
         }
     }
 
@@ -4271,6 +7162,17 @@ target_type = "album"
             appointment_scheduler: None,
             watch_scheduler: None,
             prompt_ledger: None,
+            multiroom_substrate: None,
+            asset_cache: None,
+            shelf_request_dispatcher: None,
+            audio_plane: None,
+            subject_state_subscriber: None,
+            subscription_forwarders: Arc::new(Mutex::new(HashMap::new())),
+            stream_host: None,
+            notification_emitter: None,
+            metadata_consumer: None,
+            credential_vault: None,
+            online_provider_config: None,
             plugin_name: "test".into(),
         });
 
@@ -4474,6 +7376,25 @@ name = "album"
             ),
             appointments: None,
             watches: None,
+            streams: None,
+            notifications: None,
+            metadata: None,
+            scheduler: None,
+            audio_routing: None,
+            subject_state_subscriber: None,
+            audio_plane: None,
+            asset_cache: None,
+            multiroom_substrate: None,
+            shelf_request_dispatcher: None,
+            credential_vault: None,
+            online_provider_config: None,
+            capabilities: Arc::new(
+                evo_plugin_sdk::privileges::CapabilityResolutionMap::new(),
+            ),
+            // Test harnesses bypass the framework's re-probe
+            // task wiring; `None` is the do-nothing default
+            // every harness path agrees on.
+            capabilities_watch: None,
         }
     }
 
@@ -4930,6 +7851,17 @@ name = "track"
             appointment_scheduler: None,
             watch_scheduler: None,
             prompt_ledger: None,
+            multiroom_substrate: None,
+            asset_cache: None,
+            shelf_request_dispatcher: None,
+            audio_plane: None,
+            subject_state_subscriber: None,
+            subscription_forwarders: Arc::new(Mutex::new(HashMap::new())),
+            stream_host: None,
+            notification_emitter: None,
+            metadata_consumer: None,
+            credential_vault: None,
+            online_provider_config: None,
             plugin_name: "test".into(),
         }
     }
@@ -5137,6 +8069,17 @@ name = "track"
             appointment_scheduler: None,
             watch_scheduler: None,
             prompt_ledger: None,
+            multiroom_substrate: None,
+            asset_cache: None,
+            shelf_request_dispatcher: None,
+            audio_plane: None,
+            subject_state_subscriber: None,
+            subscription_forwarders: Arc::new(Mutex::new(HashMap::new())),
+            stream_host: None,
+            notification_emitter: None,
+            metadata_consumer: None,
+            credential_vault: None,
+            online_provider_config: None,
             plugin_name: "test".into(),
         }
     }
@@ -5329,6 +8272,17 @@ name = "track"
             appointment_scheduler: None,
             watch_scheduler: None,
             prompt_ledger: None,
+            multiroom_substrate: None,
+            asset_cache: None,
+            shelf_request_dispatcher: None,
+            audio_plane: None,
+            subject_state_subscriber: None,
+            subscription_forwarders: Arc::new(Mutex::new(HashMap::new())),
+            stream_host: None,
+            notification_emitter: None,
+            metadata_consumer: None,
+            credential_vault: None,
+            online_provider_config: None,
             plugin_name: "test".into(),
         }
     }
@@ -5974,6 +8928,17 @@ name = "track"
             appointment_scheduler: None,
             watch_scheduler: None,
             prompt_ledger: None,
+            multiroom_substrate: None,
+            asset_cache: None,
+            shelf_request_dispatcher: None,
+            audio_plane: None,
+            subject_state_subscriber: None,
+            subscription_forwarders: Arc::new(Mutex::new(HashMap::new())),
+            stream_host: None,
+            notification_emitter: None,
+            metadata_consumer: None,
+            credential_vault: None,
+            online_provider_config: None,
             plugin_name: "test".into(),
         }
     }
@@ -6095,12 +9060,14 @@ name = "track"
         assert!(pe.is_fatal());
     }
 
-    /// `details` from the wire `Error` frame are preserved on the
-    /// resulting `PluginError`'s message text. The translation layer
-    /// composes the human message and the structured envelope into a
-    /// single string so an operator reading the log sees both the
-    /// summary and the subclass / extras without having to plumb a
-    /// new field through every error site.
+    /// When the wire `Error` frame carries `details.subclass`, the
+    /// translation layer restores it structurally as
+    /// `PluginError::WithSubclass { class, subclass, message }` — the
+    /// human message stays the plugin's bare operator-facing text
+    /// (no `permanent error:` / `(details=…)` composition) and the
+    /// subclass reaches the wire caller via the variant field, not
+    /// via the Display string. Class-specific extras beyond `subclass`
+    /// are not carried on this variant.
     #[test]
     fn wire_error_to_plugin_error_preserves_details_in_message() {
         let pe = wire_error_to_plugin_error(
@@ -6114,15 +9081,26 @@ name = "track"
             },
             "ctx",
         );
-        let msg = format!("{pe}");
-        assert!(
-            msg.contains("merge source unknown"),
-            "human message must survive: {msg}"
-        );
-        assert!(
-            msg.contains("merge_source_unknown") && msg.contains("abc-123"),
-            "details envelope must surface in the composed message: {msg}"
-        );
+        match pe {
+            PluginError::WithSubclass {
+                class,
+                subclass,
+                message,
+            } => {
+                assert_eq!(class, ErrorClass::NotFound);
+                assert_eq!(subclass, "merge_source_unknown");
+                assert_eq!(message, "merge source unknown");
+                assert!(
+                    !message.contains("permanent error:")
+                        && !message.contains("transient error:")
+                        && !message.contains("(details="),
+                    "message must remain bare plugin text: {message}"
+                );
+            }
+            other => {
+                panic!("expected PluginError::WithSubclass, got {other:?}")
+            }
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -6536,5 +9514,465 @@ name = "track"
             keep_going,
             "well-formed event frame must not trigger tear-down"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Audio-routing OOP wire-proxy round-trip.
+    //
+    // Asserts the full flow:
+    //
+    //   framework AudioRoutingRuntime.publish_topology
+    //     → install_audio_routing_forwarder callback fires
+    //     → AudioRoutingForwarderSink.push WireFrame::AudioRoutingStateChanged
+    //     → SDK host dispatcher routes into WireAudioRouting.apply_state_change
+    //     → plugin's ctx.audio_routing trait reads return the published values
+    //     → plugin's on_route_change callback fires with new format + reason
+    //
+    // Plus the initial state push at admission and the
+    // EndpointNotConfigured shape when no topology is published.
+    // ---------------------------------------------------------------------
+
+    mod audio_routing_wire_proxy {
+        use super::*;
+        use crate::audio_routing::{
+            install_audio_routing_forwarder, AudioRoutingRuntime,
+            PluginAudioRole, ResolvedRouting,
+        };
+        use evo_plugin_sdk::audio::{AudioFormat, PcmCodec};
+        use evo_plugin_sdk::contract::audio_routing::{
+            AudioRouting, AudioRoutingError, EndpointKind, ReadEndpoint,
+            RouteChange, RouteChangeCallback,
+        };
+        use evo_plugin_sdk::host::{serve, HostConfig};
+        use std::path::PathBuf;
+
+        fn pcm() -> AudioFormat {
+            AudioFormat::Pcm {
+                codec: PcmCodec::PcmS24Le,
+                rate_hz: 192_000,
+                channels: 2,
+            }
+        }
+
+        fn re() -> ReadEndpoint {
+            ReadEndpoint {
+                kind: EndpointKind::AlsaPcm,
+                path: PathBuf::from("loopback:0,0"),
+                format: pcm(),
+                buffer_frames: 1024,
+            }
+        }
+
+        /// Captures from the plugin side: a clone of
+        /// `ctx.audio_routing`, registered during `load`, plus
+        /// the sequence of `RouteChange` events the plugin's
+        /// callback observed.
+        #[derive(Default)]
+        struct AudioRoutingCapture {
+            handle: Mutex<Option<Arc<dyn AudioRouting>>>,
+            route_changes: Mutex<Vec<RouteChange>>,
+        }
+
+        /// Test plugin that stashes `ctx.audio_routing` during
+        /// `load` and registers a callback that records every
+        /// `RouteChange` it observes.
+        struct AudioRoutingTestPlugin {
+            name: String,
+            capture: Arc<AudioRoutingCapture>,
+        }
+
+        impl Plugin for AudioRoutingTestPlugin {
+            fn describe(
+                &self,
+            ) -> impl Future<Output = PluginDescription> + Send + '_
+            {
+                let name = self.name.clone();
+                async move {
+                    PluginDescription {
+                        identity: PluginIdentity {
+                            name,
+                            version: semver::Version::new(0, 1, 1),
+                            contract: 1,
+                        },
+                        runtime_capabilities: RuntimeCapabilities {
+                            request_types: vec!["echo".into()],
+                            course_correct_verbs: vec![],
+                            accepts_custody: false,
+                            flags: Default::default(),
+                        },
+                        build_info: BuildInfo {
+                            plugin_build: "test".into(),
+                            sdk_version: evo_plugin_sdk::VERSION.into(),
+                            rustc_version: None,
+                            built_at: None,
+                        },
+                    }
+                }
+            }
+
+            fn load<'a>(
+                &'a mut self,
+                ctx: &'a LoadContext,
+            ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a
+            {
+                async move {
+                    let handle = ctx.audio_routing.as_ref().cloned().expect(
+                        "test ctx must supply audio_routing for OOP plugins",
+                    );
+                    let capture = Arc::clone(&self.capture);
+                    let cb: RouteChangeCallback =
+                        Arc::new(move |change: &RouteChange| {
+                            capture
+                                .route_changes
+                                .lock()
+                                .unwrap()
+                                .push(change.clone());
+                        });
+                    handle.on_route_change(Some(cb));
+                    *self.capture.handle.lock().unwrap() = Some(handle);
+                    Ok(())
+                }
+            }
+
+            fn unload(
+                &mut self,
+            ) -> impl Future<Output = Result<(), PluginError>> + Send + '_
+            {
+                async move { Ok(()) }
+            }
+
+            fn health_check(
+                &self,
+            ) -> impl Future<Output = HealthReport> + Send + '_ {
+                async move { HealthReport::healthy() }
+            }
+        }
+
+        impl Respondent for AudioRoutingTestPlugin {
+            fn handle_request<'a>(
+                &'a self,
+                req: &'a Request,
+            ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a
+            {
+                async move { Ok(Response::for_request(req, req.payload.clone())) }
+            }
+        }
+
+        /// Wait for a closure to observe a true condition. Polls
+        /// at 5 ms intervals with a 2-second cap. Used to bridge
+        /// the async gap between calling
+        /// `runtime.publish_topology` on the steward side and
+        /// the plugin-side observing the resulting wire frame.
+        async fn wait_for<F>(mut probe: F)
+        where
+            F: FnMut() -> bool,
+        {
+            for _ in 0..400 {
+                if probe() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("condition not observed within 2 s");
+        }
+
+        /// End-to-end: the framework's `publish_topology` should
+        /// flow over the wire and surface as both a populated
+        /// plugin-side cache (`write_endpoint()` etc.) AND a
+        /// route-change callback firing with the right reason.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn publish_topology_round_trips_to_oop_plugin() {
+            let plugin_name = "org.test.audio.delivery".to_string();
+            let capture = Arc::new(AudioRoutingCapture::default());
+
+            // Steward writes / plugin reads.
+            let (steward_to_plugin_w, steward_to_plugin_r) =
+                tokio::io::duplex(65536);
+            // Plugin writes / steward reads.
+            let (plugin_to_steward_w, plugin_to_steward_r) =
+                tokio::io::duplex(65536);
+
+            let plugin = AudioRoutingTestPlugin {
+                name: plugin_name.clone(),
+                capture: Arc::clone(&capture),
+            };
+            let host = tokio::spawn(serve(
+                plugin,
+                HostConfig::new(plugin_name.clone()),
+                steward_to_plugin_r,
+                plugin_to_steward_w,
+            ));
+
+            let mut respondent = WireRespondent::connect(
+                plugin_to_steward_r,
+                steward_to_plugin_w,
+                plugin_name.clone(),
+            )
+            .await
+            .unwrap();
+
+            // Steward-side runtime + per-plugin handle. The
+            // forwarder will register a route-change callback on
+            // this handle that fans state pushes out over the
+            // wire.
+            let runtime = Arc::new(AudioRoutingRuntime::new());
+            let local_handle = runtime
+                .handle_for_plugin(&plugin_name, PluginAudioRole::Delivery);
+            let sink = respondent.client().audio_routing_forwarder_sink();
+
+            // Build a LoadContext stamped with the per-plugin
+            // audio_routing handle. The plugin's load() stashes
+            // a clone of it into the shared capture.
+            let registry = Arc::new(SubjectRegistry::new());
+            let graph = Arc::new(RelationGraph::new());
+            let mut ctx = test_load_context(
+                &plugin_name,
+                Arc::clone(&registry),
+                Arc::clone(&graph),
+            );
+            ctx.audio_routing = Some(Arc::clone(&local_handle));
+
+            use crate::admission::ErasedRespondent;
+            respondent.load(&ctx).await.unwrap();
+
+            // Confirm the plugin captured a handle and the
+            // initial-cache shape is EndpointNotConfigured —
+            // the forwarder has not yet been installed, no push
+            // has crossed the wire.
+            let captured = capture
+                .handle
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("plugin should have captured ctx.audio_routing");
+            assert_eq!(
+                captured.write_endpoint().unwrap_err(),
+                AudioRoutingError::EndpointNotConfigured
+            );
+
+            // Install the forwarder. Since the runtime has no
+            // topology published yet, the initial-push branch
+            // is skipped; the plugin-side cache stays empty.
+            install_audio_routing_forwarder(
+                Arc::clone(&runtime),
+                Arc::clone(&local_handle),
+                sink,
+                plugin_name.clone(),
+            );
+            // The forwarder may not be observable yet because
+            // the framework has not published any topology. The
+            // plugin's cache remains EndpointNotConfigured.
+            assert_eq!(
+                captured.read_endpoint().unwrap_err(),
+                AudioRoutingError::EndpointNotConfigured
+            );
+
+            // Publish the first topology. The forwarder fires
+            // synchronously inside publish_topology, queueing
+            // the wire frame onto the outbound channel; the
+            // plugin-side host dispatch loop applies it on its
+            // next read.
+            runtime.publish_topology(
+                &plugin_name,
+                ResolvedRouting {
+                    write: None,
+                    read: Some(re()),
+                    format: pcm(),
+                    reason: "first publish".into(),
+                },
+            );
+
+            // Wait until the plugin's callback observed the
+            // change. Same channel guarantees ordering, so
+            // after the callback fires the cache is
+            // definitionally populated.
+            let cap_for_wait = Arc::clone(&capture);
+            wait_for(move || {
+                !cap_for_wait.route_changes.lock().unwrap().is_empty()
+            })
+            .await;
+
+            // Cache populated with the published read endpoint.
+            assert_eq!(captured.read_endpoint().unwrap(), re());
+            // Format reads back correctly.
+            assert_eq!(captured.current_format().unwrap(), pcm());
+            // Callback received the post-rewire format + the
+            // operator-readable reason from the published
+            // topology.
+            let changes = capture.route_changes.lock().unwrap().clone();
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].new_format, pcm());
+            assert_eq!(changes[0].reason, "first publish");
+
+            // Second publish proves the forwarder stays
+            // registered across rewires.
+            runtime.publish_topology(
+                &plugin_name,
+                ResolvedRouting {
+                    write: None,
+                    read: Some(re()),
+                    format: pcm(),
+                    reason: "second publish".into(),
+                },
+            );
+            let cap_for_wait = Arc::clone(&capture);
+            wait_for(move || {
+                cap_for_wait.route_changes.lock().unwrap().len() >= 2
+            })
+            .await;
+            let changes = capture.route_changes.lock().unwrap().clone();
+            assert_eq!(changes.len(), 2);
+            assert_eq!(changes[1].reason, "second publish");
+
+            respondent.unload().await.unwrap();
+            drop(respondent);
+            let _ = host.await;
+        }
+
+        /// Pre-load topology: `install_audio_routing_forwarder`
+        /// should emit an initial state push immediately, so
+        /// the SDK proxy's cache is populated by the time the
+        /// next plugin trait read fires (modulo wire latency,
+        /// which the round-trip awaits).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn initial_state_push_populates_plugin_cache() {
+            let plugin_name = "org.test.audio.delivery.initial".to_string();
+            let capture = Arc::new(AudioRoutingCapture::default());
+
+            let (steward_to_plugin_w, steward_to_plugin_r) =
+                tokio::io::duplex(65536);
+            let (plugin_to_steward_w, plugin_to_steward_r) =
+                tokio::io::duplex(65536);
+
+            let plugin = AudioRoutingTestPlugin {
+                name: plugin_name.clone(),
+                capture: Arc::clone(&capture),
+            };
+            let host = tokio::spawn(serve(
+                plugin,
+                HostConfig::new(plugin_name.clone()),
+                steward_to_plugin_r,
+                plugin_to_steward_w,
+            ));
+
+            let mut respondent = WireRespondent::connect(
+                plugin_to_steward_r,
+                steward_to_plugin_w,
+                plugin_name.clone(),
+            )
+            .await
+            .unwrap();
+
+            let runtime = Arc::new(AudioRoutingRuntime::new());
+            let local_handle = runtime
+                .handle_for_plugin(&plugin_name, PluginAudioRole::Delivery);
+            let sink = respondent.client().audio_routing_forwarder_sink();
+
+            // Publish a topology BEFORE installing the
+            // forwarder, mirroring the order that occurs when
+            // reconciliation runs early and a plugin admits
+            // afterwards.
+            runtime.publish_topology(
+                &plugin_name,
+                ResolvedRouting {
+                    write: None,
+                    read: Some(re()),
+                    format: pcm(),
+                    reason: "pre-admission topology".into(),
+                },
+            );
+
+            let registry = Arc::new(SubjectRegistry::new());
+            let graph = Arc::new(RelationGraph::new());
+            let mut ctx = test_load_context(
+                &plugin_name,
+                Arc::clone(&registry),
+                Arc::clone(&graph),
+            );
+            ctx.audio_routing = Some(Arc::clone(&local_handle));
+
+            use crate::admission::ErasedRespondent;
+            respondent.load(&ctx).await.unwrap();
+
+            install_audio_routing_forwarder(
+                Arc::clone(&runtime),
+                Arc::clone(&local_handle),
+                sink,
+                plugin_name.clone(),
+            );
+
+            // Wait for the initial-push frame to traverse the
+            // wire.
+            let cap_for_wait = Arc::clone(&capture);
+            wait_for(move || {
+                !cap_for_wait.route_changes.lock().unwrap().is_empty()
+            })
+            .await;
+
+            let captured = capture
+                .handle
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("plugin should have captured ctx.audio_routing");
+            assert_eq!(captured.read_endpoint().unwrap(), re());
+            let changes = capture.route_changes.lock().unwrap().clone();
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].reason, "pre-admission topology");
+
+            respondent.unload().await.unwrap();
+            drop(respondent);
+            let _ = host.await;
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // WithSubclass round-trip across the steward↔plugin wire.
+    // When the OOP peer returns details.subclass, the steward must
+    // restore PluginError::WithSubclass — not collapse to Permanent
+    // with the subclass stuffed into the message string.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn wire_error_restores_with_subclass_from_details() {
+        let err = WireClientError::PluginReturnedError {
+            message: "network.share mutation refused: no responder".into(),
+            class: ErrorClass::PermissionDenied,
+            details: Some(serde_json::json!({
+                "subclass": "no_responder_available",
+            })),
+        };
+        match wire_error_to_plugin_error(err, "handle_request") {
+            PluginError::WithSubclass {
+                class,
+                subclass,
+                message,
+            } => {
+                assert_eq!(class, ErrorClass::PermissionDenied);
+                assert_eq!(subclass, "no_responder_available");
+                assert_eq!(
+                    message,
+                    "network.share mutation refused: no responder"
+                );
+            }
+            other => {
+                panic!("expected PluginError::WithSubclass, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn wire_error_without_subclass_remains_permanent() {
+        let err = WireClientError::PluginReturnedError {
+            message: "bad payload".into(),
+            class: ErrorClass::ContractViolation,
+            details: None,
+        };
+        match wire_error_to_plugin_error(err, "handle_request") {
+            PluginError::Permanent(msg) => {
+                assert_eq!(msg, "bad payload");
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
     }
 }

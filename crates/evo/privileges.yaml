@@ -2,6 +2,7 @@ schema_version: "1.0"
 plugin: org.evoframework.steward
 owner: evo-framework-core
 isolation: oop
+has_os_dependencies: false
 
 # Intent-only record. The steward's privilege contract declares WHAT
 # the framework needs from the OS to run; HOW that intent is satisfied
@@ -26,7 +27,7 @@ capability_intent:
     access_path: filesystem/run
     failure_mode: refuse to start; reason logged.
   - id: in_process_plugin_host
-    need: load in-process plugins into the steward identity. Privileges declared by in-process plugins union into this steward record at admission; out-of-process plugins run under their own systemd unit and identity, with privileges scoped to that unit's surface only.
+    need: load in-process plugins into the steward identity. Privileges declared by in-process plugins union into this steward record at admission; out-of-process plugins get their own systemd unit and identity (per-plugin isolated identity discipline).
     access_path: framework/internal
     failure_mode: per-plugin admission failure with structured event; steward continues serving other plugins.
 

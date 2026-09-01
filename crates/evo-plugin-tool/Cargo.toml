@@ -1,10 +1,13 @@
 [package]
 name = "evo-plugin-tool"
-description = "CLI: lint, sign, verify, pack, install (PLUGIN_TOOL.md, GAPS [20])."
+description = "evo plugin packaging CLI: lint, sign, verify, pack, and install plugin bundles."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# Permissive ecosystem layer — operator CLI source is Apache so
+# anyone can fork / adapt it. Note: compiled binaries link the
+# BSL-licensed `evo` crate; the source remains permissive.
+license = "Apache-2.0"
 repository.workspace = true
 
 [[bin]]
@@ -43,6 +46,16 @@ which = "6"
 # rather than installed globally so the existing sync paths keep
 # their straightforward exit-code shape.
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
+# Hidden-input password reader for the `step-up verify` subcommand.
+# Reads from /dev/tty when present (so password is not captured by
+# command-line history or shell logs); falls back to stdin when
+# /dev/tty is unavailable.
+#
+# Pinned `=7.3.0` because 7.5.x uses let-chains that require Rust
+# 1.88 even though the crate declares `rust-version = 1.85`.
+# 7.3.x is the latest line that compiles cleanly under the
+# workspace MSRV of 1.85.
+rpassword = "=7.3.0"
 
 [target.'cfg(unix)'.dependencies]
 # `geteuid` for the install-as-root guard. Only the install path

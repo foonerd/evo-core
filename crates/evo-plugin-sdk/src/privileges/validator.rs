@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Semantic validator for privileges records.
 //!
 //! Structural validation (required fields, types, patterns, enums,
@@ -158,10 +161,44 @@ impl PrivilegesV1 {
             }
         }
 
+        // Cross-field rule: has_os_dependencies must be consistent with
+        // the declared required_* vectors. Declaring `false` while any
+        // required_binary / required_kernel_module / required_system_service
+        // is present is a lint error — the two states diverge and the
+        // parity gate would read the boolean, skip the check, and admit
+        // a plugin whose declared runtime dependencies are unmet.
+        // Symmetrically, declaring `true` with every required_* vector
+        // empty is a lint error — the boolean promises the installer
+        // will bring packages that the record does not name.
+        let has_any_required = !self.required_binaries.is_empty()
+            || !self.required_kernel_modules.is_empty()
+            || !self.required_system_services.is_empty();
+        if !self.has_os_dependencies && has_any_required {
+            issues.push(ValidationIssue {
+                severity: ValidationSeverity::Block,
+                code: "os_dependencies_flag_understates",
+                message: format!(
+                    "has_os_dependencies=false but the record declares {} required_binaries, {} required_kernel_modules, {} required_system_services — set has_os_dependencies=true or empty the required_* vectors",
+                    self.required_binaries.len(),
+                    self.required_kernel_modules.len(),
+                    self.required_system_services.len(),
+                ),
+            });
+        }
+        if self.has_os_dependencies && !has_any_required {
+            issues.push(ValidationIssue {
+                severity: ValidationSeverity::Block,
+                code: "os_dependencies_flag_overstates",
+                message:
+                    "has_os_dependencies=true but no required_binaries / required_kernel_modules / required_system_services declared — either name what the installer must bring or set has_os_dependencies=false"
+                        .to_string(),
+            });
+        }
+
         // Cross-field advisory: framework-tier records may legitimately
         // ship intent-only (no host_provisioning). The advisory
-        // documents the deferral so a future reader sees it is
-        // intentional, not an oversight.
+        // documents the empty-provisioning state so a future reader
+        // sees it is intentional, not an oversight.
         if self.isolation == Isolation::Oop && self.host_provisioning.is_empty()
         {
             issues.push(ValidationIssue {
@@ -220,8 +257,9 @@ fn validate_systemd_semantics(
     issues: &mut Vec<ValidationIssue>,
 ) {
     // Cross-field advisory: User absent → installer resolves at
-    // install time. Schema permits absence; this advisory documents
-    // the deferral.
+    // install time. Schema permits absence; this advisory
+    // documents that the record leaves resolution to the
+    // installer.
     if systemd.user.is_none() {
         issues.push(ValidationIssue {
             severity: ValidationSeverity::Warn,
@@ -277,6 +315,7 @@ schema_version: "1.0"
 plugin: org.evoframework.network.nm
 owner: networking
 isolation: oop
+has_os_dependencies: true
 capability_intent:
   - id: nm_control
     need: control NetworkManager connections
@@ -369,6 +408,7 @@ schema_version: "1.0"
 plugin: org.evoframework.steward
 owner: evo-framework-core
 isolation: oop
+has_os_dependencies: false
 capability_intent: []
 required_binaries: []
 required_kernel_modules: []
@@ -394,6 +434,7 @@ schema_version: "1.0"
 plugin: org.evoframework.example
 owner: example
 isolation: oop
+has_os_dependencies: false
 capability_intent: []
 required_binaries: []
 required_kernel_modules: []
@@ -426,6 +467,7 @@ schema_version: "1.0"
 plugin: org.evoframework.example
 owner: example
 isolation: oop
+has_os_dependencies: false
 capability_intent:
   - id: foo
     need: first
@@ -479,6 +521,45 @@ host_provisioning: {}
             }
             other => panic!("expected SchemaValidation, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn os_dependencies_false_with_required_binary_is_blocking() {
+        let bad = sample_record()
+            .replace("has_os_dependencies: true", "has_os_dependencies: false");
+        let record = PrivilegesV1::from_yaml(&bad).unwrap();
+        let err = record.validate().unwrap_err();
+        assert!(err
+            .issues
+            .iter()
+            .any(|i| i.code == "os_dependencies_flag_understates"
+                && i.severity == ValidationSeverity::Block));
+    }
+
+    #[test]
+    fn os_dependencies_true_with_no_required_is_blocking() {
+        let bad = r#"
+schema_version: "1.0"
+plugin: org.evoframework.example
+owner: example
+isolation: oop
+has_os_dependencies: true
+capability_intent: []
+required_binaries: []
+required_kernel_modules: []
+required_system_services: []
+verification:
+  commands: ["true"]
+  expected: ["always passes"]
+host_provisioning: {}
+"#;
+        let record = PrivilegesV1::from_yaml(bad).unwrap();
+        let err = record.validate().unwrap_err();
+        assert!(err
+            .issues
+            .iter()
+            .any(|i| i.code == "os_dependencies_flag_overstates"
+                && i.severity == ValidationSeverity::Block));
     }
 
     #[test]

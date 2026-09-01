@@ -1,0 +1,50 @@
+[package]
+name = "evo-otel-export"
+description = "OpenTelemetry OTLP exporter alongside the observatory ring. Translates every typed Observation into an OTel SpanData, batches by configurable interval, and pushes via OTLP/HTTP-protobuf to any OTLP-compatible collector (Jaeger, Tempo, Honeycomb, Grafana Cloud, OTel Collector). Watermark-incremental export means each observation is exported exactly once; the in-memory observatory continues to serve real-time operator queries with no behaviour change."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["enabled"]
+# When the `enabled` feature is off, the exporter compiles to a stub
+# whose `try_from_env` always returns `Ok(None)` and `run` is a no-op.
+# Operators leave the feature on for the default build; SBC builds
+# that opt out trim the opentelemetry / opentelemetry-otlp dependency
+# graph at compile time.
+enabled = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+]
+
+[dependencies]
+evo-observatory = { path = "../evo-observatory" }
+
+# OpenTelemetry SDK + OTLP exporter. HTTP/protobuf transport (via
+# reqwest) is chosen over gRPC/tonic to keep the dependency footprint
+# minimal: reqwest is already in the workspace graph; tonic + prost
+# would be net new and an order-of-magnitude heavier. HTTP/protobuf is
+# the OTel community's recommended cross-platform transport and is
+# the form Jaeger / Tempo / Honeycomb accept directly.
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"], optional = true }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-client", "reqwest-rustls"], optional = true }
+
+# tokio (sync + time + rt + macros) is mandatory regardless of the
+# `enabled` feature so the public `OtelExporter::run` signature stays
+# stable across feature states. The `sync` feature on its own pulls in
+# only `Notify`, `Mutex`, etc — no runtime work-stealer scheduler,
+# which keeps the disabled-feature footprint small.
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tracing = "0.1"
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }
+serde_json = "1"
+
+[lints]
+workspace = true

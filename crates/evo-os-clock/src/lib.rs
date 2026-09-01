@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! OS clock-state interface for the evo framework.
 //!
 //! The framework needs to know whether the kernel believes its

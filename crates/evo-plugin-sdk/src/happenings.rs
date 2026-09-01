@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Coalescing trait + derive re-export for the framework's
 //! per-subscriber happenings-coalescing surface.
 //!

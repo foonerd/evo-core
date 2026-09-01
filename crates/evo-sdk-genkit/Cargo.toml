@@ -1,0 +1,14 @@
+[package]
+name = "evo-sdk-genkit"
+description = "Shared code-emission primitives consumed by every per-language client SDK generator (evo-sdk-typescript, evo-sdk-swift, evo-sdk-kotlin, evo-sdk-python, evo-sdk-rust). Defines identifier-case conversions, schema-grouping by capability domain, indented text emission, and the language-agnostic SdkOp annotation layer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+evo-projection-core = { path = "../evo-projection-core" }
+
+[lints]
+workspace = true

@@ -1,14 +1,16 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Synthetic watch-SubjectState plugin.
 //!
-//! Exercises the `SubjectState` watch arm wired in Phase 1.C.3 by
-//! authoring the full plugin-side path end-to-end:
+//! Exercises the `SubjectState` watch arm by authoring the full
+//! plugin-side path end-to-end:
 //!
 //! 1. On `load`, announce a subject `(test-scheme, "trigger-target")`
 //!    with initial state `{"trigger": "off"}`.
 //! 2. Resolve the addressing to its steward-minted canonical id via
-//!    `SubjectQuerier::resolve_addressing` (the surface added in
-//!    Phase 1.I — without it the plugin cannot author a SubjectState
-//!    watch on its own subject).
+//!    `SubjectQuerier::resolve_addressing` — without that surface the
+//!    plugin cannot author a SubjectState watch on its own subject.
 //! 3. Register a SubjectState watch on that canonical id with the
 //!    predicate `Equals { field: "trigger", value: "on" }`.
 //! 4. Schedule a OneShot appointment 3s out that, on fire, calls
@@ -344,7 +346,7 @@ impl Plugin for WatchSubjectStatePlugin {
 
 impl Respondent for WatchSubjectStatePlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {

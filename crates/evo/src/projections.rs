@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! The projection engine.
 //!
 //! Implements the pull-projection slice of the contract specified in
@@ -20,7 +23,7 @@
 //! - Claimants deduplication: the projection's `claimants` list is a
 //!   deduplicated union of addressing claimants and relation claimants.
 //!
-//! ## What's deferred
+//! ## What's not in the current projection module
 //!
 //! - Rack-keyed (structural) projections: require plugin state-report
 //!   contributions, which plugins do not currently push into the
@@ -297,7 +300,7 @@ impl ProjectionEngine {
     /// A projection whose scope includes relations may encounter edges
     /// pointing at subjects that are no longer in the registry (the
     /// relation graph does not cascade-delete on subject forgetting,
-    /// per `RELATIONS.md` deferred items). Such edges appear in the
+    /// per the items called out in `RELATIONS.md`). Such edges appear in the
     /// output with `target_type = None`, and the containing
     /// projection is flagged degraded with a
     /// [`DegradedReasonKind::DanglingRelation`] entry for each
@@ -775,8 +778,8 @@ pub struct SubjectProjection {
     /// `SubjectAnnouncement::state` or
     /// `SubjectRegistry::update_state`. Top-level path is the
     /// query target for `WatchCondition::SubjectState`'s
-    /// `field` lookup. In-memory only as of v0.1.12.1; durable
-    /// persistence rides v0.1.13.
+    /// `field` lookup. Mirrored durably to the `subject_states`
+    /// table so state survives a steward restart.
     pub state: serde_json::Value,
     /// When this projection was composed.
     pub composed_at: SystemTime,
@@ -1214,7 +1217,7 @@ mod tests {
         // Set up: assert a relation in the graph pointing at a
         // subject that does not exist in the registry. This can
         // happen because the relation graph does not cascade-delete
-        // on subject forgetting (documented deferred in RELATIONS.md).
+        // on subject forgetting (documented in RELATIONS.md).
         let reg = Arc::new(SubjectRegistry::new());
         let graph = Arc::new(RelationGraph::new());
         let eng = ProjectionEngine::new(Arc::clone(&reg), Arc::clone(&graph));

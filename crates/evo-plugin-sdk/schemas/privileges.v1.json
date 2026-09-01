@@ -9,6 +9,7 @@
     "plugin",
     "owner",
     "isolation",
+    "has_os_dependencies",
     "capability_intent",
     "required_binaries",
     "required_kernel_modules",
@@ -24,9 +25,9 @@
       "const": "1.0"
     },
     "plugin": {
-      "description": "Namespaced plugin / surface identifier (e.g. 'org.evoframework.network.nm', 'org.evoframework.steward', 'org.evoframework.distribution.audio').",
+      "description": "Namespaced plugin / surface identifier (e.g. 'org.evoframework.network.nm', 'org.evoframework.network.smb-server', 'org.evoframework.distribution.audio'). Each dot-separated component starts with a lower-case letter and may contain lower-case alphanumerics, underscore, or hyphen. Hyphens are allowed because established plugin bundles already ship under hyphenated identifiers (`network.smb-server`) and the framework's manifest / catalogue / deploy paths all interoperate with them.",
       "type": "string",
-      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+      "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)+$",
       "minLength": 3
     },
     "owner": {
@@ -38,6 +39,10 @@
       "description": "How this surface runs relative to the steward identity. 'oop' = its own systemd unit with isolated identity; 'in_process' = loaded into the steward (privileges union into steward identity, audited as the higher-trust class).",
       "type": "string",
       "enum": ["oop", "in_process"]
+    },
+    "has_os_dependencies": {
+      "description": "Compulsory truthful declaration: does this surface depend on any external OS package (binary, kernel module, or system service) that must be present on the host BEFORE admission can succeed? `true` means the installer is responsible for bringing the packages named in required_binaries / required_kernel_modules / required_system_services; `false` means the surface is self-contained. Every install-time and admission-time parity gate reads this field FIRST: when `true` and any declared required_binary is absent, install and admission BOTH refuse hard with a structured error naming the missing binary and its providing package. Declaring `false` while any of required_binaries / required_kernel_modules / required_system_services is non-empty is a lint error — the two states must be consistent.",
+      "type": "boolean"
     },
     "capability_intent": {
       "description": "What the surface needs to do, in domain terms. Each entry is one independently-testable intent. The framework grants the OS-level privileges that satisfy each intent's access_path.",
@@ -253,7 +258,7 @@
               }
             },
             "sudoers": {
-              "description": "Explicit sudoers entries for this surface. SHOULD be empty for runtime plugin paths (per ADR-0087 Pillar I + ADR-0084 §4 grant-mechanism order). Non-empty entries are flagged at audit and require explicit operator/CLI-only justification.",
+              "description": "Explicit sudoers entries for this surface. SHOULD be empty for runtime plugin paths: a runtime plugin should rely on systemd unit AmbientCapabilities or polkit drop-ins, not on sudoers. Non-empty entries are flagged at audit and require explicit operator/CLI-only justification.",
               "type": "array",
               "items": {
                 "type": "string",

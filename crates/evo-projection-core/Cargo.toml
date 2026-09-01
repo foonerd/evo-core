@@ -1,0 +1,25 @@
+[package]
+name = "evo-projection-core"
+description = "Foundational types for the schema-first multi-projection runtime. The wire protocol is the canonical schema; concrete projections (REST, WebSocket, gRPC, GraphQL, HTTP/3) and the per-language client SDKs all consume the contract types defined here."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Framework-internal infrastructure crate consumed by other framework
+# crates (evo-projection-rest, -ws, -grpc, -graphql, -http3, and the
+# evo-sdk-* generators). License inherits the workspace default
+# (BUSL-1.1). The generated outputs of these projection layers carry
+# their own license headers per their consumer class — generated
+# client SDKs are Apache-2.0 so third-party integrations can consume
+# them without copyleft entanglement.
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

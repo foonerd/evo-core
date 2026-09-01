@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Plugin load context and callback traits.
 //!
 //! [`LoadContext`] is the steward's delivery to the plugin at `load` time:
@@ -13,11 +16,15 @@
 //! mock steward for tests, adapter for out-of-process plugins).
 
 use crate::contract::factory::{InstanceAnnouncement, InstanceId};
+use crate::contract::metadata::MetadataConsumer;
+use crate::contract::notifications::NotificationEmitter;
 use crate::contract::plugin::HealthStatus;
 use crate::contract::relations::{RelationAssertion, RelationRetraction};
+use crate::contract::streams::StreamHost;
 use crate::contract::subjects::{
     AliasRecord, ExplicitRelationAssignment, ExternalAddressing,
     SplitRelationStrategy, SubjectAnnouncement, SubjectQueryResult,
+    SubjectStateStream,
 };
 use crate::contract::warden::CustodyHandle;
 use serde::{Deserialize, Serialize};
@@ -27,6 +34,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::broadcast;
 
 /// A deadline for a plugin contract call.
 ///
@@ -262,6 +270,317 @@ pub struct LoadContext {
     /// loudly if it is `None`; that failure signals a manifest
     /// misconfiguration the operator can fix.
     pub fast_path_dispatcher: Option<Arc<dyn FastPathDispatcher>>,
+
+    /// Handle for plugin-originated stream production (open / emit
+    /// / close against the framework's stream coordinator).
+    ///
+    /// Populated as `Some` only when the plugin's manifest
+    /// declares `capabilities.streams = true` AND the admission
+    /// engine was configured with a stream-coordinator handle.
+    /// Plugins that did not opt in see `None`; calls would panic
+    /// on unwrap, which is the intended fail-fast — a manifest
+    /// authoring mistake should surface loudly at `load` time
+    /// rather than be silently swallowed at first emit.
+    ///
+    /// The producer surface is async at the trait level even
+    /// though the in-process implementation completes
+    /// synchronously inside the coordinator's mutex; the async
+    /// shape stays compatible with an out-of-process wire-backed
+    /// implementation that round-trips frames over the steward
+    /// connection.
+    ///
+    /// See [`StreamHost`] for the per-call shape.
+    pub streams: Option<Arc<dyn StreamHost>>,
+
+    /// Handle for plugin-originated notification emission (send /
+    /// cancel against the framework's notification dispatcher).
+    ///
+    /// Populated as `Some` only when the plugin's manifest
+    /// declares `capabilities.notifications = true` AND the
+    /// admission engine was configured with a notification-
+    /// dispatcher handle. Plugins that did not opt in see `None`;
+    /// calls would panic on unwrap, which is the intended
+    /// fail-fast — a manifest authoring mistake should surface
+    /// loudly at `load` time rather than be silently swallowed at
+    /// first send.
+    ///
+    /// The framework wrapper enforces source-plugin attribution:
+    /// every notification's `source_plugin` field is overwritten
+    /// with the plugin's canonical name before reaching the
+    /// dispatcher.
+    ///
+    /// See [`NotificationEmitter`] for the per-call shape.
+    pub notifications: Option<Arc<dyn NotificationEmitter>>,
+
+    /// Handle for plugin-originated metadata queries (execute_query
+    /// / get_item / enrich against the framework's metadata
+    /// chain).
+    ///
+    /// Populated as `Some` only when the plugin's manifest
+    /// declares `capabilities.metadata = true` AND the admission
+    /// engine was configured with a metadata-chain handle. Plugins
+    /// that did not opt in see `None`; calls would panic on
+    /// unwrap, which is the intended fail-fast — a manifest
+    /// authoring mistake should surface loudly at `load` time
+    /// rather than be silently swallowed at first query.
+    ///
+    /// This is the consumer surface (issue queries). The producer
+    /// surface (answer queries) is the
+    /// [`MetadataProvider`](crate::contract::MetadataProvider)
+    /// trait the plugin implements; admission registers each
+    /// implementer against the chain. A single plugin can do both.
+    ///
+    /// See [`MetadataConsumer`] for the per-call shape.
+    pub metadata: Option<Arc<dyn MetadataConsumer>>,
+
+    /// Handle for plugin-internal background-scheduler
+    /// registration (`schedule` / `cancel` / `query` / `list`
+    /// against the framework's [`SchedulerRuntime`](crate::contract)).
+    ///
+    /// Populated as `Some` only when the plugin's manifest
+    /// declares `capabilities.scheduler = true` AND the admission
+    /// engine was configured with a scheduler-runtime handle.
+    /// Plugins that did not opt in see `None`; calls would panic
+    /// on unwrap, which is the intended fail-fast — a manifest
+    /// authoring mistake should surface loudly at `load` time
+    /// rather than be silently swallowed at first schedule.
+    ///
+    /// Distinct from [`appointments`](Self::appointments)
+    /// (operator-facing alarms) and [`watches`](Self::watches)
+    /// (condition-driven instructions); the scheduler surface
+    /// is plugin-internal recurring or delayed work — OAuth
+    /// refresh cycles, cache TTL pruning, heartbeats, polls,
+    /// one-shot delayed work — that the operator does not see
+    /// unless the plugin surfaces it.
+    ///
+    /// See [`Scheduler`] for the per-call shape.
+    pub scheduler: Option<Arc<dyn Scheduler>>,
+
+    /// Capability resolution map: the framework's
+    /// admission-time answer to every
+    /// [`crate::privileges::CapabilityIntent`] the plugin
+    /// declared in its `privileges.yaml`.
+    ///
+    /// Plugins read the map at load time and pick the right
+    /// runtime strategy without re-probing the host. Each
+    /// intent's [`crate::privileges::CapabilityResolution`]
+    /// names whether the precondition is `Available`,
+    /// `Unavailable` (with an operator-actionable remedy),
+    /// `Degraded` (with a fallback strategy), or `NotProbed`
+    /// (probe shape inapplicable on the running OS).
+    ///
+    /// Always populated. An empty map signals one of:
+    /// - the plugin declared no probable intents
+    /// - the plugin shipped no `privileges.yaml` (legacy plugins)
+    /// - the framework's preflight runner hasn't been wired
+    ///   to this admission path yet
+    ///
+    /// Plugins treat an empty map as "no preflight ran";
+    /// they fall back to whatever runtime detection they
+    /// would have done absent the gate (e.g.
+    /// `/proc/self/status` EUID detection for sudoers-aware
+    /// dispatch). When the map IS populated, plugins prefer
+    /// the resolution's `strategy` hint over runtime
+    /// detection.
+    ///
+    /// The map is wrapped in `Arc` so all per-plugin clones
+    /// share one allocation; the steward retains a strong
+    /// reference for the lifetime of the admission. The
+    /// reactive update channel (the framework's hot-tightening
+    /// re-probe loop publishes a new map when the host's
+    /// runtime privileges shift) is the sibling
+    /// [`Self::capabilities_watch`] field.
+    pub capabilities: Arc<crate::privileges::CapabilityResolutionMap>,
+
+    /// Reactive update channel for the capability resolution
+    /// map. The framework's hot-tightening re-probe loop runs
+    /// the plugin's declared [`ProbePlan`]s at a configurable
+    /// interval (the engine snapshots the plans at admission;
+    /// the task reruns them periodically) and publishes a new
+    /// `Arc<CapabilityResolutionMap>` whenever the resolution
+    /// for any intent shifts. Plugins that opt in observe
+    /// privilege regressions (sudoers drop-in removed, system
+    /// service stopped) within one re-probe interval without
+    /// re-admission.
+    ///
+    /// Two access patterns:
+    ///
+    /// - **Snapshot read** — `capabilities_watch.borrow()`
+    ///   yields a guard whose `&Arc<CapabilityResolutionMap>`
+    ///   names the current resolution. Atomic; never blocks.
+    /// - **Change notification** — `capabilities_watch
+    ///   .changed().await` yields when the map differs from
+    ///   the value the receiver last observed. Pair with a
+    ///   plugin-local task that re-resolves dispatch
+    ///   strategies on each tick.
+    ///
+    /// `None` on admission paths that did not run the
+    /// preflight loop (out-of-process plugins until the wire
+    /// codec carries `GetProbePlans`; legacy admission paths
+    /// pending the runner wiring). Plugins handle `None` as
+    /// "no live updates — read [`Self::capabilities`] once and
+    /// commit to it for the admission's lifetime".
+    ///
+    /// [`ProbePlan`]: crate::privileges::ProbePlan
+    pub capabilities_watch: Option<
+        tokio::sync::watch::Receiver<
+            Arc<crate::privileges::CapabilityResolutionMap>,
+        >,
+    >,
+
+    /// Audio routing handle. Populated only for plugins whose
+    /// manifest declares an audio capability — `source` with
+    /// an audio `output_kind`, `delivery`, or `composition`.
+    /// Non-audio plugins see `None`.
+    ///
+    /// Plugins consume the handle to fetch the OS-native
+    /// endpoint the framework configured for their chain
+    /// stage (an ALSA pcm name, a named pipe, a shm region,
+    /// or a JACK port). The plugin opens the OS primitive
+    /// directly and reads / writes audio bytes through it;
+    /// audio bytes do NOT traverse the wire protocol or any
+    /// SDK callback.
+    ///
+    /// On topology rewires (source change, format change,
+    /// composition mode change, hot-plug), the framework
+    /// invokes any callback the plugin registered via
+    /// [`crate::contract::audio_routing::AudioRouting::on_route_change`].
+    ///
+    /// See [`crate::contract::audio_routing::AudioRouting`]
+    /// for the per-call shape.
+    pub audio_routing:
+        Option<Arc<dyn crate::contract::audio_routing::AudioRouting>>,
+
+    /// Handle for push-mode subscription to subject-state
+    /// changes.
+    ///
+    /// Populated as `Some` only when the plugin's manifest
+    /// declares `capabilities.subscribe_subjects = true`.
+    /// Plugins that did not opt in see `None`.
+    ///
+    /// Where [`subject_querier`](Self::subject_querier) is the
+    /// request/response surface for one-shot reads, this
+    /// handle is the push counterpart: subscribers receive
+    /// every subject-state change for the canonical id they
+    /// asked about as a stream of typed events. See
+    /// [`SubjectStateSubscriber`] for the full contract.
+    pub subject_state_subscriber: Option<Arc<dyn SubjectStateSubscriber>>,
+
+    /// Handle on the framework's multi-room audio-plane
+    /// runtime.
+    ///
+    /// Populated as `Some` only when the plugin's manifest
+    /// declares `capabilities.audio_plane = true`. Plugins
+    /// that did not opt in see `None`.
+    ///
+    /// Source-host-role plugins call
+    /// [`AudioPlaneHandle::fan_out_audio_frame`] per encoded
+    /// audio chunk. Receiver-role plugins call
+    /// [`AudioPlaneHandle::subscribe_audio_frames`] to
+    /// consume every received frame across every connected
+    /// peer. The plugin's role flips dynamically as the
+    /// framework's source-host election arbitrates; the same
+    /// plugin admits on every node and adapts capture vs
+    /// render to its current election state.
+    pub audio_plane:
+        Option<Arc<dyn crate::contract::audio_plane::AudioPlaneHandle>>,
+
+    /// Framework-shared content-addressed asset cache.
+    /// Plugins reach this when they need to cache or fetch
+    /// blob assets (multi-room artwork propagation,
+    /// browse-tree album art, podcast cover art, lyrics
+    /// blobs, etc.) and identity is the bytes themselves
+    /// rather than a URL.
+    ///
+    /// Always populated when the steward's HTTPS substrate
+    /// has booted (`https_boot` succeeded); the framework's
+    /// implementation owns the on-disk shape under
+    /// `<framework_state_dir>/asset-cache/`, the size
+    /// bound, and the eviction policy.
+    ///
+    /// `None` when the HTTPS substrate did not boot (e.g.
+    /// distribution running framework-only without
+    /// HTTPS-projection); plugins fall back to placeholder
+    /// rendering per the universal artwork-first-or-icon
+    /// rule when the handle is `None`.
+    pub asset_cache: Option<Arc<dyn crate::contract::asset_cache::AssetCache>>,
+
+    /// Multi-room substrate consumption handle for plugins
+    /// that declare `lifecycle.mode = "reactive-only"` and
+    /// observe operator gestures on the per-device role
+    /// substrate, the group composition substrate, and the
+    /// per-group `leader_ms` setting.
+    ///
+    /// Always populated when the framework's `RoleStore` +
+    /// `GroupStore` substrates have booted. Plugins call
+    /// `subscribe_role_changes` + `subscribe_group_changes`
+    /// at `load()` time and run their own reactive loops;
+    /// `get_role` / `get_group` + the `list_*` variants
+    /// expose the current substrate state for initial
+    /// reconciliation at admit.
+    ///
+    /// `None` when the substrate has not booted (degraded
+    /// boot path); plugins react to absence by admitting
+    /// with substrate-empty defaults and not subscribing.
+    pub multiroom_substrate:
+        Option<Arc<dyn crate::multiroom_substrate::MultiroomSubstrateHandle>>,
+
+    /// Plugin-to-plugin shelf verb dispatch.
+    ///
+    /// Routes a request through the same stocking partition
+    /// gate + capability gate + response budget the wire-op
+    /// layer applies, so plugin-issued requests carry the
+    /// same admission discipline as operator / UI requests.
+    /// `None` when the steward did not wire the dispatcher
+    /// (e.g. test harnesses that mock LoadContext); plugins
+    /// gracefully degrade to local-only resolution paths
+    /// rather than refusing to load.
+    ///
+    /// First consumer: the audio reference distribution's
+    /// playback warden calls `artwork.resolve` via this
+    /// dispatcher when emitting now-playing / queue / library
+    /// envelopes, embedding the resolved content hash so the
+    /// operator UI loads artwork from the framework's existing
+    /// `/api/v1/audio/artwork/:content_hash` endpoint without
+    /// a per-envelope round-trip to discover what hash to
+    /// fetch.
+    pub shelf_request_dispatcher: Option<
+        Arc<dyn crate::contract::shelf_dispatch::ShelfRequestDispatcher>,
+    >,
+
+    /// Handle for reading and writing operator-supplied credentials
+    /// (third-party API keys, service passwords, OAuth tokens)
+    /// scoped to this plugin's identity.
+    ///
+    /// Populated as `Some` for every plugin admission; `None`
+    /// appears only in test harnesses that mock LoadContext. The
+    /// handle binds the plugin's canonical id at wiring time, so
+    /// plugins cannot enumerate or fetch credentials belonging to
+    /// any other plugin — enforced at the boundary, not at the
+    /// caller.
+    ///
+    /// Plugins use [`CredentialVaultHandle::request_from_operator`]
+    /// as the standard prompt-on-missing pattern: check the vault
+    /// via [`fetch`](CredentialVaultHandle::fetch); on `None`,
+    /// raise a [`PromptRequest::Password`] via
+    /// [`user_interaction_requester`](LoadContext::user_interaction_requester);
+    /// on operator response, store the value and return it. This
+    /// helper is the framework-blessed shape for operator-friendly
+    /// credential entry — no manual file drops on the device.
+    ///
+    pub credential_vault: Option<Arc<dyn CredentialVaultHandle>>,
+
+    /// Handle to the framework's online-provider config store.
+    /// Plugins that host a multi-source metadata cascade consult
+    /// this handle at load time to hydrate the operator's
+    /// current per-provider enable/disable + priority state, and
+    /// subscribe via [`OnlineProviderConfigHandle::subscribe_changes`]
+    /// to re-resolve the local view on every operator gesture
+    /// without a lifecycle teardown. `None` when the steward was
+    /// built without the store; plugins fall back to the
+    /// compile-time defaults ([`OnlineProviderConfig::default_for`])
+    /// in that case.
+    pub online_provider_config: Option<Arc<dyn OnlineProviderConfigHandle>>,
 }
 
 impl std::fmt::Debug for LoadContext {
@@ -326,6 +645,54 @@ impl std::fmt::Debug for LoadContext {
                     .watches
                     .as_ref()
                     .map(|_| "<Arc<dyn WatchScheduler>>")
+                    .unwrap_or("None"),
+            )
+            .field(
+                "streams",
+                &self
+                    .streams
+                    .as_ref()
+                    .map(|_| "<Arc<dyn StreamHost>>")
+                    .unwrap_or("None"),
+            )
+            .field(
+                "notifications",
+                &self
+                    .notifications
+                    .as_ref()
+                    .map(|_| "<Arc<dyn NotificationEmitter>>")
+                    .unwrap_or("None"),
+            )
+            .field(
+                "metadata",
+                &self
+                    .metadata
+                    .as_ref()
+                    .map(|_| "<Arc<dyn MetadataConsumer>>")
+                    .unwrap_or("None"),
+            )
+            .field(
+                "scheduler",
+                &self
+                    .scheduler
+                    .as_ref()
+                    .map(|_| "<Arc<dyn Scheduler>>")
+                    .unwrap_or("None"),
+            )
+            .field(
+                "asset_cache",
+                &self
+                    .asset_cache
+                    .as_ref()
+                    .map(|_| "<Arc<dyn AssetCache>>")
+                    .unwrap_or("None"),
+            )
+            .field(
+                "credential_vault",
+                &self
+                    .credential_vault
+                    .as_ref()
+                    .map(|_| "<Arc<dyn CredentialVaultHandle>>")
                     .unwrap_or("None"),
             )
             .finish()
@@ -626,11 +993,112 @@ pub enum DateTimeKind {
     DateTime,
 }
 
-/// The closed enum of prompt content shapes. v0.1.12 ships
-/// ten variants; future variants add via ADR + non-breaking
-/// enum extension. Consumers that observe an unknown variant
-/// MUST render a "newer-client-needed" fallback rather than
-/// crashing.
+/// Open-mechanism hint accompanying a
+/// [`PromptType::ExternalRedirect`]. Plugins set this when they
+/// have a preference (an OAuth flow with a code prefers
+/// `SystemBrowser` so password managers can fill; a paired-device
+/// handoff prefers `PairedDevicePush`); UI clients honour the
+/// hint when their render context allows but override when it
+/// does not (a kiosk UI ignores `SystemBrowser` and falls back
+/// to its in-app webview). The closed-set vocabulary keeps
+/// cross-vendor expectations aligned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenMechanism {
+    /// Open the URL in the system's default browser
+    /// (`xdg-open`, the platform's URL handler). Right for
+    /// touchscreen devices with system browsers; password
+    /// managers and existing browser sessions are reachable.
+    SystemBrowser,
+    /// Open the URL in a webview embedded in the UI client.
+    /// Right for kiosk-mode appliances where leaving the UI
+    /// breaks the kiosk promise; cookies and redirects are
+    /// isolated to the embedded webview.
+    InAppWebview,
+    /// Render a QR code only; the user scans it on a phone.
+    /// Right for headless audio appliances with front-panel
+    /// displays only.
+    QrOnly,
+    /// Push the URL to a paired device (phone) over the
+    /// paired-device subject. Right when the appliance has a
+    /// paired-device link active; the phone's browser is best
+    /// positioned to authenticate.
+    PairedDevicePush,
+    /// Render the URL through a vendor-defined chrome (corporate
+    /// SSO proxy, branded auth flow). Vendor themes opt in via
+    /// the theme-token surface; reference-UI installs see this
+    /// only when a vendor explicitly configured it.
+    VendorCustomChrome,
+    /// Device-proxied session — the UI iframes a same-origin URL
+    /// hosted on the device's management HTTPS plane; every byte
+    /// the operator sees is fetched by the device (through the
+    /// network plugin, over the captive-carrying interface) and
+    /// rewritten to same-origin by the framework's captive-session
+    /// endpoint. RIGHT for captive-portal admission and any other
+    /// flow where the operator's remote-LAN browser cannot reach
+    /// the venue directly (portals bind to the device MAC on the
+    /// captive segment; the operator's browser sits on the
+    /// management VLAN and would never be admitted). Plugins
+    /// signal a device-proxied flow by setting the ExternalRedirect
+    /// `url` to the plugin's session-open wire-op result (the
+    /// framework-hosted `session_url` returned by
+    /// `network.nm.captive.session.start`). The UI iframes that
+    /// URL and NEVER opens the venue portal URL directly.
+    DeviceProxiedSession,
+}
+
+/// QR-rendering policy for [`PromptType::ExternalRedirect`]. Both
+/// the plugin (which knows whether it has the data to pre-render)
+/// and the UI client (which knows whether the render context
+/// supports QR display) participate; the policy declares which
+/// side does the rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QrPolicy {
+    /// No QR is rendered. The URL is shown as text only and the
+    /// user copies it. Default for the minimal-shape
+    /// `ExternalRedirect` payload.
+    #[default]
+    None,
+    /// The UI client renders the QR from `url` (and optionally
+    /// from `user_code`). Right when the plugin doesn't have
+    /// access to a QR encoder but the UI client does.
+    RenderFromUrl,
+    /// The plugin pre-rendered the QR; the UI client displays
+    /// the supplied bytes as-is. Right when the plugin has
+    /// vendor-specific encoding requirements (logo overlay,
+    /// custom error correction) the UI client cannot honour.
+    PreRendered {
+        /// Format of the pre-rendered payload.
+        format: QrFormat,
+        /// The pre-rendered bytes. Plugin-validated as
+        /// non-empty at the emission boundary.
+        payload: Vec<u8>,
+    },
+}
+
+/// Format of a pre-rendered QR payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QrFormat {
+    /// PNG image bytes.
+    Png,
+    /// SVG markup as bytes (UTF-8 text wrapped in `Vec<u8>`).
+    Svg,
+}
+
+/// Skip-serialise helper for `bool` fields whose default is
+/// `false`. Keeps the wire form compact for the common case
+/// (sensitive = false on most prompts).
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// The closed enum of prompt content shapes. The current
+/// substrate ships ten variants; future variants add via
+/// non-breaking enum extension. Consumers that observe an
+/// unknown variant MUST render a "newer-client-needed"
+/// fallback rather than crashing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PromptType {
@@ -694,18 +1162,103 @@ pub enum PromptType {
         /// The form's fields, in render order.
         fields: Vec<PromptField>,
     },
-    /// External redirect (OAuth, captive portal). The provider-
-    /// side challenge happens outside the framework's view; the
-    /// consumer renders the URL (browser, embedded webview,
-    /// kiosk) and returns the resulting code or token.
+    /// External redirect (OAuth, paired-device handoff, support
+    /// links, vendor cloud signup). The provider-side challenge
+    /// happens outside the framework's view; the UI client picks
+    /// the open mechanism per its render context (system browser,
+    /// in-app webview, QR-on-front-panel, paired-device push,
+    /// vendor SSO chrome) and returns the resulting code or token.
+    ///
+    /// ## Captive portals — use DeviceProxiedSession
+    ///
+    /// Captive portals bind to the device MAC on the
+    /// captive-carrying interface (wlan0). A remote operator on
+    /// the management LAN cannot reach the venue portal directly
+    /// — the operator's browser sits on a different network
+    /// segment. Plugins facing captive-portal admission set
+    /// `preferred_mechanism = OpenMechanism::DeviceProxiedSession`
+    /// and put the framework-hosted `session_url` (returned by
+    /// `network.nm.captive.session.start`) in `url`; the UI
+    /// iframes that URL and NEVER opens the venue portal
+    /// directly. The venue-URL mechanisms (SystemBrowser /
+    /// InAppWebview / QrOnly) do not apply to captive portals
+    /// on remote-operator devices — they are retained for
+    /// non-captive flows where the operator's browser IS the
+    /// party the upstream authorises.
+    ///
+    /// ## Render-context split
+    ///
+    /// Plugins emit through this variant; UI clients implement
+    /// the open strategy. Plugin-author guidance: do not embed an
+    /// HTTP client / browser launcher / QR generator in the
+    /// plugin itself — emit through this variant and let each UI
+    /// client surface the redirect appropriately for its render
+    /// context. The `preferred_mechanism` field is a hint, not a
+    /// directive; UI clients SHOULD honour it but MUST NOT take
+    /// it as a hard requirement (the UI knows its context best).
+    ///
+    /// ## Backward compatibility
+    ///
+    /// The original two-field shape (`url` + `callback_help`)
+    /// continues to round-trip; the additional fields are all
+    /// `#[serde(default)]` so callers emitting the minimal shape
+    /// see no behavioural change. UI clients that pre-date the
+    /// extension see the new fields default to safe values:
+    /// no user code, no QR rendering hint, sensitive = false,
+    /// no timeout override, no mechanism preference.
     ExternalRedirect {
-        /// URL the consumer must visit.
+        /// URL the consumer must visit. Required; validation
+        /// happens at the prompt-emission boundary.
         url: String,
         /// Optional plugin-supplied help text the consumer
         /// renders alongside the redirect (e.g. "you'll be
         /// asked to log in to your provider account").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         callback_help: Option<String>,
+        /// Optional verification code to display alongside (the
+        /// OAuth device-flow `user_code`, paired-device handoff
+        /// PIN, captive-portal voucher). When present, UI
+        /// clients MUST display it prominently — it's the
+        /// out-of-band confirmation that ties the URL to this
+        /// specific session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_code: Option<String>,
+        /// QR-rendering policy. UI clients honour the policy when
+        /// rendering for headless / front-panel / phone-handoff
+        /// contexts. Defaults to [`QrPolicy::None`] for backward
+        /// compatibility — pre-extension callers do not request
+        /// a QR.
+        #[serde(default)]
+        qr: QrPolicy,
+        /// Whether the URL should be considered sensitive — UI
+        /// clients and observability tooling MUST NOT log the
+        /// URL or include it in support bundles. Defaults to
+        /// `false` for backward compatibility; OAuth-class flows
+        /// SHOULD set this to `true` because the URL carries
+        /// session-binding state.
+        #[serde(default, skip_serializing_if = "is_false")]
+        sensitive: bool,
+        /// Optional auto-cancel timeout in seconds. When `None`,
+        /// the prompt's overall timeout (per the
+        /// [`PromptRequest::timeout_ms`] field) governs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_seconds: Option<u64>,
+        /// Optional plugin-supplied hint about the preferred
+        /// open mechanism. UI clients MAY honour the hint; MUST
+        /// NOT take it as a hard requirement (the UI knows its
+        /// render context best — a kiosk UI ignores
+        /// `SystemBrowser` and uses its in-app webview).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preferred_mechanism: Option<OpenMechanism>,
+        /// Optional translation-key for the operator-facing
+        /// prompt body. When `None`, the UI client falls back to
+        /// a framework-provided generic message. The translation
+        /// catalogue resolution lands when the i18n surface ships
+        /// alongside the prompt-rendering primitive; until then,
+        /// callers may set this to a plain English string and
+        /// the UI client renders it verbatim.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_text_key: Option<String>,
     },
     /// Date / time / datetime picker.
     DateTime {
@@ -909,6 +1462,18 @@ pub struct PromptRequest {
     /// wrong field rather than re-entering everything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_answer: Option<PromptResponse>,
+    /// Optional rendering priority. Stamped on the
+    /// auto-stocked widget so the renderer's
+    /// `priority_then_creation` ordering on the
+    /// `prompts.active` shelf puts higher-priority prompts
+    /// on top. `None` is treated as
+    /// [`crate::ui::UiStockingPriority::Normal`]; explicit
+    /// `Critical` / `High` / `Low` overrides change the
+    /// rank. Plugins typically pick a priority per emission
+    /// (an emergency security prompt is `Critical`; a
+    /// routine confirm is `Normal` and may be omitted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<crate::ui::UiStockingPriority>,
 }
 
 /// The lifecycle state of a prompt as observed via subject
@@ -1215,6 +1780,33 @@ pub trait HappeningEmitter: Send + Sync {
         &'a self,
         event_type: String,
         payload: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
+
+    /// Emit a typed `Happening::AudioPlaybackEnded` for this
+    /// plugin. The framework stamps `source_plugin` with the
+    /// authoritative caller identity from the connection — the
+    /// plugin only supplies the URI that was playing (when it
+    /// tracks per-claim state) and the framework sets the
+    /// timestamp.
+    ///
+    /// Distinct from the operator-issued `Stop` verb path: when
+    /// the framework dispatches `Stop` to a source plugin and
+    /// the plugin responds successfully, the framework's
+    /// dispatcher releases custody and emits
+    /// `AudioPlaybackEnded` automatically. Plugins call THIS
+    /// method only for natural end-of-playback (the song ran
+    /// out, the queue drained, the input stream closed, etc.) —
+    /// the case that does not flow through the verb path.
+    ///
+    /// `claim_uri` should be the URI that just finished playing,
+    /// or `None` for plugins that do not track per-claim state.
+    /// The framework's listening-plans engine subscribes to this
+    /// happening for in-flight segments with
+    /// `SegmentDuration::UntilCompletion` so the segment ends in
+    /// lockstep with playback.
+    fn emit_audio_playback_ended<'a>(
+        &'a self,
+        claim_uri: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
 }
 
@@ -1530,6 +2122,379 @@ pub trait WatchScheduler: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
 }
 
+// =====================================================================
+// Background-scheduling surface.
+//
+// Background scheduling is plugin-internal recurring or delayed work
+// (OAuth refresh cycles, cache TTL pruning, heartbeats, polls, one-
+// shot delayed work, event-triggered work). Distinct from the
+// operator-facing appointments + watches surfaces by audience and
+// vocabulary: the operator does not see scheduled tasks unless the
+// plugin surfaces them; the plugin author owns the schedule it
+// created.
+//
+// Without a framework primitive, every plugin spawns its own tokio
+// task with its own timer and hits predictable failure modes
+// (plugin reload kills the task silently, device suspend doesn't
+// pause it, device reboot loses one-shot work, no introspection,
+// lifecycle decoupling, time-source disagreement). The framework
+// owns scheduling because it is lifecycle-coupled (must survive
+// reload, persist across reboot) AND universally needed (every
+// non-trivial plugin schedules something).
+//
+// Plugins declare a `ScheduleSpec`; the framework persists,
+// dispatches, retries, and cancels on lifecycle transitions.
+// =====================================================================
+
+/// Opaque identifier for a scheduled task. Minted by the framework
+/// on [`Scheduler::schedule`] and passed back to the plugin for
+/// later cancel / query. Wraps the plugin-supplied
+/// [`ScheduleSpec::task_id`] so the plugin's stable id is
+/// recoverable; the framework's internal namespace is
+/// `(creator, task_id)` for cross-plugin scoping.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ScheduleHandle(String);
+
+impl ScheduleHandle {
+    /// Construct a handle from a plugin-chosen task id.
+    /// Plugin-side wrappers use this when round-tripping handles
+    /// across the wire; framework-side wrappers mint the same
+    /// shape on `schedule` so plugin and framework agree on the
+    /// identity.
+    pub fn new(task_id: impl Into<String>) -> Self {
+        Self(task_id.into())
+    }
+
+    /// Borrow the underlying task id.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ScheduleHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Lifecycle states for a scheduled task. Mirrors the persistence-
+/// layer state column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleState {
+    /// Awaiting next scheduled fire.
+    Pending,
+    /// Currently dispatching the action.
+    Firing,
+    /// Last fire completed; transient state used by recurring
+    /// entries during next-fire recomputation.
+    Fired,
+    /// Cancelled by the plugin.
+    Cancelled,
+    /// Recurrence rule exhausted (OneShot fired once, max_fires
+    /// hit, etc.).
+    Terminal,
+}
+
+/// Closed-set vocabulary of trigger shapes. Adding a new variant
+/// is a deliberate framework change; plugin-defined vocabulary
+/// lives on the action's request_type, not on the trigger.
+///
+/// `Cron` and `EventTriggered` are reserved for follow-on work;
+/// the framework returns [`SchedulerError::Unsupported`] when a
+/// plugin schedules with either today.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScheduleTrigger {
+    /// Fire repeatedly at fixed wall-clock interval.
+    Periodic {
+        /// Interval between fires, in seconds. Validated as
+        /// non-zero by the framework.
+        interval_seconds: u64,
+        /// What to do for the first fire after registration.
+        first_fire: FirstFire,
+    },
+    /// Fire once at the named wall-clock instant.
+    OneShot {
+        /// Absolute Unix milliseconds of the fire. Past
+        /// timestamps fire immediately on the next runtime
+        /// tick (catch-up).
+        at_ms: u64,
+    },
+    /// Cron-style expression. Reserved; today the framework
+    /// returns `SchedulerError::Unsupported` on schedule.
+    Cron {
+        /// Cron expression text.
+        expression: String,
+    },
+    /// Fire each time the named event matches. Reserved; today
+    /// the framework returns `SchedulerError::Unsupported` on
+    /// schedule.
+    EventTriggered {
+        /// Plugin-defined event-filter spec.
+        event_filter: serde_json::Value,
+    },
+}
+
+/// First-fire policy for [`ScheduleTrigger::Periodic`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FirstFire {
+    /// Fire immediately on registration (or on the next runtime
+    /// tick), then continue at the periodic interval.
+    Immediate,
+    /// Wait one full interval after registration before the
+    /// first fire.
+    AfterInterval,
+}
+
+/// Power-state behaviour declaration. Recorded on the schedule
+/// row so a future power-management primitive can act on it; the
+/// current framework dispatches all schedules regardless of
+/// power state. Plugins set the field that matches their
+/// intended behaviour so the schedule continues to behave
+/// correctly when power management lands.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerBehaviour {
+    /// Pause schedule while device is in Idle or Standby; fire
+    /// on resume if past the fire time. Default for non-time-
+    /// critical work.
+    #[default]
+    PauseInLowPower,
+    /// Wake the device from low-power states to fire. Required
+    /// for alarms / scheduled rips / calendar-driven plays;
+    /// operator confirms at registration time.
+    WakeForFire,
+    /// Cancel the schedule on entering Standby; the plugin must
+    /// re-register on next Active transition. Useful for
+    /// short-lived debounce timers.
+    CancelOnLowPower,
+}
+
+/// Retry policy applied when an action returns
+/// [`FireOutcome::Failed`] with `retryable = true`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RetryPolicy {
+    /// Don't retry; next fire follows the trigger normally.
+    #[default]
+    None,
+    /// Retry up to `max_attempts` times with exponential backoff
+    /// between attempts.
+    Exponential {
+        /// Maximum retry attempts before the entry transitions to
+        /// terminal failure.
+        max_attempts: u32,
+        /// Initial delay (seconds) between the failed fire and
+        /// the first retry.
+        initial_backoff_seconds: u64,
+        /// Cap on the backoff value (seconds); subsequent
+        /// retries plateau at this maximum.
+        max_backoff_seconds: u64,
+    },
+    /// Retry on a fixed schedule.
+    Linear {
+        /// Maximum retry attempts.
+        max_attempts: u32,
+        /// Fixed delay between attempts (seconds).
+        between_attempts_seconds: u64,
+    },
+    /// Plugin's responsibility — the framework records the
+    /// failure but does not retry. The plugin observes the
+    /// `task.failed` happening and re-registers if it wants
+    /// another attempt.
+    PluginManaged,
+}
+
+/// Outcome of an action dispatch returned from the target shelf.
+/// The framework interprets the variant: `Success` /
+/// `SuccessWithNote` / `Skipped` advance the trigger normally;
+/// `Failed` engages the [`RetryPolicy`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FireOutcome {
+    /// Callback succeeded; schedule continues per trigger.
+    Success,
+    /// Callback succeeded with an operator-visible note (e.g.,
+    /// "refreshed token, new TTL 3600s"). Recorded on the
+    /// schedule row for forensic visibility.
+    SuccessWithNote {
+        /// Operator-visible note text.
+        note: String,
+    },
+    /// Callback chose to skip this fire (precondition not met).
+    /// Schedule continues; no retry.
+    Skipped {
+        /// Reason text for forensic visibility.
+        reason: String,
+    },
+    /// Callback failed. Framework applies the schedule's
+    /// [`RetryPolicy`]; if `retryable` is `false`, the schedule
+    /// transitions to terminal failure regardless of policy.
+    Failed {
+        /// Failure-reason text.
+        error: String,
+        /// Whether the framework should retry per the policy.
+        /// `false` means the failure is permanent (no retry,
+        /// schedule terminates).
+        retryable: bool,
+    },
+}
+
+/// A reference to one scheduled task surfaced through
+/// [`Scheduler::list`]. Compact summary so a plugin enumerating
+/// its own schedules sees identity + state without the full spec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleSummary {
+    /// Stable id the plugin chose at registration.
+    pub task_id: String,
+    /// Current lifecycle state.
+    pub state: ScheduleState,
+    /// Wall-clock millisecond timestamp of the next scheduled
+    /// fire; `None` for terminal states.
+    pub next_fire_at_ms: Option<u64>,
+    /// Cumulative successful-fire count.
+    pub fires_completed: u32,
+}
+
+/// Plugin-supplied specification for a scheduled task.
+///
+/// `task_id` is the plugin-chosen stable identity; re-issuing the
+/// same id after a restart is idempotent — the framework
+/// overwrites the existing row and resets state to `Pending`. The
+/// `(creator, task_id)` pair is the framework's namespace key
+/// across the persistence and runtime layers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleSpec {
+    /// Plugin-chosen task identifier. Stable across plugin
+    /// restarts so a re-register after reboot is idempotent.
+    pub task_id: String,
+    /// What event causes the action to fire.
+    pub trigger: ScheduleTrigger,
+    /// What to do on action failure.
+    #[serde(default)]
+    pub retry_policy: RetryPolicy,
+    /// Whether the schedule survives plugin reload (hot reload).
+    /// Default: `true`. `false` is appropriate for short-lived
+    /// state-locked work that should not persist (e.g., a
+    /// 30-second debounce timer).
+    #[serde(default = "default_true")]
+    pub survive_reload: bool,
+    /// Whether the schedule survives device reboot. Default:
+    /// `true`.
+    #[serde(default = "default_true")]
+    pub survive_reboot: bool,
+    /// Power-state behaviour declaration. Recorded on the
+    /// schedule row; the current framework dispatches all
+    /// schedules regardless of power state.
+    #[serde(default)]
+    pub power_behaviour: PowerBehaviour,
+    /// Optional operator-display label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Action the framework dispatches at fire time. Mirrors
+/// [`AppointmentAction`]: the framework routes a request through
+/// the standard request-type dispatch on the target shelf, and
+/// the plugin's `Respondent` returns a [`FireOutcome`] in the
+/// response payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleAction {
+    /// Shelf the dispatch targets.
+    pub target_shelf: String,
+    /// Request-type discriminator on the target plugin.
+    pub request_type: String,
+    /// Opaque payload; plugin documents the shape it expects.
+    pub payload: serde_json::Value,
+}
+
+/// Errors the [`Scheduler`] surface raises at the plugin
+/// boundary.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SchedulerError {
+    /// Caller supplied an invalid argument (empty task_id,
+    /// zero interval, malformed trigger, etc.).
+    #[error("invalid: {0}")]
+    Invalid(String),
+    /// Caller referenced a handle the runtime doesn't recognise.
+    #[error("schedule not found: {0}")]
+    NotFound(String),
+    /// Trigger or feature reserved for follow-on work; the
+    /// framework cannot dispatch it today.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+    /// Internal failure in the framework's runtime or
+    /// persistence layer.
+    #[error("internal: {0}")]
+    Internal(String),
+}
+
+/// Callback trait: plugin schedules background work.
+///
+/// Populated as `Some` only when the plugin's manifest declares
+/// `capabilities.scheduler = true` (default `false`). Plugins
+/// that do not declare it never see the trait method and cannot
+/// register schedules through the SDK surface.
+pub trait Scheduler: Send + Sync {
+    /// Register a schedule. Returns the framework-minted
+    /// [`ScheduleHandle`] (which wraps the plugin's `task_id`)
+    /// on success. Re-registering the same `task_id` overwrites
+    /// the existing row and resets state to `Pending`.
+    fn schedule<'a>(
+        &'a self,
+        spec: ScheduleSpec,
+        action: ScheduleAction,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ScheduleHandle, SchedulerError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Cancel a previously-registered schedule. Idempotent on
+    /// already-cancelled / unknown handles (returns `Ok(())`).
+    fn cancel<'a>(
+        &'a self,
+        handle: ScheduleHandle,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SchedulerError>> + Send + 'a>>;
+
+    /// Query the current state of a schedule.
+    fn query<'a>(
+        &'a self,
+        handle: ScheduleHandle,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ScheduleState, SchedulerError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// List every schedule registered by the calling plugin
+    /// (the framework wrapper scopes by creator before reaching
+    /// the runtime; cross-plugin enumeration is not exposed
+    /// here).
+    fn list<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<ScheduleSummary>, SchedulerError>>
+                + Send
+                + 'a,
+        >,
+    >;
+}
+
 /// Callback trait: plugin dispatches a Fast Path
 /// `course_correct` against another admitted warden.
 ///
@@ -1664,6 +2629,76 @@ pub trait SubjectAnnouncer: Send + Sync {
         addressing: ExternalAddressing,
         state: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
+
+    /// Volatile variant of [`Self::update_state`]. Same semantics for
+    /// resolution, authorisation, in-memory state update and
+    /// happenings emission — but the state MUST NOT be mirrored into
+    /// the durable `subject_states` table.
+    ///
+    /// Intended for high-rate telemetry subjects (spectrum frames,
+    /// VU-meter samples, waveform snapshots) whose values are
+    /// operator-invisible and whose per-emit disk-write cost would
+    /// dominate the steward's persistence budget for zero operator
+    /// benefit. A 30 Hz spectrum emitter running through non-volatile
+    /// `update_state` would issue ~108,000 sqlite writes per hour of
+    /// playback; the volatile path skips those writes entirely.
+    ///
+    /// Consumers wanting a post-connect seed still call the
+    /// producer's `get_*_frame` verb (which returns the current
+    /// in-memory snapshot); consumers wanting the stream subscribe
+    /// to the subject. The absence of a durable mirror is invisible
+    /// to consumers of the wire.
+    ///
+    /// The default impl delegates to `update_state` so pre-existing
+    /// [`SubjectAnnouncer`] implementations remain correct on the
+    /// non-volatile default; production implementations (the
+    /// framework's registry announcer, the plugin-side wire adapter)
+    /// override to skip / signal the volatile path.
+    fn update_state_volatile<'a>(
+        &'a self,
+        addressing: ExternalAddressing,
+        state: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        self.update_state(addressing, state)
+    }
+
+    /// Idempotently seed the framework's per-type subscription-
+    /// interest subject at `evo.system:subscription_interest.<X>`
+    /// with `{ count: 0, at_ms: 0 }` if it does not already exist.
+    ///
+    /// Purpose: producer plugins that observe interest via
+    /// [`SubjectStateSubscriber`] on `evo.system:subscription_
+    /// interest.<X>` today have to wait through a resolve-retry
+    /// loop on plugin load — the interest subject is announced
+    /// lazily on the first `increment_interest` call, so a plugin
+    /// loading before any consumer subscribes sees `resolve_
+    /// addressing → None` and polls every 500 ms until a consumer
+    /// finally arrives. Boot-seed makes the subject exist at
+    /// plugin-load time so the producer's `interest_subscriber`
+    /// resolves on first attempt and settles into normal update
+    /// receipt without the retry-loop latency.
+    ///
+    /// Called by the producer plugin on load, once per subject_type
+    /// it produces (e.g. terminus calls this for
+    /// `audio_playback_spectrum_frame`). Safe to call repeatedly —
+    /// re-invocation on an already-seeded type is a no-op.
+    ///
+    /// The default impl is a no-op so pre-existing
+    /// [`SubjectAnnouncer`] implementations remain correct;
+    /// production impls (the framework's registry announcer)
+    /// override to actually seed. Test-double impls and OOP
+    /// wire adapters that don't front a real interest counter
+    /// inherit the no-op default.
+    fn seed_interest_zero<'a>(
+        &'a self,
+        subject_type: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>
+    {
+        // Suppress unused-parameter warning on the no-op default.
+        let _ = subject_type;
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Callback trait: alias-aware subject lookup.
@@ -2028,6 +3063,459 @@ pub trait RelationAdmin: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), ReportError>> + Send + 'a>>;
 }
 
+/// Callback trait: subscribe to push-mode subject-state changes.
+///
+/// Implemented by the steward and handed to admitted plugins
+/// through [`LoadContext::subject_state_subscriber`]. The trait
+/// is populated as `Some` only for plugins whose manifest
+/// declares `capabilities.subscribe_subjects = true`; non-
+/// subscribing plugins see `None`.
+///
+/// Where [`SubjectQuerier`] is the request/response surface for
+/// subject identity + state (one-shot reads), this trait is the
+/// push-mode counterpart: plugins subscribe to a canonical id
+/// and receive every state change as a stream of typed
+/// [`SubjectStateUpdate`] events. The framework filters per-
+/// subscription so each consumer only sees updates for the
+/// subjects it asked about.
+///
+/// ## Pattern
+///
+/// Plugins consuming another plugin's projected state pair
+/// the subscribe with a [`SubjectQuerier`] read at load time
+/// so they capture the initial state before subscribing to
+/// future changes — the registry's broadcast carries only
+/// changes from the subscribe moment forward, not historical
+/// state.
+///
+/// ```ignore
+/// // At plugin load:
+/// let querier = ctx.subject_querier.as_ref().expect(...);
+/// let subscriber = ctx.subject_state_subscriber.as_ref().expect(...);
+/// // 1. Subscribe to future changes first (no race window).
+/// let mut stream = subscriber.subscribe_subject(canonical_id.clone()).await?;
+/// // 2. Read current state to seed initial value.
+/// let current = querier.describe_subject_with_aliases(canonical_id.clone()).await?;
+/// // 3. Process current.
+/// // 4. Loop on stream.recv() for future updates.
+/// ```
+pub trait SubjectStateSubscriber: Send + Sync {
+    /// Subscribe to the state-change stream for a single
+    /// canonical subject id.
+    ///
+    /// Returns a [`SubjectStateStream`] that yields each
+    /// subsequent [`SubjectStateUpdate`] for the named subject.
+    /// Updates for other subjects are filtered out by the
+    /// stream wrapper.
+    ///
+    /// The framework does NOT validate that `canonical_id`
+    /// refers to a known subject at subscribe time; subscribers
+    /// can register before the subject is announced, in which
+    /// case the stream yields its first update when the
+    /// subject is first announced with state.
+    fn subscribe_subject<'a>(
+        &'a self,
+        canonical_id: String,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<SubjectStateStream, ReportError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Read the current state of a canonical subject.
+    ///
+    /// Returns `Ok(Some(state))` when the subject has runtime
+    /// state, `Ok(None)` when the subject exists but no state
+    /// has ever been contributed (or it was cleared), and
+    /// `Ok(None)` when the subject is unknown to the registry.
+    /// Subscribers pair this with [`Self::subscribe_subject`]
+    /// at load time: subscribe first (no race window), then
+    /// read current state to seed the initial value, then loop
+    /// on the stream for future updates.
+    fn current_state<'a>(
+        &'a self,
+        canonical_id: String,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<serde_json::Value>, ReportError>>
+                + Send
+                + 'a,
+        >,
+    >;
+}
+
+/// Operator-visible metadata stored alongside a credential value.
+///
+/// Surfaces on the operator UI's credential-management screen.
+/// Never carries the credential value itself.
+///
+/// The `Serialize`/`Deserialize` derives let the type cross the OOP
+/// plugin wire in the credential-vault frame family (`CredentialStore`
+/// request, `CredentialListKeysResponse` entries). Field names on the
+/// wire match the struct's snake-case Rust identifiers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialMetadata {
+    /// Optional human-readable label (e.g. `"Tidal HiFi account"`).
+    /// The UI uses it when the operator inspects the credential
+    /// inventory.
+    pub display_name: Option<String>,
+    /// Optional wall-clock millisecond expiry timestamp. The
+    /// framework's expiry scan emits `credential.expiring_soon`
+    /// before this point and `credential.expired` at or after.
+    pub expires_at_ms: Option<u64>,
+    /// Per-credential retention policy on plugin uninstall.
+    pub uninstall_policy: UninstallPolicy,
+}
+
+impl Default for CredentialMetadata {
+    fn default() -> Self {
+        Self {
+            display_name: None,
+            expires_at_ms: None,
+            uninstall_policy: UninstallPolicy::Purge,
+        }
+    }
+}
+
+/// Per-credential retention policy on plugin uninstall.
+///
+/// Wire form: snake-case variant names (`"purge"`,
+/// `"preserve_for_reinstall"`, `"prompt_operator"`), matching the
+/// operator-side wire-op strings the framework already accepts on
+/// `credential_put`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UninstallPolicy {
+    /// Purge immediately on uninstall (default). Reinstall
+    /// requires fresh authentication.
+    Purge,
+    /// Retain in archived form on uninstall; restore on reinstall
+    /// of the same plugin identity. Useful for upgrades.
+    PreserveForReinstall,
+    /// Prompt the operator at uninstall time. Operator picks
+    /// `Purge` or `PreserveForReinstall`.
+    PromptOperator,
+}
+
+/// Listing entry returned by [`CredentialVaultHandle::list_keys`].
+///
+/// The operator-visible key is NOT returned (only its hash); the
+/// listing is for credential-management surfaces that show
+/// metadata. Plugins can enumerate their own keys (whose hashes
+/// they can recompute from their own key strings if needed).
+///
+/// The `Serialize`/`Deserialize` derives let the type cross the OOP
+/// plugin wire in `CredentialListKeysResponse.listings`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialListing {
+    /// Hex-encoded SHA-256 of the operator-visible key string.
+    /// The plaintext key never leaves the vault.
+    pub key_hash: String,
+    /// Operator-visible metadata.
+    pub metadata: CredentialMetadata,
+    /// Wall-clock millisecond timestamp of the first store for
+    /// this key.
+    pub created_at_ms: u64,
+    /// Wall-clock millisecond timestamp of the most recent store.
+    pub updated_at_ms: u64,
+}
+
+/// Kind discriminator on the credential-change signal the framework
+/// emits when a stored credential is put or deleted for a plugin.
+///
+/// Carried on [`crate::wire::WireFrame::CredentialSetChanged`] and
+/// mirrored to the SDK-facing [`CredentialChangeEvent`] the plugin
+/// consumes via its [`CredentialVaultHandle`] change subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialChangeKind {
+    /// A credential was written (create or overwrite).
+    Put,
+    /// A credential was removed.
+    Delete,
+}
+
+/// SDK-facing event delivered to a plugin when one or more of its
+/// own credentials was mutated by an operator gesture (put/delete
+/// via the framework wire ops).
+///
+/// The event carries the set of affected key strings — plaintext
+/// keys, not hashes — so the plugin can index its in-memory state
+/// by the same key it stores under. Values are NOT carried;
+/// consumers that need the new value re-fetch through
+/// [`CredentialVaultHandle::fetch`] to preserve the substrate's
+/// exfiltration boundary (the change signal never carries a
+/// credential value on the wire).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialChangeEvent {
+    /// Keys the mutation touched. Deletes carry the removed key
+    /// exactly once; puts carry the stored key exactly once.
+    /// The framework batches consecutive mutations for a single
+    /// plugin when they land within one dispatcher tick.
+    pub changed_keys: Vec<String>,
+    /// Discriminator: `Put` or `Delete`.
+    pub kind: CredentialChangeKind,
+}
+
+/// Errors raised by [`CredentialVaultHandle`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CredentialVaultError {
+    /// Caller supplied an empty or otherwise invalid key string.
+    Invalid(String),
+    /// The vault's persistence substrate failed.
+    Persistence(String),
+    /// The prompt-on-missing helper's operator prompt was
+    /// declined, cancelled, or otherwise did not return a value.
+    PromptDeclined(String),
+    /// A stored row's encryption algorithm did not match the
+    /// vault's currently-configured algorithm — downgrade
+    /// protection. The row cannot be interpreted safely.
+    AlgorithmMismatch {
+        /// Algorithm marker on the stored row.
+        stored_algorithm: String,
+        /// Algorithm the vault is currently configured for.
+        configured_algorithm: String,
+    },
+}
+
+impl std::fmt::Display for CredentialVaultError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(s) => write!(f, "invalid credential argument: {s}"),
+            Self::Persistence(s) => write!(f, "persistence: {s}"),
+            Self::PromptDeclined(s) => write!(f, "prompt declined: {s}"),
+            Self::AlgorithmMismatch {
+                stored_algorithm,
+                configured_algorithm,
+            } => write!(
+                f,
+                "credential algorithm mismatch: stored under {stored_algorithm:?}, \
+                 vault configured for {configured_algorithm:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CredentialVaultError {}
+
+/// Boxed future returning a credential value or `None`.
+pub type CredentialFetchFuture<'a> =
+    Pin<Box<dyn Future<Output = CredentialFetchResult> + Send + 'a>>;
+
+/// Result of a credential fetch: value bytes or `None` when the
+/// vault has no row for the plugin under the given key.
+pub type CredentialFetchResult = Result<Option<Vec<u8>>, CredentialVaultError>;
+
+/// Boxed future returning `()` on success (store, delete).
+pub type CredentialMutateFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), CredentialVaultError>> + Send + 'a>>;
+
+/// Boxed future returning the plugin's credential listings.
+pub type CredentialListingsFuture<'a> =
+    Pin<Box<dyn Future<Output = CredentialListingsResult> + Send + 'a>>;
+
+/// Result of `list_keys` — an ordered vector of `CredentialListing`.
+pub type CredentialListingsResult =
+    Result<Vec<CredentialListing>, CredentialVaultError>;
+
+/// Boxed future returning credential value bytes from the
+/// prompt-on-missing helper.
+pub type CredentialRequestFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Vec<u8>, CredentialVaultError>> + Send + 'a>,
+>;
+
+/// Plugin-facing handle to the framework credential vault.
+///
+/// Every method operates on the plugin's own credentials only.
+/// The plugin id is bound to the handle at wiring time; no method
+/// takes a `plugin_id` argument. A plugin cannot read, list, or
+/// mutate any other plugin's credentials via this handle.
+///
+/// The primitive is exposed on [`LoadContext::credential_vault`].
+pub trait CredentialVaultHandle: Send + Sync {
+    /// Fetch the credential value for `key`. Returns `Ok(None)`
+    /// when no row exists for this plugin under that key.
+    fn fetch<'a>(&'a self, key: String) -> CredentialFetchFuture<'a>;
+
+    /// Store `value` under `key`. Overwrites any prior entry;
+    /// substrate preserves the original `created_at_ms` and
+    /// advances `updated_at_ms`.
+    fn store<'a>(
+        &'a self,
+        key: String,
+        value: Vec<u8>,
+        metadata: CredentialMetadata,
+    ) -> CredentialMutateFuture<'a>;
+
+    /// Remove the vault entry for `key`. Idempotent — deleting an
+    /// already-absent entry succeeds silently.
+    fn delete<'a>(&'a self, key: String) -> CredentialMutateFuture<'a>;
+
+    /// Enumerate every credential this plugin holds. Values are
+    /// not returned; only the `key_hash + metadata + timestamps`
+    /// tuple. Order is stable: `key_hash` ascending.
+    fn list_keys<'a>(&'a self) -> CredentialListingsFuture<'a>;
+
+    /// Prompt-on-missing helper. First tries `fetch(key)`; on
+    /// `Ok(None)`, raises a [`PromptRequest::Password`] via the
+    /// framework's user-interaction substrate with the supplied
+    /// prompt text; on operator response, stores the value with
+    /// the supplied metadata and returns it.
+    ///
+    /// The standard shape for operator-friendly credential entry:
+    /// no manual file drops on the device, no plugin-side
+    /// re-implementation of the prompt / store cycle.
+    fn request_from_operator<'a>(
+        &'a self,
+        key: String,
+        prompt_text: String,
+        metadata: CredentialMetadata,
+    ) -> CredentialRequestFuture<'a>;
+
+    /// Subscribe to credential-change notifications for this
+    /// plugin. The returned `broadcast::Receiver` yields a
+    /// [`CredentialChangeEvent`] every time an operator gesture
+    /// (framework `credential_put` / `credential_delete` wire
+    /// ops) mutates a credential this plugin owns.
+    ///
+    /// The change signal is the substrate a plugin uses to
+    /// re-resolve its provider clients in place without a
+    /// lifecycle teardown: on receive, the plugin re-fetches the
+    /// affected value via [`Self::fetch`] and swaps its cached
+    /// client. Values are never carried on the signal itself so
+    /// the substrate's exfiltration boundary stays intact.
+    ///
+    /// Handles that never produce changes (test doubles, no-op
+    /// stubs) MAY return a receiver whose sender is closed; the
+    /// receiver yields `RecvError::Closed` on first `recv`. A
+    /// consumer with no need for the signal simply does not
+    /// subscribe.
+    fn subscribe_changes(&self) -> broadcast::Receiver<CredentialChangeEvent>;
+}
+
+// -----------------------------------------------------------------
+// Online-provider config — per-provider enable/disable + priority
+// substrate the multi-source metadata cascade consults.
+// -----------------------------------------------------------------
+
+/// Plugin-facing view of one online-provider config row. Carried
+/// on [`OnlineProviderConfigHandle::list_all`] and
+/// [`OnlineProviderConfigChangeEvent`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnlineProviderConfig {
+    /// Provider identifier string (`"musicbrainz"`, `"lastfm"`,
+    /// `"theaudiodb"`, `"deezer"`, `"fanart_tv"`, …). Stable
+    /// wire-side identifier.
+    pub provider_id: String,
+    /// Enable flag. Cascades dispatch only providers whose flag
+    /// is `true`.
+    pub enabled: bool,
+    /// Cascade priority. Lower values sort earlier in the
+    /// operator-selected order; 100 is the compile-time default.
+    pub priority: i32,
+}
+
+impl OnlineProviderConfig {
+    /// The compile-time default posture for an unregistered
+    /// provider: `enabled = true`, `priority = 100`.
+    pub fn default_for(provider_id: impl Into<String>) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            enabled: true,
+            priority: 100,
+        }
+    }
+}
+
+/// Change event emitted on every successful operator mutation
+/// of the online-provider config (via the framework's
+/// `online_providers_set_enabled` / `online_providers_set_priority`
+/// wire ops). Consumers subscribe via
+/// [`OnlineProviderConfigHandle::subscribe_changes`] and receive
+/// one event per operator gesture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnlineProviderConfigChangeEvent {
+    /// The provider that was mutated.
+    pub provider_id: String,
+    /// Enable flag after the mutation.
+    pub enabled: bool,
+    /// Priority after the mutation.
+    pub priority: i32,
+}
+
+impl OnlineProviderConfigChangeEvent {
+    /// Extract the [`OnlineProviderConfig`] shape from the event.
+    pub fn as_config(&self) -> OnlineProviderConfig {
+        OnlineProviderConfig {
+            provider_id: self.provider_id.clone(),
+            enabled: self.enabled,
+            priority: self.priority,
+        }
+    }
+}
+
+/// Boxed future returning the full listing.
+pub type OnlineProviderListFuture<'a> =
+    Pin<Box<dyn Future<Output = OnlineProviderListResult> + Send + 'a>>;
+
+/// Result of `list_all`: the operator's ordered per-provider
+/// config, or a wire / persistence failure surfaced as a
+/// [`OnlineProviderConfigError`].
+pub type OnlineProviderListResult =
+    Result<Vec<OnlineProviderConfig>, OnlineProviderConfigError>;
+
+/// Errors raised by [`OnlineProviderConfigHandle`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OnlineProviderConfigError {
+    /// Wire transport closed or steward-side persistence failure.
+    Transport(String),
+    /// Steward-side refusal (unavailable, unwired, etc.).
+    Refused(String),
+}
+
+impl std::fmt::Display for OnlineProviderConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(s) => write!(f, "transport: {s}"),
+            Self::Refused(s) => write!(f, "refused: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for OnlineProviderConfigError {}
+
+/// Plugin-facing handle to the framework's online-provider config
+/// store.
+///
+/// Read + subscribe surface. Operator gestures (`set_enabled` /
+/// `set_priority`) are steward-side wire ops the operator UI
+/// invokes directly; plugins consume the resulting change events
+/// via [`Self::subscribe_changes`] and re-resolve their local
+/// view of the cascade order live.
+///
+/// The primitive is exposed on
+/// [`LoadContext::online_provider_config`].
+pub trait OnlineProviderConfigHandle: Send + Sync {
+    /// Read every registered provider's config, ordered
+    /// (priority ascending, provider_id ascending) — the
+    /// operator's canonical cascade order.
+    fn list_all<'a>(&'a self) -> OnlineProviderListFuture<'a>;
+
+    /// Subscribe to config-change notifications. The returned
+    /// `broadcast::Receiver` yields one
+    /// [`OnlineProviderConfigChangeEvent`] per operator gesture.
+    ///
+    /// Handles that never produce changes (test doubles) MAY
+    /// return a receiver whose sender is closed.
+    fn subscribe_changes(
+        &self,
+    ) -> broadcast::Receiver<OnlineProviderConfigChangeEvent>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2198,6 +3686,7 @@ mod tests {
             retention_hint: Some(RetentionHint::Session),
             error_context: None,
             previous_answer: None,
+            priority: None,
         };
         let s = serde_json::to_string(&p).unwrap();
         let back: PromptRequest = serde_json::from_str(&s).unwrap();
@@ -2480,5 +3969,157 @@ mod tests {
         // Pin the constant so a future contributor cannot
         // tighten or loosen the default grace silently.
         assert_eq!(DEFAULT_APPOINTMENT_MISS_GRACE_MS, 5 * 60 * 1_000);
+    }
+
+    // ---------------- ExternalRedirect extension ----------------
+
+    #[test]
+    fn external_redirect_minimal_shape_round_trips_pre_extension_callers() {
+        // Backward-compatibility invariant: a caller emitting
+        // the original two-field shape (url + callback_help)
+        // still serialises and deserialises through the
+        // extended PromptType. The new fields default to safe
+        // values (no user_code, QrPolicy::None, sensitive
+        // false, no timeout override, no mechanism preference,
+        // no prompt_text_key).
+        let prompt = PromptType::ExternalRedirect {
+            url: "https://provider.example.com/oauth/authorize?...".into(),
+            callback_help: Some("you'll log in to your provider".into()),
+            user_code: None,
+            qr: QrPolicy::None,
+            sensitive: false,
+            timeout_seconds: None,
+            preferred_mechanism: None,
+            prompt_text_key: None,
+        };
+        let json = serde_json::to_string(&prompt).unwrap();
+        let back: PromptType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, prompt);
+        // The wire form omits the sensitive=false bit (skip-
+        // serialise helper) and every Option::None field.
+        assert!(!json.contains("sensitive"));
+        assert!(!json.contains("user_code"));
+    }
+
+    #[test]
+    fn external_redirect_legacy_payload_deserialises_into_extended_shape() {
+        // A consumer running pre-extension SDK code emits the
+        // minimal JSON shape (just url + callback_help). The
+        // extended SDK must accept it; missing fields fill in
+        // from the serde defaults.
+        let legacy_json = r#"{
+            "kind": "external_redirect",
+            "url": "https://provider.example.com",
+            "callback_help": "you'll be asked to log in"
+        }"#;
+        let prompt: PromptType = serde_json::from_str(legacy_json).unwrap();
+        match prompt {
+            PromptType::ExternalRedirect {
+                url,
+                callback_help,
+                user_code,
+                qr,
+                sensitive,
+                timeout_seconds,
+                preferred_mechanism,
+                prompt_text_key,
+            } => {
+                assert_eq!(url, "https://provider.example.com");
+                assert_eq!(
+                    callback_help.as_deref(),
+                    Some("you'll be asked to log in")
+                );
+                assert!(user_code.is_none());
+                assert_eq!(qr, QrPolicy::None);
+                assert!(!sensitive);
+                assert!(timeout_seconds.is_none());
+                assert!(preferred_mechanism.is_none());
+                assert!(prompt_text_key.is_none());
+            }
+            other => panic!("expected ExternalRedirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn external_redirect_full_shape_round_trips() {
+        // The full deployment-matrix-aware shape preserves every
+        // field across a serde round trip. OAuth-class callers
+        // (sensitive = true, user_code present, mechanism hint)
+        // and front-panel-handoff callers (QR pre-rendered,
+        // QrFormat::Png) both round-trip the same way.
+        let prompt = PromptType::ExternalRedirect {
+            url: "https://device.example/code/AB12-CD34".into(),
+            callback_help: None,
+            user_code: Some("AB12-CD34".into()),
+            qr: QrPolicy::PreRendered {
+                format: QrFormat::Png,
+                payload: vec![0x89, 0x50, 0x4e, 0x47],
+            },
+            sensitive: true,
+            timeout_seconds: Some(300),
+            preferred_mechanism: Some(OpenMechanism::QrOnly),
+            prompt_text_key: Some("oauth.redirect.body".into()),
+        };
+        let json = serde_json::to_string(&prompt).unwrap();
+        let back: PromptType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, prompt);
+    }
+
+    #[test]
+    fn qr_policy_variants_round_trip_through_serde() {
+        // Each closed-set variant serialises to its own kind tag
+        // and deserialises back identically.
+        let variants = vec![
+            QrPolicy::None,
+            QrPolicy::RenderFromUrl,
+            QrPolicy::PreRendered {
+                format: QrFormat::Svg,
+                payload: b"<svg></svg>".to_vec(),
+            },
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).unwrap();
+            let back: QrPolicy = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, v);
+        }
+    }
+
+    #[test]
+    fn open_mechanism_variants_serialise_with_stable_wire_strings() {
+        // Pin the wire strings so a UI client built against
+        // the current SDK consumes manifests / theme overrides /
+        // captured prompts from later builds without surprise.
+        let cases = [
+            (OpenMechanism::SystemBrowser, r#""system_browser""#),
+            (OpenMechanism::InAppWebview, r#""in_app_webview""#),
+            (OpenMechanism::QrOnly, r#""qr_only""#),
+            (OpenMechanism::PairedDevicePush, r#""paired_device_push""#),
+            (
+                OpenMechanism::VendorCustomChrome,
+                r#""vendor_custom_chrome""#,
+            ),
+        ];
+        for (mech, expected) in cases {
+            let actual = serde_json::to_string(&mech).unwrap();
+            assert_eq!(actual, expected, "{mech:?}");
+        }
+    }
+
+    #[test]
+    fn qr_policy_default_is_none() {
+        // The default QrPolicy used by `#[serde(default)]` on the
+        // ExternalRedirect variant. Pin so a contributor cannot
+        // silently shift the default — the back-compat invariant
+        // depends on it.
+        assert_eq!(QrPolicy::default(), QrPolicy::None);
+    }
+
+    #[test]
+    fn qr_format_round_trips_through_serde() {
+        for fmt in [QrFormat::Png, QrFormat::Svg] {
+            let json = serde_json::to_string(&fmt).unwrap();
+            let back: QrFormat = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, fmt);
+        }
     }
 }

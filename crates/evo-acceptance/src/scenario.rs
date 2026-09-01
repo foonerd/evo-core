@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Scenario types: a single named test the harness executes against
 //! the target. Scenarios carry an id, the tier they belong to, a
 //! description, the command to execute on the target, and one or

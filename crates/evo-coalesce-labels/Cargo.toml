@@ -4,7 +4,11 @@ description = "#[derive(CoalesceLabels)] proc-macro for the evo framework's per-
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# Permissive ecosystem layer — proc-macro re-exported through
+# `evo_plugin_sdk::happenings::CoalesceLabelsDerive` so SDK
+# consumers' Happening types invoke it directly. An Apache SDK with
+# a BSL'd public-surface re-export contradicts itself.
+license = "Apache-2.0"
 repository.workspace = true
 
 [lib]

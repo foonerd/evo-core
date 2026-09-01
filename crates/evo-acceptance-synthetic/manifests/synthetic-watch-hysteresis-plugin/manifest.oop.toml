@@ -6,7 +6,8 @@
 #
 #   1. announce subject (test-scheme, "hysteresis-target") with
 #      state={"value": 50.0}
-#   2. resolve addressing -> canonical id (Phase 1.I surface)
+#   2. resolve addressing -> canonical id via the
+#      SubjectQuerier::resolve_addressing surface
 #   3. register SubjectState watch on canonical id with predicate
 #      Hysteresis { field: "value", upper: 80.0, lower: 60.0 }
 #   4. schedule a Periodic appointment at 1s interval, max_fires=6

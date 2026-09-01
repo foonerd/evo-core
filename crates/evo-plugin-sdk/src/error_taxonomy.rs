@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cross-boundary error taxonomy.
 //!
 //! Every error that crosses an evo contract surface — the wire

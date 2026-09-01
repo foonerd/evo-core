@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Release-tier trust roots.
 //!
 //! Plugin trust ([`KeyRole`](crate::KeyRole) and the `*.meta.toml`
@@ -52,6 +55,9 @@
 //! directly with the documented `ed25519` raw-payload signing
 //! shape.
 
+use std::path::Path;
+
+use ed25519_dalek::pkcs8::DecodePublicKey;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
 
@@ -260,6 +266,124 @@ pub fn verify_release_signature<'a>(
     Err(TrustError::SignatureNotRecognised)
 }
 
+/// Load every `<keyname>.pem` + `<keyname>.meta.toml` pair from
+/// a release-tier trust directory into a vector of
+/// [`ReleaseTrustKey`]. Symmetrical to
+/// [`crate::load_trust_root`] but for release-tier keys —
+/// sidecars carry a `release_role` rather than the plugin
+/// trust `role`, and the loader rejects sidecars missing that
+/// field.
+///
+/// Returns an empty vector when `dir` does not exist; callers
+/// surface this to operators as "no release-trust roots
+/// configured" so a device with no release-channel updates
+/// still admits its plugin-trust set normally.
+///
+/// A sidecar parse / validation failure aborts the whole
+/// load: a partially-trusted release-trust set would silently
+/// admit some artefacts and refuse others, which is far worse
+/// than admitting nothing.
+pub fn load_release_trust_dir(
+    dir: &Path,
+) -> Result<Vec<ReleaseTrustKey>, TrustError> {
+    tracing::debug!(
+        dir = %dir.display(),
+        "release trust: load invoking"
+    );
+    let mut out = Vec::new();
+    if !dir.is_dir() {
+        tracing::debug!(
+            dir = %dir.display(),
+            "release trust: directory absent — empty trust set"
+        );
+        return Ok(out);
+    }
+    let read = std::fs::read_dir(dir).map_err(|e| {
+        TrustError::io(format!("read_dir {}", dir.display()), e)
+    })?;
+    for entry in read {
+        let entry = entry.map_err(|e| TrustError::io("read_dir entry", e))?;
+        let pem_path = entry.path();
+        if pem_path.extension().and_then(|s| s.to_str()) != Some("pem") {
+            continue;
+        }
+        let stem = pem_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                TrustError::KeyMetadata(
+                    "release trust: non-utf8 pem file name".to_string(),
+                )
+            })?
+            .to_string();
+        let meta_path = pem_path.with_file_name(format!("{stem}.meta.toml"));
+        if !meta_path.is_file() {
+            return Err(TrustError::KeyMetadata(format!(
+                "release trust: missing sidecar {} for key {}",
+                meta_path.display(),
+                pem_path.display()
+            )));
+        }
+        let pem = std::fs::read_to_string(&pem_path)
+            .map_err(|e| TrustError::io("read release pem", e))?;
+        let verifying_key =
+            VerifyingKey::from_public_key_pem(&pem).map_err(|e| {
+                TrustError::BadPublicKey(format!("{}: {e}", pem_path.display()))
+            })?;
+        let meta_toml = std::fs::read_to_string(&meta_path)
+            .map_err(|e| TrustError::io("read release key meta", e))?;
+        let meta: ReleaseKeyMeta = toml::from_str(&meta_toml).map_err(|e| {
+            TrustError::KeyMetadata(format!("{}: {e}", meta_path.display()))
+        })?;
+        if let Some(declared) = &meta.key.fingerprint {
+            let actual = blake3::hash(verifying_key.as_bytes());
+            let actual_hex = actual.to_hex().to_string();
+            if !constant_time_eq(declared.as_bytes(), actual_hex.as_bytes()) {
+                return Err(TrustError::KeyMetadata(format!(
+                    "release trust: declared fingerprint mismatch in {}",
+                    meta_path.display()
+                )));
+            }
+        }
+        if let Some(alg) = &meta.key.algorithm {
+            if alg != "ed25519" {
+                return Err(TrustError::KeyMetadata(format!(
+                    "release trust: unsupported algorithm {alg:?} in {}",
+                    meta_path.display()
+                )));
+            }
+        }
+        if let (Some(nb), Some(na)) =
+            (&meta.key.not_before, &meta.key.not_after)
+        {
+            if nb >= na {
+                return Err(TrustError::KeyMetadata(format!(
+                    "release trust: not_before >= not_after in {}",
+                    meta_path.display()
+                )));
+            }
+        }
+        out.push(ReleaseTrustKey {
+            meta,
+            verifying_key,
+            key_id: stem,
+        });
+    }
+    tracing::debug!(keys = out.len(), "release trust: load returned");
+    Ok(out)
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +585,142 @@ max_trust_class = "platform"
             std::slice::from_ref(&key),
         );
         assert!(matches!(r, Err(TrustError::MissingOrBadSignature)));
+    }
+
+    fn write_pem_pair(
+        dir: &std::path::Path,
+        stem: &str,
+        meta_toml: &str,
+    ) -> VerifyingKey {
+        use ed25519_dalek::pkcs8::{
+            spki::der::pem::LineEnding, EncodePublicKey,
+        };
+        use ed25519_dalek::SigningKey;
+        let mut seed = [0u8; 32];
+        for (i, byte) in seed.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_add(stem.len() as u8);
+        }
+        let sk = SigningKey::from_bytes(&seed);
+        let vk = sk.verifying_key();
+        let pem = vk.to_public_key_pem(LineEnding::LF).unwrap();
+        std::fs::write(dir.join(format!("{stem}.pem")), pem).unwrap();
+        std::fs::write(dir.join(format!("{stem}.meta.toml")), meta_toml)
+            .unwrap();
+        vk
+    }
+
+    #[test]
+    fn load_release_trust_dir_returns_empty_when_dir_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("nope");
+        let keys = load_release_trust_dir(&absent).unwrap();
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn load_release_trust_dir_loads_well_formed_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = r#"
+[key]
+algorithm = "ed25519"
+release_role = "framework_release"
+
+[authorisation]
+name_prefixes = ["org.evoframework.core.*"]
+max_trust_class = "platform"
+"#;
+        write_pem_pair(tmp.path(), "test-framework", meta);
+        let keys = load_release_trust_dir(tmp.path()).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key_id, "test-framework");
+        assert_eq!(
+            keys[0].meta.key.release_role,
+            ReleaseRole::FrameworkRelease
+        );
+    }
+
+    #[test]
+    fn load_release_trust_dir_refuses_pem_without_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        use ed25519_dalek::pkcs8::{
+            spki::der::pem::LineEnding, EncodePublicKey,
+        };
+        use ed25519_dalek::SigningKey;
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let vk = sk.verifying_key();
+        let pem = vk.to_public_key_pem(LineEnding::LF).unwrap();
+        std::fs::write(tmp.path().join("orphan.pem"), pem).unwrap();
+        let r = load_release_trust_dir(tmp.path());
+        assert!(matches!(r, Err(TrustError::KeyMetadata(_))));
+    }
+
+    #[test]
+    fn load_release_trust_dir_refuses_sidecar_missing_release_role() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = r#"
+[key]
+algorithm = "ed25519"
+
+[authorisation]
+name_prefixes = ["org.evoframework.core.*"]
+max_trust_class = "platform"
+"#;
+        write_pem_pair(tmp.path(), "no-role", meta);
+        let r = load_release_trust_dir(tmp.path());
+        assert!(matches!(r, Err(TrustError::KeyMetadata(_))));
+    }
+
+    #[test]
+    fn load_release_trust_dir_refuses_unknown_algorithm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = r#"
+[key]
+algorithm = "rsa-4096"
+release_role = "framework_release"
+
+[authorisation]
+name_prefixes = ["org.evoframework.core.*"]
+max_trust_class = "platform"
+"#;
+        write_pem_pair(tmp.path(), "wrong-alg", meta);
+        let r = load_release_trust_dir(tmp.path());
+        assert!(matches!(r, Err(TrustError::KeyMetadata(_))));
+    }
+
+    #[test]
+    fn load_release_trust_dir_refuses_inverted_validity_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = r#"
+[key]
+algorithm = "ed25519"
+release_role = "framework_release"
+not_before = "2030-01-01T00:00:00Z"
+not_after  = "2025-01-01T00:00:00Z"
+
+[authorisation]
+name_prefixes = ["org.evoframework.core.*"]
+max_trust_class = "platform"
+"#;
+        write_pem_pair(tmp.path(), "inverted-window", meta);
+        let r = load_release_trust_dir(tmp.path());
+        assert!(matches!(r, Err(TrustError::KeyMetadata(_))));
+    }
+
+    #[test]
+    fn load_release_trust_dir_refuses_fingerprint_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = r#"
+[key]
+algorithm = "ed25519"
+release_role = "framework_release"
+fingerprint = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[authorisation]
+name_prefixes = ["org.evoframework.core.*"]
+max_trust_class = "platform"
+"#;
+        write_pem_pair(tmp.path(), "wrong-fp", meta);
+        let r = load_release_trust_dir(tmp.path());
+        assert!(matches!(r, Err(TrustError::KeyMetadata(_))));
     }
 }

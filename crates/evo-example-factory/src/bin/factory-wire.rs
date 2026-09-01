@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! # factory-wire
 //!
 //! Out-of-process reference implementation of the evo example factory

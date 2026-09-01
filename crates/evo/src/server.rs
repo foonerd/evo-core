@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! The client-facing Unix socket server.
 //!
 //! v0 protocol is deliberately minimal: length-prefixed JSON frames over
@@ -165,8 +168,11 @@
 //!
 //! [`SubjectProjection`]: crate::projections::SubjectProjection
 
-use crate::catalogue::Cardinality;
-use crate::claimant::{ClaimantToken, ClaimantTokenIssuer};
+use evo_primitives::Cardinality;
+
+use evo_primitives::ClaimantToken;
+
+use crate::claimant::ClaimantTokenIssuer;
 use crate::client_acl::{ClientAcl, PeerCredentials, StewardIdentity};
 use crate::context::RegistrySubjectQuerier;
 use crate::custody::{CustodyRecord, StateSnapshot};
@@ -323,6 +329,20 @@ enum ClientRequest {
         /// monotonic.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         coalesce: Option<crate::coalescer::CoalesceConfig>,
+        /// Optional application-level keepalive cadence in
+        /// milliseconds. When present, the server emits a
+        /// `HappeningsKeepalive` frame every N ms so a subscriber
+        /// can distinguish a dead-but-open subscription from a
+        /// legitimately quiet one. Absent (default) preserves the
+        /// pre-keepalive wire shape — no heartbeats are sent.
+        ///
+        /// Server clamps to `1_000..=60_000` and continues; values
+        /// below 1s would burn wire budget and above 60s defeat
+        /// the watchdog. The tick is independent of the happening
+        /// stream: heartbeats fire on schedule regardless of
+        /// happening or coalescer flush activity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keepalive_ms: Option<u64>,
     },
     /// List every admitted plugin: the read-only inspection
     /// surface PLUGIN_PACKAGING.md §6 names as the
@@ -370,9 +390,9 @@ enum ClientRequest {
     /// Filtering criteria — same `scope` and `follow_aliases`
     /// shape as the `project_subject` pull op so a consumer
     /// switching from poll to push uses the same projection
-    /// definition. Live-only at v0.1.11: no `since` cursor, no
-    /// durable replay; consumers reconnecting fetch a fresh
-    /// initial projection.
+    /// definition. Live-only in the current substrate: no
+    /// `since` cursor, no durable replay; consumers reconnecting
+    /// fetch a fresh initial projection.
     SubscribeSubject {
         /// Canonical subject id to project.
         canonical_id: String,
@@ -387,6 +407,32 @@ enum ClientRequest {
         /// Subscription remains bound to the resolved id.
         #[serde(default)]
         follow_aliases: bool,
+        /// If `true`, the server computes the initial projection
+        /// BEFORE writing the subscribe ack and returns it inline
+        /// on the ack's `initial_projection` field. The follow-up
+        /// `ProjectionUpdate` at `seq = 0` is suppressed. This is
+        /// the single-source-of-truth subscribe shape a consumer
+        /// uses when it wants the subscription itself to carry
+        /// authoritative initial state — the fallback pull op
+        /// (`project_subject`) is not needed on subscribe.
+        ///
+        /// Default `false` preserves pre-existing wire shape: the
+        /// ack carries no projection, and the follow-up `seq = 0`
+        /// `ProjectionUpdate` delivers the initial state as it
+        /// did before.
+        #[serde(default)]
+        snapshot_in_ack: bool,
+        /// Optional application-level keepalive cadence in
+        /// milliseconds. When present, the server emits a
+        /// `SubjectKeepalive` frame every N ms on the same
+        /// subscription so a consumer can watchdog against
+        /// silent-death of a quiet subject. Absent (default)
+        /// preserves the pre-keepalive wire shape.
+        ///
+        /// Same clamp as `SubscribeHappenings::keepalive_ms`
+        /// (`1_000..=60_000`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keepalive_ms: Option<u64>,
     },
     /// Paginated list of every live subject in the registry.
     ///
@@ -487,6 +533,20 @@ enum ClientRequest {
         /// Operator-supplied reason for the audit trail.
         #[serde(default)]
         reason: Option<String>,
+        /// Optional step-up authentication token returned by a
+        /// prior `step_up_auth_verify`. Required for this op to
+        /// execute against a server that has an `AuthService`
+        /// configured; the server refuses with
+        /// `permission_denied / step_up_required` when the field
+        /// is absent and refuses with `permission_denied /
+        /// step_up_invalid` when the token does not validate
+        /// against the active session store. Servers built
+        /// without an `AuthService` accept omission for backward
+        /// compatibility (the operator surface that ships with
+        /// every distribution is expected to plug an
+        /// `AuthService` in).
+        #[serde(default)]
+        step_up_token: Option<String>,
     },
     /// Operator-issued plugin disable. Drains the running
     /// plugin if admitted and sets the persistent enabled bit
@@ -500,6 +560,23 @@ enum ClientRequest {
         /// Operator-supplied reason for the audit trail.
         #[serde(default)]
         reason: Option<String>,
+        /// Optional step-up token. See
+        /// [`ClientRequest::EnablePlugin`] for the gate semantics
+        /// — same shape applies to every privileged operation.
+        #[serde(default)]
+        step_up_token: Option<String>,
+        /// When `true` and the target plugin has admitted
+        /// dependents that declare it in their
+        /// `[dependencies].required` list, the framework first
+        /// disables the transitive dependent set (BFS-discovery
+        /// order — outermost first) and then disables the
+        /// target. When `false` (default) and dependents are
+        /// present, the call refuses with a structured
+        /// `permission_denied / dependents_present` error
+        /// listing the dependents so the operator can
+        /// preview-then-confirm.
+        #[serde(default)]
+        cascade_dependents: bool,
     },
     /// Operator-issued plugin uninstall. Drains, removes the
     /// recorded bundle directory from disk, and forgets the
@@ -516,6 +593,10 @@ enum ClientRequest {
         /// When `true`, also purge state and credentials.
         #[serde(default)]
         purge_state: bool,
+        /// Optional step-up token. See
+        /// [`ClientRequest::EnablePlugin`] for gate semantics.
+        #[serde(default)]
+        step_up_token: Option<String>,
     },
     /// Operator-issued state purge. Wipes
     /// `<plugin_data_root>/<name>/state/` and `credentials/`
@@ -524,6 +605,10 @@ enum ClientRequest {
     PurgePluginState {
         /// Canonical name of the plugin to purge state for.
         plugin: String,
+        /// Optional step-up token. See
+        /// [`ClientRequest::EnablePlugin`] for gate semantics.
+        #[serde(default)]
+        step_up_token: Option<String>,
     },
     /// Operator-issued take-custody against a warden. Mirrors
     /// [`crate::router::PluginRouter::take_custody`]; bypasses no
@@ -576,6 +661,10 @@ enum ClientRequest {
     ReloadPlugin {
         /// Canonical name of the plugin to reload.
         plugin: String,
+        /// Optional step-up token. See
+        /// [`ClientRequest::EnablePlugin`] for gate semantics.
+        #[serde(default)]
+        step_up_token: Option<String>,
     },
     /// Operator-issued catalogue reload. Validates and
     /// atomically swaps the loaded catalogue declarations.
@@ -588,6 +677,10 @@ enum ClientRequest {
         /// When `true`, validate without mutating.
         #[serde(default)]
         dry_run: bool,
+        /// Optional step-up token. See
+        /// [`ClientRequest::EnablePlugin`] for gate semantics.
+        #[serde(default)]
+        step_up_token: Option<String>,
     },
     /// Operator-issued single-plugin manifest reload. Validates
     /// and atomically swaps the named plugin's enforcement
@@ -602,6 +695,10 @@ enum ClientRequest {
         /// When `true`, validate without mutating.
         #[serde(default)]
         dry_run: bool,
+        /// Optional step-up token. See
+        /// [`ClientRequest::EnablePlugin`] for gate semantics.
+        #[serde(default)]
+        step_up_token: Option<String>,
     },
     /// Read-only enumeration of every active reconciliation
     /// pair. Returns one entry per pair currently held in the
@@ -668,6 +765,19 @@ enum ClientRequest {
         /// Plugin-chosen prompt identifier.
         prompt_id: String,
     },
+    /// Release the responder slot the calling bearer currently
+    /// holds. Idempotent: releasing when this bearer does not
+    /// hold the slot (either because a different bearer holds
+    /// it, or because the slot is already vacant) is a no-op and
+    /// returns `released = true` regardless — the post-condition
+    /// (this bearer does not hold the slot) is satisfied in
+    /// every case.
+    ///
+    /// Intended use: the operator UI calls this on explicit
+    /// log-out or on tab-close so a different bearer can claim
+    /// without waiting for token TTL. Capability-gated by
+    /// `user_interaction_responder`.
+    ReleaseUserInteractionResponder,
     /// Operator-issued create of an appointment. Capability-
     /// gated by `appointments_admin`. Carries an explicit
     /// `creator` label so the runtime stores the entry under a
@@ -806,6 +916,1774 @@ enum ClientRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// Operator-issued plan fire. Looks the plan up in the
+    /// engine's registry and dispatches a fire with
+    /// `FireSource::UserCommand`. Returns once the fire is
+    /// scheduled — the segment-execution loop runs on a
+    /// detached task so the operator's CLI does not block.
+    /// Capability-gated by `plans_admin`. Refuses with
+    /// `not_found / plan_not_in_registry` when the id is not
+    /// in the registry.
+    FirePlan {
+        /// Stable plan id (filename stem in the on-disk
+        /// `<plans-storage-root>/<id>.toml`).
+        plan_id: String,
+    },
+    /// Operator-issued install-plugin-from-URL. The framework
+    /// fetches the bundle archive over HTTPS, writes it into
+    /// the plugin stage directory under a unique filename,
+    /// and returns the staged path. The framework's stage
+    /// watcher (the framework's stage-directory delivery
+    /// surface) picks the
+    /// archive up on its next polling tick, extracts it, and
+    /// admits it through the same admission gate as
+    /// filesystem-dropped bundles. One gate; no bypass.
+    /// Capability-gated by `plugins_admin`. Refuses with
+    /// `protocol_violation / url_scheme_unsupported` for
+    /// non-https URLs.
+    InstallPluginFromUrl {
+        /// HTTPS URL of the bundle archive
+        /// (`.tar.gz` / `.tar.xz` / `.zip`).
+        url: String,
+        /// Optional fingerprint of an expected signing key.
+        /// Recorded with the staged-bundle audit entry so
+        /// trust-elevation logic can consult it; the
+        /// admission gate does not consume it directly today
+        /// (a bundle whose signing key is in trust roots
+        /// admits regardless of pin; a bundle whose key is
+        /// not in trust roots refuses regardless of pin).
+        /// The trust-state-per-publisher primitive that lands
+        /// alongside this op uses the pin to elevate trust
+        /// for an out-of-band-approved bundle.
+        #[serde(default)]
+        signature_pin: Option<String>,
+        /// Optional step-up token. See
+        /// [`ClientRequest::EnablePlugin`] for gate semantics.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued plugin-registry registration. Records
+    /// the registry's HTTPS manifest URL + signature URL +
+    /// pinned fingerprint; on success the polling task
+    /// refreshes the registry on its configured cadence.
+    /// Capability-gated by `plugins_admin`.
+    RegisterPluginRegistry {
+        /// Operator-supplied stable slug for the registry
+        /// (filesystem-safe ASCII; cache directory name).
+        slug: String,
+        /// HTTPS URL of the manifest TOML.
+        manifest_url: String,
+        /// HTTPS URL of the detached signature.
+        signature_url: String,
+        /// SHA-256 fingerprint the signing key must present.
+        public_key_fingerprint: String,
+        /// Optional per-registry polling interval seconds.
+        /// Absent inherits the framework default.
+        #[serde(default)]
+        poll_interval_secs: Option<u64>,
+        /// Optional step-up token. See
+        /// [`ClientRequest::EnablePlugin`] for gate semantics.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued unregistration. Forgets the slug and
+    /// removes the on-disk cache. Refuses with `not_found /
+    /// registry_slug_not_registered` for unknown slugs.
+    UnregisterPluginRegistry {
+        /// Slug to forget.
+        slug: String,
+        /// Optional step-up token. See
+        /// [`ClientRequest::EnablePlugin`] for gate semantics.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued list of registered registries.
+    /// Read-only; no capability gate today (registry slugs
+    /// and URLs are not sensitive).
+    ListPluginRegistries,
+    /// Operator-issued explicit refresh of one registered
+    /// registry. Bypasses the polling cadence; useful when
+    /// the operator wants the freshest manifest immediately
+    /// after a known-upstream update.
+    RefreshPluginRegistry {
+        /// Slug to refresh.
+        slug: String,
+        /// Optional step-up token. See
+        /// [`ClientRequest::EnablePlugin`] for gate semantics.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued grant of trust to a publisher whose
+    /// signing key is not shipped in the vendor distribution.
+    /// The grant materialises by writing the publisher's
+    /// public key into the operator trust directory so
+    /// admission picks it up on next signature verify, and
+    /// by recording the grant in the per-publisher trust
+    /// store. Capability-gated by `plugins_admin`.
+    GrantPublisherTrust {
+        /// Publisher's signing-key SHA-256 fingerprint
+        /// (lowercase hex).
+        publisher_id: String,
+        /// Operator-readable display name.
+        display_name: String,
+        /// PEM-encoded public key.
+        public_key_pem: String,
+        /// Optional per-plugin scope. Absent grants
+        /// AllPlugins.
+        #[serde(default)]
+        scope_per_plugin: Option<Vec<String>>,
+        /// Optional step-up token. See
+        /// [`ClientRequest::EnablePlugin`] for gate semantics.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued revocation of a previously-granted
+    /// publisher trust.
+    RevokePublisherTrust {
+        /// Publisher's signing-key fingerprint.
+        publisher_id: String,
+        /// Optional step-up token. See
+        /// [`ClientRequest::EnablePlugin`] for gate semantics.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued list of every recorded publisher
+    /// trust grant + revocation.
+    ListPublisherTrust,
+    /// Operator-issued set of the update-channel preference for
+    /// one target. Capability-gated by `plugins_admin` and
+    /// step-up-aware. The framework stores the preference; the
+    /// vendor-distribution update-executor consults it when
+    /// offering / applying a release. Refuses with
+    /// `contract_violation / channel_unsupported` for values
+    /// outside the canonical taxonomy
+    /// (`alpha` / `test` / `production`) and with
+    /// `contract_violation / target_unsupported` for values
+    /// outside (`core` / `plugins`).
+    SetUpdateChannel {
+        /// Update target whose channel preference is being set
+        /// (`core` / `plugins`).
+        target: String,
+        /// Channel value (`alpha` / `test` / `production`).
+        channel: String,
+        /// Step-up authentication token; see
+        /// [`Self::EnablePlugin`] for gate semantics.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued read of the recorded update-channel
+    /// preferences. Read-only; returns one entry per target with
+    /// a recorded preference (entries with no preference are
+    /// represented as the framework default `production` only at
+    /// the consumer surface, never persisted).
+    GetUpdateChannels,
+    /// Operator-issued read of the admitted UI stockings.
+    /// Read-only; returns one entry per (plugin, stocking) pair
+    /// across every admitted plugin. Optional `shelf_filter`
+    /// limits the response to stockings on the named shelf so
+    /// operator surfaces drilling into one shelf can fetch a
+    /// narrower payload.
+    DescribeUiStockings {
+        /// Optional shelf id filter. When `Some(id)`, only
+        /// stockings whose `ui_shelf` equals the id are
+        /// returned. When `None`, every admitted stocking is
+        /// returned.
+        #[serde(default)]
+        shelf_filter: Option<String>,
+    },
+    /// Renderer-driven wizard step completion. The operator UI
+    /// dispatches this wire-op when the user acknowledges a step
+    /// of the first-boot wizard plan (or any wizard plan a
+    /// vendor distribution chooses to ship). The framework
+    /// forwards the completion into the wizard runtime, which
+    /// updates the persisted resume cursor and — for consent
+    /// steps — appends a signed entry into the `evo.consent`
+    /// ledger.
+    ///
+    /// Refuses with `Internal / wizard_runtime_not_configured`
+    /// when no wizard runtime is wired (test harnesses or
+    /// distributions that opt out of the first-boot wizard).
+    /// Capability: `write:ui`. Non-privileged — the operator
+    /// drives the wizard from the renderer and the entry shape
+    /// is auditable by construction.
+    RecordWizardStepCompletion {
+        /// Identifier of the wizard step the operator
+        /// acknowledged. Matches the `id` field on the wizard
+        /// plan's `[[segments]]` entry.
+        step_id: String,
+        /// Discriminated completion shape — plain advances the
+        /// resume cursor only; consent additionally appends an
+        /// `evo.consent` ledger entry.
+        completion: WizardStepCompletionWire,
+    },
+    /// Operator-issued activation (or clear) of the active
+    /// theme. Capability-gated by `plugins_admin` and
+    /// step-up-aware. `plugin_name = None` clears the active
+    /// theme; `Some(name)` refuses with
+    /// `not_admitted / theme_not_admitted` when the named
+    /// plugin is not currently registered in the framework's
+    /// theme registry.
+    ActivateTheme {
+        /// Canonical plugin name of the theme to activate, or
+        /// `None` to clear the active theme.
+        #[serde(default)]
+        plugin_name: Option<String>,
+        /// Step-up authentication token; see
+        /// [`Self::EnablePlugin`] for gate semantics.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued activation (or clear) of the active UI
+    /// shell. Mirror of [`Self::ActivateTheme`] for the
+    /// `ui_shell` slot; refuses with
+    /// `not_admitted / ui_shell_not_admitted` for unknown
+    /// plugin names.
+    ActivateUiShell {
+        /// Canonical plugin name of the UI shell to activate,
+        /// or `None` to clear.
+        #[serde(default)]
+        plugin_name: Option<String>,
+        /// Step-up authentication token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued read of the active UI selection. Read-
+    /// only; returns the active theme + active UI shell
+    /// plugin names (each `Option<String>`).
+    DescribeActiveUiSelection,
+    /// Operator-issued upsert of one plugin profile.
+    /// Capability-gated by `plugins_admin` and step-up-aware.
+    /// Replaces existing entries for the same `profile_id`;
+    /// preserves the active flag across the upsert.
+    PutPluginProfile {
+        /// Filesystem-safe slug.
+        profile_id: String,
+        /// Operator-readable name.
+        name: String,
+        /// Optional free-form description.
+        #[serde(default)]
+        description: Option<String>,
+        /// Authoring class (`vendor` / `community` / `user`).
+        authored_by: String,
+        /// Per-plugin entries.
+        entries: Vec<PluginProfileEntryWire>,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued read of one profile (with its full
+    /// entry list). Read-only.
+    GetPluginProfile {
+        /// Profile id to fetch.
+        profile_id: String,
+    },
+    /// Operator-issued list of every profile (metadata only;
+    /// entries not included). Read-only.
+    ListPluginProfiles,
+    /// Operator-issued delete of one profile. Capability-gated
+    /// by `plugins_admin` and step-up-aware. Idempotent on
+    /// unknown profile_id (no-op).
+    DeletePluginProfile {
+        /// Profile id to delete.
+        profile_id: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued upsert of one admission policy.
+    /// Capability-gated by `plugins_admin` and step-up-aware.
+    /// Replaces existing rule body for the same `policy_id`;
+    /// preserves the active flag across the upsert.
+    PutAdmissionPolicy {
+        /// Filesystem-safe slug.
+        policy_id: String,
+        /// Operator-readable name.
+        name: String,
+        /// Optional free-form description.
+        #[serde(default)]
+        description: Option<String>,
+        /// Authoring class (`vendor` / `community` / `user`).
+        authored_by: String,
+        /// Rule body (typed shape; see
+        /// [`crate::admission_policy::AdmissionPolicyRules`]).
+        rules: crate::admission_policy::AdmissionPolicyRules,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued read of one policy. Read-only.
+    GetAdmissionPolicy {
+        /// Policy id to fetch.
+        policy_id: String,
+    },
+    /// Operator-issued list of every policy. Read-only.
+    ListAdmissionPolicies,
+    /// Operator-issued delete of one policy. Capability-gated
+    /// by `plugins_admin` and step-up-aware. Idempotent on
+    /// unknown policy_id.
+    DeleteAdmissionPolicy {
+        /// Policy id to delete.
+        policy_id: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued policy activation. Capability-gated by
+    /// `plugins_admin` and step-up-aware. `policy_id = None`
+    /// clears the active policy.
+    SetActiveAdmissionPolicy {
+        /// Policy id to activate, or `None` to clear.
+        #[serde(default)]
+        policy_id: Option<String>,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued capability revocation. Records a
+    /// `(plugin_name, capability)` revocation in the substrate.
+    /// Idempotent on the pair. Capability-gated by
+    /// `plugins_admin` and step-up-aware. Audit-ledger entry
+    /// emitted under the operations control plane.
+    RevokePluginCapability {
+        /// Plugin canonical name.
+        plugin_name: String,
+        /// Capability token to revoke.
+        capability: String,
+        /// Optional operator-supplied free-form reason.
+        #[serde(default)]
+        reason: Option<String>,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued un-revocation. Removes a previously-
+    /// recorded revocation. Idempotent on absent pairs.
+    /// Capability-gated by `plugins_admin` and step-up-aware.
+    UnrevokePluginCapability {
+        /// Plugin canonical name.
+        plugin_name: String,
+        /// Capability token to un-revoke.
+        capability: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued list of revocations recorded against
+    /// one plugin. Read-only.
+    ListPluginCapabilityRevocations {
+        /// Plugin canonical name.
+        plugin_name: String,
+    },
+    /// Operator-issued list of every recorded revocation
+    /// across all plugins. Read-only.
+    ListAllCapabilityRevocations,
+    /// Operator-issued export of the cross-device
+    /// configuration bundle. Returns every section of the
+    /// operator-curated configuration substrate as a single TOML
+    /// document. Capability-gated by `plugins_admin`. Read-only;
+    /// audit-ledger entry recorded under the operations control
+    /// plane for traceability.
+    ExportMigrationBundle,
+    /// Operator-issued import of a cross-device configuration
+    /// bundle. Replaces every covered section of the substrate
+    /// atomically (single-transaction wipe-and-insert).
+    /// Capability-gated by `plugins_admin` and step-up-aware.
+    ImportMigrationBundle {
+        /// The bundle TOML document to apply.
+        bundle_toml: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Record an operator-authored hardware-profile override
+    /// for one delivery target. Idempotent on the canonical
+    /// identity key. Capability-gated by `plugins_admin` and
+    /// step-up-aware.
+    PutHardwareProfileOverride {
+        /// The full hardware identity to which the override
+        /// applies. The framework derives the storage key
+        /// from the identity's discriminator.
+        identity: crate::hardware_profile::HardwareIdentity,
+        /// The sparse override record. Refused if no field is
+        /// set.
+        #[serde(rename = "override")]
+        override_: crate::hardware_profile::HardwareProfileOverride,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Read one operator-authored override by its canonical
+    /// identity key. Read-only; capability-gated by
+    /// `plugins_admin`.
+    GetHardwareProfileOverride {
+        /// Canonical identity key (`usb:vid=...,pid=...`,
+        /// `hat:<sig>`, `hdmi:<sink>`, `alsa:<card>`).
+        key: String,
+    },
+    /// List every recorded operator-authored override.
+    /// Read-only; capability-gated by `plugins_admin`.
+    ListHardwareProfileOverrides,
+    /// Delete one operator-authored override by its
+    /// canonical identity key. Idempotent on absent keys.
+    /// Capability-gated by `plugins_admin` and step-up-aware.
+    DeleteHardwareProfileOverride {
+        /// Canonical identity key.
+        key: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Record an operator policy for one delivery target.
+    /// Idempotent on the canonical target key. Capability-
+    /// gated by `plugins_admin` and step-up-aware.
+    PutAudioOperatorPolicy {
+        /// Canonical identity key
+        /// (`HardwareIdentity::key()`).
+        target_key: String,
+        /// The operator policy to record.
+        policy: crate::topology_scoring::OperatorPolicy,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Read the operator policy for one delivery target.
+    /// Read-only; capability-gated by `plugins_admin`.
+    GetAudioOperatorPolicy {
+        /// Canonical identity key.
+        target_key: String,
+    },
+    /// List every recorded operator policy. Read-only;
+    /// capability-gated by `plugins_admin`.
+    ListAudioOperatorPolicies,
+    /// Clear the operator policy for one delivery target.
+    /// Idempotent on absent keys. Capability-gated by
+    /// `plugins_admin` and step-up-aware.
+    DeleteAudioOperatorPolicy {
+        /// Canonical identity key.
+        target_key: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Record a volume-mode preference for one delivery
+    /// target. Idempotent on the canonical target key.
+    /// Capability-gated by `plugins_admin` and step-up-aware.
+    PutAudioVolumeMode {
+        /// Canonical identity key.
+        target_key: String,
+        /// The volume mode to record.
+        volume_mode: crate::topology_scoring::VolumeMode,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Read the volume-mode preference for one delivery
+    /// target. Read-only; capability-gated by
+    /// `plugins_admin`.
+    GetAudioVolumeMode {
+        /// Canonical identity key.
+        target_key: String,
+    },
+    /// List every recorded volume-mode preference. Read-only;
+    /// capability-gated by `plugins_admin`.
+    ListAudioVolumeModes,
+    /// Clear the volume-mode preference for one delivery
+    /// target. Idempotent on absent keys. Capability-gated by
+    /// `plugins_admin` and step-up-aware.
+    DeleteAudioVolumeMode {
+        /// Canonical identity key.
+        target_key: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Vendor-driven push of a complete active audio topology
+    /// snapshot for one delivery target. The framework
+    /// validates the snapshot, persists it, propagates the
+    /// per-stage resolved endpoints to each plugin's
+    /// `AudioRouting` handle, and emits an
+    /// `AudioTopologyChanged` happening. Capability-gated by
+    /// `plugins_admin` and step-up-aware.
+    PublishActiveAudioTopology {
+        /// The complete topology snapshot to publish.
+        topology: crate::audio_topology::ActiveAudioTopology,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Read the active audio topology for one delivery
+    /// target. Read-only; capability-gated by `plugins_admin`.
+    GetActiveAudioTopology {
+        /// Canonical identity key.
+        target_key: String,
+    },
+    /// List every published active audio topology. Read-only;
+    /// capability-gated by `plugins_admin`.
+    ListActiveAudioTopologies,
+    /// Clear the active audio topology for one delivery
+    /// target. Idempotent on absent targets; also clears the
+    /// per-stage resolved-routing entries on the
+    /// `AudioRouting` handles. Capability-gated by
+    /// `plugins_admin` and step-up-aware.
+    ClearActiveAudioTopology {
+        /// Canonical identity key.
+        target_key: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Read-only aggregate plugin-health snapshot. Returns the
+    /// counts (admitted / enabled / disabled / suspended) plus
+    /// per-plugin health and resource detail. Counts the
+    /// framework can measure are populated; per-plugin health-
+    /// state and resource-accounting fields surface as `None`
+    /// until those primitives compose. Capability-gated by
+    /// `plugins_admin`.
+    GetPluginHealth,
+    /// Read-only preview of the plugin set whose admission
+    /// would break if the target plugin were disabled or
+    /// uninstalled. Returns the transitive set (BFS-discovery
+    /// order, outermost first) of admitted plugins whose
+    /// manifests declare the target as a required dependency.
+    /// The operator surface uses this before invoking
+    /// `disable_plugin` with `cascade_dependents = true` to
+    /// show the impact graph "the following N plugins would
+    /// also be disabled".
+    PreviewDependencyCascade {
+        /// Canonical name of the plugin whose dependents are
+        /// being previewed.
+        plugin_name: String,
+    },
+    /// Operator-issued continuous-review audit: walk every
+    /// known plugin (admitted + recorded) and return the
+    /// per-plugin violations against the supplied policy.
+    /// Read-only — does not transition any plugin.
+    AuditAgainstPolicy {
+        /// Policy id to audit against. The policy does not
+        /// have to be active.
+        policy_id: String,
+    },
+    /// Operator-issued bulk preview: enumerate every plugin
+    /// matching the supplied filter without applying any
+    /// transition. Read-only; capability-gated by `plugins_admin`
+    /// (operator surfaces typically run this before the
+    /// corresponding `disable_where` / `enable_where` to show a
+    /// "the following N plugins match; proceed?" preview).
+    ListPluginsWhere {
+        /// Filter expression.
+        filter: crate::plugin_filter::PluginFilter,
+    },
+    /// Operator-issued bulk disable across every plugin matching
+    /// the filter. Capability-gated by `plugins_admin` and
+    /// step-up-aware. Each matched plugin runs through the
+    /// `disable_plugin` admission path; per-plugin failures are
+    /// recorded individually but the bulk operation always
+    /// returns the full per-plugin transition outcome.
+    DisablePluginsWhere {
+        /// Filter expression.
+        filter: crate::plugin_filter::PluginFilter,
+        /// Operator-readable reason for the audit trail. Applied
+        /// uniformly to every transition.
+        #[serde(default)]
+        reason: Option<String>,
+        /// Step-up authentication token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued bulk enable across every plugin matching
+    /// the filter. Same shape as `disable_plugins_where`.
+    EnablePluginsWhere {
+        /// Filter expression.
+        filter: crate::plugin_filter::PluginFilter,
+        /// Operator-readable reason.
+        #[serde(default)]
+        reason: Option<String>,
+        /// Step-up authentication token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued tag assignment. Records `(plugin_name,
+    /// tag)` in the `plugin_tags` substrate; idempotent on the
+    /// pair (re-tag advances `set_at_ms` but does not duplicate
+    /// the row). Capability-gated by `plugins_admin`.
+    SetPluginTag {
+        /// Plugin canonical name to tag.
+        plugin_name: String,
+        /// Tag string. Lowercase ASCII by convention.
+        tag: String,
+        /// Step-up authentication token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued tag removal. Idempotent on absent pair.
+    DeletePluginTag {
+        /// Plugin canonical name.
+        plugin_name: String,
+        /// Tag to remove.
+        tag: String,
+        /// Step-up authentication token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-issued list of every tag applied to one plugin.
+    /// Read-only.
+    ListPluginTags {
+        /// Plugin canonical name.
+        plugin_name: String,
+    },
+    /// Operator-issued profile activation. Capability-gated
+    /// by `plugins_admin` and step-up-aware. With `dry_run =
+    /// true`, computes and returns the per-plugin transition
+    /// plan without dispatching. With `dry_run = false`,
+    /// dispatches enable / disable for each entry and
+    /// transitions the active flag in one transaction.
+    ///
+    /// `profile_id = None` clears the active profile (no
+    /// profile is marked active; per-plugin states are not
+    /// mutated by this call).
+    SetActivePluginProfile {
+        /// Profile id to activate, or `None` to clear.
+        #[serde(default)]
+        profile_id: Option<String>,
+        /// When `true`, compute and return the activation
+        /// plan without dispatching transitions.
+        #[serde(default)]
+        dry_run: bool,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Privileged step-up authentication. The operator presents
+    /// a username plus secret; the framework dispatches the
+    /// verification through the configured `AuthService` and, on
+    /// success, issues a short-lived privileged session token
+    /// bound to the verifying peer's UID. Subsequent privileged
+    /// operations present the token in their `step_up_token`
+    /// field.
+    ///
+    /// Refuses with `permission_denied / step_up_unavailable`
+    /// when the framework has no `AuthService` configured (the
+    /// `NoAuthService` default). Refuses with
+    /// `permission_denied / invalid_credentials` when the
+    /// implementation rejects the credentials. Refuses with
+    /// `permission_denied / user_not_permitted` when the
+    /// principal authenticated but is not allowed to perform
+    /// privileged operations. Refuses with `internal /
+    /// step_up_unavailable` when the verification backend is
+    /// unavailable. Refuses with `permission_denied /
+    /// peer_uid_unknown` when the connection has no recoverable
+    /// peer UID (token-binding requires one).
+    ///
+    /// Every attempt — success or failure — emits an audit
+    /// ledger entry on the `evo.lifecycle` ledger.
+    StepUpAuthVerify {
+        /// Username the `AuthService` will verify.
+        ///
+        /// **Optional**: a portable UI cannot know the
+        /// distribution-specific runtime user name (whatever the
+        /// systemd unit runs as). Semantics:
+        ///
+        /// - Absent / empty on the wire — the framework
+        ///   substitutes its own runtime user (resolved from
+        ///   `getpwuid(geteuid())` at boot) before touching the
+        ///   backend.
+        /// - Present + non-empty + equal to the runtime user —
+        ///   passes through. Existing callers that sent the
+        ///   runtime user's name explicitly keep working.
+        /// - Present + non-empty + mismatch — `user_not_permitted`
+        ///   refusal before the backend is consulted; no admin
+        ///   escalation path exists through this wire op
+        ///   regardless of what the caller asserts.
+        #[serde(default)]
+        username: Option<String>,
+        /// URL-safe base64 encoding of the credential bytes.
+        /// Encoded so the wire transport never carries raw
+        /// secrets in JSON. The framework decodes, hands the
+        /// decoded bytes to `AuthService::verify`, and zeros
+        /// the buffer immediately after.
+        secret_b64: String,
+        /// Optional TTL override in seconds. Capped at the
+        /// framework ceiling regardless of the requested value.
+        /// `None` uses the store's default.
+        #[serde(default)]
+        ttl_seconds: Option<u64>,
+        /// Caller-generated single-use nonce for replay
+        /// defence. When present, the framework records the
+        /// nonce with a short TTL and refuses reuse inside that
+        /// window. Callers should always send a fresh
+        /// cryptographically random string; legacy callers that
+        /// omit the field bypass replay defence but still hit
+        /// the rate-limiter. New UI + SDK callers MUST always
+        /// send one.
+        #[serde(default)]
+        nonce: Option<String>,
+    },
+    /// Revoke a privileged session token. Idempotent: revoking
+    /// an unknown token returns `revoked = false` without
+    /// erroring. Used by operator surfaces on explicit sign-out
+    /// or to invalidate suspect sessions.
+    StepUpAuthRevoke {
+        /// Token to revoke. URL-safe base64 string returned by
+        /// a prior `step_up_auth_verify`.
+        token: String,
+    },
+    /// Mint a fresh long-lived operator bearer token through the
+    /// HTTPS substrate's per-device signing key, for the
+    /// SSH-required developer / recovery path of the framework's
+    /// trust substrate. The token is ed25519-signed by the same
+    /// key the HTTPS / WS layer's `BearerTokenValidator` verifies
+    /// against, so the operator can paste the returned token into
+    /// the UI shell's bearer-acceptance field (or set it as a
+    /// browser-side `Authorization: Bearer …` header) and reach
+    /// the WS substrate at `/api/v1/ws` immediately.
+    ///
+    /// Requires `plugins_admin` capability on the connection.
+    /// Refuses with `unavailable` when HTTPS boot did not run
+    /// (so no issuer is wired); `invalid_argument` when the
+    /// reason string is empty (the audit substrate refuses
+    /// blank-reason mints by design); `out_of_range` when the
+    /// requested TTL exceeds the framework ceiling.
+    ///
+    /// Every mint — success only; failure paths surface their
+    /// own error variants — emits a `bearer_token_issued`
+    /// observation through the steward's observatory carrying
+    /// the audit reason, the source claim
+    /// (`EVO_TOKEN_SOURCE=cli`), the token id, and the requested
+    /// TTL.
+    ///
+    /// This is the SSH-gated minimum-viable surface of the trust
+    /// substrate; the consumer-grade ceremony (domain CA +
+    /// wizard-driven trust ceremony + pairing flow +
+    /// session-cookie mint via WS upgrade) lands in a follow-on
+    /// release and supersedes the operator's need to reach for
+    /// this CLI path under normal operation.
+    MintBearerToken {
+        /// Operator-supplied free-form reason recorded in the
+        /// audit observation. Must be non-empty after trim;
+        /// the framework refuses blank reasons by construction.
+        reason: String,
+        /// Optional TTL override in seconds. Capped at the
+        /// framework `MAX_TOKEN_TTL_MS` ceiling regardless of
+        /// the requested value. `None` uses the framework
+        /// default (`DEFAULT_TOKEN_TTL_MS`).
+        #[serde(default)]
+        ttl_seconds: Option<u64>,
+        /// Optional list of scope names to narrow the issued
+        /// token's capability set. Semantics: intersection
+        /// with `operator_bootstrap_capability_set()` — for
+        /// each supplied scope name, the framework keeps the
+        /// matching capability from the bootstrap set (with
+        /// its bootstrap-declared rank preserved). A supplied
+        /// scope that does not appear in the bootstrap set is
+        /// silently dropped; if the resulting intersection is
+        /// empty the mint is refused with
+        /// `empty_capability_intersection`. When this field is
+        /// absent or empty, the issued token carries the full
+        /// bootstrap set (preserving the pre-scoping default
+        /// behaviour). A mint can narrow the issued set; it
+        /// can never widen it beyond the operator bootstrap
+        /// authority.
+        #[serde(default)]
+        capabilities: Option<Vec<String>>,
+    },
+    /// Per-credential mint: create a named bearer credential
+    /// with operator-set scopes and operator-set expiry
+    /// policy. The HTTPS / WS path to this op exists in
+    /// canonical_schema under `write:auth` so the UI tier
+    /// toggle screen reaches it via the operator's admitted
+    /// session.
+    CreateBearerToken {
+        /// Operator-friendly label; surfaces in
+        /// `list_bearer_tokens` output and in the UI.
+        name: String,
+        /// Free-form reason recorded in the audit observation.
+        /// Must be non-empty after trim.
+        reason: String,
+        /// Scopes the credential carries. Empty list means
+        /// "every operator scope" — sometimes the operator
+        /// wants the full set (e.g. a personal home-script
+        /// credential).
+        #[serde(default)]
+        scopes: Vec<evo_auth_bearer::CapabilityRef>,
+        /// Operator-set expiry policy. `None` (the default)
+        /// maps to [`evo_auth_bearer::ExpiryPolicy::Never`]
+        /// — the typical choice for IoT consumers that do not
+        /// maintain a refresh loop. `Some(seconds)` caps the
+        /// credential's lifetime at the operator-chosen
+        /// horizon.
+        #[serde(default)]
+        expires_in_seconds: Option<u64>,
+    },
+    /// Read the operator-managed bearer credential inventory.
+    /// Returns metadata only — the token bytes are never
+    /// persisted and never returned post-mint by design.
+    ListBearerTokens,
+    /// Revoke a previously-minted bearer credential by token
+    /// id. The revocation propagates to the live
+    /// `RevocationList` so subsequent requests refuse with
+    /// 401, and is persisted to `revoked.json` so the
+    /// revocation survives steward restarts.
+    RevokeBearerToken {
+        /// Token id (the `id` field of the BearerToken,
+        /// surfaced by `list_bearer_tokens`).
+        token_id: String,
+        /// Operator-supplied free-form reason recorded in the
+        /// audit observation + on the credential record.
+        reason: String,
+    },
+    /// Recovery gesture: purge every credential record + every
+    /// revocation entry and flip the steward to Open tier on
+    /// next boot. Used by the operator when locked out of
+    /// the device under Secure / Secure-industrial tier
+    /// (every credential expired or unknown to the operator;
+    /// the operator regains LAN-trust admission via Open).
+    /// Requires `step_up:system_admin` (the high-water mark
+    /// privilege the framework offers).
+    ResetCredentialsToOpen {
+        /// Operator-supplied free-form reason recorded in the
+        /// audit observation.
+        reason: String,
+    },
+    /// Store an operator-supplied credential value for a plugin.
+    /// Capability-gated by `credentials_write`. Overwrites any
+    /// prior entry under the same `(plugin_id, key)`. Never
+    /// returns the stored value in the response; the operator
+    /// UI writes only.
+    CredentialPut {
+        /// Plugin canonical id the credential is scoped to.
+        plugin_id: String,
+        /// Operator-visible credential key (SHA-256 hashed at
+        /// the persistence layer; the operator-visible name
+        /// never lands in the database).
+        key: String,
+        /// Credential value bytes as base64. The value never
+        /// leaves the vault in cleartext form on the wire on
+        /// any subsequent op; there is no `credential_get`.
+        value_b64: String,
+        /// Optional human-readable label for the operator UI.
+        #[serde(default)]
+        display_name: Option<String>,
+        /// Optional wall-clock millisecond expiry.
+        #[serde(default)]
+        expires_at_ms: Option<u64>,
+        /// Per-credential retention policy on plugin uninstall.
+        /// One of `purge` / `preserve_for_reinstall` /
+        /// `prompt_operator`; defaults to `purge` when omitted.
+        #[serde(default)]
+        uninstall_policy: Option<String>,
+    },
+    /// Remove a credential for a plugin. Idempotent — deleting
+    /// an already-absent entry succeeds silently. Callers pass
+    /// EITHER the operator-visible `key` (which the vault
+    /// SHA-256-hashes internally) OR the `key_hash` directly
+    /// (already visible via `credential_list_keys`). Exactly
+    /// one of the two must be present; both-set or neither-set
+    /// is refused as a contract violation. The `key_hash` path
+    /// lets an operator UI wire a delete button on every
+    /// listed entry without a client-side key→hash map — the
+    /// vault only ever stores the hash, so the raw key is
+    /// unavailable to a UI that didn't put the credential
+    /// itself (e.g. an acceptance-probe leftover).
+    /// Capability-gated by `credentials_write`.
+    CredentialDelete {
+        /// Plugin canonical id the credential is scoped to.
+        plugin_id: String,
+        /// Operator-visible credential key to remove. Mutually
+        /// exclusive with `key_hash`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+        /// Pre-hashed credential key (hex-encoded SHA-256 of
+        /// the operator-visible key). Mutually exclusive with
+        /// `key`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_hash: Option<String>,
+    },
+    /// Enumerate a plugin's credential inventory. Returns
+    /// key_hash + metadata + timestamps for every credential
+    /// currently held by the plugin. Values are never returned.
+    /// Capability-gated by `credentials_read`.
+    CredentialListKeys {
+        /// Plugin canonical id whose inventory to list.
+        plugin_id: String,
+    },
+    /// List every registered online-provider config the store
+    /// currently holds — the operator's per-provider
+    /// enable-disable + priority state. Ordered (priority
+    /// ascending, provider_id ascending). Capability-gated by
+    /// `online_providers_read`.
+    OnlineProvidersList,
+    /// Toggle the `enabled` flag on one online provider.
+    /// Publishes on the framework's
+    /// `online_provider_config_bus` after a successful upsert
+    /// so plugin reactors re-resolve their local view live.
+    /// Capability-gated by `online_providers_write`.
+    OnlineProvidersSetEnabled {
+        /// The provider whose enable flag to update
+        /// (e.g. `"musicbrainz"`, `"lastfm"`, `"deezer"`).
+        provider_id: String,
+        /// New enable flag.
+        enabled: bool,
+    },
+    /// Set the cascade priority on one online provider. Lower
+    /// values sort earlier in the operator-selected cascade
+    /// order. Refuses priorities outside `0..=999`. Publishes
+    /// on the framework's `online_provider_config_bus` after a
+    /// successful upsert. Capability-gated by
+    /// `online_providers_write`.
+    OnlineProvidersSetPriority {
+        /// The provider whose priority to update.
+        provider_id: String,
+        /// New priority (0 = highest, 100 = default,
+        /// 999 = lowest).
+        priority: i32,
+    },
+    /// Read the persistent device identity (device id +
+    /// operator display name + optional vendor + optional
+    /// public-key bytes + creation timestamp). Generated at
+    /// first boot and durable across reinstall. Read-only;
+    /// capability-gated by `plugins_admin`.
+    GetDeviceIdentity,
+    /// Update the operator-editable display name. The canonical
+    /// device id is immutable — only the display label changes.
+    /// Refuses empty / whitespace-only names and names
+    /// exceeding 128 chars. Capability-gated by `plugins_admin`
+    /// and step-up-aware.
+    SetDeviceDisplayName {
+        /// New display name. Trimmed; must be non-empty after
+        /// trim and at most 128 chars.
+        display_name: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Reset the operator-editable display name to its default,
+    /// re-seeded from the OS hostname when sane (falls back to
+    /// `evo-<short>`). Clears any prior operator override —
+    /// `name_source` returns to `Auto` so the collision resolver
+    /// is once again free to rewrite. Capability-gated by
+    /// `plugins_admin` and step-up-aware.
+    ResetDeviceDisplayName {
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// List multi-room peers currently observed by the
+    /// mDNS-SD discovery runtime. Read-only; capability-gated
+    /// by `plugins_admin`.
+    ListDiscoveredPeers,
+    /// Gaze-triggered roster snap with marauder query.
+    /// Captures a baseline of every currently-known peer's
+    /// `last_seen_ms`, waits the snap window for fresh
+    /// advertisements to land via the long-lived browse
+    /// event channel, issues a marauder query
+    /// (mDNS-SD `verify`) against any peer whose
+    /// `last_seen_ms` did not advance, waits the marauder
+    /// window, and composes a truthful roster at the
+    /// instant of composition. Returns the snap response;
+    /// also emits a `RosterSnapped` happening (snap-level
+    /// summary) plus one `PeerDisappeared` per
+    /// marauder-confirmed gone device so concurrent UIs
+    /// subscribed to the durable bus converge without each
+    /// issuing its own multicast. Single packet loss is
+    /// NOT an absence claim: only a marauder-confirmed
+    /// absence after both windows close produces a
+    /// `PeerDisappeared`. Read-only from the operator's
+    /// perspective; capability-gated by `plugins_admin`.
+    RosterSnap {
+        /// Why the snap was issued. Carried in the response
+        /// and in the `RosterSnapped` happening so audit
+        /// surfaces can distinguish operator-driven snaps
+        /// from system-warmed snaps.
+        reason: crate::roster_snap::SnapReason,
+        /// Optional deadline budget for the snap (snap +
+        /// marauder windows together). Defaults to
+        /// `DEFAULT_SNAP_WINDOW_MS`; clamped at the framework
+        /// ceiling `MAX_SNAP_WINDOW_MS`.
+        #[serde(default)]
+        deadline_ms: Option<u32>,
+    },
+    /// Create a new multi-room group with the supplied display
+    /// name and member device ids. Capability-gated by
+    /// `plugins_admin` and step-up-aware. Refuses empty
+    /// membership, duplicates de-duped, display name
+    /// validated (non-empty after trim, at most 128 chars).
+    CreateGroup {
+        /// Operator-supplied display name.
+        display_name: String,
+        /// Member device ids. Must be non-empty.
+        members: Vec<String>,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Read one multi-room group by canonical id with its
+    /// full membership. Read-only; capability-gated by
+    /// `plugins_admin`.
+    GetGroup {
+        /// Canonical group id.
+        group_id: String,
+    },
+    /// List every multi-room group with its full
+    /// membership. Read-only; capability-gated by
+    /// `plugins_admin`.
+    ListGroups,
+    /// Rename one multi-room group. Capability-gated by
+    /// `plugins_admin` and step-up-aware. Refuses unknown
+    /// ids; validates the new display name.
+    RenameGroup {
+        /// Canonical group id.
+        group_id: String,
+        /// New display name.
+        display_name: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Set the per-group `leader_ms` latency budget. Operator
+    /// gesture for the multi-room plugin's render-frame budget.
+    /// Refuses unknown ids; validates the new value (range
+    /// 10..=5000 ms). Capability-gated by `plugins_admin` and
+    /// step-up-aware.
+    SetGroupLeaderMs {
+        /// Canonical group id.
+        group_id: String,
+        /// New per-group latency budget in milliseconds.
+        leader_ms: u32,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Set the per-device multi-room role
+    /// (`source` / `receiver` / `auto`). Idempotent on
+    /// unchanged value. Refuses empty device ids and invalid
+    /// role strings. Capability-gated by `plugins_admin` and
+    /// step-up-aware.
+    SetDeviceRole {
+        /// Canonical device id.
+        device_id: String,
+        /// Role to set (`source` / `receiver` / `auto`).
+        role: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Read the operator-declared role for a device. Returns
+    /// `auto` for devices with no explicit gesture (substrate-
+    /// empty default). Read-only; capability-gated by
+    /// `plugins_admin`.
+    GetDeviceRole {
+        /// Canonical device id.
+        device_id: String,
+    },
+    /// List every device with an explicit operator-gestured
+    /// role. Devices in the substrate-empty / `auto` default
+    /// are NOT enumerated (they have no row to surface).
+    /// Read-only; capability-gated by `plugins_admin`.
+    ListDeviceRoles,
+    /// Clear the operator-declared role for a device. The
+    /// device returns to the substrate-empty `auto` default.
+    /// Idempotent on devices that already have no explicit
+    /// row. Capability-gated by `plugins_admin` and step-up-
+    /// aware.
+    ClearDeviceRole {
+        /// Canonical device id.
+        device_id: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-gestured reconnect storm against a peer that
+    /// is currently unreachable. Runs the 5-carrier reconnect
+    /// sequence (cached-endpoint dial / subnet sweep /
+    /// mDNS-SD targeted query / UDP broadcast wake /
+    /// audio-plane hello) in parallel with a 30 s deadline and
+    /// 2 s retry cadence; returns on first carrier success or
+    /// on exhaustion. Capability-gated by `plugins_admin` and
+    /// step-up-aware.
+    ReconnectPeer {
+        /// Canonical device id of the peer to reconnect.
+        device_id: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-gestured plugin reload. Routes through the
+    /// plugin lifecycle coordinator's operator-gesture path;
+    /// emits a `PluginReloadRequested` event with
+    /// `ReloadSource::OperatorGesture`. The admission-engine
+    /// integration that completes the reload cycle consumes
+    /// the event from the coordinator's subscription channel.
+    /// Capability-gated by `plugins_admin` and step-up-aware.
+    PluginReload {
+        /// Canonical plugin name (matches the `[plugin] name`
+        /// field in the plugin manifest).
+        plugin_name: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-gestured recovery of a degraded plugin. Clears
+    /// the plugin's degraded-state slot and resets its
+    /// per-plugin failure counters in the registry. The
+    /// caller-side admission re-attempt logic decides whether
+    /// to trigger a re-admit from the manifest defaults;
+    /// this op covers only the substrate clear. Capability-
+    /// gated by `plugins_admin` and step-up-aware.
+    PluginRestore {
+        /// Canonical plugin name.
+        plugin_name: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Add a device to a multi-room group. Idempotent on
+    /// already-present device ids. Capability-gated by
+    /// `plugins_admin` and step-up-aware.
+    AddGroupMember {
+        /// Canonical group id.
+        group_id: String,
+        /// Device id to add.
+        device_id: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Remove a device from a multi-room group. Refuses
+    /// removal of the last remaining member (operator must
+    /// call `delete_group` instead). Capability-gated by
+    /// `plugins_admin` and step-up-aware.
+    RemoveGroupMember {
+        /// Canonical group id.
+        group_id: String,
+        /// Device id to remove.
+        device_id: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Delete a multi-room group (cascades to membership).
+    /// Idempotent on absent ids — returns `removed = false`
+    /// without erroring. Capability-gated by `plugins_admin`
+    /// and step-up-aware.
+    DeleteGroup {
+        /// Canonical group id.
+        group_id: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Move a device atomically from one group to another.
+    /// Performs delete-from-source + insert-to-target as a
+    /// single state transition with no visible solo
+    /// intermediate. Emits one `MultiroomMemberMoved`
+    /// happening covering both sides.
+    ///
+    /// Leader-of-source case: when the moved device is the
+    /// source group's current source-host AND the post-move
+    /// source membership would be \u{2265} 2, the verb composes
+    /// the successor-selection step inline. First dispatch
+    /// (without `successor_device_id`) returns
+    /// `LeaderSuccessorRequired` with the eligible successor
+    /// set; second dispatch (with `successor_device_id`) is
+    /// the atomic transaction: pin successor on source group +
+    /// delete moved device from source + insert into target +
+    /// emit `MultiroomMemberMoved` + `MultiroomLeaderHandoff`.
+    ///
+    /// Auto-dissolve precedence: when removing the moved
+    /// device drops the source group below the 2-member floor,
+    /// the protocol is skipped — the source group dissolves,
+    /// residual member returns to solo, the moved device
+    /// joins the target. One operator round-trip.
+    ///
+    /// Capability-gated by `plugins_admin` and step-up-aware.
+    MoveGroupMember {
+        /// Canonical id of the source group.
+        from_group_id: String,
+        /// Canonical id of the target group.
+        to_group_id: String,
+        /// Canonical id of the device to move.
+        device_id: String,
+        /// Optional successor for the leader-of-source case.
+        /// Required on the second dispatch when the first
+        /// returned `LeaderSuccessorRequired`; ignored when the
+        /// moved device is not the source's leader.
+        #[serde(default)]
+        successor_device_id: Option<String>,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Operator-explicit successor selection following the
+    /// `SuccessorRequired` outcome of removing the current
+    /// leader from a group. Atomically pins the operator-chosen
+    /// successor as source-host and removes the departing
+    /// leader. Capability-gated by `plugins_admin` and
+    /// step-up-aware.
+    SelectGroupLeaderSuccessor {
+        /// Canonical group id.
+        group_id: String,
+        /// Canonical id of the leader being removed.
+        departing_device_id: String,
+        /// Canonical id of the operator-chosen successor.
+        successor_device_id: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Cancel a pending leader-successor decision. The leader
+    /// stays in place; no group state changed. Capability-gated
+    /// by `plugins_admin`.
+    CancelGroupLeaderSuccessor {
+        /// Canonical group id.
+        group_id: String,
+        /// Canonical id of the leader that was being removed.
+        departing_device_id: String,
+    },
+    /// Pin a specific device as the source-host for a
+    /// multi-room group. Operator override of the framework's
+    /// canonical-min election rule. Persisted on the group row;
+    /// election respects the pin while the device remains a
+    /// live member. Capability-gated by `plugins_admin` and
+    /// step-up-aware.
+    PinSourceHost {
+        /// Canonical group id.
+        group_id: String,
+        /// Canonical id of the device to pin as source-host.
+        device_id: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Clear the source-host pin for a multi-room group.
+    /// Election resumes its standard canonical-min rule.
+    /// Capability-gated by `plugins_admin` and step-up-aware.
+    UnpinSourceHost {
+        /// Canonical group id.
+        group_id: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// List every domain-membership row in the local trust
+    /// ledger, composed with live discovery state and the
+    /// persistent display-name cache. Read-only;
+    /// capability-gated by `plugins_admin`.
+    ListDomainMembers,
+    /// Admit a device to the local domain trust ledger.
+    /// Operator gesture from a domain member's UI; the
+    /// admitting device id is captured as audit. Capability-
+    /// gated by `plugins_admin` and step-up-aware.
+    AdmitPeerToDomain {
+        /// Canonical id of the device being admitted.
+        device_id: String,
+        /// Optional display name to seed the ledger row with.
+        /// When `None`, the framework resolves the peer's
+        /// currently-observed mDNS-SD advert display_name from
+        /// `discovered_peers`; admission refuses when the peer
+        /// has never been observed (the operator cannot admit
+        /// an id the framework has not seen).
+        #[serde(default)]
+        display_name: Option<String>,
+        /// Optional public-key bytes captured at admission.
+        #[serde(default)]
+        public_key_bytes: Option<Vec<u8>>,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Revoke a device's domain admission. Capability-
+    /// gated by `plugins_admin` and step-up-aware.
+    ///
+    /// **Superseded by [`Self::DiscardPeerFromDomain`].**
+    /// New code should use `discard_peer_from_domain`,
+    /// which carries operator-explicit two-step-confirm
+    /// semantics and routes through the domain-witness
+    /// chain substrate.
+    RevokePeerFromDomain {
+        /// Canonical id of the device being revoked.
+        device_id: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Discard a device from the domain. Operator-explicit,
+    /// irreversible. Appends a signed entry to the domain
+    /// witness chain; receivers project the discard onto
+    /// their local trust view byte-equal. Capability-gated
+    /// by `plugins_admin` and step-up-aware.
+    DiscardPeerFromDomain {
+        /// Canonical id of the device being discarded.
+        device_id: String,
+        /// Optional operator-supplied rationale, retained
+        /// in the chain entry as audit material.
+        #[serde(default)]
+        reason: Option<String>,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Found a new multi-room domain on this device. Signs
+    /// the genesis chain entry (self-admit) so the local
+    /// device becomes the first member of a new chain.
+    /// Refuses when the chain already contains any entry —
+    /// re-founding requires `leave_domain` or
+    /// `factory_reset_domain` first. Capability-gated by
+    /// `plugins_admin` and step-up-aware.
+    BootstrapDomain {
+        /// Optional operator-supplied display name for the
+        /// founder admission. When unset, the framework
+        /// uses the local device's `display_name` from the
+        /// device identity store.
+        #[serde(default)]
+        display_name: Option<String>,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Mark the local device as looking to join an existing
+    /// domain. Emits a `JoinModeEntered` happening so an
+    /// admitted-peer's UI can surface the request. The
+    /// joining device's chain does not advance on this
+    /// gesture — admission still requires an
+    /// `admit_peer_to_domain` from a member of the target
+    /// domain, after which the chain arrives via announce +
+    /// the inbound pump. Refuses when the chain already
+    /// contains any entry. Capability-gated by
+    /// `plugins_admin`.
+    JoinDomain {
+        /// Optional endpoint to dial directly (when an
+        /// operator has out-of-band knowledge of an
+        /// admitted-peer's address and wants to bypass the
+        /// announce-discovery loop). When unset, the device
+        /// waits for announces to arrive.
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Soft-leave the current domain. Discards the local
+    /// chain log + the projection cache so the device
+    /// becomes domain-less. The per-device signing key
+    /// persists so a subsequent `join_domain` or
+    /// `bootstrap_domain` reuses the same identity. The
+    /// steward must restart for the discard to take effect
+    /// on every in-process runtime. Capability-gated by
+    /// `plugins_admin` and step-up-aware.
+    LeaveDomain {
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Hard-reset the device's domain state. Discards the
+    /// chain log AND the per-device signing key so the
+    /// device returns to a fresh-from-factory posture.
+    /// Re-joining a domain after this gesture generates a
+    /// new signing key — the device's prior identity is
+    /// not recoverable. Steward restart required.
+    /// Capability-gated by `plugins_admin` and step-up-
+    /// aware.
+    FactoryResetDomain {
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Read the current domain witness chain head hash +
+    /// chain length. UI consumers use this as the
+    /// freshness oracle (two devices either share the
+    /// same 32-byte head hash or they do not).
+    /// Read-only; capability-gated by `plugins_admin`.
+    GetChainHead,
+    /// Replay recent domain witness chain entries in
+    /// chronological order. UI surfaces the operator's
+    /// domain history view from this. Read-only;
+    /// capability-gated by `plugins_admin`.
+    DomainHistory {
+        /// Optional limit on the number of recent entries
+        /// returned. Defaults to 50 when unset.
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Atomic move of a device between groups. Replaces
+    /// the legacy remove-then-add pair so the operator's
+    /// intent is captured as one chain entry and the
+    /// composition reconciles correctly under concurrent
+    /// gestures. Capability-gated by `plugins_admin` and
+    /// step-up-aware.
+    MoveMember {
+        /// Device id of the member being moved.
+        device_id: String,
+        /// Source group.
+        from_group_id: String,
+        /// Destination group.
+        to_group_id: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Explicit operator-gestured leader handoff for a
+    /// group. The new leader must be a current member of
+    /// the group. Capability-gated by `plugins_admin` and
+    /// step-up-aware.
+    SetGroupLeader {
+        /// Group whose leader is being changed.
+        group_id: String,
+        /// New leader's device id.
+        leader_device_id: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Fire a reconnect storm against an absent peer.
+    /// Every available carrier is tried in parallel for
+    /// the configured storm window; per-attempt progress
+    /// is emitted via the `reconnect_progress` happening.
+    /// Capability-gated by `plugins_admin` and step-up-
+    /// aware.
+    TriggerReconnect {
+        /// Device id of the peer to reconnect.
+        device_id: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Export the local domain witness chain as a portable
+    /// signed artefact. Used for the pigeon-mode out-of-band
+    /// transport scenarios (QR-coded chain transfer between
+    /// physically separated sites, emergency reconciliation
+    /// after total network outage). Read-only; capability-
+    /// gated by `plugins_admin`.
+    ExportChain,
+    /// Import a peer-supplied chain artefact. Each witness
+    /// is verified + linearised + applied through the local
+    /// witness runtime; duplicates and forks are handled by
+    /// the substrate's deterministic linearisation rules.
+    /// Capability-gated by `plugins_admin` and step-up-
+    /// aware.
+    ImportChain {
+        /// Chain entries from the source artefact, in
+        /// chronological order.
+        witnesses: Vec<evo_witness::DomainWitness>,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Refresh a peer's sticky endpoint list. Operator
+    /// gesture confirming a new observed endpoint should
+    /// be added to the peer's chain-recorded endpoint
+    /// history. Future reconnect storms try the refreshed
+    /// endpoints first. Capability-gated by `plugins_admin`
+    /// and step-up-aware.
+    UpdatePeerEndpoints {
+        /// Device id whose endpoint set is being refreshed.
+        device_id: String,
+        /// New endpoint set, replacing the previous in full.
+        endpoints: Vec<evo_witness::NetworkEndpoint>,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Declare this device as a chain-aware relay between
+    /// the supplied networks. Auto-emitted at boot when
+    /// the device detects multi-network reachability; can
+    /// also be operator-gestured. Appends a signed chain
+    /// entry; receivers see the relay in their projection
+    /// on the next chain head advance. Capability-gated
+    /// by `plugins_admin` and step-up-aware.
+    DeclareNetworkRelay {
+        /// Networks the relay bridges and the endpoint it
+        /// listens on for each.
+        networks: Vec<evo_witness::NetworkDeclaration>,
+        /// Capabilities the relay offers.
+        capabilities: Vec<evo_witness::RelayCapability>,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Read the local node's last-known source-host election
+    /// for one multi-room group. Read-only; capability-gated
+    /// by `plugins_admin`.
+    GetSourceHost {
+        /// Canonical group id.
+        group_id: String,
+    },
+    /// List the local node's last-known source-host
+    /// election for every multi-room group. Read-only;
+    /// capability-gated by `plugins_admin`.
+    ListSourceHosts,
+    /// Read the local node's clock-sync state for one
+    /// multi-room group. Read-only; capability-gated by
+    /// `plugins_admin`.
+    GetClockSync {
+        /// Canonical group id.
+        group_id: String,
+    },
+    /// List the local node's clock-sync state for every
+    /// multi-room group. Read-only; capability-gated by
+    /// `plugins_admin`.
+    ListClockSyncs,
+    /// List active audio-plane peer connections (the TCP
+    /// control + data channel between this node and other
+    /// multi-room peers). Read-only; capability-gated by
+    /// `plugins_admin`.
+    ListAudioPlaneConnections,
+    /// Manually establish an outbound audio-plane TCP
+    /// connection to the supplied peer address. Operator-
+    /// facing escape hatch when auto-discovery does not
+    /// surface a dialable address (IPv6-link-local-without-
+    /// scope-id edge case, NAT/VLAN boundaries, opaque-
+    /// network shapes the discovery runtime cannot auto-
+    /// resolve). The runtime runs the same handshake +
+    /// connection registration the auto-sweep path runs;
+    /// once admitted the connection participates in
+    /// heartbeat / sync probe / fan-out the same as auto-
+    /// discovered connections.
+    AudioPlaneDial {
+        /// `host:port` form of the peer's audio-plane
+        /// listener (typically port 7331). IPv4 dotted-quad
+        /// OR IPv6 bracket form both accepted.
+        addr: String,
+    },
+    /// Resolve where a verb targeting one multi-room group
+    /// would dispatch — identifies the elected source-host
+    /// for the group, whether it is the local node, and
+    /// (when remote) the audio-plane connection state to
+    /// the source-host. Observational substrate: the
+    /// operator's client uses the response to issue the
+    /// underlying verb (locally when `is_local_host`, via
+    /// the audio-plane channel when remote). Read-only;
+    /// capability-gated by `plugins_admin`.
+    DispatchToGroup {
+        /// Canonical group id.
+        group_id: String,
+    },
+    /// Read the composite active topology snapshot for one
+    /// multi-room group — source-host + receiver legs +
+    /// connection / sync state. Read-only; capability-gated
+    /// by `plugins_admin`.
+    GetGroupActiveTopology {
+        /// Canonical group id.
+        group_id: String,
+    },
+    /// List the composite active topology snapshot for
+    /// every multi-room group. Read-only; capability-gated
+    /// by `plugins_admin`.
+    ListGroupActiveTopologies,
+    /// List every admitted gateway plugin (plugins that
+    /// bridge between an external ecosystem and the multi-
+    /// room native protocol — AirPlay 2, Cast, Spotify
+    /// Connect, etc.). Read-only; capability-gated by
+    /// `plugins_admin`.
+    ListGatewayPlugins,
+    /// Read the aggregated update inventory across every
+    /// registered source. Read-only; capability-gated by
+    /// `plugins_admin`.
+    ListUpdateInventory,
+    /// Trigger a check across every registered update source
+    /// (or one named source when `source_id` is supplied).
+    /// Capability-gated by `plugins_admin` and step-up-aware.
+    CheckUpdatesNow {
+        /// When `Some`, check only this source. When `None`,
+        /// check every registered source.
+        #[serde(default)]
+        source_id: Option<String>,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Apply one specific update via its source. Capability-
+    /// gated by `plugins_admin` and step-up-aware.
+    ApplyUpdate {
+        /// Source id the update belongs to.
+        source_id: String,
+        /// Source-defined update id.
+        update_id: String,
+        /// When `true`, run the source's reversible apply
+        /// path without committing.
+        #[serde(default)]
+        dry_run: bool,
+        /// Operator principal recorded in the audit trail.
+        /// `None` falls back to the wire client's UID.
+        #[serde(default)]
+        approved_by: Option<String>,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Read every recorded auto-apply policy entry. Read-
+    /// only; capability-gated by `plugins_admin`.
+    GetAutoApplyPolicies,
+    /// Initiate a graceful steward restart. The framework
+    /// emits a `StewardRestarting` happening, drains for a
+    /// brief window so connected wire clients can flush,
+    /// and `execve`s the target binary. The new steward
+    /// boot path rehydrates from durable substrate and
+    /// re-admits the persisted plugin set. Capability-
+    /// gated by `plugins_admin` and step-up-aware.
+    /// Operators on the wire who issued this op see the
+    /// connection close cleanly when the steward execs.
+    RequestStewardRestart {
+        /// Operator-supplied free-form reason recorded in
+        /// the audit trail and surfaced in the
+        /// `StewardRestarting` happening.
+        reason: String,
+        /// Optional target binary path. When `None`, the
+        /// coordinator restarts in place using
+        /// `std::env::current_exe()` — useful for "restart
+        /// in place" applies after a config change. When
+        /// `Some`, the operator supplies an alternative
+        /// path (the typical use case after the core
+        /// update source has staged a new binary).
+        #[serde(default)]
+        target_binary: Option<String>,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Set the auto-apply policy for one source.
+    /// Capability-gated by `plugins_admin` and step-up-
+    /// aware.
+    SetAutoApplyPolicy {
+        /// Source id.
+        source_id: String,
+        /// `true` to enable auto-apply.
+        enabled: bool,
+        /// Severity threshold — one of `routine` /
+        /// `recommended` / `security` / `critical`.
+        severity_threshold: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Mint an operator bootstrap bearer for the device-local
+    /// kiosk shell. The framework checks `SO_PEERCRED` against
+    /// the distribution-declared compositor UID allowlist and,
+    /// on admission, returns a bearer carrying the merged
+    /// operator-bootstrap capability set. Refused with
+    /// `kiosk_socket_only` on any transport that has not been
+    /// tagged as the kiosk local socket. Refused with
+    /// `peer_not_admitted` when the peer UID is not on the
+    /// allowlist; `allowlist_empty` when the distribution
+    /// declared no compositor UID; `peer_unknown` when
+    /// `SO_PEERCRED` could not resolve a UID.
+    MintLocalKioskSession {
+        /// Free-form audit reason. Non-empty after trim. The
+        /// compositor conventionally sends `"kiosk-boot"` at
+        /// first mint and `"kiosk-reconnect"` at subsequent
+        /// renewals; the framework does not interpret the
+        /// value.
+        reason: String,
+    },
+    /// Begin a pair-once ceremony for a remote browser. The
+    /// framework records a pending attempt keyed by a fresh
+    /// `pair_id` with an 8-digit code on a 90 s TTL and
+    /// publishes the code to the prompt-ledger substrate so
+    /// the kiosk display renders it full-screen. The response
+    /// carries the `pair_id` (the browser presents it on
+    /// `pair_complete`) and the code's expiry stamp.
+    PairBegin {
+        /// UA-derived label the framework shows on the kiosk
+        /// display alongside the code (e.g. "Chrome on
+        /// Pixel 8"). Free-form; sanitised for display by the
+        /// kiosk shell.
+        device_hint: String,
+    },
+    /// Complete a pair-once ceremony. Consumes the pending
+    /// attempt atomically on any outcome (right or wrong
+    /// code, expiry) so the browser gets one guess per
+    /// `pair_begin`. On success returns a fresh bearer bound
+    /// to a new `paired_device_id` and carrying the merged
+    /// operator-bootstrap capability set.
+    ///
+    /// **Not the consumer path.** Retained for internal use
+    /// (kiosk-shell, factory tooling); the consumer browser
+    /// uses [`Self::PairAuthenticate`] instead.
+    PairComplete {
+        /// Attempt id returned by `pair_begin`.
+        pair_id: String,
+        /// 8-digit code the operator typed from the kiosk
+        /// display.
+        code: String,
+    },
+    /// Establish browser trust by authenticating with the
+    /// installation user's OS password. Fusion of the
+    /// step-up verifier (`step_up_auth_verify` semantics —
+    /// [`AuthService::verify`] against the framework's own
+    /// runtime user) and paired-device bearer issuance
+    /// ([`ClientRequest::PairComplete`]'s issuance path).
+    ///
+    /// The consumer-path pairing op. The device has one
+    /// credential — the OS password set at image-flash /
+    /// OS install, verified by the shadow backend. The UI
+    /// asks for it once; the framework verifies + registers
+    /// a paired device + issues a bearer in a single wire
+    /// round-trip. `pair_begin` / `pair_complete` and the
+    /// bootstrap preseed leave the consumer path (they may
+    /// survive as internal mechanisms for kiosk-shell or
+    /// factory tooling).
+    ///
+    /// Shares the step-up rate-limiter bucket + nonce store
+    /// (`step_up_rate_limited`, `step_up_nonce_reused`) —
+    /// a password guess against this op counts against the
+    /// same failure budget as one against `step_up_auth_verify`.
+    /// A password guess is a password guess.
+    ///
+    /// Runtime-user semantics identical to
+    /// [`Self::StepUpAuthVerify`]: the framework resolves its
+    /// own runtime user via `getpwuid(geteuid())` at boot; no
+    /// `username` field on the wire.
+    PairAuthenticate {
+        /// UA-derived label the framework attaches to the
+        /// resulting paired-device entry (e.g. "Chrome on
+        /// Pixel 8"). Free-form; sanitised for display by
+        /// operator surfaces.
+        device_hint: String,
+        /// URL-safe or standard base64 of the OS password.
+        /// Same encoding rules as `step_up_auth_verify`; the
+        /// framework decodes, verifies, and zeros the buffer
+        /// immediately after.
+        secret_b64: String,
+        /// Optional single-use nonce for replay defence.
+        /// Shares the framework nonce store with
+        /// `step_up_auth_verify`; reuse inside the replay
+        /// window refuses with `step_up_nonce_reused`.
+        /// Callers that omit the nonce bypass replay defence
+        /// (legacy CLI); UI + SDK callers MUST always send one.
+        #[serde(default)]
+        nonce: Option<String>,
+    },
+    /// List every paired device the framework currently
+    /// tracks. Requires `plugins_admin` on the connection.
+    /// Returns metadata only — bearer bytes are never
+    /// returned post-mint.
+    PairList,
+    /// Revoke a paired device by id. Idempotent — revoking an
+    /// unknown id returns `revoked = false` without erroring.
+    /// Requires `plugins_admin` on the connection and is
+    /// step-up-aware.
+    PairRevoke {
+        /// `paired_device_id` returned by `pair_complete` or
+        /// `pair_list`.
+        paired_device_id: String,
+        /// Optional step-up token.
+        #[serde(default)]
+        step_up_token: Option<String>,
+    },
+    /// Set the operator's kiosk password. Refused on any
+    /// transport that has not been tagged as the kiosk
+    /// local socket (identical `kiosk_socket_only` refusal
+    /// shape as `mint_local_kiosk_session`). The framework
+    /// writes an argon2id PHC-encoded hash to the
+    /// distribution-configured secrets file and reloads the
+    /// active `SharedSecretAuthService` in place. Rejects
+    /// passwords shorter than 8 characters after trim; the
+    /// UI enforces stricter policy where applicable.
+    SetKioskPassword {
+        /// The new password. Framework hashes with argon2id
+        /// default cost params and zeros the buffer after
+        /// hashing.
+        new_password: String,
+    },
 }
 
 /// Wire-tagged migration strategy. Mirrors
@@ -861,6 +2739,95 @@ pub struct MapMappingEntry {
 /// originating plugin, the prompt's content, and the deadline
 /// (in wall-clock milliseconds since epoch) for responder UIs
 /// that render a "expires in" countdown.
+/// One row of a [`ClientResponse::CredentialListing`] response.
+///
+/// Never carries the credential value. The operator-visible key
+/// name is never returned — only its SHA-256 hash. The UI keys
+/// its own client-side mapping from operator-visible name to
+/// hash on the operator's typed-in key at put time, so listing
+/// output is enough to correlate stored entries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CredentialListingEntry {
+    /// Hex-encoded SHA-256 of the operator-visible key.
+    pub key_hash: String,
+    /// Optional operator-visible label for the entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Optional wall-clock millisecond expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+    /// Per-credential retention policy on plugin uninstall.
+    pub uninstall_policy: String,
+    /// Wall-clock millisecond timestamp of the first store for
+    /// this key.
+    pub created_at_ms: u64,
+    /// Wall-clock millisecond timestamp of the most recent store.
+    pub updated_at_ms: u64,
+}
+
+/// One row of a [`ClientResponse::OnlineProvidersListing`] response.
+///
+/// Carries the operator's current enable-disable and priority for
+/// one online-metadata provider. The multi-source aggregation
+/// cascade walks providers whose `enabled` is `true`, in
+/// (priority ascending, provider_id ascending) order.
+///
+/// The wire carries the static shape the settings UI needs to
+/// render per-source affordances honestly — privacy class
+/// (anonymous vs identity-bearing), whether the vault currently
+/// holds a credential for the provider, the content kinds the
+/// provider serves, and the license the operator UI attributes
+/// with. Together these let the UI paint "no key needed" /
+/// "needs key" badges without a per-provider hardcoded lookup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct OnlineProviderEntry {
+    /// Provider identifier string (`"musicbrainz"`,
+    /// `"wikipedia"`, `"lastfm"`, `"theaudiodb"`, `"deezer"`,
+    /// `"fanart_tv"`, …).
+    pub provider_id: String,
+    /// Whether the provider is currently enabled for cascade
+    /// dispatch.
+    pub enabled: bool,
+    /// Cascade priority (0 = highest, 100 = default, 999 =
+    /// lowest).
+    pub priority: i32,
+    /// Wall-clock millisecond timestamp of the most recent
+    /// operator mutation.
+    pub updated_at_ms: u64,
+    /// Privacy class of the provider. `"anonymous"` (no
+    /// account, nothing beyond the query leaves the device)
+    /// or `"identity_bearing"` (an operator-supplied
+    /// credential ties queries to a registered account). The
+    /// UI surfaces this as a badge next to each entry so the
+    /// operator can see at a glance which sources are
+    /// PII-neutral.
+    pub privacy_class: &'static str,
+    /// Whether an operator credential is currently stored in
+    /// the framework vault for this provider. Always `true`
+    /// for anonymous providers (no credential needed);
+    /// reflects vault presence for identity-bearing
+    /// providers. Drives the "needs key" affordance and gates
+    /// whether `enabled=true` is actually useful.
+    pub has_credential: bool,
+    /// Content kinds this provider serves (`"bio"`,
+    /// `"album_notes"`, `"lyrics"`, `"release_credits"`,
+    /// `"track_annotation"`, `"work_notes"`, `"artist_artwork"`,
+    /// `"album_artwork"`). The UI groups per-source
+    /// affordances by kind on the settings surface.
+    pub kinds: Vec<&'static str>,
+    /// License / terms string the operator UI attributes with
+    /// alongside any rendered payload from this provider
+    /// (`"CC BY-SA"`, `"CC0"`, `"Last.fm terms of use"`, …).
+    pub license: &'static str,
+}
+
+/// One entry of a [`ClientResponse::UserInteractions`] response.
+///
+/// Carries the prompt's originating plugin and the prompt payload
+/// the responder UI renders. Reconstructed by the server from
+/// the framework's prompts-active substrate.
 #[derive(Debug, Clone, Serialize)]
 pub struct UserInteractionWire {
     /// Canonical name of the plugin that issued the prompt.
@@ -938,6 +2905,265 @@ pub struct GrammarOrphanWire {
     /// `migrating` or `resolved`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migration_id: Option<String>,
+}
+
+/// Wire-side flat shape for one entry in the per-publisher
+/// trust list response. Mirrors
+/// [`crate::publisher_trust::PublisherTrustRecord`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PublisherTrustEntryWire {
+    /// Publisher's signing-key fingerprint.
+    pub publisher_id: String,
+    /// Operator-readable display name.
+    pub display_name: String,
+    /// Trust level snake_case-serialised
+    /// (`pretrusted` / `operator_trusted` / `revoked`).
+    pub trust_level: String,
+    /// Wall-clock millisecond timestamp of the grant.
+    pub granted_at_ms: u64,
+    /// How the grant came to be recorded
+    /// (`vendor_bundle` / `registry_subscription` /
+    /// `operator_prompt` / `direct_install`).
+    pub granted_via: String,
+    /// Scope kind (`all_plugins` / `per_plugin`).
+    pub scope_kind: String,
+    /// Per-plugin scope, when scope_kind is `per_plugin`;
+    /// otherwise empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scope_per_plugin: Vec<String>,
+    /// Path to the materialised key file under the operator
+    /// trust directory; absent for vendor-bundled
+    /// publishers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_file: Option<String>,
+}
+
+/// Wire-side flat shape for one capability revocation. Mirrors
+/// [`crate::capability_grant::CapabilityRevocation`].
+#[derive(Debug, Clone, Serialize)]
+pub struct CapabilityRevocationWire {
+    /// Plugin canonical name.
+    pub plugin_name: String,
+    /// Capability token.
+    pub capability: String,
+    /// Wall-clock millisecond timestamp of revocation.
+    pub revoked_at_ms: u64,
+    /// Operator principal recorded at revocation time.
+    pub revoked_by_principal: String,
+    /// Optional free-form reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Wire-side flat shape for one admission policy. Mirrors
+/// [`crate::admission_policy::AdmissionPolicy`].
+#[derive(Debug, Clone, Serialize)]
+pub struct AdmissionPolicyWire {
+    /// Policy id (filesystem-safe slug).
+    pub policy_id: String,
+    /// Operator-readable name.
+    pub name: String,
+    /// Optional description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Authoring class.
+    pub authored_by: String,
+    /// Wall-clock millisecond timestamp of creation.
+    pub created_at_ms: u64,
+    /// Whether this policy is the currently-active one.
+    pub active: bool,
+    /// Rule body.
+    pub rules: crate::admission_policy::AdmissionPolicyRules,
+}
+
+/// Wire-side flat shape for one violation inside the
+/// `audit_against_policy` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdmissionPolicyViolationWire {
+    /// Plugin canonical name.
+    pub plugin_name: String,
+    /// Stable rule-class identifier.
+    pub rule_class: String,
+    /// Human-readable detail.
+    pub detail: String,
+}
+
+/// Wire-side flat shape for one per-plugin failure inside a
+/// bulk-lifecycle response.
+#[derive(Debug, Clone, Serialize)]
+pub struct BulkLifecycleFailureWire {
+    /// Plugin canonical name.
+    pub plugin_name: String,
+    /// Failure detail (typically the `lifecycle_error` message).
+    pub message: String,
+}
+
+/// Wire-side flat shape for one tag entry inside the
+/// `list_plugin_tags` response.
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginTagEntryWire {
+    /// Tag string.
+    pub tag: String,
+    /// Wall-clock millisecond timestamp the tag was applied.
+    pub set_at_ms: u64,
+}
+
+/// Wire-side flat shape for one per-plugin entry under a
+/// profile. Mirrors
+/// [`crate::plugin_profile::PluginProfileEntry`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginProfileEntryWire {
+    /// Plugin canonical name.
+    pub plugin_name: String,
+    /// Operator's intended state when the profile is active
+    /// (`enabled` / `disabled`).
+    pub state: String,
+}
+
+/// Wire-side flat shape for one profile (metadata only). Used by
+/// `list_plugin_profiles` and as the inner shape inside
+/// `get_plugin_profile`'s response.
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginProfileWire {
+    /// Profile id (filesystem-safe slug).
+    pub profile_id: String,
+    /// Operator-readable name.
+    pub name: String,
+    /// Optional description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Authoring class.
+    pub authored_by: String,
+    /// Wall-clock millisecond timestamp of creation.
+    pub created_at_ms: u64,
+    /// Whether this profile is currently the active one.
+    pub active: bool,
+    /// Per-plugin entries. Empty in listing responses
+    /// (metadata-only); populated in `get_plugin_profile`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<PluginProfileEntryWire>,
+}
+
+/// Wire-side flat shape for the per-plugin activation outcome.
+/// Mirrors [`crate::plugin_profile::ProfileActivationOutcome`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileActivationOutcomeWire {
+    /// Profile id that was activated.
+    pub profile_id: String,
+    /// Plugin canonical names whose state was transitioned to
+    /// enabled.
+    pub enabled: Vec<String>,
+    /// Plugin canonical names whose state was transitioned to
+    /// disabled.
+    pub disabled: Vec<String>,
+    /// Plugin canonical names already in the requested state
+    /// (skipped).
+    pub skipped: Vec<String>,
+    /// Whether this was a dry-run plan (no transitions
+    /// dispatched).
+    pub dry_run: bool,
+}
+
+/// Wire-side flat shape for one entry in the
+/// `get_update_channels` response. Mirrors
+/// [`crate::update_channel::UpdateChannelEntry`].
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateChannelEntryWire {
+    /// Update target (`core` / `plugins`).
+    pub target: String,
+    /// Channel value (`alpha` / `test` / `production`).
+    pub channel: String,
+    /// Wall-clock millisecond timestamp of the most recent set.
+    pub set_at_ms: u64,
+    /// Operator principal recorded at set time.
+    pub set_by_principal: String,
+}
+
+/// Wire-side flat shape for one entry in the
+/// `describe_ui_stockings` response. One row per (plugin,
+/// stocking) pair. Mirrors
+/// [`evo_plugin_sdk::ui::UiStocking`] with the owning plugin
+/// surfaced explicitly so operator surfaces can render
+/// per-plugin or per-shelf groupings without a join.
+#[derive(Debug, Clone, Serialize)]
+pub struct UiStockingEntryWire {
+    /// Canonical name of the plugin that owns this stocking.
+    pub plugin: String,
+    /// Target UI shelf id.
+    pub ui_shelf: String,
+    /// Widget kind id.
+    pub widget: String,
+    /// Size declared on the stocking, kebab-case
+    /// (`atom`, `quarter`, `third`, `half`, `two-thirds`,
+    /// `full`).
+    pub size: String,
+    /// Optional render mode override (`inline`, `modal`,
+    /// `overlay`, `floating`); `None` when the stocking
+    /// inherits the widget envelope's mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Schema version this stocking was admitted under.
+    pub schema_version: u32,
+}
+
+/// Wire-side projection of
+/// [`crate::plans::wizard::WizardStepCompletion`]. Discriminated
+/// union so the schema-first renderer projects the consent payload
+/// through with strong typing on the consent_id + document_hash +
+/// decision fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WizardStepCompletionWire {
+    /// Non-consent step — the runtime advances the resume cursor
+    /// only.
+    PlainStep,
+    /// Consent step — the runtime appends an `evo.consent` ledger
+    /// entry alongside advancing the resume cursor.
+    Consent {
+        /// Versioned consent-document identifier the wizard step
+        /// declared in its parameters.
+        consent_id: String,
+        /// SHA-256 hex digest of the consent document the user
+        /// saw at decision time.
+        document_hash: String,
+        /// User decision recorded on the step. Snake-case on
+        /// the wire (`accepted`, `declined`, `withdrawn`).
+        decision: String,
+        /// Optional user identifier when the device knows who is
+        /// configuring it. Omitted for device-level first-boot
+        /// setup with no user-account concept yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
+    },
+}
+
+/// Wire-side flat shape for one entry in the plugin
+/// registry's list response. Mirrors
+/// [`crate::plugin_registry::RegistryRecord`] with the
+/// last-refreshed timestamp surfaced for operator status.
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginRegistryEntryWire {
+    /// Stable slug.
+    pub slug: String,
+    /// Manifest URL.
+    pub manifest_url: String,
+    /// Signature URL.
+    pub signature_url: String,
+    /// Pinned signing-key fingerprint.
+    pub public_key_fingerprint: String,
+    /// Effective polling interval in seconds (resolved
+    /// against the framework default if no per-registry
+    /// override).
+    pub poll_interval_secs: u64,
+    /// Wall-clock millisecond timestamp of the most recent
+    /// successful refresh; `None` when not yet refreshed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_refreshed_at_ms: Option<u64>,
+    /// Number of plugin listings the cached manifest
+    /// currently contains; `None` when no manifest is
+    /// cached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_count: Option<u32>,
 }
 
 /// Wire form of one entry in [`ClientResponse::Watches`] and
@@ -1072,6 +3298,22 @@ struct HappeningFilterWire {
     /// Permitted shelf names; matched against `Happening::shelf()`.
     #[serde(default)]
     shelves: Vec<String>,
+    /// Permitted subject_type allow-list on
+    /// `Happening::SubjectStateChanged`. Empty: no filter on
+    /// the dimension. Non-empty: only state-changed events
+    /// whose `subject_type` is in the list pass; other
+    /// variants pass trivially.
+    #[serde(default)]
+    subject_types: Vec<String>,
+    /// Subject_type deny-list on
+    /// `Happening::SubjectStateChanged`. Non-empty:
+    /// state-changed events whose `subject_type` is in the
+    /// list are dropped. The dominant use case (UI consumers
+    /// dropping high-frequency subject types they don't
+    /// render — e.g. `audio_playback_spectrum_frame`) sets
+    /// only this dimension.
+    #[serde(default)]
+    subject_types_deny: Vec<String>,
 }
 
 impl From<HappeningFilterWire> for HappeningFilter {
@@ -1080,6 +3322,8 @@ impl From<HappeningFilterWire> for HappeningFilter {
             variants: w.variants,
             plugins: w.plugins,
             shelves: w.shelves,
+            subject_types: w.subject_types,
+            subject_types_deny: w.subject_types_deny,
         }
     }
 }
@@ -1152,6 +3396,53 @@ impl From<ProjectionScopeWire> for ProjectionScope {
     }
 }
 
+/// Wire-shape entry for the `list_domain_members` response.
+/// Composes the trust-ledger row with live discovery state and
+/// the local-vs-peer hint. Operator UIs render the domain
+/// roster from this shape directly.
+#[derive(Debug, Serialize)]
+pub struct DomainMemberEntry {
+    /// Canonical id of the domain member.
+    pub device_id: String,
+    /// Last-known display name (operator-set, observed-via-mDNS,
+    /// or the `evo-<short>` fallback when never observed).
+    pub display_name: String,
+    /// Wall-clock ms timestamp of admission, mirroring the
+    /// trust-ledger row.
+    pub admitted_at_ms: u64,
+    /// Canonical id of the device whose operator UI initiated
+    /// the admission. `None` for the seed device.
+    pub admitted_by_device_id: Option<String>,
+    /// `true` iff this entry is the local device.
+    pub is_local: bool,
+    /// `true` iff the device's mDNS-SD advert was observed
+    /// within the election liveness window. The
+    /// discovery-level signal: tight (default 60 s), drives
+    /// the operator-facing "Online/Offline" badge.
+    pub is_currently_advertising: bool,
+    /// `true` iff the device is currently exchanging
+    /// audio-plane heartbeats with this node within the
+    /// audio-plane heartbeat timeout (default 5 s). The
+    /// session-level signal: tighter than the discovery
+    /// signal, persists through audio pauses (heartbeat ticks
+    /// run independent of frame flow), and is what election
+    /// actually uses to decide which peers are electable. UI
+    /// surfaces gate leader-modifying affordances
+    /// (Make-leader / Move / Pin) on this rather than on
+    /// `is_currently_advertising` so the action availability
+    /// matches what election will actually accept. Always
+    /// `true` for the local device (the local node is, by
+    /// definition, session-connected to itself).
+    pub is_session_connected: bool,
+    /// Wall-clock ms timestamp of the most recent advert
+    /// observed for this device. `0` when never observed;
+    /// always `> 0` for the local-device entry.
+    pub last_seen_ms: u64,
+    /// `true` iff `revoked_at_ms` is set on the trust-ledger
+    /// row.
+    pub is_revoked: bool,
+}
+
 // ---------------------------------------------------------------------
 // Wire types - responses
 // ---------------------------------------------------------------------
@@ -1163,6 +3454,17 @@ impl From<ProjectionScopeWire> for ProjectionScope {
 /// projections, `result`+`subject_id` for `describe_alias`,
 /// `active_custodies` for the ledger snapshot, `error` for
 /// failures).
+/// One row of the `list_device_roles` response — a
+/// `(device_id, role)` pair where `role` is the stable
+/// kebab-case string (`source` / `receiver` / `auto`).
+#[derive(Debug, Serialize)]
+pub struct DeviceRoleEntry {
+    /// Canonical device id.
+    pub device_id: String,
+    /// Operator-declared role for this device.
+    pub role: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum ClientResponse {
@@ -1227,8 +3529,13 @@ enum ClientResponse {
         wire_version: u16,
         /// Names of supported ops. Stable across releases — new ops
         /// are appended; existing ops are never renamed or removed
-        /// without a wire version bump.
-        ops: Vec<&'static str>,
+        /// without a wire version bump. Derived from the canonical
+        /// wire-op schema in `crate::projection_schema::canonical_schema`
+        /// via `crate::projection_schema::runtime_op_ids`, so the
+        /// list cannot drift from the schema registry consumers
+        /// (schema-first generators, projection-layer annotations,
+        /// schema-discipline tests) read.
+        ops: Vec<String>,
         /// Named features. A consumer probes for `"feature_name"` in
         /// this list to decide whether to use the corresponding
         /// behaviour. Names are stable.
@@ -1246,6 +3553,18 @@ enum ClientResponse {
         /// drift compensators, OAuth refresh handlers) treat
         /// values other than `"trusted"` as defer-conditions.
         clock_trust: &'static str,
+        /// Most recently detected wall-clock jump (NTP step
+        /// beyond CLOCK_JUMP_THRESHOLD_SECS). `None` when no
+        /// jump has been observed since the current steward
+        /// boot. Populated durably so an operator polling this
+        /// capability after a large adjustment sees the
+        /// magnitude even after the tracker has returned from
+        /// the transient `Adjusting` state to `Trusted`.
+        /// Consumers wanting a change-driven stream instead of a
+        /// snapshot subscribe to the durable `ClockAdjusted`
+        /// happening.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_clock_step: Option<crate::time_trust::LastClockStep>,
         /// Whether the device has a battery-backed real-time
         /// clock. When `false`, the framework treats every boot
         /// as `Untrusted` until the OS time-sync daemon
@@ -1338,6 +3657,43 @@ enum ClientResponse {
         /// Bus cursor at subscribe time. `0` if no happenings
         /// have been emitted on this steward instance yet.
         current_seq: u64,
+        /// Initial projection payload carried inline when the
+        /// request set `snapshot_in_ack = true`. When present,
+        /// the follow-up `ProjectionUpdate` at `seq = 0` is
+        /// suppressed and this field is authoritative for the
+        /// subject's initial state. Absent (`null`) for legacy
+        /// consumers that did not opt in — those consumers
+        /// continue to receive the initial state via the
+        /// separate `ProjectionUpdate` at `seq = 0`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_projection: Option<serde_json::Value>,
+    },
+    /// Application-level keepalive frame on a
+    /// `SubscribeHappenings` subscription. Distinguished by the
+    /// top-level `happenings_keepalive` key. Emitted only when
+    /// the subscribe request set `keepalive_ms`. Carries the
+    /// server's wall-clock timestamp so consumers can compute
+    /// cadence drift; the frame carries no happenings payload.
+    HappeningsKeepalive {
+        /// Always `true`; key disambiguates the variant.
+        happenings_keepalive: bool,
+        /// Server wall-clock milliseconds at emit time.
+        ts_ms: u64,
+    },
+    /// Application-level keepalive frame on a `SubscribeSubject`
+    /// subscription. Distinguished by the top-level
+    /// `subject_keepalive` key. Emitted only when the subscribe
+    /// request set `keepalive_ms`. Carries the canonical id (so
+    /// a client multiplexing multiple subject subscriptions can
+    /// attribute the frame) plus the server's wall-clock
+    /// timestamp.
+    SubjectKeepalive {
+        /// Always `true`; key disambiguates the variant.
+        subject_keepalive: bool,
+        /// Canonical id of the subject this keepalive belongs to.
+        canonical_id: String,
+        /// Server wall-clock milliseconds at emit time.
+        ts_ms: u64,
     },
     /// One projection update from a `SubscribeSubject` stream.
     /// The first update is the initial projection; subsequent
@@ -1541,6 +3897,15 @@ enum ClientResponse {
         plugin: String,
         /// Echoes the request's prompt_id.
         prompt_id: String,
+    },
+    /// Acknowledgement of a `release_user_interaction_responder`
+    /// op. Distinguished by the top-level
+    /// `responder_released` key. Always `true` — the op is
+    /// idempotent and the post-condition (this bearer no longer
+    /// holds the slot) holds regardless of prior state.
+    UserInteractionResponderReleased {
+        /// Always `true`; the distinctive top-level key.
+        responder_released: bool,
     },
     /// Acknowledgement of a `create_appointment` op. Distinguished
     /// by the top-level `appointment_created` key.
@@ -1758,6 +4123,1343 @@ enum ClientResponse {
         /// Canonical plugin name (echoed).
         plugin: String,
     },
+    /// Successful response to [`ClientRequest::FirePlan`]. The
+    /// fire is asynchronous: the segment-execution loop runs on
+    /// a detached task. This response confirms the fire was
+    /// scheduled — observable progress lands on the happenings
+    /// bus (segment-entered, audio-playback-ended, plan-
+    /// completed) for consumers that want to track execution.
+    PlanFired {
+        /// Always `true`; the distinctive top-level key.
+        plan_fired: bool,
+        /// Plan id (echoed).
+        plan_id: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::InstallPluginFromUrl`]. The bundle has
+    /// been fetched and written into the stage directory.
+    /// Admission is asynchronous on the stage watcher's next
+    /// polling tick; consumers that want to track the install
+    /// outcome subscribe to the happenings bus and watch for
+    /// the corresponding admission events.
+    PluginInstallStaged {
+        /// Always `true`; the distinctive top-level key.
+        plugin_install_staged: bool,
+        /// URL the bundle was fetched from (echoed).
+        url: String,
+        /// Filesystem path the bundle was written to inside
+        /// the stage directory. The watcher's next tick picks
+        /// it up.
+        staged_path: String,
+        /// Bytes fetched from the URL.
+        bytes_fetched: u64,
+    },
+    /// Successful response to
+    /// [`ClientRequest::RegisterPluginRegistry`].
+    PluginRegistryRegistered {
+        /// Always `true`; the distinctive top-level key.
+        plugin_registry_registered: bool,
+        /// Slug of the registered registry (echoed).
+        slug: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::UnregisterPluginRegistry`].
+    PluginRegistryUnregistered {
+        /// Always `true`; the distinctive top-level key.
+        plugin_registry_unregistered: bool,
+        /// Slug forgotten (echoed).
+        slug: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ListPluginRegistries`]. One entry
+    /// per registered registry in slug order.
+    PluginRegistries {
+        /// Always `true`; the distinctive top-level key.
+        plugin_registries: bool,
+        /// Per-registry entries.
+        entries: Vec<PluginRegistryEntryWire>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::RefreshPluginRegistry`].
+    PluginRegistryRefreshed {
+        /// Always `true`; the distinctive top-level key.
+        plugin_registry_refreshed: bool,
+        /// Slug refreshed (echoed).
+        slug: String,
+        /// Wall-clock millisecond timestamp of the refresh.
+        refreshed_at_ms: u64,
+        /// Number of plugin listings the manifest contains.
+        plugin_count: u32,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GrantPublisherTrust`].
+    PublisherTrustGranted {
+        /// Always `true`; the distinctive top-level key.
+        publisher_trust_granted: bool,
+        /// Publisher fingerprint (echoed).
+        publisher_id: String,
+        /// Filesystem path of the materialised key file under
+        /// the operator trust directory.
+        key_file: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::RevokePublisherTrust`].
+    PublisherTrustRevoked {
+        /// Always `true`; the distinctive top-level key.
+        publisher_trust_revoked: bool,
+        /// Publisher fingerprint (echoed).
+        publisher_id: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ListPublisherTrust`]. One entry per
+    /// recorded publisher in fingerprint order.
+    PublisherTrust {
+        /// Always `true`; the distinctive top-level key.
+        publisher_trust: bool,
+        /// Per-publisher entries.
+        entries: Vec<PublisherTrustEntryWire>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::RevokePluginCapability`].
+    PluginCapabilityRevoked {
+        /// Always `true`; the distinctive top-level key.
+        plugin_capability_revoked: bool,
+        /// Echo of the plugin canonical name.
+        plugin_name: String,
+        /// Echo of the revoked capability.
+        capability: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::UnrevokePluginCapability`].
+    PluginCapabilityUnrevoked {
+        /// Always `true`; the distinctive top-level key.
+        plugin_capability_unrevoked: bool,
+        /// Echo of the plugin canonical name.
+        plugin_name: String,
+        /// Echo of the un-revoked capability.
+        capability: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ListPluginCapabilityRevocations`] /
+    /// [`ClientRequest::ListAllCapabilityRevocations`].
+    PluginCapabilityRevocations {
+        /// Always `true`; the distinctive top-level key.
+        plugin_capability_revocations: bool,
+        /// Per-revocation entries.
+        entries: Vec<CapabilityRevocationWire>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ExportMigrationBundle`]. Carries the
+    /// bundle TOML document.
+    MigrationBundleExported {
+        /// Always `true`; the distinctive top-level key.
+        migration_bundle_exported: bool,
+        /// The bundle as a TOML document. The operator can write
+        /// the string verbatim to a file and feed it into
+        /// `import_migration_bundle` on a target device.
+        bundle_toml: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ImportMigrationBundle`]. Carries a
+    /// summary of the applied sections so the operator sees the
+    /// shape of the change at a glance.
+    MigrationBundleImported {
+        /// Always `true`; the distinctive top-level key.
+        migration_bundle_imported: bool,
+        /// Number of update-channel rows applied.
+        update_channels_applied: u32,
+        /// Number of plugin-tag rows applied.
+        plugin_tags_applied: u32,
+        /// Number of profile rows applied.
+        plugin_profiles_applied: u32,
+        /// Active profile id after import (or `None` if cleared).
+        active_profile_id: Option<String>,
+        /// Number of admission-policy rows applied.
+        admission_policies_applied: u32,
+        /// Active policy id after import (or `None` if cleared).
+        active_policy_id: Option<String>,
+        /// Number of capability-revocation rows applied.
+        capability_revocations_applied: u32,
+    },
+    /// Successful response to
+    /// [`ClientRequest::PutHardwareProfileOverride`].
+    HardwareProfileOverridePut {
+        /// Always `true`; the distinctive top-level key.
+        hardware_profile_override_put: bool,
+        /// Echo of the canonical identity key the override
+        /// was recorded under.
+        key: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::DeleteHardwareProfileOverride`].
+    HardwareProfileOverrideDeleted {
+        /// Always `true`; the distinctive top-level key.
+        hardware_profile_override_deleted: bool,
+        /// Echo of the canonical identity key.
+        key: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GetHardwareProfileOverride`] /
+    /// [`ClientRequest::ListHardwareProfileOverrides`].
+    HardwareProfileOverrides {
+        /// Always `true`; the distinctive top-level key.
+        hardware_profile_overrides: bool,
+        /// Per-override entries. The `Get` variant returns at
+        /// most one entry; `List` returns every recorded
+        /// override.
+        entries: Vec<crate::hardware_profile::HardwareProfileOverrideRecord>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::PutAudioOperatorPolicy`].
+    AudioOperatorPolicyPut {
+        /// Always `true`; the distinctive top-level key.
+        audio_operator_policy_put: bool,
+        /// Echo of the canonical target key.
+        target_key: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::DeleteAudioOperatorPolicy`].
+    AudioOperatorPolicyDeleted {
+        /// Always `true`; the distinctive top-level key.
+        audio_operator_policy_deleted: bool,
+        /// Echo of the canonical target key.
+        target_key: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GetAudioOperatorPolicy`] /
+    /// [`ClientRequest::ListAudioOperatorPolicies`].
+    AudioOperatorPolicies {
+        /// Always `true`; the distinctive top-level key.
+        audio_operator_policies: bool,
+        /// Per-policy entries. The `Get` variant returns at
+        /// most one entry; `List` returns every recorded
+        /// policy.
+        entries: Vec<crate::audio_policy::AudioOperatorPolicyRecord>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::PutAudioVolumeMode`].
+    AudioVolumeModePut {
+        /// Always `true`; the distinctive top-level key.
+        audio_volume_mode_put: bool,
+        /// Echo of the canonical target key.
+        target_key: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::DeleteAudioVolumeMode`].
+    AudioVolumeModeDeleted {
+        /// Always `true`; the distinctive top-level key.
+        audio_volume_mode_deleted: bool,
+        /// Echo of the canonical target key.
+        target_key: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GetAudioVolumeMode`] /
+    /// [`ClientRequest::ListAudioVolumeModes`].
+    AudioVolumeModes {
+        /// Always `true`; the distinctive top-level key.
+        audio_volume_modes: bool,
+        /// Per-volume-mode entries. The `Get` variant returns
+        /// at most one entry; `List` returns every recorded
+        /// volume mode.
+        entries: Vec<crate::audio_policy::AudioVolumeModeRecord>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::PublishActiveAudioTopology`].
+    ActiveAudioTopologyPublished {
+        /// Always `true`; the distinctive top-level key.
+        active_audio_topology_published: bool,
+        /// Echo of the canonical target key.
+        target_key: String,
+        /// Echo of the bit-perfect verdict.
+        bit_perfect: bool,
+        /// Echo of the score total.
+        score_total: i32,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ClearActiveAudioTopology`].
+    ActiveAudioTopologyCleared {
+        /// Always `true`; the distinctive top-level key.
+        active_audio_topology_cleared: bool,
+        /// Echo of the canonical target key.
+        target_key: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GetActiveAudioTopology`] /
+    /// [`ClientRequest::ListActiveAudioTopologies`].
+    ActiveAudioTopologies {
+        /// Always `true`; the distinctive top-level key.
+        active_audio_topologies: bool,
+        /// Per-topology entries. The `Get` variant returns at
+        /// most one entry; `List` returns every published
+        /// topology.
+        entries: Vec<crate::audio_topology::ActiveAudioTopology>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GetPluginHealth`]. Carries the
+    /// aggregate snapshot.
+    PluginHealth {
+        /// Always `true`; the distinctive top-level key.
+        plugin_health: bool,
+        /// Aggregate snapshot.
+        snapshot: crate::plugin_health::PluginHealth,
+    },
+    /// Successful response to
+    /// [`ClientRequest::PreviewDependencyCascade`]. Returns
+    /// the transitive set of admitted plugins whose admission
+    /// would break if the target plugin were disabled.
+    DependencyCascade {
+        /// Always `true`; the distinctive top-level key.
+        dependency_cascade: bool,
+        /// Echo of the plugin canonical name.
+        plugin_name: String,
+        /// Transitive dependents in BFS-discovery order
+        /// (outermost first). Empty when no admitted plugin
+        /// declares the target as a required dependency.
+        dependents: Vec<String>,
+    },
+    /// Variant of
+    /// [`ClientResponse::PluginLifecycle`] used by the cascade
+    /// disable path: carries the per-plugin transition outcome
+    /// for every plugin transitioned (target + dependents).
+    PluginLifecycleCascaded {
+        /// Always `true`; the distinctive top-level key.
+        plugin_lifecycle_cascaded: bool,
+        /// Plugins that were disabled, in
+        /// BFS-discovery order (dependents first, target
+        /// last).
+        disabled: Vec<String>,
+        /// Per-plugin failure detail. Empty when every
+        /// transition succeeded.
+        failed: Vec<BulkLifecycleFailureWire>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::PutAdmissionPolicy`].
+    AdmissionPolicyPut {
+        /// Always `true`; the distinctive top-level key.
+        admission_policy_put: bool,
+        /// Echo of the upserted policy id.
+        policy_id: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GetAdmissionPolicy`]. `Some` when the
+    /// policy exists; absent when not.
+    AdmissionPolicy {
+        /// Always `true`; the distinctive top-level key.
+        admission_policy: bool,
+        /// Policy body. `None` when no policy with the
+        /// requested id exists.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        policy: Option<AdmissionPolicyWire>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ListAdmissionPolicies`].
+    AdmissionPolicies {
+        /// Always `true`; the distinctive top-level key.
+        admission_policies: bool,
+        /// Per-policy entries.
+        entries: Vec<AdmissionPolicyWire>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::DeleteAdmissionPolicy`].
+    AdmissionPolicyDeleted {
+        /// Always `true`; the distinctive top-level key.
+        admission_policy_deleted: bool,
+        /// Echo of the policy id.
+        policy_id: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::SetActiveAdmissionPolicy`].
+    ActiveAdmissionPolicySet {
+        /// Always `true`; the distinctive top-level key.
+        active_admission_policy_set: bool,
+        /// Echo of the policy id, or `None` when the active
+        /// flag was cleared.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        policy_id: Option<String>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::AuditAgainstPolicy`]. Per-plugin
+    /// violations in plugin-name-ascending order.
+    AdmissionPolicyAudit {
+        /// Always `true`; the distinctive top-level key.
+        admission_policy_audit: bool,
+        /// Policy id audited.
+        policy_id: String,
+        /// Per-plugin violations.
+        violations: Vec<AdmissionPolicyViolationWire>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ListPluginsWhere`].
+    PluginsMatching {
+        /// Always `true`; the distinctive top-level key.
+        plugins_matching: bool,
+        /// Canonical names of plugins matched by the filter.
+        /// Order is plugin-name-ascending for deterministic
+        /// rendering.
+        names: Vec<String>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::DisablePluginsWhere`] /
+    /// [`ClientRequest::EnablePluginsWhere`]. Carries the
+    /// per-plugin transition outcomes so the operator surface
+    /// can render which transitions succeeded and which failed.
+    PluginsBulkLifecycle {
+        /// Always `true`; the distinctive top-level key.
+        plugins_bulk_lifecycle: bool,
+        /// Canonical names of plugins whose transition succeeded.
+        succeeded: Vec<String>,
+        /// Per-plugin failure detail. Empty when every
+        /// transition succeeded.
+        failed: Vec<BulkLifecycleFailureWire>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::SetPluginTag`].
+    PluginTagSet {
+        /// Always `true`; the distinctive top-level key.
+        plugin_tag_set: bool,
+        /// Echo of the plugin canonical name.
+        plugin_name: String,
+        /// Echo of the tag.
+        tag: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::DeletePluginTag`].
+    PluginTagDeleted {
+        /// Always `true`; the distinctive top-level key.
+        plugin_tag_deleted: bool,
+        /// Echo of the plugin canonical name.
+        plugin_name: String,
+        /// Echo of the tag.
+        tag: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ListPluginTags`]. Tags applied to one
+    /// plugin in tag-ascending order.
+    PluginTags {
+        /// Always `true`; the distinctive top-level key.
+        plugin_tags: bool,
+        /// Echo of the plugin canonical name.
+        plugin_name: String,
+        /// Tags applied to this plugin.
+        tags: Vec<PluginTagEntryWire>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::PutPluginProfile`].
+    PluginProfilePut {
+        /// Always `true`; the distinctive top-level key.
+        plugin_profile_put: bool,
+        /// Echo of the upserted profile id.
+        profile_id: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GetPluginProfile`]. `Some` when the
+    /// profile exists; absent (the consumer treats absence as
+    /// not-found) when no profile with the id has been
+    /// recorded.
+    PluginProfile {
+        /// Always `true`; the distinctive top-level key.
+        plugin_profile: bool,
+        /// Profile body. `None` when no profile with the
+        /// requested id exists.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        profile: Option<PluginProfileWire>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ListPluginProfiles`]. One entry per
+    /// recorded profile (metadata only).
+    PluginProfiles {
+        /// Always `true`; the distinctive top-level key.
+        plugin_profiles: bool,
+        /// Per-profile entries.
+        entries: Vec<PluginProfileWire>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::DeletePluginProfile`]. Idempotent;
+    /// `removed = false` means the id was not present.
+    PluginProfileDeleted {
+        /// Always `true`; the distinctive top-level key.
+        plugin_profile_deleted: bool,
+        /// Echo of the profile id.
+        profile_id: String,
+        /// `true` when an existing profile was removed;
+        /// `false` when the id was already absent.
+        removed: bool,
+    },
+    /// Successful response to
+    /// [`ClientRequest::SetActivePluginProfile`]. Carries the
+    /// per-plugin transition plan that was either dispatched
+    /// (`dry_run = false`) or computed and returned without
+    /// mutation (`dry_run = true`).
+    ActivePluginProfileSet {
+        /// Always `true`; the distinctive top-level key.
+        active_plugin_profile_set: bool,
+        /// Activation outcome (per-plugin transition plan).
+        /// `None` for the clear-active call (no profile is
+        /// flagged active afterward).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        outcome: Option<ProfileActivationOutcomeWire>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::SetUpdateChannel`].
+    UpdateChannelSet {
+        /// Always `true`; the distinctive top-level key.
+        update_channel_set: bool,
+        /// Echo of the update target whose preference was set.
+        target: String,
+        /// Echo of the channel value recorded.
+        channel: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GetUpdateChannels`]. One entry per target
+    /// with a recorded preference; ordering is target-ascending
+    /// for deterministic operator-surface rendering.
+    UpdateChannels {
+        /// Always `true`; the distinctive top-level key.
+        update_channels: bool,
+        /// Per-target entries; empty when no preferences have
+        /// been recorded.
+        entries: Vec<UpdateChannelEntryWire>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::DescribeUiStockings`]. One entry per
+    /// (plugin, stocking) pair across every admitted plugin,
+    /// or filtered to the named shelf when the request set
+    /// `shelf_filter`. Ordering is `plugin` then `ui_shelf`
+    /// then declaration order — deterministic for operator
+    /// surfaces that group rows.
+    /// Successful response to
+    /// [`ClientRequest::RecordWizardStepCompletion`]. Carries
+    /// the step id that was acknowledged so renderers driving
+    /// multiple in-flight wizards (e.g. operator vs. developer)
+    /// route the acknowledgement to the right state.
+    WizardStepCompletionRecorded {
+        /// Always `true`; the distinctive top-level key.
+        wizard_step_completion_recorded: bool,
+        /// Echoes the acknowledged step id.
+        step_id: String,
+    },
+    UiStockings {
+        /// Always `true`; the distinctive top-level key.
+        ui_stockings: bool,
+        /// Per-stocking entries; empty when no UI surface is
+        /// admitted (or the shelf filter matched nothing).
+        entries: Vec<UiStockingEntryWire>,
+        /// Declared shelf contracts the framework knows about.
+        /// Empty when the boot wiring did not install a shelf-
+        /// registry handle on the admitted-stockings store
+        /// (test harnesses); populated with every registered
+        /// shelf (Tier 1 universals plus any vendor-tier
+        /// additions) on the shipped binary. Schema-first UIs
+        /// consume this alongside `entries` to drive
+        /// cardinality enforcement, accepted-widgets glob
+        /// matching, size picking, and layout selection.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        shelves: Vec<evo_plugin_sdk::ui::ShelfContract>,
+        /// Declared widget-kind envelopes. Empty when the boot
+        /// wiring did not install a widget-kind-registry handle
+        /// on the admitted-stockings store; populated with every
+        /// registered widget kind (Tier 1 universals plus any
+        /// vendor `widget_kind_pack` artefacts). Renderers
+        /// consume the per-widget-kind size envelope — min,
+        /// ideal, and max sizes alongside the responsive
+        /// breakpoint table, aspect ratio, and render mode — to
+        /// pick the active size at each breakpoint and validate
+        /// stocking compatibility.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        widget_kinds: Vec<evo_plugin_sdk::ui::WidgetKindEnvelope>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ActivateTheme`] or
+    /// [`ClientRequest::ActivateUiShell`]. Echoes the slot
+    /// the activation targeted plus the active plugin name
+    /// after the call (`None` indicates the slot was cleared
+    /// or a clear-on-already-clear no-op).
+    ActiveUiSelectionSet {
+        /// Always `true`; the distinctive top-level key.
+        active_ui_selection_set: bool,
+        /// Slot that was set (`"theme"` or `"ui_shell"`).
+        slot: String,
+        /// Active plugin name after the call, or `null` when
+        /// the slot was cleared.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        active_plugin_name: Option<String>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::DescribeActiveUiSelection`]. Carries
+    /// the active theme + active UI shell plugin names; each
+    /// is `null` when the slot has no active selection.
+    ActiveUiSelection {
+        /// Always `true`; the distinctive top-level key.
+        active_ui_selection: bool,
+        /// Active theme plugin name, or `null` when no theme
+        /// is active.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        theme: Option<String>,
+        /// Active UI shell plugin name, or `null` when no
+        /// shell is active.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ui_shell: Option<String>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::StepUpAuthVerify`]. The privileged
+    /// session token is presented on subsequent privileged ops
+    /// in their `step_up_token` field. The token is bound to the
+    /// verifying peer's UID and reaped on TTL expiry; the server
+    /// does not persist it (a steward restart invalidates every
+    /// active session).
+    StepUpAuthIssued {
+        /// Always `true`; the distinctive top-level key.
+        step_up_auth_issued: bool,
+        /// URL-safe base64 token. Treat as sensitive — anyone in
+        /// possession of this string can act as the verified
+        /// operator until expiry.
+        token: String,
+        /// Wall-clock millisecond timestamp at which the session
+        /// expires. Capped at the framework ceiling regardless
+        /// of the requested TTL.
+        expires_at_ms: u64,
+        /// Verified principal's username (echoed for operator
+        /// surfaces that render "logged in as ...").
+        principal_username: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::StepUpAuthRevoke`]. `revoked = false`
+    /// means the token was unknown or already expired; the call
+    /// is idempotent and never errors.
+    StepUpAuthRevoked {
+        /// Always `true`; the distinctive top-level key.
+        step_up_auth_revoked: bool,
+        /// `true` when an active session was removed; `false`
+        /// when the token was unknown or already expired.
+        revoked: bool,
+    },
+    /// Successful response to
+    /// [`ClientRequest::MintBearerToken`]. The encoded bearer
+    /// token is the operator's session credential for the HTTPS
+    /// / WS substrate — present it as
+    /// `Authorization: Bearer <token>` on REST calls or as the
+    /// `Sec-WebSocket-Protocol: evo.bearer.<token>` subprotocol
+    /// on WS upgrades. Treat the encoded string as sensitive;
+    /// anyone in possession can act as the operator until
+    /// expiry. Issuance is recorded in the steward's observatory
+    /// as a `bearer_token_issued` observation.
+    BearerTokenMinted {
+        /// Always `true`; the distinctive top-level key.
+        bearer_token_minted: bool,
+        /// Encoded bearer token, ed25519-signed by the steward's
+        /// per-device signing key. URL-safe payload, suitable
+        /// for direct HTTP / WS header use.
+        token: String,
+        /// Wall-clock millisecond timestamp at which the token
+        /// expires. Tokens past this stamp are refused by the
+        /// validator on every projection layer.
+        expires_at_ms: u64,
+        /// 128-bit token id (URL-safe base64). Recorded in the
+        /// audit observation; operators wanting to revoke a
+        /// specific token reference it by this id.
+        token_id: String,
+        /// Audit-trail differentiator for the issuance source.
+        /// Always `"cli"` for this wire op — the developer /
+        /// recovery path of the trust substrate.
+        source: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::CreateBearerToken`]. Carries the
+    /// minted token bytes plus the persisted credential record
+    /// metadata. The credential record is also indexed in
+    /// `list_bearer_tokens` output.
+    BearerTokenCreated {
+        /// Always `true`; the distinctive top-level key.
+        bearer_token_created: bool,
+        /// Encoded bearer token. Returned once at create time
+        /// only; never persisted by the framework.
+        token: String,
+        /// The persisted credential record.
+        record: evo_auth_bearer::CredentialRecord,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ListBearerTokens`]. Returns the full
+    /// inventory of credential records — never the token
+    /// bytes themselves.
+    BearerTokensListed {
+        /// Always `true`; the distinctive top-level key.
+        bearer_tokens_listed: bool,
+        /// The inventory.
+        records: Vec<evo_auth_bearer::CredentialRecord>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::RevokeBearerToken`]. Carries the
+    /// post-revoke record (with `revoked_at_ms` /
+    /// `revoked_reason` set) so the operator confirms the
+    /// state transition without a follow-up list.
+    BearerTokenRevoked {
+        /// Always `true`; the distinctive top-level key.
+        bearer_token_revoked: bool,
+        /// The credential record after revocation.
+        record: evo_auth_bearer::CredentialRecord,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ResetCredentialsToOpen`]. Reports the
+    /// number of records purged and revocations cleared. The
+    /// operator restarts the steward to pick up the
+    /// `Open`-tier admission policy on the next boot.
+    CredentialsResetToOpen {
+        /// Always `true`; the distinctive top-level key.
+        credentials_reset_to_open: bool,
+        /// Count of records removed from the inventory.
+        records_purged: usize,
+        /// Count of revocations cleared from the persisted
+        /// `revoked.json`.
+        revocations_cleared: usize,
+    },
+    /// Successful response to [`ClientRequest::CredentialPut`].
+    /// Reports the stored key's hash so the UI can correlate
+    /// with subsequent listings; never returns the value.
+    CredentialStored {
+        /// Always `true`; the distinctive top-level key.
+        credential_stored: bool,
+        /// Plugin canonical id the credential is scoped to.
+        plugin_id: String,
+        /// Hex-encoded SHA-256 of the operator-visible key.
+        key_hash: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::CredentialDelete`]. Reports the
+    /// key_hash of the deleted entry (or the entry that would
+    /// have been deleted — the op is idempotent).
+    CredentialDeleted {
+        /// Always `true`; the distinctive top-level key.
+        credential_deleted: bool,
+        /// Plugin canonical id the credential is scoped to.
+        plugin_id: String,
+        /// Hex-encoded SHA-256 of the operator-visible key.
+        key_hash: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::CredentialListKeys`]. Returns per-entry
+    /// key_hash + metadata + timestamps. Never returns values.
+    CredentialListing {
+        /// Always `true`; the distinctive top-level key.
+        credential_listing: bool,
+        /// Plugin canonical id the inventory is scoped to.
+        plugin_id: String,
+        /// Ordered listing (key_hash ascending).
+        entries: Vec<CredentialListingEntry>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::OnlineProvidersList`]. Returns every
+    /// registered provider ordered (priority ascending,
+    /// provider_id ascending).
+    OnlineProvidersListing {
+        /// Always `true`; the distinctive top-level key.
+        online_providers_listing: bool,
+        /// One entry per registered provider.
+        entries: Vec<OnlineProviderEntry>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::OnlineProvidersSetEnabled`] or
+    /// [`ClientRequest::OnlineProvidersSetPriority`]. Reports
+    /// the post-mutation state so the operator UI can render
+    /// the new setting without a follow-on list.
+    OnlineProviderUpdated {
+        /// Always `true`; the distinctive top-level key.
+        online_provider_updated: bool,
+        /// The provider that was mutated.
+        provider_id: String,
+        /// Post-update enable flag.
+        enabled: bool,
+        /// Post-update priority.
+        priority: i32,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GetDeviceIdentity`] /
+    /// [`ClientRequest::SetDeviceDisplayName`]. Returns the
+    /// full identity record — the `Set` variant returns the
+    /// post-update state.
+    DeviceIdentity {
+        /// Always `true`; the distinctive top-level key.
+        device_identity: bool,
+        /// The current identity record.
+        identity: evo_primitives::DeviceIdentity,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ListDiscoveredPeers`]. Returns the
+    /// peer set last-seen-ms descending — most-recently-
+    /// observed first.
+    DiscoveredPeers {
+        /// Always `true`; the distinctive top-level key.
+        discovered_peers: bool,
+        /// Per-peer entries.
+        entries: Vec<crate::discovery::DiscoveredPeer>,
+    },
+    /// Successful response to [`ClientRequest::RosterSnap`].
+    /// Carries the snap-level summary plus the per-peer
+    /// presents / gones lists. The composing snap also fans
+    /// out a `RosterSnapped` happening summarising the same
+    /// counts so concurrent UIs subscribed to the durable
+    /// bus converge without each issuing its own snap.
+    RosterSnap {
+        /// Always `true`; the distinctive top-level key.
+        roster_snap: bool,
+        /// The composed snap result.
+        result: crate::roster_snap::RosterSnap,
+    },
+    /// Successful response to
+    /// [`ClientRequest::CreateGroup`] /
+    /// [`ClientRequest::GetGroup`] /
+    /// [`ClientRequest::RenameGroup`] /
+    /// [`ClientRequest::AddGroupMember`] /
+    /// [`ClientRequest::RemoveGroupMember`].
+    Group {
+        /// Always `true`; the distinctive top-level key.
+        group: bool,
+        /// The group record (post-update for write paths).
+        record: crate::groups::Group,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ListGroups`].
+    Groups {
+        /// Always `true`; the distinctive top-level key.
+        groups: bool,
+        /// Every recorded group with full membership.
+        entries: Vec<crate::groups::Group>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GetDeviceRole`] /
+    /// [`ClientRequest::SetDeviceRole`] /
+    /// [`ClientRequest::ClearDeviceRole`].
+    DeviceRole {
+        /// Always `true`; the distinctive top-level key.
+        device_role: bool,
+        /// Canonical device id.
+        device_id: String,
+        /// Role as a stable string (`source` / `receiver` /
+        /// `auto`). Reads return `auto` for devices with no
+        /// explicit row in the substrate.
+        role: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ListDeviceRoles`]. Enumerates every
+    /// device with an explicit operator-gestured role;
+    /// devices in the substrate-empty / `auto` default are
+    /// NOT included.
+    DeviceRoles {
+        /// Always `true`; the distinctive top-level key.
+        device_roles: bool,
+        /// Per-device `(device_id, role)` pairs sorted by
+        /// device_id ascending.
+        entries: Vec<DeviceRoleEntry>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::PluginReload`] /
+    /// [`ClientRequest::PluginRestore`]. Acknowledges the
+    /// operator gesture was accepted; the resulting reload /
+    /// restore cycle's outcome surfaces via happenings.
+    PluginLifecycleAck {
+        /// Always `true`; the distinctive top-level key.
+        plugin_lifecycle_ack: bool,
+        /// Canonical plugin name.
+        plugin_name: String,
+        /// The op that was acknowledged
+        /// (`plugin_reload` / `plugin_restore`).
+        op: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ReconnectPeer`]. Carries the storm
+    /// outcome: which carrier (if any) succeeded and how
+    /// long the storm took.
+    #[allow(clippy::struct_field_names)]
+    ReconnectStormOutcome {
+        /// Always `true`; the distinctive top-level key.
+        reconnect_storm_outcome: bool,
+        /// Echo of the peer device id.
+        device_id: String,
+        /// `true` when at least one carrier reached the peer;
+        /// `false` when every carrier exhausted.
+        reconnected: bool,
+        /// Carrier name that won the race when `reconnected`
+        /// is `true` (`cached-endpoint-dial` /
+        /// `subnet-sweep-tcp` / `mdns-targeted-query` /
+        /// `udp-broadcast-wake` / `audio-plane-hello`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        winning_carrier: Option<String>,
+        /// Wall-clock time the storm ran, in milliseconds.
+        elapsed_ms: u64,
+    },
+    /// Successful response to
+    /// [`ClientRequest::DeleteGroup`]. `removed = false`
+    /// when the group did not exist (idempotent).
+    GroupDeleted {
+        /// Always `true`; the distinctive top-level key.
+        group_deleted: bool,
+        /// Echo of the canonical group id.
+        group_id: String,
+        /// `true` when a row was removed; `false` when the
+        /// id was unknown.
+        removed: bool,
+    },
+    /// Outcome of `RemoveGroupMember` when the targeted device
+    /// is the current source-host AND the post-removal member
+    /// count would still be \u{2265} 2. The framework refuses
+    /// to auto-elect a successor; the operator UI uses the
+    /// payload to surface the explicit-successor picker.
+    LeaderSuccessorRequired {
+        /// Always `true`; the distinctive top-level key.
+        successor_required: bool,
+        /// Canonical id of the leader being removed.
+        departing_device_id: String,
+        /// Canonical ids the operator may pick as successor.
+        eligible_member_ids: Vec<String>,
+    },
+    /// Successful response to [`ClientRequest::MoveGroupMember`].
+    /// Carries both groups' post-move membership and the
+    /// `source_dissolved` flag so the operator UI can re-render
+    /// without an extra `list_groups` round-trip.
+    MoveOutcome {
+        /// Always `true`; the distinctive top-level key.
+        move_outcome: bool,
+        /// The move record.
+        record: crate::groups::MoveOutcome,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ListDomainMembers`]. The framework
+    /// projects the trust ledger composed with live discovery
+    /// state and the persistent display-name cache.
+    DomainMembers {
+        /// Always `true`; the distinctive top-level key.
+        domain_members: bool,
+        /// Per-device entries, ordered local-first → live
+        /// peers (last-seen descending) → offline paired
+        /// (admitted ascending) → revoked last.
+        entries: Vec<DomainMemberEntry>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::AdmitPeerToDomain`] /
+    /// [`ClientRequest::RevokePeerFromDomain`]. Returns the
+    /// trust-ledger row post-update.
+    DomainMember {
+        /// Always `true`; the distinctive top-level key.
+        domain_member: bool,
+        /// The trust-ledger row.
+        record: crate::trust_ledger::DomainMember,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GetChainHead`]. Reports the
+    /// current domain witness chain head + length.
+    ChainHead {
+        /// Always `true`; the distinctive top-level key.
+        chain_head: bool,
+        /// Base64-encoded SHA-256 of the canonical encoding
+        /// of the most recent witness, or the zero hash
+        /// when the chain is empty.
+        head_hash_b64: String,
+        /// Number of entries currently in the chain.
+        chain_length: usize,
+    },
+    /// Successful response to
+    /// [`ClientRequest::DomainHistory`]. Returns recent
+    /// chain entries in chronological order (oldest first
+    /// within the returned window).
+    DomainHistoryPage {
+        /// Always `true`; the distinctive top-level key.
+        domain_history: bool,
+        /// Chain entries in chronological order.
+        entries: Vec<evo_witness::DomainWitness>,
+        /// Total chain length (may exceed `entries.len()`
+        /// when the limit clipped the window).
+        chain_length: usize,
+    },
+    /// Successful response to
+    /// [`ClientRequest::BootstrapDomain`]. Carries the
+    /// genesis witness's id + the founder device's id so
+    /// the UI can record audit + render confirmation.
+    DomainBootstrapped {
+        /// Always `true`; the distinctive top-level key.
+        domain_bootstrapped: bool,
+        /// Witness id of the appended genesis entry.
+        witness_id: String,
+        /// Device id that signed the genesis (the founder).
+        founder_device_id: String,
+        /// Base64-encoded chain head after the genesis
+        /// append.
+        head_hash_b64: String,
+    },
+    /// Successful response to [`ClientRequest::JoinDomain`].
+    /// Confirms the gesture was recorded; admission still
+    /// requires a member of the target domain to call
+    /// `admit_peer_to_domain` for this device.
+    DomainJoinRequested {
+        /// Always `true`; the distinctive top-level key.
+        domain_join_requested: bool,
+        /// Endpoint the local device will dial when
+        /// supplied; `None` when the device is waiting for
+        /// announces passively.
+        endpoint: Option<String>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::LeaveDomain`]. Reports that the
+    /// chain and its projection were discarded; the operator
+    /// must restart the steward for in-process runtimes to
+    /// observe the reset.
+    DomainLeft {
+        /// Always `true`; the distinctive top-level key.
+        domain_left: bool,
+        /// Operator-readable note describing the post-
+        /// gesture state and the required restart.
+        note: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::FactoryResetDomain`]. Reports the
+    /// chain + signing key were discarded; steward
+    /// restart required.
+    DomainFactoryReset {
+        /// Always `true`; the distinctive top-level key.
+        domain_factory_reset: bool,
+        /// Operator-readable note describing the post-
+        /// gesture state and the required restart.
+        note: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::DiscardPeerFromDomain`]. Carries
+    /// the chain entry's witness id + a snapshot of the
+    /// projection-resolved domain-member row post-discard.
+    PeerDiscarded {
+        /// Always `true`; the distinctive top-level key.
+        peer_discarded: bool,
+        /// Witness id of the appended discard entry.
+        witness_id: String,
+        /// Device id that was discarded.
+        device_id: String,
+    },
+    /// Successful response to [`ClientRequest::MoveMember`].
+    MemberMoved {
+        /// Always `true`; the distinctive top-level key.
+        member_moved: bool,
+        /// Witness id of the appended move entry.
+        witness_id: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::SetGroupLeader`].
+    GroupLeaderSet {
+        /// Always `true`; the distinctive top-level key.
+        group_leader_set: bool,
+        /// Witness id of the appended leader-handoff entry.
+        witness_id: String,
+    },
+    /// Successful response to [`ClientRequest::ExportChain`].
+    /// Carries the full chain in chronological order; the
+    /// caller serialises the artefact (e.g. into a QR code)
+    /// for out-of-band transport.
+    ChainExport {
+        /// Always `true`; the distinctive top-level key.
+        chain_export: bool,
+        /// Chain entries in chronological order.
+        entries: Vec<evo_witness::DomainWitness>,
+        /// Current chain head hash (sanity check for the
+        /// receiver — head must match `canonical_hash` of
+        /// the last entry).
+        head_hash_b64: String,
+    },
+    /// Successful response to [`ClientRequest::ImportChain`].
+    /// Reports how many entries were applied vs already-
+    /// known + first-error position if any.
+    ChainImport {
+        /// Always `true`; the distinctive top-level key.
+        chain_import: bool,
+        /// Number of entries newly applied to the chain.
+        applied: usize,
+        /// Number of entries that were already in the local
+        /// chain (idempotent duplicates).
+        duplicates: usize,
+    },
+    /// Successful response to
+    /// [`ClientRequest::UpdatePeerEndpoints`].
+    EndpointsUpdated {
+        /// Always `true`; the distinctive top-level key.
+        endpoints_updated: bool,
+        /// Witness id of the appended endpoint-update entry.
+        witness_id: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::DeclareNetworkRelay`].
+    RelayDeclared {
+        /// Always `true`; the distinctive top-level key.
+        relay_declared: bool,
+        /// Witness id of the appended relay declaration.
+        witness_id: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::TriggerReconnect`]. Reports the
+    /// storm outcome — either a carrier responded with the
+    /// responding endpoint and elapsed time, or the storm
+    /// exhausted its window with an attempt count.
+    #[allow(clippy::struct_field_names)]
+    ReconnectOutcome {
+        /// Always `true`; the distinctive top-level key.
+        reconnect_outcome: bool,
+        /// `"responded"` or `"exhausted"`.
+        outcome: String,
+        /// Wall-clock ms elapsed from storm start.
+        elapsed_ms: u64,
+        /// Responding endpoint address (set when
+        /// `outcome == "responded"`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoint: Option<String>,
+        /// Probe-attempt count (set when
+        /// `outcome == "exhausted"`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempts: Option<usize>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GetSourceHost`] /
+    /// [`ClientRequest::ListSourceHosts`]. Returns the
+    /// election record(s) — the `Get` variant returns at
+    /// most one entry; `List` returns every recorded
+    /// election ordered by group id.
+    SourceHosts {
+        /// Always `true`; the distinctive top-level key.
+        source_hosts: bool,
+        /// Per-group election entries.
+        entries: Vec<evo_primitives::SourceHostElection>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GetClockSync`] /
+    /// [`ClientRequest::ListClockSyncs`]. Returns the
+    /// clock-sync state record(s) — the `Get` variant
+    /// returns at most one entry; `List` returns every
+    /// recorded state ordered by group id.
+    ClockSyncs {
+        /// Always `true`; the distinctive top-level key.
+        clock_syncs: bool,
+        /// Per-group clock-sync entries.
+        entries: Vec<crate::clock_sync::ClockSync>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ListAudioPlaneConnections`].
+    AudioPlaneConnections {
+        /// Always `true`; the distinctive top-level key.
+        audio_plane_connections: bool,
+        /// Per-peer connection entries ordered by remote
+        /// device id.
+        entries: Vec<crate::audio_plane::PeerConnectionInfo>,
+    },
+    /// Successful response to [`ClientRequest::AudioPlaneDial`].
+    /// The TCP connection is established, the Hello handshake
+    /// has completed, and the connection is now registered in
+    /// the runtime's connection map.
+    AudioPlaneDialed {
+        /// Always `true`; the distinctive top-level key.
+        audio_plane_dialed: bool,
+        /// Echoed dialled address (`host:port` form).
+        addr: String,
+        /// Remote peer's canonical device id learned from the
+        /// Hello reply.
+        remote_device_id: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::DispatchToGroup`]. Returns the
+    /// resolved dispatch target for a verb targeting the
+    /// supplied group.
+    GroupDispatch {
+        /// Always `true`; the distinctive top-level key.
+        group_dispatch: bool,
+        /// Canonical group id (echo).
+        group_id: String,
+        /// Group's display name.
+        display_name: String,
+        /// Elected source-host device id, or `None` when no
+        /// candidate is currently reachable for the group.
+        source_host_device_id: Option<String>,
+        /// `true` when the local node is the source-host
+        /// — in which case the operator client issues the
+        /// underlying verb locally.
+        is_local_host: bool,
+        /// When the source-host is remote, the audio-plane
+        /// connection state to the source-host (one of
+        /// `connected` / `handshaking` / `disconnected`),
+        /// or `None` when no connection is established.
+        source_host_connection_state: Option<String>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GetGroupActiveTopology`] /
+    /// [`ClientRequest::ListGroupActiveTopologies`]. Returns
+    /// the composite topology snapshot(s).
+    GroupActiveTopologies {
+        /// Always `true`; the distinctive top-level key.
+        group_active_topologies: bool,
+        /// Per-group topology snapshots — `Get` returns at
+        /// most one entry; `List` returns every recorded
+        /// group.
+        entries: Vec<crate::group_topology::GroupActiveTopology>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ListGatewayPlugins`].
+    GatewayPlugins {
+        /// Always `true`; the distinctive top-level key.
+        gateway_plugins: bool,
+        /// Every registered gateway plugin ordered by
+        /// canonical plugin name.
+        entries: Vec<crate::gateway::GatewayInfo>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ListUpdateInventory`] /
+    /// [`ClientRequest::CheckUpdatesNow`].
+    UpdateInventory {
+        /// Always `true`; the distinctive top-level key.
+        update_inventory: bool,
+        /// Aggregated inventory snapshot.
+        snapshot: crate::updates::UpdateInventory,
+        /// Every registered source's metadata (so the
+        /// operator surface can render source display names
+        /// + capability flags alongside the inventory).
+        sources: Vec<crate::updates::RegisteredSourceInfo>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::ApplyUpdate`].
+    UpdateApplied {
+        /// Always `true`; the distinctive top-level key.
+        update_applied: bool,
+        /// Outcome reported by the source.
+        outcome: evo_plugin_sdk::update::UpdateOutcome,
+    },
+    /// Successful response to
+    /// [`ClientRequest::GetAutoApplyPolicies`].
+    AutoApplyPolicies {
+        /// Always `true`; the distinctive top-level key.
+        auto_apply_policies: bool,
+        /// Every recorded auto-apply policy entry, ordered
+        /// by source id.
+        entries: Vec<crate::updates::AutoApplyPolicy>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::RequestStewardRestart`]. The
+    /// restart has been validated + scheduled on a
+    /// background task; the steward will emit
+    /// `StewardRestarting` and `execve` shortly after
+    /// returning this response. Wire clients see their
+    /// connection close cleanly when the new process image
+    /// takes over.
+    StewardRestartScheduled {
+        /// Always `true`; the distinctive top-level key.
+        steward_restart_scheduled: bool,
+        /// Echo of the resolved target binary path the
+        /// coordinator will exec into.
+        target_binary: String,
+        /// Approximate downtime in milliseconds.
+        expected_downtime_ms: u64,
+    },
+    /// Successful response to
+    /// [`ClientRequest::SetAutoApplyPolicy`]. Echoes the
+    /// stored policy.
+    AutoApplyPolicySet {
+        /// Always `true`; the distinctive top-level key.
+        auto_apply_policy_set: bool,
+        /// The stored policy.
+        policy: crate::updates::AutoApplyPolicy,
+    },
+    /// Successful response to
+    /// [`ClientRequest::MintLocalKioskSession`]. Carries the
+    /// encoded bearer the kiosk shell injects as the
+    /// browser's origin-bound cookie.
+    LocalKioskSessionMinted {
+        /// Always `true`; the distinctive top-level key.
+        local_kiosk_session_minted: bool,
+        /// Encoded bearer token. Framework signs with the
+        /// per-device signing key the WSS validator verifies
+        /// against.
+        token: String,
+        /// Token id (URL-safe base64). Recorded on the audit
+        /// observation; operators referencing this token for
+        /// revocation use this id.
+        token_id: String,
+        /// Wall-clock ms at which the token expires. The
+        /// kiosk shell renews before this stamp by calling
+        /// `mint_local_kiosk_session` again.
+        expires_at_ms: u64,
+    },
+    /// Successful response to [`ClientRequest::PairBegin`].
+    /// Carries the pair attempt id + code expiry. The code
+    /// itself is not returned to the browser — the operator
+    /// reads it from the kiosk display and types it back
+    /// through `pair_complete`.
+    PairBegan {
+        /// Always `true`; the distinctive top-level key.
+        pair_began: bool,
+        /// Attempt id. The browser presents this on
+        /// `pair_complete`.
+        pair_id: String,
+        /// Wall-clock ms at which the pending attempt
+        /// expires. After this stamp `pair_complete` returns
+        /// `pair_expired`.
+        expires_at_ms: u64,
+    },
+    /// Successful response to
+    /// [`ClientRequest::PairComplete`]. Carries the fresh
+    /// bearer the browser stores + the assigned
+    /// `paired_device_id` for future audit correlation.
+    PairCompleted {
+        /// Always `true`; the distinctive top-level key.
+        pair_completed: bool,
+        /// Encoded bearer the browser injects into its
+        /// storage + attaches to subsequent WSS connections.
+        token: String,
+        /// Token id (URL-safe base64).
+        token_id: String,
+        /// Wall-clock ms at which the token expires. Bearer
+        /// renewal is transparent to the operator (paired
+        /// browser silently re-mints via a refresh op that
+        /// carries the paired-device id).
+        expires_at_ms: u64,
+        /// Assigned paired-device id — the operator surface
+        /// references this id in `pair_list` /
+        /// `pair_revoke`.
+        paired_device_id: String,
+    },
+    /// Successful response to
+    /// [`ClientRequest::PairAuthenticate`]. Same field set as
+    /// [`Self::PairCompleted`] so the browser handles both
+    /// interchangeably: `pair_completed: true`, the bearer
+    /// bytes, the token id + expiry, and the assigned
+    /// `paired_device_id` the operator surface references in
+    /// `pair_list` / `pair_revoke`.
+    PairAuthenticated {
+        /// Always `true`; the distinctive top-level key —
+        /// intentionally identical to
+        /// [`Self::PairCompleted`]'s so the browser's success
+        /// handling is one code path.
+        pair_completed: bool,
+        /// Encoded bearer the browser injects into its
+        /// storage + attaches to subsequent WSS connections.
+        token: String,
+        /// Token id (URL-safe base64).
+        token_id: String,
+        /// Wall-clock ms at which the token expires.
+        expires_at_ms: u64,
+        /// Assigned paired-device id.
+        paired_device_id: String,
+    },
+    /// Successful response to [`ClientRequest::PairList`].
+    PairListed {
+        /// Always `true`; the distinctive top-level key.
+        pair_listed: bool,
+        /// The registered paired-device set.
+        devices: Vec<crate::pairing::PairedDevice>,
+    },
+    /// Successful response to
+    /// [`ClientRequest::PairRevoke`]. `revoked = false` means
+    /// the id was unknown.
+    PairRevoked {
+        /// Always `true`; the distinctive top-level key.
+        pair_revoked: bool,
+        /// Whether an entry actually left the set.
+        revoked: bool,
+    },
+    /// Successful response to
+    /// [`ClientRequest::SetKioskPassword`].
+    KioskPasswordSet {
+        /// Always `true`; the distinctive top-level key.
+        kiosk_password_set: bool,
+    },
     /// Any failure.
     ///
     /// The `error` envelope is structured: it carries
@@ -1821,6 +5523,18 @@ struct PluginInventoryEntry {
     /// plugin handle is in mid-transition (e.g. concurrent
     /// reload).
     interaction_kind: String,
+    /// Plugin-declared lifecycle mode from the manifest's
+    /// `[lifecycle].mode` field — `reactive-only`,
+    /// `reload-cleanable`, or `frozen`. Falls back to
+    /// `unknown` when the manifest is not retained on the
+    /// router entry (legacy test fixtures via
+    /// `PluginEntry::new`; production admission paths always
+    /// retain it). Operator-UI consumers render this so an
+    /// operator can predict the outcome of a Reload gesture
+    /// before clicking it: reactive-only acknowledges via
+    /// substrate, reload-cleanable runs teardown + readmit,
+    /// frozen refuses with a structured contract refusal.
+    lifecycle_mode: String,
 }
 
 /// One shelf entry in a [`ClientResponse::RackProjection`]: the
@@ -2684,6 +6398,18 @@ enum HappeningWire {
         /// When the happening was recorded, ms since UNIX epoch.
         at_ms: u64,
     },
+    /// Wire form of [`Happening::PersistenceReady`]. Emitted exactly
+    /// once per boot, after every framework-owned substrate has
+    /// finished rehydrating and the WAL has been explicitly drained,
+    /// just before plugin admission. Plugins subscribing to this
+    /// signal receive a happens-before guarantee that their
+    /// `Plugin::load()` persistence writes will not race the
+    /// framework's boot-write storm.
+    PersistenceReady {
+        /// When the barrier fired (just after the WAL checkpoint
+        /// returned Ok), ms since UNIX epoch.
+        at_ms: u64,
+    },
     /// Wire form of [`Happening::ClockTrustChanged`]. Emitted on
     /// every observed wall-clock trust transition.
     ClockTrustChanged {
@@ -2886,6 +6612,556 @@ enum HappeningWire {
         /// When the happening was recorded, ms since UNIX epoch.
         at_ms: u64,
     },
+    /// Wire form of [`Happening::AudioPlaybackEnded`]. Source
+    /// plugin reporting end-of-playback after its dispatched
+    /// content played out naturally.
+    AudioPlaybackEnded {
+        /// Opaque token identifying the source plugin.
+        claimant_token: ClaimantToken,
+        /// Claim URI that was playing when playback ended, if
+        /// the plugin tracks per-claim state.
+        claim_uri: Option<String>,
+        /// When the playback actually ended, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::AudioTopologyChanged`]. Active
+    /// audio topology rewired for one delivery target. UI
+    /// subscribers fetch the full snapshot via
+    /// `get_active_audio_topology`.
+    AudioTopologyChanged {
+        /// Canonical hardware-identity key.
+        target_key: String,
+        /// Operator-readable display name.
+        display_name: String,
+        /// Bit-perfect verdict.
+        bit_perfect: bool,
+        /// Total score for the chain.
+        score_total: i32,
+        /// When the topology was published, ms since UNIX
+        /// epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::PeerDiscovered`].
+    PeerDiscovered {
+        /// Canonical UUIDv4 id of the newly-observed peer.
+        device_id: String,
+        /// Peer's display name.
+        display_name: String,
+        /// Socket-addr strings for the peer.
+        addresses: Vec<String>,
+        /// When first observed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::PeerUpdated`].
+    PeerUpdated {
+        /// Canonical id of the peer.
+        device_id: String,
+        /// Peer's current display name.
+        display_name: String,
+        /// Peer's current address set.
+        addresses: Vec<String>,
+        /// When the change was observed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::PeerLost`].
+    PeerLost {
+        /// Canonical id of the peer.
+        device_id: String,
+        /// Peer's last-known display name.
+        display_name: String,
+        /// When loss was observed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::PeerAnnounced`].
+    PeerAnnounced {
+        /// Canonical id of the announcing peer.
+        device_id: String,
+        /// Peer's currently-observed display name.
+        display_name: String,
+        /// Socket-addr strings observed for the peer.
+        addresses: Vec<String>,
+        /// True when this is the first time the peer has
+        /// been observed in the substrate's lifetime.
+        first_observation: bool,
+        /// When the advertisement was observed,
+        /// ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::PeerDisappeared`].
+    PeerDisappeared {
+        /// Canonical id of the absent peer.
+        device_id: String,
+        /// Peer's last-known display name from the prior
+        /// roster.
+        display_name: String,
+        /// `last_seen_ms` from the prior roster.
+        last_seen_ms: u64,
+        /// Canonical id of the snap whose marauder query
+        /// confirmed the absence.
+        snap_id: String,
+        /// When the marauder query confirmed the absence,
+        /// ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::RosterSnapped`].
+    RosterSnapped {
+        /// Canonical id of the snap.
+        snap_id: String,
+        /// Snake-case reason tag the caller supplied.
+        reason: String,
+        /// Wall-clock when the snap completed (post-marauder),
+        /// ms since UNIX epoch.
+        snap_completed_at_ms: u64,
+        /// Count of devices reported present.
+        presents_count: u32,
+        /// Count of devices reported gone
+        /// (marauder-confirmed).
+        gones_count: u32,
+        /// Whether the snap exceeded its deadline budget.
+        deadline_breached: bool,
+        /// When the happening was recorded,
+        /// ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::DomainJoinModeEntered`].
+    DomainJoinModeEntered {
+        /// Canonical id of the joining device.
+        device_id: String,
+        /// Endpoint the joining device will dial when set,
+        /// `None` when waiting for announces.
+        endpoint: Option<String>,
+        /// When the gesture fired, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::GroupCreated`].
+    GroupCreated {
+        /// Canonical group id.
+        group_id: String,
+        /// Display name.
+        display_name: String,
+        /// Member device ids.
+        members: Vec<String>,
+        /// When created, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::GroupRenamed`].
+    GroupRenamed {
+        /// Canonical group id.
+        group_id: String,
+        /// New display name.
+        display_name: String,
+        /// When renamed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::GroupMembershipChanged`].
+    GroupMembershipChanged {
+        /// Canonical group id.
+        group_id: String,
+        /// Group's current display name.
+        display_name: String,
+        /// Post-change member set.
+        members: Vec<String>,
+        /// Devices added in this edit.
+        added: Vec<String>,
+        /// Devices removed in this edit.
+        removed: Vec<String>,
+        /// When the change was observed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::GroupDeleted`].
+    GroupDeleted {
+        /// Canonical group id.
+        group_id: String,
+        /// Group's last-known display name.
+        display_name: String,
+        /// When deleted, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::GroupLeaderMsChanged`].
+    GroupLeaderMsChanged {
+        /// Canonical group id.
+        group_id: String,
+        /// Group's current display name.
+        display_name: String,
+        /// Per-group latency budget before the change.
+        prior_leader_ms: u32,
+        /// Per-group latency budget after the change.
+        new_leader_ms: u32,
+        /// When the change was observed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::DeviceRoleChanged`].
+    DeviceRoleChanged {
+        /// Canonical device id.
+        device_id: String,
+        /// Role before the gesture (`source` / `receiver` /
+        /// `auto`), `None` on first set.
+        prior_role: Option<String>,
+        /// Role after the gesture.
+        new_role: String,
+        /// Optional operator / surface identifier that
+        /// issued the gesture.
+        set_by: Option<String>,
+        /// When the change was observed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::SourceHostElected`].
+    SourceHostElected {
+        /// Canonical group id.
+        group_id: String,
+        /// Group's display name.
+        display_name: String,
+        /// Newly-elected source-host device id, or `None`.
+        source_host_device_id: Option<String>,
+        /// Prior elected device id, or `None`.
+        prior_source_host_device_id: Option<String>,
+        /// Candidate-set size at decision time.
+        candidate_count: u32,
+        /// When the transition was recorded, ms since UNIX
+        /// epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::PeerConnected`].
+    PeerConnected {
+        /// Peer's canonical device id.
+        device_id: String,
+        /// Connection direction string.
+        direction: String,
+        /// When connected, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::PeerDisconnected`].
+    PeerDisconnected {
+        /// Peer's canonical device id.
+        device_id: String,
+        /// When disconnected, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::DeviceDisplayNameChanged`].
+    DeviceDisplayNameChanged {
+        /// Renamed local device's canonical id.
+        device_id: String,
+        /// New display name (post-update).
+        display_name: String,
+        /// When the rename was observed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::DomainMemberAdmitted`].
+    DomainMemberAdmitted {
+        /// Newly-admitted device's canonical id.
+        device_id: String,
+        /// Display name captured at admit time.
+        display_name: String,
+        /// Wall-clock ms timestamp of the admission.
+        admitted_at_ms: u64,
+        /// Admitting device's canonical id, or `None` for the
+        /// seed device.
+        admitted_by_device_id: Option<String>,
+        /// When the admission was observed, ms since UNIX
+        /// epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::DomainMemberRevoked`].
+    DomainMemberRevoked {
+        /// Revoked device's canonical id.
+        device_id: String,
+        /// Wall-clock ms timestamp of the revoke.
+        revoked_at_ms: u64,
+        /// When the revoke was observed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of
+    /// [`Happening::DomainMemberDisplayNameObserved`].
+    DomainMemberDisplayNameObserved {
+        /// Observed domain member's canonical id.
+        device_id: String,
+        /// Newly-observed display name.
+        display_name: String,
+        /// Wall-clock ms timestamp of the observation.
+        observed_at_ms: u64,
+        /// When the observation was processed, ms since UNIX
+        /// epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::GroupMemberAddRefused`].
+    GroupMemberAddRefused {
+        /// Canonical id of the targeted group.
+        group_id: String,
+        /// Canonical id of the rejected non-domain member.
+        device_id: String,
+        /// Machine-readable refusal-reason token.
+        reason: String,
+        /// When the refusal was emitted, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of
+    /// [`Happening::GroupLeaderSuccessorRequired`].
+    GroupLeaderSuccessorRequired {
+        /// Group whose leader the operator is removing.
+        group_id: String,
+        /// Canonical id of the leader being removed.
+        departing_device_id: String,
+        /// Canonical ids the operator may pick as successor.
+        eligible_member_ids: Vec<String>,
+        /// When the protocol was entered, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of
+    /// [`Happening::GroupLeaderSuccessorCancelled`].
+    GroupLeaderSuccessorCancelled {
+        /// Group the cancellation applies to.
+        group_id: String,
+        /// Canonical id of the leader that was being removed.
+        departing_device_id: String,
+        /// When the cancellation was observed, ms since UNIX
+        /// epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::MultiroomLeaderHandoff`].
+    MultiroomLeaderHandoff {
+        /// Group the handoff applies to.
+        group_id: String,
+        /// Canonical id of the leader that was removed.
+        departing_device_id: String,
+        /// Canonical id of the operator-chosen successor now
+        /// pinned as source-host.
+        successor_device_id: String,
+        /// When the handoff was committed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::MultiroomMemberMoved`].
+    MultiroomMemberMoved {
+        /// Source group id.
+        from_group_id: String,
+        /// Target group id.
+        to_group_id: String,
+        /// Canonical id of the moved device.
+        device_id: String,
+        /// Source group's membership after the move.
+        from_members_after: Vec<String>,
+        /// Target group's membership after the move.
+        to_members_after: Vec<String>,
+        /// `true` when the source group auto-dissolved as part
+        /// of this transaction.
+        source_dissolved: bool,
+        /// When the move was committed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::SplitBrainDetected`].
+    SplitBrainDetected {
+        /// Group the disagreement is about.
+        group_id: String,
+        /// Local node's view of the source-host.
+        local_view_source_host: Option<String>,
+        /// Remote peer's claimed source-host.
+        peer_view_source_host: String,
+        /// Deterministic resolution.
+        resolution_source_host: String,
+        /// When the disagreement was observed, ms since
+        /// UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::StewardRestarting`].
+    StewardRestarting {
+        /// Operator-supplied reason.
+        reason: String,
+        /// Approximate downtime in milliseconds.
+        expected_downtime_ms: u64,
+        /// Resolved target binary path.
+        target_binary: String,
+        /// Operator principal.
+        approved_by: String,
+        /// When the coordinator initiated the restart, ms
+        /// since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::UiShelfChanged`].
+    UiShelfChanged {
+        /// Target UI shelf id.
+        shelf: String,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Change kind, snake_case
+        /// (`stocked` / `restocked` / `withdrawn`).
+        change: String,
+        /// Stocking count this plugin currently has on
+        /// `shelf` after the change. Zero on `withdrawn`.
+        stockings_after: u32,
+        /// Wall-clock millisecond timestamp of the change.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::UiThemeAdmitted`].
+    UiThemeAdmitted {
+        /// Canonical plugin name.
+        plugin: String,
+        /// Plugin version (semver string).
+        version: String,
+        /// Wall-clock millisecond timestamp.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::UiShellAdmitted`].
+    UiShellAdmitted {
+        /// Canonical plugin name.
+        plugin: String,
+        /// Plugin version.
+        version: String,
+        /// Wall-clock millisecond timestamp.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::UiWidgetPackAdmitted`].
+    UiWidgetPackAdmitted {
+        /// Canonical plugin name.
+        plugin: String,
+        /// Plugin version.
+        version: String,
+        /// Number of widget kinds the pack contributed.
+        kind_count: u32,
+        /// Wall-clock millisecond timestamp.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::UiThemeUnadmitted`].
+    UiThemeUnadmitted {
+        /// Canonical plugin name.
+        plugin: String,
+        /// Wall-clock millisecond timestamp.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::UiShellUnadmitted`].
+    UiShellUnadmitted {
+        /// Canonical plugin name.
+        plugin: String,
+        /// Wall-clock millisecond timestamp.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::UiWidgetPackUnadmitted`].
+    UiWidgetPackUnadmitted {
+        /// Canonical plugin name.
+        plugin: String,
+        /// Number of widget kinds rolled back.
+        kind_count: u32,
+        /// Wall-clock millisecond timestamp.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::UiActiveThemeChanged`].
+    UiActiveThemeChanged {
+        /// Plugin name that was active before, or `null`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous: Option<String>,
+        /// Plugin name that is active now, or `null`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current: Option<String>,
+        /// Operator principal.
+        principal: String,
+        /// Wall-clock millisecond timestamp.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::UiActiveShellChanged`].
+    UiActiveShellChanged {
+        /// Plugin name that was active before, or `null`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous: Option<String>,
+        /// Plugin name that is active now, or `null`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current: Option<String>,
+        /// Operator principal.
+        principal: String,
+        /// Wall-clock millisecond timestamp.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::UpdateCheckStarted`].
+    UpdateCheckStarted {
+        /// Source id.
+        source_id: String,
+        /// When the check began, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::UpdateCheckCompleted`].
+    UpdateCheckCompleted {
+        /// Source id.
+        source_id: String,
+        /// Count of available updates.
+        available_count: u32,
+        /// When the check finished, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::UpdateAvailableObserved`].
+    UpdateAvailableObserved {
+        /// Source id.
+        source_id: String,
+        /// Component name.
+        component: String,
+        /// Currently-installed version.
+        current_version: String,
+        /// Available version.
+        available_version: String,
+        /// Severity classification string.
+        severity: String,
+        /// When observed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::UpdateApplyStarted`].
+    UpdateApplyStarted {
+        /// Source id.
+        source_id: String,
+        /// Update id.
+        update_id: String,
+        /// Component name.
+        component: String,
+        /// Operator principal.
+        approved_by: String,
+        /// When the apply began, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::UpdateApplySucceeded`].
+    UpdateApplySucceeded {
+        /// Source id.
+        source_id: String,
+        /// Update id.
+        update_id: String,
+        /// Component name.
+        component: String,
+        /// Version now active after the apply.
+        applied_version: String,
+        /// Whether the apply was a dry-run.
+        dry_run: bool,
+        /// When the apply completed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::UpdateApplyFailed`].
+    UpdateApplyFailed {
+        /// Source id.
+        source_id: String,
+        /// Update id.
+        update_id: String,
+        /// Component name.
+        component: String,
+        /// Error message from the source.
+        error: String,
+        /// When the failure was observed, ms since UNIX
+        /// epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::ClockSyncChanged`].
+    ClockSyncChanged {
+        /// Canonical group id.
+        group_id: String,
+        /// Group's display name.
+        display_name: String,
+        /// Elected source-host device id, or `None`.
+        source_host_device_id: Option<String>,
+        /// `true` when the local node is the source-host.
+        is_local_host: bool,
+        /// Signed millisecond offset.
+        offset_ms: i64,
+        /// Measurement uncertainty in milliseconds.
+        uncertainty_ms: u32,
+        /// Quality classification — `unknown` / `warming`
+        /// / `locked` / `stale`.
+        quality: String,
+        /// When the change was observed, ms since UNIX
+        /// epoch.
+        at_ms: u64,
+    },
     /// Wire form of [`Happening::PluginManifestDrift`].
     PluginManifestDrift {
         /// Opaque token identifying the drifted plugin.
@@ -2974,6 +7250,54 @@ enum HappeningWire {
         /// When the skip was decided, ms since UNIX epoch.
         at_ms: u64,
     },
+    /// Wire form of [`Happening::PluginReloadDispatched`].
+    PluginReloadDispatched {
+        /// Opaque token identifying the plugin whose reload was
+        /// dispatched.
+        claimant_token: ClaimantToken,
+        /// Declared lifecycle mode (kebab-case): `frozen`,
+        /// `reactive-only`, `reload-cleanable`, or empty when
+        /// the plugin had no recorded manifest.
+        mode: String,
+        /// Action the dispatcher took. See the corresponding
+        /// `Happening` variant doc for the enumerated values.
+        outcome: String,
+        /// Origin of the reload request: `file_watcher` or
+        /// `operator_gesture`.
+        source: String,
+        /// When the dispatch decision was made, ms since UNIX
+        /// epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::PluginDegraded`].
+    PluginDegraded {
+        /// Opaque token identifying the plugin that transitioned
+        /// to degraded.
+        claimant_token: ClaimantToken,
+        /// Stable kebab-case reason identifier — one of
+        /// `admit_failures_exhausted`,
+        /// `teardown_timeouts_exhausted`, `plugin_panic`. Shares
+        /// the vocabulary the `PluginHealth.degraded` projection
+        /// emits.
+        reason: String,
+        /// Operator-readable detail accompanying the reason —
+        /// failure count for threshold-crossing kinds, panic
+        /// message for the panic kind.
+        detail: String,
+        /// When the transition was decided, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::PluginRestored`].
+    PluginRestored {
+        /// Opaque token identifying the plugin whose degraded
+        /// slot cleared.
+        claimant_token: ClaimantToken,
+        /// Stable kebab-case identifier for the clear source —
+        /// `admit_success` or `operator_restore`.
+        source: String,
+        /// When the clear was recorded, ms since UNIX epoch.
+        at_ms: u64,
+    },
     /// Wire form of [`Happening::CatalogueReloaded`].
     CatalogueReloaded {
         /// Catalogue schema version before the reload.
@@ -3044,6 +7368,110 @@ enum HappeningWire {
         /// instance; `false` if the plugin is no longer admitted.
         rolled_back: bool,
         /// When the failure was observed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::ChainHeadChanged`].
+    ChainHeadChanged {
+        /// New chain head, base64 SHA-256.
+        new_head_b64: String,
+        /// Chain length post-advance.
+        chain_length: usize,
+        /// When the head changed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::GestureApplied`].
+    GestureApplied {
+        /// Witness id.
+        witness_id: String,
+        /// Op kind label.
+        op_kind: String,
+        /// Originator device id.
+        originator_device_id: String,
+        /// Whether this device originated the witness.
+        was_local: bool,
+        /// When the apply occurred, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::GestureConfirmedByPeer`].
+    GestureConfirmedByPeer {
+        /// Witness id.
+        witness_id: String,
+        /// Peer that confirmed.
+        peer_device_id: String,
+        /// When the confirmation was observed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::GestureReconciled`].
+    GestureReconciled {
+        /// Winning witness id.
+        winning_witness_id: String,
+        /// Winning originator device id.
+        winning_originator_device_id: String,
+        /// When the reconciliation was observed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::PeerPresenceChanged`].
+    PeerPresenceChanged {
+        /// Device id whose state transitioned.
+        peer_device_id: String,
+        /// Previous state.
+        old_state: String,
+        /// New state.
+        new_state: String,
+        /// When the transition was observed, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::PeerObservedAtNewEndpoint`].
+    PeerObservedAtNewEndpoint {
+        /// Device id observed.
+        peer_device_id: String,
+        /// New endpoint address.
+        endpoint_address: String,
+        /// Network the observation was made on.
+        network_id: String,
+        /// When the observation occurred, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::PresenceMassEventDetected`].
+    PresenceMassEventDetected {
+        /// Affected peer device ids.
+        affected_peer_ids: Vec<String>,
+        /// Coarse root-cause hint.
+        event_kind_hint: String,
+        /// When the mass event was detected, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::ReconnectProgress`].
+    ReconnectProgress {
+        /// Device id the reconnect is targeting.
+        peer_device_id: String,
+        /// Carrier being tried.
+        carrier: String,
+        /// Status.
+        status: String,
+        /// Elapsed milliseconds since storm start.
+        elapsed_ms: u64,
+        /// When the step occurred, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::RelayDeclared`].
+    RelayDeclared {
+        /// Relay's device id.
+        relay_device_id: String,
+        /// Networks bridged.
+        networks: Vec<String>,
+        /// When the declaration was applied, ms since UNIX epoch.
+        at_ms: u64,
+    },
+    /// Wire form of [`Happening::RelayBridgeHealthChanged`].
+    RelayBridgeHealthChanged {
+        /// Relay's device id.
+        relay_device_id: String,
+        /// Pair description.
+        network_pair: String,
+        /// Health.
+        health: String,
+        /// When the change was observed, ms since UNIX epoch.
         at_ms: u64,
     },
 }
@@ -3494,6 +7922,11 @@ impl HappeningWire {
                     at_ms: system_time_to_ms(at),
                 }
             }
+            Happening::PersistenceReady { at } => {
+                HappeningWire::PersistenceReady {
+                    at_ms: system_time_to_ms(at),
+                }
+            }
             Happening::ClockTrustChanged { from, to, at } => {
                 HappeningWire::ClockTrustChanged {
                     from,
@@ -3673,6 +8106,513 @@ impl HappeningWire {
                 payload,
                 at_ms: system_time_to_ms(at),
             },
+            Happening::AudioPlaybackEnded {
+                source_plugin,
+                claim_uri,
+                at,
+            } => HappeningWire::AudioPlaybackEnded {
+                claimant_token: issuer.token_for(&source_plugin),
+                claim_uri,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::AudioTopologyChanged {
+                target_key,
+                display_name,
+                bit_perfect,
+                score_total,
+                at,
+            } => HappeningWire::AudioTopologyChanged {
+                target_key,
+                display_name,
+                bit_perfect,
+                score_total,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::PeerDiscovered {
+                device_id,
+                display_name,
+                addresses,
+                at,
+            } => HappeningWire::PeerDiscovered {
+                device_id,
+                display_name,
+                addresses,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::PeerUpdated {
+                device_id,
+                display_name,
+                addresses,
+                at,
+            } => HappeningWire::PeerUpdated {
+                device_id,
+                display_name,
+                addresses,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::PeerLost {
+                device_id,
+                display_name,
+                at,
+            } => HappeningWire::PeerLost {
+                device_id,
+                display_name,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::PeerAnnounced {
+                device_id,
+                display_name,
+                addresses,
+                first_observation,
+                at,
+            } => HappeningWire::PeerAnnounced {
+                device_id,
+                display_name,
+                addresses,
+                first_observation,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::PeerDisappeared {
+                device_id,
+                display_name,
+                last_seen_ms,
+                snap_id,
+                at,
+            } => HappeningWire::PeerDisappeared {
+                device_id,
+                display_name,
+                last_seen_ms,
+                snap_id,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::RosterSnapped {
+                snap_id,
+                reason,
+                snap_completed_at,
+                presents_count,
+                gones_count,
+                deadline_breached,
+                at,
+            } => HappeningWire::RosterSnapped {
+                snap_id,
+                reason,
+                snap_completed_at_ms: system_time_to_ms(snap_completed_at),
+                presents_count,
+                gones_count,
+                deadline_breached,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::DomainJoinModeEntered {
+                device_id,
+                endpoint,
+                at,
+            } => HappeningWire::DomainJoinModeEntered {
+                device_id,
+                endpoint,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::GroupCreated {
+                group_id,
+                display_name,
+                members,
+                at,
+            } => HappeningWire::GroupCreated {
+                group_id,
+                display_name,
+                members,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::GroupRenamed {
+                group_id,
+                display_name,
+                at,
+            } => HappeningWire::GroupRenamed {
+                group_id,
+                display_name,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::GroupMembershipChanged {
+                group_id,
+                display_name,
+                members,
+                added,
+                removed,
+                at,
+            } => HappeningWire::GroupMembershipChanged {
+                group_id,
+                display_name,
+                members,
+                added,
+                removed,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::GroupDeleted {
+                group_id,
+                display_name,
+                at,
+            } => HappeningWire::GroupDeleted {
+                group_id,
+                display_name,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::GroupLeaderMsChanged {
+                group_id,
+                display_name,
+                prior_leader_ms,
+                new_leader_ms,
+                at,
+            } => HappeningWire::GroupLeaderMsChanged {
+                group_id,
+                display_name,
+                prior_leader_ms,
+                new_leader_ms,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::DeviceRoleChanged {
+                device_id,
+                prior_role,
+                new_role,
+                set_by,
+                at,
+            } => HappeningWire::DeviceRoleChanged {
+                device_id,
+                prior_role,
+                new_role,
+                set_by,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::SourceHostElected {
+                group_id,
+                display_name,
+                source_host_device_id,
+                prior_source_host_device_id,
+                candidate_count,
+                at,
+            } => HappeningWire::SourceHostElected {
+                group_id,
+                display_name,
+                source_host_device_id,
+                prior_source_host_device_id,
+                candidate_count,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::ClockSyncChanged {
+                group_id,
+                display_name,
+                source_host_device_id,
+                is_local_host,
+                offset_ms,
+                uncertainty_ms,
+                quality,
+                at,
+            } => HappeningWire::ClockSyncChanged {
+                group_id,
+                display_name,
+                source_host_device_id,
+                is_local_host,
+                offset_ms,
+                uncertainty_ms,
+                quality,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::StewardRestarting {
+                reason,
+                expected_downtime_ms,
+                target_binary,
+                approved_by,
+                at,
+            } => HappeningWire::StewardRestarting {
+                reason,
+                expected_downtime_ms,
+                target_binary,
+                approved_by,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::UiShelfChanged {
+                shelf,
+                plugin,
+                change,
+                stockings_after,
+                at,
+            } => HappeningWire::UiShelfChanged {
+                shelf,
+                plugin,
+                change: change.as_str().to_string(),
+                stockings_after,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::UiThemeAdmitted {
+                plugin,
+                version,
+                at,
+            } => HappeningWire::UiThemeAdmitted {
+                plugin,
+                version,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::UiShellAdmitted {
+                plugin,
+                version,
+                at,
+            } => HappeningWire::UiShellAdmitted {
+                plugin,
+                version,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::UiWidgetPackAdmitted {
+                plugin,
+                version,
+                kind_count,
+                at,
+            } => HappeningWire::UiWidgetPackAdmitted {
+                plugin,
+                version,
+                kind_count,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::UiThemeUnadmitted { plugin, at } => {
+                HappeningWire::UiThemeUnadmitted {
+                    plugin,
+                    at_ms: system_time_to_ms(at),
+                }
+            }
+            Happening::UiShellUnadmitted { plugin, at } => {
+                HappeningWire::UiShellUnadmitted {
+                    plugin,
+                    at_ms: system_time_to_ms(at),
+                }
+            }
+            Happening::UiWidgetPackUnadmitted {
+                plugin,
+                kind_count,
+                at,
+            } => HappeningWire::UiWidgetPackUnadmitted {
+                plugin,
+                kind_count,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::UiActiveThemeChanged {
+                previous,
+                current,
+                principal,
+                at,
+            } => HappeningWire::UiActiveThemeChanged {
+                previous,
+                current,
+                principal,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::UiActiveShellChanged {
+                previous,
+                current,
+                principal,
+                at,
+            } => HappeningWire::UiActiveShellChanged {
+                previous,
+                current,
+                principal,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::UpdateCheckStarted { source_id, at } => {
+                HappeningWire::UpdateCheckStarted {
+                    source_id,
+                    at_ms: system_time_to_ms(at),
+                }
+            }
+            Happening::UpdateCheckCompleted {
+                source_id,
+                available_count,
+                at,
+            } => HappeningWire::UpdateCheckCompleted {
+                source_id,
+                available_count,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::UpdateAvailableObserved {
+                source_id,
+                component,
+                current_version,
+                available_version,
+                severity,
+                at,
+            } => HappeningWire::UpdateAvailableObserved {
+                source_id,
+                component,
+                current_version,
+                available_version,
+                severity,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::UpdateApplyStarted {
+                source_id,
+                update_id,
+                component,
+                approved_by,
+                at,
+            } => HappeningWire::UpdateApplyStarted {
+                source_id,
+                update_id,
+                component,
+                approved_by,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::UpdateApplySucceeded {
+                source_id,
+                update_id,
+                component,
+                applied_version,
+                dry_run,
+                at,
+            } => HappeningWire::UpdateApplySucceeded {
+                source_id,
+                update_id,
+                component,
+                applied_version,
+                dry_run,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::UpdateApplyFailed {
+                source_id,
+                update_id,
+                component,
+                error,
+                at,
+            } => HappeningWire::UpdateApplyFailed {
+                source_id,
+                update_id,
+                component,
+                error,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::PeerConnected {
+                device_id,
+                direction,
+                at,
+            } => HappeningWire::PeerConnected {
+                device_id,
+                direction,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::PeerDisconnected { device_id, at } => {
+                HappeningWire::PeerDisconnected {
+                    device_id,
+                    at_ms: system_time_to_ms(at),
+                }
+            }
+            Happening::DeviceDisplayNameChanged {
+                device_id,
+                display_name,
+                at,
+            } => HappeningWire::DeviceDisplayNameChanged {
+                device_id,
+                display_name,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::DomainMemberAdmitted {
+                device_id,
+                display_name,
+                admitted_at_ms,
+                admitted_by_device_id,
+                at,
+            } => HappeningWire::DomainMemberAdmitted {
+                device_id,
+                display_name,
+                admitted_at_ms,
+                admitted_by_device_id,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::DomainMemberRevoked {
+                device_id,
+                revoked_at_ms,
+                at,
+            } => HappeningWire::DomainMemberRevoked {
+                device_id,
+                revoked_at_ms,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::DomainMemberDisplayNameObserved {
+                device_id,
+                display_name,
+                observed_at_ms,
+                at,
+            } => HappeningWire::DomainMemberDisplayNameObserved {
+                device_id,
+                display_name,
+                observed_at_ms,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::GroupMemberAddRefused {
+                group_id,
+                device_id,
+                reason,
+                at,
+            } => HappeningWire::GroupMemberAddRefused {
+                group_id,
+                device_id,
+                reason,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::GroupLeaderSuccessorRequired {
+                group_id,
+                departing_device_id,
+                eligible_member_ids,
+                at,
+            } => HappeningWire::GroupLeaderSuccessorRequired {
+                group_id,
+                departing_device_id,
+                eligible_member_ids,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::GroupLeaderSuccessorCancelled {
+                group_id,
+                departing_device_id,
+                at,
+            } => HappeningWire::GroupLeaderSuccessorCancelled {
+                group_id,
+                departing_device_id,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::MultiroomLeaderHandoff {
+                group_id,
+                departing_device_id,
+                successor_device_id,
+                at,
+            } => HappeningWire::MultiroomLeaderHandoff {
+                group_id,
+                departing_device_id,
+                successor_device_id,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::MultiroomMemberMoved {
+                from_group_id,
+                to_group_id,
+                device_id,
+                from_members_after,
+                to_members_after,
+                source_dissolved,
+                at,
+            } => HappeningWire::MultiroomMemberMoved {
+                from_group_id,
+                to_group_id,
+                device_id,
+                from_members_after,
+                to_members_after,
+                source_dissolved,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::SplitBrainDetected {
+                group_id,
+                local_view_source_host,
+                peer_view_source_host,
+                resolution_source_host,
+                at,
+            } => HappeningWire::SplitBrainDetected {
+                group_id,
+                local_view_source_host,
+                peer_view_source_host,
+                resolution_source_host,
+                at_ms: system_time_to_ms(at),
+            },
             Happening::PluginManifestDrift {
                 plugin,
                 missing_in_implementation,
@@ -3792,6 +8732,37 @@ impl HappeningWire {
                     at_ms: system_time_to_ms(at),
                 }
             }
+            Happening::PluginReloadDispatched {
+                plugin,
+                mode,
+                outcome,
+                source,
+                at,
+            } => HappeningWire::PluginReloadDispatched {
+                claimant_token: issuer.token_for(&plugin),
+                mode,
+                outcome,
+                source,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::PluginDegraded {
+                plugin,
+                reason,
+                detail,
+                at,
+            } => HappeningWire::PluginDegraded {
+                claimant_token: issuer.token_for(&plugin),
+                reason,
+                detail,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::PluginRestored { plugin, source, at } => {
+                HappeningWire::PluginRestored {
+                    claimant_token: issuer.token_for(&plugin),
+                    source,
+                    at_ms: system_time_to_ms(at),
+                }
+            }
             Happening::ReconciliationApplied {
                 pair,
                 generation,
@@ -3814,6 +8785,110 @@ impl HappeningWire {
                 generation,
                 error_class,
                 error_message,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::ChainHeadChanged {
+                new_head_b64,
+                chain_length,
+                at,
+            } => HappeningWire::ChainHeadChanged {
+                new_head_b64,
+                chain_length,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::GestureApplied {
+                witness_id,
+                op_kind,
+                originator_device_id,
+                was_local,
+                at,
+            } => HappeningWire::GestureApplied {
+                witness_id,
+                op_kind,
+                originator_device_id,
+                was_local,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::GestureConfirmedByPeer {
+                witness_id,
+                peer_device_id,
+                at,
+            } => HappeningWire::GestureConfirmedByPeer {
+                witness_id,
+                peer_device_id,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::GestureReconciled {
+                winning_witness_id,
+                winning_originator_device_id,
+                at,
+            } => HappeningWire::GestureReconciled {
+                winning_witness_id,
+                winning_originator_device_id,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::PeerPresenceChanged {
+                peer_device_id,
+                old_state,
+                new_state,
+                at,
+            } => HappeningWire::PeerPresenceChanged {
+                peer_device_id,
+                old_state,
+                new_state,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::PeerObservedAtNewEndpoint {
+                peer_device_id,
+                endpoint_address,
+                network_id,
+                at,
+            } => HappeningWire::PeerObservedAtNewEndpoint {
+                peer_device_id,
+                endpoint_address,
+                network_id,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::PresenceMassEventDetected {
+                affected_peer_ids,
+                event_kind_hint,
+                at,
+            } => HappeningWire::PresenceMassEventDetected {
+                affected_peer_ids,
+                event_kind_hint,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::ReconnectProgress {
+                peer_device_id,
+                carrier,
+                status,
+                elapsed_ms,
+                at,
+            } => HappeningWire::ReconnectProgress {
+                peer_device_id,
+                carrier,
+                status,
+                elapsed_ms,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::RelayDeclared {
+                relay_device_id,
+                networks,
+                at,
+            } => HappeningWire::RelayDeclared {
+                relay_device_id,
+                networks,
+                at_ms: system_time_to_ms(at),
+            },
+            Happening::RelayBridgeHealthChanged {
+                relay_device_id,
+                network_pair,
+                health,
+                at,
+            } => HappeningWire::RelayBridgeHealthChanged {
+                relay_device_id,
+                network_pair,
+                health,
                 at_ms: system_time_to_ms(at),
             },
         }
@@ -3850,9 +8925,16 @@ const CAPABILITY_RECONCILIATION_ADMIN: &str = "reconciliation_admin";
 /// initiated user-interaction prompts.
 ///
 /// At most one connection holds this capability at a time
-/// (first-claimer-wins). The connection holding it sees `Open`
-/// prompts via `subscribe_user_interactions` and answers them
-/// via `answer_user_interaction`. A second connection
+/// (first-claimer-wins). The connection holding it seeds the
+/// currently-Open prompt set via `list_user_interactions` and
+/// tracks live updates by subscribing to the framework's
+/// happenings bus (`op = "subscribe_happenings"`) and filtering
+/// for `UiShelfChanged` events on the `prompts.active` shelf —
+/// each prompt auto-stocks a widget on that shelf on issue and
+/// unstocks on resolution, so `UiShelfChanged` fires on every
+/// transition the renderer needs to observe. The connection
+/// answers a prompt via `answer_user_interaction` and the
+/// plugin's awaiting future resolves. A second connection
 /// negotiating the same capability while another holds it
 /// receives a structured `permission_denied /
 /// responder_already_assigned` refusal; operators reconfigure
@@ -3925,6 +9007,16 @@ pub(crate) const CAPABILITY_WATCHES_ADMIN: &str = "watches_admin";
 /// `watches_admin`.
 pub(crate) const CAPABILITY_GRAMMAR_ADMIN: &str = "grammar_admin";
 
+/// Capability gating the operator-issued plan-management
+/// surface (`fire_plan` today; list / cancel land alongside).
+/// Distinct from the framework-internal trigger-driven fire
+/// path (appointments / watches) — that path runs without any
+/// per-connection capability because the framework drives it.
+/// The operator-fire surface gates separately so operator
+/// authority is configurable on the same axis as other admin
+/// capabilities.
+pub(crate) const CAPABILITY_PLANS_ADMIN: &str = "plans_admin";
+
 /// Capability names a consumer may negotiate today.
 ///
 /// The negotiate handler intersects the consumer's request with this
@@ -3940,6 +9032,7 @@ const NEGOTIABLE_CAPABILITIES: &[&str] = &[
     CAPABILITY_APPOINTMENTS_ADMIN,
     CAPABILITY_WATCHES_ADMIN,
     CAPABILITY_GRAMMAR_ADMIN,
+    CAPABILITY_PLANS_ADMIN,
 ];
 
 /// RAII guard that releases this connection's claim on the
@@ -3980,6 +9073,61 @@ fn next_connection_id() -> crate::prompts::ResponderConnectionId {
     )
 }
 
+/// Derive a stable [`crate::prompts::ResponderConnectionId`] from
+/// an HTTPS-arriving principal's bearer token identity.
+///
+/// The Unix-socket path mints a fresh id per accepted connection
+/// via [`next_connection_id`]; the connection has a well-defined
+/// lifetime and an RAII guard releases the responder slot when
+/// the socket closes. The HTTPS path has no such per-connection
+/// lifetime — each wire op is a separate REST/WS call and
+/// [`Server::dispatch_http_wire_op`] fabricates a fresh
+/// `ConnectionState` per op. Minting a counter-based id there
+/// would leave the responder slot holding an orphan id on every
+/// negotiate call; subsequent claims from any (fresh-id) op
+/// would then observe the mismatched holder and refuse. The UI
+/// team's report reproduced this: first claim granted, every
+/// subsequent claim refused until the steward restarted.
+///
+/// Fix: derive the responder id from the bearer token identity
+/// so every op carrying the same token maps to the same id. The
+/// [`PromptLedger::try_claim_responder`] idempotency then makes
+/// same-bearer re-claims succeed. Different bearer tokens hash
+/// to different ids and are correctly refused with
+/// `responder_already_assigned` while the current holder's
+/// bearer remains live.
+///
+/// Release semantics for the HTTPS path:
+///
+/// - When the bearer token expires or is revoked at the
+///   validator layer, subsequent ops fail auth before ever
+///   reaching the ledger. No further ops carry the old id.
+/// - A different bearer requesting the slot while a prior
+///   bearer's id is still resident sees `AlreadyHeld` — this
+///   is a bounded wait, capped by the bearer TTL (typically an
+///   hour in the standard mint), not "until steward restart".
+/// - Same-bearer re-negotiate (browser reload, WS reconnect on
+///   the same token) idempotently succeeds without lock churn.
+///
+/// The Unix-socket path is unaffected; its counter-based ids
+/// stay in the low u64 range (starting at 1, monotonic) and
+/// cannot collide with the hash-derived ids used here (which
+/// occupy the high u64 range in practice).
+fn connection_id_for_principal(
+    principal: &evo_runtime_http::Principal,
+) -> crate::prompts::ResponderConnectionId {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    // Salt so counter-derived low-u64 ids (Unix path) cannot
+    // collide with hash-derived ids for a low-collision-hash
+    // token_id. `DefaultHasher` outputs a full u64; the salt
+    // shifts the space rather than shrinks it.
+    "https_bearer_responder_id_v1".hash(&mut h);
+    principal.token_id.hash(&mut h);
+    crate::prompts::ResponderConnectionId::new(h.finish())
+}
+
 /// Mutable per-connection session state.
 ///
 /// Constructed once at accept time alongside the peer credentials,
@@ -3996,6 +9144,18 @@ struct ConnectionState {
     /// handler. Empty until the consumer sends a `negotiate` frame
     /// and the ACL grants at least one name.
     granted_capabilities: HashSet<String>,
+    /// Subset of `granted_capabilities` for which the connection's
+    /// principal additionally holds an active step-up auth session
+    /// within the step-up TTL. Populated from the bearer-token
+    /// capability set when the HTTPS dispatcher initialises the
+    /// synthetic connection; the legacy Unix-socket path leaves
+    /// this empty and the per-verb gate's StepUp branch refuses
+    /// (Unix-socket dispatch is operator-local and does not
+    /// currently establish step-up tokens). Consulted by the
+    /// plugin-route dispatcher's per-verb capability gate when the
+    /// verb's manifest declaration is
+    /// `VerbCapability::StepUp { scope }`.
+    step_up_scopes: HashSet<String>,
     /// Process-unique identifier for this connection. Used as
     /// the key for the single-responder lock on the prompt
     /// ledger; stable for the connection's lifetime.
@@ -4008,6 +9168,7 @@ impl ConnectionState {
         Self {
             peer,
             granted_capabilities: HashSet::new(),
+            step_up_scopes: HashSet::new(),
             connection_id: next_connection_id(),
         }
     }
@@ -4050,6 +9211,13 @@ pub struct Server {
     /// time-trust tracker; read by the dispatch path's
     /// `describe_capabilities` handler.
     clock_trust: crate::time_trust::SharedTimeTrust,
+    /// Shared last-detected-wall-clock-step slot. Populated by
+    /// the tracker on every NTP step > CLOCK_JUMP_THRESHOLD_SECS
+    /// and surfaced on `describe_capabilities.last_clock_step`
+    /// so operators of trust-critical devices see the magnitude
+    /// of any recent adjustment without having to correlate
+    /// happenings-log entries.
+    last_clock_step: crate::time_trust::SharedLastClockStep,
     /// Distribution-declared `has_battery_rtc` flag. Carried
     /// through to the capabilities response so consumers can
     /// reason about the device's hardware time-keeping.
@@ -4097,6 +9265,273 @@ pub struct Server {
     /// constructed without one; the capability gate then
     /// refuses with `Internal / watches_not_configured`.
     watches: Option<Arc<crate::watches::WatchRuntime>>,
+    /// Plan engine backing the operator-side `plans_admin` ops
+    /// (`fire_plan` today; list / cancel land alongside). `None`
+    /// when the server was constructed without one; the
+    /// capability gate then refuses with `Internal /
+    /// plan_engine_not_configured` so the misconfiguration is
+    /// loud rather than silent.
+    plan_engine: Option<Arc<crate::plans::PlanEngine>>,
+    /// Plugin registry runtime backing the operator-side
+    /// `plugins_admin` registry ops
+    /// (`register_plugin_registry` / `list_plugin_registries` /
+    /// `refresh_plugin_registry` / `unregister_plugin_registry`).
+    /// None means registry ops refuse with `Internal /
+    /// plugin_registry_not_configured`.
+    plugin_registry: Option<Arc<crate::plugin_registry::PluginRegistryRuntime>>,
+    /// Per-publisher trust store backing the operator-side
+    /// publisher-trust ops.
+    publisher_trust: Option<Arc<crate::publisher_trust::PublisherTrustStore>>,
+    /// Operator trust directory the publisher-trust grant op
+    /// writes key files into. Defaults to `/etc/evo/trust.d/`.
+    operator_trust_dir: Option<PathBuf>,
+    /// Audit-grade ledger handle the publisher-trust grant +
+    /// revoke handlers append entries into.
+    lifecycle_ledger: Option<Arc<crate::ledger::LedgerPrimitive>>,
+    /// Pluggable step-up verification hook. `None` means the
+    /// framework default (deny every verification call) is in
+    /// effect — a distribution that ships without configuring an
+    /// AuthService cannot elevate to privileged operations.
+    auth_service: Option<Arc<dyn crate::auth::AuthService>>,
+    /// Active privileged-session store. Always present at runtime
+    /// — the server constructs a default-configured store when
+    /// no override is supplied. Holds the in-memory map of issued
+    /// step-up tokens; the server hands out validate/revoke calls
+    /// from this store on every privileged op.
+    auth_session_store: Arc<crate::auth::AuthSessionStore>,
+    /// Rate limiter for `step_up_auth_verify` calls. Held here so
+    /// the accept loop threads a single instance across every
+    /// connection — a per-connection instance would let a peer
+    /// evade the limiter by dropping and re-establishing the
+    /// wire connection between attempts.
+    step_up_rate_limiter: Arc<crate::auth::StepUpRateLimiter>,
+    /// Nonce replay-defence store for `step_up_auth_verify`.
+    /// Held here for the same reason as the rate limiter — a
+    /// per-connection nonce store would not detect replays
+    /// across connections.
+    step_up_nonce_store: Arc<crate::auth::NonceReplayStore>,
+    /// UID allowlist consulted on `mint_local_kiosk_session`
+    /// and `set_kiosk_password`. Empty (the default) means
+    /// the distribution did not declare a compositor UID;
+    /// both wire ops refuse until at least one UID is
+    /// registered. Populated at Server construction time by
+    /// the distribution boot code.
+    kiosk_uid_allowlist: Arc<crate::kiosk_session::KioskUidAllowlist>,
+    /// Ephemeral state for remote-browser pair-once
+    /// ceremonies. Held here so pending attempts + the
+    /// paired-device index survive across the accept loop
+    /// spawning per-connection tasks.
+    pairing_store: Arc<crate::pairing::PairingStore>,
+    /// Name of the OS runtime user the framework runs as
+    /// (resolved from euid via getpwuid at boot). Held here so
+    /// `set_kiosk_password` can invoke `chpasswd -c SHA512 -R /`
+    /// with `<runtime_user>:<new_password>` to rewrite the row
+    /// [`ShadowAuthService`](crate::auth_shadow::ShadowAuthService)
+    /// verifies against on the next `step_up_auth_verify`.
+    ///
+    /// `None` means the distribution boot could not resolve the
+    /// runtime user's passwd entry — `set_kiosk_password` refuses
+    /// with `runtime_user_unresolved`.
+    runtime_user_name: Option<String>,
+    /// Update-channel preference store. `None` means the
+    /// `set_update_channel` / `get_update_channels` ops refuse
+    /// with `Internal / update_channel_store_not_configured`.
+    /// The shipped `evo` binary builds an
+    /// [`UpdateChannelStore`](crate::update_channel::UpdateChannelStore)
+    /// from the same persistence handle as the other operator
+    /// substrates.
+    update_channel_store:
+        Option<Arc<crate::update_channel::UpdateChannelStore>>,
+    /// Optional admitted UI stockings store. Pass an
+    /// [`AdmittedStockingsStore`](crate::ui_registry::AdmittedStockingsStore)
+    /// wrapping the steward's runtime handle to enable the
+    /// `describe_ui_stockings` op. Without this handle the
+    /// op refuses with
+    /// `Internal / ui_admitted_store_not_configured`. The
+    /// shipped `evo` binary always wires the same store the
+    /// admission gate populates.
+    ui_admitted_store: Option<Arc<crate::ui_registry::AdmittedStockingsStore>>,
+    /// Optional active UI selection runtime. Backs the
+    /// `activate_theme` / `activate_ui_shell` /
+    /// `describe_active_ui_selection` wire ops. Without this
+    /// handle the ops refuse with
+    /// `Internal / active_ui_selection_runtime_not_configured`.
+    /// The shipped `evo` binary wires a runtime backed by the
+    /// steward's persistence + the theme / UI shell
+    /// registries the admission gate populates.
+    active_ui_selection_runtime:
+        Option<Arc<crate::ui_active::ActiveUiSelection>>,
+    /// Optional wizard runtime. Backs the
+    /// `record_wizard_step_completion` wire op so renderer-driven
+    /// step acknowledgements (consent submissions, plain step
+    /// dismissals) reach the framework's persisted wizard state
+    /// and `evo.consent` ledger emission. Without this handle the
+    /// op refuses with
+    /// `Internal / wizard_runtime_not_configured`. The shipped
+    /// `evo` binary wires the runtime constructed at boot
+    /// alongside the wizard plan registration.
+    wizard_runtime: Option<Arc<crate::plans::WizardRuntime>>,
+    /// Search-root prefixes whose admitted plugins are classified
+    /// as `bundled` for lifecycle-policy purposes. The
+    /// `uninstall_plugin` handler refuses with
+    /// `bundled_plugin_not_removable` when the target plugin's
+    /// recorded bundle directory is rooted under any of these.
+    /// Empty list disables the policy (every plugin is treated
+    /// as `admitted`); the shipped binary populates this from
+    /// `config.plugins.bundled_roots`.
+    bundled_roots: Vec<PathBuf>,
+    /// Plugin-profile store backing the operator-facing
+    /// profile ops (`put_plugin_profile` /
+    /// `get_plugin_profile` / `list_plugin_profiles` /
+    /// `delete_plugin_profile` /
+    /// `set_active_plugin_profile`). `None` means those ops
+    /// refuse with `Internal /
+    /// plugin_profile_store_not_configured`. The shipped
+    /// binary builds the store over the same persistence
+    /// handle as the other operator substrates.
+    plugin_profile_store:
+        Option<Arc<crate::plugin_profile::PluginProfileStore>>,
+    /// Admission-policy store backing the operator-facing
+    /// policy ops (`put_admission_policy` /
+    /// `get_admission_policy` / `list_admission_policies` /
+    /// `delete_admission_policy` /
+    /// `set_active_admission_policy` / `audit_against_policy`).
+    /// `None` means those ops refuse with
+    /// `Internal / admission_policy_store_not_configured`.
+    admission_policy_store:
+        Option<Arc<crate::admission_policy::AdmissionPolicyStore>>,
+    /// Capability-grant revocation store backing the
+    /// per-capability operator surface (`revoke_plugin_capability`
+    /// / `unrevoke_plugin_capability` / `list_plugin_capability_
+    /// revocations` / `list_all_capability_revocations`). `None`
+    /// means those ops refuse with `Internal /
+    /// capability_grant_store_not_configured`.
+    capability_grant_store:
+        Option<Arc<crate::capability_grant::CapabilityGrantStore>>,
+    /// Migration-bundle store backing the cross-device
+    /// configuration export/import surface
+    /// (`export_migration_bundle` / `import_migration_bundle`).
+    /// `None` means those ops refuse with `Internal /
+    /// migration_bundle_store_not_configured`.
+    migration_bundle_store:
+        Option<Arc<crate::migration_bundle::MigrationBundleStore>>,
+    /// Hardware-profile override store backing the per-target
+    /// operator-override surface (`put_hardware_profile_override`
+    /// / `get_hardware_profile_override` /
+    /// `list_hardware_profile_overrides` /
+    /// `delete_hardware_profile_override`). `None` means those
+    /// ops refuse with `Internal /
+    /// hardware_profile_store_not_configured`.
+    hardware_profile_store:
+        Option<Arc<crate::hardware_profile::HardwareProfileStore>>,
+    /// Audio operator preferences store backing the
+    /// per-target policy / volume-mode operator surface
+    /// (`put_audio_operator_policy` etc.). `None` means those
+    /// ops refuse with `Internal /
+    /// audio_policy_store_not_configured`.
+    audio_policy_store: Option<Arc<crate::audio_policy::AudioPolicyStore>>,
+    /// Audio topology store backing the publish / get / list
+    /// / clear surface for active audio topologies. `None`
+    /// means those ops refuse with `Internal /
+    /// audio_topology_store_not_configured`.
+    audio_topology_store:
+        Option<Arc<crate::audio_topology::AudioTopologyStore>>,
+    /// Device-identity store backing the singleton device
+    /// identity surface (`get_device_identity` /
+    /// `set_device_display_name`). `None` means those ops
+    /// refuse with `Internal /
+    /// device_identity_store_not_configured`.
+    device_identity_store:
+        Option<Arc<crate::device_identity::DeviceIdentityStore>>,
+    /// Discovery runtime backing the multi-room peer surface
+    /// (`list_discovered_peers`). `None` means the op refuses
+    /// with `Internal / discovery_runtime_not_configured`.
+    discovery_runtime: Option<Arc<crate::discovery::DiscoveryRuntime>>,
+    /// Group store backing the multi-room group operator
+    /// surface (`create_group` / `get_group` / `list_groups`
+    /// / `rename_group` / `add_group_member` /
+    /// `remove_group_member` / `delete_group`). `None` means
+    /// those ops refuse with `Internal /
+    /// group_store_not_configured`.
+    group_store: Option<Arc<crate::groups::GroupStore>>,
+    /// Per-device multi-room role substrate backing
+    /// `set_device_role` / `get_device_role` /
+    /// `list_device_roles` / `clear_device_role`. `None` means
+    /// those ops refuse with `Internal /
+    /// role_store_not_configured`.
+    role_store: Option<evo_primitives::SharedRoleStore>,
+    /// Sticky endpoint cache backing the operator-gestured
+    /// reconnect-storm wire op. `None` means the storm op
+    /// refuses with `Internal / endpoint_cache_not_configured`.
+    endpoint_cache: Option<Arc<crate::endpoint_cache::EndpointCache>>,
+    /// Plugin lifecycle coordinator backing the operator-
+    /// gestured `plugin.reload` wire op. `None` means the
+    /// reload op refuses with `Internal /
+    /// plugin_lifecycle_coordinator_not_configured`.
+    plugin_lifecycle_coordinator:
+        Option<Arc<crate::plugin_lifecycle::PluginLifecycleCoordinator>>,
+    /// Plugin-degraded registry backing the operator-gestured
+    /// `plugin.restore` wire op + degraded-state queries.
+    /// `None` means those ops refuse with `Internal /
+    /// plugin_degraded_registry_not_configured`.
+    plugin_degraded_registry:
+        Option<Arc<crate::lifecycle_robustness::PluginDegradedRegistry>>,
+    /// Source-host election runtime backing
+    /// `get_source_host` / `list_source_hosts`. `None` means
+    /// those ops refuse with `Internal /
+    /// election_runtime_not_configured`.
+    election_runtime: Option<evo_primitives::SharedElectionState>,
+    /// Clock-sync runtime backing `get_clock_sync` /
+    /// `list_clock_syncs`. `None` means those ops refuse
+    /// with `Internal / clock_sync_runtime_not_configured`.
+    clock_sync_runtime: Option<Arc<crate::clock_sync::ClockSyncRuntime>>,
+    /// Audio-plane runtime backing
+    /// `list_audio_plane_connections`. `None` means the op
+    /// refuses with `Internal /
+    /// audio_plane_runtime_not_configured`.
+    audio_plane_runtime: Option<Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    /// Domain witness chain runtime backing the
+    /// chain-substrate wire ops (`get_chain_head`,
+    /// `domain_history`, `discard_peer_from_domain`,
+    /// `move_member`, `set_group_leader`, etc.). `None`
+    /// means those ops refuse with `Internal /
+    /// domain_witness_runtime_not_configured`.
+    domain_witness_runtime:
+        Option<Arc<crate::domain_witness::runtime::DomainWitnessRuntime>>,
+    /// Chain-scope presence correlator backing the per-
+    /// peer `presence_state` + `last_transition_at_ms`
+    /// projection joined onto `list_discovered_peers`.
+    /// `None` keeps the projection in advisory-only mode
+    /// (each row's `presence_state` resolves to `None`)
+    /// rather than refusing the read — the discovery half
+    /// of the row is still valid without the chain layer.
+    presence_correlator:
+        Option<Arc<crate::domain_witness::presence::PresenceCorrelator>>,
+    /// Reconnect runtime backing `trigger_reconnect`.
+    /// `None` means the op refuses with `Internal /
+    /// reconnect_runtime_not_wired`.
+    reconnect_runtime:
+        Option<Arc<crate::domain_witness::reconnect::ReconnectRuntime>>,
+    /// Group topology runtime backing
+    /// `get_group_active_topology` /
+    /// `list_group_active_topologies` and
+    /// `dispatch_to_group`. `None` means those ops refuse
+    /// with `Internal / group_topology_runtime_not_configured`.
+    group_topology_runtime:
+        Option<Arc<crate::group_topology::GroupTopologyRuntime>>,
+    /// Gateway plugin registry backing `list_gateway_plugins`.
+    /// `None` means the op refuses with `Internal /
+    /// gateway_registry_not_configured`.
+    gateway_registry: Option<Arc<crate::gateway::GatewayRegistry>>,
+    /// Update registry backing the five update wire ops.
+    /// `None` means those ops refuse with `Internal /
+    /// update_registry_not_configured`.
+    update_registry: Option<Arc<crate::updates::UpdateRegistry>>,
+    /// Restart coordinator backing
+    /// `request_steward_restart`. `None` means that op
+    /// refuses with `Internal /
+    /// restart_coordinator_not_configured`.
+    restart_coordinator: Option<Arc<crate::restart::RestartCoordinator>>,
 }
 
 impl Server {
@@ -4140,6 +9575,7 @@ impl Server {
             Arc::new(ResolutionLedger::new()),
             crate::catalogue::CatalogueSource::Configured,
             crate::time_trust::new_shared(),
+            crate::time_trust::new_shared_last_step(),
             false,
         )
     }
@@ -4169,6 +9605,7 @@ impl Server {
         resolution_ledger: Arc<ResolutionLedger>,
         catalogue_source: crate::catalogue::CatalogueSource,
         clock_trust: crate::time_trust::SharedTimeTrust,
+        last_clock_step: crate::time_trust::SharedLastClockStep,
         has_battery_rtc: bool,
     ) -> Self {
         Self {
@@ -4181,6 +9618,7 @@ impl Server {
             resolution_ledger,
             catalogue_source,
             clock_trust,
+            last_clock_step,
             has_battery_rtc,
             engine: None,
             reconciliation: None,
@@ -4188,7 +9626,565 @@ impl Server {
             prompt_ledger: None,
             appointments: None,
             watches: None,
+            plan_engine: None,
+            plugin_registry: None,
+            publisher_trust: None,
+            operator_trust_dir: None,
+            lifecycle_ledger: None,
+            auth_service: None,
+            auth_session_store: Arc::new(
+                crate::auth::AuthSessionStore::with_defaults(),
+            ),
+            step_up_rate_limiter: Arc::new(
+                crate::auth::StepUpRateLimiter::with_defaults(),
+            ),
+            step_up_nonce_store: Arc::new(
+                crate::auth::NonceReplayStore::with_defaults(),
+            ),
+            kiosk_uid_allowlist: Arc::new(
+                crate::kiosk_session::KioskUidAllowlist::empty(),
+            ),
+            pairing_store: Arc::new(crate::pairing::PairingStore::new()),
+            runtime_user_name: None,
+            update_channel_store: None,
+            ui_admitted_store: None,
+            active_ui_selection_runtime: None,
+            wizard_runtime: None,
+            bundled_roots: Vec::new(),
+            plugin_profile_store: None,
+            admission_policy_store: None,
+            capability_grant_store: None,
+            migration_bundle_store: None,
+            hardware_profile_store: None,
+            audio_policy_store: None,
+            audio_topology_store: None,
+            device_identity_store: None,
+            discovery_runtime: None,
+            group_store: None,
+            role_store: None,
+            endpoint_cache: None,
+            plugin_lifecycle_coordinator: None,
+            plugin_degraded_registry: None,
+            election_runtime: None,
+            clock_sync_runtime: None,
+            audio_plane_runtime: None,
+            domain_witness_runtime: None,
+            presence_correlator: None,
+            reconnect_runtime: None,
+            group_topology_runtime: None,
+            gateway_registry: None,
+            update_registry: None,
+            restart_coordinator: None,
         }
+    }
+
+    /// Builder-style setter for the capability-grant store.
+    pub fn with_capability_grant_store(
+        mut self,
+        store: Arc<crate::capability_grant::CapabilityGrantStore>,
+    ) -> Self {
+        self.capability_grant_store = Some(store);
+        self
+    }
+
+    /// Builder-style setter for the migration-bundle store. When
+    /// set, the server can answer `export_migration_bundle` /
+    /// `import_migration_bundle` against the operator-curated
+    /// configuration substrate.
+    pub fn with_migration_bundle_store(
+        mut self,
+        store: Arc<crate::migration_bundle::MigrationBundleStore>,
+    ) -> Self {
+        self.migration_bundle_store = Some(store);
+        self
+    }
+
+    /// Builder-style setter for the hardware-profile override
+    /// store. When set, the server can answer
+    /// `put_hardware_profile_override` /
+    /// `get_hardware_profile_override` /
+    /// `list_hardware_profile_overrides` /
+    /// `delete_hardware_profile_override` against the
+    /// operator-override substrate.
+    pub fn with_hardware_profile_store(
+        mut self,
+        store: Arc<crate::hardware_profile::HardwareProfileStore>,
+    ) -> Self {
+        self.hardware_profile_store = Some(store);
+        self
+    }
+
+    /// Builder-style setter for the audio operator
+    /// preferences store. When set, the server can answer
+    /// `put_audio_operator_policy` /
+    /// `get_audio_operator_policy` /
+    /// `list_audio_operator_policies` /
+    /// `delete_audio_operator_policy` /
+    /// `put_audio_volume_mode` / `get_audio_volume_mode` /
+    /// `list_audio_volume_modes` /
+    /// `delete_audio_volume_mode` against the operator
+    /// preferences substrate.
+    pub fn with_audio_policy_store(
+        mut self,
+        store: Arc<crate::audio_policy::AudioPolicyStore>,
+    ) -> Self {
+        self.audio_policy_store = Some(store);
+        self
+    }
+
+    /// Builder-style setter for the audio topology store. When
+    /// set, the server can answer
+    /// `publish_active_audio_topology` /
+    /// `get_active_audio_topology` /
+    /// `list_active_audio_topologies` /
+    /// `clear_active_audio_topology` against the active-
+    /// topology substrate.
+    pub fn with_audio_topology_store(
+        mut self,
+        store: Arc<crate::audio_topology::AudioTopologyStore>,
+    ) -> Self {
+        self.audio_topology_store = Some(store);
+        self
+    }
+
+    /// Builder-style setter for the device-identity store. When
+    /// set, the server can answer `get_device_identity` /
+    /// `set_device_display_name` against the singleton identity
+    /// substrate.
+    pub fn with_device_identity_store(
+        mut self,
+        store: Arc<crate::device_identity::DeviceIdentityStore>,
+    ) -> Self {
+        self.device_identity_store = Some(store);
+        self
+    }
+
+    /// Builder-style setter for the discovery runtime. When
+    /// set, the server can answer `list_discovered_peers`
+    /// against the live multi-room peer set.
+    pub fn with_discovery_runtime(
+        mut self,
+        runtime: Arc<crate::discovery::DiscoveryRuntime>,
+    ) -> Self {
+        self.discovery_runtime = Some(runtime);
+        self
+    }
+
+    /// Builder-style setter for the multi-room group store.
+    /// When set, the server can answer the seven group
+    /// operator-surface ops against the durable group
+    /// substrate.
+    pub fn with_group_store(
+        mut self,
+        store: Arc<crate::groups::GroupStore>,
+    ) -> Self {
+        self.group_store = Some(store);
+        self
+    }
+
+    /// Builder-style setter for the per-device multi-room
+    /// role store. When set, the server can answer the
+    /// `set_device_role` / `get_device_role` /
+    /// `list_device_roles` / `clear_device_role` ops against
+    /// the durable role substrate.
+    pub fn with_role_store(
+        mut self,
+        store: evo_primitives::SharedRoleStore,
+    ) -> Self {
+        self.role_store = Some(store);
+        self
+    }
+
+    /// Builder-style setter for the sticky endpoint cache.
+    /// When set, the operator-gestured reconnect-storm wire op
+    /// has the substrate it needs to dispatch carriers; when
+    /// unset the op refuses.
+    pub fn with_endpoint_cache(
+        mut self,
+        cache: Arc<crate::endpoint_cache::EndpointCache>,
+    ) -> Self {
+        self.endpoint_cache = Some(cache);
+        self
+    }
+
+    /// Builder-style setter for the plugin lifecycle
+    /// coordinator. When set, the operator-gestured
+    /// `plugin.reload` wire op routes through the coordinator's
+    /// operator-gesture reload request path.
+    pub fn with_plugin_lifecycle_coordinator(
+        mut self,
+        coord: Arc<crate::plugin_lifecycle::PluginLifecycleCoordinator>,
+    ) -> Self {
+        self.plugin_lifecycle_coordinator = Some(coord);
+        self
+    }
+
+    /// Builder-style setter for the plugin-degraded registry.
+    /// When set, the operator-gestured `plugin.restore` wire
+    /// op + degraded-state queries dispatch against this
+    /// registry.
+    pub fn with_plugin_degraded_registry(
+        mut self,
+        registry: Arc<crate::lifecycle_robustness::PluginDegradedRegistry>,
+    ) -> Self {
+        self.plugin_degraded_registry = Some(registry);
+        self
+    }
+
+    /// Build a [`SubstrateHandles`] bundle from this server's
+    /// substrate-handle fields. Cloned `Arc`s; the bundle is
+    /// the single argument passed into `handle_connection` /
+    /// `dispatch_request` so each new substrate adds a field
+    /// to [`SubstrateHandles`] rather than threading through
+    /// every dispatch-path signature.
+    fn substrate_handles(&self) -> SubstrateHandles {
+        SubstrateHandles {
+            prompt_ledger: self.prompt_ledger.clone(),
+            appointments: self.appointments.clone(),
+            watches: self.watches.clone(),
+            plan_engine: self.plan_engine.clone(),
+            plugin_registry: self.plugin_registry.clone(),
+            publisher_trust: self.publisher_trust.clone(),
+            update_channel_store: self.update_channel_store.clone(),
+            ui_admitted_store: self.ui_admitted_store.clone(),
+            active_ui_selection_runtime: self
+                .active_ui_selection_runtime
+                .clone(),
+            wizard_runtime: self.wizard_runtime.clone(),
+            plugin_profile_store: self.plugin_profile_store.clone(),
+            admission_policy_store: self.admission_policy_store.clone(),
+            capability_grant_store: self.capability_grant_store.clone(),
+            migration_bundle_store: self.migration_bundle_store.clone(),
+            hardware_profile_store: self.hardware_profile_store.clone(),
+            audio_policy_store: self.audio_policy_store.clone(),
+            audio_topology_store: self.audio_topology_store.clone(),
+            device_identity_store: self.device_identity_store.clone(),
+            discovery_runtime: self.discovery_runtime.clone(),
+            group_store: self.group_store.clone(),
+            role_store: self.role_store.clone(),
+            endpoint_cache: self.endpoint_cache.clone(),
+            plugin_lifecycle_coordinator: self
+                .plugin_lifecycle_coordinator
+                .clone(),
+            plugin_degraded_registry: self.plugin_degraded_registry.clone(),
+            election_runtime: self.election_runtime.clone(),
+            clock_sync_runtime: self.clock_sync_runtime.clone(),
+            audio_plane_runtime: self.audio_plane_runtime.clone(),
+            domain_witness_runtime: self.domain_witness_runtime.clone(),
+            presence_correlator: self.presence_correlator.clone(),
+            reconnect_runtime: self.reconnect_runtime.clone(),
+            group_topology_runtime: self.group_topology_runtime.clone(),
+            gateway_registry: self.gateway_registry.clone(),
+            update_registry: self.update_registry.clone(),
+            restart_coordinator: self.restart_coordinator.clone(),
+        }
+    }
+
+    /// Builder-style setter for the source-host election
+    /// runtime. When set, the server can answer
+    /// `get_source_host` / `list_source_hosts` against the
+    /// runtime's in-memory mirror.
+    pub fn with_election_runtime(
+        mut self,
+        runtime: evo_primitives::SharedElectionState,
+    ) -> Self {
+        self.election_runtime = Some(runtime);
+        self
+    }
+
+    /// Builder-style setter for the clock-sync runtime. When
+    /// set, the server can answer `get_clock_sync` /
+    /// `list_clock_syncs` against the runtime's in-memory
+    /// state map.
+    pub fn with_clock_sync_runtime(
+        mut self,
+        runtime: Arc<crate::clock_sync::ClockSyncRuntime>,
+    ) -> Self {
+        self.clock_sync_runtime = Some(runtime);
+        self
+    }
+
+    /// Builder-style setter for the audio-plane runtime. When
+    /// set, the server can answer
+    /// `list_audio_plane_connections` against the live
+    /// per-peer connection map.
+    pub fn with_audio_plane_runtime(
+        mut self,
+        runtime: Arc<crate::audio_plane::AudioPlaneRuntime>,
+    ) -> Self {
+        self.audio_plane_runtime = Some(runtime);
+        self
+    }
+
+    /// Builder-style setter for the domain witness chain
+    /// runtime. When set, the server can answer the
+    /// chain-substrate wire ops (`get_chain_head`,
+    /// `domain_history`, `discard_peer_from_domain`,
+    /// `move_member`, `set_group_leader`, etc.) against
+    /// the runtime's projection + signing path.
+    pub fn with_domain_witness_runtime(
+        mut self,
+        runtime: Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    ) -> Self {
+        self.domain_witness_runtime = Some(runtime);
+        self
+    }
+
+    /// Builder-style setter for the chain-scope presence
+    /// correlator. When set, `handle_list_discovered_peers`
+    /// joins each row with the correlator's
+    /// `(state, last_transition_at_ms)` snapshot so the
+    /// operator UI's per-device presence badge has a
+    /// current-state read alongside the
+    /// `peer_presence_changed` transition feed.
+    pub fn with_presence_correlator(
+        mut self,
+        correlator: Arc<crate::domain_witness::presence::PresenceCorrelator>,
+    ) -> Self {
+        self.presence_correlator = Some(correlator);
+        self
+    }
+
+    /// Builder-style setter for the reconnect runtime that
+    /// fires the operator-gestured reconnect storm. When
+    /// set, `trigger_reconnect` dispatches into the storm
+    /// orchestrator; when unset, the op refuses with the
+    /// structured `reconnect_runtime_not_wired` subclass.
+    pub fn with_reconnect_runtime(
+        mut self,
+        runtime: Arc<crate::domain_witness::reconnect::ReconnectRuntime>,
+    ) -> Self {
+        self.reconnect_runtime = Some(runtime);
+        self
+    }
+
+    /// Builder-style setter for the group topology runtime.
+    /// When set, the server can answer
+    /// `dispatch_to_group` / `get_group_active_topology` /
+    /// `list_group_active_topologies`.
+    pub fn with_group_topology_runtime(
+        mut self,
+        runtime: Arc<crate::group_topology::GroupTopologyRuntime>,
+    ) -> Self {
+        self.group_topology_runtime = Some(runtime);
+        self
+    }
+
+    /// Builder-style setter for the gateway plugin registry.
+    /// When set, the server can answer `list_gateway_plugins`.
+    pub fn with_gateway_registry(
+        mut self,
+        registry: Arc<crate::gateway::GatewayRegistry>,
+    ) -> Self {
+        self.gateway_registry = Some(registry);
+        self
+    }
+
+    /// Builder-style setter for the update registry. When
+    /// set, the server can answer the five update wire ops
+    /// against the live registry state.
+    pub fn with_update_registry(
+        mut self,
+        registry: Arc<crate::updates::UpdateRegistry>,
+    ) -> Self {
+        self.update_registry = Some(registry);
+        self
+    }
+
+    /// Builder-style setter for the restart coordinator.
+    /// When set, the server can answer
+    /// `request_steward_restart`.
+    pub fn with_restart_coordinator(
+        mut self,
+        coordinator: Arc<crate::restart::RestartCoordinator>,
+    ) -> Self {
+        self.restart_coordinator = Some(coordinator);
+        self
+    }
+
+    /// Builder-style setter for the plugin-profile store.
+    pub fn with_plugin_profile_store(
+        mut self,
+        store: Arc<crate::plugin_profile::PluginProfileStore>,
+    ) -> Self {
+        self.plugin_profile_store = Some(store);
+        self
+    }
+
+    /// Builder-style setter for the admission-policy store.
+    pub fn with_admission_policy_store(
+        mut self,
+        store: Arc<crate::admission_policy::AdmissionPolicyStore>,
+    ) -> Self {
+        self.admission_policy_store = Some(store);
+        self
+    }
+
+    /// Builder-style setter for the bundled-roots policy. Pass
+    /// the operator-configured `plugins.bundled_roots` list. The
+    /// uninstall handler matches a plugin's recorded bundle
+    /// directory prefix against this list to classify it as
+    /// `bundled` (refuses removal) or `admitted` (allows). Empty
+    /// list (the default) disables the policy.
+    pub fn with_bundled_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.bundled_roots = roots;
+        self
+    }
+
+    /// Builder-style setter for the update-channel preference
+    /// store. Pass an
+    /// [`UpdateChannelStore`](crate::update_channel::UpdateChannelStore)
+    /// wrapping the steward's persistence handle to enable the
+    /// `set_update_channel` / `get_update_channels` ops.
+    pub fn with_update_channel_store(
+        mut self,
+        store: Arc<crate::update_channel::UpdateChannelStore>,
+    ) -> Self {
+        self.update_channel_store = Some(store);
+        self
+    }
+
+    /// Builder-style setter for the admitted UI stockings
+    /// store. Pass an
+    /// [`AdmittedStockingsStore`](crate::ui_registry::AdmittedStockingsStore)
+    /// wrapping the steward's runtime handle to enable the
+    /// `describe_ui_stockings` op. The shipped `evo` binary
+    /// passes the same store the admission gate populates so
+    /// operator surfaces observe the canonical admitted set
+    /// without a separate substrate.
+    pub fn with_ui_admitted_store(
+        mut self,
+        store: Arc<crate::ui_registry::AdmittedStockingsStore>,
+    ) -> Self {
+        self.ui_admitted_store = Some(store);
+        self
+    }
+
+    /// Builder-style setter for the active UI selection
+    /// runtime. Pass an
+    /// [`ActiveUiSelection`](crate::ui_active::ActiveUiSelection)
+    /// wired against the same persistence + registries the
+    /// admission gate uses to enable the `activate_theme` /
+    /// `activate_ui_shell` / `describe_active_ui_selection`
+    /// ops. The shipped `evo` binary always wires this so
+    /// operator surfaces can drive the selection.
+    pub fn with_active_ui_selection_runtime(
+        mut self,
+        runtime: Arc<crate::ui_active::ActiveUiSelection>,
+    ) -> Self {
+        self.active_ui_selection_runtime = Some(runtime);
+        self
+    }
+
+    /// Builder-style setter for the wizard runtime. Enables the
+    /// `record_wizard_step_completion` wire op so renderer-driven
+    /// step acknowledgements reach the framework's persisted
+    /// wizard state and `evo.consent` ledger.
+    pub fn with_wizard_runtime(
+        mut self,
+        runtime: Arc<crate::plans::WizardRuntime>,
+    ) -> Self {
+        self.wizard_runtime = Some(runtime);
+        self
+    }
+
+    /// Builder-style setter for the pluggable AuthService and the
+    /// privileged-session store. Pass an explicit
+    /// [`crate::auth::AuthSessionStore`] to override the
+    /// default-configured store (5-minute default TTL,
+    /// 15-minute ceiling); pass `None` for `service` to keep the
+    /// framework-default deny-all behaviour. Both arguments are
+    /// recorded so privileged-op handlers can validate step-up
+    /// tokens and emit audit entries.
+    pub fn with_auth(
+        mut self,
+        service: Option<Arc<dyn crate::auth::AuthService>>,
+        store: Arc<crate::auth::AuthSessionStore>,
+    ) -> Self {
+        self.auth_service = service;
+        self.auth_session_store = store;
+        self
+    }
+
+    /// Builder-style setter for the kiosk UID allowlist. The
+    /// distribution boot code passes the compositor session's
+    /// UID here; without this call the allowlist stays empty
+    /// and every `mint_local_kiosk_session` +
+    /// `set_kiosk_password` call refuses with
+    /// `allowlist_empty`.
+    pub fn with_kiosk_uid_allowlist(
+        mut self,
+        allowlist: Arc<crate::kiosk_session::KioskUidAllowlist>,
+    ) -> Self {
+        self.kiosk_uid_allowlist = allowlist;
+        self
+    }
+
+    /// Builder-style setter for the OS runtime user name backing
+    /// the shadow-file password path. The distribution boot
+    /// resolves this from `getpwuid(geteuid())` and passes the
+    /// result here; the `set_kiosk_password` handler invokes
+    /// `chpasswd -c SHA512 -R /` under sudo with
+    /// `<runtime_user>:<new_password>` on stdin to rewrite the
+    /// row [`ShadowAuthService`](crate::auth_shadow::ShadowAuthService)
+    /// verifies against.
+    ///
+    /// Without this call, `set_kiosk_password` refuses with
+    /// `runtime_user_unresolved`.
+    pub fn with_runtime_user_for_password_set(
+        mut self,
+        runtime_user: String,
+    ) -> Self {
+        self.runtime_user_name = Some(runtime_user);
+        self
+    }
+
+    /// Builder-style setter for the bootstrap pair preseed. The
+    /// distribution boot code reads a preseed value from a
+    /// boot-partition file (conventionally
+    /// `/boot/evo/pair-preseed.txt`) that the operator drops
+    /// there BEFORE first plug-in — same convention as
+    /// `wpa_supplicant.conf` on stock Raspberry Pi OS. When
+    /// present, the pairing store is seeded so the first
+    /// browser calling
+    /// `pair_complete { pair_id: "bootstrap", code: <preseed> }`
+    /// gets a paired-device bearer without needing a
+    /// kiosk-displayed code. Consumed on first successful
+    /// pair; a wrong guess also consumes the slot (single-
+    /// shot discipline). Without this call, headless devices
+    /// have no pair path until a kiosk-displayed code appears
+    /// or the reset gesture wipes state.
+    pub fn with_bootstrap_pair_preseed(
+        self,
+        preseed: String,
+        device_hint_default: String,
+    ) -> Self {
+        self.pairing_store
+            .seed_bootstrap(preseed, device_hint_default);
+        self
+    }
+
+    /// Builder-style setter for the audit-grade ledger handle
+    /// used by publisher-trust grant + revoke handlers.
+    pub fn with_lifecycle_ledger(
+        mut self,
+        ledger: Arc<crate::ledger::LedgerPrimitive>,
+    ) -> Self {
+        self.lifecycle_ledger = Some(ledger);
+        self
+    }
+
+    /// Builder-style setter for the per-publisher trust store
+    /// plus the operator trust directory the grant op writes
+    /// key files into.
+    pub fn with_publisher_trust(
+        mut self,
+        store: Arc<crate::publisher_trust::PublisherTrustStore>,
+        operator_trust_dir: PathBuf,
+    ) -> Self {
+        self.publisher_trust = Some(store);
+        self.operator_trust_dir = Some(operator_trust_dir);
+        self
     }
 
     /// Builder-style setter for the watches-runtime handle.
@@ -4215,6 +10211,29 @@ impl Server {
         runtime: Arc<crate::appointments::AppointmentRuntime>,
     ) -> Self {
         self.appointments = Some(runtime);
+        self
+    }
+
+    /// Builder-style setter for the plan engine handle. The
+    /// operator-side `fire_plan` op refuses with `Internal /
+    /// plan_engine_not_configured` when the handle is absent.
+    pub fn with_plan_engine(
+        mut self,
+        engine: Arc<crate::plans::PlanEngine>,
+    ) -> Self {
+        self.plan_engine = Some(engine);
+        self
+    }
+
+    /// Builder-style setter for the plugin-registry runtime
+    /// handle. Operator-side registry ops refuse with
+    /// `Internal / plugin_registry_not_configured` when the
+    /// handle is absent.
+    pub fn with_plugin_registry(
+        mut self,
+        runtime: Arc<crate::plugin_registry::PluginRegistryRuntime>,
+    ) -> Self {
+        self.plugin_registry = Some(runtime);
         self
     }
 
@@ -4298,6 +10317,320 @@ impl Server {
     /// connection tasks are not explicitly joined in v0 (they are
     /// dropped when the tokio runtime winds down).
     ///
+    /// Dispatch one wire op originating from the HTTPS runtime mount.
+    ///
+    /// Translates the supplied `(op_id, payload, principal)` triple
+    /// into the canonical `ClientRequest` shape consumed by the
+    /// in-process dispatch path, synthesises a connection-state
+    /// envelope that grants every scope the bearer-token principal
+    /// carries, and runs the request through the same code path the
+    /// UDS listener uses. The resulting `ClientResponse` is
+    /// re-serialised back to JSON for the HTTPS responder.
+    ///
+    /// The `payload` argument is merged with an `"op": <op_id>` field
+    /// so the existing `#[serde(tag = "op")]` deserialiser picks the
+    /// right variant. A `null` payload becomes `{"op": op_id}`
+    /// (covers the no-arg ops); anything other than a JSON object or
+    /// null is refused.
+    ///
+    /// The synthesised connection state is bound to UID 0 (the
+    /// framework itself); the HTTPS boundary is the trust boundary.
+    /// Internal handlers that consult `conn.has(...)` see the
+    /// flattened capability scopes the bearer token carries, so the
+    /// per-handler capability gate succeeds iff the runtime-http
+    /// middleware admitted the request.
+    /// Open a subscription over the WS / HTTPS surface for one
+    /// of the canonical `subscribe_*` ops. Routes per op id:
+    ///
+    /// - `subscribe_happenings`: taps the durable happenings
+    ///   bus broadcast; every event surfaces as a JSON value
+    ///   whose shape is the framework's `Happening` enum.
+    ///
+    /// - `subscribe_subject`: taps the subject registry's
+    ///   state-change broadcast and filters to the
+    ///   `canonical_id` carried on the payload; every matching
+    ///   update surfaces as a JSON `SubjectStateUpdate`.
+    ///
+    /// Unknown subscribe op ids return
+    /// [`DispatchError::NotImplemented`]. Payload parse
+    /// failures return [`DispatchError::InvalidPayload`]. The
+    /// returned stream ends cleanly when the underlying
+    /// broadcast lags repeatedly or closes (server shutdown).
+    pub async fn subscribe_http_wire_op(
+        &self,
+        op_id: &str,
+        payload: serde_json::Value,
+        _principal: &evo_runtime_http::Principal,
+    ) -> Result<
+        evo_runtime_http::SubscriptionOpened,
+        evo_runtime_http::DispatchError,
+    > {
+        use evo_runtime_http::{DispatchError, SubscriptionOpened};
+        use futures::stream::StreamExt;
+
+        // Parse the two opt-in fields consumers may pass on
+        // any subscription op:
+        //
+        // - `snapshot_in_ack: bool` (default `false`) — when
+        //   `true`, the dispatcher computes an initial event
+        //   inline and returns it on the `SubscriptionAck`
+        //   frame so the subscription itself becomes the
+        //   single source of truth (no follow-up pull op
+        //   needed).
+        // - `keepalive_ms: u64?` — application-level heartbeat
+        //   cadence. Clamped to `[1_000, 60_000]`. Absent
+        //   means no heartbeats (pre-keepalive wire shape).
+        //
+        // Both are opt-in; the dispatcher's default behaviour
+        // is byte-identical to the pre-opt-in path when
+        // neither is set.
+        let snapshot_in_ack = extract_snapshot_in_ack_from_payload(&payload);
+        let keepalive_ms = extract_keepalive_ms_from_payload(&payload);
+
+        match op_id {
+            "subscribe_happenings" => {
+                let filter = parse_http_happening_filter(&payload)?;
+
+                // Produce-iff-consumed hook (WSS path). Increment
+                // the per-subject-type interest counter for every
+                // subject_type this subscription allow-lists. The
+                // stream is wrapped in a WssInterestStream so
+                // decrement runs when the stream drops (client
+                // disconnects, server shuts down, HTTP layer
+                // cancels). Empty allow-list is deliberately
+                // treated as "no interest bump" — see the P2
+                // hole tracked in SPECTRUM-DEMAND.md; an
+                // unfiltered subscription can still consume
+                // spectrum via the wildcard, and closing that
+                // requires either a wildcard-interest primitive
+                // or a discipline that all spectrum consumers
+                // filter by subject_type.
+                let interest_subject_types: Vec<String> =
+                    filter.subject_types.clone();
+                for st in &interest_subject_types {
+                    self.state.subjects.increment_interest(st).await;
+                }
+                let interest_guard = WssInterestGuard::new(
+                    Arc::clone(&self.state),
+                    interest_subject_types,
+                );
+
+                let rx = self.state.bus.subscribe();
+                let events = tokio_stream::wrappers::BroadcastStream::new(rx)
+                    .filter_map(move |item| {
+                        let filter = filter.clone();
+                        async move {
+                            match item {
+                                Ok(happening) if filter.accepts(&happening) => {
+                                    serde_json::to_value(&happening).ok()
+                                }
+                                _ => None,
+                            }
+                        }
+                    });
+                let events = events.boxed();
+                let stream: evo_runtime_http::SubscriptionEventStream =
+                    Box::pin(WssInterestStream::new(events, interest_guard));
+                let stream = merge_keepalive_stream(
+                    stream,
+                    keepalive_ms,
+                    KeepaliveKind::Happenings { canonical_id: None },
+                );
+                let _ = snapshot_in_ack;
+                Ok(SubscriptionOpened {
+                    initial_event: None,
+                    stream,
+                })
+            }
+            "subscribe_subject" => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Params {
+                    canonical_id: String,
+                    #[serde(default)]
+                    #[allow(dead_code)]
+                    snapshot_in_ack: bool,
+                    #[serde(default)]
+                    #[allow(dead_code)]
+                    keepalive_ms: Option<u64>,
+                }
+                let params: Params = serde_json::from_value(payload.clone())
+                    .map_err(|e| {
+                        DispatchError::InvalidPayload(format!(
+                            "subscribe_subject payload: {e}"
+                        ))
+                    })?;
+                let target = params.canonical_id.clone();
+
+                // Compute the initial event NOW (before
+                // subscribing to the broadcast) when the
+                // consumer opted into snapshot-in-ack. The
+                // event carries the current subject state so
+                // the subscription becomes the single source
+                // of truth from frame one. Same wire shape as
+                // the ongoing subject-state-update events on
+                // the stream below.
+                let initial_event = if snapshot_in_ack {
+                    self.state.subjects.describe(&target).map(|record| {
+                        let state = self
+                            .state
+                            .subjects
+                            .state_of(&target)
+                            .unwrap_or(serde_json::Value::Null);
+                        let modified_at_ms = record
+                            .modified_at
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        serde_json::json!({
+                            "canonical_id":   record.id,
+                            "subject_type":   record.subject_type,
+                            "state":          state,
+                            "modified_at_ms": modified_at_ms,
+                        })
+                    })
+                } else {
+                    None
+                };
+
+                // Produce-iff-consumed hook (WSS path). Look up
+                // subject_type from canonical_id and increment
+                // interest — same primitive as the Unix
+                // subscribe_subject hook. Guard is bound to the
+                // returned stream so decrement runs when the
+                // stream drops (client disconnect / cancel).
+                let interest_subject_type: Vec<String> = self
+                    .state
+                    .subjects
+                    .describe(&target)
+                    .map(|r| vec![r.subject_type])
+                    .unwrap_or_default();
+                for st in &interest_subject_type {
+                    self.state.subjects.increment_interest(st).await;
+                }
+                let interest_guard = WssInterestGuard::new(
+                    Arc::clone(&self.state),
+                    interest_subject_type,
+                );
+
+                let rx = self.state.subjects.subscribe_state_changes();
+                let events = tokio_stream::wrappers::BroadcastStream::new(rx)
+                    .filter_map(move |item| {
+                        let target = target.clone();
+                        async move {
+                            match item {
+                                Ok(update) if update.canonical_id == target => {
+                                    // SubjectStateUpdate is
+                                    // not Serialize; assemble
+                                    // the wire shape by hand.
+                                    Some(serde_json::json!({
+                                        "canonical_id":   update.canonical_id,
+                                        "subject_type":   update.subject_type,
+                                        "state":          update.state,
+                                        "modified_at_ms": update.modified_at_ms,
+                                    }))
+                                }
+                                _ => None,
+                            }
+                        }
+                    });
+                let events = events.boxed();
+                let stream: evo_runtime_http::SubscriptionEventStream =
+                    Box::pin(WssInterestStream::new(events, interest_guard));
+                let stream = merge_keepalive_stream(
+                    stream,
+                    keepalive_ms,
+                    KeepaliveKind::Subject {
+                        canonical_id: params.canonical_id,
+                    },
+                );
+                Ok(SubscriptionOpened {
+                    initial_event,
+                    stream,
+                })
+            }
+            other => Err(DispatchError::NotImplemented(format!(
+                "subscription op `{other}` not routed in the steward",
+            ))),
+        }
+    }
+
+    /// Dispatch one request/response wire op over the HTTPS
+    /// surface. Mirror of the existing TCP socket path —
+    /// shared dispatch core, different framing. The
+    /// [`evo_runtime_http::Dispatcher`] adapter wraps this in
+    /// the trait the runtime mount consumes.
+    pub async fn dispatch_http_wire_op(
+        &self,
+        op_id: &str,
+        payload: serde_json::Value,
+        principal: &evo_runtime_http::Principal,
+    ) -> Result<serde_json::Value, HttpDispatchError> {
+        let req = parse_http_wire_request(op_id, payload)?;
+        let mut conn = ConnectionState {
+            peer: PeerCredentials {
+                uid: Some(0),
+                gid: Some(0),
+            },
+            granted_capabilities: flatten_principal_capabilities(principal),
+            step_up_scopes: flatten_step_up_scopes(principal),
+            connection_id: connection_id_for_principal(principal),
+        };
+        let handles = self.substrate_handles();
+        let response = dispatch_request(
+            req,
+            &self.router,
+            &self.state,
+            &self.projections,
+            &self.acl,
+            self.steward_identity,
+            &self.resolution_ledger,
+            self.catalogue_source,
+            &self.clock_trust,
+            &self.last_clock_step,
+            self.has_battery_rtc,
+            self.engine.as_ref(),
+            self.reconciliation.as_ref(),
+            self.operator_trust_dir.as_deref(),
+            self.lifecycle_ledger.as_ref(),
+            self.auth_service.as_ref(),
+            &self.auth_session_store,
+            &self.step_up_rate_limiter,
+            &self.step_up_nonce_store,
+            &self.kiosk_uid_allowlist,
+            &self.pairing_store,
+            self.runtime_user_name.as_deref(),
+            &self.bundled_roots,
+            &handles,
+            &mut conn,
+        )
+        .await;
+        // Wire-honesty: a ClientResponse::Error means the
+        // framework accepted the request but refused it (verb
+        // capability denied, plugin not admitted, no responder,
+        // application error). Under the old shape this returned
+        // Ok(value) with the error in the body and HTTP 200 —
+        // a lying wire that clients could not classify without
+        // parsing the body. Now the same body reaches the
+        // client, but with the HTTP status the ErrorClass
+        // maps to (retryable → 5xx / 429, caller-fault → 4xx).
+        if let ClientResponse::Error { error } = &response {
+            let status = error_class_to_http_status(error.class);
+            let message = error.message.clone();
+            let body = serde_json::to_value(&response).map_err(|e| {
+                HttpDispatchError::SerializationFailed(e.to_string())
+            })?;
+            return Err(HttpDispatchError::RequestRefused {
+                status,
+                message,
+                body,
+            });
+        }
+        serde_json::to_value(&response)
+            .map_err(|e| HttpDispatchError::SerializationFailed(e.to_string()))
+    }
+
     /// When the server was constructed with [`Self::with_fast_path`],
     /// a parallel Fast Path accept loop runs alongside the slow-path
     /// one and shuts down on the same signal. The Fast Path channel
@@ -4427,12 +10760,30 @@ impl Server {
                             let catalogue_source = self.catalogue_source;
                             let clock_trust =
                                 Arc::clone(&self.clock_trust);
+                            let last_clock_step =
+                                Arc::clone(&self.last_clock_step);
                             let has_battery_rtc = self.has_battery_rtc;
                             let engine = self.engine.clone();
                             let reconciliation = self.reconciliation.clone();
-                            let prompt_ledger = self.prompt_ledger.clone();
-                            let appointments = self.appointments.clone();
-                            let watches = self.watches.clone();
+                            let operator_trust_dir =
+                                self.operator_trust_dir.clone();
+                            let lifecycle_ledger =
+                                self.lifecycle_ledger.clone();
+                            let auth_service = self.auth_service.clone();
+                            let auth_session_store =
+                                Arc::clone(&self.auth_session_store);
+                            let step_up_rate_limiter =
+                                Arc::clone(&self.step_up_rate_limiter);
+                            let step_up_nonce_store =
+                                Arc::clone(&self.step_up_nonce_store);
+                            let kiosk_uid_allowlist =
+                                Arc::clone(&self.kiosk_uid_allowlist);
+                            let pairing_store =
+                                Arc::clone(&self.pairing_store);
+                            let runtime_user_name =
+                                self.runtime_user_name.clone();
+                            let bundled_roots = self.bundled_roots.clone();
+                            let handles = self.substrate_handles();
                             tokio::spawn(async move {
                                 if let Err(e) = handle_connection(
                                     stream,
@@ -4444,12 +10795,21 @@ impl Server {
                                     resolution_ledger,
                                     catalogue_source,
                                     clock_trust,
+                                    last_clock_step,
                                     has_battery_rtc,
                                     engine,
                                     reconciliation,
-                                    prompt_ledger,
-                                    appointments,
-                                    watches,
+                                    operator_trust_dir,
+                                    lifecycle_ledger,
+                                    auth_service,
+                                    auth_session_store,
+                                    step_up_rate_limiter,
+                                    step_up_nonce_store,
+                                    kiosk_uid_allowlist,
+                                    pairing_store,
+                                    runtime_user_name,
+                                    bundled_roots,
+                                    handles,
                                     peer,
                                 ).await {
                                     tracing::warn!(
@@ -4553,14 +10913,23 @@ async fn handle_connection(
     resolution_ledger: Arc<ResolutionLedger>,
     catalogue_source: crate::catalogue::CatalogueSource,
     clock_trust: crate::time_trust::SharedTimeTrust,
+    last_clock_step: crate::time_trust::SharedLastClockStep,
     has_battery_rtc: bool,
     engine: Option<Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
     reconciliation: Option<
         Arc<crate::reconciliation::ReconciliationCoordinator>,
     >,
-    prompt_ledger: Option<Arc<crate::prompts::PromptLedger>>,
-    appointments: Option<Arc<crate::appointments::AppointmentRuntime>>,
-    watches: Option<Arc<crate::watches::WatchRuntime>>,
+    operator_trust_dir: Option<PathBuf>,
+    lifecycle_ledger: Option<Arc<crate::ledger::LedgerPrimitive>>,
+    auth_service: Option<Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: Arc<crate::auth::AuthSessionStore>,
+    step_up_rate_limiter: Arc<crate::auth::StepUpRateLimiter>,
+    step_up_nonce_store: Arc<crate::auth::NonceReplayStore>,
+    kiosk_uid_allowlist: Arc<crate::kiosk_session::KioskUidAllowlist>,
+    pairing_store: Arc<crate::pairing::PairingStore>,
+    runtime_user_name: Option<String>,
+    bundled_roots: Vec<PathBuf>,
+    handles: SubstrateHandles,
     peer: PeerCredentials,
 ) -> Result<(), StewardError> {
     let mut conn = ConnectionState::new(peer);
@@ -4569,7 +10938,7 @@ async fn handle_connection(
     // disconnect path. The guard's Drop fires when the
     // connection-handler task ends.
     let _responder_guard = ResponderConnectionGuard {
-        ledger: prompt_ledger.clone(),
+        ledger: handles.prompt_ledger.clone(),
         connection_id: conn.id(),
     };
     loop {
@@ -4600,6 +10969,7 @@ async fn handle_connection(
             since,
             filter,
             coalesce,
+            keepalive_ms,
         } = req
         {
             // Validate the coalesce config (if present) before
@@ -4635,6 +11005,7 @@ async fn handle_connection(
                 since,
                 filter.into(),
                 coalescer,
+                keepalive_ms,
             )
             .await;
         }
@@ -4643,6 +11014,8 @@ async fn handle_connection(
             canonical_id,
             scope,
             follow_aliases,
+            snapshot_in_ack,
+            keepalive_ms,
         } = req
         {
             return run_subject_subscription(
@@ -4652,6 +11025,8 @@ async fn handle_connection(
                 canonical_id,
                 scope.into(),
                 follow_aliases,
+                snapshot_in_ack,
+                keepalive_ms,
             )
             .await;
         }
@@ -4666,12 +11041,21 @@ async fn handle_connection(
             &resolution_ledger,
             catalogue_source,
             &clock_trust,
+            &last_clock_step,
             has_battery_rtc,
             engine.as_ref(),
             reconciliation.as_ref(),
-            prompt_ledger.as_ref(),
-            appointments.as_ref(),
-            watches.as_ref(),
+            operator_trust_dir.as_deref(),
+            lifecycle_ledger.as_ref(),
+            auth_service.as_ref(),
+            &auth_session_store,
+            &step_up_rate_limiter,
+            &step_up_nonce_store,
+            &kiosk_uid_allowlist,
+            &pairing_store,
+            runtime_user_name.as_deref(),
+            &bundled_roots,
+            &handles,
             &mut conn,
         )
         .await;
@@ -4745,6 +11129,141 @@ async fn write_response_frame(
     Ok(())
 }
 
+/// Bundle of optional framework substrate handles passed
+/// through every connection dispatch path. Each handle is
+/// `None` when the corresponding substrate is not configured
+/// at boot; ops that need an absent handle return a structured
+/// `Internal / <substrate>_not_configured` error to the
+/// operator surface.
+///
+/// The bundle compresses what was previously a ~30-argument
+/// cascade through `handle_connection` and `dispatch_request`
+/// into a single field — every new substrate adds a field
+/// here rather than threading through every call site, which
+/// keeps the dispatch chain's signature short and removes the
+/// `clippy::too_many_arguments` allowances those functions
+/// previously needed.
+#[derive(Default, Clone)]
+pub struct SubstrateHandles {
+    /// Prompt ledger backing the prompt verb surface and the
+    /// single-responder lock.
+    pub prompt_ledger: Option<Arc<crate::prompts::PromptLedger>>,
+    /// Appointment runtime backing the appointment verb surface.
+    pub appointments: Option<Arc<crate::appointments::AppointmentRuntime>>,
+    /// Watch runtime backing the watch verb surface.
+    pub watches: Option<Arc<crate::watches::WatchRuntime>>,
+    /// Plan engine backing the plan verb surface.
+    pub plan_engine: Option<Arc<crate::plans::PlanEngine>>,
+    /// Plugin registry runtime backing registry-poll +
+    /// catalogue refresh ops.
+    pub plugin_registry:
+        Option<Arc<crate::plugin_registry::PluginRegistryRuntime>>,
+    /// Publisher-trust store backing publisher admission +
+    /// trust-class queries.
+    pub publisher_trust:
+        Option<Arc<crate::publisher_trust::PublisherTrustStore>>,
+    /// Update-channel store backing per-channel pointer + ramp
+    /// metadata queries.
+    pub update_channel_store:
+        Option<Arc<crate::update_channel::UpdateChannelStore>>,
+    /// UI admitted-stockings store backing the per-plugin UI
+    /// admitted-stocking surface.
+    pub ui_admitted_store:
+        Option<Arc<crate::ui_registry::AdmittedStockingsStore>>,
+    /// Active UI selection runtime backing the operator's
+    /// currently-active UI artefact pointer.
+    pub active_ui_selection_runtime:
+        Option<Arc<crate::ui_active::ActiveUiSelection>>,
+    /// Wizard runtime backing the multi-step wizard verb surface.
+    pub wizard_runtime: Option<Arc<crate::plans::WizardRuntime>>,
+    /// Per-plugin profile store backing custody / instance /
+    /// recommended-plugin policy decisions.
+    pub plugin_profile_store:
+        Option<Arc<crate::plugin_profile::PluginProfileStore>>,
+    /// Admission-policy store backing the active-policy + ramp
+    /// state surfaces.
+    pub admission_policy_store:
+        Option<Arc<crate::admission_policy::AdmissionPolicyStore>>,
+    /// Capability-grant store backing operator-issued capability
+    /// grant + revoke queries.
+    pub capability_grant_store:
+        Option<Arc<crate::capability_grant::CapabilityGrantStore>>,
+    /// Migration bundle store backing the operator-facing
+    /// migration-bundle inspection surface.
+    pub migration_bundle_store:
+        Option<Arc<crate::migration_bundle::MigrationBundleStore>>,
+    /// Hardware profile override store backing per-target
+    /// profile override surfaces.
+    pub hardware_profile_store:
+        Option<Arc<crate::hardware_profile::HardwareProfileStore>>,
+    /// Audio operator-policy store backing per-target audio
+    /// policy queries.
+    pub audio_policy_store: Option<Arc<crate::audio_policy::AudioPolicyStore>>,
+    /// Audio active-topology store backing per-target
+    /// reconciliation snapshot queries.
+    pub audio_topology_store:
+        Option<Arc<crate::audio_topology::AudioTopologyStore>>,
+    /// Local device identity store backing display-name + name
+    /// rename verbs.
+    pub device_identity_store:
+        Option<Arc<crate::device_identity::DeviceIdentityStore>>,
+    /// Discovery runtime backing peer-discovery snapshot
+    /// queries.
+    pub discovery_runtime: Option<Arc<crate::discovery::DiscoveryRuntime>>,
+    /// Multi-room group store backing every group verb.
+    pub group_store: Option<Arc<crate::groups::GroupStore>>,
+    /// Per-device multi-room role store backing the role verb
+    /// surface.
+    pub role_store: Option<evo_primitives::SharedRoleStore>,
+    /// Sticky endpoint cache backing the operator-gestured
+    /// reconnect-storm wire op.
+    pub endpoint_cache: Option<Arc<crate::endpoint_cache::EndpointCache>>,
+    /// Plugin lifecycle coordinator backing the operator-
+    /// gestured `plugin.reload` wire op.
+    pub plugin_lifecycle_coordinator:
+        Option<Arc<crate::plugin_lifecycle::PluginLifecycleCoordinator>>,
+    /// Plugin-degraded registry backing `plugin.restore` +
+    /// degraded-state queries.
+    pub plugin_degraded_registry:
+        Option<Arc<crate::lifecycle_robustness::PluginDegradedRegistry>>,
+    /// Source-host election runtime backing per-group election
+    /// queries.
+    pub election_runtime: Option<evo_primitives::SharedElectionState>,
+    /// Clock-sync runtime backing per-group clock-sync state
+    /// queries.
+    pub clock_sync_runtime: Option<Arc<crate::clock_sync::ClockSyncRuntime>>,
+    /// Audio-plane runtime backing the per-peer audio-plane
+    /// connection state surface.
+    pub audio_plane_runtime: Option<Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    /// Domain witness chain runtime backing chain head /
+    /// recent-witness queries.
+    pub domain_witness_runtime:
+        Option<Arc<crate::domain_witness::runtime::DomainWitnessRuntime>>,
+    /// Chain-scope presence correlator backing the per-
+    /// peer presence projection joined into
+    /// `list_discovered_peers`. Absent on seats without
+    /// the witness substrate; advisory-only projection
+    /// when absent.
+    pub presence_correlator:
+        Option<Arc<crate::domain_witness::presence::PresenceCorrelator>>,
+    /// Reconnect runtime backing operator-gestured peer
+    /// reconnect attempts.
+    pub reconnect_runtime:
+        Option<Arc<crate::domain_witness::reconnect::ReconnectRuntime>>,
+    /// Per-group topology runtime backing composite topology
+    /// snapshot queries.
+    pub group_topology_runtime:
+        Option<Arc<crate::group_topology::GroupTopologyRuntime>>,
+    /// Gateway registry backing admitted-gateway queries.
+    pub gateway_registry: Option<Arc<crate::gateway::GatewayRegistry>>,
+    /// Update registry backing operator-facing update-bundle
+    /// inspection surfaces.
+    pub update_registry: Option<Arc<crate::updates::UpdateRegistry>>,
+    /// Restart coordinator backing the operator-gestured
+    /// process-restart verb.
+    pub restart_coordinator: Option<Arc<crate::restart::RestartCoordinator>>,
+}
+
 /// Dispatch a parsed non-streaming request to produce a
 /// [`ClientResponse`].
 ///
@@ -4761,16 +11280,100 @@ async fn dispatch_request(
     resolution_ledger: &Arc<ResolutionLedger>,
     catalogue_source: crate::catalogue::CatalogueSource,
     clock_trust: &crate::time_trust::SharedTimeTrust,
+    last_clock_step: &crate::time_trust::SharedLastClockStep,
     has_battery_rtc: bool,
     engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
     reconciliation: Option<
         &Arc<crate::reconciliation::ReconciliationCoordinator>,
     >,
-    prompt_ledger: Option<&Arc<crate::prompts::PromptLedger>>,
-    appointments: Option<&Arc<crate::appointments::AppointmentRuntime>>,
-    watches: Option<&Arc<crate::watches::WatchRuntime>>,
+    operator_trust_dir: Option<&Path>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    step_up_rate_limiter: &Arc<crate::auth::StepUpRateLimiter>,
+    step_up_nonce_store: &Arc<crate::auth::NonceReplayStore>,
+    kiosk_uid_allowlist: &Arc<crate::kiosk_session::KioskUidAllowlist>,
+    pairing_store: &Arc<crate::pairing::PairingStore>,
+    runtime_user_name: Option<&str>,
+    bundled_roots: &[PathBuf],
+    handles: &SubstrateHandles,
     conn: &mut ConnectionState,
 ) -> ClientResponse {
+    // Destructure the substrate-handles bundle into the local
+    // bindings the dispatch arms below already use. Each is
+    // `Option<&Arc<...>>` matching the prior signature, so the
+    // match-arm bodies that pass these handles into per-op
+    // handlers continue to work unchanged.
+    let SubstrateHandles {
+        prompt_ledger,
+        appointments,
+        watches,
+        plan_engine,
+        plugin_registry,
+        publisher_trust,
+        update_channel_store,
+        ui_admitted_store,
+        active_ui_selection_runtime,
+        wizard_runtime,
+        plugin_profile_store,
+        admission_policy_store,
+        capability_grant_store,
+        migration_bundle_store,
+        hardware_profile_store,
+        audio_policy_store,
+        audio_topology_store,
+        device_identity_store,
+        discovery_runtime,
+        group_store,
+        role_store,
+        endpoint_cache,
+        plugin_lifecycle_coordinator,
+        plugin_degraded_registry,
+        election_runtime,
+        clock_sync_runtime,
+        audio_plane_runtime,
+        domain_witness_runtime,
+        presence_correlator,
+        reconnect_runtime,
+        group_topology_runtime,
+        gateway_registry,
+        update_registry,
+        restart_coordinator,
+    } = handles;
+    let prompt_ledger = prompt_ledger.as_ref();
+    let appointments = appointments.as_ref();
+    let watches = watches.as_ref();
+    let plan_engine = plan_engine.as_ref();
+    let plugin_registry = plugin_registry.as_ref();
+    let publisher_trust = publisher_trust.as_ref();
+    let update_channel_store = update_channel_store.as_ref();
+    let ui_admitted_store = ui_admitted_store.as_ref();
+    let active_ui_selection_runtime = active_ui_selection_runtime.as_ref();
+    let wizard_runtime = wizard_runtime.as_ref();
+    let plugin_profile_store = plugin_profile_store.as_ref();
+    let admission_policy_store = admission_policy_store.as_ref();
+    let capability_grant_store = capability_grant_store.as_ref();
+    let migration_bundle_store = migration_bundle_store.as_ref();
+    let hardware_profile_store = hardware_profile_store.as_ref();
+    let audio_policy_store = audio_policy_store.as_ref();
+    let audio_topology_store = audio_topology_store.as_ref();
+    let device_identity_store = device_identity_store.as_ref();
+    let discovery_runtime = discovery_runtime.as_ref();
+    let group_store = group_store.as_ref();
+    let role_store = role_store.as_ref();
+    let endpoint_cache = endpoint_cache.as_ref();
+    let plugin_lifecycle_coordinator = plugin_lifecycle_coordinator.as_ref();
+    let plugin_degraded_registry = plugin_degraded_registry.as_ref();
+    let election_runtime = election_runtime.as_ref();
+    let clock_sync_runtime = clock_sync_runtime.as_ref();
+    let audio_plane_runtime = audio_plane_runtime.as_ref();
+    let domain_witness_runtime = domain_witness_runtime.as_ref();
+    let presence_correlator = presence_correlator.as_ref();
+    let reconnect_runtime = reconnect_runtime.as_ref();
+    let group_topology_runtime = group_topology_runtime.as_ref();
+    let gateway_registry = gateway_registry.as_ref();
+    let update_registry = update_registry.as_ref();
+    let restart_coordinator = restart_coordinator.as_ref();
     // Per `docs/engineering/LOGGING.md` §2: every verb invocation
     // emits a debug-level log so an engineer enabling
     // `RUST_LOG=evo=debug` sees the per-request narrative
@@ -4799,6 +11402,8 @@ async fn dispatch_request(
                 request_type,
                 payload_b64,
                 instance_id,
+                &conn.granted_capabilities,
+                &conn.step_up_scopes,
             )
             .await
         }
@@ -4840,9 +11445,11 @@ async fn dispatch_request(
         }
         ClientRequest::DescribeCapabilities => {
             let trust = crate::time_trust::current_trust(clock_trust);
+            let step = crate::time_trust::current_last_step(last_clock_step);
             describe_capabilities(
                 catalogue_source.as_str(),
                 trust.as_str(),
+                step,
                 has_battery_rtc,
             )
         }
@@ -4856,35 +11463,376 @@ async fn dispatch_request(
         ClientRequest::ResolveClaimants { tokens } => {
             handle_resolve_claimants(state, resolution_ledger, conn, tokens)
         }
-        ClientRequest::EnablePlugin { plugin, reason } => {
-            handle_enable_plugin(engine, conn, plugin, reason).await
+        ClientRequest::EnablePlugin {
+            plugin,
+            reason,
+            step_up_token,
+        } => {
+            handle_enable_plugin(
+                engine,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                plugin,
+                reason,
+                step_up_token,
+            )
+            .await
         }
-        ClientRequest::DisablePlugin { plugin, reason } => {
-            handle_disable_plugin(engine, conn, plugin, reason).await
+        ClientRequest::DisablePlugin {
+            plugin,
+            reason,
+            step_up_token,
+            cascade_dependents,
+        } => {
+            handle_disable_plugin(
+                engine,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                plugin,
+                reason,
+                step_up_token,
+                cascade_dependents,
+            )
+            .await
+        }
+        ClientRequest::PreviewDependencyCascade { plugin_name } => {
+            handle_preview_dependency_cascade(engine, conn, plugin_name).await
+        }
+        ClientRequest::GetPluginHealth => {
+            handle_get_plugin_health(
+                state,
+                engine,
+                plugin_degraded_registry,
+                conn,
+            )
+            .await
+        }
+        ClientRequest::RevokePluginCapability {
+            plugin_name,
+            capability,
+            reason,
+            step_up_token,
+        } => {
+            handle_revoke_plugin_capability(
+                capability_grant_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                plugin_name,
+                capability,
+                reason,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::UnrevokePluginCapability {
+            plugin_name,
+            capability,
+            step_up_token,
+        } => {
+            handle_unrevoke_plugin_capability(
+                capability_grant_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                plugin_name,
+                capability,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::ListPluginCapabilityRevocations { plugin_name } => {
+            handle_list_plugin_capability_revocations(
+                capability_grant_store,
+                conn,
+                plugin_name,
+            )
+            .await
+        }
+        ClientRequest::ListAllCapabilityRevocations => {
+            handle_list_all_capability_revocations(capability_grant_store, conn)
+                .await
+        }
+        ClientRequest::ExportMigrationBundle => {
+            handle_export_migration_bundle(
+                migration_bundle_store,
+                lifecycle_ledger,
+                conn,
+            )
+            .await
+        }
+        ClientRequest::ImportMigrationBundle {
+            bundle_toml,
+            step_up_token,
+        } => {
+            handle_import_migration_bundle(
+                migration_bundle_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                bundle_toml,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::PutHardwareProfileOverride {
+            identity,
+            override_,
+            step_up_token,
+        } => {
+            handle_put_hardware_profile_override(
+                hardware_profile_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                identity,
+                override_,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::GetHardwareProfileOverride { key } => {
+            handle_get_hardware_profile_override(
+                hardware_profile_store,
+                conn,
+                key,
+            )
+            .await
+        }
+        ClientRequest::ListHardwareProfileOverrides => {
+            handle_list_hardware_profile_overrides(hardware_profile_store, conn)
+                .await
+        }
+        ClientRequest::DeleteHardwareProfileOverride { key, step_up_token } => {
+            handle_delete_hardware_profile_override(
+                hardware_profile_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                key,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::PutAudioOperatorPolicy {
+            target_key,
+            policy,
+            step_up_token,
+        } => {
+            handle_put_audio_operator_policy(
+                audio_policy_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                target_key,
+                policy,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::GetAudioOperatorPolicy { target_key } => {
+            handle_get_audio_operator_policy(
+                audio_policy_store,
+                conn,
+                target_key,
+            )
+            .await
+        }
+        ClientRequest::ListAudioOperatorPolicies => {
+            handle_list_audio_operator_policies(audio_policy_store, conn).await
+        }
+        ClientRequest::DeleteAudioOperatorPolicy {
+            target_key,
+            step_up_token,
+        } => {
+            handle_delete_audio_operator_policy(
+                audio_policy_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                target_key,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::PutAudioVolumeMode {
+            target_key,
+            volume_mode,
+            step_up_token,
+        } => {
+            handle_put_audio_volume_mode(
+                audio_policy_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                target_key,
+                volume_mode,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::GetAudioVolumeMode { target_key } => {
+            handle_get_audio_volume_mode(audio_policy_store, conn, target_key)
+                .await
+        }
+        ClientRequest::ListAudioVolumeModes => {
+            handle_list_audio_volume_modes(audio_policy_store, conn).await
+        }
+        ClientRequest::DeleteAudioVolumeMode {
+            target_key,
+            step_up_token,
+        } => {
+            handle_delete_audio_volume_mode(
+                audio_policy_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                target_key,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::PublishActiveAudioTopology {
+            topology,
+            step_up_token,
+        } => {
+            handle_publish_active_audio_topology(
+                audio_topology_store,
+                state,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                topology,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::GetActiveAudioTopology { target_key } => {
+            handle_get_active_audio_topology(
+                audio_topology_store,
+                conn,
+                target_key,
+            )
+            .await
+        }
+        ClientRequest::ListActiveAudioTopologies => {
+            handle_list_active_audio_topologies(audio_topology_store, conn)
+                .await
+        }
+        ClientRequest::ClearActiveAudioTopology {
+            target_key,
+            step_up_token,
+        } => {
+            handle_clear_active_audio_topology(
+                audio_topology_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                target_key,
+                step_up_token,
+            )
+            .await
         }
         ClientRequest::UninstallPlugin {
             plugin,
             reason,
             purge_state,
+            step_up_token,
         } => {
-            handle_uninstall_plugin(engine, conn, plugin, reason, purge_state)
-                .await
+            handle_uninstall_plugin(
+                engine,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                bundled_roots,
+                conn,
+                plugin,
+                reason,
+                purge_state,
+                step_up_token,
+            )
+            .await
         }
-        ClientRequest::PurgePluginState { plugin } => {
-            handle_purge_plugin_state(engine, conn, plugin).await
+        ClientRequest::PurgePluginState {
+            plugin,
+            step_up_token,
+        } => {
+            handle_purge_plugin_state(
+                engine,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                plugin,
+                step_up_token,
+            )
+            .await
         }
-        ClientRequest::ReloadCatalogue { source, dry_run } => {
-            handle_reload_catalogue(engine, conn, source, dry_run).await
+        ClientRequest::ReloadCatalogue {
+            source,
+            dry_run,
+            step_up_token,
+        } => {
+            handle_reload_catalogue(
+                engine,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                source,
+                dry_run,
+                step_up_token,
+            )
+            .await
         }
         ClientRequest::ReloadManifest {
             plugin,
             source,
             dry_run,
+            step_up_token,
         } => {
-            handle_reload_manifest(engine, conn, plugin, source, dry_run).await
+            handle_reload_manifest(
+                engine,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                plugin,
+                source,
+                dry_run,
+                step_up_token,
+            )
+            .await
         }
-        ClientRequest::ReloadPlugin { plugin } => {
-            handle_reload_plugin(engine, conn, plugin).await
+        ClientRequest::ReloadPlugin {
+            plugin,
+            step_up_token,
+        } => {
+            handle_reload_plugin(
+                engine,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                plugin,
+                step_up_token,
+            )
+            .await
         }
         ClientRequest::TakeCustody {
             shelf,
@@ -4943,6 +11891,9 @@ async fn dispatch_request(
                 plugin,
                 prompt_id,
             )
+        }
+        ClientRequest::ReleaseUserInteractionResponder => {
+            handle_release_user_interaction_responder(prompt_ledger, conn)
         }
         ClientRequest::CreateAppointment {
             creator,
@@ -5014,6 +11965,1280 @@ async fn dispatch_request(
             )
             .await
         }
+        ClientRequest::FirePlan { plan_id } => {
+            handle_fire_plan(plan_engine, conn, plan_id).await
+        }
+        ClientRequest::InstallPluginFromUrl {
+            url,
+            signature_pin,
+            step_up_token,
+        } => {
+            handle_install_plugin_from_url(
+                engine,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                url,
+                signature_pin,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::RegisterPluginRegistry {
+            slug,
+            manifest_url,
+            signature_url,
+            public_key_fingerprint,
+            poll_interval_secs,
+            step_up_token,
+        } => {
+            handle_register_plugin_registry(
+                plugin_registry,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                slug,
+                manifest_url,
+                signature_url,
+                public_key_fingerprint,
+                poll_interval_secs,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::UnregisterPluginRegistry {
+            slug,
+            step_up_token,
+        } => {
+            handle_unregister_plugin_registry(
+                plugin_registry,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                slug,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::ListPluginRegistries => {
+            handle_list_plugin_registries(plugin_registry).await
+        }
+        ClientRequest::RefreshPluginRegistry {
+            slug,
+            step_up_token,
+        } => {
+            handle_refresh_plugin_registry(
+                plugin_registry,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                slug,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::GrantPublisherTrust {
+            publisher_id,
+            display_name,
+            public_key_pem,
+            scope_per_plugin,
+            step_up_token,
+        } => {
+            handle_grant_publisher_trust(
+                publisher_trust,
+                operator_trust_dir,
+                lifecycle_ledger,
+                auth_service,
+                auth_session_store,
+                conn,
+                publisher_id,
+                display_name,
+                public_key_pem,
+                scope_per_plugin,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::RevokePublisherTrust {
+            publisher_id,
+            step_up_token,
+        } => {
+            handle_revoke_publisher_trust(
+                publisher_trust,
+                lifecycle_ledger,
+                auth_service,
+                auth_session_store,
+                conn,
+                publisher_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::ListPublisherTrust => {
+            handle_list_publisher_trust(publisher_trust).await
+        }
+        ClientRequest::StepUpAuthVerify {
+            username,
+            secret_b64,
+            ttl_seconds,
+            nonce,
+        } => {
+            handle_step_up_auth_verify(
+                auth_service,
+                auth_session_store,
+                step_up_rate_limiter,
+                step_up_nonce_store,
+                runtime_user_name,
+                lifecycle_ledger,
+                conn,
+                username,
+                secret_b64,
+                ttl_seconds,
+                nonce,
+            )
+            .await
+        }
+        ClientRequest::StepUpAuthRevoke { token } => {
+            handle_step_up_auth_revoke(auth_session_store, token).await
+        }
+        ClientRequest::MintBearerToken {
+            reason,
+            ttl_seconds,
+            capabilities,
+        } => {
+            handle_mint_bearer_token(
+                state,
+                router,
+                conn,
+                reason,
+                ttl_seconds,
+                capabilities,
+            )
+            .await
+        }
+        ClientRequest::CreateBearerToken {
+            name,
+            reason,
+            scopes,
+            expires_in_seconds,
+        } => {
+            handle_create_bearer_token(
+                state,
+                conn,
+                name,
+                reason,
+                scopes,
+                expires_in_seconds,
+            )
+            .await
+        }
+        ClientRequest::ListBearerTokens => {
+            handle_list_bearer_tokens(state, conn).await
+        }
+        ClientRequest::RevokeBearerToken { token_id, reason } => {
+            handle_revoke_bearer_token(state, conn, token_id, reason).await
+        }
+        ClientRequest::CredentialPut {
+            plugin_id,
+            key,
+            value_b64,
+            display_name,
+            expires_at_ms,
+            uninstall_policy,
+        } => {
+            handle_credential_put(
+                state,
+                conn,
+                plugin_id,
+                key,
+                value_b64,
+                display_name,
+                expires_at_ms,
+                uninstall_policy,
+            )
+            .await
+        }
+        ClientRequest::CredentialDelete {
+            plugin_id,
+            key,
+            key_hash,
+        } => {
+            handle_credential_delete(state, conn, plugin_id, key, key_hash)
+                .await
+        }
+        ClientRequest::CredentialListKeys { plugin_id } => {
+            handle_credential_list_keys(state, conn, plugin_id).await
+        }
+        ClientRequest::OnlineProvidersList => {
+            handle_online_providers_list(state, conn).await
+        }
+        ClientRequest::OnlineProvidersSetEnabled {
+            provider_id,
+            enabled,
+        } => {
+            handle_online_providers_set_enabled(
+                state,
+                conn,
+                provider_id,
+                enabled,
+            )
+            .await
+        }
+        ClientRequest::OnlineProvidersSetPriority {
+            provider_id,
+            priority,
+        } => {
+            handle_online_providers_set_priority(
+                state,
+                conn,
+                provider_id,
+                priority,
+            )
+            .await
+        }
+        ClientRequest::ResetCredentialsToOpen { reason } => {
+            handle_reset_credentials_to_open(state, conn, reason).await
+        }
+        ClientRequest::GetDeviceIdentity => {
+            handle_get_device_identity(device_identity_store, conn).await
+        }
+        ClientRequest::SetDeviceDisplayName {
+            display_name,
+            step_up_token,
+        } => {
+            handle_set_device_display_name(
+                device_identity_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                discovery_runtime,
+                &state.bus,
+                conn,
+                display_name,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::ResetDeviceDisplayName { step_up_token } => {
+            handle_reset_device_display_name(
+                device_identity_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                discovery_runtime,
+                &state.bus,
+                conn,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::ListDiscoveredPeers => {
+            handle_list_discovered_peers(
+                discovery_runtime,
+                presence_correlator,
+                domain_witness_runtime,
+                conn,
+            )
+            .await
+        }
+        ClientRequest::RosterSnap {
+            reason,
+            deadline_ms,
+        } => {
+            handle_roster_snap(
+                discovery_runtime,
+                domain_witness_runtime,
+                &state.bus,
+                conn,
+                reason,
+                deadline_ms,
+            )
+            .await
+        }
+        ClientRequest::CreateGroup {
+            display_name,
+            members,
+            step_up_token,
+        } => {
+            handle_create_group(
+                group_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                display_name,
+                members,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::GetGroup { group_id } => {
+            handle_get_group(group_store, conn, group_id).await
+        }
+        ClientRequest::ListGroups => {
+            handle_list_groups(group_store, conn).await
+        }
+        ClientRequest::RenameGroup {
+            group_id,
+            display_name,
+            step_up_token,
+        } => {
+            handle_rename_group(
+                group_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                group_id,
+                display_name,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::SetGroupLeaderMs {
+            group_id,
+            leader_ms,
+            step_up_token,
+        } => {
+            handle_set_group_leader_ms(
+                group_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                group_id,
+                leader_ms,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::SetDeviceRole {
+            device_id,
+            role,
+            step_up_token,
+        } => {
+            handle_set_device_role(
+                role_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                device_id,
+                role,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::GetDeviceRole { device_id } => {
+            handle_get_device_role(
+                role_store,
+                lifecycle_ledger,
+                conn,
+                device_id,
+            )
+            .await
+        }
+        ClientRequest::ListDeviceRoles => {
+            handle_list_device_roles(role_store, lifecycle_ledger, conn).await
+        }
+        ClientRequest::ClearDeviceRole {
+            device_id,
+            step_up_token,
+        } => {
+            handle_clear_device_role(
+                role_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                device_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::ReconnectPeer {
+            device_id,
+            step_up_token,
+        } => {
+            handle_reconnect_peer(
+                endpoint_cache,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                device_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::PluginReload {
+            plugin_name,
+            step_up_token,
+        } => {
+            handle_plugin_reload(
+                plugin_lifecycle_coordinator,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                plugin_name,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::PluginRestore {
+            plugin_name,
+            step_up_token,
+        } => {
+            handle_plugin_restore(
+                plugin_degraded_registry,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                state,
+                conn,
+                plugin_name,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::AddGroupMember {
+            group_id,
+            device_id,
+            step_up_token,
+        } => {
+            handle_add_group_member(
+                group_store,
+                &state.bus,
+                domain_witness_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                group_id,
+                device_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::RemoveGroupMember {
+            group_id,
+            device_id,
+            step_up_token,
+        } => {
+            handle_remove_group_member(
+                group_store,
+                election_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                &state.bus,
+                conn,
+                group_id,
+                device_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::DeleteGroup {
+            group_id,
+            step_up_token,
+        } => {
+            handle_delete_group(
+                group_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                group_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::MoveGroupMember {
+            from_group_id,
+            to_group_id,
+            device_id,
+            successor_device_id,
+            step_up_token,
+        } => {
+            handle_move_group_member(
+                group_store,
+                election_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                &state.bus,
+                conn,
+                from_group_id,
+                to_group_id,
+                device_id,
+                successor_device_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::SelectGroupLeaderSuccessor {
+            group_id,
+            departing_device_id,
+            successor_device_id,
+            step_up_token,
+        } => {
+            handle_select_group_leader_successor(
+                group_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                &state.bus,
+                conn,
+                group_id,
+                departing_device_id,
+                successor_device_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::CancelGroupLeaderSuccessor {
+            group_id,
+            departing_device_id,
+        } => {
+            handle_cancel_group_leader_successor(
+                lifecycle_ledger,
+                &state.bus,
+                conn,
+                group_id,
+                departing_device_id,
+            )
+            .await
+        }
+        ClientRequest::PinSourceHost {
+            group_id,
+            device_id,
+            step_up_token,
+        } => {
+            handle_pin_source_host(
+                group_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                group_id,
+                device_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::UnpinSourceHost {
+            group_id,
+            step_up_token,
+        } => {
+            handle_unpin_source_host(
+                group_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                group_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::ListDomainMembers => {
+            handle_list_domain_members(
+                &state.bus,
+                device_identity_store,
+                discovery_runtime,
+                election_runtime,
+                audio_plane_runtime,
+                domain_witness_runtime,
+                conn,
+            )
+            .await
+        }
+        ClientRequest::AdmitPeerToDomain {
+            device_id,
+            display_name,
+            public_key_bytes,
+            step_up_token,
+        } => {
+            handle_admit_peer_to_domain(
+                &state.persistence,
+                &state.bus,
+                device_identity_store,
+                domain_witness_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                device_id,
+                display_name,
+                public_key_bytes,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::RevokePeerFromDomain {
+            device_id,
+            step_up_token,
+        } => {
+            handle_revoke_peer_from_domain(
+                &state.bus,
+                domain_witness_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                device_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::DiscardPeerFromDomain {
+            device_id,
+            reason,
+            step_up_token,
+        } => {
+            handle_discard_peer_from_domain(
+                domain_witness_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                device_id,
+                reason,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::BootstrapDomain {
+            display_name,
+            step_up_token,
+        } => {
+            handle_bootstrap_domain(
+                domain_witness_runtime,
+                audio_plane_runtime,
+                device_identity_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                display_name,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::JoinDomain {
+            endpoint,
+            step_up_token,
+        } => {
+            handle_join_domain(
+                domain_witness_runtime,
+                audio_plane_runtime,
+                &state.bus,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                endpoint,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::LeaveDomain { step_up_token } => {
+            handle_leave_domain(
+                domain_witness_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::FactoryResetDomain { step_up_token } => {
+            handle_factory_reset_domain(
+                domain_witness_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::GetChainHead => {
+            handle_get_chain_head(domain_witness_runtime, conn).await
+        }
+        ClientRequest::DomainHistory { limit } => {
+            handle_domain_history(domain_witness_runtime, conn, limit).await
+        }
+        ClientRequest::MoveMember {
+            device_id,
+            from_group_id,
+            to_group_id,
+            step_up_token,
+        } => {
+            handle_move_member(
+                domain_witness_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                device_id,
+                from_group_id,
+                to_group_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::SetGroupLeader {
+            group_id,
+            leader_device_id,
+            step_up_token,
+        } => {
+            handle_set_group_leader(
+                domain_witness_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                group_id,
+                leader_device_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::TriggerReconnect {
+            device_id,
+            step_up_token,
+        } => {
+            handle_trigger_reconnect(
+                reconnect_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                device_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::ExportChain => {
+            handle_export_chain(domain_witness_runtime, conn).await
+        }
+        ClientRequest::ImportChain {
+            witnesses,
+            step_up_token,
+        } => {
+            handle_import_chain(
+                domain_witness_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                witnesses,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::UpdatePeerEndpoints {
+            device_id,
+            endpoints,
+            step_up_token,
+        } => {
+            handle_update_peer_endpoints(
+                domain_witness_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                device_id,
+                endpoints,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::DeclareNetworkRelay {
+            networks,
+            capabilities,
+            step_up_token,
+        } => {
+            handle_declare_network_relay(
+                domain_witness_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                networks,
+                capabilities,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::GetSourceHost { group_id } => {
+            handle_get_source_host(election_runtime, conn, group_id).await
+        }
+        ClientRequest::ListSourceHosts => {
+            handle_list_source_hosts(election_runtime, conn).await
+        }
+        ClientRequest::GetClockSync { group_id } => {
+            handle_get_clock_sync(clock_sync_runtime, conn, group_id).await
+        }
+        ClientRequest::ListClockSyncs => {
+            handle_list_clock_syncs(clock_sync_runtime, conn).await
+        }
+        ClientRequest::ListAudioPlaneConnections => {
+            handle_list_audio_plane_connections(audio_plane_runtime, conn).await
+        }
+        ClientRequest::AudioPlaneDial { addr } => {
+            handle_audio_plane_dial(audio_plane_runtime, conn, addr).await
+        }
+        ClientRequest::DispatchToGroup { group_id } => {
+            handle_dispatch_to_group(
+                group_topology_runtime,
+                audio_plane_runtime,
+                conn,
+                group_id,
+            )
+            .await
+        }
+        ClientRequest::GetGroupActiveTopology { group_id } => {
+            handle_get_group_active_topology(
+                group_topology_runtime,
+                conn,
+                group_id,
+            )
+            .await
+        }
+        ClientRequest::ListGroupActiveTopologies => {
+            handle_list_group_active_topologies(group_topology_runtime, conn)
+                .await
+        }
+        ClientRequest::ListGatewayPlugins => {
+            handle_list_gateway_plugins(gateway_registry, conn).await
+        }
+        ClientRequest::ListUpdateInventory => {
+            handle_list_update_inventory(update_registry, conn).await
+        }
+        ClientRequest::CheckUpdatesNow {
+            source_id,
+            step_up_token,
+        } => {
+            handle_check_updates_now(
+                update_registry,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                source_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::ApplyUpdate {
+            source_id,
+            update_id,
+            dry_run,
+            approved_by,
+            step_up_token,
+        } => {
+            handle_apply_update(
+                update_registry,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                source_id,
+                update_id,
+                dry_run,
+                approved_by,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::GetAutoApplyPolicies => {
+            handle_get_auto_apply_policies(update_registry, conn).await
+        }
+        ClientRequest::SetAutoApplyPolicy {
+            source_id,
+            enabled,
+            severity_threshold,
+            step_up_token,
+        } => {
+            handle_set_auto_apply_policy(
+                update_registry,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                source_id,
+                enabled,
+                severity_threshold,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::MintLocalKioskSession { reason } => {
+            handle_mint_local_kiosk_session(
+                state,
+                router,
+                kiosk_uid_allowlist,
+                conn,
+                reason,
+            )
+            .await
+        }
+        ClientRequest::PairBegin { device_hint } => {
+            handle_pair_begin(pairing_store, device_hint).await
+        }
+        ClientRequest::PairComplete { pair_id, code } => {
+            handle_pair_complete(state, router, pairing_store, pair_id, code)
+                .await
+        }
+        ClientRequest::PairAuthenticate {
+            device_hint,
+            secret_b64,
+            nonce,
+        } => {
+            handle_pair_authenticate(
+                state,
+                router,
+                auth_service,
+                pairing_store,
+                step_up_rate_limiter,
+                step_up_nonce_store,
+                runtime_user_name,
+                lifecycle_ledger,
+                conn,
+                device_hint,
+                secret_b64,
+                nonce,
+            )
+            .await
+        }
+        ClientRequest::PairList => handle_pair_list(pairing_store, conn).await,
+        ClientRequest::PairRevoke {
+            paired_device_id,
+            step_up_token,
+        } => {
+            handle_pair_revoke(
+                pairing_store,
+                auth_session_store,
+                conn,
+                paired_device_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::SetKioskPassword { new_password } => {
+            handle_set_kiosk_password(
+                kiosk_uid_allowlist,
+                runtime_user_name,
+                auth_service,
+                conn,
+                new_password,
+            )
+            .await
+        }
+        ClientRequest::RequestStewardRestart {
+            reason,
+            target_binary,
+            step_up_token,
+        } => {
+            handle_request_steward_restart(
+                restart_coordinator,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                reason,
+                target_binary,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::SetUpdateChannel {
+            target,
+            channel,
+            step_up_token,
+        } => {
+            handle_set_update_channel(
+                update_channel_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                target,
+                channel,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::GetUpdateChannels => {
+            handle_get_update_channels(update_channel_store).await
+        }
+        ClientRequest::DescribeUiStockings { shelf_filter } => {
+            handle_describe_ui_stockings(ui_admitted_store, shelf_filter).await
+        }
+        ClientRequest::RecordWizardStepCompletion {
+            step_id,
+            completion,
+        } => {
+            handle_record_wizard_step_completion(
+                wizard_runtime,
+                step_id,
+                completion,
+            )
+            .await
+        }
+        ClientRequest::ActivateTheme {
+            plugin_name,
+            step_up_token,
+        } => {
+            handle_activate_theme(
+                active_ui_selection_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                plugin_name,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::ActivateUiShell {
+            plugin_name,
+            step_up_token,
+        } => {
+            handle_activate_ui_shell(
+                active_ui_selection_runtime,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                plugin_name,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::DescribeActiveUiSelection => {
+            handle_describe_active_ui_selection(active_ui_selection_runtime)
+                .await
+        }
+        ClientRequest::PutPluginProfile {
+            profile_id,
+            name,
+            description,
+            authored_by,
+            entries,
+            step_up_token,
+        } => {
+            handle_put_plugin_profile(
+                plugin_profile_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                profile_id,
+                name,
+                description,
+                authored_by,
+                entries,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::GetPluginProfile { profile_id } => {
+            handle_get_plugin_profile(plugin_profile_store, profile_id).await
+        }
+        ClientRequest::ListPluginProfiles => {
+            handle_list_plugin_profiles(plugin_profile_store).await
+        }
+        ClientRequest::DeletePluginProfile {
+            profile_id,
+            step_up_token,
+        } => {
+            handle_delete_plugin_profile(
+                plugin_profile_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                profile_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::SetActivePluginProfile {
+            profile_id,
+            dry_run,
+            step_up_token,
+        } => {
+            handle_set_active_plugin_profile(
+                plugin_profile_store,
+                engine,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                profile_id,
+                dry_run,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::PutAdmissionPolicy {
+            policy_id,
+            name,
+            description,
+            authored_by,
+            rules,
+            step_up_token,
+        } => {
+            handle_put_admission_policy(
+                admission_policy_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                policy_id,
+                name,
+                description,
+                authored_by,
+                rules,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::GetAdmissionPolicy { policy_id } => {
+            handle_get_admission_policy(admission_policy_store, policy_id).await
+        }
+        ClientRequest::ListAdmissionPolicies => {
+            handle_list_admission_policies(admission_policy_store).await
+        }
+        ClientRequest::DeleteAdmissionPolicy {
+            policy_id,
+            step_up_token,
+        } => {
+            handle_delete_admission_policy(
+                admission_policy_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                policy_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::SetActiveAdmissionPolicy {
+            policy_id,
+            step_up_token,
+        } => {
+            handle_set_active_admission_policy(
+                admission_policy_store,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                policy_id,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::AuditAgainstPolicy { policy_id } => {
+            handle_audit_against_policy(
+                admission_policy_store,
+                state,
+                engine,
+                publisher_trust,
+                conn,
+                policy_id,
+            )
+            .await
+        }
+        ClientRequest::ListPluginsWhere { filter } => {
+            handle_list_plugins_where(state, engine, conn, filter).await
+        }
+        ClientRequest::DisablePluginsWhere {
+            filter,
+            reason,
+            step_up_token,
+        } => {
+            handle_bulk_lifecycle_where(
+                state,
+                engine,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                filter,
+                reason,
+                step_up_token,
+                BulkLifecycleAction::Disable,
+            )
+            .await
+        }
+        ClientRequest::EnablePluginsWhere {
+            filter,
+            reason,
+            step_up_token,
+        } => {
+            handle_bulk_lifecycle_where(
+                state,
+                engine,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                filter,
+                reason,
+                step_up_token,
+                BulkLifecycleAction::Enable,
+            )
+            .await
+        }
+        ClientRequest::SetPluginTag {
+            plugin_name,
+            tag,
+            step_up_token,
+        } => {
+            handle_set_plugin_tag(
+                state,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                plugin_name,
+                tag,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::DeletePluginTag {
+            plugin_name,
+            tag,
+            step_up_token,
+        } => {
+            handle_delete_plugin_tag(
+                state,
+                auth_service,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                plugin_name,
+                tag,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::ListPluginTags { plugin_name } => {
+            handle_list_plugin_tags(state, plugin_name).await
+        }
         ClientRequest::SubscribeHappenings { .. } => {
             // Intercepted in handle_connection; should not reach here.
             // Defensive: surface an error rather than panicking in case
@@ -5082,6 +13307,9 @@ fn client_request_op_tag(req: &ClientRequest) -> &'static str {
         ClientRequest::CancelUserInteraction { .. } => {
             "cancel_user_interaction"
         }
+        ClientRequest::ReleaseUserInteractionResponder => {
+            "release_user_interaction_responder"
+        }
         ClientRequest::CreateAppointment { .. } => "create_appointment",
         ClientRequest::CancelAppointment { .. } => "cancel_appointment",
         ClientRequest::ListAppointments => "list_appointments",
@@ -5091,6 +13319,219 @@ fn client_request_op_tag(req: &ClientRequest) -> &'static str {
         ClientRequest::ListWatches => "list_watches",
         ClientRequest::ProjectWatch { .. } => "project_watch",
         ClientRequest::ListGrammarOrphans => "list_grammar_orphans",
+        ClientRequest::FirePlan { .. } => "fire_plan",
+        ClientRequest::InstallPluginFromUrl { .. } => "install_plugin_from_url",
+        ClientRequest::RegisterPluginRegistry { .. } => {
+            "register_plugin_registry"
+        }
+        ClientRequest::UnregisterPluginRegistry { .. } => {
+            "unregister_plugin_registry"
+        }
+        ClientRequest::ListPluginRegistries => "list_plugin_registries",
+        ClientRequest::RefreshPluginRegistry { .. } => {
+            "refresh_plugin_registry"
+        }
+        ClientRequest::GrantPublisherTrust { .. } => "grant_publisher_trust",
+        ClientRequest::RevokePublisherTrust { .. } => "revoke_publisher_trust",
+        ClientRequest::ListPublisherTrust => "list_publisher_trust",
+        ClientRequest::StepUpAuthVerify { .. } => "step_up_auth_verify",
+        ClientRequest::StepUpAuthRevoke { .. } => "step_up_auth_revoke",
+        ClientRequest::MintBearerToken { .. } => "mint_bearer_token",
+        ClientRequest::CreateBearerToken { .. } => "create_bearer_token",
+        ClientRequest::ListBearerTokens => "list_bearer_tokens",
+        ClientRequest::RevokeBearerToken { .. } => "revoke_bearer_token",
+        ClientRequest::ResetCredentialsToOpen { .. } => {
+            "reset_credentials_to_open"
+        }
+        ClientRequest::CredentialPut { .. } => "credential_put",
+        ClientRequest::CredentialDelete { .. } => "credential_delete",
+        ClientRequest::CredentialListKeys { .. } => "credential_list_keys",
+        ClientRequest::OnlineProvidersList => "online_providers_list",
+        ClientRequest::OnlineProvidersSetEnabled { .. } => {
+            "online_providers_set_enabled"
+        }
+        ClientRequest::OnlineProvidersSetPriority { .. } => {
+            "online_providers_set_priority"
+        }
+        ClientRequest::GetDeviceIdentity => "get_device_identity",
+        ClientRequest::SetDeviceDisplayName { .. } => "set_device_display_name",
+        ClientRequest::ResetDeviceDisplayName { .. } => {
+            "reset_device_display_name"
+        }
+        ClientRequest::ListDiscoveredPeers => "list_discovered_peers",
+        ClientRequest::RosterSnap { .. } => "roster_snap",
+        ClientRequest::CreateGroup { .. } => "create_group",
+        ClientRequest::GetGroup { .. } => "get_group",
+        ClientRequest::ListGroups => "list_groups",
+        ClientRequest::RenameGroup { .. } => "rename_group",
+        ClientRequest::SetGroupLeaderMs { .. } => "set_group_leader_ms",
+        ClientRequest::SetDeviceRole { .. } => "set_device_role",
+        ClientRequest::GetDeviceRole { .. } => "get_device_role",
+        ClientRequest::ListDeviceRoles => "list_device_roles",
+        ClientRequest::ClearDeviceRole { .. } => "clear_device_role",
+        ClientRequest::ReconnectPeer { .. } => "reconnect_peer",
+        ClientRequest::PluginReload { .. } => "plugin_reload",
+        ClientRequest::PluginRestore { .. } => "plugin_restore",
+        ClientRequest::AddGroupMember { .. } => "add_group_member",
+        ClientRequest::RemoveGroupMember { .. } => "remove_group_member",
+        ClientRequest::DeleteGroup { .. } => "delete_group",
+        ClientRequest::MoveGroupMember { .. } => "move_group_member",
+        ClientRequest::SelectGroupLeaderSuccessor { .. } => {
+            "select_group_leader_successor"
+        }
+        ClientRequest::CancelGroupLeaderSuccessor { .. } => {
+            "cancel_group_leader_successor"
+        }
+        ClientRequest::PinSourceHost { .. } => "pin_source_host",
+        ClientRequest::UnpinSourceHost { .. } => "unpin_source_host",
+        ClientRequest::ListDomainMembers => "list_domain_members",
+        ClientRequest::AdmitPeerToDomain { .. } => "admit_peer_to_domain",
+        ClientRequest::RevokePeerFromDomain { .. } => "revoke_peer_from_domain",
+        ClientRequest::DiscardPeerFromDomain { .. } => {
+            "discard_peer_from_domain"
+        }
+        ClientRequest::BootstrapDomain { .. } => "bootstrap_domain",
+        ClientRequest::JoinDomain { .. } => "join_domain",
+        ClientRequest::LeaveDomain { .. } => "leave_domain",
+        ClientRequest::FactoryResetDomain { .. } => "factory_reset_domain",
+        ClientRequest::GetChainHead => "get_chain_head",
+        ClientRequest::DomainHistory { .. } => "domain_history",
+        ClientRequest::MoveMember { .. } => "move_member",
+        ClientRequest::SetGroupLeader { .. } => "set_group_leader",
+        ClientRequest::TriggerReconnect { .. } => "trigger_reconnect",
+        ClientRequest::ExportChain => "export_chain",
+        ClientRequest::ImportChain { .. } => "import_chain",
+        ClientRequest::UpdatePeerEndpoints { .. } => "update_peer_endpoints",
+        ClientRequest::DeclareNetworkRelay { .. } => "declare_network_relay",
+        ClientRequest::GetSourceHost { .. } => "get_source_host",
+        ClientRequest::ListSourceHosts => "list_source_hosts",
+        ClientRequest::GetClockSync { .. } => "get_clock_sync",
+        ClientRequest::ListClockSyncs => "list_clock_syncs",
+        ClientRequest::ListAudioPlaneConnections => {
+            "list_audio_plane_connections"
+        }
+        ClientRequest::AudioPlaneDial { .. } => "audio_plane_dial",
+        ClientRequest::DispatchToGroup { .. } => "dispatch_to_group",
+        ClientRequest::GetGroupActiveTopology { .. } => {
+            "get_group_active_topology"
+        }
+        ClientRequest::ListGroupActiveTopologies => {
+            "list_group_active_topologies"
+        }
+        ClientRequest::ListGatewayPlugins => "list_gateway_plugins",
+        ClientRequest::ListUpdateInventory => "list_update_inventory",
+        ClientRequest::CheckUpdatesNow { .. } => "check_updates_now",
+        ClientRequest::ApplyUpdate { .. } => "apply_update",
+        ClientRequest::GetAutoApplyPolicies => "get_auto_apply_policies",
+        ClientRequest::SetAutoApplyPolicy { .. } => "set_auto_apply_policy",
+        ClientRequest::MintLocalKioskSession { .. } => {
+            "mint_local_kiosk_session"
+        }
+        ClientRequest::PairBegin { .. } => "pair_begin",
+        ClientRequest::PairComplete { .. } => "pair_complete",
+        ClientRequest::PairAuthenticate { .. } => "pair_authenticate",
+        ClientRequest::PairList => "pair_list",
+        ClientRequest::PairRevoke { .. } => "pair_revoke",
+        ClientRequest::SetKioskPassword { .. } => "set_kiosk_password",
+        ClientRequest::RequestStewardRestart { .. } => {
+            "request_steward_restart"
+        }
+        ClientRequest::SetUpdateChannel { .. } => "set_update_channel",
+        ClientRequest::GetUpdateChannels => "get_update_channels",
+        ClientRequest::DescribeUiStockings { .. } => "describe_ui_stockings",
+        ClientRequest::RecordWizardStepCompletion { .. } => {
+            "record_wizard_step_completion"
+        }
+        ClientRequest::ActivateTheme { .. } => "activate_theme",
+        ClientRequest::ActivateUiShell { .. } => "activate_ui_shell",
+        ClientRequest::DescribeActiveUiSelection => {
+            "describe_active_ui_selection"
+        }
+        ClientRequest::PutPluginProfile { .. } => "put_plugin_profile",
+        ClientRequest::GetPluginProfile { .. } => "get_plugin_profile",
+        ClientRequest::ListPluginProfiles => "list_plugin_profiles",
+        ClientRequest::DeletePluginProfile { .. } => "delete_plugin_profile",
+        ClientRequest::SetActivePluginProfile { .. } => {
+            "set_active_plugin_profile"
+        }
+        ClientRequest::PutAdmissionPolicy { .. } => "put_admission_policy",
+        ClientRequest::GetAdmissionPolicy { .. } => "get_admission_policy",
+        ClientRequest::ListAdmissionPolicies => "list_admission_policies",
+        ClientRequest::DeleteAdmissionPolicy { .. } => {
+            "delete_admission_policy"
+        }
+        ClientRequest::SetActiveAdmissionPolicy { .. } => {
+            "set_active_admission_policy"
+        }
+        ClientRequest::AuditAgainstPolicy { .. } => "audit_against_policy",
+        ClientRequest::PreviewDependencyCascade { .. } => {
+            "preview_dependency_cascade"
+        }
+        ClientRequest::GetPluginHealth => "get_plugin_health",
+        ClientRequest::RevokePluginCapability { .. } => {
+            "revoke_plugin_capability"
+        }
+        ClientRequest::UnrevokePluginCapability { .. } => {
+            "unrevoke_plugin_capability"
+        }
+        ClientRequest::ListPluginCapabilityRevocations { .. } => {
+            "list_plugin_capability_revocations"
+        }
+        ClientRequest::ListAllCapabilityRevocations => {
+            "list_all_capability_revocations"
+        }
+        ClientRequest::ExportMigrationBundle => "export_migration_bundle",
+        ClientRequest::ImportMigrationBundle { .. } => {
+            "import_migration_bundle"
+        }
+        ClientRequest::PutHardwareProfileOverride { .. } => {
+            "put_hardware_profile_override"
+        }
+        ClientRequest::GetHardwareProfileOverride { .. } => {
+            "get_hardware_profile_override"
+        }
+        ClientRequest::ListHardwareProfileOverrides => {
+            "list_hardware_profile_overrides"
+        }
+        ClientRequest::DeleteHardwareProfileOverride { .. } => {
+            "delete_hardware_profile_override"
+        }
+        ClientRequest::PutAudioOperatorPolicy { .. } => {
+            "put_audio_operator_policy"
+        }
+        ClientRequest::GetAudioOperatorPolicy { .. } => {
+            "get_audio_operator_policy"
+        }
+        ClientRequest::ListAudioOperatorPolicies => {
+            "list_audio_operator_policies"
+        }
+        ClientRequest::DeleteAudioOperatorPolicy { .. } => {
+            "delete_audio_operator_policy"
+        }
+        ClientRequest::PutAudioVolumeMode { .. } => "put_audio_volume_mode",
+        ClientRequest::GetAudioVolumeMode { .. } => "get_audio_volume_mode",
+        ClientRequest::ListAudioVolumeModes => "list_audio_volume_modes",
+        ClientRequest::DeleteAudioVolumeMode { .. } => {
+            "delete_audio_volume_mode"
+        }
+        ClientRequest::PublishActiveAudioTopology { .. } => {
+            "publish_active_audio_topology"
+        }
+        ClientRequest::GetActiveAudioTopology { .. } => {
+            "get_active_audio_topology"
+        }
+        ClientRequest::ListActiveAudioTopologies => {
+            "list_active_audio_topologies"
+        }
+        ClientRequest::ClearActiveAudioTopology { .. } => {
+            "clear_active_audio_topology"
+        }
+        ClientRequest::ListPluginsWhere { .. } => "list_plugins_where",
+        ClientRequest::DisablePluginsWhere { .. } => "disable_plugins_where",
+        ClientRequest::EnablePluginsWhere { .. } => "enable_plugins_where",
+        ClientRequest::SetPluginTag { .. } => "set_plugin_tag",
+        ClientRequest::DeletePluginTag { .. } => "delete_plugin_tag",
+        ClientRequest::ListPluginTags { .. } => "list_plugin_tags",
         ClientRequest::AcceptGrammarOrphans { .. } => "accept_grammar_orphans",
         ClientRequest::MigrateGrammarOrphans { .. } => {
             "migrate_grammar_orphans"
@@ -5136,20 +13577,33 @@ fn handle_negotiate(
                 acl.allows_fast_path_admin(conn.peer, steward_identity)
             }
             CAPABILITY_USER_INTERACTION_RESPONDER => {
-                // Two gates compose: ACL permission AND the
-                // single-responder runtime lock. The ACL gate
-                // surfaces denial as a "not granted" outcome
-                // (the requested name simply does not appear in
-                // `granted` on the response). The lock denial
-                // surfaces the same way at this layer; a
-                // responder that wants to know WHY can probe
-                // via a follow-up op (or the documented behaviour
-                // pattern: re-try after the previous holder
-                // disconnects).
-                if !acl.allows_user_interaction_responder(
+                // Two gates compose: authorisation AND the
+                // single-responder runtime lock. Authorisation
+                // holds if EITHER the peer-UID path via ACL grants
+                // (Unix-socket connections whose peer.uid matches
+                // a permitted entry or the steward's own UID) OR
+                // the bearer-token path grants (HTTPS-arriving
+                // connections carrying a token whose capability
+                // set includes `user_interaction_responder` in any
+                // rank — Read / Write / StepUp). Bearer tokens are
+                // themselves gated at `mint_bearer_token`, so a
+                // token carrying this scope was operator-issued.
+                //
+                // Without the bearer branch, browser sessions
+                // arriving via the HTTPS proxy could never qualify
+                // (peer.uid is synthetic on TCP paths and the ACL
+                // model is UID-only). The lock denial surfaces the
+                // same way at this layer; a responder that wants
+                // to know WHY can probe via a follow-up op or
+                // retry after the previous holder disconnects.
+                let acl_grants = acl.allows_user_interaction_responder(
                     conn.peer,
                     steward_identity,
-                ) {
+                );
+                let bearer_grants = conn
+                    .granted_capabilities
+                    .contains(CAPABILITY_USER_INTERACTION_RESPONDER);
+                if !(acl_grants || bearer_grants) {
                     false
                 } else if let Some(ledger) = prompt_ledger {
                     ledger.try_claim_responder(conn.id()).is_ok()
@@ -5169,6 +13623,9 @@ fn handle_negotiate(
             }
             CAPABILITY_GRAMMAR_ADMIN => {
                 acl.allows_grammar_admin(conn.peer, steward_identity)
+            }
+            CAPABILITY_PLANS_ADMIN => {
+                acl.allows_plans_admin(conn.peer, steward_identity)
             }
             // Defensive: a name in NEGOTIABLE_CAPABILITIES without an
             // ACL gate above is a build-time bug. Treat as not
@@ -5302,18 +13759,40 @@ fn lifecycle_error(op: &str, err: StewardError) -> ClientResponse {
     ClientResponse::Error { error: api }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_enable_plugin(
     engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
     conn: &ConnectionState,
     plugin: String,
     reason: Option<String>,
+    step_up_token: Option<String>,
 ) -> ClientResponse {
+    let operation = "plugin_enable";
     let engine = match require_plugins_admin(engine, conn, "enable_plugin") {
         Ok(e) => e,
+        Err(resp) => {
+            emit_capability_missing(lifecycle_ledger, operation, conn).await;
+            return *resp;
+        }
+    };
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
         Err(resp) => return *resp,
     };
     let guard = engine.lock().await;
-    match guard.enable_plugin(&plugin, reason).await {
+    let response = match guard.enable_plugin(&plugin, reason).await {
         Ok(o) => ClientResponse::PluginLifecycle {
             plugin_lifecycle: true,
             plugin: o.plugin,
@@ -5321,21 +13800,152 @@ async fn handle_enable_plugin(
             change_applied: o.change_applied,
         },
         Err(e) => lifecycle_error("enable_plugin", e),
-    }
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_disable_plugin(
     engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
     conn: &ConnectionState,
     plugin: String,
     reason: Option<String>,
+    step_up_token: Option<String>,
+    cascade_dependents: bool,
 ) -> ClientResponse {
+    let operation = "plugin_disable";
     let engine = match require_plugins_admin(engine, conn, "disable_plugin") {
         Ok(e) => e,
+        Err(resp) => {
+            emit_capability_missing(lifecycle_ledger, operation, conn).await;
+            return *resp;
+        }
+    };
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
         Err(resp) => return *resp,
     };
+
+    // Compute the transitive required-dependent set for the
+    // target plugin. When non-empty AND the operator did NOT
+    // pass cascade_dependents=true, refuse with a structured
+    // error listing the dependents so the operator can
+    // preview-then-confirm. When cascade_dependents=true,
+    // disable each dependent in BFS-discovery order
+    // (outermost first; the order
+    // [`AdmissionEngine::transitive_required_dependents`]
+    // returns) so deeper dependents are disabled BEFORE the
+    // plugins they require.
+    let dependents = {
+        let g = engine.lock().await;
+        g.transitive_required_dependents(&plugin)
+    };
+
+    if !dependents.is_empty() && !cascade_dependents {
+        let response = ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                format!(
+                    "disable_plugin: plugin {plugin:?} has {n} admitted \
+                     dependent(s); pass cascade_dependents = true to \
+                     disable them too",
+                    n = dependents.len()
+                ),
+            )
+            .with_details(serde_json::json!({
+                "subclass": "dependents_present",
+                "dependents": dependents,
+            })),
+        };
+        emit_operation_executed(
+            lifecycle_ledger,
+            operation,
+            "plugins_admin",
+            principal,
+            conn,
+            &response,
+        )
+        .await;
+        return response;
+    }
+
+    if cascade_dependents && !dependents.is_empty() {
+        // Cascade path: disable each dependent first, then the
+        // target. Per-plugin failures land on the failed[]
+        // list of the response so the operator surface can
+        // render which transitions worked.
+        let mut disabled = Vec::new();
+        let mut failed = Vec::new();
+        let cascade_reason = format!(
+            "cascade-disabled because dependency {plugin} was disabled"
+        );
+        let guard = engine.lock().await;
+        // Dependents in BFS order: outermost first, but
+        // operationally we want deepest first (no one
+        // depending on them after their dep goes away). The
+        // index already lists outermost first for operator UX;
+        // reverse for dispatch.
+        for dep in dependents.iter().rev() {
+            match guard
+                .disable_plugin(dep, Some(cascade_reason.clone()))
+                .await
+            {
+                Ok(_) => disabled.push(dep.clone()),
+                Err(e) => failed.push(BulkLifecycleFailureWire {
+                    plugin_name: dep.clone(),
+                    message: format!("{e}"),
+                }),
+            }
+        }
+        // Finally disable the target itself.
+        match guard.disable_plugin(&plugin, reason).await {
+            Ok(_) => disabled.push(plugin.clone()),
+            Err(e) => failed.push(BulkLifecycleFailureWire {
+                plugin_name: plugin.clone(),
+                message: format!("{e}"),
+            }),
+        }
+        drop(guard);
+        let response = ClientResponse::PluginLifecycleCascaded {
+            plugin_lifecycle_cascaded: true,
+            disabled,
+            failed,
+        };
+        emit_operation_executed(
+            lifecycle_ledger,
+            operation,
+            "plugins_admin",
+            principal,
+            conn,
+            &response,
+        )
+        .await;
+        return response;
+    }
+
     let guard = engine.lock().await;
-    match guard.disable_plugin(&plugin, reason).await {
+    let response = match guard.disable_plugin(&plugin, reason).await {
         Ok(o) => ClientResponse::PluginLifecycle {
             plugin_lifecycle: true,
             plugin: o.plugin,
@@ -5343,44 +13953,1712 @@ async fn handle_disable_plugin(
             change_applied: o.change_applied,
         },
         Err(e) => lifecycle_error("disable_plugin", e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_preview_dependency_cascade(
+    engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
+    conn: &ConnectionState,
+    plugin_name: String,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "preview_dependency_cascade: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(engine) = engine else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "preview_dependency_cascade: this server was constructed \
+                 without an admission engine handle"
+                    .to_string(),
+            )
+            .with_subclass("admission_engine_not_configured"),
+        };
+    };
+    let dependents = {
+        let g = engine.lock().await;
+        g.transitive_required_dependents(&plugin_name)
+    };
+    ClientResponse::DependencyCascade {
+        dependency_cascade: true,
+        plugin_name,
+        dependents,
     }
 }
 
+async fn handle_get_plugin_health(
+    state: &Arc<StewardState>,
+    engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
+    plugin_degraded_registry: Option<
+        &Arc<crate::lifecycle_robustness::PluginDegradedRegistry>,
+    >,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "get_plugin_health: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(engine) = engine else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_plugin_health: this server was constructed without \
+                 an admission engine handle"
+                    .to_string(),
+            )
+            .with_subclass("admission_engine_not_configured"),
+        };
+    };
+    let router = {
+        let g = engine.lock().await;
+        Arc::clone(g.router())
+    };
+    let mut aggregator = crate::plugin_health::PluginHealthAggregator::new(
+        Arc::clone(&state.persistence),
+    );
+    if let Some(reg) = plugin_degraded_registry {
+        aggregator = aggregator.with_degraded_registry(Arc::clone(reg));
+    }
+    match aggregator.snapshot(&router).await {
+        Ok(snapshot) => ClientResponse::PluginHealth {
+            plugin_health: true,
+            snapshot,
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("get_plugin_health: persistence read failed: {e}"),
+            )
+            .with_subclass("persistence_read_failed"),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_revoke_plugin_capability(
+    capability_grant_store: Option<
+        &Arc<crate::capability_grant::CapabilityGrantStore>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    plugin_name: String,
+    capability: String,
+    reason: Option<String>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "revoke_plugin_capability";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "revoke_plugin_capability: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    if capability.is_empty() {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "revoke_plugin_capability: capability must not be empty"
+                    .to_string(),
+            )
+            .with_subclass("capability_empty"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = capability_grant_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "revoke_plugin_capability: capability_grant_store not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("capability_grant_store_not_configured"),
+        };
+    };
+    let principal_for_record = principal
+        .clone()
+        .unwrap_or_else(|| format!("peer:{}", conn.peer.uid.unwrap_or(0)));
+    let response = match store
+        .revoke(
+            &plugin_name,
+            &capability,
+            &principal_for_record,
+            reason.as_deref(),
+        )
+        .await
+    {
+        Ok(_) => ClientResponse::PluginCapabilityRevoked {
+            plugin_capability_revoked: true,
+            plugin_name: plugin_name.clone(),
+            capability: capability.clone(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("revoke_plugin_capability: {e}"),
+            )
+            .with_subclass("capability_grant_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_unrevoke_plugin_capability(
+    capability_grant_store: Option<
+        &Arc<crate::capability_grant::CapabilityGrantStore>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    plugin_name: String,
+    capability: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "unrevoke_plugin_capability";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "unrevoke_plugin_capability: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = capability_grant_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "unrevoke_plugin_capability: capability_grant_store not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("capability_grant_store_not_configured"),
+        };
+    };
+    let response = match store.unrevoke(&plugin_name, &capability).await {
+        Ok(()) => ClientResponse::PluginCapabilityUnrevoked {
+            plugin_capability_unrevoked: true,
+            plugin_name: plugin_name.clone(),
+            capability: capability.clone(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("unrevoke_plugin_capability: {e}"),
+            )
+            .with_subclass("capability_grant_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_list_plugin_capability_revocations(
+    capability_grant_store: Option<
+        &Arc<crate::capability_grant::CapabilityGrantStore>,
+    >,
+    conn: &ConnectionState,
+    plugin_name: String,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_plugin_capability_revocations: plugins_admin not \
+                 granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = capability_grant_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_plugin_capability_revocations: \
+                 capability_grant_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("capability_grant_store_not_configured"),
+        };
+    };
+    match store.list_for_plugin(&plugin_name).await {
+        Ok(rows) => {
+            let entries =
+                rows.into_iter().map(revocation_to_wire).collect::<Vec<_>>();
+            ClientResponse::PluginCapabilityRevocations {
+                plugin_capability_revocations: true,
+                entries,
+            }
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("list_plugin_capability_revocations: {e}"),
+            )
+            .with_subclass("capability_grant_persistence_failed"),
+        },
+    }
+}
+
+async fn handle_list_all_capability_revocations(
+    capability_grant_store: Option<
+        &Arc<crate::capability_grant::CapabilityGrantStore>,
+    >,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_all_capability_revocations: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = capability_grant_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_all_capability_revocations: capability_grant_store \
+                 not configured"
+                    .to_string(),
+            )
+            .with_subclass("capability_grant_store_not_configured"),
+        };
+    };
+    match store.list_all().await {
+        Ok(rows) => {
+            let entries =
+                rows.into_iter().map(revocation_to_wire).collect::<Vec<_>>();
+            ClientResponse::PluginCapabilityRevocations {
+                plugin_capability_revocations: true,
+                entries,
+            }
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("list_all_capability_revocations: {e}"),
+            )
+            .with_subclass("capability_grant_persistence_failed"),
+        },
+    }
+}
+
+fn revocation_to_wire(
+    r: crate::capability_grant::CapabilityRevocation,
+) -> CapabilityRevocationWire {
+    CapabilityRevocationWire {
+        plugin_name: r.plugin_name,
+        capability: r.capability,
+        revoked_at_ms: r.revoked_at_ms,
+        revoked_by_principal: r.revoked_by_principal,
+        reason: r.reason,
+    }
+}
+
+async fn handle_export_migration_bundle(
+    migration_bundle_store: Option<
+        &Arc<crate::migration_bundle::MigrationBundleStore>,
+    >,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    let operation = "export_migration_bundle";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "export_migration_bundle: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = migration_bundle_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "export_migration_bundle: migration_bundle_store not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("migration_bundle_store_not_configured"),
+        };
+    };
+    let response = match store.export(None).await {
+        Ok(bundle) => match crate::migration_bundle::to_toml(&bundle) {
+            Ok(toml) => ClientResponse::MigrationBundleExported {
+                migration_bundle_exported: true,
+                bundle_toml: toml,
+            },
+            Err(e) => ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("export_migration_bundle: {e}"),
+                )
+                .with_subclass("migration_bundle_serialise_failed"),
+            },
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("export_migration_bundle: {e}"),
+            )
+            .with_subclass("migration_bundle_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        None,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_import_migration_bundle(
+    migration_bundle_store: Option<
+        &Arc<crate::migration_bundle::MigrationBundleStore>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    bundle_toml: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "import_migration_bundle";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "import_migration_bundle: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = migration_bundle_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "import_migration_bundle: migration_bundle_store not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("migration_bundle_store_not_configured"),
+        };
+    };
+    let bundle = match crate::migration_bundle::from_toml(&bundle_toml) {
+        Ok(b) => b,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!("import_migration_bundle: {e}"),
+                )
+                .with_subclass("migration_bundle_parse_failed"),
+            };
+        }
+    };
+    // Capture summary counts before move.
+    let update_channels_applied = bundle.update_channels.len() as u32;
+    let plugin_tags_applied = bundle.plugin_tags.len() as u32;
+    let plugin_profiles_applied = bundle.plugin_profiles.len() as u32;
+    let active_profile_id = bundle.active_profile_id.clone();
+    let admission_policies_applied = bundle.admission_policies.len() as u32;
+    let active_policy_id = bundle.active_policy_id.clone();
+    let capability_revocations_applied =
+        bundle.capability_revocations.len() as u32;
+    let response = match store.import_replace(bundle).await {
+        Ok(()) => ClientResponse::MigrationBundleImported {
+            migration_bundle_imported: true,
+            update_channels_applied,
+            plugin_tags_applied,
+            plugin_profiles_applied,
+            active_profile_id,
+            admission_policies_applied,
+            active_policy_id,
+            capability_revocations_applied,
+        },
+        Err(crate::migration_bundle::MigrationBundleError::Validation(msg)) => {
+            ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!("import_migration_bundle: {msg}"),
+                )
+                .with_subclass("migration_bundle_validation_failed"),
+            }
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("import_migration_bundle: {e}"),
+            )
+            .with_subclass("migration_bundle_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_put_hardware_profile_override(
+    hardware_profile_store: Option<
+        &Arc<crate::hardware_profile::HardwareProfileStore>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    identity: crate::hardware_profile::HardwareIdentity,
+    override_: crate::hardware_profile::HardwareProfileOverride,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "put_hardware_profile_override";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "put_hardware_profile_override: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = hardware_profile_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "put_hardware_profile_override: hardware_profile_store not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("hardware_profile_store_not_configured"),
+        };
+    };
+    let principal_for_record = principal
+        .clone()
+        .unwrap_or_else(|| format!("peer:{}", conn.peer.uid.unwrap_or(0)));
+    let key = identity.key();
+    let response = match store
+        .put_override(identity, override_, &principal_for_record)
+        .await
+    {
+        Ok(_) => ClientResponse::HardwareProfileOverridePut {
+            hardware_profile_override_put: true,
+            key: key.clone(),
+        },
+        Err(crate::hardware_profile::HardwareProfileError::EmptyOverride) => {
+            ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    "put_hardware_profile_override: override has no fields \
+                     set; submit at least one override field"
+                        .to_string(),
+                )
+                .with_subclass("hardware_profile_override_empty"),
+            }
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("put_hardware_profile_override: {e}"),
+            )
+            .with_subclass("hardware_profile_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_get_hardware_profile_override(
+    hardware_profile_store: Option<
+        &Arc<crate::hardware_profile::HardwareProfileStore>,
+    >,
+    conn: &ConnectionState,
+    key: String,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "get_hardware_profile_override: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = hardware_profile_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_hardware_profile_override: hardware_profile_store not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("hardware_profile_store_not_configured"),
+        };
+    };
+    match store.get_override(&key).await {
+        Ok(Some(record)) => ClientResponse::HardwareProfileOverrides {
+            hardware_profile_overrides: true,
+            entries: vec![record],
+        },
+        Ok(None) => ClientResponse::HardwareProfileOverrides {
+            hardware_profile_overrides: true,
+            entries: Vec::new(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("get_hardware_profile_override: {e}"),
+            )
+            .with_subclass("hardware_profile_persistence_failed"),
+        },
+    }
+}
+
+async fn handle_list_hardware_profile_overrides(
+    hardware_profile_store: Option<
+        &Arc<crate::hardware_profile::HardwareProfileStore>,
+    >,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_hardware_profile_overrides: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = hardware_profile_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_hardware_profile_overrides: hardware_profile_store \
+                 not configured"
+                    .to_string(),
+            )
+            .with_subclass("hardware_profile_store_not_configured"),
+        };
+    };
+    match store.list_overrides().await {
+        Ok(entries) => ClientResponse::HardwareProfileOverrides {
+            hardware_profile_overrides: true,
+            entries,
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("list_hardware_profile_overrides: {e}"),
+            )
+            .with_subclass("hardware_profile_persistence_failed"),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_delete_hardware_profile_override(
+    hardware_profile_store: Option<
+        &Arc<crate::hardware_profile::HardwareProfileStore>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    key: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "delete_hardware_profile_override";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "delete_hardware_profile_override: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = hardware_profile_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "delete_hardware_profile_override: hardware_profile_store \
+                 not configured"
+                    .to_string(),
+            )
+            .with_subclass("hardware_profile_store_not_configured"),
+        };
+    };
+    let response = match store.clear_override(&key).await {
+        Ok(()) => ClientResponse::HardwareProfileOverrideDeleted {
+            hardware_profile_override_deleted: true,
+            key: key.clone(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("delete_hardware_profile_override: {e}"),
+            )
+            .with_subclass("hardware_profile_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_put_audio_operator_policy(
+    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    target_key: String,
+    policy: crate::topology_scoring::OperatorPolicy,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "put_audio_operator_policy";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "put_audio_operator_policy: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = audio_policy_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "put_audio_operator_policy: audio_policy_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("audio_policy_store_not_configured"),
+        };
+    };
+    let principal_for_record = principal
+        .clone()
+        .unwrap_or_else(|| format!("peer:{}", conn.peer.uid.unwrap_or(0)));
+    let response = match store
+        .put_policy(&target_key, policy, &principal_for_record)
+        .await
+    {
+        Ok(_) => ClientResponse::AudioOperatorPolicyPut {
+            audio_operator_policy_put: true,
+            target_key: target_key.clone(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("put_audio_operator_policy: {e}"),
+            )
+            .with_subclass("audio_policy_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_get_audio_operator_policy(
+    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    conn: &ConnectionState,
+    target_key: String,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "get_audio_operator_policy: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = audio_policy_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_audio_operator_policy: audio_policy_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("audio_policy_store_not_configured"),
+        };
+    };
+    match store.get_policy(&target_key).await {
+        Ok(Some(record)) => ClientResponse::AudioOperatorPolicies {
+            audio_operator_policies: true,
+            entries: vec![record],
+        },
+        Ok(None) => ClientResponse::AudioOperatorPolicies {
+            audio_operator_policies: true,
+            entries: Vec::new(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("get_audio_operator_policy: {e}"),
+            )
+            .with_subclass("audio_policy_persistence_failed"),
+        },
+    }
+}
+
+async fn handle_list_audio_operator_policies(
+    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_audio_operator_policies: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = audio_policy_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_audio_operator_policies: audio_policy_store not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("audio_policy_store_not_configured"),
+        };
+    };
+    match store.list_policies().await {
+        Ok(entries) => ClientResponse::AudioOperatorPolicies {
+            audio_operator_policies: true,
+            entries,
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("list_audio_operator_policies: {e}"),
+            )
+            .with_subclass("audio_policy_persistence_failed"),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_delete_audio_operator_policy(
+    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    target_key: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "delete_audio_operator_policy";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "delete_audio_operator_policy: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = audio_policy_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "delete_audio_operator_policy: audio_policy_store not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("audio_policy_store_not_configured"),
+        };
+    };
+    let response = match store.clear_policy(&target_key).await {
+        Ok(()) => ClientResponse::AudioOperatorPolicyDeleted {
+            audio_operator_policy_deleted: true,
+            target_key: target_key.clone(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("delete_audio_operator_policy: {e}"),
+            )
+            .with_subclass("audio_policy_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_put_audio_volume_mode(
+    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    target_key: String,
+    volume_mode: crate::topology_scoring::VolumeMode,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "put_audio_volume_mode";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "put_audio_volume_mode: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = audio_policy_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "put_audio_volume_mode: audio_policy_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("audio_policy_store_not_configured"),
+        };
+    };
+    let principal_for_record = principal
+        .clone()
+        .unwrap_or_else(|| format!("peer:{}", conn.peer.uid.unwrap_or(0)));
+    let response = match store
+        .put_volume_mode(&target_key, volume_mode, &principal_for_record)
+        .await
+    {
+        Ok(_) => ClientResponse::AudioVolumeModePut {
+            audio_volume_mode_put: true,
+            target_key: target_key.clone(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("put_audio_volume_mode: {e}"),
+            )
+            .with_subclass("audio_policy_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_get_audio_volume_mode(
+    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    conn: &ConnectionState,
+    target_key: String,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "get_audio_volume_mode: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = audio_policy_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_audio_volume_mode: audio_policy_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("audio_policy_store_not_configured"),
+        };
+    };
+    match store.get_volume_mode(&target_key).await {
+        Ok(Some(record)) => ClientResponse::AudioVolumeModes {
+            audio_volume_modes: true,
+            entries: vec![record],
+        },
+        Ok(None) => ClientResponse::AudioVolumeModes {
+            audio_volume_modes: true,
+            entries: Vec::new(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("get_audio_volume_mode: {e}"),
+            )
+            .with_subclass("audio_policy_persistence_failed"),
+        },
+    }
+}
+
+async fn handle_list_audio_volume_modes(
+    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_audio_volume_modes: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = audio_policy_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_audio_volume_modes: audio_policy_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("audio_policy_store_not_configured"),
+        };
+    };
+    match store.list_volume_modes().await {
+        Ok(entries) => ClientResponse::AudioVolumeModes {
+            audio_volume_modes: true,
+            entries,
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("list_audio_volume_modes: {e}"),
+            )
+            .with_subclass("audio_policy_persistence_failed"),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_delete_audio_volume_mode(
+    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    target_key: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "delete_audio_volume_mode";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "delete_audio_volume_mode: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = audio_policy_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "delete_audio_volume_mode: audio_policy_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("audio_policy_store_not_configured"),
+        };
+    };
+    let response = match store.clear_volume_mode(&target_key).await {
+        Ok(()) => ClientResponse::AudioVolumeModeDeleted {
+            audio_volume_mode_deleted: true,
+            target_key: target_key.clone(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("delete_audio_volume_mode: {e}"),
+            )
+            .with_subclass("audio_policy_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_publish_active_audio_topology(
+    audio_topology_store: Option<
+        &Arc<crate::audio_topology::AudioTopologyStore>,
+    >,
+    state: &Arc<StewardState>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    topology: crate::audio_topology::ActiveAudioTopology,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "publish_active_audio_topology";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "publish_active_audio_topology: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = audio_topology_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "publish_active_audio_topology: audio_topology_store not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("audio_topology_store_not_configured"),
+        };
+    };
+    let principal_for_record = principal
+        .clone()
+        .unwrap_or_else(|| format!("peer:{}", conn.peer.uid.unwrap_or(0)));
+    let target_key = topology.target_key.clone();
+    let display_name = topology.display_name.clone();
+    let bit_perfect = topology.bit_perfect;
+    let score_total = topology.score.total;
+    let response = match store.publish(topology, &principal_for_record).await {
+        Ok(_) => {
+            // Emit the typed AudioTopologyChanged happening
+            // so operator UIs receive the live update. Bus
+            // emission may fail if the durable backing store
+            // is full / corrupt; log + carry on so the
+            // publish response still surfaces success to the
+            // operator.
+            if let Err(e) = state
+                .bus
+                .emit_durable(
+                    crate::happenings::Happening::AudioTopologyChanged {
+                        target_key: target_key.clone(),
+                        display_name: display_name.clone(),
+                        bit_perfect,
+                        score_total,
+                        at: std::time::SystemTime::now(),
+                    },
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    target_key = %target_key,
+                    "failed to emit AudioTopologyChanged happening"
+                );
+            }
+            ClientResponse::ActiveAudioTopologyPublished {
+                active_audio_topology_published: true,
+                target_key: target_key.clone(),
+                bit_perfect,
+                score_total,
+            }
+        }
+        Err(crate::audio_topology::AudioTopologyError::Validation(msg)) => {
+            ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!("publish_active_audio_topology: {msg}"),
+                )
+                .with_subclass("audio_topology_validation_failed"),
+            }
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("publish_active_audio_topology: {e}"),
+            )
+            .with_subclass("audio_topology_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_get_active_audio_topology(
+    audio_topology_store: Option<
+        &Arc<crate::audio_topology::AudioTopologyStore>,
+    >,
+    conn: &ConnectionState,
+    target_key: String,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "get_active_audio_topology: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = audio_topology_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_active_audio_topology: audio_topology_store not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("audio_topology_store_not_configured"),
+        };
+    };
+    match store.get(&target_key).await {
+        Ok(Some(topology)) => ClientResponse::ActiveAudioTopologies {
+            active_audio_topologies: true,
+            entries: vec![topology],
+        },
+        Ok(None) => ClientResponse::ActiveAudioTopologies {
+            active_audio_topologies: true,
+            entries: Vec::new(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("get_active_audio_topology: {e}"),
+            )
+            .with_subclass("audio_topology_persistence_failed"),
+        },
+    }
+}
+
+async fn handle_list_active_audio_topologies(
+    audio_topology_store: Option<
+        &Arc<crate::audio_topology::AudioTopologyStore>,
+    >,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_active_audio_topologies: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = audio_topology_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_active_audio_topologies: audio_topology_store not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("audio_topology_store_not_configured"),
+        };
+    };
+    match store.list().await {
+        Ok(entries) => ClientResponse::ActiveAudioTopologies {
+            active_audio_topologies: true,
+            entries,
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("list_active_audio_topologies: {e}"),
+            )
+            .with_subclass("audio_topology_persistence_failed"),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_clear_active_audio_topology(
+    audio_topology_store: Option<
+        &Arc<crate::audio_topology::AudioTopologyStore>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    target_key: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "clear_active_audio_topology";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "clear_active_audio_topology: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = audio_topology_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "clear_active_audio_topology: audio_topology_store not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("audio_topology_store_not_configured"),
+        };
+    };
+    let response = match store.clear(&target_key).await {
+        Ok(()) => ClientResponse::ActiveAudioTopologyCleared {
+            active_audio_topology_cleared: true,
+            target_key: target_key.clone(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("clear_active_audio_topology: {e}"),
+            )
+            .with_subclass("audio_topology_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_uninstall_plugin(
     engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    bundled_roots: &[PathBuf],
     conn: &ConnectionState,
     plugin: String,
     reason: Option<String>,
     purge_state: bool,
+    step_up_token: Option<String>,
 ) -> ClientResponse {
+    let operation = "plugin_uninstall";
     let engine = match require_plugins_admin(engine, conn, "uninstall_plugin") {
         Ok(e) => e,
+        Err(resp) => {
+            emit_capability_missing(lifecycle_ledger, operation, conn).await;
+            return *resp;
+        }
+    };
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
         Err(resp) => return *resp,
     };
-    let guard = engine.lock().await;
-    match guard.uninstall_plugin(&plugin, reason, purge_state).await {
-        Ok(o) => ClientResponse::PluginLifecycle {
-            plugin_lifecycle: true,
-            plugin: o.plugin,
-            was_currently_admitted: o.was_currently_admitted,
-            change_applied: o.change_applied,
-        },
-        Err(e) => lifecycle_error("uninstall_plugin", e),
+
+    // Lifecycle policy: classify the plugin's distribution model
+    // by path-prefix matching its recorded bundle directory
+    // against the operator-configured `plugins.bundled_roots`
+    // list. A plugin classified as `bundled` (factory-installed,
+    // shipped in the distribution image) is disable-only, never
+    // removable; the operator must use disable + state-purge to
+    // achieve the same effective state without violating the
+    // distribution-image invariant.
+    let origin_path = {
+        let g = engine.lock().await;
+        g.plugin_origin(&plugin)
+    };
+    if let Some(origin) = origin_path.as_ref() {
+        if path_is_bundled(origin, bundled_roots) {
+            // Audit-record the policy denial under the same lens
+            // the capability gate uses; classify as
+            // `bundled_plugin_not_removable` for operator surfaces.
+            let response = ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::PermissionDenied,
+                    format!(
+                        "uninstall_plugin: plugin {plugin:?} is bundled \
+                         (origin {} matches a configured bundled root); \
+                         disable + purge-state instead of remove",
+                        origin.display()
+                    ),
+                )
+                .with_subclass("bundled_plugin_not_removable"),
+            };
+            emit_operation_executed(
+                lifecycle_ledger,
+                operation,
+                "plugins_admin",
+                principal,
+                conn,
+                &response,
+            )
+            .await;
+            return response;
+        }
     }
+
+    let guard = engine.lock().await;
+    let response =
+        match guard.uninstall_plugin(&plugin, reason, purge_state).await {
+            Ok(o) => ClientResponse::PluginLifecycle {
+                plugin_lifecycle: true,
+                plugin: o.plugin,
+                was_currently_admitted: o.was_currently_admitted,
+                change_applied: o.change_applied,
+            },
+            Err(e) => lifecycle_error("uninstall_plugin", e),
+        };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
 }
 
+/// Path-prefix match for the bundled-roots policy. Returns `true`
+/// when `origin` is rooted under any entry in `bundled_roots`.
+/// The prefix match is canonical-path-based: each input is
+/// passed through [`std::path::Path::canonicalize`] when the
+/// path exists; non-existent paths fall back to the
+/// component-by-component starts-with check, which is correct
+/// for the policy because removed bundles preserve their last
+/// recorded origin literally.
+fn path_is_bundled(origin: &Path, bundled_roots: &[PathBuf]) -> bool {
+    if bundled_roots.is_empty() {
+        return false;
+    }
+    let canon_origin = origin
+        .canonicalize()
+        .unwrap_or_else(|_| origin.to_path_buf());
+    for root in bundled_roots {
+        let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if canon_origin.starts_with(&canon_root) {
+            return true;
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_purge_plugin_state(
     engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
     conn: &ConnectionState,
     plugin: String,
+    step_up_token: Option<String>,
 ) -> ClientResponse {
+    let operation = "plugin_purge_state";
     let engine = match require_plugins_admin(engine, conn, "purge_plugin_state")
     {
         Ok(e) => e,
+        Err(resp) => {
+            emit_capability_missing(lifecycle_ledger, operation, conn).await;
+            return *resp;
+        }
+    };
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
         Err(resp) => return *resp,
     };
     let guard = engine.lock().await;
-    match guard.purge_plugin_state(&plugin).await {
+    let response = match guard.purge_plugin_state(&plugin).await {
         Ok(o) => ClientResponse::PluginLifecycle {
             plugin_lifecycle: true,
             plugin: o.plugin,
@@ -5388,21 +15666,53 @@ async fn handle_purge_plugin_state(
             change_applied: o.change_applied,
         },
         Err(e) => lifecycle_error("purge_plugin_state", e),
-    }
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_reload_catalogue(
     engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
     conn: &ConnectionState,
     source: ReloadSourceWire,
     dry_run: bool,
+    step_up_token: Option<String>,
 ) -> ClientResponse {
+    let operation = "reload_catalogue";
     let engine = match require_plugins_admin(engine, conn, "reload_catalogue") {
         Ok(e) => e,
+        Err(resp) => {
+            emit_capability_missing(lifecycle_ledger, operation, conn).await;
+            return *resp;
+        }
+    };
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
         Err(resp) => return *resp,
     };
     let guard = engine.lock().await;
-    match guard
+    let response = match guard
         .reload_catalogue(source.into_manifest_source(), dry_run)
         .await
     {
@@ -5415,7 +15725,17 @@ async fn handle_reload_catalogue(
             dry_run: o.dry_run,
         },
         Err(e) => lifecycle_error("reload_catalogue", e),
-    }
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
 }
 
 async fn handle_take_custody(
@@ -5504,38 +15824,10545 @@ async fn handle_release_custody(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_reload_plugin(
     engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
     conn: &ConnectionState,
     plugin: String,
+    step_up_token: Option<String>,
 ) -> ClientResponse {
+    let operation = "plugin_reload";
     let engine = match require_plugins_admin(engine, conn, "reload_plugin") {
         Ok(e) => e,
+        Err(resp) => {
+            emit_capability_missing(lifecycle_ledger, operation, conn).await;
+            return *resp;
+        }
+    };
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
         Err(resp) => return *resp,
     };
     let mut guard = engine.lock().await;
-    match guard.reload_plugin(&plugin).await {
+    let response = match guard.reload_plugin(&plugin).await {
         Ok(()) => ClientResponse::PluginReloaded {
             plugin_reload: true,
             plugin,
         },
         Err(e) => lifecycle_error("reload_plugin", e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+/// Maximum bytes read from the supplied URL. Bundles larger
+/// than this refuse with `ContractViolation /
+/// bundle_too_large`. The cap matches `evo-plugin-tool
+/// install`'s default URL cap so the two delivery paths fail
+/// at the same threshold.
+const INSTALL_FROM_URL_MAX_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_install_plugin_from_url(
+    engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    url: String,
+    signature_pin: Option<String>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "plugin_install_from_url";
+    let engine =
+        match require_plugins_admin(engine, conn, "install_plugin_from_url") {
+            Ok(e) => e,
+            Err(resp) => {
+                emit_capability_missing(lifecycle_ledger, operation, conn)
+                    .await;
+                return *resp;
+            }
+        };
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+
+    // URL fetches use TLS. http:// is
+    // refused at the framework boundary; an operator wanting
+    // unencrypted fetches must drop the bundle into the stage
+    // directory directly via filesystem / SMB / etc.
+    if !url.starts_with("https://") {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ProtocolViolation,
+                format!(
+                    "install_plugin_from_url: URL must start with \
+                     https:// (got {url:?}); the framework refuses \
+                     unencrypted fetches"
+                ),
+            )
+            .with_subclass("url_scheme_unsupported"),
+        };
+    }
+
+    // The stage directory lives under the engine's plugin data
+    // root. We hold the engine lock briefly to read the path,
+    // then release it before the (potentially long) HTTPS
+    // fetch.
+    let stage_dir = {
+        let guard = engine.lock().await;
+        guard.plugin_data_root().join("stage")
+    };
+
+    // Make sure the stage directory exists. The framework's
+    // boot wiring already creates it when the watcher starts;
+    // re-create idempotently here in case an operator wiped
+    // the directory or the watcher's `enabled = false`.
+    if let Err(e) = std::fs::create_dir_all(&stage_dir) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!(
+                    "install_plugin_from_url: cannot create stage \
+                     directory {}: {e}",
+                    stage_dir.display()
+                ),
+            )
+            .with_subclass("stage_dir_unwritable"),
+        };
+    }
+
+    // Mint a unique filename for the staged archive. Derived
+    // from the URL plus a timestamp so multiple installs of
+    // the same URL do not clobber each other before the
+    // watcher consumes one of them.
+    let url_for_call = url.clone();
+    let stage_dir_for_call = stage_dir.clone();
+    let fetch_result = tokio::task::spawn_blocking(move || {
+        fetch_url_to_stage(&url_for_call, &stage_dir_for_call)
+    })
+    .await;
+    let staged_archive = match fetch_result {
+        Ok(Ok(path)) => path,
+        Ok(Err((subclass, message))) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ProtocolViolation,
+                    format!("install_plugin_from_url: {message}"),
+                )
+                .with_subclass(subclass),
+            };
+        }
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("install_plugin_from_url: task join: {e}"),
+                ),
+            };
+        }
+    };
+
+    // Stat the freshly-staged archive for the response.
+    let bytes_fetched = std::fs::metadata(&staged_archive)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    tracing::info!(
+        url = %url,
+        staged_path = %staged_archive.display(),
+        bytes_fetched,
+        signature_pin_supplied = signature_pin.is_some(),
+        "install_plugin_from_url: bundle staged; awaiting watcher"
+    );
+
+    let response = ClientResponse::PluginInstallStaged {
+        plugin_install_staged: true,
+        url,
+        staged_path: staged_archive.to_string_lossy().into_owned(),
+        bytes_fetched,
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+/// Fetch `url` into `stage_dir` under a unique filename. On
+/// success returns the staged path. On error returns a
+/// `(subclass, message)` pair the caller embeds in the
+/// structured response.
+fn fetch_url_to_stage(
+    url: &str,
+    stage_dir: &Path,
+) -> Result<PathBuf, (&'static str, String)> {
+    let response = ureq::get(url).call().map_err(|e| {
+        ("url_fetch_failed", format!("HTTPS fetch of {url}: {e}"))
+    })?;
+
+    if !(200..300).contains(&response.status()) {
+        return Err((
+            "url_fetch_failed",
+            format!("HTTP {} fetching {url}", response.status()),
+        ));
+    }
+
+    // Bound the body read so a hostile / mis-sized URL cannot
+    // exhaust steward memory.
+    let cap = INSTALL_FROM_URL_MAX_BYTES.saturating_add(1);
+    let mut body = Vec::with_capacity(64 * 1024);
+    use std::io::Read;
+    response
+        .into_reader()
+        .take(cap)
+        .read_to_end(&mut body)
+        .map_err(|e| {
+            ("url_fetch_failed", format!("reading body of {url}: {e}"))
+        })?;
+    if body.len() as u64 > INSTALL_FROM_URL_MAX_BYTES {
+        return Err((
+            "bundle_too_large",
+            format!(
+                "bundle from {url} exceeds {INSTALL_FROM_URL_MAX_BYTES} bytes"
+            ),
+        ));
+    }
+
+    // Derive a stable filename from the URL's last segment
+    // when reasonable; fall back to a timestamp-based name. A
+    // millisecond suffix avoids collisions on rapid sequential
+    // installs of the same URL before the watcher consumes the
+    // prior staged archive.
+    let stem = url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            // Strip any query string from the path's last segment.
+            s.split('?').next().unwrap_or(s).to_string()
+        })
+        .unwrap_or_else(|| "bundle".to_string());
+    let extension = pick_archive_extension(&stem).unwrap_or(".tar.gz");
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let safe_stem = stem
+        .trim_end_matches(extension)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let staged_filename = format!("{safe_stem}.{timestamp_ms}{extension}");
+    let staged_path = stage_dir.join(staged_filename);
+
+    std::fs::write(&staged_path, &body).map_err(|e| {
+        (
+            "stage_write_failed",
+            format!("writing staged bundle {}: {e}", staged_path.display()),
+        )
+    })?;
+    Ok(staged_path)
+}
+
+/// Recognise the archive extension on a URL's last path
+/// segment so the staged file keeps its format (the stage
+/// watcher dispatches extraction on extension).
+fn pick_archive_extension(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".tar.gz") {
+        Some(".tar.gz")
+    } else if lower.ends_with(".tgz") {
+        Some(".tgz")
+    } else if lower.ends_with(".tar.xz") {
+        Some(".tar.xz")
+    } else if lower.ends_with(".txz") {
+        Some(".txz")
+    } else if lower.ends_with(".zip") {
+        Some(".zip")
+    } else {
+        None
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_register_plugin_registry(
+    plugin_registry: Option<
+        &Arc<crate::plugin_registry::PluginRegistryRuntime>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    slug: String,
+    manifest_url: String,
+    signature_url: String,
+    public_key_fingerprint: String,
+    poll_interval_secs: Option<u64>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "plugin_registry_register";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "register_plugin_registry: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(runtime) = plugin_registry else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "register_plugin_registry: plugin_registry runtime not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("plugin_registry_not_configured"),
+        };
+    };
+    let record = crate::plugin_registry::RegistryRecord {
+        slug: slug.clone(),
+        manifest_url,
+        signature_url,
+        public_key_fingerprint,
+        poll_interval_secs,
+        last_refreshed_at_ms: None,
+    };
+    let response = match runtime.register(record).await {
+        Ok(()) => ClientResponse::PluginRegistryRegistered {
+            plugin_registry_registered: true,
+            slug,
+        },
+        Err(e) => registry_error_to_response("register_plugin_registry", e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_unregister_plugin_registry(
+    plugin_registry: Option<
+        &Arc<crate::plugin_registry::PluginRegistryRuntime>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    slug: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "plugin_registry_unregister";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "unregister_plugin_registry: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(runtime) = plugin_registry else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "unregister_plugin_registry: plugin_registry runtime not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("plugin_registry_not_configured"),
+        };
+    };
+    let response = match runtime.unregister(&slug).await {
+        Ok(()) => ClientResponse::PluginRegistryUnregistered {
+            plugin_registry_unregistered: true,
+            slug,
+        },
+        Err(e) => registry_error_to_response("unregister_plugin_registry", e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_list_plugin_registries(
+    plugin_registry: Option<
+        &Arc<crate::plugin_registry::PluginRegistryRuntime>,
+    >,
+) -> ClientResponse {
+    let Some(runtime) = plugin_registry else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_plugin_registries: plugin_registry runtime not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("plugin_registry_not_configured"),
+        };
+    };
+    let records = runtime.list().await;
+    let mut entries = Vec::with_capacity(records.len());
+    for record in records {
+        let snap = runtime.snapshot(&record.slug).await;
+        let plugin_count = snap
+            .as_ref()
+            .and_then(|s| s.1.as_ref().map(|m| m.plugins.len() as u32));
+        entries.push(PluginRegistryEntryWire {
+            slug: record.slug.clone(),
+            manifest_url: record.manifest_url.clone(),
+            signature_url: record.signature_url.clone(),
+            public_key_fingerprint: record.public_key_fingerprint.clone(),
+            poll_interval_secs: record.effective_poll_interval().as_secs(),
+            last_refreshed_at_ms: record.last_refreshed_at_ms,
+            plugin_count,
+        });
+    }
+    ClientResponse::PluginRegistries {
+        plugin_registries: true,
+        entries,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_refresh_plugin_registry(
+    plugin_registry: Option<
+        &Arc<crate::plugin_registry::PluginRegistryRuntime>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    slug: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "plugin_registry_refresh";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "refresh_plugin_registry: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(runtime) = plugin_registry else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "refresh_plugin_registry: plugin_registry runtime not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("plugin_registry_not_configured"),
+        };
+    };
+    let snap = runtime.snapshot(&slug).await;
+    let Some((record, _)) = snap else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::NotFound,
+                format!("refresh_plugin_registry: slug {slug} not registered"),
+            )
+            .with_subclass("registry_slug_not_registered"),
+        };
+    };
+    runtime.refresh_one(&record).await;
+    let after = runtime.snapshot(&slug).await;
+    let (refreshed_at_ms, plugin_count) = match after {
+        Some((r, m)) => (
+            r.last_refreshed_at_ms.unwrap_or(0),
+            m.as_ref().map(|m| m.plugins.len() as u32).unwrap_or(0),
+        ),
+        None => (0, 0),
+    };
+    let response = ClientResponse::PluginRegistryRefreshed {
+        plugin_registry_refreshed: true,
+        slug,
+        refreshed_at_ms,
+        plugin_count,
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+fn registry_error_to_response(
+    op: &str,
+    err: crate::plugin_registry::RegistryError,
+) -> ClientResponse {
+    use crate::plugin_registry::RegistryError;
+    let (class, subclass): (ErrorClass, &str) = match &err {
+        RegistryError::InvalidSlug(_) => {
+            (ErrorClass::ContractViolation, "invalid_slug")
+        }
+        RegistryError::UrlNotHttps(_) => {
+            (ErrorClass::ProtocolViolation, "url_scheme_unsupported")
+        }
+        RegistryError::ManifestTooLarge(_) => {
+            (ErrorClass::ContractViolation, "manifest_too_large")
+        }
+        RegistryError::ManifestParse(_) => {
+            (ErrorClass::ContractViolation, "manifest_parse_failed")
+        }
+        RegistryError::SchemaTooNew { .. } => {
+            (ErrorClass::ContractViolation, "schema_too_new")
+        }
+        RegistryError::FingerprintMismatch { .. } => {
+            (ErrorClass::ContractViolation, "fingerprint_mismatch")
+        }
+        RegistryError::ManifestExpired(_) => {
+            (ErrorClass::ContractViolation, "manifest_expired")
+        }
+        RegistryError::FetchFailed(_) => {
+            (ErrorClass::Internal, "registry_fetch_failed")
+        }
+        RegistryError::Io(_) => (ErrorClass::Internal, "registry_io_failed"),
+        RegistryError::NotRegistered(_) => {
+            (ErrorClass::NotFound, "registry_slug_not_registered")
+        }
+    };
+    ClientResponse::Error {
+        error: ApiError::new(class, format!("{op}: {err}"))
+            .with_subclass(subclass),
+    }
+}
+
+// Allowed clippy::too_many_arguments: the handler's parameter
+// list mirrors the wire op's ClientRequest variant fields plus
+// the dependency handles the dispatch path threads through. A
+// struct-of-args wrapper would obscure the per-handler
+// signature without simplifying the call site.
+#[allow(clippy::too_many_arguments)]
+async fn handle_grant_publisher_trust(
+    publisher_trust: Option<&Arc<crate::publisher_trust::PublisherTrustStore>>,
+    operator_trust_dir: Option<&Path>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    conn: &ConnectionState,
+    publisher_id: String,
+    display_name: String,
+    public_key_pem: String,
+    scope_per_plugin: Option<Vec<String>>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "publisher_trust_grant";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "grant_publisher_trust: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = publisher_trust else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "grant_publisher_trust: publisher_trust store not configured"
+                    .to_string(),
+            )
+            .with_subclass("publisher_trust_not_configured"),
+        };
+    };
+    let Some(trust_dir) = operator_trust_dir else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "grant_publisher_trust: operator trust directory not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("operator_trust_dir_not_configured"),
+        };
+    };
+    let scope = match scope_per_plugin {
+        Some(plugins) if !plugins.is_empty() => {
+            crate::publisher_trust::TrustScope::PerPlugin { plugins }
+        }
+        _ => crate::publisher_trust::TrustScope::AllPlugins,
+    };
+    let display_name_for_ledger = display_name.clone();
+    let response = match store
+        .grant(
+            publisher_id.clone(),
+            display_name,
+            &public_key_pem,
+            crate::publisher_trust::GrantedVia::DirectInstall,
+            scope,
+            trust_dir,
+        )
+        .await
+    {
+        Ok(record) => {
+            // Audit-ledger entry: trust grant recorded (separate
+            // entry from the operations control-plane entry below).
+            if let Some(ledger) = lifecycle_ledger {
+                let approver = format!(
+                    "user:{}",
+                    conn.peer
+                        .uid
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+                let payload = serde_json::json!({
+                    "display_name": display_name_for_ledger,
+                    "granted_via": "direct_install",
+                    "scope_kind": match record.scope {
+                        crate::publisher_trust::TrustScope::AllPlugins => "all_plugins",
+                        crate::publisher_trust::TrustScope::PerPlugin { .. } => "per_plugin",
+                    },
+                });
+                if let Err(e) = ledger
+                    .append_publisher_trust_grant(
+                        &approver,
+                        &publisher_id,
+                        payload,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        publisher_id = %publisher_id,
+                        error = %e,
+                        "publisher trust grant: ledger append failed (grant succeeded)"
+                    );
+                }
+            }
+            ClientResponse::PublisherTrustGranted {
+                publisher_trust_granted: true,
+                publisher_id,
+                key_file: record
+                    .key_file
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            }
+        }
+        Err(e) => publisher_trust_error_to_response("grant_publisher_trust", e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_revoke_publisher_trust(
+    publisher_trust: Option<&Arc<crate::publisher_trust::PublisherTrustStore>>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    conn: &ConnectionState,
+    publisher_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "publisher_trust_revoke";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "revoke_publisher_trust: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = publisher_trust else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "revoke_publisher_trust: publisher_trust store not configured"
+                    .to_string(),
+            )
+            .with_subclass("publisher_trust_not_configured"),
+        };
+    };
+    let response = match store.revoke(&publisher_id).await {
+        Ok(record) => {
+            if let Some(ledger) = lifecycle_ledger {
+                let approver = format!(
+                    "user:{}",
+                    conn.peer
+                        .uid
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+                let payload = serde_json::json!({
+                    "display_name": record.display_name,
+                });
+                if let Err(e) = ledger
+                    .append_publisher_trust_revoke(
+                        &approver,
+                        &publisher_id,
+                        payload,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        publisher_id = %publisher_id,
+                        error = %e,
+                        "publisher trust revoke: ledger append failed"
+                    );
+                }
+            }
+            ClientResponse::PublisherTrustRevoked {
+                publisher_trust_revoked: true,
+                publisher_id,
+            }
+        }
+        Err(e) => {
+            publisher_trust_error_to_response("revoke_publisher_trust", e)
+        }
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_list_publisher_trust(
+    publisher_trust: Option<&Arc<crate::publisher_trust::PublisherTrustStore>>,
+) -> ClientResponse {
+    let Some(store) = publisher_trust else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_publisher_trust: publisher_trust store not configured"
+                    .to_string(),
+            )
+            .with_subclass("publisher_trust_not_configured"),
+        };
+    };
+    let records = store.list().await;
+    let entries = records
+        .into_iter()
+        .map(|r| {
+            let trust_level = match r.trust_level {
+                crate::publisher_trust::PublisherTrustLevel::Pretrusted => {
+                    "pretrusted"
+                }
+                crate::publisher_trust::PublisherTrustLevel::OperatorTrusted => {
+                    "operator_trusted"
+                }
+                crate::publisher_trust::PublisherTrustLevel::Revoked => {
+                    "revoked"
+                }
+            };
+            let granted_via = match r.granted_via {
+                crate::publisher_trust::GrantedVia::VendorBundle => {
+                    "vendor_bundle"
+                }
+                crate::publisher_trust::GrantedVia::RegistrySubscription => {
+                    "registry_subscription"
+                }
+                crate::publisher_trust::GrantedVia::OperatorPrompt => {
+                    "operator_prompt"
+                }
+                crate::publisher_trust::GrantedVia::DirectInstall => {
+                    "direct_install"
+                }
+            };
+            let (scope_kind, scope_per_plugin) = match r.scope {
+                crate::publisher_trust::TrustScope::AllPlugins => {
+                    ("all_plugins".to_string(), Vec::new())
+                }
+                crate::publisher_trust::TrustScope::PerPlugin { plugins } => {
+                    ("per_plugin".to_string(), plugins)
+                }
+            };
+            PublisherTrustEntryWire {
+                publisher_id: r.publisher_id,
+                display_name: r.display_name,
+                trust_level: trust_level.to_string(),
+                granted_at_ms: r.granted_at_ms,
+                granted_via: granted_via.to_string(),
+                scope_kind,
+                scope_per_plugin,
+                key_file: r
+                    .key_file
+                    .map(|p| p.to_string_lossy().into_owned()),
+            }
+        })
+        .collect();
+    ClientResponse::PublisherTrust {
+        publisher_trust: true,
+        entries,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_step_up_auth_verify(
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    rate_limiter: &Arc<crate::auth::StepUpRateLimiter>,
+    nonce_store: &Arc<crate::auth::NonceReplayStore>,
+    runtime_user_name: Option<&str>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    username: Option<String>,
+    secret_b64: String,
+    ttl_seconds: Option<u64>,
+    nonce: Option<String>,
+) -> ClientResponse {
+    use crate::auth::{AuthVerificationError, VerifiedPrincipal};
+    use crate::ledger::{
+        LifecycleOutcome, StepUpAuthAttemptedPayload, StepUpAuthOutcome,
+    };
+
+    // Runtime-user substitution. A portable UI cannot know the
+    // distribution-specific OS runtime user name. Callers may
+    // omit the `username` field or send it empty; the framework
+    // substitutes its own runtime user (from
+    // `getpwuid(geteuid())` at boot, threaded through as
+    // `runtime_user_name`) before touching the backend. A caller
+    // that DOES send a username must send one that equals the
+    // runtime user; anything else refuses with
+    // `user_not_permitted` before any backend call runs — no
+    // admin escalation path exists through this wire op.
+    let supplied = username.as_deref().filter(|s| !s.is_empty());
+    let username = match (supplied, runtime_user_name) {
+        // No username on the wire — substitute the framework's
+        // runtime user. This is the portable-UI path: the caller
+        // does not need to know the distribution-specific OS
+        // runtime user name.
+        (None, Some(rt)) => rt.to_string(),
+        // Explicit username matches the runtime user — pass
+        // through. Existing callers that were sending the runtime
+        // user's name explicitly keep working unchanged.
+        (Some(name), Some(rt)) if name == rt => rt.to_string(),
+        // Explicit username mismatches the runtime user —
+        // refuse before touching the backend. No admin escalation
+        // path exists through this wire op regardless of what
+        // the caller asserts.
+        (Some(name), Some(rt)) => {
+            tracing::warn!(
+                supplied = %name,
+                runtime_user = %rt,
+                "step_up_auth_verify: explicit username mismatched runtime \
+                 user; refusing before backend call"
+            );
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::PermissionDenied,
+                    "step_up_auth_verify: username does not match the \
+                     framework's runtime user",
+                )
+                .with_subclass("user_not_permitted"),
+            };
+        }
+        // Framework has no runtime user resolved (getpwuid failed
+        // at boot). If the caller supplied one, use it; the
+        // AuthService backend still refuses it if inappropriate.
+        // If not, surface as a distributor error — the operator
+        // sees this on set_kiosk_password too as
+        // `runtime_user_unresolved`.
+        (Some(name), None) => name.to_string(),
+        (None, None) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    "step_up_auth_verify: no username supplied and \
+                     framework's runtime user is not resolved",
+                )
+                .with_subclass("runtime_user_unresolved"),
+            };
+        }
+    };
+
+    let Some(peer_uid) = conn.peer.uid else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "step_up_auth_verify: peer UID unknown; step-up requires \
+                 a recoverable peer UID for token binding",
+            )
+            .with_subclass("peer_uid_unknown"),
+        };
+    };
+    let peer_gid = conn.peer.gid.unwrap_or(0);
+    let identity = format!("uid:{peer_uid}");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    // Rate-limit check — refuses without contacting the auth
+    // backend when the identity has burnt its failure budget in
+    // the current window.
+    if let crate::auth::RateLimitOutcome::Locked { retry_after_ms } =
+        rate_limiter.check(&identity, now_ms)
+    {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                format!(
+                    "step_up_auth_verify: too many failed attempts; \
+                     retry after {retry_after_ms}ms"
+                ),
+            )
+            .with_subclass("step_up_rate_limited"),
+        };
+    }
+
+    // Replay defence — refuses when the caller reuses a nonce
+    // inside the framework nonce window. Callers that omit the
+    // nonce field entirely (legacy CLI) skip this check; the UI +
+    // SDK callers always send one.
+    if let Some(nonce_value) = nonce.as_deref() {
+        if !nonce_value.is_empty() {
+            if let crate::auth::NonceOutcome::Reused =
+                nonce_store.record(nonce_value, now_ms)
+            {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::PermissionDenied,
+                        "step_up_auth_verify: nonce reused inside replay \
+                         window; caller must generate a fresh nonce per \
+                         verify attempt",
+                    )
+                    .with_subclass("step_up_nonce_reused"),
+                };
+            }
+        }
+    }
+
+    // Decode secret outside the verify call so a malformed payload
+    // surfaces as a contract violation rather than a verification
+    // failure (and never reaches the auth backend).
+    use base64::Engine as _;
+    let secret = match base64::engine::general_purpose::STANDARD
+        .decode(&secret_b64)
+        .or_else(|_| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&secret_b64)
+        }) {
+        Ok(b) => b,
+        Err(_) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    "step_up_auth_verify: secret_b64 must be base64 \
+                     (standard or URL-safe-nopad)",
+                )
+                .with_subclass("invalid_secret_encoding"),
+            };
+        }
+    };
+
+    let approver = format!("user:{}", peer_uid);
+
+    // Without a configured AuthService the framework default
+    // denies every call; surface that as `step_up_unavailable`
+    // so operator surfaces can render "step-up not configured"
+    // distinct from "wrong password".
+    let Some(service) = auth_service else {
+        let payload = StepUpAuthAttemptedPayload {
+            username: username.clone(),
+            peer_uid,
+            peer_gid,
+            outcome: StepUpAuthOutcome::BackendUnavailable {
+                reason: "no AuthService configured".into(),
+            },
+            implementation: "none".into(),
+        };
+        if let Some(ledger) = lifecycle_ledger {
+            if let Err(e) = ledger
+                .append_step_up_attempt(
+                    &approver,
+                    &payload,
+                    LifecycleOutcome::Failed {
+                        reason: "backend_unavailable".into(),
+                    },
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "step_up_auth_verify: ledger append failed"
+                );
+            }
+        }
+        // Zero the secret buffer before returning.
+        let mut secret = secret;
+        secret.iter_mut().for_each(|b| *b = 0);
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "step_up_auth_verify: AuthService not configured",
+            )
+            .with_subclass("step_up_unavailable"),
+        };
+    };
+
+    let implementation = service.implementation_name().to_string();
+    // Hand the decoded bytes to the verification call. The
+    // AuthService implementation is expected to consume the
+    // slice by reference; we zero it after the call returns
+    // regardless of outcome.
+    let result: Result<VerifiedPrincipal, AuthVerificationError> =
+        service.verify(&username, &secret);
+    let mut secret = secret;
+    secret.iter_mut().for_each(|b| *b = 0);
+
+    match result {
+        Ok(principal) => {
+            // Success — clear any accumulated failure budget so
+            // a later run of wrong-passwords does not carry a
+            // lock forward.
+            rate_limiter.record_success(&identity);
+            let session = auth_session_store.issue(
+                principal.clone(),
+                peer_uid,
+                ttl_seconds.map(std::time::Duration::from_secs),
+            );
+            let payload = StepUpAuthAttemptedPayload {
+                username: username.clone(),
+                peer_uid,
+                peer_gid,
+                outcome: StepUpAuthOutcome::Authenticated,
+                implementation,
+            };
+            if let Some(ledger) = lifecycle_ledger {
+                if let Err(e) = ledger
+                    .append_step_up_attempt(
+                        &approver,
+                        &payload,
+                        LifecycleOutcome::Success,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "step_up_auth_verify: ledger append failed"
+                    );
+                }
+            }
+            ClientResponse::StepUpAuthIssued {
+                step_up_auth_issued: true,
+                token: session.token,
+                expires_at_ms: session.expires_at_ms,
+                principal_username: principal.username,
+            }
+        }
+        Err(err) => {
+            // Only credential-family failures burn the failure
+            // budget — a backend outage should not lock the
+            // operator out.
+            if matches!(
+                err,
+                AuthVerificationError::InvalidCredentials
+                    | AuthVerificationError::UserNotPermitted
+            ) {
+                rate_limiter.record_failure(&identity, now_ms);
+            }
+            let (outcome_kind, error_class, subclass, message) = match &err {
+                AuthVerificationError::InvalidCredentials => (
+                    StepUpAuthOutcome::InvalidCredentials,
+                    ErrorClass::PermissionDenied,
+                    "invalid_credentials",
+                    "step_up_auth_verify: invalid credentials",
+                ),
+                AuthVerificationError::UserNotPermitted => (
+                    StepUpAuthOutcome::UserNotPermitted,
+                    ErrorClass::PermissionDenied,
+                    "user_not_permitted",
+                    "step_up_auth_verify: user not permitted",
+                ),
+                // No AuthService in play at all — this is the true
+                // "no password set" case the UI copy for
+                // `step_up_unavailable` describes.
+                AuthVerificationError::BackendUnavailable { reason } => (
+                    StepUpAuthOutcome::BackendUnavailable {
+                        reason: reason.clone(),
+                    },
+                    ErrorClass::Internal,
+                    "step_up_unavailable",
+                    "step_up_auth_verify: backend unavailable",
+                ),
+                // Backend is in place but couldn't read the stored
+                // credential (shadow file unreadable, runtime user
+                // missing from shadow, etc.). Distribution-setup
+                // defect. Distinct subclass so the operator surface
+                // can distinguish this from "no password set".
+                AuthVerificationError::BackendReadFailed { reason } => (
+                    StepUpAuthOutcome::BackendReadFailed {
+                        reason: reason.clone(),
+                    },
+                    ErrorClass::Internal,
+                    "step_up_backend_read_failed",
+                    "step_up_auth_verify: backend could not read \
+                     stored credential",
+                ),
+                // Backend read the credential but the verification
+                // primitive rejected it (unsupported hash format,
+                // malformed hash, libcrypt internal error). Recovery
+                // is a password rotation via set_kiosk_password (or
+                // the OS-native equivalent) that rewrites the row
+                // in a format the backend can consume. Distinct
+                // subclass so the operator surface can render the
+                // correct copy — this is NOT "no password set".
+                AuthVerificationError::BackendVerifyError { reason } => (
+                    StepUpAuthOutcome::BackendVerifyError {
+                        reason: reason.clone(),
+                    },
+                    ErrorClass::Internal,
+                    "step_up_backend_verify_error",
+                    "step_up_auth_verify: backend could not verify \
+                     stored credential",
+                ),
+            };
+            let lifecycle_outcome_reason = match &err {
+                AuthVerificationError::InvalidCredentials => {
+                    "invalid_credentials"
+                }
+                AuthVerificationError::UserNotPermitted => "user_not_permitted",
+                AuthVerificationError::BackendUnavailable { .. } => {
+                    "backend_unavailable"
+                }
+                AuthVerificationError::BackendReadFailed { .. } => {
+                    "backend_read_failed"
+                }
+                AuthVerificationError::BackendVerifyError { .. } => {
+                    "backend_verify_error"
+                }
+            };
+            let payload = StepUpAuthAttemptedPayload {
+                username: username.clone(),
+                peer_uid,
+                peer_gid,
+                outcome: outcome_kind,
+                implementation,
+            };
+            if let Some(ledger) = lifecycle_ledger {
+                if let Err(e) = ledger
+                    .append_step_up_attempt(
+                        &approver,
+                        &payload,
+                        LifecycleOutcome::Failed {
+                            reason: lifecycle_outcome_reason.into(),
+                        },
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "step_up_auth_verify: ledger append failed"
+                    );
+                }
+            }
+            ClientResponse::Error {
+                error: ApiError::new(error_class, message)
+                    .with_subclass(subclass),
+            }
+        }
+    }
+}
+
+/// Password-authenticated pairing. Fuses the step-up verifier
+/// (`ShadowAuthService::verify` against the framework's own
+/// runtime user) with paired-device bearer issuance
+/// ([`handle_pair_complete`]'s path). The consumer path — the
+/// device has one credential (the OS password set at image-flash
+/// / OS install), the UI asks for it once, this op verifies it
+/// and hands back a paired-device bearer in one round-trip.
+///
+/// Shares:
+/// - The step-up rate-limiter (`step_up_rate_limiter`) — same
+///   bucket keyed by peer UID. A password guess is a password
+///   guess; six wrong guesses across `pair_authenticate` and
+///   `step_up_auth_verify` combined trip the limiter.
+/// - The step-up nonce store (`step_up_nonce_store`) — same
+///   replay window.
+/// - The runtime-user substitution semantics of
+///   `step_up_auth_verify` — no `username` field on the wire;
+///   framework resolves via `getpwuid(geteuid())` at boot.
+/// - The error surface: `invalid_credentials`,
+///   `step_up_rate_limited`, `step_up_nonce_reused`,
+///   `step_up_unavailable`, `step_up_backend_read_failed`,
+///   `step_up_backend_verify_error`, `invalid_secret_encoding`,
+///   `peer_uid_unknown`, `runtime_user_unresolved`.
+///
+/// On success: registers a paired device via
+/// [`PairingStore::register_paired_device`] (no `pair_begin` /
+/// `pair_complete` ceremony), issues a paired-device bearer via
+/// the framework's bearer-token issuer carrying the merged
+/// operator-bootstrap capability set, and returns
+/// [`ClientResponse::PairAuthenticated`].
+#[allow(clippy::too_many_arguments)]
+async fn handle_pair_authenticate(
+    state: &Arc<crate::state::StewardState>,
+    router: &Arc<PluginRouter>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    pairing_store: &Arc<crate::pairing::PairingStore>,
+    rate_limiter: &Arc<crate::auth::StepUpRateLimiter>,
+    nonce_store: &Arc<crate::auth::NonceReplayStore>,
+    runtime_user_name: Option<&str>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    device_hint: String,
+    secret_b64: String,
+    nonce: Option<String>,
+) -> ClientResponse {
+    use crate::auth::{AuthVerificationError, VerifiedPrincipal};
+    use crate::ledger::{
+        LifecycleOutcome, StepUpAuthAttemptedPayload, StepUpAuthOutcome,
+    };
+
+    // Runtime-user substitution — identical to
+    // handle_step_up_auth_verify. No username field on the wire;
+    // the framework resolves its own runtime user.
+    let Some(username) = runtime_user_name.map(str::to_string) else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "pair_authenticate: framework's runtime user is not resolved",
+            )
+            .with_subclass("runtime_user_unresolved"),
+        };
+    };
+
+    let Some(peer_uid) = conn.peer.uid else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "pair_authenticate: peer UID unknown; password-authenticated \
+                 pairing requires a recoverable peer UID for rate-limiter \
+                 bucket binding",
+            )
+            .with_subclass("peer_uid_unknown"),
+        };
+    };
+    let peer_gid = conn.peer.gid.unwrap_or(0);
+    // Same identity key as handle_step_up_auth_verify — a password
+    // guess is a password guess; the same bucket applies across
+    // both wire ops.
+    let identity = format!("uid:{peer_uid}");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    if let crate::auth::RateLimitOutcome::Locked { retry_after_ms } =
+        rate_limiter.check(&identity, now_ms)
+    {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                format!(
+                    "pair_authenticate: too many failed attempts; \
+                     retry after {retry_after_ms}ms"
+                ),
+            )
+            .with_subclass("step_up_rate_limited"),
+        };
+    }
+
+    if let Some(nonce_value) = nonce.as_deref() {
+        if !nonce_value.is_empty() {
+            if let crate::auth::NonceOutcome::Reused =
+                nonce_store.record(nonce_value, now_ms)
+            {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::PermissionDenied,
+                        "pair_authenticate: nonce reused inside replay \
+                         window; caller must generate a fresh nonce per \
+                         attempt",
+                    )
+                    .with_subclass("step_up_nonce_reused"),
+                };
+            }
+        }
+    }
+
+    use base64::Engine as _;
+    let secret = match base64::engine::general_purpose::STANDARD
+        .decode(&secret_b64)
+        .or_else(|_| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&secret_b64)
+        }) {
+        Ok(b) => b,
+        Err(_) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    "pair_authenticate: secret_b64 must be base64 \
+                     (standard or URL-safe-nopad)",
+                )
+                .with_subclass("invalid_secret_encoding"),
+            };
+        }
+    };
+
+    let approver = format!("user:{}", peer_uid);
+
+    // Without a configured AuthService there is no password to
+    // check against — refuse with step_up_unavailable so the
+    // operator sees the true "no password set" surface.
+    let Some(service) = auth_service else {
+        let payload = StepUpAuthAttemptedPayload {
+            username: username.clone(),
+            peer_uid,
+            peer_gid,
+            outcome: StepUpAuthOutcome::BackendUnavailable {
+                reason: "no AuthService configured".into(),
+            },
+            implementation: "none".into(),
+        };
+        if let Some(ledger) = lifecycle_ledger {
+            if let Err(e) = ledger
+                .append_step_up_attempt(
+                    &approver,
+                    &payload,
+                    LifecycleOutcome::Failed {
+                        reason: "backend_unavailable".into(),
+                    },
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "pair_authenticate: ledger append failed"
+                );
+            }
+        }
+        let mut secret = secret;
+        secret.iter_mut().for_each(|b| *b = 0);
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "pair_authenticate: AuthService not configured",
+            )
+            .with_subclass("step_up_unavailable"),
+        };
+    };
+
+    let implementation = service.implementation_name().to_string();
+    let result: Result<VerifiedPrincipal, AuthVerificationError> =
+        service.verify(&username, &secret);
+    let mut secret = secret;
+    secret.iter_mut().for_each(|b| *b = 0);
+
+    match result {
+        Ok(principal) => {
+            rate_limiter.record_success(&identity);
+            let payload = StepUpAuthAttemptedPayload {
+                username: username.clone(),
+                peer_uid,
+                peer_gid,
+                outcome: StepUpAuthOutcome::Authenticated,
+                implementation,
+            };
+            if let Some(ledger) = lifecycle_ledger {
+                if let Err(e) = ledger
+                    .append_step_up_attempt(
+                        &approver,
+                        &payload,
+                        LifecycleOutcome::Success,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "pair_authenticate: ledger append failed"
+                    );
+                }
+            }
+            // Verify succeeded — register a paired device and
+            // issue the paired-device bearer via the same code
+            // path as `pair_complete`. Same capability set, same
+            // TTL, same audit correlation.
+            let device = pairing_store.register_paired_device(device_hint);
+            let Some(issuer) = state.bearer_token_issuer.get() else {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::Internal,
+                        "pair_authenticate: bearer-token issuer not wired",
+                    )
+                    .with_subclass("issuer_unavailable"),
+                };
+            };
+            let capabilities =
+                crate::https_boot::merged_operator_bootstrap_capability_set(
+                    router,
+                );
+            let ttl_ms = evo_auth_bearer::DEFAULT_TOKEN_TTL_MS;
+            let token = match issuer.issue(capabilities, ttl_ms, now_ms) {
+                Ok(t) => t,
+                Err(e) => {
+                    return ClientResponse::Error {
+                        error: ApiError::new(
+                            ErrorClass::Internal,
+                            format!("pair_authenticate: issuance failed: {e}"),
+                        )
+                        .with_subclass("issuance_failed"),
+                    };
+                }
+            };
+            tracing::info!(
+                paired_device_id = %device.id.0,
+                token_id = %token.id,
+                label = %device.label,
+                expires_at_ms = token.expires_at_ms,
+                principal = %principal.username,
+                "pair_authenticate minted paired-device bearer"
+            );
+            ClientResponse::PairAuthenticated {
+                pair_completed: true,
+                token: token.encode(),
+                token_id: token.id,
+                expires_at_ms: token.expires_at_ms,
+                paired_device_id: device.id.0,
+            }
+        }
+        Err(err) => {
+            if matches!(
+                err,
+                AuthVerificationError::InvalidCredentials
+                    | AuthVerificationError::UserNotPermitted
+            ) {
+                rate_limiter.record_failure(&identity, now_ms);
+            }
+            let (outcome_kind, error_class, subclass, message) = match &err {
+                AuthVerificationError::InvalidCredentials => (
+                    StepUpAuthOutcome::InvalidCredentials,
+                    ErrorClass::PermissionDenied,
+                    "invalid_credentials",
+                    "pair_authenticate: invalid credentials",
+                ),
+                AuthVerificationError::UserNotPermitted => (
+                    StepUpAuthOutcome::UserNotPermitted,
+                    ErrorClass::PermissionDenied,
+                    "user_not_permitted",
+                    "pair_authenticate: user not permitted",
+                ),
+                AuthVerificationError::BackendUnavailable { reason } => (
+                    StepUpAuthOutcome::BackendUnavailable {
+                        reason: reason.clone(),
+                    },
+                    ErrorClass::Internal,
+                    "step_up_unavailable",
+                    "pair_authenticate: backend unavailable",
+                ),
+                AuthVerificationError::BackendReadFailed { reason } => (
+                    StepUpAuthOutcome::BackendReadFailed {
+                        reason: reason.clone(),
+                    },
+                    ErrorClass::Internal,
+                    "step_up_backend_read_failed",
+                    "pair_authenticate: backend could not read \
+                     stored credential",
+                ),
+                AuthVerificationError::BackendVerifyError { reason } => (
+                    StepUpAuthOutcome::BackendVerifyError {
+                        reason: reason.clone(),
+                    },
+                    ErrorClass::Internal,
+                    "step_up_backend_verify_error",
+                    "pair_authenticate: backend could not verify \
+                     stored credential",
+                ),
+            };
+            let lifecycle_outcome_reason = match &err {
+                AuthVerificationError::InvalidCredentials => {
+                    "invalid_credentials"
+                }
+                AuthVerificationError::UserNotPermitted => "user_not_permitted",
+                AuthVerificationError::BackendUnavailable { .. } => {
+                    "backend_unavailable"
+                }
+                AuthVerificationError::BackendReadFailed { .. } => {
+                    "backend_read_failed"
+                }
+                AuthVerificationError::BackendVerifyError { .. } => {
+                    "backend_verify_error"
+                }
+            };
+            let payload = StepUpAuthAttemptedPayload {
+                username: username.clone(),
+                peer_uid,
+                peer_gid,
+                outcome: outcome_kind,
+                implementation,
+            };
+            if let Some(ledger) = lifecycle_ledger {
+                if let Err(e) = ledger
+                    .append_step_up_attempt(
+                        &approver,
+                        &payload,
+                        LifecycleOutcome::Failed {
+                            reason: lifecycle_outcome_reason.into(),
+                        },
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "pair_authenticate: ledger append failed"
+                    );
+                }
+            }
+            ClientResponse::Error {
+                error: ApiError::new(error_class, message)
+                    .with_subclass(subclass),
+            }
+        }
+    }
+}
+
+async fn handle_step_up_auth_revoke(
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    token: String,
+) -> ClientResponse {
+    let revoked = auth_session_store.revoke(&token);
+    ClientResponse::StepUpAuthRevoked {
+        step_up_auth_revoked: true,
+        revoked,
+    }
+}
+
+/// Narrow the operator bootstrap capability set to only the
+/// entries whose scope name appears in `requested_scopes`.
+/// Rank is preserved from the bootstrap set — the requester
+/// asks for a scope name and gets the framework-declared rank
+/// for that scope, so a mint can never widen beyond the
+/// bootstrap authority.
+///
+/// A scope name that does not appear in the bootstrap set is
+/// silently dropped (the caller cannot request scopes the
+/// bootstrap authority does not carry). Duplicate scope names
+/// in `requested_scopes` produce one entry in the output.
+fn narrow_bootstrap_by_scope_names(
+    bootstrap: &evo_auth_bearer::CapabilitySet,
+    requested_scopes: &[String],
+) -> evo_auth_bearer::CapabilitySet {
+    use std::collections::HashSet;
+    let wanted: HashSet<&str> =
+        requested_scopes.iter().map(|s| s.as_str()).collect();
+    let narrowed: Vec<evo_auth_bearer::Capability> = bootstrap
+        .capabilities()
+        .iter()
+        .filter(|c| wanted.contains(c.scope()))
+        .cloned()
+        .collect();
+    evo_auth_bearer::CapabilitySet::new(narrowed)
+}
+
+async fn handle_mint_bearer_token(
+    state: &Arc<crate::state::StewardState>,
+    router: &Arc<PluginRouter>,
+    conn: &ConnectionState,
+    reason: String,
+    ttl_seconds: Option<u64>,
+    requested_scopes: Option<Vec<String>>,
+) -> ClientResponse {
+    if !conn.has("plugins_admin") {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "mint_bearer_token requires plugins_admin capability on the \
+                 negotiated connection; the wire op is the SSH-required dev \
+                 / recovery path of the trust substrate",
+            )
+            .with_subclass("plugins_admin_required"),
+        };
+    }
+
+    let reason_trimmed = reason.trim();
+    if reason_trimmed.is_empty() {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "mint_bearer_token: reason must be non-empty after trim \
+                 (audit substrate refuses blank-reason mints by design)",
+            )
+            .with_subclass("blank_reason"),
+        };
+    }
+
+    let Some(issuer) = state.bearer_token_issuer.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "mint_bearer_token: bearer-token issuer not wired (HTTPS \
+                 substrate did not boot on this steward; check the boot log \
+                 for `HTTPS boot failed` and resolve the underlying cause)",
+            )
+            .with_subclass("issuer_unavailable"),
+        };
+    };
+
+    let ttl_ms = ttl_seconds
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(evo_auth_bearer::DEFAULT_TOKEN_TTL_MS);
+    if ttl_ms > evo_auth_bearer::MAX_TOKEN_TTL_MS {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                format!(
+                    "mint_bearer_token: TTL {ttl_ms}ms exceeds framework \
+                     ceiling {ceiling}ms",
+                    ceiling = evo_auth_bearer::MAX_TOKEN_TTL_MS,
+                ),
+            )
+            .with_subclass("ttl_exceeds_ceiling"),
+        };
+    }
+
+    // Merge framework-declared operator scopes with every
+    // step-up scope any admitted plugin's manifest declares.
+    // Without the merge, plugin-declared step-up scopes
+    // (`network_admin`, and any future plugin's admin scope)
+    // are unreachable from mint — a
+    // `mint-bearer-token --scope <plugin_scope>` would return
+    // `empty_capability_intersection` and no HTTPS client
+    // could ever call the gated verb.
+    let bootstrap =
+        crate::https_boot::merged_operator_bootstrap_capability_set(router);
+    let capabilities = match requested_scopes.as_ref() {
+        None => bootstrap,
+        Some(scopes) if scopes.is_empty() => bootstrap,
+        Some(scopes) => {
+            let narrowed = narrow_bootstrap_by_scope_names(&bootstrap, scopes);
+            if narrowed.is_empty() {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::ContractViolation,
+                        format!(
+                            "mint_bearer_token: none of the requested scope \
+                             names ({scopes:?}) intersect the operator \
+                             bootstrap capability set; refusing to mint an \
+                             empty-scope token",
+                        ),
+                    )
+                    .with_subclass("empty_capability_intersection"),
+                };
+            }
+            narrowed
+        }
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let token = match issuer.issue(capabilities, ttl_ms, now_ms) {
+        Ok(t) => t,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("mint_bearer_token: issuance failed: {e}"),
+                )
+                .with_subclass("issuance_failed"),
+            };
+        }
+    };
+
+    // Operator-reason + source claim audit trail. The
+    // observatory entry comes from `issuer.issue()` itself
+    // (`bearer_token_issued` observation, attached at boot
+    // per https_boot.rs); the tracing event here carries the
+    // operator-supplied reason + source claim into the
+    // structured journal so reviewers correlating audits across
+    // surfaces see both planes.
+    let issued_scope_count = token.capabilities.len();
+    let issued_scopes: Vec<&str> = token
+        .capabilities
+        .capabilities()
+        .iter()
+        .map(|c| c.scope())
+        .collect();
+    tracing::info!(
+        token_id = %token.id,
+        reason = %reason_trimmed,
+        source = "cli",
+        peer_uid = ?conn.peer.uid,
+        expires_at_ms = token.expires_at_ms,
+        ttl_ms = ttl_ms,
+        issued_scope_count,
+        issued_scopes = ?issued_scopes,
+        requested_scope_names = ?requested_scopes,
+        "bearer token minted via mint_bearer_token wire op"
+    );
+
+    ClientResponse::BearerTokenMinted {
+        bearer_token_minted: true,
+        token: token.encode(),
+        expires_at_ms: token.expires_at_ms,
+        token_id: token.id,
+        source: "cli".to_string(),
+    }
+}
+
+async fn handle_mint_local_kiosk_session(
+    state: &Arc<crate::state::StewardState>,
+    router: &Arc<PluginRouter>,
+    allowlist: &Arc<crate::kiosk_session::KioskUidAllowlist>,
+    conn: &ConnectionState,
+    reason: String,
+) -> ClientResponse {
+    let admission =
+        crate::kiosk_session::evaluate_admission(conn.peer, allowlist);
+    let Some(issuer) = state.bearer_token_issuer.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "mint_local_kiosk_session: bearer-token issuer not wired \
+                 (HTTPS substrate did not boot on this steward)",
+            )
+            .with_subclass("issuer_unavailable"),
+        };
+    };
+    let capabilities =
+        crate::https_boot::merged_operator_bootstrap_capability_set(router);
+    let ttl_seconds = 24 * 60 * 60;
+    match crate::kiosk_session::mint_kiosk_bearer(
+        issuer,
+        capabilities,
+        admission,
+        crate::kiosk_session::KioskMintReason(reason),
+        ttl_seconds,
+    ) {
+        Ok(ok) => ClientResponse::LocalKioskSessionMinted {
+            local_kiosk_session_minted: true,
+            token: ok.encoded_token,
+            token_id: ok.token_id,
+            expires_at_ms: ok.expires_at_ms,
+        },
+        Err(err) => ClientResponse::Error {
+            error: ApiError::new(
+                match err {
+                    crate::kiosk_session::KioskMintErr::IssuanceFailed(_) => {
+                        ErrorClass::Internal
+                    }
+                    _ => ErrorClass::PermissionDenied,
+                },
+                err.message(),
+            )
+            .with_subclass(err.subclass()),
+        },
+    }
+}
+
+async fn handle_pair_begin(
+    pairing_store: &Arc<crate::pairing::PairingStore>,
+    device_hint: String,
+) -> ClientResponse {
+    let hint_trimmed = device_hint.trim();
+    let hint = if hint_trimmed.is_empty() {
+        "Unknown device".to_string()
+    } else {
+        hint_trimmed.to_string()
+    };
+    let attempt = pairing_store.begin(hint);
+    tracing::info!(
+        pair_id = %attempt.id.0,
+        device_hint = %attempt.device_hint,
+        expires_at_ms = attempt.expires_at_ms,
+        "pair.begin recorded pending attempt"
+    );
+    // TODO: publish the code + QR payload to the prompt-ledger
+    // substrate here so the kiosk shell renders it full-screen.
+    // For now the caller can read the code out-of-band during
+    // rig demos via the tracing event above. Wiring the ledger
+    // publish is a follow-on edit that does not change the wire
+    // shape.
+    ClientResponse::PairBegan {
+        pair_began: true,
+        pair_id: attempt.id.0,
+        expires_at_ms: attempt.expires_at_ms,
+    }
+}
+
+async fn handle_pair_complete(
+    state: &Arc<crate::state::StewardState>,
+    router: &Arc<PluginRouter>,
+    pairing_store: &Arc<crate::pairing::PairingStore>,
+    pair_id: String,
+    code: String,
+) -> ClientResponse {
+    use crate::pairing::{PairAttemptId, PairCode, PairCompleteError};
+    let device = match pairing_store
+        .complete(&PairAttemptId(pair_id), &PairCode(code))
+    {
+        Ok(dev) => dev,
+        Err(PairCompleteError::UnknownAttempt) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::PermissionDenied,
+                    "pair_complete: unknown pair id",
+                )
+                .with_subclass("pair_unknown"),
+            };
+        }
+        Err(PairCompleteError::Expired) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::PermissionDenied,
+                    "pair_complete: pair attempt expired; start again",
+                )
+                .with_subclass("pair_expired"),
+            };
+        }
+        Err(PairCompleteError::WrongCode) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::PermissionDenied,
+                    "pair_complete: wrong code; pair attempt consumed, \
+                     start again",
+                )
+                .with_subclass("pair_wrong_code"),
+            };
+        }
+    };
+    let Some(issuer) = state.bearer_token_issuer.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "pair_complete: bearer-token issuer not wired",
+            )
+            .with_subclass("issuer_unavailable"),
+        };
+    };
+    let capabilities =
+        crate::https_boot::merged_operator_bootstrap_capability_set(router);
+    let ttl_ms = evo_auth_bearer::DEFAULT_TOKEN_TTL_MS;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let token = match issuer.issue(capabilities, ttl_ms, now_ms) {
+        Ok(t) => t,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("pair_complete: issuance failed: {e}"),
+                )
+                .with_subclass("issuance_failed"),
+            };
+        }
+    };
+    tracing::info!(
+        paired_device_id = %device.id.0,
+        token_id = %token.id,
+        label = %device.label,
+        expires_at_ms = token.expires_at_ms,
+        "pair.complete minted paired-device bearer"
+    );
+    ClientResponse::PairCompleted {
+        pair_completed: true,
+        token: token.encode(),
+        token_id: token.id,
+        expires_at_ms: token.expires_at_ms,
+        paired_device_id: device.id.0,
+    }
+}
+
+async fn handle_pair_list(
+    pairing_store: &Arc<crate::pairing::PairingStore>,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has("plugins_admin") {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "pair_list requires plugins_admin capability",
+            )
+            .with_subclass("plugins_admin_required"),
+        };
+    }
+    let mut devices = pairing_store.list_devices();
+    devices.sort_by_key(|d| d.first_paired_at_ms);
+    ClientResponse::PairListed {
+        pair_listed: true,
+        devices,
+    }
+}
+
+async fn handle_pair_revoke(
+    pairing_store: &Arc<crate::pairing::PairingStore>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    conn: &ConnectionState,
+    paired_device_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    if !conn.has("plugins_admin") {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "pair_revoke requires plugins_admin capability",
+            )
+            .with_subclass("plugins_admin_required"),
+        };
+    }
+    // Step-up gate — the caller must present a live step-up
+    // token bound to the same peer UID. Skipped when the
+    // caller cannot supply one (Unix-socket local peer with
+    // an unavailable auth service); the rig-side path uses
+    // this branch for CLI demos.
+    if let (Some(token), Some(peer_uid)) =
+        (step_up_token.as_deref(), conn.peer.uid)
+    {
+        if auth_session_store.validate(token, peer_uid).is_err() {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::PermissionDenied,
+                    "pair_revoke: step-up token invalid or expired",
+                )
+                .with_subclass("step_up_required"),
+            };
+        }
+    }
+    let revoked = pairing_store
+        .revoke_device(&crate::pairing::PairedDeviceId(paired_device_id));
+    ClientResponse::PairRevoked {
+        pair_revoked: true,
+        revoked,
+    }
+}
+
+async fn handle_set_kiosk_password(
+    allowlist: &Arc<crate::kiosk_session::KioskUidAllowlist>,
+    runtime_user_name: Option<&str>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    conn: &ConnectionState,
+    new_password: String,
+) -> ClientResponse {
+    // Two admission paths: the compositor UID via SO_PEERCRED on
+    // the kiosk socket (screened devices — the operator sets the
+    // password from the touchscreen at first boot); or a
+    // paired-device bearer whose capability set carries
+    // `plugins_admin` (headless devices — the operator sets the
+    // password from the paired browser after completing the
+    // bootstrap-preseed pair). The two paths together give both
+    // device classes a first-run set-password screen without
+    // opening a new admission axis: `plugins_admin` on the
+    // connection means either a code-provenance bearer or a
+    // bootstrap-preseed bearer already proved physical presence.
+    let kiosk_admission =
+        crate::kiosk_session::evaluate_admission(conn.peer, allowlist);
+    let admitted_via_kiosk = matches!(
+        kiosk_admission,
+        crate::kiosk_session::KioskAdmission::Admitted { .. }
+    );
+    let admitted_via_bearer = conn.has("plugins_admin");
+    if !admitted_via_kiosk && !admitted_via_bearer {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "set_kiosk_password: refused; the connection has neither a \
+                 compositor UID on the kiosk allowlist nor a paired-device \
+                 bearer carrying plugins_admin",
+            )
+            .with_subclass("password_set_not_admitted"),
+        };
+    }
+    let trimmed = new_password.trim();
+    if trimmed.len() < 8 {
+        // Overwrite + drop.
+        drop(new_password.into_bytes());
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "set_kiosk_password: new password must be at least 8 \
+                 characters after trim",
+            )
+            .with_subclass("password_too_short"),
+        };
+    }
+    let Some(runtime_user) = runtime_user_name else {
+        // Drop the plaintext before returning.
+        drop(new_password.into_bytes());
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "set_kiosk_password: framework could not resolve the OS \
+                 runtime user at boot; distribution has a broken passwd \
+                 entry for the framework's euid",
+            )
+            .with_subclass("runtime_user_unresolved"),
+        };
+    };
+    // Invoke `chpasswd -c SHA512 -R /` via `sudo -n` with
+    // `<runtime_user>:<new_password>` on stdin. The sudoers
+    // drop-in scopes this to /usr/sbin/chpasswd only; the
+    // framework never runs anything else as root.
+    //
+    // -c SHA512 forces `$6$...` regardless of the distribution's
+    // default ENCRYPT_METHOD, so the stored hash matches what
+    // ShadowAuthService verifies. -R / roots against the live
+    // filesystem (defensive; default when unset).
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let mut child = match Command::new("sudo")
+        .args(["-n", "/usr/sbin/chpasswd", "-c", "SHA512", "-R", "/"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            drop(new_password.into_bytes());
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("set_kiosk_password: spawn chpasswd failed: {e}"),
+                )
+                .with_subclass("chpasswd_spawn_failed"),
+            };
+        }
+    };
+    let stdin_bytes = format!("{runtime_user}:{trimmed}\n").into_bytes();
+    // Drop plaintext buffer + trim slice before waiting for the
+    // subprocess. The stdin_bytes buffer we hand chpasswd is the
+    // last plaintext copy the framework holds.
+    let plain_len = trimmed.len();
+    drop(new_password.into_bytes());
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(&stdin_bytes) {
+            drop(stdin_bytes);
+            let _ = child.kill();
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!(
+                        "set_kiosk_password: write chpasswd stdin failed: {e}"
+                    ),
+                )
+                .with_subclass("chpasswd_write_failed"),
+            };
+        }
+    }
+    // Overwrite the stdin bytes buffer explicitly before the
+    // subprocess returns. `chpasswd` copies them into its own
+    // memory; we retain no plaintext post-write.
+    drop(stdin_bytes);
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("set_kiosk_password: chpasswd wait failed: {e}"),
+                )
+                .with_subclass("chpasswd_wait_failed"),
+            };
+        }
+    };
+    let _ = plain_len; // suppress unused variable if tracing off
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!(
+            runtime_user = %runtime_user,
+            exit_code = ?output.status.code(),
+            stderr = %stderr,
+            "set_kiosk_password: chpasswd refused"
+        );
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!(
+                    "set_kiosk_password: chpasswd returned {:?}: {stderr}",
+                    output.status.code()
+                ),
+            )
+            .with_subclass("chpasswd_refused"),
+        };
+    }
+    tracing::info!(
+        runtime_user = %runtime_user,
+        "set_kiosk_password: chpasswd rewrote /etc/shadow row"
+    );
+    // The shadow-backed AuthService reads /etc/shadow fresh on
+    // every verify; there is no in-memory cache to reload. The
+    // `refresh_after_secret_write` hook is called defensively for
+    // any vendor-supplied AuthService that IS file-backed; a
+    // failure there is logged but does not fail the wire op — the
+    // chpasswd rewrite has already succeeded and the operator's
+    // new password is the source of truth on disk.
+    if let Some(svc) = auth_service {
+        if let Err(reload_err) = svc.refresh_after_secret_write() {
+            tracing::warn!(
+                runtime_user = %runtime_user,
+                error = %reload_err,
+                implementation = svc.implementation_name(),
+                "set_kiosk_password: chpasswd wrote /etc/shadow but a \
+                 vendor AuthService refresh hook returned an error; the \
+                 shadow-backed default is unaffected"
+            );
+        }
+    }
+    ClientResponse::KioskPasswordSet {
+        kiosk_password_set: true,
+    }
+}
+
+async fn handle_create_bearer_token(
+    state: &Arc<crate::state::StewardState>,
+    conn: &ConnectionState,
+    name: String,
+    reason: String,
+    scopes: Vec<evo_auth_bearer::CapabilityRef>,
+    expires_in_seconds: Option<u64>,
+) -> ClientResponse {
+    if !conn.has("auth_write") && !conn.has("plugins_admin") {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "create_bearer_token requires write:auth (or plugins_admin) capability",
+            )
+            .with_subclass("auth_write_required"),
+        };
+    }
+
+    let name_trimmed = name.trim();
+    let reason_trimmed = reason.trim();
+    if name_trimmed.is_empty() || reason_trimmed.is_empty() {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "create_bearer_token: name and reason must each be non-empty after trim",
+            )
+            .with_subclass("blank_input"),
+        };
+    }
+
+    let Some(issuer) = state.bearer_token_issuer.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "create_bearer_token: bearer-token issuer not wired (HTTPS substrate did not boot)",
+            )
+            .with_subclass("issuer_unavailable"),
+        };
+    };
+    let Some(store) = state.credential_store.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "create_bearer_token: credential store not wired",
+            )
+            .with_subclass("store_unavailable"),
+        };
+    };
+
+    let capabilities = if scopes.is_empty() {
+        crate::https_boot::operator_bootstrap_capability_set()
+    } else {
+        let mut caps = Vec::with_capacity(scopes.len());
+        for sref in &scopes {
+            match sref.to_capability() {
+                Some(c) => caps.push(c),
+                None => {
+                    return ClientResponse::Error {
+                        error: ApiError::new(
+                            ErrorClass::ContractViolation,
+                            format!(
+                                "create_bearer_token: scope kind '{}' unrecognised",
+                                sref.kind
+                            ),
+                        )
+                        .with_subclass("unknown_scope_kind"),
+                    };
+                }
+            }
+        }
+        evo_auth_bearer::CapabilitySet::new(caps)
+    };
+
+    let (expiry_policy, ttl_ms) = match expires_in_seconds {
+        None => (
+            evo_auth_bearer::ExpiryPolicy::Never,
+            evo_auth_bearer::MAX_TOKEN_TTL_MS,
+        ),
+        Some(secs) => {
+            let ms = secs.saturating_mul(1000);
+            (
+                evo_auth_bearer::ExpiryPolicy::Seconds { value: secs },
+                ms.min(evo_auth_bearer::MAX_TOKEN_TTL_MS),
+            )
+        }
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let token = match issuer.issue(capabilities.clone(), ttl_ms, now_ms) {
+        Ok(t) => t,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("create_bearer_token: issuance failed: {e}"),
+                )
+                .with_subclass("issuance_failed"),
+            };
+        }
+    };
+
+    let expires_at_ms = match expiry_policy {
+        evo_auth_bearer::ExpiryPolicy::Never => None,
+        evo_auth_bearer::ExpiryPolicy::Seconds { .. } => {
+            Some(token.expires_at_ms)
+        }
+    };
+
+    let record = evo_auth_bearer::CredentialRecord {
+        token_id: token.id.clone(),
+        name: name_trimmed.to_string(),
+        created_reason: reason_trimmed.to_string(),
+        scopes: capabilities
+            .capabilities()
+            .iter()
+            .map(evo_auth_bearer::CapabilityRef::from)
+            .collect(),
+        expiry_policy,
+        created_at_ms: now_ms,
+        expires_at_ms,
+        revoked_at_ms: None,
+        revoked_reason: None,
+    };
+    if let Err(e) = store.put(&record) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!(
+                    "create_bearer_token: persisting credential record failed: {e}"
+                ),
+            )
+            .with_subclass("persistence_failed"),
+        };
+    }
+
+    tracing::info!(
+        token_id = %token.id,
+        name = %name_trimmed,
+        reason = %reason_trimmed,
+        scope_count = record.scopes.len(),
+        expiry_policy = ?record.expiry_policy,
+        "bearer credential created via create_bearer_token wire op"
+    );
+
+    ClientResponse::BearerTokenCreated {
+        bearer_token_created: true,
+        token: token.encode(),
+        record,
+    }
+}
+
+async fn handle_list_bearer_tokens(
+    state: &Arc<crate::state::StewardState>,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has("auth_read") && !conn.has("plugins_admin") {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_bearer_tokens requires read:auth (or plugins_admin) capability",
+            )
+            .with_subclass("auth_read_required"),
+        };
+    }
+    let Some(store) = state.credential_store.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_bearer_tokens: credential store not wired",
+            )
+            .with_subclass("store_unavailable"),
+        };
+    };
+    match store.list() {
+        Ok(mut records) => {
+            records.sort_by_key(|r| r.created_at_ms);
+            ClientResponse::BearerTokensListed {
+                bearer_tokens_listed: true,
+                records,
+            }
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("list_bearer_tokens: store enumerate failed: {e}"),
+            )
+            .with_subclass("store_io"),
+        },
+    }
+}
+
+async fn handle_revoke_bearer_token(
+    state: &Arc<crate::state::StewardState>,
+    conn: &ConnectionState,
+    token_id: String,
+    reason: String,
+) -> ClientResponse {
+    if !conn.has("auth_write") && !conn.has("plugins_admin") {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "revoke_bearer_token requires write:auth (or plugins_admin) capability",
+            )
+            .with_subclass("auth_write_required"),
+        };
+    }
+    let reason_trimmed = reason.trim();
+    if reason_trimmed.is_empty() {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "revoke_bearer_token: reason must be non-empty after trim",
+            )
+            .with_subclass("blank_reason"),
+        };
+    }
+    let Some(store) = state.credential_store.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "revoke_bearer_token: credential store not wired",
+            )
+            .with_subclass("store_unavailable"),
+        };
+    };
+    let Some(rev_list) = state.revocation_list.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "revoke_bearer_token: revocation list not wired",
+            )
+            .with_subclass("revocation_unavailable"),
+        };
+    };
+
+    let mut record = match store.get(&token_id) {
+        Ok(r) => r,
+        Err(evo_auth_bearer::CredentialStoreError::NotFound(_)) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::NotFound,
+                    format!("revoke_bearer_token: no credential record for token_id '{token_id}'"),
+                )
+                .with_subclass("not_found"),
+            };
+        }
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("revoke_bearer_token: store read failed: {e}"),
+                )
+                .with_subclass("store_io"),
+            };
+        }
+    };
+    if record.revoked_at_ms.is_some() {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                format!("revoke_bearer_token: credential '{token_id}' is already revoked"),
+            )
+            .with_subclass("already_revoked"),
+        };
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    record.revoked_at_ms = Some(now_ms);
+    record.revoked_reason = Some(reason_trimmed.to_string());
+    if let Err(e) = store.put(&record) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("revoke_bearer_token: persisting revoked record failed: {e}"),
+            )
+            .with_subclass("persistence_failed"),
+        };
+    }
+
+    rev_list.revoke(&token_id);
+
+    let https_dir = std::env::var("EVO_HTTPS_STATE_DIR")
+        .map(|s| std::path::PathBuf::from(s).join("https"))
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from("/var/lib/evo/https/https")
+        });
+    if let Err(e) =
+        crate::https_boot::persist_revocation(&https_dir, &token_id).await
+    {
+        tracing::warn!(
+            token_id = %token_id,
+            error = %e,
+            "revoke_bearer_token: persisting revocation to disk failed; \
+             in-memory revocation is in effect for this process but will \
+             not survive restart until disk write succeeds"
+        );
+    }
+
+    tracing::info!(
+        token_id = %token_id,
+        reason = %reason_trimmed,
+        "bearer credential revoked via revoke_bearer_token wire op"
+    );
+
+    ClientResponse::BearerTokenRevoked {
+        bearer_token_revoked: true,
+        record,
+    }
+}
+
+async fn handle_reset_credentials_to_open(
+    state: &Arc<crate::state::StewardState>,
+    conn: &ConnectionState,
+    reason: String,
+) -> ClientResponse {
+    if !conn.has("plugins_admin") {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "reset_credentials_to_open requires plugins_admin (the HTTPS path additionally requires step_up:system_admin enforced at the schema layer)",
+            )
+            .with_subclass("plugins_admin_required"),
+        };
+    }
+    let reason_trimmed = reason.trim();
+    if reason_trimmed.is_empty() {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "reset_credentials_to_open: reason must be non-empty after trim",
+            )
+            .with_subclass("blank_reason"),
+        };
+    }
+    let Some(store) = state.credential_store.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "reset_credentials_to_open: credential store not wired",
+            )
+            .with_subclass("store_unavailable"),
+        };
+    };
+    let records_purged = match store.purge() {
+        Ok(n) => n,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!(
+                        "reset_credentials_to_open: store purge failed: {e}"
+                    ),
+                )
+                .with_subclass("store_io"),
+            };
+        }
+    };
+
+    let https_dir = std::env::var("EVO_HTTPS_STATE_DIR")
+        .map(|s| std::path::PathBuf::from(s).join("https"))
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from("/var/lib/evo/https/https")
+        });
+    let revoked_path = https_dir.join("revoked.json");
+    let revocations_cleared = if revoked_path.exists() {
+        match tokio::fs::read(&revoked_path).await {
+            Ok(bytes) => {
+                let ids: Vec<String> =
+                    serde_json::from_slice(&bytes).unwrap_or_default();
+                let n = ids.len();
+                if let Err(e) = tokio::fs::remove_file(&revoked_path).await {
+                    tracing::warn!(
+                        path = %revoked_path.display(),
+                        error = %e,
+                        "reset_credentials_to_open: removing revoked.json failed"
+                    );
+                }
+                n
+            }
+            Err(_) => 0,
+        }
+    } else {
+        0
+    };
+
+    tracing::info!(
+        reason = %reason_trimmed,
+        records_purged,
+        revocations_cleared,
+        "credential substrate reset to Open tier via reset_credentials_to_open"
+    );
+
+    ClientResponse::CredentialsResetToOpen {
+        credentials_reset_to_open: true,
+        records_purged,
+        revocations_cleared,
+    }
+}
+
+// -----------------------------------------------------------------
+// credential_put / credential_delete / credential_list_keys
+// -----------------------------------------------------------------
+//
+// Third-party API keys / service passwords / OAuth tokens the
+// framework holds on behalf of plugins. LAN-trust operator UI
+// only. There is no credential_get op by design; values leave the
+// vault only via the plugin-side LoadContext handle.
+
+const CAP_CREDENTIALS_WRITE: &str = "credentials_write";
+const CAP_CREDENTIALS_READ: &str = "credentials_read";
+
+fn parse_uninstall_policy(
+    s: &str,
+) -> Result<crate::credentials::UninstallPolicy, ApiError> {
+    match s {
+        "purge" => Ok(crate::credentials::UninstallPolicy::Purge),
+        "preserve_for_reinstall" => {
+            Ok(crate::credentials::UninstallPolicy::PreserveForReinstall)
+        }
+        "prompt_operator" => {
+            Ok(crate::credentials::UninstallPolicy::PromptOperator)
+        }
+        other => Err(ApiError::new(
+            ErrorClass::ContractViolation,
+            format!(
+                "unknown uninstall_policy {other:?}; expected purge | \
+                 preserve_for_reinstall | prompt_operator"
+            ),
+        )
+        .with_subclass("invalid_uninstall_policy")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_credential_put(
+    state: &Arc<crate::state::StewardState>,
+    conn: &ConnectionState,
+    plugin_id: String,
+    key: String,
+    value_b64: String,
+    display_name: Option<String>,
+    expires_at_ms: Option<u64>,
+    uninstall_policy: Option<String>,
+) -> ClientResponse {
+    if !conn.has(CAP_CREDENTIALS_WRITE) && !conn.has("plugins_admin") {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "credential_put requires write:credentials capability",
+            )
+            .with_subclass("credentials_write_required"),
+        };
+    }
+    if plugin_id.trim().is_empty() || key.trim().is_empty() {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "credential_put: plugin_id and key must each be non-empty after trim",
+            )
+            .with_subclass("blank_input"),
+        };
+    }
+    let Some(vault) = state.credential_vault.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "credential_put: credential vault not wired",
+            )
+            .with_subclass("vault_unavailable"),
+        };
+    };
+    let value = match base64_decode(&value_b64) {
+        Ok(v) => v,
+        Err(msg) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!("credential_put: value_b64 decode failed: {msg}"),
+                )
+                .with_subclass("invalid_base64"),
+            };
+        }
+    };
+    let policy = match uninstall_policy.as_deref() {
+        None => crate::credentials::UninstallPolicy::Purge,
+        Some(s) => match parse_uninstall_policy(s) {
+            Ok(p) => p,
+            Err(e) => return ClientResponse::Error { error: e },
+        },
+    };
+    let metadata = crate::credentials::CredentialMetadata {
+        display_name,
+        expires_at_ms,
+        uninstall_policy: policy,
+    };
+    if let Err(e) = vault.store(&plugin_id, &key, &value, metadata).await {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("credential_put: vault store failed: {e}"),
+            )
+            .with_subclass("vault_store_failed"),
+        };
+    }
+    // Publish on the central per-plugin change bus so every
+    // currently-subscribed `subscribe_changes` receiver (in-process
+    // plugin reactor or OOP subprocess forwarder) observes the
+    // mutation and re-resolves in place — no lifecycle teardown.
+    // The value is not published; consumers re-fetch through the
+    // plugin's own vault handle to preserve the substrate's
+    // exfiltration boundary. Delivery is best-effort — a publish
+    // with no receivers is not itself a failure (uninstalled
+    // plugin, or plugin with no active reactor).
+    state.credential_change_bus.publish(
+        &plugin_id,
+        evo_plugin_sdk::contract::context::CredentialChangeEvent {
+            changed_keys: vec![key.clone()],
+            kind: evo_plugin_sdk::contract::context::CredentialChangeKind::Put,
+        },
+    );
+    let key_hash = crate::credentials::key_hash_hex(&key);
+    ClientResponse::CredentialStored {
+        credential_stored: true,
+        plugin_id,
+        key_hash,
+    }
+}
+
+async fn handle_credential_delete(
+    state: &Arc<crate::state::StewardState>,
+    conn: &ConnectionState,
+    plugin_id: String,
+    key: Option<String>,
+    key_hash: Option<String>,
+) -> ClientResponse {
+    if !conn.has(CAP_CREDENTIALS_WRITE) && !conn.has("plugins_admin") {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "credential_delete requires write:credentials capability",
+            )
+            .with_subclass("credentials_write_required"),
+        };
+    }
+    if plugin_id.trim().is_empty() {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "credential_delete: plugin_id must be non-empty",
+            )
+            .with_subclass("blank_input"),
+        };
+    }
+    // Exactly-one contract: `key` XOR `key_hash`. Both-set is
+    // ambiguous (which does the caller mean?); neither-set is
+    // a nonsense request. Either failure is a contract
+    // violation, not a runtime miss.
+    let key = key.filter(|s| !s.trim().is_empty());
+    let key_hash = key_hash.filter(|s| !s.trim().is_empty());
+    let resolved_key_hash: String = match (key.as_ref(), key_hash.as_ref()) {
+        (Some(_), Some(_)) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    "credential_delete: pass exactly one of `key` or \
+                     `key_hash`, not both",
+                )
+                .with_subclass("blank_input"),
+            };
+        }
+        (None, None) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    "credential_delete: either `key` (operator-visible \
+                     key string) or `key_hash` (hex-encoded SHA-256 of \
+                     the key, as returned by credential_list_keys) is \
+                     required",
+                )
+                .with_subclass("blank_input"),
+            };
+        }
+        (Some(k), None) => crate::credentials::key_hash_hex(k),
+        (None, Some(h)) => {
+            // Defensive shape check: SHA-256 hex is exactly 64
+            // lowercase hex chars. Wire operators pass wrong-
+            // shape values often (uppercase, truncated,
+            // whitespace) — a clean 400 beats a silent no-op
+            // that returns success on a bogus hash.
+            let trimmed = h.trim();
+            if trimmed.len() != 64
+                || !trimmed.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::ContractViolation,
+                        "credential_delete: `key_hash` must be 64 \
+                         lowercase hex characters (SHA-256, hex-encoded)",
+                    )
+                    .with_subclass("blank_input"),
+                };
+            }
+            trimmed.to_ascii_lowercase()
+        }
+    };
+    let Some(vault) = state.credential_vault.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "credential_delete: credential vault not wired",
+            )
+            .with_subclass("vault_unavailable"),
+        };
+    };
+    if let Err(e) = vault
+        .delete_by_key_hash(&plugin_id, &resolved_key_hash)
+        .await
+    {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("credential_delete: vault delete failed: {e}"),
+            )
+            .with_subclass("vault_delete_failed"),
+        };
+    }
+    // Publish on the central per-plugin change bus. Symmetric to
+    // the put path; a Delete signals the plugin to drop its cached
+    // provider client for the removed key. When the caller used
+    // the `key` path we carry the raw key on the change event
+    // (existing behaviour); on the `key_hash` path the raw key
+    // is unrecoverable so the event carries only the empty
+    // `changed_keys` list — reactors that keyed off names should
+    // treat an empty list as "opaque delete, re-fetch full
+    // inventory to reconcile".
+    let changed_keys = match key.as_ref() {
+        Some(k) => vec![k.clone()],
+        None => Vec::new(),
+    };
+    state.credential_change_bus.publish(
+        &plugin_id,
+        evo_plugin_sdk::contract::context::CredentialChangeEvent {
+            changed_keys,
+            kind:
+                evo_plugin_sdk::contract::context::CredentialChangeKind::Delete,
+        },
+    );
+    ClientResponse::CredentialDeleted {
+        credential_deleted: true,
+        plugin_id,
+        key_hash: resolved_key_hash,
+    }
+}
+
+async fn handle_credential_list_keys(
+    state: &Arc<crate::state::StewardState>,
+    conn: &ConnectionState,
+    plugin_id: String,
+) -> ClientResponse {
+    if !conn.has(CAP_CREDENTIALS_READ)
+        && !conn.has(CAP_CREDENTIALS_WRITE)
+        && !conn.has("plugins_admin")
+    {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "credential_list_keys requires read:credentials capability",
+            )
+            .with_subclass("credentials_read_required"),
+        };
+    }
+    if plugin_id.trim().is_empty() {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "credential_list_keys: plugin_id must be non-empty",
+            )
+            .with_subclass("blank_input"),
+        };
+    }
+    let Some(vault) = state.credential_vault.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "credential_list_keys: credential vault not wired",
+            )
+            .with_subclass("vault_unavailable"),
+        };
+    };
+    let rows = match vault.list_keys(&plugin_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("credential_list_keys: vault list failed: {e}"),
+                )
+                .with_subclass("vault_list_failed"),
+            };
+        }
+    };
+    let entries = rows
+        .into_iter()
+        .map(|row| CredentialListingEntry {
+            key_hash: row.key_hash,
+            display_name: row.metadata.display_name,
+            expires_at_ms: row.metadata.expires_at_ms,
+            uninstall_policy: row
+                .metadata
+                .uninstall_policy
+                .as_str()
+                .to_string(),
+            created_at_ms: row.created_at_ms,
+            updated_at_ms: row.updated_at_ms,
+        })
+        .collect();
+    ClientResponse::CredentialListing {
+        credential_listing: true,
+        plugin_id,
+        entries,
+    }
+}
+
+// -----------------------------------------------------------------
+// online_providers_list / online_providers_set_enabled /
+// online_providers_set_priority
+// -----------------------------------------------------------------
+//
+// Per-online-metadata-provider enable/disable + priority wire ops.
+// Operator gestures land here; on a successful upsert the handler
+// publishes an `OnlineProviderConfigChangeEvent` on
+// `state.online_provider_config_bus` so plugin reactors re-resolve
+// their local view in place without a lifecycle teardown.
+
+const CAP_ONLINE_PROVIDERS_WRITE: &str = "online_providers_write";
+const CAP_ONLINE_PROVIDERS_READ: &str = "online_providers_read";
+
+/// Priority values outside this range are refused at the wire
+/// boundary. Lower priorities sort earlier; the ceiling is a
+/// defensive guard against caller mistakes.
+const ONLINE_PROVIDERS_PRIORITY_RANGE: std::ops::RangeInclusive<i32> = 0..=999;
+
+async fn handle_online_providers_list(
+    state: &Arc<crate::state::StewardState>,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAP_ONLINE_PROVIDERS_READ)
+        && !conn.has(CAP_ONLINE_PROVIDERS_WRITE)
+        && !conn.has("plugins_admin")
+    {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "online_providers_list requires read:online_providers capability",
+            )
+            .with_subclass("online_providers_read_required"),
+        };
+    }
+    let Some(store) = state.online_provider_config_store.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "online_providers_list: config store not wired",
+            )
+            .with_subclass("provider_store_unavailable"),
+        };
+    };
+    let rows = match store.list_all().await {
+        Ok(r) => r,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("online_providers_list: store list failed: {e}"),
+                )
+                .with_subclass("provider_store_list_failed"),
+            };
+        }
+    };
+    // Fetch the persisted timestamps alongside — list_all yields
+    // the operator-facing typed config; the wire response also
+    // carries updated_at_ms for the operator UI's audit line.
+    let persistence = &state.persistence;
+    let mut entries: Vec<OnlineProviderEntry> = Vec::with_capacity(rows.len());
+    for cfg in rows {
+        let updated_at_ms =
+            match persistence.get_online_provider(&cfg.provider_id).await {
+                Ok(Some(row)) => row.updated_at_ms,
+                Ok(None) => 0,
+                Err(_) => 0,
+            };
+        // Enrich each row with the static provider registry
+        // shape the settings UI needs to render honestly.
+        let facts = online_provider_registry(&cfg.provider_id);
+        // has_credential = anonymous providers always true;
+        // identity-bearing = vault presence check for the
+        // (plugin_id, vault_key) the provider's owning plugin
+        // uses. Vault-not-wired or fetch-error is reported as
+        // false — both mean "not usable" from the operator's
+        // perspective, and lying about presence would land the
+        // UI on a broken affordance.
+        let has_credential = match facts.credential {
+            Some((plugin_id, vault_key)) => {
+                match state.credential_vault.get() {
+                    Some(vault) => matches!(
+                        vault.fetch(plugin_id, vault_key).await,
+                        Ok(Some(_))
+                    ),
+                    None => false,
+                }
+            }
+            None => true,
+        };
+        entries.push(OnlineProviderEntry {
+            provider_id: cfg.provider_id,
+            enabled: cfg.enabled,
+            priority: cfg.priority,
+            updated_at_ms,
+            privacy_class: facts.privacy_class,
+            has_credential,
+            kinds: facts.kinds.to_vec(),
+            license: facts.license,
+        });
+    }
+    ClientResponse::OnlineProvidersListing {
+        online_providers_listing: true,
+        entries,
+    }
+}
+
+/// Static per-provider registry: privacy class, content kinds
+/// served, license string the UI attributes with, and (for
+/// identity-bearing providers) the plugin id + vault key the
+/// credential lives under so `handle_online_providers_list`
+/// can answer `has_credential` honestly.
+///
+/// Kept in framework code because the online_providers_list
+/// wire op is framework-side and needs to answer without a
+/// plugin round-trip — the plugin knows these facts too but
+/// exposing them on the wire per-provider would require an
+/// extra dispatcher hop for every settings render.
+struct OnlineProviderFacts {
+    privacy_class: &'static str,
+    kinds: &'static [&'static str],
+    license: &'static str,
+    /// `Some((plugin_id, vault_key))` for identity-bearing
+    /// providers; `None` for anonymous.
+    credential: Option<(&'static str, &'static str)>,
+}
+
+fn online_provider_registry(provider_id: &str) -> OnlineProviderFacts {
+    match provider_id {
+        // Metadata / text-enrichment providers (owned by
+        // org.evoframework.metadata.online).
+        "musicbrainz" => OnlineProviderFacts {
+            privacy_class: "anonymous",
+            kinds: &["release_credits", "reconciliation"],
+            license: "CC0",
+            credential: None,
+        },
+        "wikipedia" => OnlineProviderFacts {
+            privacy_class: "anonymous",
+            kinds: &["bio", "album_notes", "track_annotation", "work_notes"],
+            license: "CC BY-SA",
+            credential: None,
+        },
+        "wikidata" => OnlineProviderFacts {
+            privacy_class: "anonymous",
+            kinds: &["bio", "work_notes"],
+            license: "CC0",
+            credential: None,
+        },
+        "lrclib" => OnlineProviderFacts {
+            privacy_class: "anonymous",
+            kinds: &["lyrics"],
+            license: "LRCLIB terms of use",
+            credential: None,
+        },
+        "theaudiodb" => OnlineProviderFacts {
+            // Free public test API key `"2"` ships in the client;
+            // treated anonymous from the operator's perspective
+            // (no per-operator account). An optional Patreon key
+            // exists but the enable/order UI does not gate on it.
+            privacy_class: "anonymous",
+            kinds: &["bio", "album_notes"],
+            license: "TheAudioDB terms of use",
+            credential: None,
+        },
+        "lastfm" => OnlineProviderFacts {
+            privacy_class: "identity_bearing",
+            kinds: &["bio", "album_notes"],
+            license: "Last.fm terms of use",
+            credential: Some((
+                "org.evoframework.metadata.online",
+                "lastfm_api_key",
+            )),
+        },
+        "discogs" => OnlineProviderFacts {
+            privacy_class: "identity_bearing",
+            kinds: &["album_notes", "release_credits", "bio"],
+            license: "Discogs terms of use",
+            credential: Some((
+                "org.evoframework.metadata.online",
+                "discogs_personal_access_token",
+            )),
+        },
+        "genius" => OnlineProviderFacts {
+            privacy_class: "identity_bearing",
+            kinds: &["track_annotation"],
+            license: "Genius terms of use",
+            credential: Some((
+                "org.evoframework.metadata.online",
+                "genius_client_access_token",
+            )),
+        },
+        // Artwork providers (owned by
+        // org.evoframework.artwork.online). Listed here so the
+        // settings UI's per-source surface is complete when a
+        // future migration registers them in the shared config
+        // store; today they are not stocked into
+        // `online_providers_list` but the registry answers
+        // honestly if asked.
+        "cover_art_archive" => OnlineProviderFacts {
+            privacy_class: "anonymous",
+            kinds: &["album_artwork"],
+            license: "CC0",
+            credential: None,
+        },
+        "itunes" => OnlineProviderFacts {
+            privacy_class: "anonymous",
+            kinds: &["album_artwork"],
+            license: "iTunes Search API terms",
+            credential: None,
+        },
+        "deezer" => OnlineProviderFacts {
+            privacy_class: "anonymous",
+            kinds: &["artist_artwork"],
+            license: "Deezer terms of use",
+            credential: None,
+        },
+        "fanart_tv" => OnlineProviderFacts {
+            privacy_class: "identity_bearing",
+            kinds: &["artist_artwork"],
+            license: "fanart.tv terms of use",
+            credential: Some((
+                "org.evoframework.artwork.online",
+                "fanart_tv_api_key",
+            )),
+        },
+        _ => OnlineProviderFacts {
+            privacy_class: "anonymous",
+            kinds: &[],
+            license: "unknown",
+            credential: None,
+        },
+    }
+}
+
+async fn handle_online_providers_set_enabled(
+    state: &Arc<crate::state::StewardState>,
+    conn: &ConnectionState,
+    provider_id: String,
+    enabled: bool,
+) -> ClientResponse {
+    if !conn.has(CAP_ONLINE_PROVIDERS_WRITE) && !conn.has("plugins_admin") {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "online_providers_set_enabled requires \
+                 write:online_providers capability",
+            )
+            .with_subclass("online_providers_write_required"),
+        };
+    }
+    if provider_id.trim().is_empty() {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "online_providers_set_enabled: provider_id must be non-empty",
+            )
+            .with_subclass("blank_input"),
+        };
+    }
+    let Some(store) = state.online_provider_config_store.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "online_providers_set_enabled: config store not wired",
+            )
+            .with_subclass("provider_store_unavailable"),
+        };
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let updated = match store.set_enabled(&provider_id, enabled, now_ms).await {
+        Ok(c) => c,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!(
+                        "online_providers_set_enabled: store write failed: {e}"
+                    ),
+                )
+                .with_subclass("provider_store_write_failed"),
+            };
+        }
+    };
+    // Publish on the central bus so every currently-subscribed
+    // plugin reactor observes the change and re-resolves its
+    // local view without a lifecycle teardown.
+    let event = crate::online_providers::OnlineProviderConfigChangeEvent {
+        provider_id: updated.provider_id.clone(),
+        enabled: updated.enabled,
+        priority: updated.priority,
+    };
+    state.online_provider_config_bus.publish(event);
+    ClientResponse::OnlineProviderUpdated {
+        online_provider_updated: true,
+        provider_id: updated.provider_id,
+        enabled: updated.enabled,
+        priority: updated.priority,
+    }
+}
+
+async fn handle_online_providers_set_priority(
+    state: &Arc<crate::state::StewardState>,
+    conn: &ConnectionState,
+    provider_id: String,
+    priority: i32,
+) -> ClientResponse {
+    if !conn.has(CAP_ONLINE_PROVIDERS_WRITE) && !conn.has("plugins_admin") {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "online_providers_set_priority requires \
+                 write:online_providers capability",
+            )
+            .with_subclass("online_providers_write_required"),
+        };
+    }
+    if provider_id.trim().is_empty() {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "online_providers_set_priority: provider_id must be non-empty",
+            )
+            .with_subclass("blank_input"),
+        };
+    }
+    if !ONLINE_PROVIDERS_PRIORITY_RANGE.contains(&priority) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                format!(
+                    "online_providers_set_priority: priority {priority} \
+                     out of range [{}, {}]",
+                    ONLINE_PROVIDERS_PRIORITY_RANGE.start(),
+                    ONLINE_PROVIDERS_PRIORITY_RANGE.end()
+                ),
+            )
+            .with_subclass("priority_out_of_range"),
+        };
+    }
+    let Some(store) = state.online_provider_config_store.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "online_providers_set_priority: config store not wired",
+            )
+            .with_subclass("provider_store_unavailable"),
+        };
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let updated = match store.set_priority(&provider_id, priority, now_ms).await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!(
+                        "online_providers_set_priority: store write failed: {e}"
+                    ),
+                )
+                .with_subclass("provider_store_write_failed"),
+            };
+        }
+    };
+    let event = crate::online_providers::OnlineProviderConfigChangeEvent {
+        provider_id: updated.provider_id.clone(),
+        enabled: updated.enabled,
+        priority: updated.priority,
+    };
+    state.online_provider_config_bus.publish(event);
+    ClientResponse::OnlineProviderUpdated {
+        online_provider_updated: true,
+        provider_id: updated.provider_id,
+        enabled: updated.enabled,
+        priority: updated.priority,
+    }
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| format!("{e}"))
+}
+
+async fn handle_get_device_identity(
+    device_identity_store: Option<
+        &Arc<crate::device_identity::DeviceIdentityStore>,
+    >,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "get_device_identity: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = device_identity_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_device_identity: device_identity_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("device_identity_store_not_configured"),
+        };
+    };
+    match store.get().await {
+        Ok(Some(identity)) => ClientResponse::DeviceIdentity {
+            device_identity: true,
+            identity,
+        },
+        Ok(None) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_device_identity: identity not yet generated — boot \
+                     path must call ensure() first"
+                    .to_string(),
+            )
+            .with_subclass("device_identity_not_generated"),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("get_device_identity: {e}"),
+            )
+            .with_subclass("device_identity_persistence_failed"),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_set_device_display_name(
+    device_identity_store: Option<
+        &Arc<crate::device_identity::DeviceIdentityStore>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    discovery_runtime: Option<&Arc<crate::discovery::DiscoveryRuntime>>,
+    happenings: &Arc<crate::happenings::HappeningBus>,
+    conn: &ConnectionState,
+    display_name: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "set_device_display_name";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "set_device_display_name: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = device_identity_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "set_device_display_name: device_identity_store not \
+                     configured"
+                    .to_string(),
+            )
+            .with_subclass("device_identity_store_not_configured"),
+        };
+    };
+    let response = match store.set_display_name(&display_name).await {
+        Ok(identity) => {
+            // Best-effort wire propagation: re-register the
+            // mDNS-SD advert with the new TXT record so peers
+            // see the new name without waiting for the next
+            // reboot. Failures are WARN-logged but do NOT
+            // fail the operator's rename — the persisted state
+            // is correct; the next reconciliation cycle
+            // recovers.
+            if let Some(discovery) = discovery_runtime {
+                if let Err(e) = discovery.re_advertise(&identity).await {
+                    tracing::warn!(
+                        error = %e,
+                        device_id = %identity.device_id.as_str(),
+                        "set_device_display_name: mDNS-SD re-advertise \
+                         failed; peer view will recover on next TTL prune"
+                    );
+                }
+            }
+            // Best-effort fan-out: emit the happening so
+            // remote UIs invalidate cached peer names
+            // reactively. Failures are WARN-logged; the
+            // persisted state remains the source of truth.
+            let happening =
+                crate::happenings::Happening::DeviceDisplayNameChanged {
+                    device_id: identity.device_id.as_str().to_string(),
+                    display_name: identity.display_name.clone(),
+                    at: std::time::SystemTime::now(),
+                };
+            if let Err(e) = happenings.emit_durable(happening).await {
+                tracing::warn!(
+                    error = %e,
+                    device_id = %identity.device_id.as_str(),
+                    "set_device_display_name: emit device_display_name_changed \
+                     happening failed; remote UIs recover on next snapshot refresh"
+                );
+            }
+            ClientResponse::DeviceIdentity {
+                device_identity: true,
+                identity,
+            }
+        }
+        Err(
+            crate::device_identity::DeviceIdentityError::InvalidDisplayName(
+                msg,
+            ),
+        ) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                format!("set_device_display_name: {msg}"),
+            )
+            .with_subclass("display_name_invalid"),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("set_device_display_name: {e}"),
+            )
+            .with_subclass("device_identity_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_reset_device_display_name(
+    device_identity_store: Option<
+        &Arc<crate::device_identity::DeviceIdentityStore>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    discovery_runtime: Option<&Arc<crate::discovery::DiscoveryRuntime>>,
+    happenings: &Arc<crate::happenings::HappeningBus>,
+    conn: &ConnectionState,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "reset_device_display_name";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "reset_device_display_name: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = device_identity_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "reset_device_display_name: device_identity_store not \
+                     configured"
+                    .to_string(),
+            )
+            .with_subclass("device_identity_store_not_configured"),
+        };
+    };
+    let response = match store.reset_display_name_to_default().await {
+        Ok(identity) => {
+            if let Some(discovery) = discovery_runtime {
+                if let Err(e) = discovery.re_advertise(&identity).await {
+                    tracing::warn!(
+                        error = %e,
+                        device_id = %identity.device_id.as_str(),
+                        "reset_device_display_name: mDNS-SD re-advertise \
+                         failed; peer view will recover on next TTL prune"
+                    );
+                }
+            }
+            let happening =
+                crate::happenings::Happening::DeviceDisplayNameChanged {
+                    device_id: identity.device_id.as_str().to_string(),
+                    display_name: identity.display_name.clone(),
+                    at: std::time::SystemTime::now(),
+                };
+            if let Err(e) = happenings.emit_durable(happening).await {
+                tracing::warn!(
+                    error = %e,
+                    device_id = %identity.device_id.as_str(),
+                    "reset_device_display_name: emit \
+                     device_display_name_changed happening failed"
+                );
+            }
+            ClientResponse::DeviceIdentity {
+                device_identity: true,
+                identity,
+            }
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("reset_device_display_name: {e}"),
+            )
+            .with_subclass("device_identity_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_list_discovered_peers(
+    discovery_runtime: Option<&Arc<crate::discovery::DiscoveryRuntime>>,
+    presence_correlator: Option<
+        &Arc<crate::domain_witness::presence::PresenceCorrelator>,
+    >,
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_discovered_peers: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(runtime) = discovery_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_discovered_peers: discovery runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("discovery_runtime_not_configured"),
+        };
+    };
+    let mut entries = runtime.list_peers().await;
+
+    // Track 4K join: each discovery row gains the chain-scope
+    // presence projection + per-peer network identity. The
+    // discovery row itself never persists these fields; the
+    // join happens here at read time so the badge a UI
+    // renders reflects the authoritative correlator state
+    // and the chain's signed endpoint observations. Both
+    // signals are advisory-only when their substrate is
+    // absent: the witness substrate runs only on seats where
+    // the chain layer is wired (lib.rs boot path) — operator
+    // seats without it see `presence_state = None` +
+    // `network = None` on every row but still get the
+    // discovery half intact. UI distinguishes "framework has
+    // no signal" (None) from "framework observed the peer
+    // and classified it" (Some) cleanly via the Option.
+    //
+    // The snapshots are taken ONCE per request, not per row
+    // — the correlator's `Arc<Mutex<...>>` is contended by
+    // the 1 Hz tick task and the chain projection is rebuilt
+    // on every chain head change. Re-locking per row would
+    // serialise reads against those writers; pre-snapshotting
+    // is O(N) build + O(1) per-row lookup.
+    let presence_index: std::collections::HashMap<
+        String,
+        crate::domain_witness::presence::PeerPresence,
+    > = match presence_correlator {
+        Some(correlator) => correlator
+            .snapshot()
+            .await
+            .into_iter()
+            .map(|p| (p.device_id.clone(), p))
+            .collect(),
+        None => std::collections::HashMap::new(),
+    };
+    let endpoint_projection = domain_witness_runtime
+        .map(|rt| rt.current_projection())
+        .map(|p| p.endpoints.clone());
+
+    join_track_4k_projection_into(
+        &mut entries,
+        &presence_index,
+        endpoint_projection.as_ref(),
+    );
+
+    ClientResponse::DiscoveredPeers {
+        discovered_peers: true,
+        entries,
+    }
+}
+
+/// Track 4K projection join — pure helper, testable.
+///
+/// Mutates `entries` in place, populating `presence_state` +
+/// `last_transition_at_ms` from `presence_index` and `network`
+/// from `endpoint_history`'s most recent chain-recorded
+/// observation for the entry's `device_id`. Untouched fields
+/// remain at their incoming values (typically `None` from the
+/// discovery-row construction path).
+///
+/// Contracts:
+///
+/// * Peers absent from `presence_index` keep `presence_state`
+///   and `last_transition_at_ms` as `None` — the chain-scope
+///   correlator has not classified them yet.
+/// * `endpoint_history` of `None` keeps every `network` as
+///   `None` — the witness substrate is not running on this
+///   seat.
+/// * Peers present in `endpoint_history` but with no endpoint
+///   in the current observation (defensive case — the chain
+///   structurally requires non-empty endpoints on apply,
+///   but the projection is pure data and could be empty
+///   under test) keep `network` as `None`.
+/// * The chosen `network_id` is the FIRST endpoint of the
+///   peer's most recent observation. Multi-network peers
+///   expose the network the chain entry's signer enumerated
+///   first; the wire shape is single-valued by Track 4K's
+///   contract.
+fn join_track_4k_projection_into(
+    entries: &mut [crate::persistence::PersistedDiscoveredPeer],
+    presence_index: &std::collections::HashMap<
+        String,
+        crate::domain_witness::presence::PeerPresence,
+    >,
+    endpoint_history: Option<&crate::domain_witness::DeviceEndpointHistory>,
+) {
+    for entry in entries.iter_mut() {
+        if let Some(record) = presence_index.get(&entry.device_id) {
+            entry.presence_state = Some(record.state.as_str().to_string());
+            entry.last_transition_at_ms = Some(record.last_transition_at_ms);
+        }
+        if let Some(endpoints) = endpoint_history {
+            entry.network = endpoints
+                .current(&entry.device_id)
+                .and_then(|eps| eps.first())
+                .map(|ep| ep.network_id.clone());
+        }
+    }
+}
+
+async fn handle_roster_snap(
+    discovery_runtime: Option<&Arc<crate::discovery::DiscoveryRuntime>>,
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    bus: &Arc<crate::happenings::HappeningBus>,
+    conn: &ConnectionState,
+    reason: crate::roster_snap::SnapReason,
+    deadline_ms: Option<u32>,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "roster_snap: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(runtime) = discovery_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "roster_snap: discovery runtime not configured".to_string(),
+            )
+            .with_subclass("discovery_runtime_not_configured"),
+        };
+    };
+    let orchestrator = crate::roster_snap::RosterSnapRuntime::with_chain(
+        Arc::clone(runtime),
+        Arc::clone(bus),
+        domain_witness_runtime.cloned(),
+    );
+    let result = orchestrator.snap(reason, deadline_ms).await;
+    ClientResponse::RosterSnap {
+        roster_snap: true,
+        result,
+    }
+}
+
+fn group_error_to_response(
+    op: &str,
+    e: crate::groups::GroupError,
+) -> ClientResponse {
+    use crate::groups::GroupError;
+    match e {
+        GroupError::InvalidDisplayName(msg) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                format!("{op}: {msg}"),
+            )
+            .with_subclass("display_name_invalid"),
+        },
+        GroupError::EmptyMembership => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                format!("{op}: group creation requires at least one member"),
+            )
+            .with_subclass("empty_membership"),
+        },
+        GroupError::NotFound(id) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::NotFound,
+                format!("{op}: group not found: {id}"),
+            )
+            .with_subclass("group_not_found"),
+        },
+        GroupError::LastMember => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                format!(
+                    "{op}: cannot remove the last member; delete the \
+                     group instead"
+                ),
+            )
+            .with_subclass("last_member"),
+        },
+        GroupError::InvalidMemberId => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                format!("{op}: member device id must not be empty"),
+            )
+            .with_subclass("member_id_invalid"),
+        },
+        GroupError::Persistence(p) => ClientResponse::Error {
+            error: ApiError::new(ErrorClass::Internal, format!("{op}: {p}"))
+                .with_subclass("group_persistence_failed"),
+        },
+        GroupError::DeviceNotInDomain(id) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                format!("{op}: device {id} is not an admitted domain member"),
+            )
+            .with_subclass("device_not_in_domain"),
+        },
+        GroupError::SuccessorRequired {
+            departing_device_id,
+            eligible_member_ids,
+        } => ClientResponse::LeaderSuccessorRequired {
+            successor_required: true,
+            departing_device_id,
+            eligible_member_ids,
+        },
+        GroupError::SuccessorNotEligible(id) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                format!("{op}: successor {id} is not an eligible group member"),
+            )
+            .with_subclass("successor_not_eligible"),
+        },
+        GroupError::InvalidLeaderMs(ms) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                format!(
+                    "{op}: leader_ms {ms} ms outside admissible range \
+                     10..=5000"
+                ),
+            )
+            .with_subclass("leader_ms_invalid"),
+        },
+        GroupError::Chain(msg) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("{op}: chain append failed: {msg}"),
+            )
+            .with_subclass("chain_append_failed"),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_create_group(
+    group_store: Option<&Arc<crate::groups::GroupStore>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    display_name: String,
+    members: Vec<String>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "create_group";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "create_group: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = group_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "create_group: group_store not configured".to_string(),
+            )
+            .with_subclass("group_store_not_configured"),
+        };
+    };
+    let response = match store.create(&display_name, &members).await {
+        Ok(record) => ClientResponse::Group {
+            group: true,
+            record,
+        },
+        Err(e) => group_error_to_response(operation, e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_get_group(
+    group_store: Option<&Arc<crate::groups::GroupStore>>,
+    conn: &ConnectionState,
+    group_id: String,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "get_group: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = group_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_group: group_store not configured".to_string(),
+            )
+            .with_subclass("group_store_not_configured"),
+        };
+    };
+    match store.get(&group_id).await {
+        Ok(Some(record)) => ClientResponse::Group {
+            group: true,
+            record,
+        },
+        Ok(None) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::NotFound,
+                format!("get_group: group not found: {group_id}"),
+            )
+            .with_subclass("group_not_found"),
+        },
+        Err(e) => group_error_to_response("get_group", e),
+    }
+}
+
+async fn handle_list_groups(
+    group_store: Option<&Arc<crate::groups::GroupStore>>,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_groups: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = group_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_groups: group_store not configured".to_string(),
+            )
+            .with_subclass("group_store_not_configured"),
+        };
+    };
+    match store.list().await {
+        Ok(entries) => ClientResponse::Groups {
+            groups: true,
+            entries,
+        },
+        Err(e) => group_error_to_response("list_groups", e),
+    }
+}
+
+fn role_store_error_to_response(
+    op: &str,
+    e: evo_primitives::RoleStoreError,
+) -> ClientResponse {
+    use evo_primitives::RoleStoreError;
+    match e {
+        RoleStoreError::InvalidRole(s) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                format!(
+                    "{op}: invalid role '{s}' (expected source / receiver / \
+                     auto)"
+                ),
+            )
+            .with_subclass("role_invalid"),
+        },
+        RoleStoreError::InvalidDeviceId => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                format!("{op}: device_id must not be empty"),
+            )
+            .with_subclass("device_id_invalid"),
+        },
+        RoleStoreError::Persistence(p) => ClientResponse::Error {
+            error: ApiError::new(ErrorClass::Internal, format!("{op}: {p}"))
+                .with_subclass("role_store_persistence_failed"),
+        },
+    }
+}
+
+fn role_store_unavailable(op: &str) -> ClientResponse {
+    ClientResponse::Error {
+        error: ApiError::new(
+            ErrorClass::Internal,
+            format!("{op}: role_store not configured"),
+        )
+        .with_subclass("role_store_not_configured"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_set_device_role(
+    role_store: Option<&evo_primitives::SharedRoleStore>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    device_id: String,
+    role: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "set_device_role";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "set_device_role: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = role_store else {
+        return role_store_unavailable(operation);
+    };
+    let parsed_role = match role.parse::<evo_primitives::Role>() {
+        Ok(r) => r,
+        Err(e) => return role_store_error_to_response(operation, e),
+    };
+    let set_by = principal.as_ref().map(|s| s.to_string());
+    let response = match store
+        .current()
+        .set_role(&device_id, parsed_role, set_by)
+        .await
+    {
+        Ok(()) => ClientResponse::DeviceRole {
+            device_role: true,
+            device_id,
+            role: parsed_role.as_str().to_string(),
+        },
+        Err(e) => role_store_error_to_response(operation, e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_get_device_role(
+    role_store: Option<&evo_primitives::SharedRoleStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    device_id: String,
+) -> ClientResponse {
+    let operation = "get_device_role";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "get_device_role: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = role_store else {
+        return role_store_unavailable(operation);
+    };
+    let response = match store.current().get_role(&device_id).await {
+        Ok(role) => ClientResponse::DeviceRole {
+            device_role: true,
+            device_id,
+            role: role.as_str().to_string(),
+        },
+        Err(e) => role_store_error_to_response(operation, e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        None,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_list_device_roles(
+    role_store: Option<&evo_primitives::SharedRoleStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    let operation = "list_device_roles";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_device_roles: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = role_store else {
+        return role_store_unavailable(operation);
+    };
+    let response = match store.current().list_explicit_roles().await {
+        Ok(entries) => ClientResponse::DeviceRoles {
+            device_roles: true,
+            entries: entries
+                .into_iter()
+                .map(|(device_id, role)| DeviceRoleEntry {
+                    device_id,
+                    role: role.as_str().to_string(),
+                })
+                .collect(),
+        },
+        Err(e) => role_store_error_to_response(operation, e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        None,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_clear_device_role(
+    role_store: Option<&evo_primitives::SharedRoleStore>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    device_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "clear_device_role";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "clear_device_role: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = role_store else {
+        return role_store_unavailable(operation);
+    };
+    let response = match store.current().clear_role(&device_id).await {
+        Ok(()) => ClientResponse::DeviceRole {
+            device_role: true,
+            device_id,
+            // Substrate-empty default after clear is `auto`.
+            role: evo_primitives::Role::Auto.as_str().to_string(),
+        },
+        Err(e) => role_store_error_to_response(operation, e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_plugin_reload(
+    coord: Option<&Arc<crate::plugin_lifecycle::PluginLifecycleCoordinator>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    plugin_name: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "plugin_reload";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "plugin_reload: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(coord) = coord else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "plugin_reload: plugin_lifecycle_coordinator not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("plugin_lifecycle_coordinator_not_configured"),
+        };
+    };
+    coord.request_reload(&plugin_name).await;
+    let response = ClientResponse::PluginLifecycleAck {
+        plugin_lifecycle_ack: true,
+        plugin_name,
+        op: "plugin_reload".to_string(),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_plugin_restore(
+    registry: Option<&Arc<crate::lifecycle_robustness::PluginDegradedRegistry>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    state: &Arc<StewardState>,
+    conn: &ConnectionState,
+    plugin_name: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "plugin_restore";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "plugin_restore: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(registry) = registry else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "plugin_restore: plugin_degraded_registry not configured"
+                    .to_string(),
+            )
+            .with_subclass("plugin_degraded_registry_not_configured"),
+        };
+    };
+    registry.restore(&plugin_name).await;
+    // Emit the `plugin_restored` happening on the durable bus
+    // so operator UI subscribers retire the Restore affordance
+    // + dismiss the degraded badge without re-polling. Source
+    // is `operator_restore` (this gesture); the alternative
+    // source `admit_success` is emitted from the admission
+    // engine when a successful admit clears the registry slot.
+    let happening = crate::happenings::Happening::PluginRestored {
+        plugin: plugin_name.clone(),
+        source: "operator_restore".to_string(),
+        at: std::time::SystemTime::now(),
+    };
+    if let Err(e) = state.bus.emit_durable(happening).await {
+        // LOGGING.md §2: warn (recoverable anomaly — subscribers
+        // miss this specific lifecycle notification; the restore
+        // itself succeeded and no cascade follows).
+        tracing::warn!(
+            error = %e,
+            plugin = %plugin_name,
+            "plugin_restored happening emission failed"
+        );
+    }
+    let response = ClientResponse::PluginLifecycleAck {
+        plugin_lifecycle_ack: true,
+        plugin_name,
+        op: "plugin_restore".to_string(),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_reconnect_peer(
+    endpoint_cache: Option<&Arc<crate::endpoint_cache::EndpointCache>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    device_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "reconnect_peer";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "reconnect_peer: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(cache) = endpoint_cache else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "reconnect_peer: endpoint_cache not configured".to_string(),
+            )
+            .with_subclass("endpoint_cache_not_configured"),
+        };
+    };
+    // Drain the progress channel into a noop sink — progress
+    // events are operator-surface concerns at the wire layer
+    // they aren't part of the synchronous response. The
+    // happenings bus is the structured progress surface.
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let progress_drain = tokio::spawn(async move {
+        while progress_rx.recv().await.is_some() {
+            // Discard.
+        }
+    });
+    let outcome = crate::reconnect_storm::run_storm(
+        device_id.clone(),
+        Arc::clone(cache),
+        progress_tx,
+    )
+    .await;
+    // Drop the storm's tx side by closing the sender clones —
+    // the storm internally owned them, so on return the channel
+    // closes and progress_drain completes. Wait briefly so the
+    // task exits cleanly.
+    drop(progress_drain);
+    let response = match outcome {
+        crate::reconnect_storm::StormOutcome::Reconnected {
+            winning_carrier,
+            elapsed_ms,
+        } => ClientResponse::ReconnectStormOutcome {
+            reconnect_storm_outcome: true,
+            device_id,
+            reconnected: true,
+            winning_carrier: Some(winning_carrier.to_string()),
+            elapsed_ms,
+        },
+        crate::reconnect_storm::StormOutcome::Exhausted { elapsed_ms } => {
+            ClientResponse::ReconnectStormOutcome {
+                reconnect_storm_outcome: true,
+                device_id,
+                reconnected: false,
+                winning_carrier: None,
+                elapsed_ms,
+            }
+        }
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_set_group_leader_ms(
+    group_store: Option<&Arc<crate::groups::GroupStore>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    group_id: String,
+    leader_ms: u32,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "set_group_leader_ms";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "set_group_leader_ms: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = group_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "set_group_leader_ms: group_store not configured".to_string(),
+            )
+            .with_subclass("group_store_not_configured"),
+        };
+    };
+    let response = match store.set_leader_ms(&group_id, leader_ms).await {
+        Ok(record) => ClientResponse::Group {
+            group: true,
+            record,
+        },
+        Err(e) => group_error_to_response(operation, e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_rename_group(
+    group_store: Option<&Arc<crate::groups::GroupStore>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    group_id: String,
+    display_name: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "rename_group";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "rename_group: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = group_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "rename_group: group_store not configured".to_string(),
+            )
+            .with_subclass("group_store_not_configured"),
+        };
+    };
+    let response = match store.rename(&group_id, &display_name).await {
+        Ok(record) => ClientResponse::Group {
+            group: true,
+            record,
+        },
+        Err(e) => group_error_to_response(operation, e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_add_group_member(
+    group_store: Option<&Arc<crate::groups::GroupStore>>,
+    happenings: &Arc<crate::happenings::HappeningBus>,
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    group_id: String,
+    device_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "add_group_member";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "add_group_member: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = group_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "add_group_member: group_store not configured".to_string(),
+            )
+            .with_subclass("group_store_not_configured"),
+        };
+    };
+    // Validate against the trust ledger before touching the
+    // group: only admitted (non-revoked) domain members may
+    // be admitted to a group. Phantoms refused at the
+    // framework boundary so `members[]` stays consistent with
+    // the domain roster.
+    let ledger = crate::trust_ledger::TrustLedger::new(Arc::clone(happenings));
+    if let Some(rt) = domain_witness_runtime {
+        ledger.set_witness_runtime(Arc::clone(rt));
+    }
+    match ledger.is_admitted(&device_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let happening =
+                crate::happenings::Happening::GroupMemberAddRefused {
+                    group_id: group_id.clone(),
+                    device_id: device_id.clone(),
+                    reason: "device_not_in_domain".to_string(),
+                    at: std::time::SystemTime::now(),
+                };
+            if let Err(e) = happenings.emit_durable(happening).await {
+                tracing::warn!(
+                    error = %e,
+                    "add_group_member: emit refused happening failed"
+                );
+            }
+            let response = group_error_to_response(
+                operation,
+                crate::groups::GroupError::DeviceNotInDomain(device_id.clone()),
+            );
+            emit_operation_executed(
+                lifecycle_ledger,
+                operation,
+                "plugins_admin",
+                principal,
+                conn,
+                &response,
+            )
+            .await;
+            return response;
+        }
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("add_group_member: trust-ledger read failed: {e}"),
+                )
+                .with_subclass("trust_ledger_read_failed"),
+            };
+        }
+    }
+    let response = match store.add_member(&group_id, &device_id).await {
+        Ok(record) => ClientResponse::Group {
+            group: true,
+            record,
+        },
+        Err(e) => group_error_to_response(operation, e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_remove_group_member(
+    group_store: Option<&Arc<crate::groups::GroupStore>>,
+    election_runtime: Option<&evo_primitives::SharedElectionState>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    happenings: &Arc<crate::happenings::HappeningBus>,
+    conn: &ConnectionState,
+    group_id: String,
+    device_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "remove_group_member";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "remove_group_member: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = group_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "remove_group_member: group_store not configured".to_string(),
+            )
+            .with_subclass("group_store_not_configured"),
+        };
+    };
+    // Leader-successor protocol gate. When the target device is
+    // the current source-host AND the post-removal member count
+    // would still be \u{2265} 2, the framework refuses to auto-
+    // elect a successor. The operator must call
+    // `select_group_leader_successor` (or `cancel...`) before
+    // the removal commits. Auto-dissolve precedence: when
+    // post-removal would drop below 2, the protocol is skipped
+    // (the group ends structurally; the leader role evaporates
+    // with the group).
+    if let Some(elect) = election_runtime {
+        if let Ok(Some(group)) = store.get(&group_id).await {
+            let post_count =
+                group.members.iter().filter(|m| *m != &device_id).count();
+            let current_leader =
+                elect.current().source_host_for(&group_id).await;
+            if current_leader.as_deref() == Some(&device_id) && post_count >= 2
+            {
+                let eligible_member_ids: Vec<String> = group
+                    .members
+                    .iter()
+                    .filter(|m| *m != &device_id)
+                    .cloned()
+                    .collect();
+                let happening =
+                    crate::happenings::Happening::GroupLeaderSuccessorRequired {
+                        group_id: group_id.clone(),
+                        departing_device_id: device_id.clone(),
+                        eligible_member_ids: eligible_member_ids.clone(),
+                        at: std::time::SystemTime::now(),
+                    };
+                if let Err(e) = happenings.emit_durable(happening).await {
+                    tracing::warn!(
+                        error = %e,
+                        group_id = %group_id,
+                        "remove_group_member: emit successor-required \
+                         happening failed"
+                    );
+                }
+                let response = ClientResponse::LeaderSuccessorRequired {
+                    successor_required: true,
+                    departing_device_id: device_id.clone(),
+                    eligible_member_ids,
+                };
+                emit_operation_executed(
+                    lifecycle_ledger,
+                    operation,
+                    "plugins_admin",
+                    principal,
+                    conn,
+                    &response,
+                )
+                .await;
+                return response;
+            }
+        }
+    }
+    let response = match store.remove_member(&group_id, &device_id).await {
+        Ok(record) => ClientResponse::Group {
+            group: true,
+            record,
+        },
+        Err(e) => group_error_to_response(operation, e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_move_group_member(
+    group_store: Option<&Arc<crate::groups::GroupStore>>,
+    election_runtime: Option<&evo_primitives::SharedElectionState>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    happenings: &Arc<crate::happenings::HappeningBus>,
+    conn: &ConnectionState,
+    from_group_id: String,
+    to_group_id: String,
+    device_id: String,
+    successor_device_id: Option<String>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "move_group_member";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "move_group_member: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = group_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "move_group_member: group_store not configured".to_string(),
+            )
+            .with_subclass("group_store_not_configured"),
+        };
+    };
+
+    // Leader-of-source detection. If the moved device is the
+    // source group's current source-host AND removing it would
+    // leave \u{2265} 2 members, the framework runs the
+    // explicit-successor protocol on the source side: first
+    // dispatch returns LeaderSuccessorRequired; second dispatch
+    // (with successor_device_id) commits the atomic
+    // pin-successor + remove-leader + add-to-target sequence.
+    //
+    // When the post-move source membership would drop below 2,
+    // the protocol is skipped: source auto-dissolves, residual
+    // member to solo, moved device joins target. Auto-dissolve
+    // precedence rule.
+    if let Some(elect) = election_runtime {
+        if let Ok(Some(from_group)) = store.get(&from_group_id).await {
+            let post_count = from_group
+                .members
+                .iter()
+                .filter(|m| *m != &device_id)
+                .count();
+            let current_leader =
+                elect.current().source_host_for(&from_group_id).await;
+            let is_leader_move = current_leader.as_deref() == Some(&device_id);
+            if is_leader_move && post_count >= 2 {
+                match successor_device_id.as_deref() {
+                    None => {
+                        let eligible: Vec<String> = from_group
+                            .members
+                            .iter()
+                            .filter(|m| *m != &device_id)
+                            .cloned()
+                            .collect();
+                        let happening =
+                            crate::happenings::Happening::GroupLeaderSuccessorRequired {
+                                group_id: from_group_id.clone(),
+                                departing_device_id: device_id.clone(),
+                                eligible_member_ids: eligible.clone(),
+                                at: std::time::SystemTime::now(),
+                            };
+                        if let Err(e) = happenings.emit_durable(happening).await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                group_id = %from_group_id,
+                                "move_group_member: emit successor-required \
+                                 happening failed"
+                            );
+                        }
+                        let response =
+                            ClientResponse::LeaderSuccessorRequired {
+                                successor_required: true,
+                                departing_device_id: device_id.clone(),
+                                eligible_member_ids: eligible,
+                            };
+                        emit_operation_executed(
+                            lifecycle_ledger,
+                            operation,
+                            "plugins_admin",
+                            principal,
+                            conn,
+                            &response,
+                        )
+                        .await;
+                        return response;
+                    }
+                    Some(successor_id) => {
+                        if successor_id == device_id {
+                            return ClientResponse::Error {
+                                error: ApiError::new(
+                                    ErrorClass::ContractViolation,
+                                    "move_group_member: successor must \
+                                     differ from departing leader"
+                                        .to_string(),
+                                )
+                                .with_subclass("successor_not_eligible"),
+                            };
+                        }
+                        if let Err(e) = store
+                            .pin_source_host(&from_group_id, successor_id)
+                            .await
+                        {
+                            let response =
+                                group_error_to_response(operation, e);
+                            emit_operation_executed(
+                                lifecycle_ledger,
+                                operation,
+                                "plugins_admin",
+                                principal,
+                                conn,
+                                &response,
+                            )
+                            .await;
+                            return response;
+                        }
+                        // Pin succeeded. Emit the handoff
+                        // happening alongside the move below.
+                    }
+                }
+            }
+        }
+    }
+
+    let response = match store
+        .move_member(&from_group_id, &to_group_id, &device_id)
+        .await
+    {
+        Ok(record) => {
+            if let Some(successor_id) = successor_device_id.as_deref() {
+                let happening =
+                    crate::happenings::Happening::MultiroomLeaderHandoff {
+                        group_id: from_group_id.clone(),
+                        departing_device_id: device_id.clone(),
+                        successor_device_id: successor_id.to_string(),
+                        at: std::time::SystemTime::now(),
+                    };
+                if let Err(e) = happenings.emit_durable(happening).await {
+                    tracing::warn!(
+                        error = %e,
+                        group_id = %from_group_id,
+                        "move_group_member: emit handoff happening failed"
+                    );
+                }
+            }
+            ClientResponse::MoveOutcome {
+                move_outcome: true,
+                record,
+            }
+        }
+        Err(e) => group_error_to_response(operation, e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_select_group_leader_successor(
+    group_store: Option<&Arc<crate::groups::GroupStore>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    happenings: &Arc<crate::happenings::HappeningBus>,
+    conn: &ConnectionState,
+    group_id: String,
+    departing_device_id: String,
+    successor_device_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "select_group_leader_successor";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "select_group_leader_successor: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = group_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "select_group_leader_successor: group_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("group_store_not_configured"),
+        };
+    };
+    // Validate the successor: must be a current group member,
+    // must not be the departing leader. Pin first so the next
+    // election respects the operator's choice; then remove the
+    // departing leader.
+    if successor_device_id == departing_device_id {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "select_group_leader_successor: successor must differ from \
+                 departing leader"
+                    .to_string(),
+            )
+            .with_subclass("successor_not_eligible"),
+        };
+    }
+    if let Err(e) = store.pin_source_host(&group_id, &successor_device_id).await
+    {
+        let response = group_error_to_response(operation, e);
+        emit_operation_executed(
+            lifecycle_ledger,
+            operation,
+            "plugins_admin",
+            principal,
+            conn,
+            &response,
+        )
+        .await;
+        return response;
+    }
+    let response =
+        match store.remove_member(&group_id, &departing_device_id).await {
+            Ok(record) => {
+                let happening =
+                    crate::happenings::Happening::MultiroomLeaderHandoff {
+                        group_id: group_id.clone(),
+                        departing_device_id: departing_device_id.clone(),
+                        successor_device_id: successor_device_id.clone(),
+                        at: std::time::SystemTime::now(),
+                    };
+                if let Err(e) = happenings.emit_durable(happening).await {
+                    tracing::warn!(
+                        error = %e,
+                        group_id = %group_id,
+                        "select_group_leader_successor: emit handoff happening \
+                         failed"
+                    );
+                }
+                ClientResponse::Group {
+                    group: true,
+                    record,
+                }
+            }
+            Err(e) => group_error_to_response(operation, e),
+        };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_cancel_group_leader_successor(
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    happenings: &Arc<crate::happenings::HappeningBus>,
+    conn: &ConnectionState,
+    group_id: String,
+    departing_device_id: String,
+) -> ClientResponse {
+    let operation = "cancel_group_leader_successor";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "cancel_group_leader_successor: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let happening =
+        crate::happenings::Happening::GroupLeaderSuccessorCancelled {
+            group_id: group_id.clone(),
+            departing_device_id: departing_device_id.clone(),
+            at: std::time::SystemTime::now(),
+        };
+    if let Err(e) = happenings.emit_durable(happening).await {
+        tracing::warn!(
+            error = %e,
+            group_id = %group_id,
+            "cancel_group_leader_successor: emit cancellation happening failed"
+        );
+    }
+    let response = ClientResponse::Group {
+        group: true,
+        record: crate::groups::Group {
+            group_id: crate::groups::GroupId(group_id.clone()),
+            display_name: String::new(),
+            members: Vec::new(),
+            created_at_ms: 0,
+            modified_at_ms: 0,
+            pinned_source_host: None,
+            leader_ms: crate::persistence::DEFAULT_GROUP_LEADER_MS,
+            effective_leader: None,
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        None,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_pin_source_host(
+    group_store: Option<&Arc<crate::groups::GroupStore>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    group_id: String,
+    device_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "pin_source_host";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "pin_source_host: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = group_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "pin_source_host: group_store not configured".to_string(),
+            )
+            .with_subclass("group_store_not_configured"),
+        };
+    };
+    let response = match store.pin_source_host(&group_id, &device_id).await {
+        Ok(record) => ClientResponse::Group {
+            group: true,
+            record,
+        },
+        Err(e) => group_error_to_response(operation, e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_unpin_source_host(
+    group_store: Option<&Arc<crate::groups::GroupStore>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    group_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "unpin_source_host";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "unpin_source_host: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = group_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "unpin_source_host: group_store not configured".to_string(),
+            )
+            .with_subclass("group_store_not_configured"),
+        };
+    };
+    let response = match store.unpin_source_host(&group_id).await {
+        Ok(record) => ClientResponse::Group {
+            group: true,
+            record,
+        },
+        Err(e) => group_error_to_response(operation, e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_list_domain_members(
+    happenings: &Arc<crate::happenings::HappeningBus>,
+    device_identity_store: Option<
+        &Arc<crate::device_identity::DeviceIdentityStore>,
+    >,
+    discovery_runtime: Option<&Arc<crate::discovery::DiscoveryRuntime>>,
+    election_runtime: Option<&evo_primitives::SharedElectionState>,
+    audio_plane_runtime: Option<&Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_domain_members: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let ledger = crate::trust_ledger::TrustLedger::new(Arc::clone(happenings));
+    if let Some(rt) = domain_witness_runtime {
+        ledger.set_witness_runtime(Arc::clone(rt));
+    }
+    let rows = match ledger.list().await {
+        Ok(r) => r,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("list_domain_members: {e}"),
+                )
+                .with_subclass("trust_ledger_read_failed"),
+            };
+        }
+    };
+    // Compose with local identity (is_local) and discovery
+    // state (is_currently_advertising + last_seen_ms).
+    let local_id = match device_identity_store {
+        Some(s) => s
+            .get()
+            .await
+            .ok()
+            .flatten()
+            .map(|i| i.device_id.as_str().to_string()),
+        None => None,
+    };
+    let live_peers: std::collections::HashMap<String, u64> =
+        match discovery_runtime {
+            Some(d) => d
+                .list_peers()
+                .await
+                .into_iter()
+                .map(|p| (p.device_id, p.last_seen_ms))
+                .collect(),
+            None => std::collections::HashMap::new(),
+        };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    // Liveness window for the discovery-level signal. Tight
+    // (default 60 s). Drives `is_currently_advertising` — the
+    // operator-facing Online/Offline badge. Reads through the
+    // installed `ElectionState` implementor so a multi-room
+    // distribution sees its runtime's configured window; a
+    // non-multi-room boot (handle still pointing at
+    // `NoElection`) sees the trait default (60 s) and reports
+    // it identically.
+    let liveness_window_ms = match election_runtime {
+        Some(handle) => handle.current().liveness_window_ms(),
+        None => 60_000,
+    };
+
+    // Session-level heartbeat freshness map + window. Heartbeat
+    // timeout (default 5 s) is the connection-drop threshold;
+    // the projection reports `is_session_connected = true`
+    // when a peer's most recent inbound heartbeat lies within
+    // it. Tighter than the discovery window; persists through
+    // audio pauses (heartbeats tick independent of frame flow)
+    // and is the authoritative signal election uses to decide
+    // electability. Operator UI surfaces gate leader-modifying
+    // affordances on this so the action-availability matches
+    // what election will accept.
+    let (heartbeat_window_ms, session_heartbeats): (
+        u64,
+        std::collections::HashMap<String, u64>,
+    ) = match audio_plane_runtime {
+        Some(rt) => (
+            rt.idle_reap_threshold().as_millis() as u64,
+            rt.list_connections()
+                .await
+                .into_iter()
+                .map(|c| (c.remote_device_id, c.last_channel_activity_ms))
+                .collect(),
+        ),
+        None => (
+            crate::audio_plane::AudioPlaneConfig::default()
+                .idle_reap_threshold
+                .as_millis() as u64,
+            std::collections::HashMap::new(),
+        ),
+    };
+
+    let mut entries: Vec<DomainMemberEntry> = rows
+        .into_iter()
+        .map(|row| {
+            let is_local = local_id.as_deref() == Some(row.device_id.as_str());
+            let live_seen = live_peers.get(row.device_id.as_str()).copied();
+            // A non-local peer is currently advertising iff its
+            // last-observed advert is within the election
+            // liveness window. The local device is the
+            // observer; it always reads as currently
+            // advertising.
+            let is_advertising = if is_local {
+                true
+            } else {
+                live_seen
+                    .map(|ts| now_ms.saturating_sub(ts) < liveness_window_ms)
+                    .unwrap_or(false)
+            };
+            // Session-connected iff a heartbeat from the peer
+            // arrived within the heartbeat timeout. Local is
+            // session-connected to itself by definition.
+            let is_session_connected = if is_local {
+                true
+            } else {
+                session_heartbeats
+                    .get(row.device_id.as_str())
+                    .copied()
+                    .map(|ts| {
+                        ts > 0
+                            && now_ms.saturating_sub(ts) < heartbeat_window_ms
+                    })
+                    .unwrap_or(false)
+            };
+            DomainMemberEntry {
+                device_id: row.device_id,
+                display_name: row.display_name,
+                admitted_at_ms: row.admitted_at_ms,
+                admitted_by_device_id: row.admitted_by_device_id,
+                is_local,
+                is_currently_advertising: is_advertising,
+                is_session_connected,
+                last_seen_ms: live_seen.unwrap_or(if is_local {
+                    now_ms
+                } else {
+                    0
+                }),
+                is_revoked: row.revoked_at_ms.is_some(),
+            }
+        })
+        .collect();
+    // Order: local-first, then live peers (last-seen desc),
+    // then offline paired (admitted asc), then revoked last.
+    entries.sort_by(|a, b| {
+        match (
+            a.is_revoked,
+            b.is_revoked,
+            a.is_local,
+            b.is_local,
+            a.is_currently_advertising,
+            b.is_currently_advertising,
+        ) {
+            (true, false, _, _, _, _) => std::cmp::Ordering::Greater,
+            (false, true, _, _, _, _) => std::cmp::Ordering::Less,
+            (_, _, true, false, _, _) => std::cmp::Ordering::Less,
+            (_, _, false, true, _, _) => std::cmp::Ordering::Greater,
+            (_, _, _, _, true, false) => std::cmp::Ordering::Less,
+            (_, _, _, _, false, true) => std::cmp::Ordering::Greater,
+            (_, _, _, _, true, true) => b.last_seen_ms.cmp(&a.last_seen_ms),
+            (_, _, _, _, false, false) => {
+                a.admitted_at_ms.cmp(&b.admitted_at_ms)
+            }
+        }
+    });
+    ClientResponse::DomainMembers {
+        domain_members: true,
+        entries,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_admit_peer_to_domain(
+    persistence: &Arc<dyn crate::persistence::PersistenceStore>,
+    happenings: &Arc<crate::happenings::HappeningBus>,
+    device_identity_store: Option<
+        &Arc<crate::device_identity::DeviceIdentityStore>,
+    >,
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    device_id: String,
+    display_name: Option<String>,
+    public_key_bytes: Option<Vec<u8>>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "admit_peer_to_domain";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "admit_peer_to_domain: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    // Resolve display_name. When the caller passes None, the
+    // framework looks up the peer's currently-observed mDNS-SD
+    // advert display_name from `discovered_peers`. When the
+    // caller passes Some(name), the operator-supplied label
+    // wins (operator-set names are explicit overrides).
+    let resolved_display_name = match display_name {
+        Some(name) => name,
+        None => match persistence.get_discovered_peer(&device_id).await {
+            Ok(Some(row)) => row.display_name,
+            Ok(None) => {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::NotFound,
+                        format!(
+                            "admit_peer_to_domain: device {device_id} has \
+                             not been observed via discovery; pass an \
+                             explicit display_name to admit anyway"
+                        ),
+                    )
+                    .with_subclass("peer_not_discovered"),
+                };
+            }
+            Err(e) => {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::Internal,
+                        format!(
+                            "admit_peer_to_domain: discovered_peers read \
+                             failed: {e}"
+                        ),
+                    )
+                    .with_subclass("discovered_peers_read_failed"),
+                };
+            }
+        },
+    };
+    let admitted_by = match device_identity_store {
+        Some(s) => s
+            .get()
+            .await
+            .ok()
+            .flatten()
+            .map(|i| i.device_id.as_str().to_string()),
+        None => None,
+    };
+    // Route through the chain when the witness runtime is
+    // configured; the chain is the durable substrate of
+    // record. The legacy `TrustLedger::admit` write below
+    // serves consumers that still read the ledger
+    // directly; once `TrustLedger` becomes a projection
+    // over the chain in a follow-on commit the direct
+    // ledger write becomes redundant and is removed.
+    //
+    // Public-key resolution: callers MAY pass
+    // `public_key_bytes` (developer / recovery path), but
+    // operator-facing CLI surfaces leave it unset. The
+    // resolution then reads `discovered_peers.public_key_b64`
+    // — populated by the chain-announce-driven discovery
+    // freshness pump on every 1 Hz envelope arrival. The
+    // operator never types base64; the framework carries
+    // the key transparently from the announce envelope to
+    // the chain entry.
+    //
+    // TOFU semantics: when both an operator-supplied key
+    // AND a discovered-cache key exist and disagree, the
+    // request refuses with `identity_changed`. The
+    // operator must explicitly resolve (discard the prior
+    // admit, re-admit with the new key) — silent overwrite
+    // would let a rogue advertising the same device_id with
+    // a fresh key silently hijack an existing admission.
+    let chain_witness = match domain_witness_runtime {
+        Some(runtime) => {
+            use base64::engine::general_purpose::STANDARD;
+            use base64::Engine;
+            let (cached_public_key_b64, cached_addresses): (
+                Option<String>,
+                Vec<String>,
+            ) = match persistence.get_discovered_peer(&device_id).await {
+                Ok(Some(row)) => (row.public_key_b64, row.addresses),
+                Ok(None) => (None, Vec::new()),
+                Err(e) => {
+                    return ClientResponse::Error {
+                        error: ApiError::new(
+                            ErrorClass::Internal,
+                            format!(
+                                "admit_peer_to_domain: discovered_peers \
+                                 read failed: {e}"
+                            ),
+                        )
+                        .with_subclass("discovered_peers_read_failed"),
+                    };
+                }
+            };
+            let supplied_public_key_b64 =
+                public_key_bytes.as_deref().map(|b| STANDARD.encode(b));
+            let resolved_public_key_b64 = match (
+                supplied_public_key_b64.as_ref(),
+                cached_public_key_b64.as_ref(),
+            ) {
+                (Some(supplied), Some(cached)) if supplied != cached => {
+                    return ClientResponse::Error {
+                        error: ApiError::new(
+                            ErrorClass::ContractViolation,
+                            format!(
+                                "admit_peer_to_domain: device {device_id} \
+                                 is advertising a public key that differs \
+                                 from the operator-supplied key. Discard \
+                                 the prior admission + re-admit with the \
+                                 confirmed key, OR confirm the network is \
+                                 not carrying a rogue announce."
+                            ),
+                        )
+                        .with_subclass("identity_changed"),
+                    };
+                }
+                (Some(supplied), _) => supplied.clone(),
+                (None, Some(cached)) => cached.clone(),
+                (None, None) => {
+                    return ClientResponse::Error {
+                        error: ApiError::new(
+                            ErrorClass::NotFound,
+                            format!(
+                                "admit_peer_to_domain: device {device_id} \
+                                 has not been observed on the chain-announce \
+                                 carrier (UDP/5354) yet; wait for the peer \
+                                 to come up or check that the local broadcast \
+                                 domain reaches it"
+                            ),
+                        )
+                        .with_subclass("peer_public_key_not_observed"),
+                    };
+                }
+            };
+            // Witness statement: the admitter records the
+            // subject's reachability at admit time, derived
+            // from the discovery row's mDNS-SD addresses
+            // paired with the local interface that routes to
+            // each. The chain projection's
+            // `DeviceEndpointHistory` consumes these as the
+            // first observation per peer; later
+            // `UpdatePeerEndpoints` chain entries from the
+            // subject (when the substrate's self-update
+            // surface fires) overlay newest-first and
+            // supersede the admit-time witness. Empty when
+            // no local interface shares a subnet with any
+            // mDNS-SD-observed address (peer reachable only
+            // via a relay — out of scope at admit time).
+            let admit_endpoints =
+                derive_subject_endpoints_from_addresses(&cached_addresses);
+            let op = evo_witness::DomainStateOp::AdmitPeer {
+                device_id: device_id.clone(),
+                display_name: resolved_display_name.clone(),
+                public_key_b64: resolved_public_key_b64,
+                endpoints: admit_endpoints,
+            };
+            match runtime.append_local_gesture(op, vec![]).await {
+                Ok(witness) => Some(witness),
+                Err(e) => {
+                    return ClientResponse::Error {
+                        error: ApiError::new(
+                            ErrorClass::Internal,
+                            format!("admit_peer_to_domain: {e}"),
+                        )
+                        .with_subclass("chain_append_failed"),
+                    };
+                }
+            }
+        }
+        None => None,
+    };
+    let _ = chain_witness;
+    let ledger = crate::trust_ledger::TrustLedger::new(Arc::clone(happenings));
+    if let Some(rt) = domain_witness_runtime {
+        ledger.set_witness_runtime(Arc::clone(rt));
+    }
+    let response = match ledger
+        .admit(
+            &device_id,
+            &resolved_display_name,
+            public_key_bytes,
+            admitted_by.as_deref(),
+        )
+        .await
+    {
+        Ok(record) => ClientResponse::DomainMember {
+            domain_member: true,
+            record,
+        },
+        Err(crate::trust_ledger::TrustLedgerError::InvalidDisplayName(msg)) => {
+            ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!("admit_peer_to_domain: {msg}"),
+                )
+                .with_subclass("display_name_invalid"),
+            }
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("admit_peer_to_domain: {e}"),
+            )
+            .with_subclass("trust_ledger_write_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_revoke_peer_from_domain(
+    happenings: &Arc<crate::happenings::HappeningBus>,
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    device_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "revoke_peer_from_domain";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "revoke_peer_from_domain: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    // Legacy `revoke_peer_from_domain` is retained for client
+    // compatibility but routes through the same chain-canonical
+    // `DiscardPeer` path the newer `discard_peer_from_domain`
+    // op uses. The chain witness is the durable record;
+    // `TrustLedger` reads the projection to compose the
+    // operator-visible response. New code SHOULD call
+    // `discard_peer_from_domain` directly — it carries the
+    // two-step-confirm + reason fields.
+    let Some(runtime) = domain_witness_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "revoke_peer_from_domain: domain-witness runtime not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("domain_witness_runtime_not_configured"),
+        };
+    };
+    let projection = runtime.current_projection();
+    if !projection.trust.contains_key(&device_id) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::NotFound,
+                format!(
+                    "revoke_peer_from_domain: device {device_id} is not \
+                     a domain member"
+                ),
+            )
+            .with_subclass("device_not_in_domain"),
+        };
+    }
+    let op = evo_witness::DomainStateOp::DiscardPeer {
+        device_id: device_id.clone(),
+        reason: None,
+    };
+    let ledger = crate::trust_ledger::TrustLedger::new(Arc::clone(happenings));
+    ledger.set_witness_runtime(Arc::clone(runtime));
+    let response = match runtime.append_local_gesture(op, vec![]).await {
+        Ok((_witness, outcome)) if outcome.is_canonical() => {
+            match ledger.get(&device_id).await {
+                Ok(Some(record)) => ClientResponse::DomainMember {
+                    domain_member: true,
+                    record,
+                },
+                Ok(None) => ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::Internal,
+                        format!(
+                            "revoke_peer_from_domain: chain accepted \
+                             DiscardPeer but projection lost \
+                             {device_id}"
+                        ),
+                    )
+                    .with_subclass("chain_projection_drift"),
+                },
+                Err(e) => ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::Internal,
+                        format!(
+                            "revoke_peer_from_domain: projection read \
+                             failed: {e}"
+                        ),
+                    )
+                    .with_subclass("trust_ledger_read_failed"),
+                },
+            }
+        }
+        Ok((_, outcome)) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Transient,
+                format!(
+                    "revoke_peer_from_domain: gesture outvoted by a \
+                     concurrent gesture on another seat; retry on \
+                     the new canonical head will succeed. \
+                     outcome={outcome:?}"
+                ),
+            )
+            .with_subclass("chain_fork_lost"),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("revoke_peer_from_domain: {e}"),
+            )
+            .with_subclass("chain_append_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+/// Enumerate every non-loopback IPv4 interface and pair its
+/// address with the audio-plane control port. Used by
+/// `handle_bootstrap_domain` + `handle_join_domain` so the
+/// chain entries the founder signs (and the join-mode
+/// happening) carry dialable endpoints rather than empty
+/// vectors or the wildcard address. Returns an empty vec
+/// when `if_addrs` fails — the caller decides whether to
+/// proceed or refuse.
+fn enumerate_local_network_endpoints(
+    control_port: u16,
+) -> Vec<evo_witness::NetworkEndpoint> {
+    if_addrs::get_if_addrs()
+        .map(|addrs| {
+            addrs
+                .into_iter()
+                .filter_map(|a| match a.addr {
+                    if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() => {
+                        Some(evo_witness::NetworkEndpoint {
+                            network_id: a.name.clone(),
+                            address: v4.ip.to_string(),
+                            port: control_port,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Derive a `Vec<NetworkEndpoint>` for an admit-time witness
+/// statement: each entry pairs a discovery-row address with
+/// the network_id of the local interface that routes to it
+/// (subnet match via the interface's netmask). Used by
+/// `handle_admit_peer_to_domain` so the AdmitPeer chain
+/// entry carries the admitter's observation of the subject's
+/// reachability rather than an empty vector — feeding the
+/// `DeviceEndpointHistory` projection that
+/// `handle_list_discovered_peers` joins for Track 4K's
+/// per-peer `network` field.
+///
+/// Skips:
+///
+/// * Addresses that don't parse as `SocketAddr` (mDNS-SD
+///   service-name strings, malformed entries).
+/// * IPv6 addresses — the LAN-scope substrate is IPv4-only
+///   on the audio plane.
+/// * Addresses on a subnet no local interface owns (the peer
+///   is reachable via a non-local network; would require a
+///   declared relay — out of scope at admit time).
+///
+/// When the subject's own `UpdatePeerEndpoints` chain entry
+/// later lands, its newer observation supersedes this admit-
+/// time witness; the projection's newest-first ordering does
+/// that naturally.
+fn derive_subject_endpoints_from_addresses(
+    addresses: &[String],
+) -> Vec<evo_witness::NetworkEndpoint> {
+    let locals = if_addrs::get_if_addrs().unwrap_or_default();
+    addresses
+        .iter()
+        .filter_map(|addr_str| {
+            let sa = addr_str.parse::<std::net::SocketAddr>().ok()?;
+            let peer_ip = match sa.ip() {
+                std::net::IpAddr::V4(v4) => v4,
+                std::net::IpAddr::V6(_) => return None,
+            };
+            let network_id = locals.iter().find_map(|a| match a.addr {
+                if_addrs::IfAddr::V4(ref v4) if !v4.ip.is_loopback() => {
+                    if ipv4_same_subnet(peer_ip, v4.ip, v4.netmask) {
+                        Some(a.name.clone())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })?;
+            Some(evo_witness::NetworkEndpoint {
+                network_id,
+                address: peer_ip.to_string(),
+                port: sa.port(),
+            })
+        })
+        .collect()
+}
+
+/// Pure helper: `true` when `a` and `b` share the same
+/// subnet under `mask`. Exposed for the dedicated unit test
+/// in this module's tests below.
+fn ipv4_same_subnet(
+    a: std::net::Ipv4Addr,
+    b: std::net::Ipv4Addr,
+    mask: std::net::Ipv4Addr,
+) -> bool {
+    let a_u32 = u32::from(a);
+    let b_u32 = u32::from(b);
+    let m_u32 = u32::from(mask);
+    (a_u32 & m_u32) == (b_u32 & m_u32)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_bootstrap_domain(
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    audio_plane_runtime: Option<&Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    device_identity_store: Option<
+        &Arc<crate::device_identity::DeviceIdentityStore>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    display_name: Option<String>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "bootstrap_domain";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "bootstrap_domain: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(runtime) = domain_witness_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "bootstrap_domain: domain-witness runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("domain_witness_runtime_not_configured"),
+        };
+    };
+    if runtime.chain_length() > 0 {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "bootstrap_domain: chain already contains entries; call \
+                 leave_domain or factory_reset_domain first"
+                    .to_string(),
+            )
+            .with_subclass("chain_already_present"),
+        };
+    }
+    let resolved_display_name = match display_name {
+        Some(name) => name,
+        None => match device_identity_store {
+            Some(store) => match store.get().await {
+                Ok(Some(identity)) => identity.display_name.clone(),
+                _ => runtime.local_device_id().to_string(),
+            },
+            None => runtime.local_device_id().to_string(),
+        },
+    };
+    let endpoints = audio_plane_runtime
+        .map(|ap| enumerate_local_network_endpoints(ap.control_port()))
+        .unwrap_or_default();
+    let witness = match runtime
+        .bootstrap_genesis(resolved_display_name, endpoints)
+        .await
+    {
+        Ok(Some(witness)) => witness,
+        Ok(None) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    "bootstrap_domain: chain non-empty mid-flight; refusing"
+                        .to_string(),
+                )
+                .with_subclass("chain_already_present"),
+            };
+        }
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("bootstrap_domain: {e}"),
+                )
+                .with_subclass("chain_append_failed"),
+            };
+        }
+    };
+    let response = ClientResponse::DomainBootstrapped {
+        domain_bootstrapped: true,
+        witness_id: witness.id.as_str().to_string(),
+        founder_device_id: witness.originator_device_id.clone(),
+        head_hash_b64: runtime.chain_head_b64(),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_join_domain(
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    audio_plane_runtime: Option<&Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    happenings: &Arc<crate::happenings::HappeningBus>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    endpoint: Option<String>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "join_domain";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "join_domain: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(runtime) = domain_witness_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "join_domain: domain-witness runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("domain_witness_runtime_not_configured"),
+        };
+    };
+    if runtime.chain_length() > 0 {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "join_domain: chain already contains entries; call \
+                 leave_domain or factory_reset_domain first"
+                    .to_string(),
+            )
+            .with_subclass("chain_already_present"),
+        };
+    }
+
+    // When the operator supplied an explicit endpoint, dial it
+    // via the audio plane and broadcast a chain-tail request so
+    // the dialed peer ships their full chain. The local
+    // InboundPump applies the response and the joining device
+    // converges to the dialed peer's chain head, which the
+    // founder-side `admit_peer_to_domain` gesture will then
+    // extend with this device's admission entry.
+    //
+    // When the operator did not supply an endpoint, the join
+    // gesture is passive: emit the happening, return OK, and
+    // let the announce-driven discovery + admission flow
+    // bring the chain in.
+    if let Some(addr_str) = endpoint.as_ref() {
+        let Some(audio_plane) = audio_plane_runtime else {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    "join_domain: audio-plane runtime not configured; \
+                     explicit-endpoint dial is unavailable"
+                        .to_string(),
+                )
+                .with_subclass("audio_plane_runtime_not_configured"),
+            };
+        };
+        let addr: std::net::SocketAddr =
+            match addr_str.parse::<std::net::SocketAddr>() {
+                Ok(a) => a,
+                Err(e) => {
+                    return ClientResponse::Error {
+                        error: ApiError::new(
+                            ErrorClass::ContractViolation,
+                            format!(
+                                "join_domain: endpoint {addr_str:?} is not a \
+                             parseable socket address (host:port): {e}"
+                            ),
+                        )
+                        .with_subclass("endpoint_parse_failed"),
+                    };
+                }
+            };
+        if let Err(e) = Arc::clone(audio_plane).dial_peer(addr).await {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("join_domain: dial to {addr_str} failed: {e}"),
+                )
+                .with_subclass("dial_failed"),
+            };
+        }
+        // Broadcast a chain-tail request from the zero hash so
+        // the dialed peer ships their full chain. The audio-
+        // plane routes the request to every known peer; the
+        // freshly-dialed peer is now in that set.
+        audio_plane
+            .broadcast_to_peers(
+                crate::audio_plane::AudioPlaneMessage::DomainWitnessRequest {
+                    from_hash_b64:
+                        evo_witness::DomainWitness::zero_prev_hash_b64(),
+                },
+            )
+            .await;
+    }
+
+    let happening = crate::happenings::Happening::DomainJoinModeEntered {
+        device_id: runtime.local_device_id().to_string(),
+        endpoint: endpoint.clone(),
+        at: std::time::SystemTime::now(),
+    };
+    if let Err(e) = happenings.emit_durable(happening).await {
+        tracing::warn!(
+            error = %e,
+            "join_domain: emit happening failed"
+        );
+    }
+    let response = ClientResponse::DomainJoinRequested {
+        domain_join_requested: true,
+        endpoint,
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_leave_domain(
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "leave_domain";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "leave_domain: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(runtime) = domain_witness_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "leave_domain: domain-witness runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("domain_witness_runtime_not_configured"),
+        };
+    };
+    // Reset the in-process chain runtime (clears entries,
+    // head hash, key resolver, projection cache, and removes
+    // the on-disk chain log) so the gesture takes effect
+    // immediately. No steward restart required. The per-
+    // device signing key is preserved — a subsequent
+    // bootstrap_domain or join_domain reuses the same
+    // identity.
+    if let Err(e) = runtime.reset().await {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("leave_domain: runtime reset failed: {e}"),
+            )
+            .with_subclass("runtime_reset_failed"),
+        };
+    }
+    let response = ClientResponse::DomainLeft {
+        domain_left: true,
+        note: "chain discarded in-process; per-device signing key \
+               preserved; subsequent bootstrap_domain or join_domain \
+               reuses the same identity"
+            .to_string(),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_factory_reset_domain(
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "factory_reset_domain";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "factory_reset_domain: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(runtime) = domain_witness_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "factory_reset_domain: domain-witness runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("domain_witness_runtime_not_configured"),
+        };
+    };
+    // Reset the in-process chain runtime first. This clears
+    // entries, head, key resolver, projection cache, and
+    // removes the on-disk chain log.
+    if let Err(e) = runtime.reset().await {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("factory_reset_domain: runtime reset failed: {e}"),
+            )
+            .with_subclass("runtime_reset_failed"),
+        };
+    }
+    // Factory reset additionally removes the per-device
+    // signing key so the device returns to a fresh-from-
+    // factory posture. Re-joining a domain after this
+    // gesture mints a new keypair; prior identity is
+    // unrecoverable.
+    if let Some(domain_state_dir) = runtime.state_dir() {
+        let key_path = domain_state_dir.join("signing_key.bin");
+        if key_path.exists() {
+            if let Err(e) = std::fs::remove_file(&key_path) {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::Internal,
+                        format!(
+                            "factory_reset_domain: failed to remove {}: {e}",
+                            key_path.display()
+                        ),
+                    )
+                    .with_subclass("signing_key_remove_failed"),
+                };
+            }
+        }
+    }
+    let response = ClientResponse::DomainFactoryReset {
+        domain_factory_reset: true,
+        note: "chain discarded in-process; signing key removed on disk. \
+               The in-process runtime continues to hold the prior key in \
+               memory until the steward restarts — restart to mint a \
+               fresh identity"
+            .to_string(),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_get_chain_head(
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "get_chain_head: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(runtime) = domain_witness_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_chain_head: domain-witness runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("domain_witness_runtime_not_configured"),
+        };
+    };
+    ClientResponse::ChainHead {
+        chain_head: true,
+        head_hash_b64: runtime.chain_head_b64(),
+        chain_length: runtime.chain_length(),
+    }
+}
+
+async fn handle_domain_history(
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    conn: &ConnectionState,
+    limit: Option<usize>,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "domain_history: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(runtime) = domain_witness_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "domain_history: domain-witness runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("domain_witness_runtime_not_configured"),
+        };
+    };
+    let mut chain = runtime.snapshot_chain();
+    let chain_length = chain.len();
+    let cap = limit.unwrap_or(50).clamp(1, 1000);
+    if chain.len() > cap {
+        let cut_from = chain.len() - cap;
+        chain = chain.split_off(cut_from);
+    }
+    ClientResponse::DomainHistoryPage {
+        domain_history: true,
+        entries: chain,
+        chain_length,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_discard_peer_from_domain(
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    device_id: String,
+    reason: Option<String>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "discard_peer_from_domain";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "discard_peer_from_domain: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(runtime) = domain_witness_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "discard_peer_from_domain: domain-witness runtime not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("domain_witness_runtime_not_configured"),
+        };
+    };
+    let projection = runtime.current_projection();
+    if !projection.trust.contains_key(&device_id) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::NotFound,
+                format!(
+                    "discard_peer_from_domain: device {device_id} is not \
+                     a domain member"
+                ),
+            )
+            .with_subclass("device_not_in_domain"),
+        };
+    }
+    let op = evo_witness::DomainStateOp::DiscardPeer {
+        device_id: device_id.clone(),
+        reason,
+    };
+    let response = match runtime.append_local_gesture(op, vec![]).await {
+        Ok((witness, outcome)) if outcome.is_canonical() => {
+            ClientResponse::PeerDiscarded {
+                peer_discarded: true,
+                witness_id: witness.id.as_str().to_string(),
+                device_id,
+            }
+        }
+        Ok((_, outcome)) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Transient,
+                format!(
+                    "discard_peer_from_domain: gesture outvoted by a \
+                     concurrent gesture on another seat; canonical \
+                     chain head moved on. outcome={outcome:?}"
+                ),
+            )
+            .with_subclass("chain_fork_lost"),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("discard_peer_from_domain: {e}"),
+            )
+            .with_subclass("chain_append_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_move_member(
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    device_id: String,
+    from_group_id: String,
+    to_group_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "move_member";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "move_member: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(runtime) = domain_witness_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "move_member: domain-witness runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("domain_witness_runtime_not_configured"),
+        };
+    };
+    let op = evo_witness::DomainStateOp::MoveMember {
+        device_id,
+        from_group_id,
+        to_group_id,
+    };
+    let response = match runtime.append_local_gesture(op, vec![]).await {
+        Ok((witness, outcome)) if outcome.is_canonical() => {
+            ClientResponse::MemberMoved {
+                member_moved: true,
+                witness_id: witness.id.as_str().to_string(),
+            }
+        }
+        Ok((_, outcome)) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Transient,
+                format!(
+                    "move_member: gesture outvoted by a concurrent \
+                     gesture on another seat. outcome={outcome:?}"
+                ),
+            )
+            .with_subclass("chain_fork_lost"),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("move_member: {e}"),
+            )
+            .with_subclass("chain_append_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_set_group_leader(
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    group_id: String,
+    leader_device_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "set_group_leader";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "set_group_leader: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(runtime) = domain_witness_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "set_group_leader: domain-witness runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("domain_witness_runtime_not_configured"),
+        };
+    };
+    let op = evo_witness::DomainStateOp::SetGroupLeader {
+        group_id,
+        leader_device_id,
+    };
+    let response = match runtime.append_local_gesture(op, vec![]).await {
+        Ok((witness, outcome)) if outcome.is_canonical() => {
+            ClientResponse::GroupLeaderSet {
+                group_leader_set: true,
+                witness_id: witness.id.as_str().to_string(),
+            }
+        }
+        Ok((_, outcome)) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Transient,
+                format!(
+                    "set_group_leader: gesture outvoted by a \
+                     concurrent gesture on another seat. \
+                     outcome={outcome:?}"
+                ),
+            )
+            .with_subclass("chain_fork_lost"),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("set_group_leader: {e}"),
+            )
+            .with_subclass("chain_append_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_trigger_reconnect(
+    reconnect_runtime: Option<
+        &Arc<crate::domain_witness::reconnect::ReconnectRuntime>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    device_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "trigger_reconnect";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "trigger_reconnect: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(runtime) = reconnect_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "trigger_reconnect: reconnect runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("reconnect_runtime_not_configured"),
+        };
+    };
+    let response = match runtime.trigger_reconnect(&device_id).await {
+        Ok(crate::domain_witness::reconnect::StormOutcome::Responded {
+            endpoint,
+            elapsed_ms,
+        }) => ClientResponse::ReconnectOutcome {
+            reconnect_outcome: true,
+            outcome: "responded".to_string(),
+            elapsed_ms,
+            endpoint: Some(format!("{}:{}", endpoint.address, endpoint.port)),
+            attempts: None,
+        },
+        Ok(crate::domain_witness::reconnect::StormOutcome::StormExhausted {
+            attempts,
+            elapsed_ms,
+        }) => ClientResponse::ReconnectOutcome {
+            reconnect_outcome: true,
+            outcome: "exhausted".to_string(),
+            elapsed_ms,
+            endpoint: None,
+            attempts: Some(attempts),
+        },
+        Err(
+            crate::domain_witness::reconnect::ReconnectRuntimeError::NotAdmitted {
+                device_id,
+            },
+        ) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::NotFound,
+                format!(
+                    "trigger_reconnect: peer {device_id} is not admitted in \
+                     the domain"
+                ),
+            )
+            .with_subclass("device_not_in_domain"),
+        },
+        Err(
+            crate::domain_witness::reconnect::ReconnectRuntimeError::NoEndpoints {
+                device_id,
+            },
+        ) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                format!(
+                    "trigger_reconnect: peer {device_id} has no stored \
+                     endpoints to dial"
+                ),
+            )
+            .with_subclass("no_stored_endpoints"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_export_chain(
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "export_chain: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(runtime) = domain_witness_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "export_chain: domain-witness runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("domain_witness_runtime_not_configured"),
+        };
+    };
+    ClientResponse::ChainExport {
+        chain_export: true,
+        entries: runtime.snapshot_chain(),
+        head_hash_b64: runtime.chain_head_b64(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_import_chain(
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    witnesses: Vec<evo_witness::DomainWitness>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "import_chain";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "import_chain: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(runtime) = domain_witness_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "import_chain: domain-witness runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("domain_witness_runtime_not_configured"),
+        };
+    };
+    let mut applied = 0usize;
+    let mut duplicates = 0usize;
+    for witness in witnesses {
+        match runtime
+            .receive_remote_witness(witness, "operator_import")
+            .await
+        {
+            Ok(outcome) if outcome.is_fresh_apply() => applied += 1,
+            Ok(_) => duplicates += 1,
+            Err(e) => {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::Internal,
+                        format!("import_chain: {e}"),
+                    )
+                    .with_subclass("chain_import_failed"),
+                };
+            }
+        }
+    }
+    let response = ClientResponse::ChainImport {
+        chain_import: true,
+        applied,
+        duplicates,
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_update_peer_endpoints(
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    device_id: String,
+    endpoints: Vec<evo_witness::NetworkEndpoint>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "update_peer_endpoints";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "update_peer_endpoints: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(runtime) = domain_witness_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "update_peer_endpoints: domain-witness runtime not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("domain_witness_runtime_not_configured"),
+        };
+    };
+    let op = evo_witness::DomainStateOp::UpdatePeerEndpoints {
+        device_id,
+        endpoints,
+    };
+    let response = match runtime.append_local_gesture(op, vec![]).await {
+        Ok((witness, outcome)) if outcome.is_canonical() => {
+            ClientResponse::EndpointsUpdated {
+                endpoints_updated: true,
+                witness_id: witness.id.as_str().to_string(),
+            }
+        }
+        Ok((_, outcome)) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Transient,
+                format!(
+                    "update_peer_endpoints: gesture outvoted by a \
+                     concurrent gesture on another seat; retry on \
+                     the new canonical head will succeed. \
+                     outcome={outcome:?}"
+                ),
+            )
+            .with_subclass("chain_fork_lost"),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("update_peer_endpoints: {e}"),
+            )
+            .with_subclass("chain_append_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_declare_network_relay(
+    domain_witness_runtime: Option<
+        &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    networks: Vec<evo_witness::NetworkDeclaration>,
+    capabilities: Vec<evo_witness::RelayCapability>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "declare_network_relay";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "declare_network_relay: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(runtime) = domain_witness_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "declare_network_relay: domain-witness runtime not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("domain_witness_runtime_not_configured"),
+        };
+    };
+    let op = evo_witness::DomainStateOp::DeclareNetworkRelay {
+        networks,
+        capabilities,
+    };
+    let response = match runtime.append_local_gesture(op, vec![]).await {
+        Ok((witness, outcome)) if outcome.is_canonical() => {
+            ClientResponse::RelayDeclared {
+                relay_declared: true,
+                witness_id: witness.id.as_str().to_string(),
+            }
+        }
+        Ok((_, outcome)) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Transient,
+                format!(
+                    "declare_network_relay: gesture outvoted by a \
+                     concurrent gesture on another seat; retry on \
+                     the new canonical head will succeed. \
+                     outcome={outcome:?}"
+                ),
+            )
+            .with_subclass("chain_fork_lost"),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("declare_network_relay: {e}"),
+            )
+            .with_subclass("chain_append_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_delete_group(
+    group_store: Option<&Arc<crate::groups::GroupStore>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    group_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "delete_group";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "delete_group: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = group_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "delete_group: group_store not configured".to_string(),
+            )
+            .with_subclass("group_store_not_configured"),
+        };
+    };
+    let response = match store.delete(&group_id).await {
+        Ok(removed) => ClientResponse::GroupDeleted {
+            group_deleted: true,
+            group_id: group_id.clone(),
+            removed,
+        },
+        Err(e) => group_error_to_response(operation, e),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_get_source_host(
+    election_runtime: Option<&evo_primitives::SharedElectionState>,
+    conn: &ConnectionState,
+    group_id: String,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "get_source_host: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(runtime) = election_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_source_host: election runtime not configured".to_string(),
+            )
+            .with_subclass("election_runtime_not_configured"),
+        };
+    };
+    match runtime.current().election_for(&group_id).await {
+        Some(record) => ClientResponse::SourceHosts {
+            source_hosts: true,
+            entries: vec![record],
+        },
+        None => ClientResponse::SourceHosts {
+            source_hosts: true,
+            entries: Vec::new(),
+        },
+    }
+}
+
+async fn handle_list_source_hosts(
+    election_runtime: Option<&evo_primitives::SharedElectionState>,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_source_hosts: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(runtime) = election_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_source_hosts: election runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("election_runtime_not_configured"),
+        };
+    };
+    let entries = runtime.current().list_elections().await;
+    ClientResponse::SourceHosts {
+        source_hosts: true,
+        entries,
+    }
+}
+
+async fn handle_get_clock_sync(
+    clock_sync_runtime: Option<&Arc<crate::clock_sync::ClockSyncRuntime>>,
+    conn: &ConnectionState,
+    group_id: String,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "get_clock_sync: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(runtime) = clock_sync_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_clock_sync: clock-sync runtime not configured".to_string(),
+            )
+            .with_subclass("clock_sync_runtime_not_configured"),
+        };
+    };
+    match runtime.get(&group_id).await {
+        Some(record) => ClientResponse::ClockSyncs {
+            clock_syncs: true,
+            entries: vec![record],
+        },
+        None => ClientResponse::ClockSyncs {
+            clock_syncs: true,
+            entries: Vec::new(),
+        },
+    }
+}
+
+async fn handle_list_clock_syncs(
+    clock_sync_runtime: Option<&Arc<crate::clock_sync::ClockSyncRuntime>>,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_clock_syncs: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(runtime) = clock_sync_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_clock_syncs: clock-sync runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("clock_sync_runtime_not_configured"),
+        };
+    };
+    let entries = runtime.list().await;
+    ClientResponse::ClockSyncs {
+        clock_syncs: true,
+        entries,
+    }
+}
+
+async fn handle_list_audio_plane_connections(
+    audio_plane_runtime: Option<&Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_audio_plane_connections: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(runtime) = audio_plane_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_audio_plane_connections: audio-plane runtime not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("audio_plane_runtime_not_configured"),
+        };
+    };
+    let entries = runtime.list_connections().await;
+    ClientResponse::AudioPlaneConnections {
+        audio_plane_connections: true,
+        entries,
+    }
+}
+
+async fn handle_audio_plane_dial(
+    audio_plane_runtime: Option<&Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    conn: &ConnectionState,
+    addr: String,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "audio_plane_dial: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(runtime) = audio_plane_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "audio_plane_dial: audio-plane runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("audio_plane_runtime_not_configured"),
+        };
+    };
+    let parsed: std::net::SocketAddr = match addr.parse() {
+        Ok(s) => s,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!(
+                        "audio_plane_dial: addr is not a valid socket \
+                         address ({addr}): {e}"
+                    ),
+                )
+                .with_subclass("audio_plane_dial_invalid_addr"),
+            };
+        }
+    };
+    if let Err(e) = runtime.clone().dial_peer(parsed).await {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("audio_plane_dial: {e}"),
+            )
+            .with_subclass("audio_plane_dial_failed"),
+        };
+    }
+    // Look up the just-established connection so the caller
+    // gets the remote device id learned from the Hello reply.
+    let remote_device_id = runtime
+        .list_connections()
+        .await
+        .into_iter()
+        .find(|c| c.remote_address == addr)
+        .map(|c| c.remote_device_id)
+        .unwrap_or_else(|| "<unknown>".to_string());
+    ClientResponse::AudioPlaneDialed {
+        audio_plane_dialed: true,
+        addr,
+        remote_device_id,
+    }
+}
+
+async fn handle_dispatch_to_group(
+    group_topology_runtime: Option<
+        &Arc<crate::group_topology::GroupTopologyRuntime>,
+    >,
+    audio_plane_runtime: Option<&Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    conn: &ConnectionState,
+    group_id: String,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "dispatch_to_group: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(runtime) = group_topology_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "dispatch_to_group: group topology runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("group_topology_runtime_not_configured"),
+        };
+    };
+    let snapshot = match runtime.get(&group_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::NotFound,
+                    format!("dispatch_to_group: group not found: {group_id}"),
+                )
+                .with_subclass("group_not_found"),
+            };
+        }
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("dispatch_to_group: {e}"),
+                )
+                .with_subclass("group_topology_failed"),
+            };
+        }
+    };
+
+    // Connection state to the source-host (only meaningful
+    // when source-host is remote and the audio-plane runtime
+    // is configured).
+    let source_host_connection_state = match (
+        snapshot.is_local_host,
+        snapshot.source_host_device_id.as_deref(),
+        audio_plane_runtime,
+    ) {
+        (false, Some(host_id), Some(plane)) => plane
+            .list_connections()
+            .await
+            .into_iter()
+            .find(|c| c.remote_device_id == host_id)
+            .map(|c| match c.state {
+                crate::audio_plane::ConnectionState::Handshaking => {
+                    "handshaking".to_string()
+                }
+                crate::audio_plane::ConnectionState::Connected => {
+                    "connected".to_string()
+                }
+                crate::audio_plane::ConnectionState::Disconnected => {
+                    "disconnected".to_string()
+                }
+            }),
+        _ => None,
+    };
+
+    ClientResponse::GroupDispatch {
+        group_dispatch: true,
+        group_id: snapshot.group_id,
+        display_name: snapshot.display_name,
+        source_host_device_id: snapshot.source_host_device_id,
+        is_local_host: snapshot.is_local_host,
+        source_host_connection_state,
+    }
+}
+
+async fn handle_get_group_active_topology(
+    group_topology_runtime: Option<
+        &Arc<crate::group_topology::GroupTopologyRuntime>,
+    >,
+    conn: &ConnectionState,
+    group_id: String,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "get_group_active_topology: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(runtime) = group_topology_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_group_active_topology: group topology runtime not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("group_topology_runtime_not_configured"),
+        };
+    };
+    match runtime.get(&group_id).await {
+        Ok(Some(snap)) => ClientResponse::GroupActiveTopologies {
+            group_active_topologies: true,
+            entries: vec![snap],
+        },
+        Ok(None) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::NotFound,
+                format!(
+                    "get_group_active_topology: group not found: {group_id}"
+                ),
+            )
+            .with_subclass("group_not_found"),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("get_group_active_topology: {e}"),
+            )
+            .with_subclass("group_topology_failed"),
+        },
+    }
+}
+
+async fn handle_list_group_active_topologies(
+    group_topology_runtime: Option<
+        &Arc<crate::group_topology::GroupTopologyRuntime>,
+    >,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_group_active_topologies: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(runtime) = group_topology_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_group_active_topologies: group topology runtime not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("group_topology_runtime_not_configured"),
+        };
+    };
+    match runtime.list().await {
+        Ok(entries) => ClientResponse::GroupActiveTopologies {
+            group_active_topologies: true,
+            entries,
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("list_group_active_topologies: {e}"),
+            )
+            .with_subclass("group_topology_failed"),
+        },
+    }
+}
+
+async fn handle_list_gateway_plugins(
+    gateway_registry: Option<&Arc<crate::gateway::GatewayRegistry>>,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_gateway_plugins: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(registry) = gateway_registry else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_gateway_plugins: gateway registry not configured"
+                    .to_string(),
+            )
+            .with_subclass("gateway_registry_not_configured"),
+        };
+    };
+    let entries = registry.list().await;
+    ClientResponse::GatewayPlugins {
+        gateway_plugins: true,
+        entries,
+    }
+}
+
+fn parse_severity(
+    s: &str,
+) -> Result<evo_plugin_sdk::update::UpdateSeverity, String> {
+    use evo_plugin_sdk::update::UpdateSeverity;
+    match s {
+        "routine" => Ok(UpdateSeverity::Routine),
+        "recommended" => Ok(UpdateSeverity::Recommended),
+        "security" => Ok(UpdateSeverity::Security),
+        "critical" => Ok(UpdateSeverity::Critical),
+        other => Err(format!(
+            "unknown severity {other:?}; expected one of routine / \
+             recommended / security / critical"
+        )),
+    }
+}
+
+async fn build_update_inventory_response(
+    registry: &Arc<crate::updates::UpdateRegistry>,
+) -> ClientResponse {
+    let snapshot = registry.inventory().await;
+    let sources = registry.list_sources().await;
+    ClientResponse::UpdateInventory {
+        update_inventory: true,
+        snapshot,
+        sources,
+    }
+}
+
+async fn handle_list_update_inventory(
+    update_registry: Option<&Arc<crate::updates::UpdateRegistry>>,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_update_inventory: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(registry) = update_registry else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_update_inventory: update registry not configured"
+                    .to_string(),
+            )
+            .with_subclass("update_registry_not_configured"),
+        };
+    };
+    build_update_inventory_response(registry).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_check_updates_now(
+    update_registry: Option<&Arc<crate::updates::UpdateRegistry>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    source_id: Option<String>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "check_updates_now";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "check_updates_now: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(registry) = update_registry else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "check_updates_now: update registry not configured".to_string(),
+            )
+            .with_subclass("update_registry_not_configured"),
+        };
+    };
+    let response = match source_id {
+        Some(id) => match registry.check_one(&id).await {
+            Ok(_) => build_update_inventory_response(registry).await,
+            Err(e) => ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("check_updates_now: {e}"),
+                )
+                .with_subclass("update_check_failed"),
+            },
+        },
+        None => {
+            let _ = registry.check_all_now().await;
+            build_update_inventory_response(registry).await
+        }
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_apply_update(
+    update_registry: Option<&Arc<crate::updates::UpdateRegistry>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    source_id: String,
+    update_id: String,
+    dry_run: bool,
+    approved_by: Option<String>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "apply_update";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "apply_update: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(registry) = update_registry else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "apply_update: update registry not configured".to_string(),
+            )
+            .with_subclass("update_registry_not_configured"),
+        };
+    };
+    let approver = approved_by
+        .or_else(|| principal.clone())
+        .unwrap_or_else(|| format!("peer:{}", conn.peer.uid.unwrap_or(0)));
+    let options = evo_plugin_sdk::update::ApplyOptions {
+        dry_run,
+        approved_by: Some(approver),
+    };
+    let id = evo_plugin_sdk::update::UpdateId::new(update_id);
+    let response = match registry.apply(&source_id, &id, options).await {
+        Ok(outcome) => ClientResponse::UpdateApplied {
+            update_applied: true,
+            outcome,
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("apply_update: {e}"),
+            )
+            .with_subclass("update_apply_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_get_auto_apply_policies(
+    update_registry: Option<&Arc<crate::updates::UpdateRegistry>>,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "get_auto_apply_policies: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(registry) = update_registry else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_auto_apply_policies: update registry not configured"
+                    .to_string(),
+            )
+            .with_subclass("update_registry_not_configured"),
+        };
+    };
+    let entries = registry.list_auto_apply_policies().await;
+    ClientResponse::AutoApplyPolicies {
+        auto_apply_policies: true,
+        entries,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_set_auto_apply_policy(
+    update_registry: Option<&Arc<crate::updates::UpdateRegistry>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    source_id: String,
+    enabled: bool,
+    severity_threshold: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "set_auto_apply_policy";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "set_auto_apply_policy: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(registry) = update_registry else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "set_auto_apply_policy: update registry not configured"
+                    .to_string(),
+            )
+            .with_subclass("update_registry_not_configured"),
+        };
+    };
+    let severity = match parse_severity(&severity_threshold) {
+        Ok(s) => s,
+        Err(msg) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!("set_auto_apply_policy: {msg}"),
+                )
+                .with_subclass("severity_invalid"),
+            };
+        }
+    };
+    let policy = crate::updates::AutoApplyPolicy {
+        source_id: source_id.clone(),
+        enabled,
+        severity_threshold: severity,
+    };
+    registry.set_auto_apply_policy(policy.clone()).await;
+    let response = ClientResponse::AutoApplyPolicySet {
+        auto_apply_policy_set: true,
+        policy,
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_request_steward_restart(
+    restart_coordinator: Option<&Arc<crate::restart::RestartCoordinator>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    reason: String,
+    target_binary: Option<String>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "request_steward_restart";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "request_steward_restart: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(coordinator) = restart_coordinator else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "request_steward_restart: restart coordinator not configured"
+                    .to_string(),
+            )
+            .with_subclass("restart_coordinator_not_configured"),
+        };
+    };
+    let request = crate::restart::RestartRequest {
+        reason,
+        target_binary: target_binary.map(std::path::PathBuf::from),
+        approved_by: principal
+            .clone()
+            .or_else(|| Some(format!("peer:{}", conn.peer.uid.unwrap_or(0)))),
+    };
+    let resolved = match coordinator.validate(&request) {
+        Ok(p) => p,
+        Err(crate::restart::RestartError::BinaryMissing(path)) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!(
+                        "request_steward_restart: target binary does not \
+                         exist: {}",
+                        path.display()
+                    ),
+                )
+                .with_subclass("target_binary_missing"),
+            };
+        }
+        Err(crate::restart::RestartError::BinaryNotExecutable(path)) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!(
+                        "request_steward_restart: target binary not \
+                         executable: {}",
+                        path.display()
+                    ),
+                )
+                .with_subclass("target_binary_not_executable"),
+            };
+        }
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("request_steward_restart: {e}"),
+                )
+                .with_subclass("restart_validation_failed"),
+            };
+        }
+    };
+
+    // Spawn the restart on a background task so the wire op
+    // can return its ack before exec replaces the process
+    // image. The wire client sees the response, then sees
+    // the connection close.
+    let coordinator_for_task = Arc::clone(coordinator);
+    let request_for_task = request;
+    tokio::spawn(async move {
+        match coordinator_for_task.initiate(request_for_task).await {
+            Ok(_) => {
+                // initiate returns Infallible on success;
+                // unreachable.
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "graceful steward restart failed"
+                );
+            }
+        }
+    });
+
+    let response = ClientResponse::StewardRestartScheduled {
+        steward_restart_scheduled: true,
+        target_binary: resolved.display().to_string(),
+        expected_downtime_ms: 2_500,
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_set_update_channel(
+    update_channel_store: Option<
+        &Arc<crate::update_channel::UpdateChannelStore>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    target: String,
+    channel: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "set_update_channel";
+
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "set_update_channel: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+
+    let parsed_target =
+        match crate::update_channel::UpdateChannelTarget::parse(&target) {
+            Some(t) => t,
+            None => {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::ContractViolation,
+                        format!(
+                            "set_update_channel: target {target:?} is not in \
+                         the supported set (core, plugins)"
+                        ),
+                    )
+                    .with_subclass("target_unsupported"),
+                };
+            }
+        };
+    let parsed_channel =
+        match crate::update_channel::UpdateChannel::parse(&channel) {
+            Some(c) => c,
+            None => {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::ContractViolation,
+                        format!(
+                            "set_update_channel: channel {channel:?} is not \
+                         in the supported set (alpha, test, production)"
+                        ),
+                    )
+                    .with_subclass("channel_unsupported"),
+                };
+            }
+        };
+
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+
+    let Some(store) = update_channel_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "set_update_channel: update_channel_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("update_channel_store_not_configured"),
+        };
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let principal_for_record = principal
+        .clone()
+        .unwrap_or_else(|| format!("peer:{}", conn.peer.uid.unwrap_or(0)));
+
+    let response = match store
+        .set(parsed_target, parsed_channel, now_ms, principal_for_record)
+        .await
+    {
+        Ok(()) => ClientResponse::UpdateChannelSet {
+            update_channel_set: true,
+            target: parsed_target.as_str().to_string(),
+            channel: parsed_channel.as_str().to_string(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("set_update_channel: persistence write failed: {e}"),
+            )
+            .with_subclass("persistence_write_failed"),
+        },
+    };
+
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_get_update_channels(
+    update_channel_store: Option<
+        &Arc<crate::update_channel::UpdateChannelStore>,
+    >,
+) -> ClientResponse {
+    let Some(store) = update_channel_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_update_channels: update_channel_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("update_channel_store_not_configured"),
+        };
+    };
+    match store.list().await {
+        Ok(rows) => {
+            let entries = rows
+                .into_iter()
+                .map(|r| UpdateChannelEntryWire {
+                    target: r.target.as_str().to_string(),
+                    channel: r.channel.as_str().to_string(),
+                    set_at_ms: r.set_at_ms,
+                    set_by_principal: r.set_by_principal,
+                })
+                .collect();
+            ClientResponse::UpdateChannels {
+                update_channels: true,
+                entries,
+            }
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("get_update_channels: persistence read failed: {e}"),
+            )
+            .with_subclass("persistence_read_failed"),
+        },
+    }
+}
+
+/// Handle the `describe_ui_stockings` op. Read-only;
+/// returns one entry per (plugin, stocking) pair, optionally
+/// filtered to a single shelf id. Refuses with
+/// `Internal / ui_admitted_store_not_configured` when the
+/// server was built without an
+/// [`AdmittedStockingsStore`](crate::ui_registry::AdmittedStockingsStore)
+/// handle (typically a test harness).
+async fn handle_record_wizard_step_completion(
+    wizard_runtime: Option<&Arc<crate::plans::WizardRuntime>>,
+    step_id: String,
+    completion: WizardStepCompletionWire,
+) -> ClientResponse {
+    let Some(runtime) = wizard_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "record_wizard_step_completion: wizard runtime not configured"
+                    .to_string(),
+            )
+            .with_subclass("wizard_runtime_not_configured"),
+        };
+    };
+    let typed = match completion {
+        WizardStepCompletionWire::PlainStep => {
+            crate::plans::wizard::WizardStepCompletion::PlainStep
+        }
+        WizardStepCompletionWire::Consent {
+            consent_id,
+            document_hash,
+            decision,
+            user_id,
+        } => {
+            let decision = match decision.as_str() {
+                "accepted" => crate::ledger::ConsentDecision::Accepted,
+                "declined" => crate::ledger::ConsentDecision::Declined,
+                "withdrawn" => crate::ledger::ConsentDecision::Withdrawn,
+                other => {
+                    return ClientResponse::Error {
+                        error: ApiError::new(
+                            ErrorClass::ContractViolation,
+                            format!(
+                                "record_wizard_step_completion: \
+                                 unknown consent decision {other:?}",
+                            ),
+                        )
+                        .with_subclass("unknown_consent_decision"),
+                    };
+                }
+            };
+            crate::plans::wizard::WizardStepCompletion::Consent {
+                consent_id,
+                document_hash,
+                decision,
+                user_id,
+            }
+        }
+    };
+    match runtime.record_step_completion(&step_id, typed).await {
+        Ok(()) => ClientResponse::WizardStepCompletionRecorded {
+            wizard_step_completion_recorded: true,
+            step_id,
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("record_wizard_step_completion: {e}"),
+            )
+            .with_subclass("wizard_runtime_error"),
+        },
+    }
+}
+
+async fn handle_describe_ui_stockings(
+    ui_admitted_store: Option<&Arc<crate::ui_registry::AdmittedStockingsStore>>,
+    shelf_filter: Option<String>,
+) -> ClientResponse {
+    let Some(store) = ui_admitted_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "describe_ui_stockings: ui_admitted_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("ui_admitted_store_not_configured"),
+        };
+    };
+    let mut entries: Vec<UiStockingEntryWire> = Vec::new();
+    for (plugin, stockings) in store.list_all().await {
+        for stocking in stockings {
+            if let Some(filter) = shelf_filter.as_deref() {
+                if stocking.ui_shelf != filter {
+                    continue;
+                }
+            }
+            entries.push(UiStockingEntryWire {
+                plugin: plugin.clone(),
+                ui_shelf: stocking.ui_shelf,
+                widget: stocking.widget,
+                size: stocking.size.as_str().to_string(),
+                mode: stocking.mode.map(|m| m.as_str().to_string()),
+                schema_version: stocking.schema_version,
+            });
+        }
+    }
+    let shelves = match store.shelf_registry() {
+        Some(registry) => {
+            let mut all = registry.list().await;
+            if let Some(filter) = shelf_filter.as_deref() {
+                all.retain(|s| s.id == filter);
+            }
+            all
+        }
+        None => Vec::new(),
+    };
+    let widget_kinds = match store.widget_kind_registry() {
+        Some(registry) => registry.list().await,
+        None => Vec::new(),
+    };
+    ClientResponse::UiStockings {
+        ui_stockings: true,
+        entries,
+        shelves,
+        widget_kinds,
+    }
+}
+
+/// Handle `activate_theme` — set or clear the active theme.
+/// Capability-gated by `plugins_admin`, step-up-aware.
+async fn handle_activate_theme(
+    active_ui_selection_runtime: Option<
+        &Arc<crate::ui_active::ActiveUiSelection>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    plugin_name: Option<String>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    handle_active_ui_selection_set(
+        active_ui_selection_runtime,
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        ActiveUiSlot::Theme,
+        plugin_name,
+        step_up_token,
+    )
+    .await
+}
+
+/// Handle `activate_ui_shell` — set or clear the active shell.
+async fn handle_activate_ui_shell(
+    active_ui_selection_runtime: Option<
+        &Arc<crate::ui_active::ActiveUiSelection>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    plugin_name: Option<String>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    handle_active_ui_selection_set(
+        active_ui_selection_runtime,
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        ActiveUiSlot::UiShell,
+        plugin_name,
+        step_up_token,
+    )
+    .await
+}
+
+/// Slot discriminator for the shared activate-set handler.
+#[derive(Debug, Clone, Copy)]
+enum ActiveUiSlot {
+    Theme,
+    UiShell,
+}
+
+impl ActiveUiSlot {
+    fn slot_str(self) -> &'static str {
+        match self {
+            Self::Theme => crate::ui_active::slots::THEME,
+            Self::UiShell => crate::ui_active::slots::UI_SHELL,
+        }
+    }
+
+    fn op(self) -> &'static str {
+        match self {
+            Self::Theme => "activate_theme",
+            Self::UiShell => "activate_ui_shell",
+        }
+    }
+
+    fn not_admitted_subclass(self) -> &'static str {
+        match self {
+            Self::Theme => "theme_not_admitted",
+            Self::UiShell => "ui_shell_not_admitted",
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_active_ui_selection_set(
+    active_ui_selection_runtime: Option<
+        &Arc<crate::ui_active::ActiveUiSelection>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    slot: ActiveUiSlot,
+    plugin_name: Option<String>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = slot.op();
+
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                format!("{operation}: plugins_admin not granted"),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+
+    let Some(runtime) = active_ui_selection_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!(
+                    "{operation}: active_ui_selection_runtime not configured"
+                ),
+            )
+            .with_subclass("active_ui_selection_runtime_not_configured"),
+        };
+    };
+
+    let principal_for_record = principal
+        .clone()
+        .unwrap_or_else(|| format!("peer:{}", conn.peer.uid.unwrap_or(0)));
+
+    let result = match slot {
+        ActiveUiSlot::Theme => {
+            runtime
+                .set_active_theme(plugin_name.as_deref(), &principal_for_record)
+                .await
+        }
+        ActiveUiSlot::UiShell => {
+            runtime
+                .set_active_ui_shell(
+                    plugin_name.as_deref(),
+                    &principal_for_record,
+                )
+                .await
+        }
+    };
+
+    let response = match result {
+        Ok(()) => ClientResponse::ActiveUiSelectionSet {
+            active_ui_selection_set: true,
+            slot: slot.slot_str().to_string(),
+            active_plugin_name: plugin_name,
+        },
+        Err(crate::ui_active::ActiveUiSelectionError::NotAdmitted {
+            slot: refused_slot,
+            plugin_name,
+        }) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::NotFound,
+                format!(
+                    "{operation}: plugin {plugin_name:?} is not admitted in \
+                     the {refused_slot} registry"
+                ),
+            )
+            .with_subclass(slot.not_admitted_subclass()),
+        },
+        Err(crate::ui_active::ActiveUiSelectionError::Persistence(e)) => {
+            ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("{operation}: persistence write failed: {e}"),
+                )
+                .with_subclass("persistence_write_failed"),
+            }
+        }
+    };
+
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+/// Handle `describe_active_ui_selection` — read-only snapshot
+/// of the active theme + active UI shell.
+async fn handle_describe_active_ui_selection(
+    active_ui_selection_runtime: Option<
+        &Arc<crate::ui_active::ActiveUiSelection>,
+    >,
+) -> ClientResponse {
+    let Some(runtime) = active_ui_selection_runtime else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "describe_active_ui_selection: active_ui_selection_runtime \
+                 not configured"
+                    .to_string(),
+            )
+            .with_subclass("active_ui_selection_runtime_not_configured"),
+        };
+    };
+    let snapshot = runtime.snapshot().await;
+    ClientResponse::ActiveUiSelection {
+        active_ui_selection: true,
+        theme: snapshot.theme,
+        ui_shell: snapshot.ui_shell,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_put_plugin_profile(
+    plugin_profile_store: Option<
+        &Arc<crate::plugin_profile::PluginProfileStore>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    profile_id: String,
+    name: String,
+    description: Option<String>,
+    authored_by: String,
+    entries: Vec<PluginProfileEntryWire>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "put_plugin_profile";
+
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "put_plugin_profile: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+
+    let parsed_author =
+        match crate::plugin_profile::ProfileAuthor::parse(&authored_by) {
+            Some(a) => a,
+            None => {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::ContractViolation,
+                        format!(
+                            "put_plugin_profile: authored_by {authored_by:?} \
+                             not in supported set (vendor / community / \
+                             user)"
+                        ),
+                    )
+                    .with_subclass("authored_by_unsupported"),
+                };
+            }
+        };
+
+    let mut decoded_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let state = match crate::plugin_profile::PluginProfileEntryState::parse(
+            &entry.state,
+        ) {
+            Some(s) => s,
+            None => {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::ContractViolation,
+                        format!(
+                            "put_plugin_profile: entry state {state:?} not \
+                             in supported set (enabled / disabled)",
+                            state = entry.state
+                        ),
+                    )
+                    .with_subclass("entry_state_unsupported"),
+                };
+            }
+        };
+        decoded_entries.push(crate::plugin_profile::PluginProfileEntry {
+            plugin_name: entry.plugin_name,
+            state,
+        });
+    }
+
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+
+    let Some(store) = plugin_profile_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "put_plugin_profile: plugin_profile_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("plugin_profile_store_not_configured"),
+        };
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let profile = crate::plugin_profile::PluginProfile {
+        profile_id: profile_id.clone(),
+        name,
+        description,
+        authored_by: parsed_author,
+        created_at_ms: now_ms,
+        active: false,
+        entries: decoded_entries,
+    };
+
+    let response = match store.put(profile).await {
+        Ok(()) => ClientResponse::PluginProfilePut {
+            plugin_profile_put: true,
+            profile_id: profile_id.clone(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("put_plugin_profile: {e}"),
+            )
+            .with_subclass("plugin_profile_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_get_plugin_profile(
+    plugin_profile_store: Option<
+        &Arc<crate::plugin_profile::PluginProfileStore>,
+    >,
+    profile_id: String,
+) -> ClientResponse {
+    let Some(store) = plugin_profile_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_plugin_profile: plugin_profile_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("plugin_profile_store_not_configured"),
+        };
+    };
+    match store.get(&profile_id).await {
+        Ok(Some(p)) => ClientResponse::PluginProfile {
+            plugin_profile: true,
+            profile: Some(profile_to_wire(p)),
+        },
+        Ok(None) => ClientResponse::PluginProfile {
+            plugin_profile: true,
+            profile: None,
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("get_plugin_profile: {e}"),
+            )
+            .with_subclass("plugin_profile_persistence_failed"),
+        },
+    }
+}
+
+async fn handle_list_plugin_profiles(
+    plugin_profile_store: Option<
+        &Arc<crate::plugin_profile::PluginProfileStore>,
+    >,
+) -> ClientResponse {
+    let Some(store) = plugin_profile_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_plugin_profiles: plugin_profile_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("plugin_profile_store_not_configured"),
+        };
+    };
+    match store.list().await {
+        Ok(rows) => {
+            let entries =
+                rows.into_iter().map(profile_to_wire).collect::<Vec<_>>();
+            ClientResponse::PluginProfiles {
+                plugin_profiles: true,
+                entries,
+            }
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("list_plugin_profiles: {e}"),
+            )
+            .with_subclass("plugin_profile_persistence_failed"),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_delete_plugin_profile(
+    plugin_profile_store: Option<
+        &Arc<crate::plugin_profile::PluginProfileStore>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    profile_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "delete_plugin_profile";
+
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "delete_plugin_profile: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = plugin_profile_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "delete_plugin_profile: plugin_profile_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("plugin_profile_store_not_configured"),
+        };
+    };
+    let existed = matches!(store.get(&profile_id).await, Ok(Some(_)));
+    let response = match store.delete(&profile_id).await {
+        Ok(()) => ClientResponse::PluginProfileDeleted {
+            plugin_profile_deleted: true,
+            profile_id: profile_id.clone(),
+            removed: existed,
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("delete_plugin_profile: {e}"),
+            )
+            .with_subclass("plugin_profile_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_set_active_plugin_profile(
+    plugin_profile_store: Option<
+        &Arc<crate::plugin_profile::PluginProfileStore>,
+    >,
+    engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    profile_id: Option<String>,
+    dry_run: bool,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "set_active_plugin_profile";
+
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "set_active_plugin_profile: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = plugin_profile_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "set_active_plugin_profile: plugin_profile_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("plugin_profile_store_not_configured"),
+        };
+    };
+
+    // Clear-active path: no engine dispatch, just substrate
+    // transition.
+    let Some(target_id) = profile_id.clone() else {
+        let response = match store.mark_active(None).await {
+            Ok(()) => ClientResponse::ActivePluginProfileSet {
+                active_plugin_profile_set: true,
+                outcome: None,
+            },
+            Err(e) => ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("set_active_plugin_profile (clear): {e}"),
+                )
+                .with_subclass("plugin_profile_persistence_failed"),
+            },
+        };
+        emit_operation_executed(
+            lifecycle_ledger,
+            operation,
+            "plugins_admin",
+            principal,
+            conn,
+            &response,
+        )
+        .await;
+        return response;
+    };
+
+    let Some(engine) = engine else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "set_active_plugin_profile: this server was constructed \
+                 without an admission engine handle"
+                    .to_string(),
+            )
+            .with_subclass("admission_engine_not_configured"),
+        };
+    };
+
+    // Compute the activation plan against the current router
+    // state. lookup_by_name returns Some when the plugin is
+    // currently admitted (i.e. enabled).
+    let plan_outcome = {
+        let guard = engine.lock().await;
+        let router = guard.router();
+        let target_id_for_plan = target_id.clone();
+        store
+            .plan_activation(&target_id_for_plan, |name| {
+                Some(router.lookup_by_name(name).is_some())
+            })
+            .await
+    };
+    let outcome = match plan_outcome {
+        Ok(o) => o,
+        Err(crate::plugin_profile::ProfileStoreError::NotFound(_)) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::NotFound,
+                    format!(
+                        "set_active_plugin_profile: profile {target_id:?} \
+                         does not exist"
+                    ),
+                )
+                .with_subclass("profile_not_found"),
+            };
+        }
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("set_active_plugin_profile: {e}"),
+                )
+                .with_subclass("plugin_profile_persistence_failed"),
+            };
+        }
+    };
+
+    if dry_run {
+        let response = ClientResponse::ActivePluginProfileSet {
+            active_plugin_profile_set: true,
+            outcome: Some(outcome_to_wire(outcome, true)),
+        };
+        emit_operation_executed(
+            lifecycle_ledger,
+            operation,
+            "plugins_admin",
+            principal,
+            conn,
+            &response,
+        )
+        .await;
+        return response;
+    }
+
+    // Dispatch transitions. We accumulate per-plugin failure
+    // detail and surface via Failed outcome on the OperationExecuted
+    // audit entry; the wire response is success even on partial
+    // dispatch (the operator's UI consumes the outcome detail to
+    // render which transitions failed).
+    let reason = format!("profile activation: {target_id}");
+    {
+        let guard = engine.lock().await;
+        for plugin in &outcome.enabled {
+            let _ = guard.enable_plugin(plugin, Some(reason.clone())).await;
+        }
+        for plugin in &outcome.disabled {
+            let _ = guard.disable_plugin(plugin, Some(reason.clone())).await;
+        }
+    }
+
+    if let Err(e) = store.mark_active(Some(&target_id)).await {
+        let response = ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!(
+                    "set_active_plugin_profile: transitions dispatched but \
+                     active flag persistence failed: {e}"
+                ),
+            )
+            .with_subclass("plugin_profile_persistence_failed"),
+        };
+        emit_operation_executed(
+            lifecycle_ledger,
+            operation,
+            "plugins_admin",
+            principal,
+            conn,
+            &response,
+        )
+        .await;
+        return response;
+    }
+
+    let response = ClientResponse::ActivePluginProfileSet {
+        active_plugin_profile_set: true,
+        outcome: Some(outcome_to_wire(outcome, false)),
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+fn profile_to_wire(
+    p: crate::plugin_profile::PluginProfile,
+) -> PluginProfileWire {
+    PluginProfileWire {
+        profile_id: p.profile_id,
+        name: p.name,
+        description: p.description,
+        authored_by: p.authored_by.as_str().to_string(),
+        created_at_ms: p.created_at_ms,
+        active: p.active,
+        entries: p
+            .entries
+            .into_iter()
+            .map(|e| PluginProfileEntryWire {
+                plugin_name: e.plugin_name,
+                state: e.state.as_str().to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn outcome_to_wire(
+    o: crate::plugin_profile::ProfileActivationOutcome,
+    dry_run: bool,
+) -> ProfileActivationOutcomeWire {
+    ProfileActivationOutcomeWire {
+        profile_id: o.profile_id,
+        enabled: o.enabled,
+        disabled: o.disabled,
+        skipped: o.skipped,
+        dry_run,
+    }
+}
+
+/// Per-plugin lifecycle action selector for the bulk wire op
+/// dispatch path. Local to the bulk surface; not exposed on the
+/// wire.
+#[derive(Debug, Clone, Copy)]
+enum BulkLifecycleAction {
+    Enable,
+    Disable,
+}
+
+/// Build a [`PluginContext`](crate::plugin_filter::PluginContext)
+/// for one canonical plugin name from the live router state +
+/// persistence + tags. Returns `None` only when the persistence
+/// layer fails — every other path returns a context with
+/// best-effort field population (manifest fields fall back to
+/// `None` / empty when the plugin's manifest is unavailable).
+async fn build_plugin_context(
+    state: &Arc<StewardState>,
+    router: &Arc<PluginRouter>,
+    canonical_name: &str,
+    is_admitted: bool,
+    enabled_in_persistence: Option<bool>,
+) -> Option<crate::plugin_filter::PluginContext> {
+    use crate::plugin_filter::PluginCurrentState;
+
+    // Lifecycle classification.
+    let current_state = match (is_admitted, enabled_in_persistence) {
+        (true, _) => PluginCurrentState::Enabled,
+        (false, Some(false)) => PluginCurrentState::Disabled,
+        (false, _) => PluginCurrentState::NotAdmitted,
+    };
+
+    // Manifest fields (version, capabilities) when the plugin
+    // is currently admitted and the router holds its manifest.
+    let (version, capabilities) = if is_admitted {
+        match router.lookup_by_name(canonical_name) {
+            Some(entry) => extract_manifest_fields(&entry),
+            None => (None, Vec::new()),
+        }
+    } else {
+        (None, Vec::new())
+    };
+
+    // Tags from the plugin_tags substrate.
+    let tags = match state.persistence.list_plugin_tags(canonical_name).await {
+        Ok(rows) => rows.into_iter().map(|r| r.tag).collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+
+    Some(crate::plugin_filter::PluginContext::new(
+        canonical_name,
+        version,
+        capabilities,
+        tags,
+        current_state,
+    ))
+}
+
+/// Return the manifest-declared lifecycle mode for a router
+/// entry as the canonical kebab-case wire string. Falls back to
+/// `unknown` when the manifest is not retained on the entry
+/// (legacy `PluginEntry::new` test fixtures; production
+/// admission paths always retain it). Operator-UI consumers
+/// render this on the plugin tile so the operator knows
+/// before clicking Reload whether the plugin will hot-reload
+/// (reactive-only), restart (reload-cleanable), or refuse
+/// (frozen).
+fn read_lifecycle_mode_string(entry: &crate::router::PluginEntry) -> String {
+    let guard = entry.manifest.lock().expect("manifest mutex poisoned");
+    let Some(manifest) = guard.as_ref() else {
+        // Manifest not retained — legacy `PluginEntry::new` test
+        // fixtures only; production admission paths always
+        // populate this field. `unknown` is the operator-visible
+        // signal that something prevented the projection.
+        return "unknown".to_string();
+    };
+    // Manifest's `[lifecycle]` block is itself optional in the
+    // SDK shape; when absent, the SDK contract is `Frozen` (the
+    // safe default — no reload, restart is the only mutation
+    // vector). The kebab-case wire form mirrors the schema's
+    // `mode` field domain.
+    let mode = manifest
+        .lifecycle
+        .as_ref()
+        .map(|l| l.mode)
+        .unwrap_or(evo_plugin_sdk::manifest::LifecycleMode::Frozen);
+    match mode {
+        evo_plugin_sdk::manifest::LifecycleMode::ReactiveOnly => {
+            "reactive-only".to_string()
+        }
+        evo_plugin_sdk::manifest::LifecycleMode::ReloadCleanable => {
+            "reload-cleanable".to_string()
+        }
+        evo_plugin_sdk::manifest::LifecycleMode::Frozen => "frozen".to_string(),
+    }
+}
+
+/// Pull the version + the presence-style capability tokens out
+/// of an admitted plugin's manifest. Returns empty fields when
+/// the manifest is unavailable.
+fn extract_manifest_fields(
+    entry: &crate::router::PluginEntry,
+) -> (Option<semver::Version>, Vec<String>) {
+    let manifest_guard =
+        entry.manifest.lock().expect("manifest mutex poisoned");
+    let Some(manifest) = manifest_guard.as_ref() else {
+        return (None, Vec::new());
+    };
+    let version = Some(manifest.plugin.version.clone());
+    let mut caps = Vec::new();
+    let c = &manifest.capabilities;
+    if c.respondent.is_some() {
+        caps.push("respondent".to_string());
+    }
+    if c.warden.is_some() {
+        caps.push("warden".to_string());
+    }
+    if c.factory.is_some() {
+        caps.push("factory".to_string());
+    }
+    if c.source.is_some() {
+        caps.push("source".to_string());
+    }
+    if c.admin {
+        caps.push("admin".to_string());
+    }
+    if c.fast_path {
+        caps.push("fast_path".to_string());
+    }
+    if c.appointments {
+        caps.push("appointments".to_string());
+    }
+    if c.watches {
+        caps.push("watches".to_string());
+    }
+    (version, caps)
+}
+
+/// Enumerate every plugin canonical name the framework knows
+/// about — currently admitted (router) plus any installed-row
+/// from persistence. Returned in plugin-name-ascending order
+/// for deterministic listing.
+async fn collect_known_plugin_names(
+    state: &Arc<StewardState>,
+    router: &Arc<PluginRouter>,
+) -> Result<Vec<(String, bool, Option<bool>)>, ClientResponse> {
+    let mut by_name: std::collections::BTreeMap<String, (bool, Option<bool>)> =
+        std::collections::BTreeMap::new();
+    for entry in router.entries_in_order() {
+        by_name.insert(entry.name.clone(), (true, None));
+    }
+    match state.persistence.load_all_installed_plugins().await {
+        Ok(rows) => {
+            for row in rows {
+                let entry =
+                    by_name.entry(row.plugin_name).or_insert((false, None));
+                entry.1 = Some(row.enabled);
+            }
+        }
+        Err(e) => {
+            return Err(ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!(
+                        "bulk filter: load_all_installed_plugins failed: {e}"
+                    ),
+                )
+                .with_subclass("persistence_read_failed"),
+            });
+        }
+    }
+    Ok(by_name
+        .into_iter()
+        .map(|(name, (admitted, enabled))| (name, admitted, enabled))
+        .collect())
+}
+
+async fn handle_list_plugins_where(
+    state: &Arc<StewardState>,
+    engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
+    conn: &ConnectionState,
+    filter: crate::plugin_filter::PluginFilter,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "list_plugins_where: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(engine) = engine else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_plugins_where: this server was constructed without \
+                 an admission engine handle"
+                    .to_string(),
+            )
+            .with_subclass("admission_engine_not_configured"),
+        };
+    };
+    let router = {
+        let g = engine.lock().await;
+        Arc::clone(g.router())
+    };
+    let candidates = match collect_known_plugin_names(state, &router).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let mut matched = Vec::new();
+    for (name, admitted, enabled) in candidates {
+        if let Some(ctx) =
+            build_plugin_context(state, &router, &name, admitted, enabled).await
+        {
+            if filter.matches(&ctx) {
+                matched.push(name);
+            }
+        }
+    }
+    ClientResponse::PluginsMatching {
+        plugins_matching: true,
+        names: matched,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_bulk_lifecycle_where(
+    state: &Arc<StewardState>,
+    engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    filter: crate::plugin_filter::PluginFilter,
+    reason: Option<String>,
+    step_up_token: Option<String>,
+    action: BulkLifecycleAction,
+) -> ClientResponse {
+    let operation = match action {
+        BulkLifecycleAction::Enable => "enable_plugins_where",
+        BulkLifecycleAction::Disable => "disable_plugins_where",
+    };
+
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                format!("{operation}: plugins_admin not granted"),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(engine) = engine else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!(
+                    "{operation}: this server was constructed without an \
+                     admission engine handle"
+                ),
+            )
+            .with_subclass("admission_engine_not_configured"),
+        };
+    };
+
+    let router = {
+        let g = engine.lock().await;
+        Arc::clone(g.router())
+    };
+    let candidates = match collect_known_plugin_names(state, &router).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
+    let mut matched = Vec::new();
+    for (name, admitted, enabled) in candidates {
+        if let Some(ctx) =
+            build_plugin_context(state, &router, &name, admitted, enabled).await
+        {
+            if filter.matches(&ctx) {
+                matched.push(name);
+            }
+        }
+    }
+
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+    {
+        let guard = engine.lock().await;
+        for plugin in matched {
+            let result = match action {
+                BulkLifecycleAction::Enable => {
+                    guard.enable_plugin(&plugin, reason.clone()).await
+                }
+                BulkLifecycleAction::Disable => {
+                    guard.disable_plugin(&plugin, reason.clone()).await
+                }
+            };
+            match result {
+                Ok(_) => succeeded.push(plugin),
+                Err(e) => failed.push(BulkLifecycleFailureWire {
+                    plugin_name: plugin,
+                    message: format!("{e}"),
+                }),
+            }
+        }
+    }
+
+    let response = ClientResponse::PluginsBulkLifecycle {
+        plugins_bulk_lifecycle: true,
+        succeeded,
+        failed,
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_set_plugin_tag(
+    state: &Arc<StewardState>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    plugin_name: String,
+    tag: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "set_plugin_tag";
+
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "set_plugin_tag: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    if tag.is_empty() {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "set_plugin_tag: tag must not be empty".to_string(),
+            )
+            .with_subclass("tag_empty"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let response = match state
+        .persistence
+        .put_plugin_tag(&plugin_name, &tag, now_ms)
+        .await
+    {
+        Ok(()) => ClientResponse::PluginTagSet {
+            plugin_tag_set: true,
+            plugin_name: plugin_name.clone(),
+            tag: tag.clone(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("set_plugin_tag: {e}"),
+            )
+            .with_subclass("persistence_write_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_delete_plugin_tag(
+    state: &Arc<StewardState>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    plugin_name: String,
+    tag: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "delete_plugin_tag";
+
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "delete_plugin_tag: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let response = match state
+        .persistence
+        .delete_plugin_tag(&plugin_name, &tag)
+        .await
+    {
+        Ok(()) => ClientResponse::PluginTagDeleted {
+            plugin_tag_deleted: true,
+            plugin_name: plugin_name.clone(),
+            tag: tag.clone(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("delete_plugin_tag: {e}"),
+            )
+            .with_subclass("persistence_write_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_list_plugin_tags(
+    state: &Arc<StewardState>,
+    plugin_name: String,
+) -> ClientResponse {
+    match state.persistence.list_plugin_tags(&plugin_name).await {
+        Ok(rows) => {
+            let tags = rows
+                .into_iter()
+                .map(|r| PluginTagEntryWire {
+                    tag: r.tag,
+                    set_at_ms: r.set_at_ms,
+                })
+                .collect();
+            ClientResponse::PluginTags {
+                plugin_tags: true,
+                plugin_name,
+                tags,
+            }
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("list_plugin_tags: {e}"),
+            )
+            .with_subclass("persistence_read_failed"),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_put_admission_policy(
+    admission_policy_store: Option<
+        &Arc<crate::admission_policy::AdmissionPolicyStore>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    policy_id: String,
+    name: String,
+    description: Option<String>,
+    authored_by: String,
+    rules: crate::admission_policy::AdmissionPolicyRules,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "put_admission_policy";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "put_admission_policy: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let parsed_author =
+        match crate::plugin_profile::ProfileAuthor::parse(&authored_by) {
+            Some(a) => a,
+            None => {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::ContractViolation,
+                        format!(
+                            "put_admission_policy: authored_by \
+                             {authored_by:?} not in supported set (vendor \
+                             / community / user)"
+                        ),
+                    )
+                    .with_subclass("authored_by_unsupported"),
+                };
+            }
+        };
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = admission_policy_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "put_admission_policy: admission_policy_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("admission_policy_store_not_configured"),
+        };
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let policy = crate::admission_policy::AdmissionPolicy {
+        policy_id: policy_id.clone(),
+        name,
+        description,
+        authored_by: parsed_author,
+        created_at_ms: now_ms,
+        active: false,
+        rules,
+    };
+    let response = match store.put(policy).await {
+        Ok(()) => ClientResponse::AdmissionPolicyPut {
+            admission_policy_put: true,
+            policy_id: policy_id.clone(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("put_admission_policy: {e}"),
+            )
+            .with_subclass("admission_policy_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_get_admission_policy(
+    admission_policy_store: Option<
+        &Arc<crate::admission_policy::AdmissionPolicyStore>,
+    >,
+    policy_id: String,
+) -> ClientResponse {
+    let Some(store) = admission_policy_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "get_admission_policy: admission_policy_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("admission_policy_store_not_configured"),
+        };
+    };
+    match store.get(&policy_id).await {
+        Ok(Some(p)) => ClientResponse::AdmissionPolicy {
+            admission_policy: true,
+            policy: Some(policy_to_wire(p)),
+        },
+        Ok(None) => ClientResponse::AdmissionPolicy {
+            admission_policy: true,
+            policy: None,
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("get_admission_policy: {e}"),
+            )
+            .with_subclass("admission_policy_persistence_failed"),
+        },
+    }
+}
+
+async fn handle_list_admission_policies(
+    admission_policy_store: Option<
+        &Arc<crate::admission_policy::AdmissionPolicyStore>,
+    >,
+) -> ClientResponse {
+    let Some(store) = admission_policy_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "list_admission_policies: admission_policy_store not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("admission_policy_store_not_configured"),
+        };
+    };
+    match store.list().await {
+        Ok(rows) => {
+            let entries =
+                rows.into_iter().map(policy_to_wire).collect::<Vec<_>>();
+            ClientResponse::AdmissionPolicies {
+                admission_policies: true,
+                entries,
+            }
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("list_admission_policies: {e}"),
+            )
+            .with_subclass("admission_policy_persistence_failed"),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_delete_admission_policy(
+    admission_policy_store: Option<
+        &Arc<crate::admission_policy::AdmissionPolicyStore>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    policy_id: String,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "delete_admission_policy";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "delete_admission_policy: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = admission_policy_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "delete_admission_policy: admission_policy_store not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("admission_policy_store_not_configured"),
+        };
+    };
+    let response = match store.delete(&policy_id).await {
+        Ok(()) => ClientResponse::AdmissionPolicyDeleted {
+            admission_policy_deleted: true,
+            policy_id: policy_id.clone(),
+        },
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("delete_admission_policy: {e}"),
+            )
+            .with_subclass("admission_policy_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_set_active_admission_policy(
+    admission_policy_store: Option<
+        &Arc<crate::admission_policy::AdmissionPolicyStore>,
+    >,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    policy_id: Option<String>,
+    step_up_token: Option<String>,
+) -> ClientResponse {
+    let operation = "set_active_admission_policy";
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        emit_capability_missing(lifecycle_ledger, operation, conn).await;
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "set_active_admission_policy: plugins_admin not granted"
+                    .to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(store) = admission_policy_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "set_active_admission_policy: admission_policy_store not \
+                 configured"
+                    .to_string(),
+            )
+            .with_subclass("admission_policy_store_not_configured"),
+        };
+    };
+    let response = match store.mark_active(policy_id.as_deref()).await {
+        Ok(()) => ClientResponse::ActiveAdmissionPolicySet {
+            active_admission_policy_set: true,
+            policy_id: policy_id.clone(),
+        },
+        Err(crate::admission_policy::PolicyStoreError::NotFound(id)) => {
+            ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::NotFound,
+                    format!(
+                        "set_active_admission_policy: policy {id:?} does \
+                         not exist"
+                    ),
+                )
+                .with_subclass("policy_not_found"),
+            }
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("set_active_admission_policy: {e}"),
+            )
+            .with_subclass("admission_policy_persistence_failed"),
+        },
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
+}
+
+async fn handle_audit_against_policy(
+    admission_policy_store: Option<
+        &Arc<crate::admission_policy::AdmissionPolicyStore>,
+    >,
+    state: &Arc<StewardState>,
+    engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
+    publisher_trust: Option<&Arc<crate::publisher_trust::PublisherTrustStore>>,
+    conn: &ConnectionState,
+    policy_id: String,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "audit_against_policy: plugins_admin not granted".to_string(),
+            )
+            .with_subclass("plugins_admin_not_granted"),
+        };
+    }
+    let Some(store) = admission_policy_store else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "audit_against_policy: admission_policy_store not configured"
+                    .to_string(),
+            )
+            .with_subclass("admission_policy_store_not_configured"),
+        };
+    };
+    let Some(engine) = engine else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "audit_against_policy: this server was constructed without \
+                 an admission engine handle"
+                    .to_string(),
+            )
+            .with_subclass("admission_engine_not_configured"),
+        };
+    };
+
+    // Build the candidate plugin set.
+    let router = {
+        let g = engine.lock().await;
+        Arc::clone(g.router())
+    };
+    let candidates = match collect_known_plugin_names(state, &router).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let mut contexts = Vec::with_capacity(candidates.len());
+    for (name, admitted, enabled) in candidates {
+        if let Some(ctx) =
+            build_plugin_context(state, &router, &name, admitted, enabled).await
+        {
+            contexts.push(ctx);
+        }
+    }
+
+    // Snapshot the publisher-trust store into a HashSet of
+    // verified publisher prefixes. The reader closure consults
+    // this snapshot per-plugin.
+    let verified_publishers: std::collections::HashSet<String> = if let Some(
+        pt,
+    ) =
+        publisher_trust
+    {
+        pt.list()
+                .await
+                .into_iter()
+                .filter(|r| {
+                    matches!(
+                        r.trust_level,
+                        crate::publisher_trust::PublisherTrustLevel::Pretrusted
+                            | crate::publisher_trust::PublisherTrustLevel::OperatorTrusted
+                    )
+                })
+                .map(|r| r.display_name)
+                .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    let result = store
+        .audit_plugins(&policy_id, &contexts, |publisher| {
+            verified_publishers.contains(publisher)
+        })
+        .await;
+    match result {
+        Ok(violations) => {
+            let violations = violations
+                .into_iter()
+                .map(|v| AdmissionPolicyViolationWire {
+                    plugin_name: v.plugin_name,
+                    rule_class: v.rule_class,
+                    detail: v.detail,
+                })
+                .collect();
+            ClientResponse::AdmissionPolicyAudit {
+                admission_policy_audit: true,
+                policy_id,
+                violations,
+            }
+        }
+        Err(crate::admission_policy::PolicyStoreError::NotFound(id)) => {
+            ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::NotFound,
+                    format!(
+                        "audit_against_policy: policy {id:?} does not exist"
+                    ),
+                )
+                .with_subclass("policy_not_found"),
+            }
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("audit_against_policy: {e}"),
+            )
+            .with_subclass("admission_policy_audit_failed"),
+        },
+    }
+}
+
+fn policy_to_wire(
+    p: crate::admission_policy::AdmissionPolicy,
+) -> AdmissionPolicyWire {
+    AdmissionPolicyWire {
+        policy_id: p.policy_id,
+        name: p.name,
+        description: p.description,
+        authored_by: p.authored_by.as_str().to_string(),
+        created_at_ms: p.created_at_ms,
+        active: p.active,
+        rules: p.rules,
+    }
+}
+
+/// Conditional step-up gate. Returns the verified principal's
+/// username when the server has an `AuthService` configured AND
+/// the presented step-up token validates; returns `Ok(None)` when
+/// the server has no `AuthService` configured (legacy
+/// non-step-up behaviour for distributions that ship without the
+/// pluggable auth hook); returns `Err(response)` when an
+/// `AuthService` is configured but the token is missing /
+/// invalid / expired (the response is the structured error the
+/// caller should send back).
+///
+/// Distributions that ship without configuring an `AuthService`
+/// have no way to issue tokens — so requiring one would lock
+/// out every privileged op. Distributions that ship a real
+/// `AuthService` get full step-up enforcement on every privileged
+/// op the gate is composed onto.
+async fn maybe_validate_step_up(
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    operation: &str,
+    step_up_token: Option<&str>,
+) -> Result<Option<String>, Box<ClientResponse>> {
+    if auth_service.is_none() {
+        return Ok(None);
+    }
+    let session = validate_step_up_for_operation(
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token,
+    )
+    .await?;
+    Ok(Some(session.principal.username))
+}
+
+/// Emit an [`crate::ledger::LifecycleEventType::OperationDenied`]
+/// entry with `reason_class = capability_missing`. Helper used by
+/// every privileged-op handler at the capability-check failure
+/// site so the audit trail records denials uniformly.
+async fn emit_capability_missing(
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    operation: &str,
+    conn: &ConnectionState,
+) {
+    if let Some(ledger) = lifecycle_ledger {
+        let payload = crate::ledger::OperationDeniedPayload {
+            operation: operation.to_string(),
+            reason_class:
+                crate::ledger::OperationDenialReason::CapabilityMissing,
+            peer_uid: conn.peer.uid.unwrap_or(0),
+            peer_gid: conn.peer.gid.unwrap_or(0),
+        };
+        let approver = format!("user:{}", conn.peer.uid.unwrap_or(0));
+        if let Err(e) =
+            ledger.append_operation_denied(&approver, &payload).await
+        {
+            tracing::warn!(
+                error = %e,
+                "operation denied (capability missing): ledger append failed"
+            );
+        }
+    }
+}
+
+/// Emit an [`crate::ledger::LifecycleEventType::OperationExecuted`]
+/// entry. Inspects `response` to derive
+/// [`crate::ledger::LifecycleOutcome`] — `ClientResponse::Error`
+/// becomes `Failed { reason: "operation_failed" }`, anything else
+/// becomes `Success`. Helper used by every privileged-op handler
+/// at the post-execution site.
+async fn emit_operation_executed(
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    operation: &str,
+    capability_key: &str,
+    step_up_principal: Option<String>,
+    conn: &ConnectionState,
+    response: &ClientResponse,
+) {
+    if let Some(ledger) = lifecycle_ledger {
+        let outcome = match response {
+            ClientResponse::Error { .. } => {
+                crate::ledger::LifecycleOutcome::Failed {
+                    reason: "operation_failed".into(),
+                }
+            }
+            _ => crate::ledger::LifecycleOutcome::Success,
+        };
+        let payload = crate::ledger::OperationExecutedPayload {
+            operation: operation.to_string(),
+            capability_key: capability_key.to_string(),
+            step_up_username: step_up_principal,
+            peer_uid: conn.peer.uid.unwrap_or(0),
+            peer_gid: conn.peer.gid.unwrap_or(0),
+        };
+        let approver = format!("user:{}", conn.peer.uid.unwrap_or(0));
+        if let Err(e) = ledger
+            .append_operation_executed(&approver, &payload, outcome)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                "operation executed: ledger append failed"
+            );
+        }
+    }
+}
+
+/// Validate a step-up token presented on a privileged operation
+/// and emit the matching audit-ledger entry on the failure path.
+/// Returns the validated session on success; on failure, emits a
+/// [`crate::ledger::LifecycleEventType::OperationDenied`] entry
+/// and returns an `Err` with the [`ClientResponse`] the caller
+/// should send. On success the caller is responsible for emitting
+/// the matching `OperationExecuted` entry after the operation
+/// completes (so the ledger captures the operation's outcome).
+async fn validate_step_up_for_operation(
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    operation: &str,
+    step_up_token: Option<&str>,
+) -> Result<crate::auth::PrivilegedSession, Box<ClientResponse>> {
+    use crate::auth::SessionValidationError;
+    use crate::ledger::{OperationDenialReason, OperationDeniedPayload};
+
+    let peer_uid = conn.peer.uid.unwrap_or(0);
+    let peer_gid = conn.peer.gid.unwrap_or(0);
+    let approver = format!("user:{}", peer_uid);
+
+    let token = match step_up_token {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            let payload = OperationDeniedPayload {
+                operation: operation.to_string(),
+                reason_class: OperationDenialReason::StepUpRequired,
+                peer_uid,
+                peer_gid,
+            };
+            if let Some(ledger) = lifecycle_ledger {
+                if let Err(e) =
+                    ledger.append_operation_denied(&approver, &payload).await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "operation denied: ledger append failed"
+                    );
+                }
+            }
+            return Err(Box::new(ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::PermissionDenied,
+                    format!(
+                        "{operation}: step-up required; obtain a token via \
+                         step_up_auth_verify and present it in step_up_token"
+                    ),
+                )
+                .with_subclass("step_up_required"),
+            }));
+        }
+    };
+
+    match auth_session_store.validate(token, peer_uid) {
+        Ok(session) => Ok(session),
+        Err(err) => {
+            let reason_class = match err {
+                SessionValidationError::Unknown
+                | SessionValidationError::WrongPeer => {
+                    OperationDenialReason::StepUpInvalid
+                }
+                SessionValidationError::Expired => {
+                    OperationDenialReason::StepUpExpired
+                }
+            };
+            let payload = OperationDeniedPayload {
+                operation: operation.to_string(),
+                reason_class,
+                peer_uid,
+                peer_gid,
+            };
+            if let Some(ledger) = lifecycle_ledger {
+                if let Err(e) =
+                    ledger.append_operation_denied(&approver, &payload).await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "operation denied: ledger append failed"
+                    );
+                }
+            }
+            let (subclass, msg): (&str, &str) = match err {
+                SessionValidationError::Unknown => (
+                    "step_up_invalid",
+                    "step-up token unknown or already revoked",
+                ),
+                SessionValidationError::WrongPeer => (
+                    "step_up_invalid",
+                    "step-up token bound to a different peer",
+                ),
+                SessionValidationError::Expired => {
+                    ("step_up_expired", "step-up token expired")
+                }
+            };
+            Err(Box::new(ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::PermissionDenied,
+                    format!("{operation}: {msg}"),
+                )
+                .with_subclass(subclass),
+            }))
+        }
+    }
+}
+
+fn publisher_trust_error_to_response(
+    op: &str,
+    err: crate::publisher_trust::PublisherTrustError,
+) -> ClientResponse {
+    use crate::publisher_trust::PublisherTrustError;
+    let (class, subclass): (ErrorClass, &str) = match &err {
+        PublisherTrustError::NotFound(_) => {
+            (ErrorClass::NotFound, "publisher_not_found")
+        }
+        PublisherTrustError::Io(_) => {
+            (ErrorClass::Internal, "publisher_trust_io_failed")
+        }
+        PublisherTrustError::InvalidFingerprint(_) => {
+            (ErrorClass::ContractViolation, "invalid_fingerprint")
+        }
+        PublisherTrustError::EmptyDisplayName => {
+            (ErrorClass::ContractViolation, "empty_display_name")
+        }
+        PublisherTrustError::InvalidPem(_) => {
+            (ErrorClass::ContractViolation, "invalid_pem")
+        }
+    };
+    ClientResponse::Error {
+        error: ApiError::new(class, format!("{op}: {err}"))
+            .with_subclass(subclass),
+    }
+}
+
+async fn handle_fire_plan(
+    plan_engine: Option<&Arc<crate::plans::PlanEngine>>,
+    conn: &ConnectionState,
+    plan_id: String,
+) -> ClientResponse {
+    if !conn.has(CAPABILITY_PLANS_ADMIN) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "fire_plan: plans_admin not granted on this connection"
+                    .to_string(),
+            )
+            .with_subclass("plans_admin_not_granted"),
+        };
+    }
+    let Some(engine) = plan_engine else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "fire_plan: this server was constructed without a \
+                 plan engine handle; plan ops are unavailable"
+                    .to_string(),
+            )
+            .with_subclass("plan_engine_not_configured"),
+        };
+    };
+    let typed_id = match evo_plugin_sdk::contract::PlanId::new(&plan_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!("fire_plan: plan_id is invalid: {e}"),
+                )
+                .with_subclass("plan_id_invalid"),
+            };
+        }
+    };
+    match engine.fire_user_command(&typed_id).await {
+        Ok(()) => ClientResponse::PlanFired {
+            plan_fired: true,
+            plan_id,
+        },
+        Err(crate::plans::PlanEngineError::NotFound(_)) => {
+            ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::NotFound,
+                    format!("fire_plan: plan {plan_id} is not in the registry"),
+                )
+                .with_subclass("plan_not_in_registry"),
+            }
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("fire_plan: {e}"),
+            ),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_reload_manifest(
     engine: Option<&Arc<AsyncMutex<crate::admission::AdmissionEngine>>>,
+    auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
     conn: &ConnectionState,
     plugin: String,
     source: ReloadSourceWire,
     dry_run: bool,
+    step_up_token: Option<String>,
 ) -> ClientResponse {
+    let operation = "reload_manifest";
     let engine = match require_plugins_admin(engine, conn, "reload_manifest") {
         Ok(e) => e,
+        Err(resp) => {
+            emit_capability_missing(lifecycle_ledger, operation, conn).await;
+            return *resp;
+        }
+    };
+    let principal = match maybe_validate_step_up(
+        auth_service,
+        auth_session_store,
+        lifecycle_ledger,
+        conn,
+        operation,
+        step_up_token.as_deref(),
+    )
+    .await
+    {
+        Ok(p) => p,
         Err(resp) => return *resp,
     };
     let guard = engine.lock().await;
-    match guard
+    let response = match guard
         .reload_manifest(&plugin, source.into_manifest_source(), dry_run)
         .await
     {
@@ -5548,7 +26375,17 @@ async fn handle_reload_manifest(
             dry_run: o.dry_run,
         },
         Err(e) => lifecycle_error("reload_manifest", e),
-    }
+    };
+    emit_operation_executed(
+        lifecycle_ledger,
+        operation,
+        "plugins_admin",
+        principal,
+        conn,
+        &response,
+    )
+    .await;
+    response
 }
 
 /// Helper that gates the operator-issued `reconcile_pair_now`
@@ -5723,7 +26560,12 @@ async fn handle_reconcile_pair_now(
 /// the presence of a prompt-ledger handle. Mirrors
 /// [`require_plugins_admin`] in shape; returns the ledger or a
 /// boxed error response.
-fn require_user_interaction_responder<'a>(
+/// Capability + ledger check for responder-gated ops that are
+/// safe to call from any bearer carrying the responder scope
+/// regardless of slot ownership. Currently: only
+/// `release_user_interaction_responder`, which is idempotent
+/// same-holder-only in the ledger.
+fn require_user_interaction_responder_capability<'a>(
     ledger: Option<&'a Arc<crate::prompts::PromptLedger>>,
     conn: &ConnectionState,
     op: &'static str,
@@ -5752,6 +26594,72 @@ fn require_user_interaction_responder<'a>(
             .with_subclass("prompt_ledger_not_configured"),
         })
     })
+}
+
+/// Full responder gate: capability + ledger + single-responder
+/// runtime lock. Used by the ops that mutate or read responder-
+/// scoped state (list / answer / cancel). Refuses when the
+/// connection carries the capability scope but no session has
+/// claimed the slot (typical when the caller skipped negotiate),
+/// AND when the slot is held by a different session (typical
+/// when a second bearer minted for the responder role tries to
+/// operate while the first is still connected). Both refusals
+/// carry a structured subclass so the caller can distinguish.
+///
+/// Without this gate the single-responder property is theatre:
+/// two bearers minted for the responder role BOTH carry the
+/// scope, `conn.has(...)` returns true for both, and the
+/// runtime lock is only consulted at negotiate time. Every
+/// subsequent op would pass unchecked. This function is the
+/// enforcement point.
+fn require_user_interaction_responder<'a>(
+    ledger: Option<&'a Arc<crate::prompts::PromptLedger>>,
+    conn: &ConnectionState,
+    op: &'static str,
+) -> Result<&'a Arc<crate::prompts::PromptLedger>, Box<ClientResponse>> {
+    let ledger =
+        require_user_interaction_responder_capability(ledger, conn, op)?;
+    match ledger.current_responder() {
+        Some(id) if id == conn.connection_id => Ok(ledger),
+        Some(other) => {
+            tracing::info!(
+                op,
+                requesting_conn = conn.connection_id.0,
+                slot_holder = other.0,
+                "responder-gated op refused: slot held by a different session"
+            );
+            Err(Box::new(ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::PermissionDenied,
+                    format!(
+                        "{op}: responder slot held by a different session; \
+                         a bearer holding the capability must claim the \
+                         slot via `negotiate` before the responder-gated \
+                         ops become available on this connection"
+                    ),
+                )
+                .with_subclass("responder_slot_held_by_other"),
+            }))
+        }
+        None => {
+            tracing::info!(
+                op,
+                requesting_conn = conn.connection_id.0,
+                "responder-gated op refused: no session has claimed the slot"
+            );
+            Err(Box::new(ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::PermissionDenied,
+                    format!(
+                        "{op}: bearer holds the responder capability but \
+                         no session has claimed the slot; call `negotiate` \
+                         first to claim the responder role"
+                    ),
+                )
+                .with_subclass("responder_slot_unclaimed"),
+            }))
+        }
+    }
 }
 
 /// Read-only snapshot of every Open prompt. Capability-gated
@@ -5931,6 +26839,50 @@ fn project_appointment_entry(
         next_fire_ms,
         fires_completed: u64::from(entry.fires_completed),
         last_fired_ms: entry.last_fired_at_ms,
+    }
+}
+
+/// Operator-issued release of the responder slot the calling
+/// bearer currently holds. Capability-gated by
+/// `user_interaction_responder` (which the caller must already
+/// have negotiated for the release to be meaningful — a caller
+/// without the capability could not have claimed the slot in
+/// the first place).
+///
+/// Idempotent by construction: [`PromptLedger::release_responder`]
+/// is a same-holder-only clear, so calling this from a bearer
+/// that does not hold the slot (either because a different
+/// bearer holds it, or because the slot is already vacant) is a
+/// no-op. The response's `responder_released` field is always
+/// `true` because the post-condition (this bearer does not hold
+/// the slot) is satisfied in every case.
+///
+/// Intended use: the operator UI calls this on explicit log-out
+/// or on tab-close so a different bearer can claim without
+/// waiting for token TTL. See the responder-slot HTTPS session
+/// stability contract at
+/// [`connection_id_for_principal`].
+fn handle_release_user_interaction_responder(
+    ledger: Option<&Arc<crate::prompts::PromptLedger>>,
+    conn: &ConnectionState,
+) -> ClientResponse {
+    // Uses the capability-only gate (not the slot-holder gate)
+    // because release is idempotent on `PromptLedger::release_responder`
+    // — same-holder-only clear, no-op otherwise. A caller that
+    // holds the capability but not the slot gets a truthful
+    // `responder_released: true` because the post-condition
+    // (this caller does not hold the slot) is satisfied.
+    let ledger = match require_user_interaction_responder_capability(
+        ledger,
+        conn,
+        "release_user_interaction_responder",
+    ) {
+        Ok(l) => l,
+        Err(resp) => return *resp,
+    };
+    ledger.release_responder(conn.connection_id);
+    ClientResponse::UserInteractionResponderReleased {
+        responder_released: true,
     }
 }
 
@@ -6535,13 +27487,40 @@ async fn handle_migrate_grammar_orphans(
 /// first) or will arrive on it. The replay query may itself
 /// include events with seq > current_seq if emits happened during
 /// the persistence read; those are deduped by the live filter.
+// The keepalive parameter is the newest bit here; the underlying
+// select! already handles the three concerns (bus receive,
+// coalescer flush, subscriber write) and adding a fourth is
+// additive. Bundling into a struct would move the plumbing one
+// hop away without changing the number of moving parts the
+// reader has to follow.
+#[allow(clippy::too_many_arguments)]
 async fn run_subscription(
     mut stream: UnixStream,
     state: Arc<StewardState>,
     since: Option<u64>,
     filter: HappeningFilter,
     mut coalescer: Option<crate::coalescer::Coalescer>,
+    keepalive_ms: Option<u64>,
 ) -> Result<(), StewardError> {
+    // Increment the per-subject-type interest counter for every
+    // subject_type this subscription's filter allow-lists. This
+    // is the produce-iff-consumed hook for the
+    // `subscribe_happenings` path — the UI consumes the
+    // spectrum via a happenings subscription filtered by
+    // subject_type, not via `subscribe_subject`. Without this
+    // hook the interest counter stays at zero and terminus
+    // parks its capture path despite a live viewer. Guard
+    // decrements on any exit path so the count reflects live
+    // subscribers exactly.
+    let interest_subject_types: Vec<String> = filter.subject_types.clone();
+    for st in &interest_subject_types {
+        state.subjects.increment_interest(st).await;
+    }
+    let _interest_guard = HappeningsInterestGuard::new(
+        Arc::clone(&state),
+        interest_subject_types,
+    );
+
     // Subscribe first so events emitted concurrently with the
     // persistence read are buffered, not lost. The subscribe and the
     // current_seq sample are taken under the same emit_lock the bus
@@ -6682,6 +27661,17 @@ async fn run_subscription(
         0
     };
 
+    // Clamp keepalive to the safe range: below 1 s would burn
+    // wire budget on a busy fleet; above 60 s defeats the
+    // watchdog purpose. `None` disables heartbeats entirely
+    // (pre-keepalive behaviour, no wire change for legacy
+    // consumers).
+    let keepalive_period_ms = keepalive_ms.map(|ms| ms.clamp(1_000, 60_000));
+    let mut next_keepalive_at: Option<std::time::Instant> = keepalive_period_ms
+        .map(|ms| {
+            std::time::Instant::now() + std::time::Duration::from_millis(ms)
+        });
+
     loop {
         // When a coalescer is active, drive a `select!` between the
         // bus receiver and a sleep-until the next pending bucket
@@ -6691,6 +27681,17 @@ async fn run_subscription(
         let sleep_fut: std::pin::Pin<
             Box<dyn std::future::Future<Output = ()> + Send>,
         > = match next_deadline {
+            Some(deadline) => Box::pin(tokio::time::sleep_until(
+                tokio::time::Instant::from_std(deadline),
+            )),
+            None => Box::pin(std::future::pending()),
+        };
+
+        // Keepalive sleep — pends forever when the request did not
+        // opt in, or waits for the next scheduled tick when it did.
+        let keepalive_fut: std::pin::Pin<
+            Box<dyn std::future::Future<Output = ()> + Send>,
+        > = match next_keepalive_at {
             Some(deadline) => Box::pin(tokio::time::sleep_until(
                 tokio::time::Instant::from_std(deadline),
             )),
@@ -6809,8 +27810,44 @@ async fn run_subscription(
                     }
                 }
             }
+            _ = keepalive_fut => {
+                // Application-level keepalive tick — emits a
+                // frame the subscriber can watchdog against.
+                // Independent of the happening flow: fires even
+                // when the bus is quiet AND when it is busy
+                // (bounded cost — the write is a single small
+                // frame, and the reschedule below pushes the
+                // next fire out by the full period regardless
+                // of jitter).
+                let frame = ClientResponse::HappeningsKeepalive {
+                    happenings_keepalive: true,
+                    ts_ms: wall_clock_ms(),
+                };
+                if write_response_frame(&mut stream, &frame)
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                if let Some(period_ms) = keepalive_period_ms {
+                    next_keepalive_at = Some(
+                        std::time::Instant::now()
+                            + std::time::Duration::from_millis(period_ms),
+                    );
+                }
+            }
         }
     }
+}
+
+/// Wall-clock milliseconds since the UNIX epoch. Used by the
+/// subscribe keepalive frames so a consumer can compute cadence
+/// drift. Zero on the impossible pre-1970 clock case.
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Project a subject and send the result as a `ProjectionUpdate`
@@ -6861,9 +27898,161 @@ async fn project_and_send_subject(
 /// affecting the subject (per
 /// [`Happening::affects_subject`]) is emitted on the bus.
 ///
-/// Live-only at v0.1.11: no `since` cursor, no durable replay.
-/// Consumers reconnecting always fetch a fresh initial
-/// projection.
+/// Scope guard: decrements the per-subject-type interest counter
+/// on drop. Ensures the count reflects the actual number of live
+/// subscriber connections regardless of which exit path the
+/// subscription task takes (loop break, keepalive-write failure,
+/// task cancellation).
+struct InterestGuard {
+    state: Arc<StewardState>,
+    subject_type: Option<String>,
+}
+
+impl InterestGuard {
+    fn new(state: Arc<StewardState>, subject_type: Option<String>) -> Self {
+        Self {
+            state,
+            subject_type,
+        }
+    }
+}
+
+impl Drop for InterestGuard {
+    fn drop(&mut self) {
+        let st = match self.subject_type.take() {
+            Some(st) => st,
+            None => return,
+        };
+        let state = Arc::clone(&self.state);
+        // decrement_interest is async; spawn on the runtime.
+        // Best-effort — if the runtime is shutting down, the
+        // steward is exiting anyway.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                state.subjects.decrement_interest(&st).await;
+            });
+        }
+    }
+}
+
+/// Scope guard: decrements the per-subject-type interest
+/// counter for every subject_type a `subscribe_happenings`
+/// subscription allow-listed. Ensures the count reflects live
+/// happenings-subscribers regardless of exit path. Multi-type
+/// filters produce one increment per type on entry and one
+/// decrement per type on drop.
+struct HappeningsInterestGuard {
+    state: Arc<StewardState>,
+    subject_types: Vec<String>,
+}
+
+impl HappeningsInterestGuard {
+    fn new(state: Arc<StewardState>, subject_types: Vec<String>) -> Self {
+        Self {
+            state,
+            subject_types,
+        }
+    }
+}
+
+impl Drop for HappeningsInterestGuard {
+    fn drop(&mut self) {
+        if self.subject_types.is_empty() {
+            return;
+        }
+        let types = std::mem::take(&mut self.subject_types);
+        let state = Arc::clone(&self.state);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                for st in types {
+                    state.subjects.decrement_interest(&st).await;
+                }
+            });
+        }
+    }
+}
+
+/// Same discipline as [`HappeningsInterestGuard`] but scoped to a
+/// WSS-side subscription stream. The stream wrapper
+/// [`WssInterestStream`] holds one of these; when the stream drops
+/// (client disconnect, server shutdown, HTTP layer cancel), the
+/// guard drops and the decrement fires. The WSS server always runs
+/// on a live tokio runtime, so `Handle::try_current()` succeeds
+/// deterministically — the "best-effort" path only matters for
+/// process-teardown paths where the runtime is already gone and
+/// the decrement is moot.
+struct WssInterestGuard {
+    state: Arc<StewardState>,
+    subject_types: Vec<String>,
+}
+
+impl WssInterestGuard {
+    fn new(state: Arc<StewardState>, subject_types: Vec<String>) -> Self {
+        Self {
+            state,
+            subject_types,
+        }
+    }
+}
+
+impl Drop for WssInterestGuard {
+    fn drop(&mut self) {
+        if self.subject_types.is_empty() {
+            return;
+        }
+        let types = std::mem::take(&mut self.subject_types);
+        let state = Arc::clone(&self.state);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                for st in types {
+                    state.subjects.decrement_interest(&st).await;
+                }
+            });
+        }
+    }
+}
+
+/// Wraps a subscription event stream + a [`WssInterestGuard`] so
+/// the guard's lifetime is bound to the stream's. The guard drops
+/// when the stream is dropped by the HTTP layer, firing the
+/// decrement. Delegates `Stream` to the inner without observing
+/// any items — pure lifetime binding.
+struct WssInterestStream<S> {
+    inner: S,
+    _guard: WssInterestGuard,
+}
+
+impl<S> WssInterestStream<S> {
+    fn new(inner: S, guard: WssInterestGuard) -> Self {
+        Self {
+            inner,
+            _guard: guard,
+        }
+    }
+}
+
+impl<S> futures::Stream for WssInterestStream<S>
+where
+    S: futures::Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+/// Live-only in the current substrate: no `since` cursor, no
+/// durable replay. Consumers reconnecting always fetch a fresh
+/// initial projection.
+#[allow(clippy::too_many_arguments)]
 async fn run_subject_subscription(
     mut stream: UnixStream,
     state: Arc<StewardState>,
@@ -6871,6 +28060,8 @@ async fn run_subject_subscription(
     canonical_id: String,
     scope: ProjectionScope,
     follow_aliases: bool,
+    snapshot_in_ack: bool,
+    keepalive_ms: Option<u64>,
 ) -> Result<(), StewardError> {
     // Resolve the alias chain so the subscription binds to the
     // terminal id when follow_aliases is set. Without
@@ -6958,82 +28149,185 @@ async fn run_subject_subscription(
         }
     };
 
+    // Increment the per-subject-type interest counter and hold
+    // a guard that decrements on connection close (any exit
+    // path — happy loop break, keepalive-write failure, task
+    // cancellation). Producer plugins observing the counter
+    // via `SubjectRegistry::interest_receiver` see subscribe /
+    // unsubscribe transitions and can park compute when the
+    // count reaches zero.
+    let interest_subject_type: Option<String> = state
+        .subjects
+        .describe(&effective_id)
+        .map(|r| r.subject_type);
+    if let Some(st) = interest_subject_type.as_deref() {
+        state.subjects.increment_interest(st).await;
+    }
+    let _interest_guard =
+        InterestGuard::new(Arc::clone(&state), interest_subject_type.clone());
+
     // Subscribe before sampling current_seq so events emitted
     // concurrently with the initial projection are buffered, not
     // lost. Same invariant as `run_subscription`.
     let (mut rx, current_seq) = state.bus.subscribe_with_current_seq().await;
 
+    // Snapshot-in-ack path: compute the initial projection
+    // BEFORE writing the ack so the ack itself carries the
+    // authoritative initial state. Suppresses the separate
+    // `seq = 0` follow-up so the consumer sees exactly one
+    // authoritative source of truth.
+    //
+    // Legacy path (`snapshot_in_ack = false`): the ack goes out
+    // first, then the separate `seq = 0` `ProjectionUpdate` —
+    // preserving the pre-existing wire shape byte-for-byte for
+    // consumers that did not opt in.
+    let initial_projection_value = if snapshot_in_ack {
+        Some(compute_projection_wire_value(
+            &projections,
+            &state.claimant_issuer,
+            &scope,
+            &effective_id,
+        ))
+    } else {
+        None
+    };
+
     let ack = ClientResponse::SubscribedSubject {
         subscribed_subject: true,
         canonical_id: effective_id.clone(),
         current_seq,
+        initial_projection: initial_projection_value,
     };
     if write_response_frame(&mut stream, &ack).await.is_err() {
         return Ok(());
     }
 
-    // Initial snapshot. Marked with seq = 0 to signal "snapshot,
-    // not driven by a specific event"; subsequent updates carry
-    // the bus seq of the triggering happening.
-    if !project_and_send_subject(
-        &mut stream,
-        &projections,
-        &state.claimant_issuer,
-        &scope,
-        &effective_id,
-        0,
-    )
-    .await
+    // Follow-up snapshot only for consumers that did not opt
+    // into `snapshot_in_ack`. Marked with seq = 0 to signal
+    // "snapshot, not driven by a specific event"; subsequent
+    // updates carry the bus seq of the triggering happening.
+    if !snapshot_in_ack
+        && !project_and_send_subject(
+            &mut stream,
+            &projections,
+            &state.claimant_issuer,
+            &scope,
+            &effective_id,
+            0,
+        )
+        .await
     {
         return Ok(());
     }
+
+    // Same keepalive shape as `run_subscription` — opt-in
+    // cadence, clamped 1_000..=60_000, `None` disables entirely.
+    let keepalive_period_ms = keepalive_ms.map(|ms| ms.clamp(1_000, 60_000));
+    let mut next_keepalive_at: Option<std::time::Instant> = keepalive_period_ms
+        .map(|ms| {
+            std::time::Instant::now() + std::time::Duration::from_millis(ms)
+        });
 
     // Live phase. Forward a fresh projection on every happening
     // that affects the subject. The bus subscription is dropped
     // when this function returns.
     loop {
-        match rx.recv().await {
-            Ok(env) => {
-                if !env.happening.affects_subject(&effective_id) {
-                    continue;
+        // Keepalive sleep — pends forever when the request did
+        // not opt in, otherwise waits for the next scheduled
+        // tick.
+        let keepalive_fut: std::pin::Pin<
+            Box<dyn std::future::Future<Output = ()> + Send>,
+        > = match next_keepalive_at {
+            Some(deadline) => Box::pin(tokio::time::sleep_until(
+                tokio::time::Instant::from_std(deadline),
+            )),
+            None => Box::pin(std::future::pending()),
+        };
+
+        tokio::select! {
+            recv_result = rx.recv() => {
+                match recv_result {
+                    Ok(env) => {
+                        if !env.happening.affects_subject(&effective_id) {
+                            continue;
+                        }
+                        if !project_and_send_subject(
+                            &mut stream,
+                            &projections,
+                            &state.claimant_issuer,
+                            &scope,
+                            &effective_id,
+                            env.seq,
+                        )
+                        .await
+                        {
+                            return Ok(());
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(missed_count)) => {
+                        // Subscriber fell behind. Surface a structured
+                        // signal mirroring the happenings-stream Lagged
+                        // shape and exit. Consumers reconnect to get a
+                        // fresh subscription.
+                        let oldest_available_seq = state
+                            .persistence
+                            .load_oldest_happening_seq()
+                            .await
+                            .unwrap_or(0);
+                        let frame = ClientResponse::Lagged {
+                            lagged: LaggedSignal {
+                                missed_count,
+                                oldest_available_seq,
+                                current_seq: state.bus.last_emitted_seq(),
+                            },
+                        };
+                        let _ = write_response_frame(&mut stream, &frame).await;
+                        return Ok(());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Ok(());
+                    }
                 }
-                if !project_and_send_subject(
-                    &mut stream,
-                    &projections,
-                    &state.claimant_issuer,
-                    &scope,
-                    &effective_id,
-                    env.seq,
-                )
-                .await
+            }
+            _ = keepalive_fut => {
+                let frame = ClientResponse::SubjectKeepalive {
+                    subject_keepalive: true,
+                    canonical_id: effective_id.clone(),
+                    ts_ms: wall_clock_ms(),
+                };
+                if write_response_frame(&mut stream, &frame)
+                    .await
+                    .is_err()
                 {
                     return Ok(());
                 }
-            }
-            Err(broadcast::error::RecvError::Lagged(missed_count)) => {
-                // Subscriber fell behind. Surface a structured
-                // signal mirroring the happenings-stream Lagged
-                // shape and exit. Consumers reconnect to get a
-                // fresh subscription.
-                let oldest_available_seq = state
-                    .persistence
-                    .load_oldest_happening_seq()
-                    .await
-                    .unwrap_or(0);
-                let frame = ClientResponse::Lagged {
-                    lagged: LaggedSignal {
-                        missed_count,
-                        oldest_available_seq,
-                        current_seq: state.bus.last_emitted_seq(),
-                    },
-                };
-                let _ = write_response_frame(&mut stream, &frame).await;
-                return Ok(());
-            }
-            Err(broadcast::error::RecvError::Closed) => {
-                return Ok(());
+                if let Some(period_ms) = keepalive_period_ms {
+                    next_keepalive_at = Some(
+                        std::time::Instant::now()
+                            + std::time::Duration::from_millis(period_ms),
+                    );
+                }
             }
         }
+    }
+}
+
+/// Compute the subject's projection wire value for the
+/// snapshot-in-ack path. Never fails visibly: an unknown
+/// subject resolves to JSON `null` (mirroring
+/// [`project_and_send_subject`]'s behaviour on the same case).
+fn compute_projection_wire_value(
+    projections: &ProjectionEngine,
+    issuer: &ClaimantTokenIssuer,
+    scope: &ProjectionScope,
+    canonical_id: &str,
+) -> serde_json::Value {
+    match projections.project_subject(canonical_id, scope) {
+        Ok(p) => {
+            let wire = SubjectProjectionWire::from_projection(p, issuer);
+            serde_json::to_value(&wire).unwrap_or(serde_json::Value::Null)
+        }
+        Err(ProjectionError::UnknownSubject(_)) => serde_json::Value::Null,
     }
 }
 
@@ -7043,6 +28337,7 @@ async fn run_subject_subscription(
 /// mutex is acquired, so concurrent client requests addressed at
 /// different shelves run truly in parallel rather than serialising on
 /// the engine lock.
+#[allow(clippy::too_many_arguments)]
 async fn handle_plugin_request(
     router: &Arc<PluginRouter>,
     state: &Arc<StewardState>,
@@ -7050,6 +28345,8 @@ async fn handle_plugin_request(
     request_type: String,
     payload_b64: String,
     instance_id: Option<String>,
+    granted_capabilities: &HashSet<String>,
+    step_up_scopes: &HashSet<String>,
 ) -> ClientResponse {
     let payload = match B64.decode(&payload_b64) {
         Ok(p) => p,
@@ -7064,6 +28361,224 @@ async fn handle_plugin_request(
         }
     };
 
+    // Per-verb capability gate. Look up the
+    // plugin's manifest-derived enforcement policy and consult
+    // `respondent_verb_capabilities[request_type]`. The declared
+    // requirement (when present) is checked against the
+    // principal's granted-capabilities set + step-up-scopes set
+    // BEFORE the request is forwarded into the router. A failed
+    // check refuses with `permission_denied` and never reaches
+    // the plugin; the plugin only ever sees requests its declared
+    // capability scope admitted. Verbs whose manifest entry is
+    // absent or `VerbCapability::None` pass through unchanged —
+    // the legacy default (anonymous-OK) preserved for manifests
+    // authored before this field existed.
+    // Verb-aware lookup. Multi-occupant respondent shelves
+    // disambiguate by verb: the verb belongs to exactly one
+    // occupant's stocking (the partition gate at admission
+    // refuses overlapping verbs across co-occupants). Falls
+    // back to the first occupant when no stocking carries the
+    // verb so the partition gate below can surface a structured
+    // `verb_not_stocked_on_shelf` refusal naming the actual
+    // occupant the operator is looking at.
+    let routed_entry = router
+        .lookup_for_verb(&shelf, &request_type)
+        .or_else(|| router.lookup(&shelf));
+    let (principal_scope, has_step_up) = match routed_entry {
+        Some(entry) => {
+            // Per-shelf partition gate. Multi-stocking
+            // plugins partition their full `request_types` set
+            // across stockings; the dispatcher routes the verb via
+            // the stocking whose shelf the request names. A verb
+            // arriving at a shelf that doesn't carry it refuses
+            // with `not_found` regardless of capability scope.
+            //
+            // For single-stocking plugins (legacy `[target]` form
+            // or one-element `[[stockings]]`) the partition gate
+            // is structurally trivial: the stocking owns every
+            // verb. For multi-stocking the gate enforces the
+            // Stocking primitive invariant — one verb belongs to exactly
+            // one stocking, and dispatch must hit the right one.
+            //
+            // Empty `stockings` (legacy entries created via
+            // PluginEntry::new without `with_stockings`) bypasses
+            // the gate — the plugin-level enforcement policy below
+            // is the only check. New admission paths always
+            // populate stockings.
+            if !entry.stockings.is_empty()
+                && entry.stocking_on(&shelf).is_some_and(|s| {
+                    !s.request_types.iter().any(|v| v == &request_type)
+                })
+            {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::NotFound,
+                        format!(
+                            "verb {request_type:?} is not stocked on \
+                             shelf {shelf:?} (plugin {plugin:?} \
+                             partitions this verb to a different \
+                             stocking)",
+                            plugin = entry.name
+                        ),
+                    )
+                    .with_subclass("verb_not_stocked_on_shelf"),
+                };
+            }
+            let policy = entry.load_policy();
+            match policy.respondent_verb_capabilities.get(&request_type) {
+                Some(evo_plugin_sdk::manifest::VerbCapability::None) | None => {
+                    (None, false)
+                }
+                Some(evo_plugin_sdk::manifest::VerbCapability::Read {
+                    scope,
+                })
+                | Some(evo_plugin_sdk::manifest::VerbCapability::Write {
+                    scope,
+                }) => {
+                    if !granted_capabilities.contains(scope) {
+                        return ClientResponse::Error {
+                            error: ApiError::new(
+                                ErrorClass::PermissionDenied,
+                                format!(
+                                    "verb {request_type:?} requires \
+                                     capability scope {scope:?}; principal \
+                                     does not hold it"
+                                ),
+                            )
+                            .with_subclass("verb_capability_scope_not_granted"),
+                        };
+                    }
+                    (Some(scope.clone()), false)
+                }
+                Some(evo_plugin_sdk::manifest::VerbCapability::StepUp {
+                    scope,
+                }) => {
+                    if !granted_capabilities.contains(scope) {
+                        return ClientResponse::Error {
+                            error: ApiError::new(
+                                ErrorClass::PermissionDenied,
+                                format!(
+                                    "verb {request_type:?} requires \
+                                     step-up capability scope {scope:?}; \
+                                     principal does not hold the write \
+                                     scope"
+                                ),
+                            )
+                            .with_subclass("verb_capability_scope_not_granted"),
+                        };
+                    }
+                    if !step_up_scopes.contains(scope) {
+                        return ClientResponse::Error {
+                            error: ApiError::new(
+                                ErrorClass::PermissionDenied,
+                                format!(
+                                    "verb {request_type:?} requires active \
+                                     step-up auth on scope {scope:?}; \
+                                     principal holds the write scope but \
+                                     no step-up session"
+                                ),
+                            )
+                            .with_subclass("step_up_required"),
+                        };
+                    }
+                    (Some(scope.clone()), true)
+                }
+            }
+        }
+        // No plugin admitted on this shelf — the router will refuse
+        // dispatch with a no-plugin error below; we don't gate here
+        // because the verb has nowhere to land regardless.
+        None => (None, false),
+    };
+
+    // Warden custody bootstrap for warden+respondent plugins.
+    //
+    // The `request` op routes directly through
+    // `router.handle_request` and therefore bypasses the
+    // source-verb dispatcher's custody-acquisition step.
+    // Warden+respondent plugins (e.g. an audio playback warden
+    // that owns music URI schemes and also exposes its transport
+    // surface as source verbs) expect their warden surface to
+    // hold custody so the supervisor task runs and the plugin's
+    // `handle_request` body can find the active custody handle.
+    // Without this bootstrap the plugin's handle_request refuses
+    // with "no active custody on the warden".
+    //
+    // Idempotence is plugin-side. The framework always attempts
+    // bootstrap; the plugin's `take_custody` is expected to be
+    // idempotent — when custody is already held, return the
+    // existing handle without spawning a duplicate supervisor.
+    // Framework-side ledger snapshots cannot be the idempotence
+    // signal because the ledger survives steward restart while
+    // plugin in-memory custody state does not; relying on the
+    // ledger would mistakenly skip bootstrap after restart and
+    // leave the plugin with no custody to dispatch against.
+    //
+    // Mirrors the bootstrap semantics in
+    // `source_verb_dispatch::dispatch_inner` so the two dispatch
+    // surfaces (request op + source-verb dispatcher) deliver the
+    // same custody-acquisition behaviour to plugin authors.
+    // Verb-aware lookup — multi-occupant respondent shelves
+    // disambiguate by the requested verb. Custody verbs route
+    // through this same path; warden shelves are structurally
+    // single-occupant, so the lookup_for_verb fallback resolves
+    // to the sole warden when the verb is one of its custody
+    // primitives.
+    if let Some(entry) = router
+        .lookup_for_verb(&shelf, &request_type)
+        .or_else(|| router.lookup(&shelf))
+    {
+        if let Some(manifest) = entry.current_manifest() {
+            let is_warden_with_respondent =
+                manifest.kind.as_ref().is_some_and(|k| {
+                    k.interaction
+                        == evo_plugin_sdk::manifest::InteractionShape::Warden
+                }) && manifest.capabilities.respondent.is_some();
+            let request_type_is_respondent =
+                manifest.capabilities.respondent.as_ref().is_some_and(|r| {
+                    r.request_types.iter().any(|t| t == &request_type)
+                });
+            if is_warden_with_respondent && request_type_is_respondent {
+                let custody_domain = manifest
+                    .capabilities
+                    .warden
+                    .as_ref()
+                    .map(|w| w.custody_domain.clone())
+                    .unwrap_or_default();
+                let shelf_for_take = entry.shelf.clone();
+                if let Err(e) = router
+                    .take_custody(
+                        &shelf_for_take,
+                        custody_domain,
+                        Vec::new(),
+                        None,
+                    )
+                    .await
+                {
+                    // LOGGING.md §2: warn (recoverable anomaly —
+                    // bootstrap failed but the request path
+                    // continues; plugin may have its own custody,
+                    // operator should review if requests fail).
+                    tracing::warn!(
+                        error = %e,
+                        shelf = %shelf_for_take,
+                        request_type = %request_type,
+                        "request op: warden custody bootstrap failed; \
+                         proceeding with handle_request anyway (plugin \
+                         may have own existing custody)"
+                    );
+                } else {
+                    tracing::debug!(
+                        shelf = %shelf_for_take,
+                        request_type = %request_type,
+                        "request op: warden custody bootstrapped before \
+                         handle_request"
+                    );
+                }
+            }
+        }
+    }
+
     let cid = NEXT_CID.fetch_add(1, Ordering::Relaxed);
     let sdk_request = Request {
         request_type: request_type.clone(),
@@ -7071,6 +28586,8 @@ async fn handle_plugin_request(
         correlation_id: cid,
         deadline: None,
         instance_id,
+        principal_scope,
+        has_step_up,
     };
 
     let result = router.handle_request(&shelf, sdk_request).await;
@@ -7099,9 +28616,15 @@ async fn handle_plugin_request(
 }
 
 /// Emit framework-declared happenings on successful dispatch of
-/// well-known operator-issued ops. Currently covers
-/// `flight_mode.set` against any `flight_mode.<class>` shelf;
-/// future framework-declared variants extend the match arm here.
+/// well-known operator-issued ops. Covers:
+///
+/// - `flight_mode.set` against any `flight_mode.<class>` shelf.
+/// - `network.nm.flight_mode.set` on `networking.link` (the
+///   reference Wi-Fi / radio artery — one bus emission, no
+///   plugin-side PluginEvent duplicate; every wireless-rack
+///   consumer subscribes to `FlightModeChanged { rack_class:
+///   "wireless" }` alone).
+///
 /// Failures to emit are logged at `warn` and do not affect the
 /// caller's response — the dispatch already succeeded; the
 /// audit-trail is best-effort durable.
@@ -7111,37 +28634,51 @@ async fn emit_post_dispatch_happening(
     request_type: &str,
     payload: &[u8],
 ) {
-    if let Some(rack_class) = shelf.strip_prefix("flight_mode.") {
-        if request_type == "flight_mode.set" {
-            let on = parse_flight_mode_set_on(payload);
-            let happening = crate::happenings::Happening::FlightModeChanged {
-                rack_class: rack_class.to_string(),
-                on,
-                at: std::time::SystemTime::now(),
-            };
-            if let Err(e) = state.bus.emit_durable(happening).await {
-                tracing::warn!(
-                    error = %e,
-                    rack_class = %rack_class,
-                    on = on,
-                    "post-dispatch FlightModeChanged emission failed"
-                );
+    let rack_class: Option<String> =
+        if let Some(class) = shelf.strip_prefix("flight_mode.") {
+            if request_type == "flight_mode.set" {
+                Some(class.to_string())
+            } else {
+                None
             }
+        } else if shelf == "networking.link"
+            && request_type == "network.nm.flight_mode.set"
+        {
+            // Catalogue acceptance: rack_class = "wireless".
+            Some("wireless".to_string())
+        } else {
+            None
+        };
+    if let Some(rack_class) = rack_class {
+        let on = parse_flight_mode_set_on(payload);
+        let happening = crate::happenings::Happening::FlightModeChanged {
+            rack_class: rack_class.clone(),
+            on,
+            at: std::time::SystemTime::now(),
+        };
+        if let Err(e) = state.bus.emit_durable(happening).await {
+            tracing::warn!(
+                error = %e,
+                rack_class = %rack_class,
+                on = on,
+                "post-dispatch FlightModeChanged emission failed"
+            );
         }
     }
 }
 
-/// Best-effort `on` extractor from a `flight_mode.set` payload.
-/// The payload format is `{ "on": <bool> }` per
-/// `evo-plugin-tool admin flight set`. Malformed / non-bool
-/// payloads default to `true` (the same disposition the framework
-/// would draw if the plugin's handler returned success on a
-/// malformed request — the audit trail records "something
-/// happened" rather than dropping the emission silently).
+/// Best-effort `on` extractor from a flight-mode set payload.
+/// Accepts `{ "on": <bool> }` (admin CLI) and `{ "enabled": <bool> }`
+/// (`network.nm.flight_mode.set`). Malformed / non-bool payloads
+/// default to `true` so the audit trail records the transition.
 fn parse_flight_mode_set_on(payload: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(payload)
         .ok()
-        .and_then(|v| v.get("on").and_then(|x| x.as_bool()))
+        .and_then(|v| {
+            v.get("on")
+                .or_else(|| v.get("enabled"))
+                .and_then(|x| x.as_bool())
+        })
         .unwrap_or(true)
 }
 
@@ -7350,7 +28887,7 @@ fn handle_project_rack(
                 // mid-unload. Both paths gracefully fall back to
                 // `unknown` rather than blocking the projection
                 // call.
-                let interaction_kind = match entry.handle.try_lock() {
+                let interaction_kind = match entry.handle.try_read() {
                     Ok(guard) => guard
                         .as_ref()
                         .map(|h| h.kind_name().to_string())
@@ -7406,17 +28943,19 @@ async fn handle_list_plugins(
     let entries = router.entries_in_order();
     let mut plugins = Vec::with_capacity(entries.len());
     for entry in entries {
-        let interaction_kind = match entry.handle.try_lock() {
+        let interaction_kind = match entry.handle.try_read() {
             Ok(guard) => guard
                 .as_ref()
                 .map(|h| h.kind_name().to_string())
                 .unwrap_or_else(|| "unknown".into()),
             Err(_) => "unknown".into(),
         };
+        let lifecycle_mode = read_lifecycle_mode_string(&entry);
         plugins.push(PluginInventoryEntry {
             name: entry.name.clone(),
             shelf: entry.shelf.clone(),
             interaction_kind,
+            lifecycle_mode,
         });
     }
 
@@ -7808,55 +29347,24 @@ fn handle_enumerate_addressings(
 /// incompatibly. Adding a new op or feature does NOT bump this.
 const CLIENT_WIRE_VERSION: u16 = 1;
 
-/// Op names this build accepts on the client socket.
-///
-/// Stable across releases — new ops are appended; existing ops are
-/// never renamed or removed without bumping
-/// [`CLIENT_WIRE_VERSION`]. Mirrors the variant set in
-/// [`ClientRequest`].
-const SUPPORTED_OPS: &[&str] = &[
-    "request",
-    "project_subject",
-    "project_rack",
-    "list_plugins",
-    "describe_alias",
-    "list_active_custodies",
-    "list_subjects",
-    "list_relations",
-    "enumerate_addressings",
-    "subscribe_happenings",
-    "subscribe_subject",
-    "describe_capabilities",
-    "negotiate",
-    "resolve_claimants",
-    "enable_plugin",
-    "disable_plugin",
-    "uninstall_plugin",
-    "purge_plugin_state",
-    "reload_catalogue",
-    "reload_manifest",
-    "reload_plugin",
-    "take_custody",
-    "course_correct",
-    "release_custody",
-    "list_reconciliation_pairs",
-    "project_reconciliation_pair",
-    "reconcile_pair_now",
-    "list_user_interactions",
-    "answer_user_interaction",
-    "cancel_user_interaction",
-    "create_appointment",
-    "cancel_appointment",
-    "list_appointments",
-    "project_appointment",
-    "create_watch",
-    "cancel_watch",
-    "list_watches",
-    "project_watch",
-    "list_grammar_orphans",
-    "accept_grammar_orphans",
-    "migrate_grammar_orphans",
-];
+// Op names the steward accepts on the client socket are derived
+// from the canonical wire-op schema in
+// `crate::projection_schema::canonical_schema` via
+// `crate::projection_schema::runtime_op_ids`. The
+// `describe_capabilities` handler reads its `ops` list directly
+// from that single source of truth so the runtime response, the
+// schema-discipline registry, and every downstream schema-first
+// generator stay aligned by construction.
+//
+// Prior shape held a parallel `const SUPPORTED_OPS: &[&str]`
+// array here. The duplication produced silent drift across many
+// release cycles: handlers + ClientRequest variants + schema
+// entries landed without their SUPPORTED_OPS twin, and
+// capability-discovery consumers (UIs that feature-gate on
+// describe_capabilities) could not see the affected ops despite
+// the dispatch path being live. The parallel array is retired;
+// adding a new wire op is one registry edit (the schema entry)
+// and the runtime response reflects it automatically.
 
 /// Named features this build supports.
 ///
@@ -7946,15 +29454,17 @@ const SUPPORTED_FEATURES: &[&str] = &[
 fn describe_capabilities(
     catalogue_source: &'static str,
     clock_trust: &'static str,
+    last_clock_step: Option<crate::time_trust::LastClockStep>,
     has_battery_rtc: bool,
 ) -> ClientResponse {
     ClientResponse::Capabilities {
         capabilities: true,
         wire_version: CLIENT_WIRE_VERSION,
-        ops: SUPPORTED_OPS.to_vec(),
+        ops: crate::projection_schema::runtime_op_ids(),
         features: SUPPORTED_FEATURES.to_vec(),
         catalogue_source,
         clock_trust,
+        last_clock_step,
         has_battery_rtc,
         coalesce_labels: build_coalesce_labels_map(),
     }
@@ -8012,6 +29522,9 @@ fn build_coalesce_labels_map(
         "catalogue_invalid",
         "cardinality_violation",
         "plugin_admission_skipped",
+        "plugin_reload_dispatched",
+        "plugin_degraded",
+        "plugin_restored",
         "reconciliation_applied",
         "reconciliation_failed",
     ] {
@@ -8021,6 +29534,337 @@ fn build_coalesce_labels_map(
         }
     }
     map
+}
+
+// ---------------------------------------------------------------------
+// HTTPS wire-op adapter
+// ---------------------------------------------------------------------
+
+/// Errors produced by [`Server::dispatch_http_wire_op`] before the
+/// request even reaches the canonical dispatch path.
+///
+/// Dispatch-time failures the framework classified as refusals
+/// (capability denied, plugin not admitted, no responder,
+/// application error) surface as [`HttpDispatchError::RequestRefused`]
+/// carrying the HTTP status derived from the error class AND the
+/// full response body. The HTTP handler uses both — the status
+/// gives clients that only inspect HTTP status a truthful signal;
+/// the body preserves the framework's structured envelope
+/// (subclass, message, op id) for clients that parse.
+///
+/// The old shape (HTTP 200 always, error inside body) is the wire-
+/// honesty defect the refusal path closes.
+#[derive(Debug, thiserror::Error)]
+pub enum HttpDispatchError {
+    /// The JSON payload could not be deserialised into a known wire
+    /// op shape. The op id was unrecognised, the payload was not a
+    /// JSON object, or required fields were missing or wrong-typed.
+    #[error("invalid payload: {0}")]
+    InvalidPayload(String),
+
+    /// The dispatcher returned a `ClientResponse` whose serialiser
+    /// failed. Should never happen with the framework's own response
+    /// shapes; surfaces only as a defence against future shape
+    /// changes that break round-tripping.
+    #[error("response serialisation failed: {0}")]
+    SerializationFailed(String),
+
+    /// The framework's dispatch produced a `ClientResponse::Error`
+    /// — the request was accepted but refused. Status is derived
+    /// from the error class (retryable classes → 5xx / 429,
+    /// caller-fault classes → 4xx). Body carries the full
+    /// framework error envelope verbatim so subclass + message
+    /// reach the client's structured parser.
+    #[error("request refused ({status}): {message}")]
+    RequestRefused {
+        /// HTTP status derived from `ErrorClass` on the framework's
+        /// `ApiError`.
+        status: http::StatusCode,
+        /// Human-readable message extracted from the framework's
+        /// `ApiError.message` — used for the Display impl and for
+        /// audit/telemetry lines. The full envelope stays in `body`.
+        message: String,
+        /// Full serialised `ClientResponse::Error` envelope. The
+        /// HTTP handler surfaces this verbatim as the response
+        /// body — every field the framework produced is preserved.
+        body: serde_json::Value,
+    },
+}
+
+/// Map an [`evo_plugin_sdk::error_taxonomy::ErrorClass`] to the
+/// HTTP status the wire-honesty path returns. Retryable /
+/// pressure classes map to 5xx or 429; caller-fault classes to
+/// 4xx; internal invariant violations to 500.
+///
+/// Kept as a free function in the framework (not on the SDK
+/// enum) so the SDK stays free of any HTTP dependency; the
+/// mapping is a concern of the HTTP surface.
+pub fn error_class_to_http_status(
+    class: evo_plugin_sdk::error_taxonomy::ErrorClass,
+) -> http::StatusCode {
+    use evo_plugin_sdk::error_taxonomy::ErrorClass as C;
+    use http::StatusCode as S;
+    match class {
+        C::Transient => S::SERVICE_UNAVAILABLE,
+        C::Unavailable => S::SERVICE_UNAVAILABLE,
+        C::ResourceExhausted => S::TOO_MANY_REQUESTS,
+        C::ContractViolation => S::BAD_REQUEST,
+        C::NotFound => S::NOT_FOUND,
+        C::PermissionDenied => S::FORBIDDEN,
+        C::TrustViolation => S::FORBIDDEN,
+        C::TrustExpired => S::UNAUTHORIZED,
+        C::ProtocolViolation => S::BAD_REQUEST,
+        C::Misconfiguration => S::INTERNAL_SERVER_ERROR,
+        C::Internal => S::INTERNAL_SERVER_ERROR,
+        // `ErrorClass` is `#[non_exhaustive]`; any future
+        // taxonomy addition that ships without a paired
+        // http_status mapping falls back to 500 rather than
+        // breaking the build. The follow-on ADR that adds the
+        // new class must update this match with the intended
+        // status.
+        _ => S::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// Parse the optional `filter` payload field on a
+/// `subscribe_happenings` HTTPS / WS dispatch. Mirrors the
+/// typed `ClientRequest::SubscribeHappenings::filter` field
+/// the Unix-socket path receives via serde — the same
+/// `HappeningFilterWire` `deny_unknown_fields` posture
+/// applies here so an unknown field on the filter sub-object
+/// surfaces synchronously rather than being silently
+/// ignored.
+///
+/// Accepted shapes:
+/// - `null` payload — no filter (no-op).
+/// - `{}` payload — no filter (no-op).
+/// - `{ "filter": {} }` — no filter (no-op).
+/// - `{ "filter": { ... HappeningFilterWire fields ... } }`
+///   — the canonical shape with one or more dimensions set.
+///
+/// Refused shapes:
+/// - Non-object payload (string / number / bool / array) —
+///   structurally cannot carry a filter.
+/// - `{ "filter": <non-object> }` — filter must be an
+///   object even when empty.
+/// - `{ "filter": { "unknown_field": ... } }` — refused by
+///   `HappeningFilterWire`'s `deny_unknown_fields`.
+fn parse_http_happening_filter(
+    payload: &serde_json::Value,
+) -> Result<HappeningFilter, evo_runtime_http::DispatchError> {
+    use evo_runtime_http::DispatchError;
+    let filter_value = match payload {
+        serde_json::Value::Null => return Ok(HappeningFilter::default()),
+        serde_json::Value::Object(map) => map
+            .get("filter")
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(Default::default())),
+        other => {
+            return Err(DispatchError::InvalidPayload(format!(
+                "subscribe_happenings payload must be a JSON object or null; \
+                 got {}",
+                match other {
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Array(_) => "array",
+                    _ => "value",
+                }
+            )));
+        }
+    };
+    if !filter_value.is_object() {
+        return Err(DispatchError::InvalidPayload(format!(
+            "subscribe_happenings filter must be a JSON object; got {}",
+            match &filter_value {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => unreachable!(),
+            }
+        )));
+    }
+    let wire: HappeningFilterWire = serde_json::from_value(filter_value)
+        .map_err(|e| {
+            DispatchError::InvalidPayload(format!(
+                "subscribe_happenings filter: {e}"
+            ))
+        })?;
+    Ok(wire.into())
+}
+/// Extract the optional `snapshot_in_ack: bool` field from a
+/// subscription payload. Absent / non-bool → `false`. Never
+/// errors — the field is opt-in and a client that does not
+/// declare it sees the pre-snapshot-in-ack wire shape.
+fn extract_snapshot_in_ack_from_payload(payload: &serde_json::Value) -> bool {
+    payload
+        .as_object()
+        .and_then(|m| m.get("snapshot_in_ack"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Extract the optional `keepalive_ms: u64` field from a
+/// subscription payload. Absent / non-number → `None`.
+/// Clamped to `[1_000, 60_000]` — below 1 s would burn wire
+/// budget, above 60 s defeats the watchdog. Never errors.
+fn extract_keepalive_ms_from_payload(
+    payload: &serde_json::Value,
+) -> Option<u64> {
+    payload
+        .as_object()
+        .and_then(|m| m.get("keepalive_ms"))
+        .and_then(|v| v.as_u64())
+        .map(|ms| ms.clamp(1_000, 60_000))
+}
+
+/// Class of keepalive frame the merged stream emits. Preserves
+/// the discriminant on the wire so a multiplexing consumer can
+/// route the keepalive back to the subscription that emitted it.
+#[derive(Clone)]
+enum KeepaliveKind {
+    Happenings {
+        /// Currently always `None`; reserved for a future
+        /// keepalive-per-subscription-id shape.
+        #[allow(dead_code)]
+        canonical_id: Option<String>,
+    },
+    Subject {
+        canonical_id: String,
+    },
+}
+
+/// Merge an application-level keepalive tick into a
+/// subscription event stream. `None` cadence → pass-through
+/// (no keepalives emitted). Otherwise a periodic tick emits
+/// a distinctive keepalive frame (distinguished by
+/// `happenings_keepalive: true` or `subject_keepalive: true`
+/// top-level key) alongside the normal event stream so a
+/// consumer can watchdog on frame silence.
+fn merge_keepalive_stream(
+    events: evo_runtime_http::SubscriptionEventStream,
+    keepalive_ms: Option<u64>,
+    kind: KeepaliveKind,
+) -> evo_runtime_http::SubscriptionEventStream {
+    use futures::stream::StreamExt;
+    let Some(ms) = keepalive_ms else {
+        return events;
+    };
+    let interval = std::time::Duration::from_millis(ms);
+    let keepalives = tokio_stream::wrappers::IntervalStream::new(
+        tokio::time::interval(interval),
+    )
+    .skip(1) // interval's first tick is immediate; skip so we don't emit at t=0
+    .map(move |_| match &kind {
+        KeepaliveKind::Happenings { .. } => {
+            serde_json::json!({
+                "happenings_keepalive": true,
+                "ts_ms":                wall_clock_ms_for_keepalive(),
+            })
+        }
+        KeepaliveKind::Subject { canonical_id } => {
+            serde_json::json!({
+                "subject_keepalive": true,
+                "canonical_id":      canonical_id,
+                "ts_ms":             wall_clock_ms_for_keepalive(),
+            })
+        }
+    });
+    Box::pin(futures::stream::select(events, keepalives))
+}
+
+fn wall_clock_ms_for_keepalive() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Merge `{"op": op_id}` into `payload` and deserialise as
+/// [`ClientRequest`].
+///
+/// The serde discriminator on `ClientRequest` is `op` with
+/// `rename_all = "snake_case"`, so the canonical wire op id is
+/// already in the right shape. A `null` payload becomes
+/// `{"op": op_id}` so no-arg ops still deserialise.
+fn parse_http_wire_request(
+    op_id: &str,
+    payload: serde_json::Value,
+) -> Result<ClientRequest, HttpDispatchError> {
+    let merged = match payload {
+        serde_json::Value::Object(mut map) => {
+            map.insert(
+                "op".to_string(),
+                serde_json::Value::String(op_id.to_string()),
+            );
+            serde_json::Value::Object(map)
+        }
+        serde_json::Value::Null => {
+            serde_json::json!({ "op": op_id })
+        }
+        other => {
+            return Err(HttpDispatchError::InvalidPayload(format!(
+                "expected a JSON object or null; got {}",
+                match other {
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Array(_) => "array",
+                    _ => "value",
+                }
+            )));
+        }
+    };
+    serde_json::from_value::<ClientRequest>(merged)
+        .map_err(|e| HttpDispatchError::InvalidPayload(e.to_string()))
+}
+
+/// Flatten the principal's structured bearer-token capability set
+/// into the legacy `HashSet<String>` of named scopes the per-handler
+/// `conn.has(...)` checks consult.
+///
+/// The runtime-http middleware already enforced the rank-ordered
+/// capability requirement at the HTTPS boundary; flattening every
+/// capability scope into the granted set is therefore sound — every
+/// scope the token can witness is granted in the synthetic
+/// connection.
+fn flatten_principal_capabilities(
+    principal: &evo_runtime_http::Principal,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for cap in principal.capabilities.capabilities() {
+        out.insert(cap.scope().to_string());
+    }
+    out
+}
+
+/// Subset of [`flatten_principal_capabilities`] restricted to
+/// capability scopes for which the principal holds an active
+/// step-up auth session (the bearer-token capability set carries a
+/// `StepUp { scope }` entry).
+///
+/// Used by the plugin-route per-verb capability gate when a verb's
+/// manifest declaration is
+/// [`VerbCapability::StepUp`](evo_plugin_sdk::manifest::VerbCapability::StepUp);
+/// the gate requires both `granted_capabilities.contains(scope)`
+/// (write-or-higher on that scope) AND
+/// `step_up_scopes.contains(scope)` (step-up auth verified for that
+/// scope by the auth layer at admission). The double-set design
+/// preserves the framework-canonical step-up semantics inside the
+/// plugin dispatch path without re-implementing the rank lattice
+/// at the plugin layer.
+fn flatten_step_up_scopes(
+    principal: &evo_runtime_http::Principal,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for cap in principal.capabilities.capabilities() {
+        if matches!(cap, evo_auth_bearer::Capability::StepUp { .. }) {
+            out.insert(cap.scope().to_string());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -8632,15 +30476,16 @@ mod tests {
 
     #[test]
     fn describe_capabilities_response_shape_is_stable() {
-        let r = describe_capabilities("configured", "untrusted", false);
+        let r = describe_capabilities("configured", "untrusted", None, false);
         let s = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["capabilities"].as_bool(), Some(true));
         assert_eq!(v["wire_version"].as_u64(), Some(1));
 
         // Op set must include every dispatchable op so consumers can
-        // probe before invoking. Order is stable (matches the
-        // SUPPORTED_OPS constant).
+        // probe before invoking. The list is derived from the
+        // canonical wire-op schema; order matches the schema entry
+        // order (which is stable across releases).
         let ops: Vec<&str> = v["ops"]
             .as_array()
             .unwrap()
@@ -8707,7 +30552,7 @@ mod tests {
 
     #[test]
     fn capabilities_response_carries_lkg_catalogue_source() {
-        let r = describe_capabilities("lkg", "untrusted", false);
+        let r = describe_capabilities("lkg", "untrusted", None, false);
         let s = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["catalogue_source"].as_str(), Some("lkg"));
@@ -8715,7 +30560,7 @@ mod tests {
 
     #[test]
     fn capabilities_response_carries_builtin_catalogue_source() {
-        let r = describe_capabilities("builtin", "untrusted", false);
+        let r = describe_capabilities("builtin", "untrusted", None, false);
         let s = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["catalogue_source"].as_str(), Some("builtin"));
@@ -8723,7 +30568,7 @@ mod tests {
 
     #[test]
     fn capabilities_response_carries_trusted_clock_state() {
-        let r = describe_capabilities("configured", "trusted", true);
+        let r = describe_capabilities("configured", "trusted", None, true);
         let s = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["clock_trust"].as_str(), Some("trusted"));
@@ -8732,7 +30577,7 @@ mod tests {
 
     #[test]
     fn capabilities_response_carries_stale_clock_state() {
-        let r = describe_capabilities("configured", "stale", false);
+        let r = describe_capabilities("configured", "stale", None, false);
         let s = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["clock_trust"].as_str(), Some("stale"));
@@ -8740,7 +30585,7 @@ mod tests {
 
     #[test]
     fn capabilities_response_carries_adjusting_clock_state() {
-        let r = describe_capabilities("configured", "adjusting", false);
+        let r = describe_capabilities("configured", "adjusting", None, false);
         let s = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["clock_trust"].as_str(), Some("adjusting"));
@@ -8748,7 +30593,7 @@ mod tests {
 
     #[test]
     fn capabilities_response_advertises_coalesce_labels_per_variant() {
-        let r = describe_capabilities("configured", "untrusted", false);
+        let r = describe_capabilities("configured", "untrusted", None, false);
         let s = serde_json::to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         let labels = v["coalesce_labels"]
@@ -8797,7 +30642,7 @@ mod tests {
     fn capabilities_response_distinguishable_from_other_variants() {
         // The untagged-enum disambiguation relies on the top-level
         // `capabilities` key being unique to this variant.
-        let r = describe_capabilities("configured", "untrusted", false);
+        let r = describe_capabilities("configured", "untrusted", None, false);
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("\"capabilities\""));
         assert!(!s.contains("\"payload_b64\""));
@@ -8878,10 +30723,10 @@ mod tests {
 
     #[test]
     fn describe_capabilities_includes_project_rack() {
-        match describe_capabilities("configured", "untrusted", false) {
+        match describe_capabilities("configured", "untrusted", None, false) {
             ClientResponse::Capabilities { ops, features, .. } => {
                 assert!(
-                    ops.contains(&"project_rack"),
+                    ops.iter().any(|s| s == "project_rack"),
                     "project_rack missing from advertised ops: {ops:?}"
                 );
                 assert!(
@@ -8915,10 +30760,10 @@ mod tests {
     fn describe_capabilities_includes_list_plugins() {
         // Pin the new op + feature so a future refactor that
         // accidentally drops them fails loud here.
-        match describe_capabilities("configured", "untrusted", false) {
+        match describe_capabilities("configured", "untrusted", None, false) {
             ClientResponse::Capabilities { ops, features, .. } => {
                 assert!(
-                    ops.contains(&"list_plugins"),
+                    ops.iter().any(|s| s == "list_plugins"),
                     "list_plugins missing from advertised ops: {ops:?}"
                 );
                 assert!(
@@ -8993,6 +30838,7 @@ mod tests {
                 canonical_id,
                 scope,
                 follow_aliases,
+                ..
             } => {
                 assert_eq!(canonical_id, "uuid-x");
                 assert!(follow_aliases);
@@ -9009,10 +30855,10 @@ mod tests {
     fn describe_capabilities_includes_subscribe_subject() {
         // Pin the new op + feature so a future refactor that
         // accidentally drops them fails loud here.
-        match describe_capabilities("configured", "untrusted", false) {
+        match describe_capabilities("configured", "untrusted", None, false) {
             ClientResponse::Capabilities { ops, features, .. } => {
                 assert!(
-                    ops.contains(&"subscribe_subject"),
+                    ops.iter().any(|s| s == "subscribe_subject"),
                     "subscribe_subject missing from advertised ops: {ops:?}"
                 );
                 assert!(
@@ -9064,6 +30910,162 @@ mod tests {
         assert!(!s.contains("happening"));
         assert!(!s.contains("lagged"));
         assert!(!s.contains("active_custodies"));
+    }
+
+    #[test]
+    fn client_request_parses_subscribe_happenings_with_keepalive() {
+        let json = r#"{
+            "op": "subscribe_happenings",
+            "keepalive_ms": 10000
+        }"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::SubscribeHappenings { keepalive_ms, .. } => {
+                assert_eq!(keepalive_ms, Some(10_000));
+            }
+            other => panic!("expected SubscribeHappenings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_request_subscribe_happenings_keepalive_defaults_none() {
+        // Backward compat: absent keepalive_ms means no heartbeats,
+        // pre-keepalive wire shape unchanged.
+        let json = r#"{ "op": "subscribe_happenings" }"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::SubscribeHappenings { keepalive_ms, .. } => {
+                assert!(
+                    keepalive_ms.is_none(),
+                    "missing keepalive_ms must default to None"
+                );
+            }
+            other => panic!("expected SubscribeHappenings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_request_parses_subscribe_subject_with_snapshot_in_ack() {
+        let json = r#"{
+            "op": "subscribe_subject",
+            "canonical_id": "abc",
+            "snapshot_in_ack": true,
+            "keepalive_ms": 5000
+        }"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::SubscribeSubject {
+                canonical_id,
+                snapshot_in_ack,
+                keepalive_ms,
+                ..
+            } => {
+                assert_eq!(canonical_id, "abc");
+                assert!(snapshot_in_ack);
+                assert_eq!(keepalive_ms, Some(5_000));
+            }
+            other => panic!("expected SubscribeSubject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_request_subscribe_subject_snapshot_in_ack_defaults_false() {
+        // Backward compat: absent snapshot_in_ack means the
+        // legacy two-frame shape (ack + seq=0 ProjectionUpdate).
+        let json = r#"{
+            "op": "subscribe_subject",
+            "canonical_id": "abc"
+        }"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::SubscribeSubject {
+                snapshot_in_ack,
+                keepalive_ms,
+                ..
+            } => {
+                assert!(
+                    !snapshot_in_ack,
+                    "missing snapshot_in_ack must default to false"
+                );
+                assert!(keepalive_ms.is_none());
+            }
+            other => panic!("expected SubscribeSubject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_response_happenings_keepalive_serialises() {
+        let r = ClientResponse::HappeningsKeepalive {
+            happenings_keepalive: true,
+            ts_ms: 1_720_000_000_000,
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        // Distinctive key set — the untagged enum disambiguates
+        // via `happenings_keepalive`; no other variant carries it.
+        assert_eq!(v["happenings_keepalive"].as_bool(), Some(true));
+        assert_eq!(v["ts_ms"].as_u64(), Some(1_720_000_000_000));
+        assert!(!s.contains("subscribed"));
+        assert!(!s.contains("subject_keepalive"));
+        assert!(!s.contains("happening\":"));
+    }
+
+    #[test]
+    fn client_response_subject_keepalive_serialises() {
+        let r = ClientResponse::SubjectKeepalive {
+            subject_keepalive: true,
+            canonical_id: "abc".into(),
+            ts_ms: 1_720_000_000_000,
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["subject_keepalive"].as_bool(), Some(true));
+        assert_eq!(v["canonical_id"].as_str(), Some("abc"));
+        assert_eq!(v["ts_ms"].as_u64(), Some(1_720_000_000_000));
+        assert!(!s.contains("subscribed_subject"));
+        assert!(!s.contains("happenings_keepalive"));
+    }
+
+    #[test]
+    fn client_response_subscribed_subject_with_initial_projection_serialises() {
+        let projection = serde_json::json!({
+            "canonical_id": "abc",
+            "state": { "current": "value" }
+        });
+        let r = ClientResponse::SubscribedSubject {
+            subscribed_subject: true,
+            canonical_id: "abc".into(),
+            current_seq: 42,
+            initial_projection: Some(projection.clone()),
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["subscribed_subject"].as_bool(), Some(true));
+        assert_eq!(v["current_seq"].as_u64(), Some(42));
+        assert_eq!(v["initial_projection"], projection);
+    }
+
+    #[test]
+    fn client_response_subscribed_subject_without_initial_projection_omits_field(
+    ) {
+        // Backward compat: legacy consumer that didn't opt into
+        // snapshot_in_ack must see the pre-existing key set on
+        // the ack (no `initial_projection` field). serde's
+        // `skip_serializing_if = "Option::is_none"` enforces this.
+        let r = ClientResponse::SubscribedSubject {
+            subscribed_subject: true,
+            canonical_id: "abc".into(),
+            current_seq: 42,
+            initial_projection: None,
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["subscribed_subject"].as_bool(), Some(true));
+        assert!(
+            v.get("initial_projection").is_none(),
+            "legacy ack must omit the initial_projection field entirely, \
+             got: {s}"
+        );
     }
 
     #[test]
@@ -9353,6 +31355,7 @@ mod tests {
                 Some(0),
                 HappeningFilter::default(),
                 None,
+                None,
             )
             .await
         });
@@ -9442,6 +31445,7 @@ mod tests {
                     state,
                     Some(0),
                     HappeningFilter::default(),
+                    None,
                     None,
                 )
                 .await
@@ -9570,6 +31574,7 @@ mod tests {
                 state_for_task,
                 Some(3),
                 HappeningFilter::default(),
+                None,
                 None,
             )
             .await
@@ -10018,6 +32023,7 @@ mod tests {
                 state_clone,
                 None,
                 HappeningFilter::default(),
+                None,
                 None,
             )
             .await
@@ -10474,9 +32480,14 @@ mod tests {
         let json = r#"{"op":"enable_plugin","plugin":"org.test.x","reason":"because"}"#;
         let r: ClientRequest = serde_json::from_str(json).unwrap();
         match r {
-            ClientRequest::EnablePlugin { plugin, reason } => {
+            ClientRequest::EnablePlugin {
+                plugin,
+                reason,
+                step_up_token,
+            } => {
                 assert_eq!(plugin, "org.test.x");
                 assert_eq!(reason.as_deref(), Some("because"));
+                assert!(step_up_token.is_none());
             }
             other => panic!("expected EnablePlugin, got {other:?}"),
         }
@@ -10491,10 +32502,12 @@ mod tests {
                 plugin,
                 reason,
                 purge_state,
+                step_up_token,
             } => {
                 assert_eq!(plugin, "org.test.x");
                 assert!(reason.is_none());
                 assert!(!purge_state);
+                assert!(step_up_token.is_none());
             }
             other => panic!("expected UninstallPlugin, got {other:?}"),
         }
@@ -10509,8 +32522,13 @@ mod tests {
         }"#;
         let r: ClientRequest = serde_json::from_str(json).unwrap();
         match r {
-            ClientRequest::ReloadCatalogue { source, dry_run } => {
+            ClientRequest::ReloadCatalogue {
+                source,
+                dry_run,
+                step_up_token,
+            } => {
                 assert!(dry_run);
+                assert!(step_up_token.is_none());
                 match source {
                     ReloadSourceWire::Inline { toml } => {
                         assert_eq!(toml, "schema_version = 1");
@@ -10530,8 +32548,18 @@ mod tests {
             uid: Some(1234),
             gid: Some(1234),
         });
-        let response =
-            handle_enable_plugin(None, &conn, "org.test.x".into(), None).await;
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let response = handle_enable_plugin(
+            None,
+            None,
+            &store,
+            None,
+            &conn,
+            "org.test.x".into(),
+            None,
+            None,
+        )
+        .await;
         match response {
             ClientResponse::Error { error } => {
                 assert_eq!(error.class, ErrorClass::PermissionDenied);
@@ -10555,8 +32583,19 @@ mod tests {
             gid: Some(1234),
         });
         conn.granted_capabilities.insert("plugins_admin".into());
-        let response =
-            handle_disable_plugin(None, &conn, "org.test.x".into(), None).await;
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let response = handle_disable_plugin(
+            None,
+            None,
+            &store,
+            None,
+            &conn,
+            "org.test.x".into(),
+            None,
+            None,
+            false,
+        )
+        .await;
         match response {
             ClientResponse::Error { error } => {
                 assert_eq!(error.class, ErrorClass::Internal);
@@ -10564,6 +32603,738 @@ mod tests {
                 assert_eq!(
                     details["subclass"].as_str(),
                     Some("admission_engine_not_configured")
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Bundled-removal policy tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn path_is_bundled_with_empty_roots_always_false() {
+        // Empty bundled_roots list disables the policy — no path
+        // is classified bundled, every plugin is removable.
+        assert!(!super::path_is_bundled(
+            std::path::Path::new("/opt/evo/plugins/p"),
+            &[],
+        ));
+        assert!(!super::path_is_bundled(
+            std::path::Path::new("/var/lib/evo/plugins/p"),
+            &[],
+        ));
+    }
+
+    #[test]
+    fn path_is_bundled_matches_under_root() {
+        let roots = vec![std::path::PathBuf::from("/opt/evo/plugins")];
+        assert!(super::path_is_bundled(
+            std::path::Path::new("/opt/evo/plugins/com.example.audio"),
+            &roots,
+        ));
+        assert!(super::path_is_bundled(
+            std::path::Path::new("/opt/evo/plugins/sub/com.example.audio"),
+            &roots,
+        ));
+    }
+
+    #[test]
+    fn path_is_bundled_skips_admitted_path() {
+        let roots = vec![std::path::PathBuf::from("/opt/evo/plugins")];
+        // /var/lib is admitted territory by default — operator-
+        // installed plugins land here and MUST be removable.
+        assert!(!super::path_is_bundled(
+            std::path::Path::new("/var/lib/evo/plugins/p"),
+            &roots,
+        ));
+    }
+
+    #[test]
+    fn path_is_bundled_handles_multiple_roots() {
+        let roots = vec![
+            std::path::PathBuf::from("/opt/evo/plugins"),
+            std::path::PathBuf::from("/usr/lib/evo/plugins"),
+        ];
+        assert!(super::path_is_bundled(
+            std::path::Path::new("/usr/lib/evo/plugins/p"),
+            &roots,
+        ));
+        assert!(!super::path_is_bundled(
+            std::path::Path::new("/var/lib/evo/plugins/p"),
+            &roots,
+        ));
+    }
+
+    #[test]
+    fn path_is_bundled_does_not_match_partial_segment() {
+        // /opt/evo/plugins-secondary/p is NOT under
+        // /opt/evo/plugins because Path::starts_with respects
+        // component boundaries.
+        let roots = vec![std::path::PathBuf::from("/opt/evo/plugins")];
+        assert!(!super::path_is_bundled(
+            std::path::Path::new("/opt/evo/plugins-secondary/p"),
+            &roots,
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // Step-up auth wire-op tests.
+    // -----------------------------------------------------------------
+
+    /// Test-only AuthService that authenticates a fixed
+    /// (username, secret) pair. Anything else returns
+    /// `InvalidCredentials`.
+    #[derive(Debug)]
+    struct FixedAuthService {
+        username: String,
+        secret: Vec<u8>,
+    }
+
+    impl crate::auth::AuthService for FixedAuthService {
+        fn verify(
+            &self,
+            username: &str,
+            secret: &[u8],
+        ) -> Result<
+            crate::auth::VerifiedPrincipal,
+            crate::auth::AuthVerificationError,
+        > {
+            if username == self.username && secret == self.secret.as_slice() {
+                Ok(crate::auth::VerifiedPrincipal {
+                    username: username.to_string(),
+                    uid: Some(1000),
+                })
+            } else {
+                Err(crate::auth::AuthVerificationError::InvalidCredentials)
+            }
+        }
+
+        fn implementation_name(&self) -> &'static str {
+            "fixed-test"
+        }
+    }
+
+    #[test]
+    fn step_up_auth_verify_op_parses_inline() {
+        let json = r#"{"op":"step_up_auth_verify","username":"alice","secret_b64":"cGFzc3dvcmQ="}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::StepUpAuthVerify {
+                username,
+                secret_b64,
+                ttl_seconds,
+                nonce,
+            } => {
+                assert_eq!(username.as_deref(), Some("alice"));
+                assert_eq!(secret_b64, "cGFzc3dvcmQ=");
+                assert!(ttl_seconds.is_none());
+                assert!(nonce.is_none());
+            }
+            other => panic!("expected StepUpAuthVerify, got {other:?}"),
+        }
+    }
+
+    /// `username` is optional on the wire — a portable UI cannot
+    /// know the distribution-specific OS runtime user name.
+    /// Absent field parses as `None`; the handler substitutes the
+    /// framework's own runtime user.
+    #[test]
+    fn step_up_auth_verify_parses_without_username() {
+        let json = r#"{"op":"step_up_auth_verify","secret_b64":"cGFzc3dvcmQ=","nonce":"abc123"}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::StepUpAuthVerify {
+                username,
+                secret_b64,
+                nonce,
+                ..
+            } => {
+                assert!(username.is_none());
+                assert_eq!(secret_b64, "cGFzc3dvcmQ=");
+                assert_eq!(nonce.as_deref(), Some("abc123"));
+            }
+            other => panic!("expected StepUpAuthVerify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pair_authenticate_op_parses_inline() {
+        let json = r#"{"op":"pair_authenticate","device_hint":"Chrome on Pixel 8","secret_b64":"cGFzc3dvcmQ=","nonce":"abc123"}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::PairAuthenticate {
+                device_hint,
+                secret_b64,
+                nonce,
+            } => {
+                assert_eq!(device_hint, "Chrome on Pixel 8");
+                assert_eq!(secret_b64, "cGFzc3dvcmQ=");
+                assert_eq!(nonce.as_deref(), Some("abc123"));
+            }
+            other => panic!("expected PairAuthenticate, got {other:?}"),
+        }
+    }
+
+    /// `nonce` is optional on the wire — legacy callers may
+    /// omit it. Same convention as `step_up_auth_verify`.
+    #[test]
+    fn pair_authenticate_parses_without_nonce() {
+        let json = r#"{"op":"pair_authenticate","device_hint":"kiosk","secret_b64":"cGFzc3dvcmQ="}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::PairAuthenticate {
+                device_hint,
+                secret_b64,
+                nonce,
+            } => {
+                assert_eq!(device_hint, "kiosk");
+                assert_eq!(secret_b64, "cGFzc3dvcmQ=");
+                assert!(nonce.is_none());
+            }
+            other => panic!("expected PairAuthenticate, got {other:?}"),
+        }
+    }
+
+    /// The response shape mirrors `PairCompleted` field-for-field
+    /// so the browser's success handling is one code path across
+    /// both `pair_complete` (kiosk / factory path) and
+    /// `pair_authenticate` (consumer path).
+    #[test]
+    fn pair_authenticated_response_serialises_with_expected_shape() {
+        let response = ClientResponse::PairAuthenticated {
+            pair_completed: true,
+            token: "eyJhbGciOi...".into(),
+            token_id: "tok-id-123".into(),
+            expires_at_ms: 1_700_000_000_000,
+            paired_device_id: "dev-abc".into(),
+        };
+        let json =
+            serde_json::to_string(&response).expect("serialise response");
+        // Distinctive top-level key mirrors PairCompleted.
+        assert!(
+            json.contains("\"pair_completed\":true"),
+            "response body: {json}"
+        );
+        assert!(json.contains("\"token\":\"eyJhbGciOi...\""));
+        assert!(json.contains("\"token_id\":\"tok-id-123\""));
+        assert!(json.contains("\"expires_at_ms\":1700000000000"));
+        assert!(json.contains("\"paired_device_id\":\"dev-abc\""));
+    }
+
+    #[test]
+    fn step_up_auth_revoke_op_parses_inline() {
+        let json = r#"{"op":"step_up_auth_revoke","token":"abc123"}"#;
+        let r: ClientRequest = serde_json::from_str(json).unwrap();
+        match r {
+            ClientRequest::StepUpAuthRevoke { token } => {
+                assert_eq!(token, "abc123");
+            }
+            other => panic!("expected StepUpAuthRevoke, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn step_up_verify_without_auth_service_refuses_unavailable() {
+        let conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        });
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let rate_limiter =
+            Arc::new(crate::auth::StepUpRateLimiter::with_defaults());
+        let nonce_store =
+            Arc::new(crate::auth::NonceReplayStore::with_defaults());
+        let response = handle_step_up_auth_verify(
+            None,
+            &store,
+            &rate_limiter,
+            &nonce_store,
+            Some("alice"),
+            None,
+            &conn,
+            Some("alice".into()),
+            base64::engine::general_purpose::STANDARD.encode(b"password"),
+            None,
+            None,
+        )
+        .await;
+        match response {
+            ClientResponse::Error { error } => {
+                assert_eq!(error.class, ErrorClass::Internal);
+                let details = error.details.as_ref().expect("details");
+                assert_eq!(
+                    details["subclass"].as_str(),
+                    Some("step_up_unavailable")
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert_eq!(store.live_session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn step_up_verify_without_peer_uid_refuses() {
+        let conn = ConnectionState::new(PeerCredentials {
+            uid: None,
+            gid: None,
+        });
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let svc: Arc<dyn crate::auth::AuthService> =
+            Arc::new(FixedAuthService {
+                username: "alice".into(),
+                secret: b"password".to_vec(),
+            });
+        let rate_limiter =
+            Arc::new(crate::auth::StepUpRateLimiter::with_defaults());
+        let nonce_store =
+            Arc::new(crate::auth::NonceReplayStore::with_defaults());
+        let response = handle_step_up_auth_verify(
+            Some(&svc),
+            &store,
+            &rate_limiter,
+            &nonce_store,
+            Some("alice"),
+            None,
+            &conn,
+            Some("alice".into()),
+            base64::engine::general_purpose::STANDARD.encode(b"password"),
+            None,
+            None,
+        )
+        .await;
+        match response {
+            ClientResponse::Error { error } => {
+                assert_eq!(error.class, ErrorClass::PermissionDenied);
+                let details = error.details.as_ref().expect("details");
+                assert_eq!(
+                    details["subclass"].as_str(),
+                    Some("peer_uid_unknown")
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn step_up_verify_with_correct_credentials_issues_token() {
+        let conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        });
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let svc: Arc<dyn crate::auth::AuthService> =
+            Arc::new(FixedAuthService {
+                username: "alice".into(),
+                secret: b"password".to_vec(),
+            });
+        let rate_limiter =
+            Arc::new(crate::auth::StepUpRateLimiter::with_defaults());
+        let nonce_store =
+            Arc::new(crate::auth::NonceReplayStore::with_defaults());
+        let response = handle_step_up_auth_verify(
+            Some(&svc),
+            &store,
+            &rate_limiter,
+            &nonce_store,
+            Some("alice"),
+            None,
+            &conn,
+            Some("alice".into()),
+            base64::engine::general_purpose::STANDARD.encode(b"password"),
+            None,
+            None,
+        )
+        .await;
+        match response {
+            ClientResponse::StepUpAuthIssued {
+                step_up_auth_issued,
+                token,
+                expires_at_ms,
+                principal_username,
+            } => {
+                assert!(step_up_auth_issued);
+                assert!(!token.is_empty());
+                assert!(expires_at_ms > 0);
+                assert_eq!(principal_username, "alice");
+            }
+            other => panic!("expected StepUpAuthIssued, got {other:?}"),
+        }
+        assert_eq!(store.live_session_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn step_up_verify_with_wrong_credentials_refuses_invalid() {
+        let conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        });
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let svc: Arc<dyn crate::auth::AuthService> =
+            Arc::new(FixedAuthService {
+                username: "alice".into(),
+                secret: b"password".to_vec(),
+            });
+        let rate_limiter =
+            Arc::new(crate::auth::StepUpRateLimiter::with_defaults());
+        let nonce_store =
+            Arc::new(crate::auth::NonceReplayStore::with_defaults());
+        let response = handle_step_up_auth_verify(
+            Some(&svc),
+            &store,
+            &rate_limiter,
+            &nonce_store,
+            Some("alice"),
+            None,
+            &conn,
+            Some("alice".into()),
+            base64::engine::general_purpose::STANDARD.encode(b"wrong"),
+            None,
+            None,
+        )
+        .await;
+        match response {
+            ClientResponse::Error { error } => {
+                assert_eq!(error.class, ErrorClass::PermissionDenied);
+                let details = error.details.as_ref().expect("details");
+                assert_eq!(
+                    details["subclass"].as_str(),
+                    Some("invalid_credentials")
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert_eq!(store.live_session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn step_up_revoke_removes_active_session_and_unknown_returns_false() {
+        let conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        });
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let svc: Arc<dyn crate::auth::AuthService> =
+            Arc::new(FixedAuthService {
+                username: "alice".into(),
+                secret: b"password".to_vec(),
+            });
+        let rate_limiter =
+            Arc::new(crate::auth::StepUpRateLimiter::with_defaults());
+        let nonce_store =
+            Arc::new(crate::auth::NonceReplayStore::with_defaults());
+        // Issue a token first.
+        let issued = handle_step_up_auth_verify(
+            Some(&svc),
+            &store,
+            &rate_limiter,
+            &nonce_store,
+            Some("alice"),
+            None,
+            &conn,
+            Some("alice".into()),
+            base64::engine::general_purpose::STANDARD.encode(b"password"),
+            None,
+            None,
+        )
+        .await;
+        let token = match issued {
+            ClientResponse::StepUpAuthIssued { token, .. } => token,
+            other => panic!("expected issued, got {other:?}"),
+        };
+        // Revoke the live token.
+        let revoked_response =
+            handle_step_up_auth_revoke(&store, token.clone()).await;
+        match revoked_response {
+            ClientResponse::StepUpAuthRevoked {
+                step_up_auth_revoked,
+                revoked,
+            } => {
+                assert!(step_up_auth_revoked);
+                assert!(revoked);
+            }
+            other => panic!("expected StepUpAuthRevoked, got {other:?}"),
+        }
+        assert_eq!(store.live_session_count(), 0);
+        // Revoke an unknown token: idempotent, returns false.
+        let again =
+            handle_step_up_auth_revoke(&store, "not-a-real-token".into()).await;
+        match again {
+            ClientResponse::StepUpAuthRevoked { revoked, .. } => {
+                assert!(!revoked);
+            }
+            other => panic!("expected StepUpAuthRevoked, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn step_up_verify_rejects_malformed_secret_b64() {
+        let conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        });
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let svc: Arc<dyn crate::auth::AuthService> =
+            Arc::new(FixedAuthService {
+                username: "alice".into(),
+                secret: b"password".to_vec(),
+            });
+        let rate_limiter =
+            Arc::new(crate::auth::StepUpRateLimiter::with_defaults());
+        let nonce_store =
+            Arc::new(crate::auth::NonceReplayStore::with_defaults());
+        let response = handle_step_up_auth_verify(
+            Some(&svc),
+            &store,
+            &rate_limiter,
+            &nonce_store,
+            Some("alice"),
+            None,
+            &conn,
+            Some("alice".into()),
+            "!!!not-base64!!!".into(),
+            None,
+            None,
+        )
+        .await;
+        match response {
+            ClientResponse::Error { error } => {
+                assert_eq!(error.class, ErrorClass::ContractViolation);
+                let details = error.details.as_ref().expect("details");
+                assert_eq!(
+                    details["subclass"].as_str(),
+                    Some("invalid_secret_encoding")
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// Correction 3 substrate proof — absent `username` on the
+    /// wire substitutes the framework's runtime user and verify
+    /// proceeds against the backend. Portable UIs that cannot
+    /// know the OS runtime user name send no username at all.
+    #[tokio::test]
+    async fn step_up_verify_absent_username_substitutes_runtime_user() {
+        let conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        });
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let svc: Arc<dyn crate::auth::AuthService> =
+            Arc::new(FixedAuthService {
+                username: "operator".into(),
+                secret: b"password".to_vec(),
+            });
+        let rate_limiter =
+            Arc::new(crate::auth::StepUpRateLimiter::with_defaults());
+        let nonce_store =
+            Arc::new(crate::auth::NonceReplayStore::with_defaults());
+        let response = handle_step_up_auth_verify(
+            Some(&svc),
+            &store,
+            &rate_limiter,
+            &nonce_store,
+            Some("operator"), // framework's runtime user name
+            None,
+            &conn,
+            None, // absent username on the wire
+            base64::engine::general_purpose::STANDARD.encode(b"password"),
+            None,
+            None,
+        )
+        .await;
+        match response {
+            ClientResponse::StepUpAuthIssued {
+                step_up_auth_issued,
+                principal_username,
+                ..
+            } => {
+                assert!(step_up_auth_issued);
+                assert_eq!(principal_username, "operator");
+            }
+            other => panic!("expected StepUpAuthIssued, got {other:?}"),
+        }
+    }
+
+    /// Correction 3 substrate proof — an empty-string username on
+    /// the wire is treated the same as absent (the portable UI
+    /// might send `""` rather than omit the field on the JSON
+    /// side). The framework still substitutes the runtime user.
+    #[tokio::test]
+    async fn step_up_verify_empty_username_substitutes_runtime_user() {
+        let conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        });
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let svc: Arc<dyn crate::auth::AuthService> =
+            Arc::new(FixedAuthService {
+                username: "operator".into(),
+                secret: b"password".to_vec(),
+            });
+        let rate_limiter =
+            Arc::new(crate::auth::StepUpRateLimiter::with_defaults());
+        let nonce_store =
+            Arc::new(crate::auth::NonceReplayStore::with_defaults());
+        let response = handle_step_up_auth_verify(
+            Some(&svc),
+            &store,
+            &rate_limiter,
+            &nonce_store,
+            Some("operator"),
+            None,
+            &conn,
+            Some("".into()),
+            base64::engine::general_purpose::STANDARD.encode(b"password"),
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            response,
+            ClientResponse::StepUpAuthIssued {
+                step_up_auth_issued: true,
+                ..
+            }
+        ));
+    }
+
+    /// Correction 3 substrate proof — explicit runtime user on
+    /// the wire passes through unchanged. Backwards-compatible
+    /// with existing callers that were sending the runtime user
+    /// name explicitly (my walk drivers).
+    #[tokio::test]
+    async fn step_up_verify_explicit_runtime_user_passes_through() {
+        let conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        });
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let svc: Arc<dyn crate::auth::AuthService> =
+            Arc::new(FixedAuthService {
+                username: "operator".into(),
+                secret: b"password".to_vec(),
+            });
+        let rate_limiter =
+            Arc::new(crate::auth::StepUpRateLimiter::with_defaults());
+        let nonce_store =
+            Arc::new(crate::auth::NonceReplayStore::with_defaults());
+        let response = handle_step_up_auth_verify(
+            Some(&svc),
+            &store,
+            &rate_limiter,
+            &nonce_store,
+            Some("operator"),
+            None,
+            &conn,
+            Some("operator".into()),
+            base64::engine::general_purpose::STANDARD.encode(b"password"),
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            response,
+            ClientResponse::StepUpAuthIssued {
+                step_up_auth_issued: true,
+                ..
+            }
+        ));
+    }
+
+    /// Correction 3 substrate proof — an explicit username that
+    /// does NOT match the framework's runtime user refuses with
+    /// `user_not_permitted` BEFORE the backend is consulted. No
+    /// admin escalation path exists through this wire op
+    /// regardless of what the caller asserts.
+    #[tokio::test]
+    async fn step_up_verify_explicit_mismatch_refuses_user_not_permitted() {
+        let conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        });
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let svc: Arc<dyn crate::auth::AuthService> =
+            Arc::new(FixedAuthService {
+                username: "operator".into(),
+                secret: b"password".to_vec(),
+            });
+        let rate_limiter =
+            Arc::new(crate::auth::StepUpRateLimiter::with_defaults());
+        let nonce_store =
+            Arc::new(crate::auth::NonceReplayStore::with_defaults());
+        let response = handle_step_up_auth_verify(
+            Some(&svc),
+            &store,
+            &rate_limiter,
+            &nonce_store,
+            Some("operator"),
+            None,
+            &conn,
+            Some("root".into()),
+            base64::engine::general_purpose::STANDARD.encode(b"password"),
+            None,
+            None,
+        )
+        .await;
+        match response {
+            ClientResponse::Error { error } => {
+                assert_eq!(error.class, ErrorClass::PermissionDenied);
+                let details = error.details.as_ref().expect("details");
+                assert_eq!(
+                    details["subclass"].as_str(),
+                    Some("user_not_permitted")
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// Correction 3 substrate proof — a distribution whose passwd
+    /// entry for the framework's euid is broken (no runtime user
+    /// resolved at boot) surfaces the absent-username call as
+    /// `runtime_user_unresolved` so the operator sees a
+    /// distributor error, not a wrong-password refusal.
+    #[tokio::test]
+    async fn step_up_verify_absent_username_no_runtime_user_surfaces_unresolved(
+    ) {
+        let conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        });
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let svc: Arc<dyn crate::auth::AuthService> =
+            Arc::new(FixedAuthService {
+                username: "operator".into(),
+                secret: b"password".to_vec(),
+            });
+        let rate_limiter =
+            Arc::new(crate::auth::StepUpRateLimiter::with_defaults());
+        let nonce_store =
+            Arc::new(crate::auth::NonceReplayStore::with_defaults());
+        let response = handle_step_up_auth_verify(
+            Some(&svc),
+            &store,
+            &rate_limiter,
+            &nonce_store,
+            None, // framework did not resolve a runtime user
+            None,
+            &conn,
+            None, // no username on the wire
+            base64::engine::general_purpose::STANDARD.encode(b"password"),
+            None,
+            None,
+        )
+        .await;
+        match response {
+            ClientResponse::Error { error } => {
+                assert_eq!(error.class, ErrorClass::Internal);
+                let details = error.details.as_ref().expect("details");
+                assert_eq!(
+                    details["subclass"].as_str(),
+                    Some("runtime_user_unresolved")
                 );
             }
             other => panic!("expected Error, got {other:?}"),
@@ -10998,6 +33769,7 @@ mod tests {
             retention_hint: None,
             error_context: None,
             previous_answer: None,
+            priority: None,
         }
     }
 
@@ -11008,6 +33780,24 @@ mod tests {
         });
         conn.granted_capabilities
             .insert(CAPABILITY_USER_INTERACTION_RESPONDER.to_string());
+        conn
+    }
+
+    /// A responder connection that has ALSO claimed the slot in
+    /// the supplied ledger. Use for happy-path tests of the
+    /// responder-gated ops: after tightening
+    /// `require_user_interaction_responder` to enforce the
+    /// single-responder runtime lock at op level, the op-level
+    /// gate refuses a bare `responder_conn()` because the
+    /// ledger's slot is vacant. Tests that expect the op to
+    /// succeed must first claim.
+    fn responder_conn_with_claim(
+        ledger: &Arc<crate::prompts::PromptLedger>,
+    ) -> ConnectionState {
+        let conn = responder_conn();
+        ledger
+            .try_claim_responder(conn.connection_id)
+            .expect("test setup: ledger must be freshly created");
         conn
     }
 
@@ -11063,7 +33853,7 @@ mod tests {
         );
         ledger.mark_answered("org.audio", "p-1");
 
-        let conn = responder_conn();
+        let conn = responder_conn_with_claim(&ledger);
         let response = handle_list_user_interactions(Some(&ledger), &conn);
         match response {
             ClientResponse::UserInteractions {
@@ -11079,6 +33869,209 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // release_user_interaction_responder tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn release_user_interaction_responder_refuses_when_capability_absent() {
+        let conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        });
+        let response = handle_release_user_interaction_responder(None, &conn);
+        match response {
+            ClientResponse::Error { error } => {
+                assert_eq!(error.class, ErrorClass::PermissionDenied);
+                let details = error.details.as_ref().expect("details");
+                assert_eq!(
+                    details["subclass"].as_str(),
+                    Some("user_interaction_responder_not_granted")
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn release_user_interaction_responder_frees_slot_for_next_bearer() {
+        // End-to-end fixture for the browser log-out path:
+        // bearer A claims, releases; bearer B then claims and
+        // succeeds without waiting for token TTL.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let a_id = crate::prompts::ResponderConnectionId::new(1001);
+        let b_id = crate::prompts::ResponderConnectionId::new(2002);
+
+        // Bearer A claims.
+        assert!(ledger.try_claim_responder(a_id).is_ok());
+        assert_eq!(ledger.current_responder(), Some(a_id));
+
+        // Bearer B refused while A holds.
+        assert!(matches!(
+            ledger.try_claim_responder(b_id),
+            Err(crate::prompts::ResponderClaimError::AlreadyHeld { .. })
+        ));
+
+        // Bearer A releases via the wire op.
+        let mut a_conn = responder_conn();
+        a_conn.connection_id = a_id;
+        let response =
+            handle_release_user_interaction_responder(Some(&ledger), &a_conn);
+        assert!(matches!(
+            response,
+            ClientResponse::UserInteractionResponderReleased {
+                responder_released: true
+            }
+        ));
+        assert_eq!(ledger.current_responder(), None);
+
+        // Bearer B claims and succeeds.
+        assert!(ledger.try_claim_responder(b_id).is_ok());
+        assert_eq!(ledger.current_responder(), Some(b_id));
+    }
+
+    #[test]
+    fn release_user_interaction_responder_idempotent_when_slot_vacant() {
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        assert_eq!(ledger.current_responder(), None);
+        let conn = responder_conn();
+        let response =
+            handle_release_user_interaction_responder(Some(&ledger), &conn);
+        assert!(matches!(
+            response,
+            ClientResponse::UserInteractionResponderReleased {
+                responder_released: true
+            }
+        ));
+        assert_eq!(ledger.current_responder(), None);
+    }
+
+    #[test]
+    fn release_user_interaction_responder_is_no_op_across_bearers() {
+        // Bearer A holds; Bearer B calls release. B does not
+        // hold the slot, so the release is a no-op and A's claim
+        // survives. Post-condition on B (B does not hold the slot)
+        // was already satisfied, so response is still `true`.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let a_id = crate::prompts::ResponderConnectionId::new(3003);
+        assert!(ledger.try_claim_responder(a_id).is_ok());
+
+        let mut b_conn = responder_conn();
+        b_conn.connection_id = crate::prompts::ResponderConnectionId::new(4004);
+        let response =
+            handle_release_user_interaction_responder(Some(&ledger), &b_conn);
+        assert!(matches!(
+            response,
+            ClientResponse::UserInteractionResponderReleased {
+                responder_released: true
+            }
+        ));
+        assert_eq!(
+            ledger.current_responder(),
+            Some(a_id),
+            "release from non-holder must not disturb the actual holder"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Single-responder-lock op-level enforcement tests.
+    // Regression coverage for Finding 3: responder-gated ops must
+    // consult the runtime slot, not just the capability scope on
+    // the bearer, otherwise two bearers minted for the responder
+    // role BOTH gain access and the "single responder" property
+    // is theatre.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn responder_gated_op_refuses_when_slot_unclaimed() {
+        // Bearer holds the capability scope but no session has
+        // called `negotiate` to claim the slot. The op must
+        // refuse with `responder_slot_unclaimed`, not fall
+        // through on bearer scope alone.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        assert_eq!(ledger.current_responder(), None);
+        let conn = responder_conn();
+        let response = handle_list_user_interactions(Some(&ledger), &conn);
+        match response {
+            ClientResponse::Error { error } => {
+                assert_eq!(error.class, ErrorClass::PermissionDenied);
+                let details = error.details.as_ref().expect("details");
+                assert_eq!(
+                    details["subclass"].as_str(),
+                    Some("responder_slot_unclaimed"),
+                    "bearer with scope but no claim must be refused with \
+                     the specific `responder_slot_unclaimed` subclass"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn responder_gated_op_refuses_when_slot_held_by_other() {
+        // Bearer A holds the slot. Bearer B tries a responder-
+        // gated op with a different connection id. The op must
+        // refuse with `responder_slot_held_by_other`; the
+        // single-responder property is preserved.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let a_id = crate::prompts::ResponderConnectionId::new(5005);
+        assert!(ledger.try_claim_responder(a_id).is_ok());
+
+        let mut b_conn = responder_conn();
+        b_conn.connection_id = crate::prompts::ResponderConnectionId::new(6006);
+        let response = handle_list_user_interactions(Some(&ledger), &b_conn);
+        match response {
+            ClientResponse::Error { error } => {
+                assert_eq!(error.class, ErrorClass::PermissionDenied);
+                let details = error.details.as_ref().expect("details");
+                assert_eq!(
+                    details["subclass"].as_str(),
+                    Some("responder_slot_held_by_other"),
+                    "bearer with scope but slot held by a different \
+                     session must be refused with the specific \
+                     `responder_slot_held_by_other` subclass"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn responder_gated_op_admits_slot_holder() {
+        // Bearer holds the capability AND has claimed the slot.
+        // The op passes the gate and reaches its normal logic
+        // path.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let conn = responder_conn_with_claim(&ledger);
+        let response = handle_list_user_interactions(Some(&ledger), &conn);
+        assert!(
+            matches!(response, ClientResponse::UserInteractions { .. }),
+            "slot-holder must be admitted to responder-gated op; got {response:?}"
+        );
+    }
+
+    #[test]
+    fn release_uses_capability_only_gate_not_slot_ownership() {
+        // Release is idempotent by design — the ledger's
+        // `release_responder` is a same-holder-only clear.
+        // Callers that hold the capability but not the slot get
+        // a truthful `responder_released: true` because the
+        // post-condition (this caller does not hold the slot)
+        // is satisfied in every case. Contrast with the list /
+        // answer / cancel path which refuses non-holders.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        assert_eq!(ledger.current_responder(), None);
+        let conn = responder_conn();
+        let response =
+            handle_release_user_interaction_responder(Some(&ledger), &conn);
+        assert!(matches!(
+            response,
+            ClientResponse::UserInteractionResponderReleased {
+                responder_released: true
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn answer_user_interaction_resolves_plugin_waiter() {
         let ledger = Arc::new(crate::prompts::PromptLedger::new());
@@ -11088,7 +34081,7 @@ mod tests {
             PromptDuration::from_secs(60),
         );
 
-        let conn = responder_conn();
+        let conn = responder_conn_with_claim(&ledger);
         let response = handle_answer_user_interaction(
             Some(&ledger),
             &conn,
@@ -11132,7 +34125,7 @@ mod tests {
     #[test]
     fn answer_user_interaction_refuses_unknown_prompt() {
         let ledger = Arc::new(crate::prompts::PromptLedger::new());
-        let conn = responder_conn();
+        let conn = responder_conn_with_claim(&ledger);
         let response = handle_answer_user_interaction(
             Some(&ledger),
             &conn,
@@ -11166,7 +34159,7 @@ mod tests {
             PromptDuration::from_secs(60),
         );
 
-        let conn = responder_conn();
+        let conn = responder_conn_with_claim(&ledger);
         let response = handle_cancel_user_interaction(
             Some(&ledger),
             &conn,
@@ -11200,7 +34193,7 @@ mod tests {
     #[test]
     fn cancel_user_interaction_refuses_unknown_prompt() {
         let ledger = Arc::new(crate::prompts::PromptLedger::new());
-        let conn = responder_conn();
+        let conn = responder_conn_with_claim(&ledger);
         let response = handle_cancel_user_interaction(
             Some(&ledger),
             &conn,
@@ -11855,6 +34848,1001 @@ mod tests {
                 );
             }
             other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pick_archive_extension_recognises_known_shapes() {
+        assert_eq!(
+            super::pick_archive_extension("foo.tar.gz"),
+            Some(".tar.gz")
+        );
+        assert_eq!(super::pick_archive_extension("foo.tgz"), Some(".tgz"));
+        assert_eq!(
+            super::pick_archive_extension("foo.tar.xz"),
+            Some(".tar.xz")
+        );
+        assert_eq!(super::pick_archive_extension("foo.txz"), Some(".txz"));
+        assert_eq!(super::pick_archive_extension("foo.zip"), Some(".zip"));
+        assert_eq!(
+            super::pick_archive_extension("FOO.TAR.GZ"),
+            Some(".tar.gz")
+        );
+        assert_eq!(super::pick_archive_extension("foo"), None);
+        assert_eq!(super::pick_archive_extension("foo.txt"), None);
+    }
+
+    #[tokio::test]
+    async fn install_plugin_from_url_refuses_without_capability() {
+        // No plugins_admin granted on the connection. The
+        // capability gate runs first; the URL is never
+        // fetched.
+        let conn = ConnectionState::new(PeerCredentials {
+            uid: Some(0),
+            gid: Some(0),
+        });
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let response = handle_install_plugin_from_url(
+            None,
+            None,
+            &store,
+            None,
+            &conn,
+            "https://example.invalid/bundle.tar.gz".to_string(),
+            None,
+            None,
+        )
+        .await;
+        match response {
+            ClientResponse::Error { error } => {
+                assert_eq!(error.class, ErrorClass::PermissionDenied);
+                let details = error.details.as_ref().expect("details");
+                assert_eq!(
+                    details["subclass"].as_str(),
+                    Some("plugins_admin_not_granted")
+                );
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+    }
+
+    // ----- Track 4K projection join (presence + network) -----
+
+    /// Synthesise a `PersistedDiscoveredPeer` discovery row.
+    /// All Track 4K fields (`presence_state`,
+    /// `last_transition_at_ms`, `network`) start as `None` —
+    /// the runtime construction path always emits them as
+    /// `None` and the projection populates them at read time.
+    fn t4k_discovery_row(
+        device_id: &str,
+    ) -> crate::persistence::PersistedDiscoveredPeer {
+        crate::persistence::PersistedDiscoveredPeer {
+            device_id: device_id.to_string(),
+            display_name: device_id.to_string(),
+            addresses: vec!["10.0.0.1:7331".to_string()],
+            vendor_id: None,
+            public_key_fingerprint: None,
+            capability_flags: vec!["multi-room".to_string()],
+            framework_version: Some("0.1.13".to_string()),
+            first_seen_ms: 1_000,
+            last_seen_ms: 1_500,
+            public_key_b64: None,
+            presence_state: None,
+            last_transition_at_ms: None,
+            network: None,
+        }
+    }
+
+    fn t4k_presence(
+        device_id: &str,
+        state: crate::domain_witness::presence::PresenceState,
+        last_transition_at_ms: u64,
+    ) -> crate::domain_witness::presence::PeerPresence {
+        crate::domain_witness::presence::PeerPresence {
+            device_id: device_id.to_string(),
+            state,
+            last_announce_at_ms: Some(last_transition_at_ms),
+            last_transition_at_ms,
+        }
+    }
+
+    /// Build a `DeviceEndpointHistory` that has `device_id`
+    /// observed on `network_id` at `address:port`. Uses the
+    /// same chain-witness apply path as production.
+    fn t4k_endpoint_history(
+        device_id: &str,
+        network_id: &str,
+        address: &str,
+        port: u16,
+    ) -> crate::domain_witness::DeviceEndpointHistory {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        use ed25519_dalek::SigningKey;
+        use evo_witness::{DomainStateOp, DomainWitness, NetworkEndpoint};
+        use rand_core::OsRng;
+
+        let key = SigningKey::generate(&mut OsRng);
+        let endpoint = NetworkEndpoint {
+            network_id: network_id.to_string(),
+            address: address.to_string(),
+            port,
+        };
+        let witness = DomainWitness::sign(
+            &key,
+            DomainWitness::zero_prev_hash_b64(),
+            100,
+            device_id.to_string(),
+            vec![endpoint.clone()],
+            DomainStateOp::AdmitPeer {
+                device_id: device_id.to_string(),
+                display_name: device_id.to_string(),
+                public_key_b64: STANDARD.encode(key.verifying_key().to_bytes()),
+                endpoints: vec![endpoint],
+            },
+        )
+        .expect("sign admit");
+
+        let mut h = crate::domain_witness::DeviceEndpointHistory::new();
+        h.apply(&witness);
+        h
+    }
+
+    #[test]
+    fn t4k_join_populates_presence_and_network_for_chain_admitted_peer() {
+        // Peer is in the discovery row, the correlator has
+        // classified it Live, and the chain has recorded its
+        // endpoint on `audio-vlan-10`. After the join, all
+        // three new fields are populated.
+        let mut entries = vec![t4k_discovery_row("peer-a")];
+        let presence_index: std::collections::HashMap<_, _> =
+            std::iter::once((
+                "peer-a".to_string(),
+                t4k_presence(
+                    "peer-a",
+                    crate::domain_witness::presence::PresenceState::Live,
+                    2_500,
+                ),
+            ))
+            .collect();
+        let endpoints =
+            t4k_endpoint_history("peer-a", "audio-vlan-10", "10.10.0.1", 7331);
+
+        join_track_4k_projection_into(
+            &mut entries,
+            &presence_index,
+            Some(&endpoints),
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].presence_state.as_deref(), Some("live"));
+        assert_eq!(entries[0].last_transition_at_ms, Some(2_500));
+        assert_eq!(entries[0].network.as_deref(), Some("audio-vlan-10"));
+        // Discovery half is preserved.
+        assert_eq!(entries[0].device_id, "peer-a");
+        assert_eq!(entries[0].last_seen_ms, 1_500);
+    }
+
+    #[test]
+    fn t4k_join_leaves_presence_none_when_correlator_has_not_classified_peer() {
+        // Peer is discovered via mDNS-SD but never chain-
+        // admitted, so the correlator has no record. Presence
+        // + last_transition stay None; discovery half intact.
+        let mut entries = vec![t4k_discovery_row("peer-x")];
+        let presence_index = std::collections::HashMap::new();
+
+        join_track_4k_projection_into(&mut entries, &presence_index, None);
+
+        assert_eq!(entries[0].presence_state, None);
+        assert_eq!(entries[0].last_transition_at_ms, None);
+        assert_eq!(entries[0].network, None);
+        assert_eq!(entries[0].device_id, "peer-x");
+    }
+
+    #[test]
+    fn t4k_join_leaves_network_none_without_endpoint_history() {
+        // The witness substrate is not running on this seat
+        // — endpoint_history is None. Presence still
+        // populates if the correlator is wired (advisory
+        // configurations are independent); network is None
+        // on every row.
+        let mut entries = vec![t4k_discovery_row("peer-b")];
+        let presence_index: std::collections::HashMap<_, _> =
+            std::iter::once((
+                "peer-b".to_string(),
+                t4k_presence(
+                    "peer-b",
+                    crate::domain_witness::presence::PresenceState::Quiet,
+                    3_000,
+                ),
+            ))
+            .collect();
+
+        join_track_4k_projection_into(&mut entries, &presence_index, None);
+
+        assert_eq!(entries[0].presence_state.as_deref(), Some("quiet"));
+        assert_eq!(entries[0].last_transition_at_ms, Some(3_000));
+        assert_eq!(entries[0].network, None);
+    }
+
+    #[test]
+    fn t4k_subject_endpoint_derivation_matches_local_subnet() {
+        // Match: 192.0.2.40 falls inside 192.0.2.0/24
+        // (sharing the local seat's subnet) → derived endpoint
+        // carries the local interface's name as network_id.
+        assert!(ipv4_same_subnet(
+            std::net::Ipv4Addr::new(192, 0, 2, 40),
+            std::net::Ipv4Addr::new(192, 0, 2, 10),
+            std::net::Ipv4Addr::new(255, 255, 255, 0),
+        ));
+        // No match: peer on 10.0.0.0/24, local on 192.0.2.0/24.
+        assert!(!ipv4_same_subnet(
+            std::net::Ipv4Addr::new(10, 0, 0, 41),
+            std::net::Ipv4Addr::new(192, 0, 2, 10),
+            std::net::Ipv4Addr::new(255, 255, 255, 0),
+        ));
+        // /16 mask: 172.16.x.x is reachable via 172.16.0.10.
+        assert!(ipv4_same_subnet(
+            std::net::Ipv4Addr::new(172, 16, 42, 7),
+            std::net::Ipv4Addr::new(172, 16, 0, 10),
+            std::net::Ipv4Addr::new(255, 255, 0, 0),
+        ));
+    }
+
+    #[test]
+    fn t4k_derive_subject_endpoints_skips_unparseable_and_ipv6() {
+        // The helper accepts the discovery row's addresses
+        // (mDNS-SD-observed strings); malformed entries +
+        // IPv6 + bare hostnames are skipped without panic.
+        // The function reads the LOCAL seat's interfaces via
+        // if_addrs, which in a unit-test process returns
+        // whatever the host carries — we can't depend on a
+        // specific match. So we assert the SHAPE: the
+        // function never panics, and entries we know cannot
+        // match are excluded.
+        let result = derive_subject_endpoints_from_addresses(&[
+            "not-an-address".to_string(),
+            "device.local:7331".to_string(),
+            "[::1]:7331".to_string(),
+            "".to_string(),
+        ]);
+        // None of these can match a local IPv4 interface;
+        // every one is skipped — empty result is the contract.
+        assert!(
+            result.is_empty(),
+            "unparseable + IPv6-only inputs produced unexpected output: \
+             {result:?}"
+        );
+    }
+
+    #[test]
+    fn t4k_join_maps_every_state_to_its_snake_case_wire_string() {
+        // The wire string domain is fixed by the UI's badge
+        // implementation: live / quiet / stalled / absent /
+        // discarded. A new variant added in code without an
+        // explicit wire-string mapping would fail this test
+        // — pins the contract.
+        use crate::domain_witness::presence::PresenceState;
+        let cases = [
+            (PresenceState::Live, "live"),
+            (PresenceState::Quiet, "quiet"),
+            (PresenceState::Stalled, "stalled"),
+            (PresenceState::Absent, "absent"),
+            (PresenceState::Discarded, "discarded"),
+        ];
+        for (state, wire) in cases {
+            let mut entries = vec![t4k_discovery_row("peer")];
+            let presence_index: std::collections::HashMap<_, _> =
+                std::iter::once((
+                    "peer".to_string(),
+                    t4k_presence("peer", state, 1_000),
+                ))
+                .collect();
+            join_track_4k_projection_into(&mut entries, &presence_index, None);
+            assert_eq!(
+                entries[0].presence_state.as_deref(),
+                Some(wire),
+                "presence_state for {state:?} must be {wire}"
+            );
+        }
+    }
+
+    // ----- parse_http_happening_filter (HTTPS dispatcher path) -----
+    //
+    // These tests exercise the parse helper the HTTPS / WS
+    // subscribe_happenings dispatcher consumes. A prior
+    // regression silently dropped the filter payload at the
+    // dispatch boundary while the typed HappeningFilter
+    // struct's `accepts` logic worked correctly — the unit
+    // tests on `accepts` passed, but the wire never reached
+    // them. These tests gate the regression at the parse
+    // boundary itself.
+
+    #[test]
+    fn http_filter_null_payload_yields_noop_filter() {
+        let f = parse_http_happening_filter(&serde_json::Value::Null).unwrap();
+        assert!(f.is_noop());
+    }
+
+    #[test]
+    fn http_filter_empty_object_yields_noop_filter() {
+        let f = parse_http_happening_filter(&serde_json::json!({})).unwrap();
+        assert!(f.is_noop());
+    }
+
+    #[test]
+    fn http_filter_omitted_filter_field_yields_noop_filter() {
+        // Some clients pass other top-level fields (e.g.
+        // future `since` cursor) without setting `filter`.
+        // Treat absence of `filter` as no-op, not as error.
+        let f = parse_http_happening_filter(&serde_json::json!({
+            "since": 12345
+        }))
+        .unwrap();
+        assert!(f.is_noop());
+    }
+
+    #[test]
+    fn http_filter_empty_filter_object_yields_noop_filter() {
+        let f = parse_http_happening_filter(&serde_json::json!({
+            "filter": {}
+        }))
+        .unwrap();
+        assert!(f.is_noop());
+    }
+
+    #[test]
+    fn http_filter_subject_types_deny_threads_through() {
+        let f = parse_http_happening_filter(&serde_json::json!({
+            "filter": {
+                "subject_types_deny": ["audio_playback_spectrum_frame"]
+            }
+        }))
+        .unwrap();
+        assert!(!f.is_noop());
+        assert_eq!(
+            f.subject_types_deny,
+            vec!["audio_playback_spectrum_frame".to_string()]
+        );
+    }
+
+    #[test]
+    fn http_filter_subject_types_allow_threads_through() {
+        let f = parse_http_happening_filter(&serde_json::json!({
+            "filter": {
+                "subject_types": ["audio_playback_now_playing"]
+            }
+        }))
+        .unwrap();
+        assert!(!f.is_noop());
+        assert_eq!(
+            f.subject_types,
+            vec!["audio_playback_now_playing".to_string()]
+        );
+    }
+
+    #[test]
+    fn http_filter_all_dimensions_thread_through() {
+        let f = parse_http_happening_filter(&serde_json::json!({
+            "filter": {
+                "variants":           ["custody_taken"],
+                "plugins":            ["org.test"],
+                "shelves":            ["a.b"],
+                "subject_types":      ["audio_playback_now_playing"],
+                "subject_types_deny": ["audio_playback_spectrum_frame"],
+            }
+        }))
+        .unwrap();
+        assert_eq!(f.variants, vec!["custody_taken".to_string()]);
+        assert_eq!(f.plugins, vec!["org.test".to_string()]);
+        assert_eq!(f.shelves, vec!["a.b".to_string()]);
+        assert_eq!(
+            f.subject_types,
+            vec!["audio_playback_now_playing".to_string()]
+        );
+        assert_eq!(
+            f.subject_types_deny,
+            vec!["audio_playback_spectrum_frame".to_string()]
+        );
+    }
+
+    #[test]
+    fn http_filter_non_object_payload_refused() {
+        for bad in &[
+            serde_json::json!("a string"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::json!([1, 2, 3]),
+        ] {
+            let err = parse_http_happening_filter(bad).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("payload must be a JSON object or null"),
+                "expected payload-shape diagnostic for {bad:?}; got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_filter_non_object_filter_field_refused() {
+        let err = parse_http_happening_filter(&serde_json::json!({
+            "filter": "not an object"
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("filter must be a JSON object"),
+            "expected filter-shape diagnostic; got {err}"
+        );
+    }
+
+    #[test]
+    fn http_filter_unknown_field_refused() {
+        // `HappeningFilterWire` carries `deny_unknown_fields`.
+        // Typos / forward-roll-back must surface synchronously,
+        // not silently degrade to no-op.
+        let err = parse_http_happening_filter(&serde_json::json!({
+            "filter": { "unknown_dimension": ["x"] }
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown_dimension"),
+            "expected unknown-field diagnostic naming the bad field; got {err}"
+        );
+    }
+
+    // End-to-end stream-level test: stand the HTTPS dispatcher
+    // path on the real StewardState bus, publish two happenings
+    // of distinct subject_types, subscribe with a deny-list on
+    // one of them, drain the stream, assert only the
+    // not-denied happening passes through.
+    //
+    // This is the test that would have caught the earlier
+    // regression: a unit test that pumps the real bus end-to-
+    // end through the actual dispatcher arm, not a typed-
+    // struct unit test alone.
+
+    // End-to-end stream-level test: stand the HTTPS
+    // dispatcher path on a real Server fixture, publish two
+    // happenings of distinct subject_types, subscribe with a
+    // deny-list on one of them, drain the stream, assert only
+    // the not-denied happening passes through.
+    //
+    // This is the test that would have caught the regression
+    // that prompted this fix: a unit test that pumps the
+    // real bus end-to-end through the actual dispatcher arm,
+    // not a typed-struct unit test alone.
+
+    fn build_minimal_server_for_filter_tests() -> std::sync::Arc<Server> {
+        use crate::admin::AdminLedger;
+        use crate::catalogue::Catalogue;
+        use crate::custody::CustodyLedger;
+        use crate::happenings::HappeningBus;
+        use crate::persistence::MemoryPersistenceStore;
+        use crate::projections::ProjectionEngine;
+        use crate::relations::RelationGraph;
+        use crate::router::PluginRouter;
+        use crate::state::StewardState;
+        use crate::subjects::SubjectRegistry;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        const MIN_CAT: &str = r#"
+schema_version = 1
+[[racks]]
+name = "example"
+family = "domain"
+kinds = ["producer"]
+charter = "minimal test rack"
+"#;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cat_path = tmp.path().join("catalogue.toml");
+        std::fs::write(&cat_path, MIN_CAT).expect("write");
+        let catalogue = Arc::new(Catalogue::load(&cat_path).expect("load"));
+        let state = StewardState::builder()
+            .catalogue(catalogue)
+            .subjects(Arc::new(SubjectRegistry::new()))
+            .relations(Arc::new(RelationGraph::new()))
+            .custody(Arc::new(CustodyLedger::new()))
+            .bus(Arc::new(HappeningBus::new()))
+            .admin(Arc::new(AdminLedger::new()))
+            .persistence(Arc::new(MemoryPersistenceStore::new()))
+            .claimant_issuer(Arc::new(
+                crate::claimant::ClaimantTokenIssuer::new("filter-tests"),
+            ))
+            .build()
+            .expect("build state");
+        let projections = Arc::new(ProjectionEngine::new(
+            Arc::clone(&state.subjects),
+            Arc::clone(&state.relations),
+        ));
+        let router = Arc::new(PluginRouter::new(Arc::clone(&state)));
+        Arc::new(Server::new(
+            PathBuf::from("/tmp/evo-filter-tests-unused.sock"),
+            router,
+            Arc::clone(&state),
+            projections,
+        ))
+    }
+
+    fn anon_principal() -> evo_runtime_http::Principal {
+        evo_runtime_http::Principal::new(
+            "test-token",
+            evo_auth_bearer::CapabilitySet::default(),
+        )
+    }
+
+    fn state_changed(subject_type: &str, canonical_id: &str) -> Happening {
+        Happening::SubjectStateChanged {
+            plugin: "org.test".into(),
+            canonical_id: canonical_id.into(),
+            subject_type: subject_type.into(),
+            prev_state: serde_json::Value::Null,
+            new_state: serde_json::Value::Null,
+            at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_happenings_http_deny_list_drops_listed_subject_type() {
+        use futures::StreamExt;
+        let server = build_minimal_server_for_filter_tests();
+        let payload = serde_json::json!({
+            "filter": {
+                "subject_types_deny": ["audio_playback_spectrum_frame"]
+            }
+        });
+        let stream = server
+            .subscribe_http_wire_op(
+                "subscribe_happenings",
+                payload,
+                &anon_principal(),
+            )
+            .await
+            .expect("subscribe should accept the filter shape");
+
+        // Publish one denied + one allowed event. Order:
+        // denied first so a regression that lets it through
+        // surfaces as the first stream frame.
+        server.state.bus.emit(state_changed(
+            "audio_playback_spectrum_frame",
+            "subject-denied",
+        ));
+        server.state.bus.emit(state_changed(
+            "audio_playback_now_playing",
+            "subject-allowed",
+        ));
+
+        let mut stream = stream.stream;
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            stream.next(),
+        )
+        .await
+        .expect("stream should yield within 500 ms")
+        .expect("stream should produce a frame");
+        assert_eq!(
+            observed
+                .get("subject_type")
+                .and_then(serde_json::Value::as_str),
+            Some("audio_playback_now_playing"),
+            "denied subject_type must not appear; only allowed should pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_happenings_http_no_filter_passes_every_event() {
+        use futures::StreamExt;
+        let server = build_minimal_server_for_filter_tests();
+        let stream = server
+            .subscribe_http_wire_op(
+                "subscribe_happenings",
+                serde_json::Value::Null,
+                &anon_principal(),
+            )
+            .await
+            .expect("null payload subscribe should succeed");
+
+        server
+            .state
+            .bus
+            .emit(state_changed("audio_playback_spectrum_frame", "subject-1"));
+
+        let mut stream = stream.stream;
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            stream.next(),
+        )
+        .await
+        .expect("stream should yield within 500 ms")
+        .expect("stream should produce a frame");
+        assert_eq!(
+            observed
+                .get("subject_type")
+                .and_then(serde_json::Value::as_str),
+            Some("audio_playback_spectrum_frame"),
+            "no-filter subscribe must pass every happening unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_happenings_http_keepalive_absent_emits_no_heartbeats() {
+        // Baseline / backward-compat: with no keepalive_ms
+        // the stream carries only genuine happenings; no
+        // heartbeat frame ever fires. A legacy consumer that
+        // does not opt in sees byte-identical pre-keepalive
+        // wire behaviour.
+        use futures::StreamExt;
+        let server = build_minimal_server_for_filter_tests();
+        let opened = server
+            .subscribe_http_wire_op(
+                "subscribe_happenings",
+                serde_json::Value::Null,
+                &anon_principal(),
+            )
+            .await
+            .expect("baseline subscribe should succeed");
+        assert!(
+            opened.initial_event.is_none(),
+            "subscribe_happenings has no initial-event today"
+        );
+        let mut stream = opened.stream;
+        let poll = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            stream.next(),
+        )
+        .await;
+        // Timeout is the expected outcome — no bus emit, no
+        // keepalive, no frame at all within the window.
+        assert!(
+            poll.is_err(),
+            "no keepalive requested → stream must be silent \
+             when the bus is idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_happenings_http_keepalive_present_emits_heartbeats_at_cadence(
+    ) {
+        // Opt-in path: with keepalive_ms=1000 (the clamp
+        // floor), the stream produces a distinctive keepalive
+        // frame independent of bus activity. The frame's
+        // `happenings_keepalive: true` top-level key
+        // discriminates it from every happening variant.
+        use futures::StreamExt;
+        let server = build_minimal_server_for_filter_tests();
+        let opened = server
+            .subscribe_http_wire_op(
+                "subscribe_happenings",
+                serde_json::json!({ "keepalive_ms": 1000 }),
+                &anon_principal(),
+            )
+            .await
+            .expect("keepalive subscribe should succeed");
+        let mut stream = opened.stream;
+        // Interval's first tick is skipped in our merge, so
+        // the first heartbeat arrives ~keepalive_ms after
+        // subscription. Budget 2.5 s so a slower CI does not
+        // false-fail; the assertion below is on shape, not on
+        // exact cadence.
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_millis(2_500),
+            stream.next(),
+        )
+        .await
+        .expect("keepalive should fire within 2.5 s")
+        .expect("stream should produce the keepalive frame");
+        assert_eq!(
+            observed
+                .get("happenings_keepalive")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "keepalive frame must carry `happenings_keepalive: true` \
+             top-level key; got {observed}"
+        );
+        assert!(
+            observed
+                .get("ts_ms")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "keepalive frame must carry a wall-clock `ts_ms`; \
+             got {observed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_subject_http_snapshot_in_ack_omitted_for_unknown_subject(
+    ) {
+        // Unknown subject → subscribe still opens (the state
+        // broadcast can carry future state for the id) but
+        // the initial_event is `None` since there is nothing
+        // to snapshot. Consumer sees the same shape as the
+        // legacy pre-snapshot-in-ack path — no ack payload.
+        let server = build_minimal_server_for_filter_tests();
+        let opened = server
+            .subscribe_http_wire_op(
+                "subscribe_subject",
+                serde_json::json!({
+                    "canonical_id":    "no-such-subject",
+                    "snapshot_in_ack": true,
+                }),
+                &anon_principal(),
+            )
+            .await
+            .expect("subscribe_subject should accept snapshot_in_ack");
+        assert!(
+            opened.initial_event.is_none(),
+            "unknown subject → no initial state to snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_subject_http_rejects_unknown_payload_field() {
+        // `deny_unknown_fields` on the parsed struct catches
+        // typos on the consumer side — better a synchronous
+        // refusal than a silently-ignored parameter.
+        let server = build_minimal_server_for_filter_tests();
+        let err = server
+            .subscribe_http_wire_op(
+                "subscribe_subject",
+                serde_json::json!({
+                    "canonical_id": "abc",
+                    "typo_field":   "unexpected",
+                }),
+                &anon_principal(),
+            )
+            .await
+            .expect_err("unknown payload field must refuse");
+        match err {
+            evo_runtime_http::DispatchError::InvalidPayload(msg) => {
+                assert!(
+                    msg.contains("typo_field") || msg.contains("unknown"),
+                    "refusal must name the unknown field, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidPayload, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // HTTPS-arriving responder-slot session-stability tests.
+    //
+    // Regression coverage for the defect where the HTTPS dispatch path
+    // (`Server::dispatch_http_wire_op`) minted a fresh
+    // `ResponderConnectionId` per wire op via `next_connection_id()`,
+    // leaving the responder slot holding an orphan id after the first
+    // negotiate returned. Every subsequent claim from any (fresh-id)
+    // op was refused until the steward restarted. Fix:
+    // `connection_id_for_principal` derives the id from a stable hash
+    // of the bearer token identity so same-bearer re-claims are
+    // idempotent and different-bearer claims are correctly refused.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn https_responder_id_stable_across_ops_from_same_bearer() {
+        use evo_auth_bearer::{Capability, CapabilitySet};
+        let p1 = evo_runtime_http::Principal::new(
+            "tok-abc-123",
+            CapabilitySet::new(vec![Capability::write(
+                "user_interaction_responder",
+            )]),
+        );
+        let p2 = evo_runtime_http::Principal::new(
+            "tok-abc-123",
+            CapabilitySet::new(vec![Capability::write(
+                "user_interaction_responder",
+            )]),
+        );
+        assert_eq!(
+            connection_id_for_principal(&p1),
+            connection_id_for_principal(&p2),
+            "same bearer token id must yield the same responder \
+             connection id — otherwise the same session's ops get \
+             refused after the first claim"
+        );
+    }
+
+    #[test]
+    fn https_responder_id_differs_between_bearers() {
+        use evo_auth_bearer::{Capability, CapabilitySet};
+        let p1 = evo_runtime_http::Principal::new(
+            "tok-alice",
+            CapabilitySet::new(vec![Capability::write(
+                "user_interaction_responder",
+            )]),
+        );
+        let p2 = evo_runtime_http::Principal::new(
+            "tok-bob",
+            CapabilitySet::new(vec![Capability::write(
+                "user_interaction_responder",
+            )]),
+        );
+        assert_ne!(
+            connection_id_for_principal(&p1),
+            connection_id_for_principal(&p2),
+            "different bearer token ids must yield different \
+             responder connection ids — otherwise the second bearer \
+             would silently steal the first's claim slot"
+        );
+    }
+
+    #[test]
+    fn https_responder_id_high_range_versus_unix_counter() {
+        // The Unix-socket path uses `next_connection_id` starting at
+        // 1 and incrementing monotonically. A well-formed hash of a
+        // real token id lands in the high u64 range with over-
+        // whelming probability. This test asserts a specific token
+        // hashes above 1M — proving in practice the two id spaces
+        // do not collide. Salt in `connection_id_for_principal`
+        // makes the low-range collision astronomically unlikely.
+        use evo_auth_bearer::{Capability, CapabilitySet};
+        let p = evo_runtime_http::Principal::new(
+            "tok-collision-guard-probe",
+            CapabilitySet::new(vec![Capability::write(
+                "user_interaction_responder",
+            )]),
+        );
+        let id = connection_id_for_principal(&p).0;
+        assert!(
+            id > 1_000_000,
+            "hash-derived id landed in Unix-counter range \
+             (id={id}); collision guard broken"
+        );
+    }
+
+    #[test]
+    fn https_responder_claim_idempotent_same_bearer() {
+        // Composed with `PromptLedger::try_claim_responder`: two
+        // ops from the same bearer both succeed at claiming the
+        // slot (the second call is idempotent). This is the fix's
+        // core behaviour — pre-fix, the second op would fail with
+        // `AlreadyHeld`.
+        use evo_auth_bearer::{Capability, CapabilitySet};
+        let principal = evo_runtime_http::Principal::new(
+            "tok-idempotent",
+            CapabilitySet::new(vec![Capability::write(
+                "user_interaction_responder",
+            )]),
+        );
+        let ledger = crate::prompts::PromptLedger::new();
+        let id_op1 = connection_id_for_principal(&principal);
+        let id_op2 = connection_id_for_principal(&principal);
+        assert!(ledger.try_claim_responder(id_op1).is_ok());
+        assert!(
+            ledger.try_claim_responder(id_op2).is_ok(),
+            "same-bearer second claim must be idempotent-Ok"
+        );
+    }
+
+    #[test]
+    fn https_responder_claim_refused_across_bearers() {
+        use evo_auth_bearer::{Capability, CapabilitySet};
+        let alice = evo_runtime_http::Principal::new(
+            "tok-alice",
+            CapabilitySet::new(vec![Capability::write(
+                "user_interaction_responder",
+            )]),
+        );
+        let bob = evo_runtime_http::Principal::new(
+            "tok-bob",
+            CapabilitySet::new(vec![Capability::write(
+                "user_interaction_responder",
+            )]),
+        );
+        let ledger = crate::prompts::PromptLedger::new();
+        assert!(ledger
+            .try_claim_responder(connection_id_for_principal(&alice))
+            .is_ok());
+        let bob_result =
+            ledger.try_claim_responder(connection_id_for_principal(&bob));
+        assert!(
+            matches!(
+                bob_result,
+                Err(crate::prompts::ResponderClaimError::AlreadyHeld { .. })
+            ),
+            "different-bearer claim while another holds must be \
+             refused; got {bob_result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Scoped mint intersection tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn narrow_bootstrap_by_single_scope_keeps_matching_capability() {
+        let bootstrap = crate::https_boot::operator_bootstrap_capability_set();
+        let narrowed = narrow_bootstrap_by_scope_names(
+            &bootstrap,
+            &["user_interaction_responder".to_string()],
+        );
+        assert_eq!(narrowed.len(), 1);
+        let cap = &narrowed.capabilities()[0];
+        assert_eq!(cap.scope(), "user_interaction_responder");
+        // Rank must be preserved from the bootstrap set (Write).
+        assert!(matches!(cap, evo_auth_bearer::Capability::Write { .. }));
+    }
+
+    #[test]
+    fn narrow_bootstrap_by_unknown_scope_drops_silently() {
+        // A scope name that does not appear in the bootstrap set
+        // is silently dropped — the caller cannot manufacture
+        // scopes the framework does not carry. Combined with the
+        // empty-intersection refusal at the handler layer, this
+        // means a mint request with only unknown scopes is
+        // refused; the CLI operator sees the structured error.
+        let bootstrap = crate::https_boot::operator_bootstrap_capability_set();
+        let narrowed = narrow_bootstrap_by_scope_names(
+            &bootstrap,
+            &["totally_made_up_scope".to_string()],
+        );
+        assert!(
+            narrowed.is_empty(),
+            "unknown scope names must not appear in the narrowed set"
+        );
+    }
+
+    #[test]
+    fn narrow_bootstrap_deduplicates_repeated_scope() {
+        let bootstrap = crate::https_boot::operator_bootstrap_capability_set();
+        let narrowed = narrow_bootstrap_by_scope_names(
+            &bootstrap,
+            &[
+                "user_interaction_responder".to_string(),
+                "user_interaction_responder".to_string(),
+                "user_interaction_responder".to_string(),
+            ],
+        );
+        assert_eq!(
+            narrowed.len(),
+            1,
+            "duplicate scope names must yield a single entry"
+        );
+    }
+
+    #[test]
+    fn narrow_bootstrap_by_multiple_scopes_keeps_all_matches() {
+        let bootstrap = crate::https_boot::operator_bootstrap_capability_set();
+        let narrowed = narrow_bootstrap_by_scope_names(
+            &bootstrap,
+            &[
+                "user_interaction_responder".to_string(),
+                "plugins_admin".to_string(),
+                "audio".to_string(),
+            ],
+        );
+        assert_eq!(narrowed.len(), 3);
+        let scopes: Vec<&str> =
+            narrowed.capabilities().iter().map(|c| c.scope()).collect();
+        assert!(scopes.contains(&"user_interaction_responder"));
+        assert!(scopes.contains(&"plugins_admin"));
+        assert!(scopes.contains(&"audio"));
+    }
+
+    #[test]
+    fn narrow_bootstrap_cannot_widen_beyond_bootstrap_authority() {
+        // Invariant: whatever the caller supplies, the resulting
+        // set is a subset of the bootstrap set. A mint can
+        // narrow; it can never widen. This test asserts the
+        // property against a request that includes both real and
+        // fabricated scope names — only the real ones survive.
+        let bootstrap = crate::https_boot::operator_bootstrap_capability_set();
+        let bootstrap_scopes: std::collections::HashSet<&str> =
+            bootstrap.capabilities().iter().map(|c| c.scope()).collect();
+        let narrowed = narrow_bootstrap_by_scope_names(
+            &bootstrap,
+            &[
+                "user_interaction_responder".to_string(),
+                "admin_root_god_mode".to_string(),
+                "reboot_the_universe".to_string(),
+            ],
+        );
+        for cap in narrowed.capabilities() {
+            assert!(
+                bootstrap_scopes.contains(cap.scope()),
+                "narrowed set must be a subset of bootstrap; \
+                 leaked scope: {}",
+                cap.scope()
+            );
         }
     }
 }

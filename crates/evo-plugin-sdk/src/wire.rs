@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Wire protocol messages.
 //!
 //! Implements the message schema specified in
@@ -39,8 +42,8 @@
 //!
 //! ## Types deliberately excluded from v1
 //!
-//! - User-interaction requests: deferred.
-//! - Hot reload (`reload_in_place`): deferred.
+//! - User-interaction requests: not in the v1 protocol.
+//! - Hot reload (`reload_in_place`): not in the v1 protocol.
 //! - Cancellation frames: the v1 protocol relies on deadline expiry.
 //!
 //! Factory verbs (`announce_instance`, `retract_instance`) are
@@ -210,6 +213,22 @@ pub enum WireFrame {
         /// requirement.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instance_id: Option<String>,
+        /// Capability scope the steward dispatcher verified the
+        /// principal holds before forwarding this frame to the plugin
+        /// host. `None` when the verb's manifest entry is
+        /// `VerbCapability::None` or absent (the legacy default; the
+        /// verb accepts anonymous dispatches); otherwise the verified
+        /// scope string. Forwarded into `Request::principal_scope` by
+        /// the plugin host.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        principal_scope: Option<String>,
+        /// `true` when the steward dispatcher verified the principal
+        /// holds an active step-up auth session for the verb's
+        /// declared scope. Always `false` when the verb's manifest
+        /// declaration is not `VerbCapability::StepUp`. Forwarded into
+        /// `Request::has_step_up` by the plugin host.
+        #[serde(default)]
+        has_step_up: bool,
     },
 
     // ---------------------------------------------------------------
@@ -466,6 +485,17 @@ pub enum WireFrame {
         addressing: ExternalAddressing,
         /// New state value. `null` clears the state.
         state: serde_json::Value,
+        /// Volatile — the state MUST NOT be mirrored into the
+        /// durable `subject_states` table. Intended for high-rate
+        /// telemetry subjects (spectrum frames, VU-meter samples,
+        /// waveform snapshots) whose per-emit persist cost would
+        /// dominate the steward's write budget for zero operator
+        /// benefit. Default `false` — pre-existing frames without
+        /// this field deserialise to the durable path unchanged.
+        /// See [`SubjectAnnouncer::update_state_volatile`] on the
+        /// plugin-SDK side.
+        #[serde(default)]
+        volatile: bool,
     },
 
     /// Relation assertion event. Plugin claims an edge in the
@@ -637,6 +667,127 @@ pub enum WireFrame {
         plugin: String,
         /// The resolved canonical id, if any.
         canonical_id: Option<String>,
+    },
+
+    // ---------------------------------------------------------------
+    // Plugin -> Steward: subject-state subscription surface — wire
+    // proxy for [`crate::contract::SubjectStateSubscriber`].
+    //
+    // `SubscribeSubject` opens a server-pushed update stream for one
+    // canonical subject id; the steward acknowledges with a
+    // `SubscribeSubjectResponse` and then forwards every state
+    // change for the subject via [`Self::SubjectStateUpdatePush`]
+    // until the plugin sends [`Self::UnsubscribeSubject`] or the
+    // connection drops. Multiple `SubscribeSubject` requests for
+    // the same id from the same plugin establish independent
+    // subscriptions; the steward forwards each update once per
+    // active subscription. `CurrentState` is a one-shot snapshot
+    // pull paired with [`Self::CurrentStateResponse`].
+    //
+    // OOP plugins previously saw `subject_state_subscriber = None`
+    // (advisory mode); these frames let the wire-backed proxy in
+    // the SDK supply a real implementation that round-trips
+    // subscription + push through the steward's subject registry.
+    // ---------------------------------------------------------------
+    /// `subscribe_subject` request.
+    SubscribeSubject {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID — matched by the paired response.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Canonical subject id the plugin wants updates for.
+        canonical_id: String,
+    },
+
+    /// `subscribe_subject` response. Confirms the steward bound a
+    /// subscription. After this frame the steward will start
+    /// emitting [`Self::SubjectStateUpdatePush`] frames for
+    /// `canonical_id` until the plugin unsubscribes or disconnects.
+    SubscribeSubjectResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Canonical subject id the subscription is bound to.
+        canonical_id: String,
+    },
+
+    /// `unsubscribe_subject` request. The plugin sends this when
+    /// the matching [`crate::contract::SubjectStateStream`] drops
+    /// so the steward can release its server-side subscription.
+    /// Best-effort: a connection drop also triggers cleanup.
+    UnsubscribeSubject {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID — matched by the paired response.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Canonical subject id the plugin is unsubscribing from.
+        canonical_id: String,
+    },
+
+    /// `unsubscribe_subject` response. Plain ack; the steward
+    /// emits this once the server-side subscription has been
+    /// released. The cid lets the plugin pair it with its
+    /// `UnsubscribeSubject` request for shutdown ordering.
+    UnsubscribeSubjectResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// `current_state` request — one-shot pull of the current
+    /// projection for `canonical_id`. Returns `None` when the
+    /// subject exists but no state has been published, or when
+    /// the subject is unknown.
+    CurrentState {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID — matched by the paired response.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Canonical subject id whose state to read.
+        canonical_id: String,
+    },
+
+    /// `current_state` response.
+    CurrentStateResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Current state payload, or `None`.
+        state: Option<serde_json::Value>,
+    },
+
+    /// Server-pushed projection update for an active
+    /// [`Self::SubscribeSubject`] subscription. No `cid` — push
+    /// frames are not paired with a plugin request; the plugin
+    /// demuxes by `canonical_id`.
+    SubjectStateUpdatePush {
+        /// Protocol version.
+        v: u16,
+        /// Canonical plugin name the push targets.
+        plugin: String,
+        /// Canonical subject id whose state changed.
+        canonical_id: String,
+        /// Subject type at the time of the change.
+        subject_type: String,
+        /// New state payload, or `None` when cleared.
+        state: Option<serde_json::Value>,
+        /// Wall-clock millisecond at the change.
+        modified_at_ms: u64,
     },
 
     // ---------------------------------------------------------------
@@ -975,6 +1126,167 @@ pub enum WireFrame {
     },
 
     // ---------------------------------------------------------------
+    // Plugin-originated asset-cache access (plugin -> steward).
+    // Mirrors [`crate::contract::AssetCache::get`] /
+    // [`crate::contract::AssetCache::put`] across the wire so OOP
+    // plugins reach the same content-addressed store as in-process
+    // ones. The steward replies with
+    // [`Self::AssetCacheGetResponse`] /
+    // [`Self::AssetCachePutResponse`] on success or
+    // [`Self::Error`] on refusal. The Error's `details.subclass`
+    // carries the structured refusal token (`hash_mismatch`,
+    // `invalid_hash`, `io`, `eviction`).
+    // ---------------------------------------------------------------
+    /// Plugin-originated asset-cache get request.
+    AssetCacheGet {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical name of the dispatching plugin.
+        plugin: String,
+        /// Content hash to look up. Validated against the
+        /// AssetCache trait's 64-lowercase-hex shape at the
+        /// steward end.
+        content_hash: String,
+    },
+
+    /// Plugin-originated asset-cache get success response.
+    /// `found` discriminates hit vs miss: when `found = true`,
+    /// `bytes` carries the cached content; when `found = false`,
+    /// `bytes` is empty.
+    AssetCacheGetResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// `true` on cache hit; `false` on miss. The boolean
+        /// discriminator avoids an Option<Vec<u8>> codec helper
+        /// while keeping the wire-shape unambiguous.
+        found: bool,
+        /// Cached bytes on hit; empty vector on miss. Encoded as
+        /// a native CBOR byte string under CBOR and as a base64
+        /// JSON string under JSON.
+        #[serde(with = "crate::codec::base64_bytes")]
+        bytes: Vec<u8>,
+    },
+
+    /// Plugin-originated asset-cache put request.
+    AssetCachePut {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical name of the dispatching plugin.
+        plugin: String,
+        /// Content hash to store under. The cache validates
+        /// that SHA-256(bytes) matches; mismatch surfaces as
+        /// [`Self::Error`] with `subclass = "hash_mismatch"`.
+        content_hash: String,
+        /// Bytes to store. Encoded as a native CBOR byte string
+        /// under CBOR and as a base64 JSON string under JSON
+        /// via [`crate::codec::base64_bytes`].
+        #[serde(with = "crate::codec::base64_bytes")]
+        bytes: Vec<u8>,
+    },
+
+    /// Plugin-originated asset-cache put success response.
+    AssetCachePutResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Plugin-originated asset-cache delete request.
+    ///
+    /// Evicts a single content-hash entry from the framework's
+    /// asset cache. Idempotent — a delete against an entry that
+    /// has already been evicted (or never existed) succeeds with
+    /// `existed = false`; framework-level failures (I/O,
+    /// syntactically-invalid hash) surface as [`Self::Error`]
+    /// with the same subclass mapping the get/put paths use.
+    AssetCacheDelete {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical name of the dispatching plugin.
+        plugin: String,
+        /// Content hash to evict. Validated for shape (64
+        /// lowercase-hex chars) before dispatch; malformed hashes
+        /// return `Error` with `subclass = "invalid_hash"`.
+        content_hash: String,
+    },
+
+    /// Plugin-originated asset-cache delete success response.
+    AssetCacheDeleteResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// True when the entry was present and was removed;
+        /// false when there was no entry under the supplied
+        /// hash (delete-of-absent is not an error).
+        existed: bool,
+    },
+
+    // ---------------------------------------------------------------
+    // Plugin-originated shelf-dispatch request (plugin -> steward).
+    // Mirrors the in-process [`crate::contract::ShelfRequestDispatcher`]
+    // trait method across the wire so OOP plugins reach the same
+    // shelf-dispatch path as in-process ones. The steward routes the
+    // dispatch call to the destination plugin's request handler and
+    // replies with [`Self::ShelfDispatchResponse`] on success or
+    // [`Self::Error`] on refusal. The Error's `details.subclass`
+    // carries the structured refusal token
+    // (`no_plugin_on_shelf`, `verb_not_stocked_on_shelf`,
+    // `permanent`, `transient`, `deadline_exceeded`, `substrate_failure`).
+    // ---------------------------------------------------------------
+    /// Plugin-originated shelf-dispatch request.
+    ShelfDispatchRequest {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical name of the dispatching plugin.
+        plugin: String,
+        /// Target shelf name (e.g. `audio.library`).
+        shelf: String,
+        /// Verb name declared in destination plugin's manifest.
+        request_type: String,
+        /// Request payload as JSON bytes (UTF-8). Encoded as a native
+        /// CBOR byte string under CBOR and as a base64 JSON string
+        /// under JSON via [`crate::codec::base64_bytes`].
+        #[serde(with = "crate::codec::base64_bytes")]
+        payload: Vec<u8>,
+        /// Instance ID for factory-stocked instance routing; `None`
+        /// for singleton stockings.
+        instance_id: Option<String>,
+    },
+
+    /// Plugin-originated shelf-dispatch success response.
+    ShelfDispatchResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Response payload as JSON bytes (UTF-8). Encoded as a native
+        /// CBOR byte string under CBOR and as a base64 JSON string
+        /// under JSON via [`crate::codec::base64_bytes`].
+        #[serde(with = "crate::codec::base64_bytes")]
+        payload: Vec<u8>,
+    },
+
+    // ---------------------------------------------------------------
     // Plugin-originated user-interaction request (plugin -> steward).
     // Mirrors the in-process
     // [`crate::contract::UserInteractionRequester`] trait method
@@ -1042,6 +1354,44 @@ pub enum WireFrame {
     /// success — the SDK trait method's return type is
     /// `Result<(), ReportError>`.
     EmitPluginEventResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    // ---------------------------------------------------------------
+    // Plugin-originated AudioPlaybackEnded emission (plugin -> steward).
+    // Mirrors the in-process
+    // [`crate::contract::HappeningEmitter::emit_audio_playback_ended`]
+    // surface across the wire. The steward's wire-handler reaches
+    // the same `Happening::AudioPlaybackEnded` bus emission path as
+    // an in-process source plugin would; the framework stamps
+    // `source_plugin` with the authoritative caller identity, the
+    // plugin only supplies `claim_uri`. Reply is
+    // [`Self::EmitAudioPlaybackEndedResponse`] on success or
+    // [`Self::Error`] on refusal.
+    // ---------------------------------------------------------------
+    /// Plugin-originated AudioPlaybackEnded emission request.
+    EmitAudioPlaybackEnded {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical name of the emitting plugin.
+        plugin: String,
+        /// URI that was playing when playback ended, when the
+        /// plugin tracks per-claim state. `None` for plugins
+        /// that do not surface the URI on end.
+        claim_uri: Option<String>,
+    },
+
+    /// Plugin-originated AudioPlaybackEnded emission response.
+    /// Empty on success — the SDK trait method's return type is
+    /// `Result<(), ReportError>`.
+    EmitAudioPlaybackEndedResponse {
         /// Protocol version.
         v: u16,
         /// Correlation ID echoing the request.
@@ -1188,6 +1538,870 @@ pub enum WireFrame {
         /// Canonical plugin name.
         plugin: String,
     },
+
+    /// Steward → plugin: audio-routing state push. Emitted on
+    /// every reconciliation-engine rewire that affects the
+    /// receiving plugin's chain stage. The plugin's SDK
+    /// `WireAudioRouting` proxy updates its cache + fires the
+    /// plugin's registered `on_route_change` callback and
+    /// acknowledges with `EventAck`. The trait's four sync read
+    /// methods (`write_endpoint`, `read_endpoint`,
+    /// `composition_endpoints`, `current_format`) serve from
+    /// this cached snapshot — no per-call wire round-trip,
+    /// preserving the sync trait signature without
+    /// block-on-async hazards inside the plugin process.
+    AudioRoutingStateChanged {
+        /// Protocol version.
+        v: u16,
+        /// Event's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Post-rewire snapshot of the plugin's resolved
+        /// routing. `Some` carries the configured topology;
+        /// `None` clears the proxy cache (e.g. after
+        /// `clear_topology` on plugin teardown while the
+        /// subprocess remains alive).
+        resolved: Option<crate::contract::audio_routing::ResolvedRouting>,
+        /// Free-form operator-readable reason for the rewire.
+        /// Passed through to the plugin's callback via
+        /// [`crate::contract::audio_routing::RouteChange::reason`].
+        reason: String,
+    },
+
+    /// Plugin → steward: read a device's operator-declared
+    /// multi-room role. Same shape as
+    /// [`crate::multiroom_substrate::MultiroomSubstrateHandle::get_role`].
+    /// Steward replies with [`Self::GetMultiroomRoleResponse`].
+    GetMultiroomRole {
+        /// Protocol version.
+        v: u16,
+        /// Request's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Canonical device id whose role to read.
+        device_id: String,
+    },
+
+    /// Steward → plugin: response to [`Self::GetMultiroomRole`].
+    GetMultiroomRoleResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID of the matching request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Result of the trait call. `Ok(Role)` carries the
+        /// substrate-empty default (`Role::Auto`) when the
+        /// device has no explicit row.
+        result: Result<
+            crate::multiroom_substrate::Role,
+            crate::multiroom_substrate::MultiroomSubstrateError,
+        >,
+    },
+
+    /// Plugin → steward: list every device with an explicit
+    /// operator-gestured role.
+    ListMultiroomExplicitRoles {
+        /// Protocol version.
+        v: u16,
+        /// Request's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Steward → plugin: response to
+    /// [`Self::ListMultiroomExplicitRoles`].
+    ListMultiroomExplicitRolesResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID of the matching request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// `(device_id, role)` rows for every device with an
+        /// explicit role; devices in the `Auto` default are
+        /// not included.
+        result: Result<
+            Vec<(String, crate::multiroom_substrate::Role)>,
+            crate::multiroom_substrate::MultiroomSubstrateError,
+        >,
+    },
+
+    /// Plugin → steward: read one multi-room group by canonical
+    /// id.
+    GetMultiroomGroup {
+        /// Protocol version.
+        v: u16,
+        /// Request's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Canonical group id to look up.
+        group_id: String,
+    },
+
+    /// Steward → plugin: response to [`Self::GetMultiroomGroup`].
+    GetMultiroomGroupResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID of the matching request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// `Ok(Some(record))` when the group exists; `Ok(None)`
+        /// when no row is recorded for the supplied id.
+        result: Result<
+            Option<crate::multiroom_substrate::GroupRecord>,
+            crate::multiroom_substrate::MultiroomSubstrateError,
+        >,
+    },
+
+    /// Plugin → steward: list every recorded multi-room group.
+    ListMultiroomGroups {
+        /// Protocol version.
+        v: u16,
+        /// Request's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Steward → plugin: response to
+    /// [`Self::ListMultiroomGroups`].
+    ListMultiroomGroupsResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID of the matching request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Full membership projection for every recorded group.
+        result: Result<
+            Vec<crate::multiroom_substrate::GroupRecord>,
+            crate::multiroom_substrate::MultiroomSubstrateError,
+        >,
+    },
+
+    /// Plugin → steward: list every group a device participates
+    /// in.
+    ListMultiroomGroupsForDevice {
+        /// Protocol version.
+        v: u16,
+        /// Request's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Canonical device id whose group memberships to
+        /// enumerate.
+        device_id: String,
+    },
+
+    /// Steward → plugin: response to
+    /// [`Self::ListMultiroomGroupsForDevice`].
+    ListMultiroomGroupsForDeviceResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID of the matching request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Full projection for every group containing the
+        /// queried device.
+        result: Result<
+            Vec<crate::multiroom_substrate::GroupRecord>,
+            crate::multiroom_substrate::MultiroomSubstrateError,
+        >,
+    },
+
+    /// Steward → plugin: a multi-room role substrate change
+    /// event. The steward's forwarder subscribes to
+    /// `subscribe_role_changes()` on the local
+    /// `MultiroomSubstrateHandle` at admission and fans every
+    /// event out to subprocess plugins as this frame. The SDK
+    /// proxy pushes the event onto the plugin's
+    /// `RoleChangeReceiver`. Acknowledged with `EventAck`.
+    MultiroomRoleChanged {
+        /// Protocol version.
+        v: u16,
+        /// Event's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The substrate change to dispatch.
+        change: crate::multiroom_substrate::RoleChange,
+    },
+
+    /// Steward → plugin: a multi-room group substrate change
+    /// event. Same forwarder shape as
+    /// [`Self::MultiroomRoleChanged`].
+    MultiroomGroupChanged {
+        /// Protocol version.
+        v: u16,
+        /// Event's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The substrate change to dispatch.
+        change: crate::multiroom_substrate::GroupChange,
+    },
+
+    /// Steward → plugin: audio-plane initial state push. Emitted
+    /// once post-load by the OOP-admission forwarder so the
+    /// SDK proxy can cache the two sync utility values
+    /// [`crate::contract::audio_plane::AudioPlaneHandle::monotonic_ns`]
+    /// and
+    /// [`crate::contract::audio_plane::AudioPlaneHandle::local_device_id`]
+    /// returns. The plugin captures its own local
+    /// [`std::time::Instant`] at the moment of receipt so
+    /// subsequent `monotonic_ns()` calls compute relative to
+    /// that anchor (`framework_epoch_ns + plugin_elapsed_ns`).
+    AudioPlaneInit {
+        /// Protocol version.
+        v: u16,
+        /// Event's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Framework runtime's monotonic ns at install time.
+        framework_monotonic_ns: u64,
+        /// Local device's canonical id. Stable for the
+        /// process lifetime.
+        local_device_id: String,
+    },
+
+    /// Plugin → steward: fan an audio frame out to every
+    /// receiver of the supplied group.
+    AudioPlaneFanOutFrame {
+        /// Protocol version.
+        v: u16,
+        /// Request's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Target group id.
+        group_id: String,
+        /// Encoded frame envelope.
+        frame: crate::contract::audio_plane::AudioFrameSeed,
+    },
+
+    /// Steward → plugin: success response to
+    /// [`Self::AudioPlaneFanOutFrame`]. Failures arrive as
+    /// [`Self::Error`] frames.
+    AudioPlaneFanOutFrameResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID of the matching request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Plugin → steward: upsert a multi-room group's membership.
+    AudioPlaneUpsertGroup {
+        /// Protocol version.
+        v: u16,
+        /// Request's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Canonical group id.
+        group_id: String,
+        /// Operator-editable display name.
+        display_name: String,
+        /// Member device ids.
+        members: Vec<String>,
+    },
+
+    /// Steward → plugin: success response to
+    /// [`Self::AudioPlaneUpsertGroup`].
+    AudioPlaneUpsertGroupResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID of the matching request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Plugin → steward: dial an outbound audio-plane peer.
+    AudioPlaneDialPeer {
+        /// Protocol version.
+        v: u16,
+        /// Request's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// `host:port` literal of the peer to dial.
+        addr: String,
+    },
+
+    /// Steward → plugin: success response to
+    /// [`Self::AudioPlaneDialPeer`].
+    AudioPlaneDialPeerResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID of the matching request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Plugin → steward: close every outbound audio-plane peer
+    /// connection.
+    AudioPlaneCloseOutboundConnections {
+        /// Protocol version.
+        v: u16,
+        /// Request's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Steward → plugin: success response to
+    /// [`Self::AudioPlaneCloseOutboundConnections`].
+    AudioPlaneCloseOutboundConnectionsResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID of the matching request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Plugin → steward: report a per-frame audible-time trace
+    /// from the receiver side.
+    AudioPlaneReportFrameTrace {
+        /// Protocol version.
+        v: u16,
+        /// Request's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Receiver-side trace observations.
+        report: crate::contract::audio_plane::ReceiverFrameTraceReport,
+    },
+
+    /// Steward → plugin: success response to
+    /// [`Self::AudioPlaneReportFrameTrace`].
+    AudioPlaneReportFrameTraceResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID of the matching request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Steward → plugin: one received audio frame.
+    AudioPlaneFrameReceived {
+        /// Protocol version.
+        v: u16,
+        /// Event's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Decoded frame envelope.
+        frame: crate::contract::audio_plane::AudioFrameReceived,
+    },
+
+    /// Steward → plugin: one frame-send observation.
+    AudioPlaneFrameSendEvent {
+        /// Protocol version.
+        v: u16,
+        /// Event's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The send observation.
+        event: crate::contract::audio_plane::FrameSendEvent,
+    },
+
+    /// Steward → plugin: one frame-trace back-report from a
+    /// receiver peer.
+    AudioPlaneFrameTraceReport {
+        /// Protocol version.
+        v: u16,
+        /// Event's correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The back-report.
+        report: crate::contract::audio_plane::FrameTraceReport,
+    },
+
+    // ---------------------------------------------------------------
+    // Plugin -> Steward: streaming wire primitive (open / emit /
+    // close). Mirrors the SDK's `StreamHost` trait; each verb round-
+    // trips one wire frame to the steward's `StreamCoordinator`.
+    // Errors surface via `WireFrame::Error` echoing the same cid,
+    // matching the pattern the alias-aware describe queries use.
+    // Populates `LoadContext.streams` for OOP plugins whose
+    // manifest declares `capabilities.streams = true`. Consumer-
+    // side subscription is a separate event-shaped path not covered
+    // by these variants; the OOP producer path lands first.
+    // ---------------------------------------------------------------
+    /// `open_stream` request. Registers a stream against the
+    /// coordinator, coalescing into an existing stream when the
+    /// spec matches.
+    OpenStream {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The stream's canonical identifier. Idempotent on a
+        /// matching spec; a divergent spec surfaces as an `Error`
+        /// frame carrying `StreamError::Invalid`.
+        stream_id: crate::contract::streams::StreamId,
+        /// The stream's format + rate + backpressure spec.
+        spec: crate::contract::streams::StreamSpec,
+    },
+
+    /// `open_stream` response. Echoes the same `stream_id` back so
+    /// the plugin can chain it through subsequent emits without
+    /// re-validating.
+    OpenStreamResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The stream's canonical identifier.
+        stream_id: crate::contract::streams::StreamId,
+    },
+
+    /// `emit_stream` request. Publishes one frame to every subscribed
+    /// consumer under per-consumer backpressure policy.
+    EmitStream {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Which stream to publish against.
+        stream_id: crate::contract::streams::StreamId,
+        /// Producer's timestamp when the frame's payload was ready.
+        /// Consumers use this to compute end-to-end latency.
+        produced_at_ns: u64,
+        /// Codec token identifying the payload's encoding.
+        codec: String,
+        /// Encoded payload. Base64-encoded in JSON; raw bytes in
+        /// CBOR.
+        #[serde(with = "crate::codec::base64_bytes")]
+        payload: Vec<u8>,
+    },
+
+    /// `emit_stream` response. Carries the fan-out aggregate.
+    EmitStreamResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Per-consumer emit outcome.
+        emit_result: crate::contract::streams::EmitResult,
+    },
+
+    /// `close_stream` request. Retires the stream from the
+    /// coordinator; future emits refuse with `StreamError::Closed`.
+    CloseStream {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Which stream to retire.
+        stream_id: crate::contract::streams::StreamId,
+    },
+
+    /// `close_stream` response. Success signal only; errors return
+    /// via `WireFrame::Error`.
+    CloseStreamResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Plugin-initiated `send_notification` request routed to the
+    /// steward's in-process [`crate::contract::NotificationEmitter`]
+    /// implementation. On success the steward answers with
+    /// `SendNotificationResponse`; on failure via `WireFrame::Error`.
+    SendNotification {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin runtime, echoed by
+        /// the response.
+        cid: u64,
+        /// Canonical plugin name (the framework wrapper overwrites
+        /// `notification.source_plugin` with this value).
+        plugin: String,
+        /// The notification payload the plugin wishes to send.
+        notification: crate::contract::notifications::Notification,
+    },
+
+    /// `send_notification` response. Carries the handle the plugin
+    /// retains for a later cancel; error paths use `WireFrame::Error`.
+    SendNotificationResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Handle the dispatcher assigned to the newly-sent
+        /// notification.
+        handle: crate::contract::notifications::NotificationHandle,
+    },
+
+    /// Plugin-initiated `cancel_notification` request routed to the
+    /// steward's [`crate::contract::NotificationEmitter`] impl.
+    CancelNotification {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin runtime.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Handle previously returned by `SendNotificationResponse`.
+        handle: crate::contract::notifications::NotificationHandle,
+    },
+
+    /// `cancel_notification` response. Success signal only; errors
+    /// return via `WireFrame::Error`.
+    CancelNotificationResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Plugin-initiated `execute_query` request routed to the
+    /// steward's in-process [`crate::contract::MetadataConsumer`]
+    /// implementation (backed by the framework's `MetadataChain`).
+    /// On success the steward answers with
+    /// `ExecuteMetadataQueryResponse`; on failure via
+    /// `WireFrame::Error`.
+    ExecuteMetadataQuery {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin runtime.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The structured query to run across registered providers.
+        query: crate::contract::metadata::Query,
+    },
+
+    /// `execute_query` response carrying the merged first-page
+    /// result stream (per-provider status + rows).
+    ExecuteMetadataQueryResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Merged result stream returned by the chain.
+        result: crate::contract::metadata::ResultStream,
+    },
+
+    /// Plugin-initiated `get_item` request routed to the steward's
+    /// [`crate::contract::MetadataConsumer`] impl.
+    GetMetadataItem {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin runtime.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Owning provider to route the fetch to.
+        provider_id: crate::contract::metadata::ProviderId,
+        /// URI of the item within the provider's namespace.
+        uri: crate::contract::metadata::ItemUri,
+    },
+
+    /// `get_item` response carrying the fetched item.
+    GetMetadataItemResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The fetched provider item.
+        item: crate::contract::metadata::ProviderItem,
+    },
+
+    /// Plugin-initiated `enrich` request routed to the steward's
+    /// [`crate::contract::MetadataConsumer`] impl. Batches over
+    /// every provider that declares any of the requested fields;
+    /// the steward returns per-provider enrichments verbatim.
+    EnrichMetadata {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin runtime.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// References to enrich.
+        refs: Vec<crate::contract::metadata::EnrichmentRef>,
+        /// Fields to enrich each reference with.
+        fields: Vec<crate::contract::metadata::FieldName>,
+    },
+
+    /// `enrich` response carrying the per-provider enrichment
+    /// batch. Merging is the caller's responsibility (matches the
+    /// in-process trait shape).
+    EnrichMetadataResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// One entry per provider that contributed enrichments.
+        batch: crate::contract::metadata::EnrichmentBatch,
+    },
+
+    // ---------------------------------------------------------------
+    // Plugin-originated credential-vault access (plugin -> steward).
+    // Mirrors [`crate::contract::context::CredentialVaultHandle`]
+    // across the wire so OOP plugins reach the same
+    // [`crate::credentials::CredentialVault`] the framework already
+    // exposes to in-process plugins. Every request carries the
+    // plugin's canonical name in the wire envelope; the steward
+    // routes to a [`PluginScopedCredentialVault`] bound to that
+    // name at the wire boundary, so the plugin cannot address any
+    // other plugin's credentials via this surface (the framework
+    // vault's per-plugin scoping is closed over at wiring time and
+    // never a runtime argument the plugin can supply).
+    //
+    // Values leaving the vault use the same base64-in-JSON /
+    // native-bytes-in-CBOR shape every other opaque payload uses.
+    // On `CredentialFetch` there is no separate `Option<Vec<u8>>`
+    // encoding: the response carries `found: bool` alongside a
+    // `value: Vec<u8>` that is empty on miss, matching
+    // [`Self::AssetCacheGetResponse`]. This keeps the wire shape
+    // unambiguous without an Option<Vec<u8>> codec helper.
+    // ---------------------------------------------------------------
+    /// Plugin-originated credential fetch request.
+    CredentialFetch {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical name of the plugin issuing the request. The
+        /// steward binds vault access to this identity — a plugin
+        /// cannot fetch another plugin's credentials.
+        plugin: String,
+        /// Operator-visible key string. The vault stores under
+        /// the SHA-256 hash internally; the plugin uses the
+        /// plaintext key it chose at store time.
+        key: String,
+    },
+
+    /// Plugin-originated credential fetch response. `found`
+    /// discriminates hit vs miss: on hit `value` carries the
+    /// stored bytes; on miss `value` is empty.
+    CredentialFetchResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// `true` on cache hit; `false` on miss.
+        found: bool,
+        /// Stored bytes on hit; empty vector on miss. Encoded as
+        /// a native CBOR byte string under CBOR and as a base64
+        /// JSON string under JSON via
+        /// [`crate::codec::base64_bytes`].
+        #[serde(with = "crate::codec::base64_bytes")]
+        value: Vec<u8>,
+    },
+
+    /// Plugin-originated credential store request.
+    CredentialStore {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Operator-visible key string.
+        key: String,
+        /// Bytes to store. Encoded as a native CBOR byte string
+        /// under CBOR and as a base64 JSON string under JSON.
+        #[serde(with = "crate::codec::base64_bytes")]
+        value: Vec<u8>,
+        /// Operator-visible metadata (display name / expiry /
+        /// uninstall policy). Matches the in-process
+        /// [`crate::contract::context::CredentialMetadata`] shape.
+        metadata: crate::contract::context::CredentialMetadata,
+    },
+
+    /// Plugin-originated credential store success response.
+    /// Empty on success — the trait method returns
+    /// `Result<(), CredentialVaultError>`.
+    CredentialStoreResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Plugin-originated credential delete request. Idempotent —
+    /// the steward returns success even if no row existed.
+    CredentialDelete {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Operator-visible key string to remove.
+        key: String,
+    },
+
+    /// Plugin-originated credential delete success response.
+    CredentialDeleteResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Plugin-originated `list_keys` request. Enumerates the
+    /// plugin's credential inventory. Values are never returned;
+    /// each entry carries only the key hash + metadata + timestamps.
+    CredentialListKeys {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Plugin-originated `list_keys` response. Ordered by
+    /// `key_hash` ascending, matching the in-process trait shape.
+    CredentialListKeysResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The plugin's credential listings.
+        listings: Vec<crate::contract::context::CredentialListing>,
+    },
+
+    // ---------------------------------------------------------------
+    // Steward -> Plugin: credential-change push. Emitted by the
+    // framework when an operator gesture (`credential_put` /
+    // `credential_delete` wire ops) mutates one of the plugin's
+    // credentials. The plugin's SDK-side `WireCredentialVaultProxy`
+    // fans this out on its local broadcast so a subscriber inside
+    // the plugin can re-resolve provider clients in place without a
+    // lifecycle teardown. Never carries the credential value —
+    // subscribers that need the new value re-fetch through
+    // `CredentialFetch` to preserve the substrate's exfiltration
+    // boundary.
+    //
+    // Mirrors `AudioRoutingStateChanged` in polarity: steward-
+    // initiated push, plugin acknowledges with `EventAck`. Sits in
+    // [`Self::is_request`] alongside the other steward-initiated
+    // pushes.
+    // ---------------------------------------------------------------
+    /// Steward → plugin credential-change push.
+    CredentialSetChanged {
+        /// Protocol version.
+        v: u16,
+        /// Event's correlation ID (steward-minted).
+        cid: u64,
+        /// Canonical plugin name the push targets.
+        plugin: String,
+        /// Keys the mutation touched (batched when consecutive
+        /// mutations for the same plugin land within one
+        /// dispatcher tick).
+        changed_keys: Vec<String>,
+        /// Discriminator: `Put` or `Delete`.
+        kind: crate::contract::context::CredentialChangeKind,
+    },
+
+    // ---------------------------------------------------------------
+    // Plugin -> Steward: online-provider config read. The steward
+    // serves from its `OnlineProviderConfigStore`. Same shape as
+    // the credential list — plugin makes a bare request, steward
+    // returns the full ordered listing.
+    // ---------------------------------------------------------------
+    /// Plugin-originated `online_provider_config_list` request.
+    OnlineProviderConfigList {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Plugin-originated `online_provider_config_list` response.
+    /// Ordered (priority ascending, provider_id ascending) —
+    /// the operator's canonical cascade order.
+    OnlineProviderConfigListResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// The ordered per-provider config listing.
+        configs: Vec<crate::contract::context::OnlineProviderConfig>,
+    },
+
+    // ---------------------------------------------------------------
+    // Steward -> Plugin: online-provider config change push.
+    // Emitted by the framework when an operator gesture
+    // (`online_providers_set_enabled` / `online_providers_set_priority`)
+    // mutates a provider's config. Fires globally (per-plugin
+    // filtering, if any, happens on the plugin side by inspecting
+    // the event's `provider_id`).
+    //
+    // Mirrors `CredentialSetChanged` in polarity: steward-
+    // initiated push, plugin acks with `EventAck`.
+    // ---------------------------------------------------------------
+    /// Steward → plugin online-provider config change push.
+    OnlineProviderConfigChanged {
+        /// Protocol version.
+        v: u16,
+        /// Event's correlation ID (steward-minted).
+        cid: u64,
+        /// Canonical plugin name the push targets.
+        plugin: String,
+        /// The provider that was mutated.
+        provider_id: String,
+        /// Enable flag after the mutation.
+        enabled: bool,
+        /// Priority after the mutation.
+        priority: i32,
+    },
 }
 
 /// Wire form of [`StateBlob`](crate::contract::StateBlob).
@@ -1213,7 +2427,211 @@ pub struct LiveReloadState {
     pub payload: Vec<u8>,
 }
 
+/// Direction / role classification of every [`WireFrame`] variant.
+///
+/// This enum plus [`WireFrame::kind`] is the single source of truth
+/// for every request / response / event predicate on `WireFrame`.
+/// The `is_request` / `is_plugin_request` / `is_response` /
+/// `is_event` / `is_event_ack` / `is_error` / `is_handshake`
+/// predicates derive from [`WireFrame::kind`]; they do not carry
+/// their own variant lists. Adding a new `WireFrame` variant is a
+/// compile error until the new arm is added to
+/// [`WireFrame::kind`] — a hand-maintained parallel list on each
+/// predicate could silently drift; the exhaustive `match self`
+/// inside `kind` cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FrameKind {
+    /// Steward-initiated request delivered to the plugin. Includes
+    /// both call-style verbs (`Describe`, `Load`, `HandleRequest`,
+    /// custody verbs, `PrepareForLiveReload`) and steward-initiated
+    /// pushes the plugin acks with `EventAck`
+    /// (`AudioRoutingStateChanged`, multi-room role/group pushes,
+    /// audio-plane forwards, `SubjectStateUpdatePush`,
+    /// `CredentialSetChanged`).
+    StewardRequest,
+    /// Plugin-initiated request awaiting a steward response.
+    PluginRequest,
+    /// Response paired to a prior request. The `cid` on the
+    /// response matches the request that originated it, whichever
+    /// side that was.
+    Response,
+    /// Plugin-originated async event. The steward acknowledges
+    /// with `EventAck` on success or `Error` on rejection.
+    Event,
+    /// Steward's acknowledgement of a plugin-originated event.
+    EventAck,
+    /// Error frame — replaces a response when the verb failed, or
+    /// an event-ack when the event was rejected. Bidirectional.
+    Error,
+    /// Handshake frame (`Hello` / `HelloAck`). Flows once at the
+    /// start of each connection before any other dispatch.
+    Handshake,
+}
+
 impl WireFrame {
+    /// Direction / role of this frame.
+    ///
+    /// The single exhaustive `match self` below is the source of
+    /// truth every predicate (`is_request`, `is_plugin_request`,
+    /// `is_response`, `is_event`, `is_event_ack`, `is_error`,
+    /// `is_handshake`) reads from. A new `WireFrame` variant that
+    /// omits a `kind` arm fails to compile — the classification
+    /// cannot silently drift the way parallel `matches!` lists on
+    /// each predicate could.
+    pub fn kind(&self) -> FrameKind {
+        match self {
+            // Steward-initiated requests (call-style verbs).
+            Self::Describe { .. }
+            | Self::Load { .. }
+            | Self::Unload { .. }
+            | Self::HealthCheck { .. }
+            | Self::HandleRequest { .. }
+            | Self::TakeCustody { .. }
+            | Self::CourseCorrect { .. }
+            | Self::ReleaseCustody { .. }
+            | Self::PrepareForLiveReload { .. }
+            // Steward-initiated pushes (plugin acks with EventAck).
+            | Self::AudioRoutingStateChanged { .. }
+            | Self::MultiroomRoleChanged { .. }
+            | Self::MultiroomGroupChanged { .. }
+            | Self::AudioPlaneInit { .. }
+            | Self::AudioPlaneFrameReceived { .. }
+            | Self::AudioPlaneFrameSendEvent { .. }
+            | Self::AudioPlaneFrameTraceReport { .. }
+            | Self::SubjectStateUpdatePush { .. }
+            | Self::CredentialSetChanged { .. }
+            | Self::OnlineProviderConfigChanged { .. } => {
+                FrameKind::StewardRequest
+            }
+
+            // Plugin-initiated requests (steward answers with the
+            // matching `*_response` variant).
+            Self::DescribeAlias { .. }
+            | Self::DescribeSubject { .. }
+            | Self::ResolveAddressing { .. }
+            | Self::SubscribeSubject { .. }
+            | Self::UnsubscribeSubject { .. }
+            | Self::CurrentState { .. }
+            | Self::ForcedRetractAddressing { .. }
+            | Self::MergeSubjects { .. }
+            | Self::SplitSubject { .. }
+            | Self::ForcedRetractClaim { .. }
+            | Self::SuppressRelation { .. }
+            | Self::UnsuppressRelation { .. }
+            | Self::FastPathDispatch { .. }
+            | Self::AssetCacheGet { .. }
+            | Self::AssetCachePut { .. }
+            | Self::AssetCacheDelete { .. }
+            | Self::ShelfDispatchRequest { .. }
+            | Self::RequestUserInteraction { .. }
+            | Self::EmitPluginEvent { .. }
+            | Self::EmitAudioPlaybackEnded { .. }
+            | Self::CreateAppointment { .. }
+            | Self::CancelAppointment { .. }
+            | Self::CreateWatch { .. }
+            | Self::CancelWatch { .. }
+            | Self::GetMultiroomRole { .. }
+            | Self::ListMultiroomExplicitRoles { .. }
+            | Self::GetMultiroomGroup { .. }
+            | Self::ListMultiroomGroups { .. }
+            | Self::ListMultiroomGroupsForDevice { .. }
+            | Self::AudioPlaneFanOutFrame { .. }
+            | Self::AudioPlaneUpsertGroup { .. }
+            | Self::AudioPlaneDialPeer { .. }
+            | Self::AudioPlaneCloseOutboundConnections { .. }
+            | Self::AudioPlaneReportFrameTrace { .. }
+            | Self::OpenStream { .. }
+            | Self::EmitStream { .. }
+            | Self::CloseStream { .. }
+            | Self::SendNotification { .. }
+            | Self::CancelNotification { .. }
+            | Self::ExecuteMetadataQuery { .. }
+            | Self::GetMetadataItem { .. }
+            | Self::EnrichMetadata { .. }
+            | Self::CredentialFetch { .. }
+            | Self::CredentialStore { .. }
+            | Self::CredentialDelete { .. }
+            | Self::CredentialListKeys { .. }
+            | Self::OnlineProviderConfigList { .. } => FrameKind::PluginRequest,
+
+            // Paired responses (either direction).
+            Self::DescribeResponse { .. }
+            | Self::LoadResponse { .. }
+            | Self::UnloadResponse { .. }
+            | Self::HealthCheckResponse { .. }
+            | Self::HandleRequestResponse { .. }
+            | Self::TakeCustodyResponse { .. }
+            | Self::CourseCorrectResponse { .. }
+            | Self::ReleaseCustodyResponse { .. }
+            | Self::PrepareForLiveReloadResponse { .. }
+            | Self::DescribeAliasResponse { .. }
+            | Self::DescribeSubjectResponse { .. }
+            | Self::ResolveAddressingResponse { .. }
+            | Self::SubscribeSubjectResponse { .. }
+            | Self::UnsubscribeSubjectResponse { .. }
+            | Self::CurrentStateResponse { .. }
+            | Self::ForcedRetractAddressingResponse { .. }
+            | Self::MergeSubjectsResponse { .. }
+            | Self::SplitSubjectResponse { .. }
+            | Self::ForcedRetractClaimResponse { .. }
+            | Self::SuppressRelationResponse { .. }
+            | Self::UnsuppressRelationResponse { .. }
+            | Self::FastPathDispatchResponse { .. }
+            | Self::AssetCacheGetResponse { .. }
+            | Self::AssetCachePutResponse { .. }
+            | Self::AssetCacheDeleteResponse { .. }
+            | Self::ShelfDispatchResponse { .. }
+            | Self::RequestUserInteractionResponse { .. }
+            | Self::EmitPluginEventResponse { .. }
+            | Self::EmitAudioPlaybackEndedResponse { .. }
+            | Self::CreateAppointmentResponse { .. }
+            | Self::CancelAppointmentResponse { .. }
+            | Self::CreateWatchResponse { .. }
+            | Self::CancelWatchResponse { .. }
+            | Self::GetMultiroomRoleResponse { .. }
+            | Self::ListMultiroomExplicitRolesResponse { .. }
+            | Self::GetMultiroomGroupResponse { .. }
+            | Self::ListMultiroomGroupsResponse { .. }
+            | Self::ListMultiroomGroupsForDeviceResponse { .. }
+            | Self::AudioPlaneFanOutFrameResponse { .. }
+            | Self::AudioPlaneUpsertGroupResponse { .. }
+            | Self::AudioPlaneDialPeerResponse { .. }
+            | Self::AudioPlaneCloseOutboundConnectionsResponse { .. }
+            | Self::AudioPlaneReportFrameTraceResponse { .. }
+            | Self::OpenStreamResponse { .. }
+            | Self::EmitStreamResponse { .. }
+            | Self::CloseStreamResponse { .. }
+            | Self::SendNotificationResponse { .. }
+            | Self::CancelNotificationResponse { .. }
+            | Self::ExecuteMetadataQueryResponse { .. }
+            | Self::GetMetadataItemResponse { .. }
+            | Self::EnrichMetadataResponse { .. }
+            | Self::CredentialFetchResponse { .. }
+            | Self::CredentialStoreResponse { .. }
+            | Self::CredentialDeleteResponse { .. }
+            | Self::CredentialListKeysResponse { .. }
+            | Self::OnlineProviderConfigListResponse { .. } => {
+                FrameKind::Response
+            }
+
+            // Plugin-originated async events (steward acks with
+            // EventAck or Error).
+            Self::ReportState { .. }
+            | Self::AnnounceSubject { .. }
+            | Self::RetractSubject { .. }
+            | Self::UpdateSubjectState { .. }
+            | Self::AssertRelation { .. }
+            | Self::RetractRelation { .. }
+            | Self::AnnounceInstance { .. }
+            | Self::RetractInstance { .. }
+            | Self::ReportCustodyState { .. } => FrameKind::Event,
+
+            Self::EventAck { .. } => FrameKind::EventAck,
+            Self::Error { .. } => FrameKind::Error,
+            Self::Hello { .. } | Self::HelloAck { .. } => FrameKind::Handshake,
+        }
+    }
+
     /// Extract the envelope fields common to every variant.
     pub fn envelope(&self) -> (u16, u64, &str) {
         match self {
@@ -1264,6 +2682,14 @@ impl WireFrame {
             | Self::UnsuppressRelationResponse { v, cid, plugin }
             | Self::FastPathDispatch { v, cid, plugin, .. }
             | Self::FastPathDispatchResponse { v, cid, plugin }
+            | Self::AssetCacheGet { v, cid, plugin, .. }
+            | Self::AssetCacheGetResponse { v, cid, plugin, .. }
+            | Self::AssetCachePut { v, cid, plugin, .. }
+            | Self::AssetCachePutResponse { v, cid, plugin }
+            | Self::AssetCacheDelete { v, cid, plugin, .. }
+            | Self::AssetCacheDeleteResponse { v, cid, plugin, .. }
+            | Self::ShelfDispatchRequest { v, cid, plugin, .. }
+            | Self::ShelfDispatchResponse { v, cid, plugin, .. }
             | Self::RequestUserInteraction { v, cid, plugin, .. }
             | Self::RequestUserInteractionResponse { v, cid, plugin, .. }
             | Self::CreateAppointment { v, cid, plugin, .. }
@@ -1276,11 +2702,95 @@ impl WireFrame {
             | Self::CancelWatchResponse { v, cid, plugin }
             | Self::EmitPluginEvent { v, cid, plugin, .. }
             | Self::EmitPluginEventResponse { v, cid, plugin }
+            | Self::EmitAudioPlaybackEnded { v, cid, plugin, .. }
+            | Self::EmitAudioPlaybackEndedResponse { v, cid, plugin }
             | Self::Error { v, cid, plugin, .. }
             | Self::EventAck { v, cid, plugin }
             | Self::Hello { v, cid, plugin, .. }
-            | Self::HelloAck { v, cid, plugin, .. } => {
+            | Self::HelloAck { v, cid, plugin, .. }
+            | Self::AudioRoutingStateChanged { v, cid, plugin, .. }
+            | Self::GetMultiroomRole { v, cid, plugin, .. }
+            | Self::GetMultiroomRoleResponse { v, cid, plugin, .. }
+            | Self::ListMultiroomExplicitRoles { v, cid, plugin }
+            | Self::ListMultiroomExplicitRolesResponse {
+                v, cid, plugin, ..
+            }
+            | Self::GetMultiroomGroup { v, cid, plugin, .. }
+            | Self::GetMultiroomGroupResponse { v, cid, plugin, .. }
+            | Self::ListMultiroomGroups { v, cid, plugin }
+            | Self::ListMultiroomGroupsResponse { v, cid, plugin, .. }
+            | Self::ListMultiroomGroupsForDevice { v, cid, plugin, .. }
+            | Self::ListMultiroomGroupsForDeviceResponse {
+                v,
+                cid,
+                plugin,
+                ..
+            }
+            | Self::MultiroomRoleChanged { v, cid, plugin, .. }
+            | Self::MultiroomGroupChanged { v, cid, plugin, .. }
+            | Self::AudioPlaneInit { v, cid, plugin, .. }
+            | Self::AudioPlaneFanOutFrame { v, cid, plugin, .. }
+            | Self::AudioPlaneFanOutFrameResponse { v, cid, plugin }
+            | Self::AudioPlaneUpsertGroup { v, cid, plugin, .. }
+            | Self::AudioPlaneUpsertGroupResponse { v, cid, plugin }
+            | Self::AudioPlaneDialPeer { v, cid, plugin, .. }
+            | Self::AudioPlaneDialPeerResponse { v, cid, plugin }
+            | Self::AudioPlaneCloseOutboundConnections { v, cid, plugin }
+            | Self::AudioPlaneCloseOutboundConnectionsResponse {
+                v,
+                cid,
+                plugin,
+            }
+            | Self::AudioPlaneReportFrameTrace { v, cid, plugin, .. }
+            | Self::AudioPlaneReportFrameTraceResponse { v, cid, plugin }
+            | Self::AudioPlaneFrameReceived { v, cid, plugin, .. }
+            | Self::AudioPlaneFrameSendEvent { v, cid, plugin, .. }
+            | Self::AudioPlaneFrameTraceReport { v, cid, plugin, .. }
+            | Self::SubscribeSubject { v, cid, plugin, .. }
+            | Self::SubscribeSubjectResponse { v, cid, plugin, .. }
+            | Self::UnsubscribeSubject { v, cid, plugin, .. }
+            | Self::UnsubscribeSubjectResponse { v, cid, plugin }
+            | Self::CurrentState { v, cid, plugin, .. }
+            | Self::CurrentStateResponse { v, cid, plugin, .. }
+            | Self::OpenStream { v, cid, plugin, .. }
+            | Self::OpenStreamResponse { v, cid, plugin, .. }
+            | Self::EmitStream { v, cid, plugin, .. }
+            | Self::EmitStreamResponse { v, cid, plugin, .. }
+            | Self::CloseStream { v, cid, plugin, .. }
+            | Self::CloseStreamResponse { v, cid, plugin }
+            | Self::SendNotification { v, cid, plugin, .. }
+            | Self::SendNotificationResponse { v, cid, plugin, .. }
+            | Self::CancelNotification { v, cid, plugin, .. }
+            | Self::CancelNotificationResponse { v, cid, plugin }
+            | Self::ExecuteMetadataQuery { v, cid, plugin, .. }
+            | Self::ExecuteMetadataQueryResponse { v, cid, plugin, .. }
+            | Self::GetMetadataItem { v, cid, plugin, .. }
+            | Self::GetMetadataItemResponse { v, cid, plugin, .. }
+            | Self::EnrichMetadata { v, cid, plugin, .. }
+            | Self::EnrichMetadataResponse { v, cid, plugin, .. }
+            | Self::CredentialFetch { v, cid, plugin, .. }
+            | Self::CredentialFetchResponse { v, cid, plugin, .. }
+            | Self::CredentialStore { v, cid, plugin, .. }
+            | Self::CredentialStoreResponse { v, cid, plugin }
+            | Self::CredentialDelete { v, cid, plugin, .. }
+            | Self::CredentialDeleteResponse { v, cid, plugin }
+            | Self::CredentialListKeys { v, cid, plugin }
+            | Self::CredentialListKeysResponse { v, cid, plugin, .. }
+            | Self::CredentialSetChanged { v, cid, plugin, .. }
+            | Self::OnlineProviderConfigList { v, cid, plugin }
+            | Self::OnlineProviderConfigListResponse {
+                v, cid, plugin, ..
+            }
+            | Self::OnlineProviderConfigChanged { v, cid, plugin, .. } => {
                 (*v, *cid, plugin.as_str())
+            }
+            // Server-pushed frames carry no cid (no plugin
+            // request to pair with). Return cid = 0 as the
+            // documented sentinel; callers that switch on
+            // request/response semantics check the variant
+            // tag instead of treating cid as load-bearing.
+            Self::SubjectStateUpdatePush { v, plugin, .. } => {
+                (*v, 0, plugin.as_str())
             }
         }
     }
@@ -1289,20 +2799,13 @@ impl WireFrame {
     ///
     /// Plugin-originated request frames (e.g. the alias-aware
     /// describe queries) are NOT counted here; they go through
-    /// [`is_plugin_request`](Self::is_plugin_request).
+    /// [`is_plugin_request`](Self::is_plugin_request). The
+    /// classification derives from [`Self::kind`]: a new variant
+    /// classified as `StewardRequest` is a request-initiated
+    /// steward call automatically; a new variant classified as
+    /// anything else is not.
     pub fn is_request(&self) -> bool {
-        matches!(
-            self,
-            Self::Describe { .. }
-                | Self::Load { .. }
-                | Self::Unload { .. }
-                | Self::HealthCheck { .. }
-                | Self::HandleRequest { .. }
-                | Self::TakeCustody { .. }
-                | Self::CourseCorrect { .. }
-                | Self::ReleaseCustody { .. }
-                | Self::PrepareForLiveReload { .. }
-        )
+        matches!(self.kind(), FrameKind::StewardRequest)
     }
 
     /// True if this frame is a request initiated by the plugin
@@ -1311,92 +2814,42 @@ impl WireFrame {
     /// Distinct from [`is_request`](Self::is_request), which covers
     /// steward-initiated requests. The two directions sit on the
     /// same wire but follow opposite request / response polarity.
+    /// Derives from [`Self::kind`].
     pub fn is_plugin_request(&self) -> bool {
-        matches!(
-            self,
-            Self::DescribeAlias { .. }
-                | Self::DescribeSubject { .. }
-                | Self::ResolveAddressing { .. }
-                | Self::ForcedRetractAddressing { .. }
-                | Self::MergeSubjects { .. }
-                | Self::SplitSubject { .. }
-                | Self::ForcedRetractClaim { .. }
-                | Self::SuppressRelation { .. }
-                | Self::UnsuppressRelation { .. }
-                | Self::FastPathDispatch { .. }
-                | Self::RequestUserInteraction { .. }
-                | Self::CreateAppointment { .. }
-                | Self::CancelAppointment { .. }
-                | Self::CreateWatch { .. }
-                | Self::CancelWatch { .. }
-                | Self::EmitPluginEvent { .. }
-        )
+        matches!(self.kind(), FrameKind::PluginRequest)
     }
 
     /// True if this frame is a response to a prior request,
-    /// regardless of which side originated the request.
+    /// regardless of which side originated the request. Derives
+    /// from [`Self::kind`].
     pub fn is_response(&self) -> bool {
-        matches!(
-            self,
-            Self::DescribeResponse { .. }
-                | Self::LoadResponse { .. }
-                | Self::UnloadResponse { .. }
-                | Self::HealthCheckResponse { .. }
-                | Self::HandleRequestResponse { .. }
-                | Self::TakeCustodyResponse { .. }
-                | Self::CourseCorrectResponse { .. }
-                | Self::ReleaseCustodyResponse { .. }
-                | Self::DescribeAliasResponse { .. }
-                | Self::DescribeSubjectResponse { .. }
-                | Self::ResolveAddressingResponse { .. }
-                | Self::ForcedRetractAddressingResponse { .. }
-                | Self::MergeSubjectsResponse { .. }
-                | Self::SplitSubjectResponse { .. }
-                | Self::ForcedRetractClaimResponse { .. }
-                | Self::SuppressRelationResponse { .. }
-                | Self::UnsuppressRelationResponse { .. }
-                | Self::PrepareForLiveReloadResponse { .. }
-                | Self::FastPathDispatchResponse { .. }
-                | Self::RequestUserInteractionResponse { .. }
-                | Self::CreateAppointmentResponse { .. }
-                | Self::CancelAppointmentResponse { .. }
-                | Self::CreateWatchResponse { .. }
-                | Self::CancelWatchResponse { .. }
-                | Self::EmitPluginEventResponse { .. }
-        )
+        matches!(self.kind(), FrameKind::Response)
     }
 
-    /// True if this frame is an async event originated by the plugin.
+    /// True if this frame is an async event originated by the
+    /// plugin. Derives from [`Self::kind`].
     pub fn is_event(&self) -> bool {
-        matches!(
-            self,
-            Self::ReportState { .. }
-                | Self::AnnounceSubject { .. }
-                | Self::RetractSubject { .. }
-                | Self::UpdateSubjectState { .. }
-                | Self::AssertRelation { .. }
-                | Self::RetractRelation { .. }
-                | Self::AnnounceInstance { .. }
-                | Self::RetractInstance { .. }
-                | Self::ReportCustodyState { .. }
-        )
+        matches!(self.kind(), FrameKind::Event)
     }
 
-    /// True if this frame is an error.
+    /// True if this frame is an error. Derives from
+    /// [`Self::kind`].
     pub fn is_error(&self) -> bool {
-        matches!(self, Self::Error { .. })
+        matches!(self.kind(), FrameKind::Error)
     }
 
     /// True if this frame is an event acknowledgement.
     ///
-    /// `EventAck` is the success-side counterpart to [`Self::Error`]
-    /// when the latter is used as an event-rejection ack. The two
-    /// together form the response surface for plugin-originated
-    /// events; plugin-side wire implementations of the announcer /
-    /// reporter traits await one of them per event `cid` to surface
-    /// a `Result<(), ReportError>` to the trait caller.
+    /// `EventAck` is the success-side counterpart to
+    /// [`Self::Error`] when the latter is used as an
+    /// event-rejection ack. The two together form the response
+    /// surface for plugin-originated events; plugin-side wire
+    /// implementations of the announcer / reporter traits await
+    /// one of them per event `cid` to surface a
+    /// `Result<(), ReportError>` to the trait caller. Derives from
+    /// [`Self::kind`].
     pub fn is_event_ack(&self) -> bool {
-        matches!(self, Self::EventAck { .. })
+        matches!(self.kind(), FrameKind::EventAck)
     }
 
     /// True if this frame is part of the handshake exchange.
@@ -1406,9 +2859,9 @@ impl WireFrame {
     /// their own handshake exchange completes; conversely, after
     /// the exchange completes, a peer that observes another
     /// handshake frame treats it as a protocol violation and
-    /// closes the connection.
+    /// closes the connection. Derives from [`Self::kind`].
     pub fn is_handshake(&self) -> bool {
-        matches!(self, Self::Hello { .. } | Self::HelloAck { .. })
+        matches!(self.kind(), FrameKind::Handshake)
     }
 }
 
@@ -1820,6 +3273,8 @@ mod tests {
             payload: b"hello".to_vec(),
             deadline_ms: Some(1000),
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let json = serde_json::to_string(&orig).unwrap();
         let back: WireFrame = serde_json::from_str(&json).unwrap();
@@ -1836,6 +3291,8 @@ mod tests {
             payload: b"hello".to_vec(),
             deadline_ms: None,
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let json = serde_json::to_string(&orig).unwrap();
         // "hello" -> base64 "aGVsbG8=". Assert on the exact string form
@@ -1932,10 +3389,56 @@ mod tests {
                 "playback_status": "playing",
                 "elapsed_ms": 12_345,
             }),
+            volatile: false,
         };
         let json = serde_json::to_string(&orig).unwrap();
         let back: WireFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn update_subject_state_volatile_round_trip() {
+        let orig = WireFrame::UpdateSubjectState {
+            v: PROTOCOL_VERSION,
+            cid: 206,
+            plugin: sample_plugin(),
+            addressing: sample_addressing(),
+            state: serde_json::json!({"bins": 64, "channels": 1}),
+            volatile: true,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(
+            json.contains(r#""volatile":true"#),
+            "volatile flag MUST appear on the wire when true: {json}"
+        );
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn update_subject_state_deserialises_pre_volatile_frame_as_durable() {
+        // Backward-compat property: a wire frame authored before the
+        // `volatile` field existed deserialises with volatile=false,
+        // preserving the pre-existing durable-persist behaviour for
+        // every legacy sender.
+        let legacy_json = r#"{
+            "op": "update_subject_state",
+            "v": 1,
+            "cid": 42,
+            "plugin": "org.evoframework.example",
+            "addressing": {"scheme": "mbid", "value": "recording-1"},
+            "state": {"foo": "bar"}
+        }"#;
+        let back: WireFrame = serde_json::from_str(legacy_json).unwrap();
+        match back {
+            WireFrame::UpdateSubjectState { volatile, .. } => {
+                assert!(
+                    !volatile,
+                    "pre-volatile-field frames MUST deserialise as durable"
+                );
+            }
+            other => panic!("expected UpdateSubjectState, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2045,6 +3548,73 @@ mod tests {
         assert!(json.contains(r#""op":"event_ack""#));
         let back: WireFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn emit_audio_playback_ended_round_trip_with_uri() {
+        let orig = WireFrame::EmitAudioPlaybackEnded {
+            v: PROTOCOL_VERSION,
+            cid: 900,
+            plugin: sample_plugin(),
+            claim_uri: Some("evo-test:track:42".to_string()),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"emit_audio_playback_ended""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn emit_audio_playback_ended_round_trip_without_uri() {
+        let orig = WireFrame::EmitAudioPlaybackEnded {
+            v: PROTOCOL_VERSION,
+            cid: 901,
+            plugin: sample_plugin(),
+            claim_uri: None,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn emit_audio_playback_ended_response_round_trip() {
+        let orig = WireFrame::EmitAudioPlaybackEndedResponse {
+            v: PROTOCOL_VERSION,
+            cid: 900,
+            plugin: sample_plugin(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"emit_audio_playback_ended_response""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn emit_audio_playback_ended_classifies_as_plugin_request() {
+        let f = WireFrame::EmitAudioPlaybackEnded {
+            v: PROTOCOL_VERSION,
+            cid: 1,
+            plugin: "p".into(),
+            claim_uri: None,
+        };
+        assert!(f.is_plugin_request());
+        assert!(!f.is_response());
+        assert!(!f.is_request());
+        assert!(!f.is_event());
+    }
+
+    #[test]
+    fn emit_audio_playback_ended_response_classifies_as_response() {
+        let f = WireFrame::EmitAudioPlaybackEndedResponse {
+            v: PROTOCOL_VERSION,
+            cid: 1,
+            plugin: "p".into(),
+        };
+        assert!(f.is_response());
+        assert!(!f.is_plugin_request());
+        assert!(!f.is_request());
+        assert!(!f.is_event());
     }
 
     #[test]
@@ -2344,6 +3914,7 @@ mod tests {
             retention_hint: None,
             error_context: None,
             previous_answer: None,
+            priority: None,
         };
         let orig = WireFrame::RequestUserInteraction {
             v: PROTOCOL_VERSION,
@@ -2372,6 +3943,7 @@ mod tests {
             retention_hint: None,
             error_context: None,
             previous_answer: None,
+            priority: None,
         };
         let orig = WireFrame::RequestUserInteraction {
             v: PROTOCOL_VERSION,
@@ -2420,6 +3992,7 @@ mod tests {
                 retention_hint: None,
                 error_context: None,
                 previous_answer: None,
+                priority: None,
             },
         };
         assert!(f.is_plugin_request());
@@ -2716,6 +4289,120 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_subject_round_trip() {
+        let orig = WireFrame::SubscribeSubject {
+            v: PROTOCOL_VERSION,
+            cid: 800,
+            plugin: sample_plugin(),
+            canonical_id: "subj-sub-0001".to_string(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"subscribe_subject""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_plugin_request());
+    }
+
+    #[test]
+    fn subscribe_subject_response_round_trip() {
+        let orig = WireFrame::SubscribeSubjectResponse {
+            v: PROTOCOL_VERSION,
+            cid: 800,
+            plugin: sample_plugin(),
+            canonical_id: "subj-sub-0001".to_string(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"subscribe_subject_response""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_response());
+    }
+
+    #[test]
+    fn unsubscribe_subject_round_trip() {
+        let orig = WireFrame::UnsubscribeSubject {
+            v: PROTOCOL_VERSION,
+            cid: 801,
+            plugin: sample_plugin(),
+            canonical_id: "subj-sub-0001".to_string(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_plugin_request());
+    }
+
+    #[test]
+    fn unsubscribe_subject_response_round_trip() {
+        let orig = WireFrame::UnsubscribeSubjectResponse {
+            v: PROTOCOL_VERSION,
+            cid: 801,
+            plugin: sample_plugin(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_response());
+    }
+
+    #[test]
+    fn current_state_round_trip() {
+        let orig = WireFrame::CurrentState {
+            v: PROTOCOL_VERSION,
+            cid: 802,
+            plugin: sample_plugin(),
+            canonical_id: "subj-pull-0001".to_string(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"current_state""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_plugin_request());
+    }
+
+    #[test]
+    fn current_state_response_round_trip_some_and_none() {
+        let some_state = WireFrame::CurrentStateResponse {
+            v: PROTOCOL_VERSION,
+            cid: 802,
+            plugin: sample_plugin(),
+            state: Some(serde_json::json!({"k": "v"})),
+        };
+        let json = serde_json::to_string(&some_state).unwrap();
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, some_state);
+        assert!(some_state.is_response());
+
+        let none_state = WireFrame::CurrentStateResponse {
+            v: PROTOCOL_VERSION,
+            cid: 803,
+            plugin: sample_plugin(),
+            state: None,
+        };
+        let json = serde_json::to_string(&none_state).unwrap();
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, none_state);
+    }
+
+    #[test]
+    fn subject_state_update_push_round_trip() {
+        let orig = WireFrame::SubjectStateUpdatePush {
+            v: PROTOCOL_VERSION,
+            plugin: sample_plugin(),
+            canonical_id: "subj-push-0001".to_string(),
+            subject_type: "audio_options_settings".to_string(),
+            state: Some(serde_json::json!({"mixer_type": "software"})),
+            modified_at_ms: 1_700_000_000_000,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"subject_state_update_push""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        // Server-pushed: classed as a steward-initiated request.
+        assert!(orig.is_request());
+    }
+
+    #[test]
     fn describe_subject_response_round_trip_found() {
         use crate::contract::{
             CanonicalSubjectId, SubjectAddressingRecord, SubjectQueryResult,
@@ -2789,6 +4476,503 @@ mod tests {
         let json = serde_json::to_string(&orig).unwrap();
         let back: WireFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(back, orig);
+    }
+
+    // ---- Credential-vault wire frames ----
+
+    #[test]
+    fn credential_fetch_round_trip() {
+        let orig = WireFrame::CredentialFetch {
+            v: PROTOCOL_VERSION,
+            cid: 700,
+            plugin: sample_plugin(),
+            key: "lastfm_api_key".into(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"credential_fetch""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_plugin_request());
+        assert!(!orig.is_response());
+        assert!(!orig.is_request());
+    }
+
+    #[test]
+    fn credential_fetch_response_hit_and_miss_round_trip() {
+        let hit = WireFrame::CredentialFetchResponse {
+            v: PROTOCOL_VERSION,
+            cid: 701,
+            plugin: sample_plugin(),
+            found: true,
+            value: vec![0xa1, 0xb2, 0xc3, 0xd4],
+        };
+        let json = serde_json::to_string(&hit).unwrap();
+        assert!(json.contains(r#""op":"credential_fetch_response""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, hit);
+        assert!(hit.is_response());
+        assert!(!hit.is_plugin_request());
+
+        let miss = WireFrame::CredentialFetchResponse {
+            v: PROTOCOL_VERSION,
+            cid: 702,
+            plugin: sample_plugin(),
+            found: false,
+            value: Vec::new(),
+        };
+        let json = serde_json::to_string(&miss).unwrap();
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, miss);
+    }
+
+    #[test]
+    fn credential_store_round_trip_carries_metadata() {
+        use crate::contract::context::{CredentialMetadata, UninstallPolicy};
+        let orig = WireFrame::CredentialStore {
+            v: PROTOCOL_VERSION,
+            cid: 703,
+            plugin: sample_plugin(),
+            key: "discogs_personal_access_token".into(),
+            value: vec![1, 2, 3, 4, 5],
+            metadata: CredentialMetadata {
+                display_name: Some("Discogs (rig VM)".into()),
+                expires_at_ms: Some(1_800_000_000_000),
+                uninstall_policy: UninstallPolicy::PreserveForReinstall,
+            },
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"credential_store""#));
+        // Uninstall policy uses snake_case on the wire.
+        assert!(json.contains(r#""uninstall_policy":"preserve_for_reinstall""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_plugin_request());
+        assert!(!orig.is_response());
+    }
+
+    #[test]
+    fn credential_store_response_round_trip() {
+        let orig = WireFrame::CredentialStoreResponse {
+            v: PROTOCOL_VERSION,
+            cid: 704,
+            plugin: sample_plugin(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"credential_store_response""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_response());
+    }
+
+    #[test]
+    fn credential_delete_round_trip() {
+        let orig = WireFrame::CredentialDelete {
+            v: PROTOCOL_VERSION,
+            cid: 705,
+            plugin: sample_plugin(),
+            key: "genius_client_access_token".into(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"credential_delete""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_plugin_request());
+    }
+
+    #[test]
+    fn credential_delete_response_round_trip() {
+        let orig = WireFrame::CredentialDeleteResponse {
+            v: PROTOCOL_VERSION,
+            cid: 706,
+            plugin: sample_plugin(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"credential_delete_response""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_response());
+    }
+
+    #[test]
+    fn credential_list_keys_round_trip_empty_and_populated() {
+        use crate::contract::context::{
+            CredentialListing, CredentialMetadata, UninstallPolicy,
+        };
+        let empty = WireFrame::CredentialListKeysResponse {
+            v: PROTOCOL_VERSION,
+            cid: 707,
+            plugin: sample_plugin(),
+            listings: Vec::new(),
+        };
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(json.contains(r#""op":"credential_list_keys_response""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, empty);
+        assert!(empty.is_response());
+
+        let listing = CredentialListing {
+            key_hash: "a".repeat(64),
+            metadata: CredentialMetadata {
+                display_name: Some("Last.fm".into()),
+                expires_at_ms: None,
+                uninstall_policy: UninstallPolicy::Purge,
+            },
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_500,
+        };
+        let populated = WireFrame::CredentialListKeysResponse {
+            v: PROTOCOL_VERSION,
+            cid: 708,
+            plugin: sample_plugin(),
+            listings: vec![listing],
+        };
+        let json = serde_json::to_string(&populated).unwrap();
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, populated);
+    }
+
+    #[test]
+    fn credential_list_keys_request_round_trip() {
+        let orig = WireFrame::CredentialListKeys {
+            v: PROTOCOL_VERSION,
+            cid: 709,
+            plugin: sample_plugin(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"credential_list_keys""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+        assert!(orig.is_plugin_request());
+    }
+
+    #[test]
+    fn credential_set_changed_round_trip_put_and_delete() {
+        use crate::contract::context::CredentialChangeKind;
+        let put = WireFrame::CredentialSetChanged {
+            v: PROTOCOL_VERSION,
+            cid: 710,
+            plugin: sample_plugin(),
+            changed_keys: vec!["lastfm_api_key".into()],
+            kind: CredentialChangeKind::Put,
+        };
+        let json = serde_json::to_string(&put).unwrap();
+        assert!(json.contains(r#""op":"credential_set_changed""#));
+        // Kind uses snake_case on the wire.
+        assert!(json.contains(r#""kind":"put""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, put);
+        // Steward-initiated push: sits under is_request(), NOT
+        // is_plugin_request() and NOT is_response().
+        assert!(put.is_request());
+        assert!(!put.is_plugin_request());
+        assert!(!put.is_response());
+        assert!(!put.is_event());
+
+        let del = WireFrame::CredentialSetChanged {
+            v: PROTOCOL_VERSION,
+            cid: 711,
+            plugin: sample_plugin(),
+            changed_keys: vec![
+                "discogs_personal_access_token".into(),
+                "genius_client_access_token".into(),
+            ],
+            kind: CredentialChangeKind::Delete,
+        };
+        let json = serde_json::to_string(&del).unwrap();
+        assert!(json.contains(r#""kind":"delete""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, del);
+    }
+
+    #[test]
+    fn frame_kind_partitions_frame_predicates() {
+        // Property: every predicate is TRUE iff kind() returns
+        // the matching FrameKind, and FrameKind values partition
+        // the frame space (exactly one predicate returns true per
+        // frame). Because the seven predicates derive from
+        // kind(), this test is really a partition-check on
+        // FrameKind, plus an inductive corpus over every frame
+        // family. Any variant this corpus misses whose kind() arm
+        // is also missing would fail to compile — the compiler is
+        // the primary line of defence; this test is the
+        // secondary property check.
+        use crate::contract::context::{
+            CredentialChangeKind, CredentialListing, CredentialMetadata,
+        };
+        let corpus: Vec<(WireFrame, FrameKind)> = vec![
+            // Steward-initiated requests / pushes.
+            (
+                WireFrame::Describe {
+                    v: PROTOCOL_VERSION,
+                    cid: 1,
+                    plugin: sample_plugin(),
+                },
+                FrameKind::StewardRequest,
+            ),
+            (
+                WireFrame::PrepareForLiveReload {
+                    v: PROTOCOL_VERSION,
+                    cid: 2,
+                    plugin: sample_plugin(),
+                },
+                FrameKind::StewardRequest,
+            ),
+            (
+                WireFrame::CredentialSetChanged {
+                    v: PROTOCOL_VERSION,
+                    cid: 3,
+                    plugin: sample_plugin(),
+                    changed_keys: vec!["k".into()],
+                    kind: CredentialChangeKind::Put,
+                },
+                FrameKind::StewardRequest,
+            ),
+            // Plugin-initiated requests.
+            (
+                WireFrame::CredentialFetch {
+                    v: PROTOCOL_VERSION,
+                    cid: 4,
+                    plugin: sample_plugin(),
+                    key: "k".into(),
+                },
+                FrameKind::PluginRequest,
+            ),
+            (
+                WireFrame::CredentialStore {
+                    v: PROTOCOL_VERSION,
+                    cid: 5,
+                    plugin: sample_plugin(),
+                    key: "k".into(),
+                    value: vec![9],
+                    metadata: CredentialMetadata::default(),
+                },
+                FrameKind::PluginRequest,
+            ),
+            (
+                WireFrame::CredentialDelete {
+                    v: PROTOCOL_VERSION,
+                    cid: 6,
+                    plugin: sample_plugin(),
+                    key: "k".into(),
+                },
+                FrameKind::PluginRequest,
+            ),
+            (
+                WireFrame::CredentialListKeys {
+                    v: PROTOCOL_VERSION,
+                    cid: 7,
+                    plugin: sample_plugin(),
+                },
+                FrameKind::PluginRequest,
+            ),
+            // Paired responses.
+            (
+                WireFrame::LoadResponse {
+                    v: PROTOCOL_VERSION,
+                    cid: 8,
+                    plugin: sample_plugin(),
+                },
+                FrameKind::Response,
+            ),
+            (
+                WireFrame::CredentialFetchResponse {
+                    v: PROTOCOL_VERSION,
+                    cid: 9,
+                    plugin: sample_plugin(),
+                    found: false,
+                    value: Vec::new(),
+                },
+                FrameKind::Response,
+            ),
+            (
+                WireFrame::CredentialListKeysResponse {
+                    v: PROTOCOL_VERSION,
+                    cid: 10,
+                    plugin: sample_plugin(),
+                    listings: vec![CredentialListing {
+                        key_hash: "0".repeat(64),
+                        metadata: CredentialMetadata::default(),
+                        created_at_ms: 1,
+                        updated_at_ms: 1,
+                    }],
+                },
+                FrameKind::Response,
+            ),
+            // Plugin async event.
+            (
+                WireFrame::ReportState {
+                    v: PROTOCOL_VERSION,
+                    cid: 11,
+                    plugin: sample_plugin(),
+                    payload: vec![1, 2, 3],
+                    priority: crate::contract::ReportPriority::Normal,
+                },
+                FrameKind::Event,
+            ),
+            // Ack + error.
+            (
+                WireFrame::EventAck {
+                    v: PROTOCOL_VERSION,
+                    cid: 12,
+                    plugin: sample_plugin(),
+                },
+                FrameKind::EventAck,
+            ),
+            (
+                WireFrame::Error {
+                    v: PROTOCOL_VERSION,
+                    cid: 13,
+                    plugin: sample_plugin(),
+                    class: crate::error_taxonomy::ErrorClass::Internal,
+                    message: "test".into(),
+                    details: None,
+                },
+                FrameKind::Error,
+            ),
+            // Handshake.
+            (
+                WireFrame::Hello {
+                    v: PROTOCOL_VERSION,
+                    cid: 0,
+                    plugin: sample_plugin(),
+                    feature_min: 1,
+                    feature_max: 1,
+                    codecs: vec!["json".into()],
+                },
+                FrameKind::Handshake,
+            ),
+            (
+                WireFrame::HelloAck {
+                    v: PROTOCOL_VERSION,
+                    cid: 0,
+                    plugin: sample_plugin(),
+                    feature: 1,
+                    codec: "json".into(),
+                },
+                FrameKind::Handshake,
+            ),
+        ];
+
+        for (frame, expected) in &corpus {
+            let observed = frame.kind();
+            assert_eq!(
+                observed, *expected,
+                "kind() classified {:?} as {:?}, expected {:?}",
+                frame, observed, expected,
+            );
+
+            // Partition property: every predicate returns TRUE iff
+            // kind() matches its FrameKind.
+            let bits = [
+                (frame.is_request(), FrameKind::StewardRequest),
+                (frame.is_plugin_request(), FrameKind::PluginRequest),
+                (frame.is_response(), FrameKind::Response),
+                (frame.is_event(), FrameKind::Event),
+                (frame.is_event_ack(), FrameKind::EventAck),
+                (frame.is_error(), FrameKind::Error),
+                (frame.is_handshake(), FrameKind::Handshake),
+            ];
+            for (bit, kind) in &bits {
+                assert_eq!(
+                    *bit,
+                    observed == *kind,
+                    "predicate for {:?} disagreed with kind() on {:?}",
+                    kind,
+                    frame,
+                );
+            }
+            // Exactly one predicate true — partition, not overlap.
+            let true_count = bits.iter().filter(|(b, _)| *b).count();
+            assert_eq!(
+                true_count, 1,
+                "expected exactly one predicate true for {:?}, got {}",
+                frame, true_count,
+            );
+        }
+    }
+
+    #[test]
+    fn credential_frames_carry_envelope() {
+        // Envelope match arm must cover every new variant. Any
+        // variant that reaches this test through the match arm
+        // returns its own cid + plugin; a missing match arm would
+        // fail to compile.
+        use crate::contract::context::{
+            CredentialChangeKind, CredentialListing, CredentialMetadata,
+            UninstallPolicy,
+        };
+        let cases: Vec<WireFrame> = vec![
+            WireFrame::CredentialFetch {
+                v: PROTOCOL_VERSION,
+                cid: 800,
+                plugin: sample_plugin(),
+                key: "k".into(),
+            },
+            WireFrame::CredentialFetchResponse {
+                v: PROTOCOL_VERSION,
+                cid: 801,
+                plugin: sample_plugin(),
+                found: true,
+                value: vec![9],
+            },
+            WireFrame::CredentialStore {
+                v: PROTOCOL_VERSION,
+                cid: 802,
+                plugin: sample_plugin(),
+                key: "k".into(),
+                value: vec![9],
+                metadata: CredentialMetadata::default(),
+            },
+            WireFrame::CredentialStoreResponse {
+                v: PROTOCOL_VERSION,
+                cid: 803,
+                plugin: sample_plugin(),
+            },
+            WireFrame::CredentialDelete {
+                v: PROTOCOL_VERSION,
+                cid: 804,
+                plugin: sample_plugin(),
+                key: "k".into(),
+            },
+            WireFrame::CredentialDeleteResponse {
+                v: PROTOCOL_VERSION,
+                cid: 805,
+                plugin: sample_plugin(),
+            },
+            WireFrame::CredentialListKeys {
+                v: PROTOCOL_VERSION,
+                cid: 806,
+                plugin: sample_plugin(),
+            },
+            WireFrame::CredentialListKeysResponse {
+                v: PROTOCOL_VERSION,
+                cid: 807,
+                plugin: sample_plugin(),
+                listings: vec![CredentialListing {
+                    key_hash: "0".repeat(64),
+                    metadata: CredentialMetadata {
+                        display_name: None,
+                        expires_at_ms: None,
+                        uninstall_policy: UninstallPolicy::Purge,
+                    },
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                }],
+            },
+            WireFrame::CredentialSetChanged {
+                v: PROTOCOL_VERSION,
+                cid: 808,
+                plugin: sample_plugin(),
+                changed_keys: vec!["k".into()],
+                kind: CredentialChangeKind::Put,
+            },
+        ];
+        for f in &cases {
+            let (v, cid, plugin) = f.envelope();
+            assert_eq!(v, PROTOCOL_VERSION);
+            assert!(cid >= 800);
+            assert_eq!(plugin, sample_plugin());
+        }
     }
 
     #[test]
@@ -2953,6 +5137,8 @@ mod tests {
                             payload,
                             deadline_ms,
                             instance_id: None,
+                            principal_scope: None,
+                            has_step_up: false,
                         }
                     },
                 ),
@@ -2977,5 +5163,37 @@ mod tests {
                 },
             ),
         ]
+    }
+
+    #[test]
+    fn shelf_dispatch_request_round_trip() {
+        let orig = WireFrame::ShelfDispatchRequest {
+            v: PROTOCOL_VERSION,
+            cid: 99,
+            plugin: sample_plugin(),
+            shelf: "audio.library".to_string(),
+            request_type: "search".to_string(),
+            payload: b"query payload".to_vec(),
+            instance_id: Some("inst-1".to_string()),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"shelf_dispatch_request""#));
+        assert!(json.contains(r#""shelf":"audio.library""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
+    }
+
+    #[test]
+    fn shelf_dispatch_response_round_trip() {
+        let orig = WireFrame::ShelfDispatchResponse {
+            v: PROTOCOL_VERSION,
+            cid: 99,
+            plugin: sample_plugin(),
+            payload: b"response payload".to_vec(),
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains(r#""op":"shelf_dispatch_response""#));
+        let back: WireFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, orig);
     }
 }

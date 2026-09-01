@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Crash-recovery test helper.
 //!
 //! Opens the production SQLite persistence layer at the path given on

@@ -111,18 +111,18 @@ This is the strictest non-paranoid setting. It trades some throughput (fsync per
 
 ### 4.2 Per-PRAGMA settings
 
-The steward opens every SQLite connection with the following pragmas applied before any query runs:
+The steward opens every SQLite connection with the following pragmas applied before any query runs. **Ordering is load-bearing** — `busy_timeout` is set first so every subsequent pragma call (including `journal_mode = WAL`, which itself can raise `SQLITE_BUSY` if another connection holds a lock during checkpoint) inherits the retry-on-busy loop:
 
-| Pragma | Value | Rationale |
-|--------|-------|-----------|
-| `journal_mode` | `WAL` | Multi-reader / single-writer concurrency. Required for the async boundary in section 10.4. |
-| `synchronous` | `FULL` | Full durability on commit. See section 4.1. |
-| `foreign_keys` | `ON` | Referential integrity enforced by SQLite, not by application code. |
-| `busy_timeout` | `5000` (ms) | A writer waits up to 5 seconds for a conflicting lock to clear before failing with `SQLITE_BUSY`. Tunable via config if operators report contention. |
-| `mmap_size` | `268435456` (256 MB) | Memory-mapped I/O for read-heavy workloads. Large enough to cover the realistic working set on any target; small enough that 32-bit targets do not exhaust address space. |
-| `cache_size` | `-20000` (20 MB) | Per-connection page cache. Negative value denotes KB; SQLite documents the sign convention. |
-| `wal_autocheckpoint` | `1000` (pages) | Default. Pages flush from the WAL to the main database every 1000 pages of WAL growth. |
-| `temp_store` | `MEMORY` | Temporary tables (used during `PRAGMA integrity_check` and some query plans) stay in RAM. |
+| Order | Pragma | Value | Rationale |
+|-------|--------|-------|-----------|
+| 1 | `busy_timeout` | `30000` (ms) | A writer waits up to 30 seconds for a conflicting lock to clear before failing with `SQLITE_BUSY`. Deliberately generous: under `synchronous = FULL` every commit fsyncs, and on variable-latency disk substrates (virtualised block devices, spinning disks under heavy write load, journal-quiescing filesystems mid-flush) a single fsync can spike into the multi-second range. 30 s absorbs any realistic single-fsync spike plus several rounds of writer serialisation with headroom. Under normal disk latency the extra headroom is dormant; under bad-disk pathology it converts silent state loss on the durable path into visible slowness — the operator can diagnose slowness, silent data loss is invisible until it explodes. |
+| 2 | `journal_mode` | `WAL` | Multi-reader / single-writer concurrency. Required for the async boundary in section 10.4. |
+| 3 | `synchronous` | `FULL` | Full durability on commit. See section 4.1. |
+| 4 | `foreign_keys` | `ON` | Referential integrity enforced by SQLite, not by application code. |
+| 5 | `mmap_size` | `268435456` (256 MB) | Memory-mapped I/O for read-heavy workloads. Large enough to cover the realistic working set on any target; small enough that 32-bit targets do not exhaust address space. |
+| 6 | `cache_size` | `-20000` (20 MB) | Per-connection page cache. Negative value denotes KB; SQLite documents the sign convention. |
+| 7 | `wal_autocheckpoint` | `1000` (pages) | Default. Pages flush from the WAL to the main database every 1000 pages of WAL growth. |
+| 8 | `temp_store` | `MEMORY` | Temporary tables (used during `PRAGMA integrity_check` and some query plans) stay in RAM. |
 
 These pragmas are set by the connection initializer in the connection pool; every connection handed out is already in this state. There is no code path that operates on a freshly-opened connection without these pragmas applied.
 
@@ -418,6 +418,26 @@ The initial schema (version 1) declares the subjects / relations subset. Subsequ
 | 9 | `009_installed_plugins.sql` | `installed_plugins` operator enable/disable bit |
 | 10 | `010_reconciliation_state.sql` | `reconciliation_state` per-pair last-known-good |
 | 11 | `011_pending_grammar_orphans.sql` | `pending_grammar_orphans` operator-visible record of subject-grammar orphans and any migration / acceptance decisions |
+| 12 | `012_prompts.sql` | `prompts` durable mirror of the in-memory user-interaction-routing ledger so open prompts survive steward restart |
+| 13 | `013_appointments.sql` | `appointments` time-driven instruction primitive (per-creator `appointment_id`, recurrence, miss-policy, last-fire bookkeeping) |
+| 14 | `014_subject_states.sql` | `subject_states` typed key-value store keyed by canonical id + predicate, the substrate `WatchScheduler` evaluates against |
+| 15 | `015_ledger_entries.sql` | `lifecycle_ledger_entries` audit-grade record of operator lifecycle operations (capability grants, profile activations, plugin-trust transitions, etc.) |
+| 16 | `016_credentials.sql` | `credentials` per-plugin encrypted credential vault primitive (algorithm-versioned cipher; cross-restart restoration) |
+| 17 | `017_queue.sql` | `queues` + `queue_entries` durable instruction queue primitive — bounded retry + dead-letter inheritance — used by appointments / watches dispatch and any future deferred-instruction surface |
+| 18 | `018_active_source_custody.sql` | `active_source_custody` per-custody-id holder + claim metadata for the active-source primitive (singleton-per-custody-id, NULL holder = released state distinct from row-absent) |
+| 19 | `019_scheduled_tasks.sql` | `scheduled_tasks` boot-rehydratable record of in-flight steward maintenance tasks |
+| 20 | `020_update_channels.sql` | `update_channels` per-target operator-selected channel preference (`core` / `plugins`; `alpha` / `test` / `production`) |
+| 21 | `021_plugin_profiles.sql` | `plugin_profiles` + `plugin_profile_entries` + `plugin_tags` for the operator-facing plugin lifecycle primitive (named plugin sets, per-entry overrides, activation state) |
+| 22 | `022_admission_policies.sql` | `admission_policies` operator-curated admission gates evaluated per-plugin at admission time |
+| 23 | `023_revoked_plugin_capabilities.sql` | `revoked_plugin_capabilities` per-plugin per-capability revocation set consulted at `LoadContext` build to suppress capability handles fail-closed |
+| 24 | `024_hardware_profile_overrides.sql` | `hardware_profile_overrides` operator-supplied corrections layered atop probed / database / declared hardware profile (audio-substrate consumer; bit-perfect topology scoring input) |
+| 25 | `025_audio_operator_preferences.sql` | `audio_operator_preferences` per-target operator policy + volume mode preferences (`Auto` / `StrictBitPerfect` / `Pinned`; `Software` / `Hardware` / `None`) |
+| 26 | `026_audio_active_topology.sql` | `audio_active_topology` published authoritative active-topology subject per target — the reconciliation publish primitive's substrate |
+| 27 | `027_device_identity.sql` | `device_identity` once-and-only-once persistent device id + display label (operator-rotatable via wire op) |
+| 28 | `028_discovered_peers.sql` | `discovered_peers` mDNS-SD peer-presence cache for the multi-room peer-discovery primitive (last-seen TTL; reverse-DNS friendly-name) |
+| 29 | `029_groups.sql` | `multiroom_groups` + `multiroom_group_members` operator-defined room groups for the multi-room substrate |
+| 30 | `030_source_host_elections.sql` | `source_host_elections` per-group local-view election record (elected device id, candidate count, decision timestamp) consumed by the reconciliation source-host primitive |
+| 31 | `031_active_ui_selection.sql` | `active_ui_selection` operator-chosen active theme / active UI shell (one row per slot — `theme` / `ui_shell` — NULL `plugin_name` = explicitly cleared, distinct from row-absent / never-set) |
 
 Every migration appends rows to `schema_version`. The runner applies each in order on first encounter (see §8.3); a steward downgrade attempt against a database whose `MAX(version)` exceeds the binary's maximum refuses to start with `StewardError::SchemaVersionAhead`.
 
@@ -686,7 +706,7 @@ Pool configuration is drawn from `StewardConfig`:
 [persistence]
 path = "/var/lib/evo/state/evo.db"      # Override for testing.
 max_connections = 8                     # Pool size. Default suits most devices.
-busy_timeout_ms = 5000                  # Per-connection busy timeout.
+busy_timeout_ms = 30000                 # Per-connection busy timeout (see §4.2 ordering + rationale).
 ```
 
 Defaults chosen so a typical device runs with no configuration; operators can tune on contention.

@@ -11,12 +11,35 @@ members = [
     "crates/evo-example-echo",
     "crates/evo-example-factory",
     "crates/evo-example-warden",
+    "crates/evo-multiroom-sdk",
     "crates/evo-os-clock",
+    "crates/evo-shadow-crypt",
     "crates/evo-plugin-sdk",
+    "crates/evo-primitives",
+    "crates/evo-auth-bearer",
     "crates/evo-plugin-test",
     "crates/evo-plugin-tool",
-    "crates/evo-trust",
-]
+    "crates/evo-projection-core",
+    "crates/evo-projection-graphql",
+    "crates/evo-projection-grpc",
+    "crates/evo-projection-http3",
+    "crates/evo-projection-rest",
+    "crates/evo-projection-ws",
+    "crates/evo-graphql",
+    "crates/evo-grpc",
+    "crates/evo-http3",
+    "crates/evo-observatory",
+    "crates/evo-otel-export",
+    "crates/evo-runtime-http",
+    "crates/evo-witness",
+    "crates/evo-tls-certs",
+    "crates/evo-sdk-genkit",
+    "crates/evo-sdk-kotlin",
+    "crates/evo-sdk-python",
+    "crates/evo-sdk-rust",
+    "crates/evo-sdk-swift",
+    "crates/evo-sdk-typescript",
+    "crates/evo-trust",]
 # `crates/evo-loom` is intentionally NOT a workspace member. It hosts
 # loom model-checking tests for the router's lookup-clone-drop
 # discipline; running those tests requires `RUSTFLAGS="--cfg loom"`,
@@ -33,7 +56,7 @@ exclude = ["crates/evo-loom"]
 # workspace crate has a corresponding citation in those documents.
 
 [workspace.package]
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 # MSRV is a framework-level choice, independent of any single
 # distribution's OS. evo-core supports an open set of distributions
@@ -70,7 +93,13 @@ edition = "2021"
 # See .cargo/config.toml for the MSRV-aware resolver configuration
 # that protects lockfile generation against future ecosystem shifts.
 rust-version = "1.85"
-license = "Apache-2.0"
+# Workspace default license. Strategic-IP crates inherit this via
+# `license.workspace = true` in their Cargo.toml. The plugin SDK,
+# operator CLI, and trust-primitive crates (evo-plugin-sdk,
+# evo-plugin-tool, evo-trust) override this with explicit
+# `license = "Apache-2.0"` declarations so the ecosystem layer
+# remains permissive.
+license = "BUSL-1.1"
 repository = "https://github.com/foonerd/evo-core"
 
 [workspace.lints.rust]

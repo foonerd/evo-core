@@ -1,0 +1,64 @@
+schema_version: "1.0"
+plugin: com.example.weather.provider
+owner: example-author
+isolation: oop
+
+# Set true when the plugin depends on any host-side OS package
+# (binary, kernel module, system service). The compulsory
+# parity gate at install-time and admission-time reads this
+# field FIRST: true + a missing required_binary = HARD FAIL.
+has_os_dependencies: false
+
+# ARCHETYPE: weather_provider
+#
+# A plugin that periodically fetches external weather data over
+# HTTPS (OpenWeatherMap, wttr.in, Met Office, equivalent) and
+# publishes it onto the framework's happenings bus for tiles,
+# routine triggers, or alarm-clock context. Reference example
+# for the whole "periodic external fetcher" pattern.
+#
+# TAILOR before shipping:
+#   - `plugin` — replace with the reverse-DNS canonical id for
+#     your plugin (e.g. `com.acme.weather.openweathermap`).
+#   - `owner` — the accountable team / individual / organisation.
+#   - `verification.commands` — read-only shell commands that
+#     confirm the host actually satisfies the intents. Every entry
+#     must exit 0 as the plugin's declared service identity.
+
+capability_intent:
+  - id: weather_fetch
+    need: fetch a JSON weather record from a configured provider's HTTPS API using an operator-supplied API key on a periodic schedule.
+    access_path: network/outbound
+    failure_mode: publish the last-known-good record with a `stale` marker; structured event carries the fetch error; no panic.
+  - id: state_storage
+    need: write per-plugin state directory to persist the API key, provider configuration, last-known-good response, rate-limit counters, and per-location refresh cursors.
+    access_path: filesystem/state
+    failure_mode: refuse to start (the API key cannot round-trip); structured admission error; no panic.
+
+required_binaries: []
+
+required_kernel_modules: []
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+    - "test -w /var/lib/evo"
+  expected:
+    - state directory exists
+    - state directory is writable as the declared service identity (API key + last-known-good must persist)
+
+host_provisioning:
+  debian:
+    systemd:
+      SupplementaryGroups: []
+      CapabilityBoundingSet: []
+      AmbientCapabilities: []
+      ProtectSystem: strict
+      ProtectHome: "yes"
+      ReadWritePaths:
+        - /var/lib/evo/plugins/com.example.weather.provider/state
+      NoNewPrivileges: true
+    capabilities: []
+    sudoers: []

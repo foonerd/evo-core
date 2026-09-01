@@ -163,13 +163,41 @@ The steward binary (`evo`) accepts these flags:
 
 ### 4.2 Environment Variables
 
-Only one: `RUST_LOG`. Standard `tracing_subscriber` semantics. Setting `RUST_LOG=debug` overrides a config file's `log_level = "warn"`; setting `--log-level warn` overrides `RUST_LOG=debug`.
+**Core configuration.** Only one variable participates in the
+core-config precedence chain: `RUST_LOG`. Standard `tracing_subscriber`
+semantics. Setting `RUST_LOG=debug` overrides a config file's
+`log_level = "warn"`; setting `--log-level warn` overrides
+`RUST_LOG=debug`.
 
-The steward does not read any other environment variables by default. Distributions wanting per-install configuration can do any of:
+**Transport substrate.** Every network envelope the framework projects
+(HTTPS, HTTP redirect, gRPC, GraphQL, HTTP/3) plus the supporting
+security and observability primitives (ACME, mTLS, step-up auth, OIDC,
+OpenTelemetry export) is opt-in via environment variables. Unset means
+unmounted; the steward boots UDS-only by default with no implicit
+network listeners. The full env-var contract lives in
+`TRANSPORTS.md`; one-line index:
+
+| Variable | Mounts |
+| --- | --- |
+| `EVO_HTTPS_LISTEN_ADDR` | HTTPS listener (REST + WS) |
+| `EVO_HTTPS_STATE_DIR` | Override path for device-CA + bearer-token state |
+| `EVO_HTTP_REDIRECT_LISTEN_ADDR` | HTTP → HTTPS 308 redirect listener |
+| `EVO_GRPC_LISTEN_ADDR` | gRPC listener (tonic) |
+| `EVO_GRAPHQL_LISTEN_ADDR` | GraphQL listener (async-graphql) |
+| `EVO_HTTP3_LISTEN_ADDR` | HTTP/3 + QUIC listener (quinn + h3) |
+| `EVO_AUTH_SECRET_FILE` | argon2id-hashed operator credentials for step-up auth |
+| `EVO_ACME_DIRECTORY_URL` + `EVO_ACME_CONTACT_EMAIL` + `EVO_ACME_HOSTNAMES` | ACME RFC 8555 issuer |
+| `EVO_MTLS_CLIENT_CA_FILE` | Trusted client-CA PEM for mTLS verification |
+| `EVO_OIDC_ISSUER` + `EVO_OIDC_AUDIENCE` (+ optional `EVO_OIDC_GROUP_CLAIM`) | OIDC JWT verifier |
+| `EVO_OTLP_ENDPOINT` (+ optional `EVO_OTLP_SERVICE_NAME` / `_BATCH_INTERVAL_MS` / `_MAX_BATCH_SIZE` / `_HEADERS`) | OpenTelemetry OTLP exporter |
+
+Distributions wanting per-install configuration can:
 
 - Ship an `/etc/evo/evo.toml` baked with the right values.
-- Use systemd's `EnvironmentFile=` plus shell-expansion in the ExecStart to pass `--catalogue` etc.
-- Wrap the steward in a thin launcher script that computes config values and invokes `evo`.
+- Use systemd's `EnvironmentFile=` plus shell-expansion in the ExecStart
+  to pass `--catalogue` etc. and the transport env vars above.
+- Wrap the steward in a thin launcher script that computes config
+  values and invokes `evo`.
 
 ## 5. Operational Patterns
 

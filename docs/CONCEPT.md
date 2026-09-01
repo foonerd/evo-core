@@ -166,7 +166,7 @@ Full layout in `docs/engineering/PLUGIN_PACKAGING.md`.
 
 ## 10. Deliberately Open
 
-Concept-level decisions deferred to the engineering layer. Named here so downstream documents know what they must answer.
+Concept-level decisions handed down to the engineering layer. Named here so downstream documents know what they must answer.
 
 | Open question | Decision doc |
 |---------------|--------------|

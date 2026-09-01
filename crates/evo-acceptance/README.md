@@ -1,16 +1,16 @@
 # evo-acceptance
 
-Adaptive acceptance harness for the evo framework. Runs structured T1-T5 tier scenarios against any target (Pi 5 prototype, x86 dev box, vendor board) defined by a target descriptor file, and emits a Markdown readiness report with a tri-state PROMOTE / CONDITIONAL / BLOCK verdict.
+Adaptive acceptance harness for the evo framework. Runs structured T1-T5 tier scenarios against any target (aarch64 validation target, x86 dev box, vendor board) defined by a target descriptor file, and emits a Markdown readiness report with a tri-state PROMOTE / CONDITIONAL / BLOCK verdict.
 
 ## Usage
 
 ```bash
 evo-acceptance run \
-    --target=acceptance/targets/pi5-prototype.toml \
-    --plan=acceptance/plans/v0.1.12.toml \
-    --release=v0.1.12 \
+    --target=acceptance/targets/aarch64-validation.toml \
+    --plan=acceptance/plans/vMAJOR.MINOR.PATCH.toml \
+    --release=vMAJOR.MINOR.PATCH \
     --rc=1 \
-    --output=reports/V0.1.12-RC.1-PI5-READINESS-REPORT.md
+    --output=reports/vMAJOR.MINOR.PATCH-rc.1-readiness-report.md
 ```
 
 ## Inputs

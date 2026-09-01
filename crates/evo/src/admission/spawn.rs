@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Out-of-process plugin lifecycle: socket-readiness polling and
 //! child-process teardown.
 //!

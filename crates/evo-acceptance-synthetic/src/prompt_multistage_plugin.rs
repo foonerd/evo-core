@@ -1,13 +1,15 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Synthetic multi-stage prompt persistence plugin.
 //!
 //! Sibling to the existing `prompt_plugin` (5s Text prompt, single
 //! issue per load); this plugin tests the durable prompt ledger +
-//! boot-time rehydration landed in Phase 1.H. The scenario stops
-//! the steward mid-prompt and restarts; the prompt's durable row
-//! survives; the plugin re-loads and re-issues with the same
-//! prompt_id (re-issue semantics re-attach to the existing row);
-//! the operator answers post-restart and the outcome reaches the
-//! plugin's new awaiter.
+//! boot-time rehydration. The scenario stops the steward mid-prompt
+//! and restarts; the prompt's durable row survives; the plugin
+//! re-loads and re-issues with the same prompt_id (re-issue
+//! semantics re-attach to the existing row); the operator answers
+//! post-restart and the outcome reaches the plugin's new awaiter.
 //!
 //! Behaviour:
 //!
@@ -129,6 +131,7 @@ impl Plugin for PromptMultistagePlugin {
                 retention_hint: None,
                 error_context: None,
                 previous_answer: None,
+                priority: None,
             };
 
             tokio::spawn(async move {
@@ -184,7 +187,7 @@ impl Plugin for PromptMultistagePlugin {
 
 impl Respondent for PromptMultistagePlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         _req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {

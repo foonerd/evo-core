@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Out-of-process bundle checks: signature, key authorisation, revocations.
 //!
 //! ## Layered chain of trust
@@ -195,7 +198,7 @@ pub fn verify_out_of_process_bundle_at(
     {
         check_window(op, now_dt)?;
         validate_chain(op, keys, revocations, now_dt)?;
-        return finalise(op, bundle, opt);
+        return finalise(op, bundle.plugin_name, bundle.declared_trust, opt);
     }
 
     // Otherwise, walk each candidate signer's chain. The first one
@@ -214,7 +217,12 @@ pub fn verify_out_of_process_bundle_at(
                     });
                     continue;
                 }
-                return finalise(leaf, bundle, opt);
+                return finalise(
+                    leaf,
+                    bundle.plugin_name,
+                    bundle.declared_trust,
+                    opt,
+                );
             }
             Err(e) => {
                 // A `Revoked` error from the chain walk MUST NOT be
@@ -238,7 +246,164 @@ pub fn verify_out_of_process_bundle_at(
                     if let Some(rot) =
                         rotation_window_accepts(leaf, keys, revocations, now_dt)
                     {
-                        match finalise_intersection(leaf, rot, bundle, opt) {
+                        match finalise_intersection(
+                            leaf,
+                            rot,
+                            bundle.plugin_name,
+                            bundle.declared_trust,
+                            opt,
+                        ) {
+                            Ok(outcome) => return Ok(outcome),
+                            Err(rot_err) => {
+                                last_err = Some(rot_err);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or(TrustError::SignatureNotRecognised))
+}
+
+/// Bundle reference for an artefact (theme / ui_shell /
+/// widget_kind_pack) verification call. The artefact path
+/// has no single executable file; the signing payload is
+/// computed via [`crate::digest::signing_message_artefact`]
+/// over the manifest plus the content-tree digest of the
+/// plugin directory.
+pub struct ArtefactBundleRef<'a> {
+    /// Plugin root directory.
+    pub plugin_dir: &'a Path,
+    /// `manifest.toml` path within `plugin_dir`.
+    pub manifest_path: &'a Path,
+    /// `plugin.name` from the manifest.
+    pub plugin_name: &'a str,
+    /// Declared [`TrustClass`] from the manifest.
+    pub declared_trust: TrustClass,
+}
+
+/// Verify an artefact bundle's `manifest.sig` (if present),
+/// key authorisation, and revocation list. Mirror of
+/// [`verify_out_of_process_bundle`] for the V2 artefact
+/// signing payload (manifest + content-tree digest).
+///
+/// The verification timestamp is `SystemTime::now()`.
+pub fn verify_artefact_bundle(
+    bundle: &ArtefactBundleRef<'_>,
+    keys: &[TrustKey],
+    revocations: &RevocationSet,
+    opt: TrustOptions,
+) -> Result<TrustOutcome, TrustError> {
+    verify_artefact_bundle_at(bundle, keys, revocations, opt, SystemTime::now())
+}
+
+/// Same as [`verify_artefact_bundle`] but with an explicit
+/// verification timestamp. Tests use this to drive validity
+/// windows + rotation logic deterministically.
+pub fn verify_artefact_bundle_at(
+    bundle: &ArtefactBundleRef<'_>,
+    keys: &[TrustKey],
+    revocations: &RevocationSet,
+    opt: TrustOptions,
+    now: SystemTime,
+) -> Result<TrustOutcome, TrustError> {
+    tracing::debug!(
+        plugin_dir = %bundle.plugin_dir.display(),
+        declared_trust = ?bundle.declared_trust,
+        candidate_keys = keys.len(),
+        allow_unsigned = opt.allow_unsigned,
+        "trust verify (artefact): invoking"
+    );
+    let id = crate::digest::install_digest_artefact(
+        bundle.manifest_path,
+        bundle.plugin_dir,
+    )?;
+    if revocations.is_revoked(&id) {
+        tracing::debug!(
+            plugin_dir = %bundle.plugin_dir.display(),
+            digest = %RevocationSet::display_digest(&id),
+            "trust verify (artefact): refused (revoked)"
+        );
+        return Err(TrustError::Revoked(
+            RevocationSet::display_digest(&id).to_string(),
+        ));
+    }
+
+    let sig_path = bundle.plugin_dir.join("manifest.sig");
+    let has_sig = sig_path.is_file();
+
+    if !has_sig {
+        if !opt.allow_unsigned {
+            return Err(TrustError::UnsignedInadmissible);
+        }
+        return Ok(TrustOutcome {
+            effective_trust: TrustClass::Sandbox,
+            was_unsigned: true,
+        });
+    }
+
+    let now_dt: DateTime<Utc> = now.into();
+    let msg = crate::digest::signing_message_artefact(
+        bundle.manifest_path,
+        bundle.plugin_dir,
+    )?;
+    let sig = read_signature_file(bundle.plugin_dir)?;
+
+    let mut signers: Vec<&TrustKey> = Vec::new();
+    for k in keys {
+        if k.verifying.verify(&msg, &sig).is_ok() {
+            signers.push(k);
+        }
+    }
+    if signers.is_empty() {
+        return Err(TrustError::SignatureNotRecognised);
+    }
+
+    if let Some(op) = signers
+        .iter()
+        .find(|k| matches_role(k, KeyRole::OperatorRoot))
+    {
+        check_window(op, now_dt)?;
+        validate_chain(op, keys, revocations, now_dt)?;
+        return finalise(op, bundle.plugin_name, bundle.declared_trust, opt);
+    }
+
+    let mut last_err: Option<TrustError> = None;
+    for leaf in &signers {
+        match validate_chain(leaf, keys, revocations, now_dt) {
+            Ok(()) => {
+                if !name_matches_prefixes(
+                    bundle.plugin_name,
+                    &leaf.meta.authorisation.name_prefixes,
+                ) {
+                    last_err = Some(TrustError::NameNotAuthorised {
+                        name: bundle.plugin_name.to_string(),
+                        key_basename: leaf.basename.clone(),
+                    });
+                    continue;
+                }
+                return finalise(
+                    leaf,
+                    bundle.plugin_name,
+                    bundle.declared_trust,
+                    opt,
+                );
+            }
+            Err(e) => {
+                if !matches!(e, TrustError::Revoked(_)) {
+                    if let Some(rot) =
+                        rotation_window_accepts(leaf, keys, revocations, now_dt)
+                    {
+                        match finalise_intersection(
+                            leaf,
+                            rot,
+                            bundle.plugin_name,
+                            bundle.declared_trust,
+                            opt,
+                        ) {
                             Ok(outcome) => return Ok(outcome),
                             Err(rot_err) => {
                                 last_err = Some(rot_err);
@@ -437,24 +602,19 @@ fn in_overlap_window(
 
 fn finalise(
     k: &TrustKey,
-    bundle: &OutOfProcessBundleRef<'_>,
+    plugin_name: &str,
+    declared_trust: TrustClass,
     opt: TrustOptions,
 ) -> Result<TrustOutcome, TrustError> {
-    if !name_matches_prefixes(
-        bundle.plugin_name,
-        &k.meta.authorisation.name_prefixes,
-    ) {
+    if !name_matches_prefixes(plugin_name, &k.meta.authorisation.name_prefixes)
+    {
         return Err(TrustError::NameNotAuthorised {
-            name: bundle.plugin_name.to_string(),
+            name: plugin_name.to_string(),
             key_basename: k.basename.clone(),
         });
     }
     let key_max = k.meta.authorisation.max_trust_class;
-    match effective_trust_class(
-        bundle.declared_trust,
-        key_max,
-        opt.degrade_trust,
-    ) {
+    match effective_trust_class(declared_trust, key_max, opt.degrade_trust) {
         Ok(eff) => Ok(TrustOutcome {
             effective_trust: eff,
             was_unsigned: false,
@@ -479,24 +639,25 @@ fn finalise(
 fn finalise_intersection(
     old: &TrustKey,
     new: &TrustKey,
-    bundle: &OutOfProcessBundleRef<'_>,
+    plugin_name: &str,
+    declared_trust: TrustClass,
     opt: TrustOptions,
 ) -> Result<TrustOutcome, TrustError> {
     if !name_matches_prefixes(
-        bundle.plugin_name,
+        plugin_name,
         &old.meta.authorisation.name_prefixes,
     ) {
         return Err(TrustError::NameNotAuthorised {
-            name: bundle.plugin_name.to_string(),
+            name: plugin_name.to_string(),
             key_basename: old.basename.clone(),
         });
     }
     if !name_matches_prefixes(
-        bundle.plugin_name,
+        plugin_name,
         &new.meta.authorisation.name_prefixes,
     ) {
         return Err(TrustError::NameNotAuthorised {
-            name: bundle.plugin_name.to_string(),
+            name: plugin_name.to_string(),
             key_basename: new.basename.clone(),
         });
     }
@@ -514,11 +675,7 @@ fn finalise_intersection(
     } else {
         (old, old.meta.authorisation.max_trust_class)
     };
-    match effective_trust_class(
-        bundle.declared_trust,
-        key_max,
-        opt.degrade_trust,
-    ) {
+    match effective_trust_class(declared_trust, key_max, opt.degrade_trust) {
         Ok(eff) => Ok(TrustOutcome {
             effective_trust: eff,
             was_unsigned: false,

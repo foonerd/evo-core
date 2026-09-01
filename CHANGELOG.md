@@ -13,7 +13,53 @@ v0.1.8 is the first tagged release. Versions prior to 0.1.8 existed only as
 workspace-version values in source; they were not tagged and have no release
 artefacts. Consult the git log for pre-0.1.8 history.
 
-## [Unreleased]
+## [0.1.13] - 2026-09-01
+
+### Security
+
+- **LAN-trust admission no longer grants `user_interaction_responder` to anonymous LAN peers.** `HttpsBootConfig.lan_trust_capabilities` used to default to `operator_bootstrap_capability_set()`, which carries the responder scope for the bearer-mint path. An anonymous LAN browser admitted under Open / Secure-LAN could therefore claim the single-holder responder role without any bearer and race the operator's actual UI session. The default is now `lan_trust_capability_set()`, which returns the operator-bootstrap set minus every scope in a new `SINGLE_HOLDER_ROLE_SCOPES` list (currently just `user_interaction_responder`; list-extensible for future single-holder role scopes). LAN-side responders must reach the role through the bearer path — a scoped mint via `evo-plugin-tool admin auth mint-bearer-token --scope user_interaction_responder`. An invariant test (`https_boot::tests::lan_trust_set_is_operator_bootstrap_minus_single_holder_scopes`) catches any future edit that widens LAN-trust past the floor.
+
+### Fixed
+
+- **WebSocket server-side heartbeat closes dead sessions.** axum's WS integration auto-responds to inbound Ping but never initiates a server-side probe. A crashed browser / power-cut client leaves the upstream proxy's TCP half-open; the framework never learned the session died and any held responder slot stayed claimed until the steward restarted. A per-connection heartbeat task in `handle_socket` now sends a server-initiated Ping every 15 seconds and closes the connection when the peer has been silent past a 30-second tolerance envelope. The receive loop refreshes an activity clock on every inbound Text/Binary/Pong/Ping so a slow application handler cannot fool the heartbeat. When the peer is declared dead, the socket close cascades through the normal teardown to the responder-slot release paths.
+
+- **Prompts demo emitter no longer accumulates stale stockings.** `PromptLedger::mark_cancelled` only flips the ledger's state field to `Cancelled`; the shelf-stocking unstock hook lives on `complete_with_outcome` / `cancel_with_attribution`. The rotating-sample demo was using `mark_cancelled`, leaving one stale stocking per rotation step on `prompts.active`. Fix: switch to `cancel_with_attribution(..., PromptCanceller::Plugin)` so the widget unstocks on every rotation step. Verified end-to-end on an integration bench that the shelf holds exactly one active stocking through a full four-step rotation.
+
+- **`user_interaction_responder` on browser sessions.** The negotiate handler's arm for this capability now accepts EITHER a Unix-socket peer-UID grant OR a bearer-token grant (`conn.granted_capabilities.contains("user_interaction_responder")`). Pre-fix, the ACL check was UID-only and browser sessions carrying a bearer token had a synthetic `peer.uid`; every claim was refused regardless of scope. See `docs/engineering/CLIENT_API.md` §4.14 and `docs/engineering/STEWARD.md` §12.8 for the routing description.
+
+- **HTTPS responder-slot release semantics.** `Server::dispatch_http_wire_op` used to mint a fresh `ResponderConnectionId` per wire op via a monotonic counter. After a first successful claim, the ledger's `responder` slot held an orphan id that no subsequent op could match, and every follow-up bearer request was refused until the steward restarted. The HTTPS-arriving id is now derived from a salted hash of `Principal.token_id`, so ops carrying the same bearer share one claim (idempotent same-holder re-claim) and different bearers are correctly refused. Release is bounded by bearer TTL, not steward lifetime. Unix-socket path unchanged (its counter + RAII guard were already correct; high-u64 hash space cannot collide with the low-u64 counter).
+
+- **Single-responder property enforced at op level.** `require_user_interaction_responder` used to gate on `conn.has(scope)` alone, which returned true for any bearer holding the scope regardless of whether the connection held the ledger's runtime slot. Two bearers minted for the responder role BOTH passed the op-level gate. Now split into `require_user_interaction_responder_capability` (used by the idempotent release op) and `require_user_interaction_responder` (used by list/answer/cancel, which additionally verify `ledger.current_responder() == conn.connection_id`). Structured subclasses `responder_slot_unclaimed` and `responder_slot_held_by_other` distinguish the refusals.
+
+- **`operator_bootstrap_capability_set` carries the responder scope.** All mint paths (first-boot bootstrap token and SSH-required `mint_bearer_token` wire op) derive scope from this set. Without the entry, no minted operator token could grant the responder capability and the negotiate arm's bearer branch was structurally unreachable.
+
+- **Schema requirement for responder ops retargeted.** `list_user_interactions` / `answer_user_interaction` / `cancel_user_interaction` / `release_user_interaction_responder` are now declared at the projection-schema layer as requiring `user_interaction_responder` capability (previously `read:ui` / `write:ui`). A single-scope responder mint (`--scope user_interaction_responder`) now operates end to end without a second `--scope ui`.
+
+- **WebSocket subprotocol prefix aligned with CLI banner.** `SUBPROTOCOL_BEARER_PREFIX` in the runtime-http `ws_endpoint` was `"bearer."` while the operator CLI banner and browser probes send `evo.bearer.<token>`. `strip_prefix` silently failed; the extract path fell through to Authorization (which browsers cannot set on `new WebSocket()`), then to LAN-trust admission, and upgraded without any subprotocol on the 101. RFC 6455 §4.2.2-compliant clients (Node `ws`, every browser stack) aborted the handshake. The constant is now `"evo.bearer."`. See `docs/engineering/CREDENTIALS.md` for the JS example.
+
+- **WebSocket 101 explicitly echoes `Sec-WebSocket-Protocol`.** The response now unconditionally inserts the accepted subprotocol on the 101 headers when the client offered one, regardless of whether axum's `WebSocketUpgrade::protocols()` matching succeeded. Belt-and-suspenders — earlier deployed proxies were observed dropping the header from the axum-provided response.
+
+- **SQLite `INIT_PRAGMAS` ordering + `busy_timeout` value.** `busy_timeout` is now the first pragma applied on every connection (was fourth), so a `SQLITE_BUSY` on any subsequent pragma call (including `journal_mode = WAL`, which can raise BUSY when another connection holds a lock during checkpoint) inherits the retry loop rather than aborting the sequence with the timeout still at its zero default. The value is bumped from 5 s to 30 s to absorb multi-second `fsync` spikes on variable-latency disk substrates (virtualised block devices, spinning disks under heavy write load, journal-quiescing filesystems mid-flush). Chronic `database is locked` warnings on `subject_states` upsert cease post-fix. See `docs/engineering/PERSISTENCE.md` §4.2.
+
+### Added
+
+- **`release_user_interaction_responder` wire op.** Explicit idempotent release of the responder slot the calling bearer currently holds, so a different bearer may claim without waiting for token TTL. Intended for the operator UI's log-out and tab-close paths. Returns `{ "responder_released": true }` in every case. Refuses only on `user_interaction_responder_not_granted` (the connection does not carry the capability at all); a non-holder call is a no-op because the ledger's release is same-holder-only clear.
+
+- **`mint_bearer_token` narrows to a requested scope list.** The wire op's `capabilities` field (`Option<Vec<String>>`) intersects the operator bootstrap set with the requested scope names — a mint can narrow but never widen. `evo-plugin-tool admin auth mint-bearer-token --scope <NAME>` (repeatable) exposes the same. The audit log emits `issued_scope_count` + `issued_scopes` + `requested_scope_names` so reviewers see what was asked for and what was issued. A narrow scope produces a substantially shorter token than the full operator-bootstrap default — enough to satisfy the WebSocket subprotocol carriage constraint on browsers that cap subprotocol length.
+
+- **INFO-level tracing at responder slot lifecycle points.** `PromptLedger::try_claim_responder` and `release_responder` now emit INFO lines at grant / refuse / release. Slot-holder-check refusals at the op-level gate also emit INFO with `slot_holder` / `requesting_conn` for correlation. Enable via `RUST_LOG=info`.
+
+### Changed
+
+- **Steward logging — single-layer emission.** The steward previously installed both the `tracing-journald` native layer AND the `tracing-subscriber` `fmt` stderr layer simultaneously on Linux, double-emitting every event into journald (once as a structured record, once as a captured-stderr text line). The substrate now installs exactly one layer per process: `tracing-journald` when journald is reachable, the `fmt`-stderr layer only as fallback when journald is unavailable (non-systemd / container / non-root). Halves the steward-wide journal footprint and removes the structural contention point for high-frequency tracing sources on realtime paths. Default `journalctl -u evo` output now renders the event's `MESSAGE` field (matching how systemd's own native services render); structured fields remain queryable via `journalctl -o verbose` or `-o json`. See `docs/engineering/LOGGING.md` §4 for the full surface description.
+
+### Changed
+
+- **Stderr fallback writer is non-blocking.** When the `fmt`-stderr fallback layer is active (journald unreachable), the writer is wrapped in `tracing_appender::non_blocking`. Write syscalls happen on a dedicated worker thread; high-frequency tracing sources cannot block the calling thread on a slow stderr consumer. The `WorkerGuard` returned from `logging::init` is owned by the binary's entrypoint for the program lifetime.
+
+### Added
+
+- **`evo-plugin-tool admin group frame-trace`** subcommand. Wraps the multi-room native plugin's `audio.multiroom.frame_trace.snapshot` wire-op as an operator CLI surface, rendering the rolling-window per-frame audible-time trace records in a compact table form or, with `--json`, as the wire-op envelope verbatim for piping into structured-analysis tooling. Capability-gated by `plugins_admin`; read-only.
 
 ## [0.1.12.1] - 2026-05-04
 
@@ -24,9 +70,9 @@ artefacts. Consult the git log for pre-0.1.8 history.
 
 ### Acceptance — closure of v0.1.12 charter
 
-- **Pi 5 prototype 71/71 Pass.** The v0.1.12 charter's "Pi 5 production-confidence acceptance harness (T1-T5)" is now built and run end-to-end. RC.3 readiness report on a reference Pi 5 prototype (aarch64, Trixie 13.4, 8 GB, USB-attached SSD): **71 / 71 Pass · 0 Fail · 0 Skip · 29.3 min wall · auto-verdict PROMOTE**. Coverage: T1 bring-up smoke (4), T2 per-feature functional (47 — every shipped wire op + capability + miss-policy edge), T3 cross-feature interaction (5), T4 burn-in cluster (5: idle-soak 600 s, concurrent-admission 306 s, fast-path-throughput 67 s, coalescing-burst, bulk-orphan-stress with 50k subjects + concurrent describe-capabilities probes), T5 failure-mode (7: catalogue-corrupt, catalogue-builtin, plugin-crash-mid-recon, OOM, disk-full, network-drop, flight-mode-no-panic). Storage class scaling: contract durations and grammar-migration budgets adapted to USB-attached SSD's per-event-fsync floor; full design-target validation moves to amd64/NVMe rigs in a future test pass.
+- **Reference aarch64 target 71/71 Pass.** The v0.1.12 charter's "Reference aarch64 production-confidence acceptance harness (T1-T5)" is now built and run end-to-end. RC.3 readiness report on the aarch64 reference target: **71 / 71 Pass · 0 Fail · 0 Skip · 29.3 min wall · auto-verdict PROMOTE**. Coverage: T1 bring-up smoke (4), T2 per-feature functional (47 — every shipped wire op + capability + miss-policy edge), T3 cross-feature interaction (5), T4 burn-in cluster (5: idle-soak 600 s, concurrent-admission 306 s, fast-path-throughput 67 s, coalescing-burst, bulk-orphan-stress with 50k subjects + concurrent describe-capabilities probes), T5 failure-mode (7: catalogue-corrupt, catalogue-builtin, plugin-crash-mid-recon, OOM, disk-full, network-drop, flight-mode-no-panic). Storage class scaling: contract durations and grammar-migration budgets adapted to USB-attached SSD's per-event-fsync floor; full design-target validation moves to amd64/NVMe rigs in a future test pass.
 - **Acceptance harness library + binary.** `evo-acceptance` crate carries the runner, scenario plan parser, target descriptor parser, inspector, connection layer (ssh / local), and report writer (Markdown + JSON sidecar). The crate is public-shippable; vendors building distributions consume it and author their own target descriptors and scenario plans for their own infrastructure.
-- **`acceptance/` ships as adopter-facing template.** The framework's pi5-prototype target descriptor (with the `REPLACE_ME` sentinels described in the leak-posture work above) and the v0.1.12 scenario plan are present in the public source so distribution authors can read a complete, runnable example before authoring their own. See `acceptance/README.md` for the three audiences (framework operators, distribution authors, plugin authors).
+- **`acceptance/` ships as adopter-facing template.** The framework's reference aarch64 target descriptor (with the `REPLACE_ME` sentinels described in the leak-posture work above) and the v0.1.12 scenario plan are present in the public source so distribution authors can read a complete, runnable example before authoring their own. See `acceptance/README.md` for the three audiences (framework operators, distribution authors, plugin authors).
 - **Acceptance synthetic plugin suite.** `evo-acceptance-synthetic` crate ships ~20 synthetic plugins exercising every framework primitive end-to-end (drift, appointment, watch, prompt, reload, skew, flight-rack, fast-path warden, composer + delivery warden, watch-SubjectState, watch-Hysteresis, periodic appointment, multi-stage prompt persistence, past-due appointment, grammar source, coalescing source, reload-plugin oversized blob, skew warn-band, appointment wake). Each plugin's manifest pins `target.shape` and `target.shelf` so the catalogue can declare the synthetic shelves once and the suite admits cleanly.
 - **In-process acceptance distribution.** `evo-acceptance-distribution` crate builds an alternate steward binary that admits the synthetic ReloadPlugin in-process, exercising the framework's `reload_plugin_in_process_live` path (no spawn / no wire / state passed directly between Plugin trait calls). Used by `T2.hot-reload-live-inproc`.
 
@@ -34,7 +80,7 @@ artefacts. Consult the git log for pre-0.1.8 history.
 
 - **Per-plugin live-reload blob cap (`lifecycle.live_blob_max`).** Plugin manifests may declare `lifecycle.live_blob_max: u64` to raise the live-reload state-blob ceiling for that one plugin above the framework default (16 MiB), up to the wire's hard ceiling. Admission resolves the effective cap via `effective_live_blob_cap()`; the framework refuses any blob above the resolved cap with a stable subclass token. Validates the per-plugin cap admission + hard-ceiling refusal path.
 - **Wire transport `MAX_FRAME_SIZE` raised from 1 MiB to 64 MiB.** Pinned to `MAX_LIVE_RELOAD_BLOB_BYTES`. The slow-path control wire and the SDK codec both raised in lockstep; `evo-plugin-tool admin` clients raised to match. Multi-MiB live-reload state blobs now ride the wire without forcing a hard-coded retry tier.
-- **Live-reload successor socket path scheme (`.lr.{6hex}.sock`).** Linux's `SUN_PATH_MAX = 108` was the binding constraint when a live-reload successor needed a unique sibling socket; long plugin names plus the suffix overran the limit. The new compact-suffix scheme keeps every live-reload successor socket path inside the budget. Four unit tests in `admission.rs` pin the contract: typical 52-char names fit; two consecutive calls produce distinct paths (atomic counter); overlong names refused with a clear error; 70-char names supported on `/var/run/evo`. SHOWSTOPPER R-011 closed.
+- **Live-reload successor socket path scheme (`.lr.{6hex}.sock`).** Linux's `SUN_PATH_MAX = 108` was the binding constraint when a live-reload successor needed a unique sibling socket; long plugin names plus the suffix overran the limit. The new compact-suffix scheme keeps every live-reload successor socket path inside the budget. Four unit tests in `admission.rs` pin the contract: typical 52-char names fit; two consecutive calls produce distinct paths (atomic counter); overlong names refused with a clear error; 70-char names supported on `/var/run/evo`. Closes the socket-path-length SHOWSTOPPER.
 - **Plugin state-dir admission gap closed.** The `ensure_plugin_state_and_credentials` helper moved from the discovery-only path into `build_load_context` so every admit path (OOP discovery, in-process programmatic, factory) creates the state + credentials directories before `LoadContext` is handed to the plugin. Previously in-process admissions saw non-existent state_dirs and silently-failing log writes.
 - **`RtcWakeCallback` on `RunOptions`.** Distributions inject an OS RTC wake adapter via `RunOptions::with_rtc_wake(...)`. The `AppointmentRuntime` calls the callback on every transition for must-wake-device appointments. The acceptance distribution wires a recording adapter (`RecordingRtcWakeCallback`) that logs `program_wake` calls so scenarios validate the framework's wake-arming contract independently of OS-level suspend/resume plumbing — the Path-3 framework-contract validation per the v0.1.12.1 acceptance design.
 - **Framework-version override (`EVO_FRAMEWORK_VERSION_OVERRIDE`).** `framework_version()` consults the env var first and falls back to `CARGO_PKG_VERSION`. Lets `T2.version-skew-warn-band` exercise the framework's WarnBand admit-and-warn path deterministically (no plugin in v0.1.x can naturally reach WarnBand without the override).
@@ -48,15 +94,16 @@ artefacts. Consult the git log for pre-0.1.8 history.
 - **`env_test_lock` await-holding-lock.** The test-only lock was a `std::sync::Mutex` held across an `await` boundary; clippy's `await_holding_lock` gate caught it once the framework-version override gained tests. Switched to `tokio::sync::Mutex`.
 - **`reload_plugin_in_process_live` doc-test signature.** Doc example used struct-literal `RunOptions { args, admission }`; once `RtcWakeCallback` was added the literal stopped compiling. Switched the example to `RunOptions::new(args, admission)`.
 
-### Acceptance harness — leak posture (R-012 closure)
+### Acceptance harness — leak posture
 
 - **Target descriptor sanitised.** `acceptance/targets/pi5-prototype.toml` carries `REPLACE_ME` sentinels in every connection-bearing field (host, user, key_path); the public-shape capability surface stays in the committed file. Machine-specific connection details live in a sibling `<name>.local.toml` overlay loaded at runtime; `acceptance/targets/*.local.toml` is gitignored (never committed).
 - **Overlay loader.** `crates/evo-acceptance/src/target.rs` parses the base descriptor, looks for the sibling overlay, applies it field-by-field, then refuses any descriptor still carrying the `REPLACE_ME` sentinel after merge — emitting a `DescriptorPlaceholder` error pointing the operator at `acceptance/README.md §Local overrides`. Five unit tests pin the contract.
 - **Scenario shell portability.** `T5.disk-full` derives the steward's service user/group at runtime via `stat -c %U /var/lib/evo` and `%G` so the committed scenario plan stays portable across distributions (the user name differs per product line; the framework imposes none).
+- **Promote-side scrub.** `reports/` added to `.scrub-exclude`. The eng repo's release-cut readiness reports + JSON sidecars (which name machine-specific paths and quote command output) belong to the eng repo's audit trail, not to the public source surface; the promote script's `rm -rf` pass now drops the directory before the squashed commit is built.
 
 ### Acceptance harness — scenario plan correctness
 
-- **Scenario-plan trap-SQL bash-quoting.** Five trap blocks across the grammar and stress scenarios contained SQL string literals (`'acceptance_track_v1'`, `'type_migrated'`, `'bulk-%'`, etc.) inside a single-quoted bash trap body. Bash's quote parser stripped the embedded single quotes, producing SQL like `IN (acceptance_track_v1, ...)` which sqlite3 refused with `unrecognized token` or `no such column` — silenced by `2>/dev/null || true`. The traps appeared to fire but actually left every test's database residue behind. Migrated to the `'\''` bash idiom (in TOML basic-multiline source: `'\\''`) across all five trap blocks; verified end-to-end on Pi 5.
+- **Scenario-plan trap-SQL bash-quoting.** Five trap blocks across the grammar and stress scenarios contained SQL string literals (`'acceptance_track_v1'`, `'type_migrated'`, `'bulk-%'`, etc.) inside a single-quoted bash trap body. Bash's quote parser stripped the embedded single quotes, producing SQL like `IN (acceptance_track_v1, ...)` which sqlite3 refused with `unrecognized token` or `no such column` — silenced by `2>/dev/null || true`. The traps appeared to fire but actually left every test's database residue behind. Migrated to the `'\''` bash idiom (in TOML basic-multiline source: `'\\''`) across all five trap blocks; verified end-to-end on the aarch64 reference target.
 - **Scenario-plan grep patterns.** Three coalescing scenarios grep'd `^burst done elapsed_ms=` against an event log line that actually starts `burst done emitted=N requested=N elapsed_ms=...`. Pattern relaxed to `^burst done emitted=` to match the plugin's actual log format.
 - **`T2.grammar-orphans-rename` trap parity.** The rename scenario's trap previously omitted DB cleanup, leaving 100 v2 rows behind that contaminated the bulk-50k assertion (`v2(new-ids)=50100`) and the orphan-reload count (`orphans discovered: 900` instead of 1000). Brought to parity with the bulk / resume / reload / stress traps' DB-wipe shape.
 
@@ -126,7 +173,7 @@ artefacts. Consult the git log for pre-0.1.8 history.
 
 ### Acceptance
 
-- Validated on aarch64 Linux (Raspberry Pi 5, 8 GB, Trixie 13.4): cross-compilation, persistence migration 011 against a populated v0.1.11 database, capability negotiation, end-to-end round-trip of every new wire op (`list_grammar_orphans`, `accept_grammar_orphans`, `migrate_grammar_orphans`, `create_appointment` / `cancel_appointment` / `list_appointments`, `create_watch` / `cancel_watch` / `list_watches`), and `evo-plugin-tool catalogue validate-shelf-schema` against the in-tree worked example.
+- Validated on aarch64 Linux: cross-compilation, persistence migration 011 against a populated v0.1.11 database, capability negotiation, end-to-end round-trip of every new wire op (`list_grammar_orphans`, `accept_grammar_orphans`, `migrate_grammar_orphans`, `create_appointment` / `cancel_appointment` / `list_appointments`, `create_watch` / `cancel_watch` / `list_watches`), and `evo-plugin-tool catalogue validate-shelf-schema` against the in-tree worked example.
 
 ## [0.1.11] - 2026-04-29
 
@@ -176,7 +223,7 @@ artefacts. Consult the git log for pre-0.1.8 history.
 
 ### Acceptance
 
-- Validated end-to-end on the Pi 5 prototype (aarch64-unknown-linux-gnu, Debian 13.4 trixie). Offline binary signature verification, OOP bundle install via `evo-plugin-tool install`, plugin discovery + admission of the reference factory plugin and the audio-domain `org.evoframework.artwork.local` bundle, wire-protocol round-trips for every shipped op (`request`, `project_subject`, `project_rack`, `subscribe_subject`, `list_plugins`, `subscribe_happenings`, `list_active_custodies`), durability cross-check (`subjects` / `subject_addressings` / `claim_log` / `happenings_log` populated; `MAX(seq)` matches wire `current_seq`), restart-cycle verification (subjects re-announce; tombstones produced; durable cursor advances), clean SIGTERM shutdown.
+- Validated end-to-end on the reference aarch64 prototype (aarch64-unknown-linux-gnu, Debian 13.4 trixie). Offline binary signature verification, OOP bundle install via `evo-plugin-tool install`, plugin discovery + admission of the reference factory plugin and the audio-domain `org.evoframework.artwork.local` bundle, wire-protocol round-trips for every shipped op (`request`, `project_subject`, `project_rack`, `subscribe_subject`, `list_plugins`, `subscribe_happenings`, `list_active_custodies`), durability cross-check (`subjects` / `subject_addressings` / `claim_log` / `happenings_log` populated; `MAX(seq)` matches wire `current_seq`), restart-cycle verification (subjects re-announce; tombstones produced; durable cursor advances), clean SIGTERM shutdown.
 
 ## [0.1.10] - 2026-04-28
 
@@ -213,7 +260,7 @@ artefacts. Consult the git log for pre-0.1.8 history.
 
 ### Acceptance
 
-- Validated end-to-end on the Pi 5 prototype (aarch64-unknown-linux-gnu, Debian 13.4 trixie). Offline binary signature verification against the source-pinned framework release signing key, OOP bundle install via `evo-plugin-tool install`, plugin discovery + admission of the reference echo plugin and the audio-domain `org.evoframework.artwork.local` plugin, wire-protocol round-trips for both shipped reference plugins, clean SIGTERM shutdown. Per-architecture acceptance: aarch64 carries a hardware-validated deployable mark; x86_64 and armv7 inherit the workflow-validated provenance and are deployable subject to whichever plugin developer first runs them on real hardware of those architectures.
+- Validated end-to-end on the reference aarch64 prototype (aarch64-unknown-linux-gnu, Debian 13.4 trixie). Offline binary signature verification against the source-pinned framework release signing key, OOP bundle install via `evo-plugin-tool install`, plugin discovery + admission of the reference echo plugin and the audio-domain `org.evoframework.artwork.local` plugin, wire-protocol round-trips for both shipped reference plugins, clean SIGTERM shutdown. Per-architecture acceptance: aarch64 carries a hardware-validated deployable mark; x86_64 and armv7 inherit the workflow-validated provenance and are deployable subject to whichever plugin developer first runs them on real hardware of those architectures.
 
 ## [0.1.9] - 2026-04-26
 
@@ -648,7 +695,7 @@ artefacts. Consult the git log for pre-0.1.8 history.
  `install` URL cap (`--max-url-bytes`, default 256 MiB), optional `--chown`
  via `chown(1)` on Unix, and **exit codes** 0–4 from `exit_code` +
  `anyhow::Error::is` for trust / ureq / I/O. `uninstall` / `purge` remain
- Phase 5. `GAPS` closed for v1; `PLUGIN_TOOL.md` status updated.
+ Phase 5. engineering-side gap closed for v1; `PLUGIN_TOOL.md` status updated.
 - **`docs/engineering/PLUGIN_TOOL.md`:** 
  `evo-plugin-tool` — v1 includes `lint` `sign` `verify` `pack` `install`
  (uninstall/purge stay Phase 5); promote/rename to `plugin.name` when
@@ -658,7 +705,7 @@ artefacts. Consult the git log for pre-0.1.8 history.
  steward; archive formats per `PLUGIN_PACKAGING` §9; **exit codes** 0–4
  for CI/UI; default `pack` name with or without version; binary
  `/opt/evo/bin/evo-plugin-tool` beside `evo`. `README` and
- `PLUGIN_PACKAGING` §9 pointer; `GAPS` **Decision: IMPLEMENT**
+ `PLUGIN_PACKAGING` §9 pointer; engineering-side gap **Decision: IMPLEMENT**
  (pending) with this doc as authority.
 - **`PLUGIN_PACKAGING` §7 and §9** — installation: **Strategy A** (distribution
  / system installer places final paths and extra OS integration) vs

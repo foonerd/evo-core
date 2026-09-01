@@ -22,18 +22,23 @@
 #
 # What this file IS: a tested baseline of the unit shape evo-core
 # expects. RuntimeDirectory=, StateDirectory=, ConfigurationDirectory=,
-# the hardening directives, the ExecStart path - these are framework-
-# shaped and a distribution should preserve them unless it has a
-# specific reason to deviate.
+# the hardening directives - these are framework-shaped and a
+# distribution should preserve them unless it has a specific reason to
+# deviate.
 #
-# What this file IS NOT: a runnable unit. The User= and Group= lines
-# are not set; without a distribution-side choice the steward would run
-# as root (permitted by the docs in development and certain embedded
-# scenarios but never the right answer for a packaged appliance).
+# What this file IS NOT: a runnable unit. Both the User=/Group= identity
+# and the ExecStart= command are deliberately left for the distribution
+# to fill in. systemd refuses to load a service unit with no ExecStart,
+# and that refusal is the point: every deployment of the framework
+# reference unit must make an explicit decision about which steward
+# binary runs and which identity it runs under. The two
+# DISTRIBUTION-OWNED CHOICE blocks below cover both.
 #
 # To use: copy this file into your distribution's packaging tree
-# (renaming to `evo.service`), set the distribution-owned choices
-# marked below, and ship the result on the target image.
+# (renaming to `evo.service`), supply the distribution-owned choices
+# marked below either by editing this file in place or by shipping
+# drop-ins under `/etc/systemd/system/evo.service.d/`, and ship the
+# result on the target image.
 
 [Unit]
 Description=Evo steward
@@ -42,9 +47,65 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/opt/evo/bin/evo
+
+# ----------------------------------------------------------------------
+# DISTRIBUTION-OWNED CHOICE: ExecStart
+#
+# The framework reference unit deliberately omits a concrete ExecStart
+# value. The steward binary that runs in a given deployment is the
+# distribution's call: the framework's own integration tests run
+# `/opt/evo/bin/evo`; a domain reference such as evo-device-audio runs
+# `/opt/evo/bin/evo-device-audio`; a vendor distribution may rebrand
+# the binary entirely. Baking a name here would force every distribution
+# to either rename its binary or layer a drop-in that clears + replaces
+# this value - making the abstraction below the explicit choice.
+#
+# To use: ship a drop-in at
+# `/etc/systemd/system/evo.service.d/exec-start.conf` with:
+#
+#     [Service]
+#     ExecStart=
+#     ExecStart=/opt/evo/bin/<your-steward-binary>
+#
+# The empty `ExecStart=` first line is required: systemd treats
+# `ExecStart=` as a list-typed directive, so without the empty-clear
+# the drop-in would append rather than replace.
+# ----------------------------------------------------------------------
+
 Restart=on-failure
 RestartSec=5s
+
+# Shutdown ordering. Out-of-process plugins run as subprocesses of
+# the steward and share this service's cgroup. Under systemd's
+# default `KillMode=control-group`, `systemctl stop` /
+# `systemctl restart` SIGTERMs every process in the cgroup at the
+# same instant — steward AND every plugin. That collides with the
+# steward's own drain sequence, which needs plugin subprocesses
+# still alive so it can send `release_custody` and `Unload` frames
+# over their wires and read acks back.
+#
+# `KillMode=mixed` sends SIGTERM only to the main process (the
+# steward). Plugin subprocesses stay alive; the steward drives
+# their shutdown via wire frames, exactly as its shutdown-report
+# flow expects. After `TimeoutStopSec` the whole cgroup receives
+# SIGKILL — a hard ceiling that catches any holdouts.
+#
+# `TimeoutStopSec=30s` gives comfortable headroom over the
+# framework's built-in shutdown deadline (10 s default in
+# `admission::ShutdownConfig`) plus per-plugin unload budgets.
+# Distributions that admit unusually slow-draining plugins can
+# raise this; distributions that admit only fast plugins can
+# lower it — the framework's own deadline is what actually
+# governs how long shutdown takes, not `TimeoutStopSec`.
+#
+# Without this block, a `systemctl restart evo` on a session that
+# had playback custody accepted produces two WARN log lines per
+# restart (`custody release during shutdown did not complete
+# cleanly`, `custody not released cleanly within drain window`)
+# because the plugin was already dead by the time custody drain
+# reached it.
+KillMode=mixed
+TimeoutStopSec=30s
 
 # ----------------------------------------------------------------------
 # DISTRIBUTION-OWNED CHOICE: service identity

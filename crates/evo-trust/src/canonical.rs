@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Canonical TOML re-serialiser for the signing payload.
 //!
 //! Whitespace, comments, key ordering, and TOML quoting style on

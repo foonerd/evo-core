@@ -4,7 +4,10 @@ description = "Example singleton warden plugin: takes custody, accepts course co
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# Pedagogical reference plugin — Apache 2.0 so plugin authors can
+# copy / adapt the patterns into their own plugins without
+# licensing restriction.
+license = "Apache-2.0"
 repository.workspace = true
 
 [lib]

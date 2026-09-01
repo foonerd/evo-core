@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! # evo-example-echo
 //!
 //! Example singleton respondent plugin for evo. Echoes input payloads back
@@ -25,6 +28,7 @@ use evo_plugin_sdk::contract::{
 };
 use evo_plugin_sdk::Manifest;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The echo plugin's embedded manifest, as a static string.
 ///
@@ -48,7 +52,11 @@ pub fn manifest() -> Manifest {
 #[derive(Debug, Default)]
 pub struct EchoPlugin {
     loaded: bool,
-    echo_count: u64,
+    /// Diagnostic counter incremented on every handled echo
+    /// request. Interior-mutable atomic so `handle_request`
+    /// stays `&self` under the framework's concurrent-dispatch
+    /// contract.
+    echo_count: AtomicU64,
 }
 
 impl EchoPlugin {
@@ -60,7 +68,7 @@ impl EchoPlugin {
     /// Number of echo requests handled since `load` (or since construction
     /// if never loaded). Useful for tests.
     pub fn echo_count(&self) -> u64 {
-        self.echo_count
+        self.echo_count.load(Ordering::Relaxed)
     }
 }
 
@@ -116,7 +124,7 @@ impl Plugin for EchoPlugin {
             );
             tracing::info!(
                 plugin = "org.evo.example.echo",
-                echoes = self.echo_count,
+                echoes = self.echo_count.load(Ordering::Relaxed),
                 "plugin unload"
             );
             self.loaded = false;
@@ -142,7 +150,7 @@ impl Plugin for EchoPlugin {
 
 impl Respondent for EchoPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {
@@ -157,7 +165,7 @@ impl Respondent for EchoPlugin {
                     req.request_type
                 )));
             }
-            self.echo_count += 1;
+            self.echo_count.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
                 plugin = "org.evo.example.echo",
                 cid = req.correlation_id,
@@ -201,7 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_request_rejects_before_load() {
-        let mut p = EchoPlugin::new();
+        let p = EchoPlugin::new();
         let req = Request {
             request_type: "echo".into(),
             payload: b"hi".to_vec(),
@@ -209,6 +217,8 @@ mod tests {
             deadline: None,
 
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let e = p.handle_request(&req).await.unwrap_err();
         assert!(matches!(e, PluginError::Permanent(_)));
@@ -225,6 +235,8 @@ mod tests {
             deadline: None,
 
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let e = p.handle_request(&req).await.unwrap_err();
         assert!(matches!(e, PluginError::Permanent(_)));
@@ -241,6 +253,8 @@ mod tests {
             deadline: None,
 
             instance_id: None,
+            principal_scope: None,
+            has_step_up: false,
         };
         let resp = p.handle_request(&req).await.unwrap();
         assert_eq!(resp.payload, b"hello, evo");

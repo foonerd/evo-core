@@ -1,0 +1,76 @@
+schema_version: "1.0"
+plugin: com.example.network.streamer
+owner: example-author
+isolation: oop
+
+# Set true when the plugin depends on any host-side OS package
+# (binary, kernel module, system service). The compulsory
+# parity gate at install-time and admission-time reads this
+# field FIRST: true + a missing required_binary = HARD FAIL.
+has_os_dependencies: false
+
+# ARCHETYPE: network_streamer
+#
+# A plugin that streams audio from a cloud music service
+# (Spotify / Tidal / Qobuz / Deezer / Apple Music / equivalent)
+# through the framework's playback pipeline. Handles service
+# auth (OAuth 2 or long-lived tokens), track resolution,
+# transport session, and per-service DRM / ID3 quirks.
+#
+# TAILOR before shipping:
+#   - `plugin` — replace with the reverse-DNS canonical id for
+#     your plugin (e.g. `com.acme.streamer.tidal`).
+#   - `owner` — the accountable team / individual / organisation.
+#   - `required_binaries` — the cloud-service SDK binary, if
+#     you shell out to a helper (some ecosystems require a
+#     licensed daemon). Empty is fine when your Rust code owns
+#     the full transport.
+#   - `verification.commands` — read-only shell commands that
+#     confirm the host actually satisfies the intents. Every entry
+#     must exit 0 as the plugin's declared service identity.
+#   - `host_provisioning.<distro>.systemd.SupplementaryGroups` —
+#     add `audio` if you feed PCM into the framework's playback
+#     pipeline directly (most network streamers do NOT — they
+#     hand PCM through the SDK's stream primitive instead).
+
+capability_intent:
+  - id: service_auth
+    need: authenticate against the third-party cloud service using an OAuth token or long-lived credential stored in the plugin's state directory.
+    access_path: network/outbound
+    failure_mode: report unauthenticated state; structured event; no panic; user prompt through the operator surface to re-authenticate.
+  - id: stream_playback
+    need: open a streaming session to the third-party service's audio CDN and forward PCM (or a codec-tagged stream) into the framework's playback pipeline.
+    access_path: network/outbound
+    failure_mode: report unavailable stream; structured event carries the service error class; no panic; playback controller falls back or reports.
+  - id: state_storage
+    need: write per-plugin state directory to persist auth tokens (encrypted at rest), track history, transient session state, and per-service rate-limit counters.
+    access_path: filesystem/state
+    failure_mode: refuse to start (auth tokens cannot round-trip); structured admission error; no panic.
+
+required_binaries: []
+
+required_kernel_modules: []
+
+required_system_services: []
+
+verification:
+  commands:
+    - "test -d /var/lib/evo"
+    - "test -w /var/lib/evo"
+  expected:
+    - state directory exists
+    - state directory is writable as the declared service identity (auth tokens must persist)
+
+host_provisioning:
+  debian:
+    systemd:
+      SupplementaryGroups: []
+      CapabilityBoundingSet: []
+      AmbientCapabilities: []
+      ProtectSystem: strict
+      ProtectHome: "yes"
+      ReadWritePaths:
+        - /var/lib/evo/plugins/com.example.network.streamer/state
+      NoNewPrivileges: true
+    capabilities: []
+    sudoers: []

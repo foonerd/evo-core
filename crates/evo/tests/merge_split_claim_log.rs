@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Invariant: every admin merge or split appends exactly one
 //! `ClaimRecord` to the in-registry claim log, in the right shape.
 //!

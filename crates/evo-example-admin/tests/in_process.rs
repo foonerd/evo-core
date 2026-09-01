@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! In-process integration tests for `evo-example-admin`.
 //!
 //! Exercise the full admission + dispatch flow:
@@ -216,7 +219,7 @@ impl Plugin for VictimPlugin {
 
 impl Respondent for VictimPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl std::future::Future<Output = Result<Response, PluginError>> + Send + 'a
     {
@@ -317,6 +320,8 @@ async fn admin_forced_retract_addressing_removes_stale_entry() {
         deadline: None,
 
         instance_id: None,
+        principal_scope: None,
+        has_step_up: false,
     };
     let resp = engine
         .router()
@@ -376,6 +381,8 @@ async fn admin_forced_retract_claim_removes_other_plugin_claim() {
         deadline: None,
 
         instance_id: None,
+        principal_scope: None,
+        has_step_up: false,
     };
     engine
         .router()
@@ -599,6 +606,8 @@ async fn admin_merge_collapses_two_tracks() {
         deadline: None,
 
         instance_id: None,
+        principal_scope: None,
+        has_step_up: false,
     };
     engine
         .router()
@@ -671,6 +680,8 @@ async fn admin_split_creates_new_subjects() {
         deadline: None,
 
         instance_id: None,
+        principal_scope: None,
+        has_step_up: false,
     };
     engine
         .router()
@@ -724,6 +735,8 @@ async fn admin_suppress_hides_relation() {
         deadline: None,
 
         instance_id: None,
+        principal_scope: None,
+        has_step_up: false,
     };
     engine
         .router()
@@ -791,6 +804,8 @@ async fn admin_unsuppress_restores_relation() {
                 deadline: None,
 
                 instance_id: None,
+                principal_scope: None,
+                has_step_up: false,
             },
         )
         .await
@@ -830,6 +845,8 @@ async fn admin_unsuppress_restores_relation() {
                 deadline: None,
 
                 instance_id: None,
+                principal_scope: None,
+                has_step_up: false,
             },
         )
         .await

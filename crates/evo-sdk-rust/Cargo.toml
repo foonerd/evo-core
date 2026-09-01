@@ -1,0 +1,15 @@
+[package]
+name = "evo-sdk-rust"
+description = "Rust client SDK generator. Emits a multi-file Rust crate with `async fn` for one-shot dispatch, a `Stream` impl shape for subscriptions, and a `Transport` trait the runtime mount implements."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+evo-projection-core = { path = "../evo-projection-core" }
+evo-sdk-genkit = { path = "../evo-sdk-genkit" }
+
+[lints]
+workspace = true

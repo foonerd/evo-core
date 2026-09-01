@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! The happenings bus.
 //!
 //! Implements the "HAPPENING" fabric concept from the concept
@@ -116,12 +119,12 @@
 //! consult the ledger (current state) or the observability rack
 //! when it lands (historical trail).
 
-use crate::catalogue::Cardinality;
 use crate::persistence::PersistenceStore;
 use crate::relations::SuppressionRecord;
 use evo_plugin_sdk::contract::{
     ExternalAddressing, HealthStatus, SplitRelationStrategy,
 };
+use evo_primitives::Cardinality;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1224,6 +1227,34 @@ pub enum Happening {
         #[coalesce_labels(skip)]
         at: SystemTime,
     },
+    /// The persistence layer has completed boot-time initialisation
+    /// and the write-ahead log has been drained to a clean state.
+    /// Emitted exactly once per steward boot, AFTER every framework-
+    /// owned substrate has finished rehydrating from the durable
+    /// store (subject registry, custody, relation, plan engine,
+    /// appointments, watches, audit ledger, capability vault, etc.)
+    /// AND BEFORE any plugin's `Plugin::load()` is invoked.
+    ///
+    /// Plugins that subscribe to this happening receive a happens-
+    /// before guarantee: any persistence write they issue during
+    /// `Plugin::load()` (subject announce, URI-scheme registration,
+    /// scheduled-task seeding, etc.) starts after the framework's
+    /// own boot-write storm has fully settled, eliminating the
+    /// fresh-DB cold-start contention class where plugin writes
+    /// were refused with `database is locked` because the WAL
+    /// setup + boot-write throughput exceeded the connection
+    /// `busy_timeout` ceiling.
+    ///
+    /// The framework also writes the typed observation tied to
+    /// this happening into the audit ledger so the boot trace is
+    /// reconstructable: the admission gate cannot fire before
+    /// `PersistenceReady` is recorded.
+    PersistenceReady {
+        /// When the barrier fired (just after the explicit
+        /// `PRAGMA wal_checkpoint(TRUNCATE)` returned Ok).
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
     /// The framework's wall-clock trust state transitioned.
     ///
     /// Emitted by the time-trust tracker on every observed change
@@ -1395,6 +1426,132 @@ pub enum Happening {
         /// Operator-readable failure reason.
         error_message: String,
         /// When the failure was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Plugin reload request dispatched by the lifecycle
+    /// dispatcher.
+    ///
+    /// Emitted for every reload request the coordinator
+    /// publishes (file-watcher TOML edit or operator wire-op
+    /// gesture). The `mode` field names the plugin's declared
+    /// `[lifecycle] mode`; the `outcome` field names the action
+    /// the dispatcher took. Reload-cleanable plugins emit this
+    /// once on receipt followed by the existing
+    /// `PluginLiveReloadStarted` / `PluginLiveReloadCompleted` /
+    /// `PluginLiveReloadFailed` trio for the teardown +
+    /// re-admit cycle. Frozen and reactive-only plugins emit
+    /// only this happening; no teardown work runs.
+    ///
+    /// `outcome` values:
+    /// - `refused_frozen`: plugin's manifest declares
+    ///   `lifecycle.mode = "frozen"`; the operator's TOML edit
+    ///   does not produce a runtime reload. Restart the steward
+    ///   to apply.
+    /// - `substrate_driven_acknowledged`: plugin declares
+    ///   `lifecycle.mode = "reactive-only"`; operator state
+    ///   lives in framework substrates and is updated via wire
+    ///   ops. The TOML edit observed here does not propagate
+    ///   directly; substrate wire ops are the actuation path.
+    /// - `teardown_and_readmit_started`: plugin declares
+    ///   `lifecycle.mode = "reload-cleanable"`; teardown +
+    ///   re-admit cycle is starting. Subsequent
+    ///   `PluginLiveReload*` happenings carry the cycle
+    ///   outcome.
+    /// - `no_manifest_recorded`: plugin was admitted
+    ///   programmatically without a recorded manifest (no
+    ///   `[lifecycle]` source); reload is unsupported and no
+    ///   work runs.
+    /// - `plugin_not_admitted`: the named plugin is not
+    ///   currently admitted; no work runs.
+    PluginReloadDispatched {
+        /// Canonical name of the plugin whose reload was
+        /// dispatched.
+        plugin: String,
+        /// Plugin's declared `[lifecycle] mode` as a string
+        /// (kebab-case): `frozen`, `reactive-only`, or
+        /// `reload-cleanable`. Empty when the plugin had no
+        /// recorded manifest.
+        mode: String,
+        /// Action the dispatcher took. See the variant's
+        /// doc-comment for the enumerated values.
+        outcome: String,
+        /// Origin of the reload request: `file_watcher` or
+        /// `operator_gesture`.
+        source: String,
+        /// When the dispatch decision was made.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Plugin transitioned to degraded.
+    ///
+    /// Emitted by the framework when a plugin's slot in the
+    /// [`PluginDegradedRegistry`] flips from healthy to degraded.
+    /// The transition surfaces from one of three sources matched
+    /// by the registry's [`DegradationReason`]: three consecutive
+    /// admit failures, two consecutive teardown timeouts, or a
+    /// plugin-task panic. The operator UI subscribes to render a
+    /// per-plugin Restore affordance on the degraded set and
+    /// surface the reason to the operator. Recovery clears the
+    /// degraded slot via `record_admit_success` (next successful
+    /// admit) or via the `plugin_restore` wire op (explicit
+    /// operator gesture); both paths emit
+    /// [`Happening::PluginRestored`] when the slot clears.
+    ///
+    /// The current build provisions the registry + this happening
+    /// declaration; the production call sites that drive
+    /// `record_*` from admission outcome paths are wired
+    /// progressively as the admission engine learns to surface
+    /// outcome telemetry. Until those sites materialise, the
+    /// registry remains empty in production and the happening
+    /// surfaces only from explicit test paths exercising the
+    /// registry directly. This honesty matches the engineering-
+    /// bar invariant: the read surface reports the registry's
+    /// actual state, not a synthetic claim.
+    ///
+    /// [`PluginDegradedRegistry`]: crate::lifecycle_robustness::PluginDegradedRegistry
+    /// [`DegradationReason`]: crate::lifecycle_robustness::DegradationReason
+    PluginDegraded {
+        /// Canonical name of the plugin that transitioned to
+        /// degraded.
+        plugin: String,
+        /// Stable kebab-case identifier for why the plugin
+        /// degraded — one of `admit_failures_exhausted`,
+        /// `teardown_timeouts_exhausted`, `plugin_panic`. The
+        /// same vocabulary the `PluginHealth.degraded` projection
+        /// uses so operator UI rendering from either surface
+        /// sees identical tokens.
+        reason: String,
+        /// Operator-readable detail accompanying the reason —
+        /// failure count for the threshold-crossing kinds,
+        /// panic message for the panic kind. Free-form;
+        /// operator UI renders verbatim.
+        detail: String,
+        /// When the transition was decided.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Plugin's degraded slot cleared.
+    ///
+    /// Emitted when the framework clears the plugin's degraded
+    /// slot in the [`PluginDegradedRegistry`]. The clear surfaces
+    /// from one of two sources: a successful admit (the canonical
+    /// recovery signal) or the operator-issued `plugin_restore`
+    /// wire op (explicit gesture that resets the failure
+    /// counters). The operator UI consumes this to retire the
+    /// Restore affordance and dismiss the degraded-state badge.
+    ///
+    /// [`PluginDegradedRegistry`]: crate::lifecycle_robustness::PluginDegradedRegistry
+    PluginRestored {
+        /// Canonical name of the plugin whose degraded slot
+        /// cleared.
+        plugin: String,
+        /// Stable kebab-case identifier for the clear source —
+        /// `admit_success` (next successful admit cleared the
+        /// counter) or `operator_restore` (operator-issued
+        /// `plugin_restore` wire op).
+        source: String,
+        /// When the clear was recorded.
         #[coalesce_labels(skip)]
         at: SystemTime,
     },
@@ -1754,6 +1911,1072 @@ pub enum Happening {
         #[coalesce_labels(skip)]
         at: SystemTime,
     },
+    /// The active audio topology for one delivery target
+    /// changed. Emitted by the framework after the vendor
+    /// distribution pushes a new
+    /// [`crate::audio_topology::ActiveAudioTopology`] snapshot
+    /// through `publish_active_audio_topology`. Operator UIs
+    /// subscribe to this to render Roon-style signal-path
+    /// updates the moment the chain rewires.
+    ///
+    /// The full topology snapshot is intentionally NOT carried
+    /// on the happening — snapshots can be large (every chain
+    /// stage's endpoint + format + score breakdown). Subscribers
+    /// receive the change notification + identity key + summary
+    /// fields and call `get_active_audio_topology` for the full
+    /// snapshot.
+    AudioTopologyChanged {
+        /// Canonical hardware-identity key the chain
+        /// terminates at. Subscribers filter on this to listen
+        /// to a specific delivery target.
+        target_key: String,
+        /// Operator-readable display name (mirrors the
+        /// snapshot's `display_name` field).
+        display_name: String,
+        /// `true` when the chain genuinely preserves
+        /// bit-perfect.
+        bit_perfect: bool,
+        /// Total score for the chain (the topology scorer's
+        /// weighted breakdown total).
+        score_total: i32,
+        /// When the topology was published.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A source plugin's dispatched playback ended naturally.
+    /// Emitted by source plugins when the queue they were
+    /// playing reaches end-of-content (last item finished, no
+    /// more items queued). The framework's listening-plans
+    /// engine subscribes to this happening for in-flight
+    /// segments with `SegmentDuration::UntilCompletion` so the
+    /// segment ends in lockstep with playback. Other framework
+    /// subsystems — UI shell, multi-room control, prompts —
+    /// also subscribe to drive their own playback-ended
+    /// behaviour without per-source coordination.
+    ///
+    /// Distinct from `Stop`: `Stop` is operator-issued (verb
+    /// dispatched by user / system); `AudioPlaybackEnded` is
+    /// playback running out naturally. A plugin that handles
+    /// the `Stop` verb releases custody; a plugin that emits
+    /// `AudioPlaybackEnded` may either release custody (no more
+    /// content) or wait for a follow-on dispatch, depending on
+    /// its policy.
+    AudioPlaybackEnded {
+        /// Canonical name of the source plugin reporting the
+        /// end-of-playback. The framework subscribes to this
+        /// field via the plugins dimension of the watch
+        /// happening filter so consumers can target a specific
+        /// source.
+        source_plugin: String,
+        /// The claim URI that was playing when playback ended,
+        /// if the plugin tracks per-claim state. `None` for
+        /// plugins that don't surface the URI on end (acceptable
+        /// for the engine — the in-flight segment is identified
+        /// by its plan id + segment idx already).
+        #[coalesce_labels(skip)]
+        claim_uri: Option<String>,
+        /// When the playback actually ended.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A multi-room peer was newly observed on the local
+    /// broadcast domain. Emitted by the framework's mDNS-SD
+    /// discovery runtime the first time it resolves a remote
+    /// evo node's advertisement. Operator surfaces use this
+    /// to grow the room view without polling.
+    PeerDiscovered {
+        /// Canonical UUIDv4 id of the peer.
+        device_id: String,
+        /// Peer's operator-editable display name as observed
+        /// in its TXT record.
+        display_name: String,
+        /// Socket-addr strings observed for the peer (one
+        /// entry per resolved interface).
+        #[coalesce_labels(skip)]
+        addresses: Vec<String>,
+        /// When the peer was first observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A previously-discovered multi-room peer's
+    /// advertisement changed materially (display rename,
+    /// address set drift, capability flag delta, vendor
+    /// change, public-key fingerprint change). Re-resolves
+    /// that change nothing observable do not emit this.
+    PeerUpdated {
+        /// Canonical id of the peer.
+        device_id: String,
+        /// Peer's current display name (post-change).
+        display_name: String,
+        /// Peer's current address set.
+        #[coalesce_labels(skip)]
+        addresses: Vec<String>,
+        /// When the change was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A multi-room peer disappeared. Either the peer's
+    /// advertisement was withdrawn (graceful unregister) or
+    /// the discovery runtime's TTL prune loop ran past the
+    /// peer's last-seen window.
+    PeerLost {
+        /// Canonical id of the peer.
+        device_id: String,
+        /// Peer's last-known display name.
+        display_name: String,
+        /// When the loss was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A multi-room peer's mDNS-SD advertisement was freshly
+    /// observed via the long-lived browse event channel.
+    /// Distinct from `PeerDiscovered` (which fires only on
+    /// the FIRST-ever observation of a previously-unknown
+    /// device id): this variant fires on every fresh
+    /// advertisement arrival, regardless of whether the peer
+    /// was already known. Operator surfaces use this as the
+    /// primary event-driven signal that a peer is reachable;
+    /// consumers that care only about novel observations
+    /// subscribe to `PeerDiscovered` instead. Emitted by the
+    /// framework's discovery bridge task on every
+    /// `ServiceResolved` event after the substrate mirror
+    /// has been updated.
+    PeerAnnounced {
+        /// Canonical id of the announcing peer.
+        device_id: String,
+        /// Peer's currently-observed display name from the
+        /// TXT record.
+        display_name: String,
+        /// Socket-addr strings observed for the peer.
+        #[coalesce_labels(skip)]
+        addresses: Vec<String>,
+        /// True when this is the first time the peer has
+        /// been observed in the discovery substrate's
+        /// lifetime; false for a re-observation.
+        first_observation: bool,
+        /// When the advertisement was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A multi-room peer was confirmed absent from the LAN
+    /// by the marauder query of a gaze-triggered
+    /// `roster_snap`. Distinct from `PeerLost` (which fires
+    /// on TTL prune of the substrate's cache — a periodic
+    /// mechanism the zero-poll posture retires): this fires
+    /// only after a targeted multicast query has confirmed
+    /// the peer did not respond within the marauder window.
+    /// Single packet loss does NOT trigger this; only
+    /// marauder-confirmed absence does. Emitted by the
+    /// framework's roster-snap orchestration after the
+    /// marauder query composes the snap response.
+    PeerDisappeared {
+        /// Canonical id of the peer.
+        device_id: String,
+        /// Peer's last-known display name from the prior
+        /// roster.
+        display_name: String,
+        /// Peer's `last_seen_ms` from the prior roster
+        /// (carried so operator surfaces can render
+        /// "last seen N minutes ago").
+        #[coalesce_labels(skip)]
+        last_seen_ms: u64,
+        /// Canonical id of the snap whose marauder query
+        /// confirmed the absence. Operator audit trails
+        /// join against this id.
+        snap_id: String,
+        /// When the marauder query confirmed the absence.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A gaze-triggered `roster_snap` completed. Carries
+    /// the snap-level summary (id, timestamps,
+    /// present/gone counts, deadline status); the per-peer
+    /// detail rides the wire-op response, not this
+    /// happening. Concurrent UIs subscribed to the durable
+    /// bus converge on the same snap truth without each
+    /// issuing its own multicast query. Emitted by the
+    /// framework's roster-snap orchestration immediately
+    /// before the wire-op response is returned.
+    RosterSnapped {
+        /// Canonical id of the snap.
+        snap_id: String,
+        /// Snake-case reason tag the caller supplied.
+        reason: String,
+        /// Wall-clock when the snap completed (post-marauder).
+        #[coalesce_labels(skip)]
+        snap_completed_at: SystemTime,
+        /// Count of devices reported present in the snap
+        /// response.
+        presents_count: u32,
+        /// Count of devices reported gone
+        /// (marauder-confirmed) in the snap response.
+        gones_count: u32,
+        /// Whether the snap exceeded its operator-budget
+        /// deadline before composing the response.
+        deadline_breached: bool,
+        /// When the happening was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A device entered the "looking to join a domain" state
+    /// via the `join_domain` wire op. Admitted peers' UIs
+    /// surface this so the operator on an existing-domain
+    /// seat can complete admission with `admit_peer_to_domain`.
+    DomainJoinModeEntered {
+        /// Canonical device id of the joining device.
+        device_id: String,
+        /// Optional endpoint the joining device will dial
+        /// when supplied; `None` when the device is passively
+        /// waiting for announces.
+        #[coalesce_labels(skip)]
+        endpoint: Option<String>,
+        /// When the gesture fired.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A multi-room group was created. Carries the canonical
+    /// group id, display name, and full member set at the
+    /// moment of creation.
+    GroupCreated {
+        /// Canonical UUIDv4 group id.
+        group_id: String,
+        /// Operator-supplied display name.
+        display_name: String,
+        /// Member device ids (insertion order).
+        #[coalesce_labels(skip)]
+        members: Vec<String>,
+        /// When the group was created.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A multi-room group's display name changed.
+    GroupRenamed {
+        /// Canonical group id.
+        group_id: String,
+        /// New display name.
+        display_name: String,
+        /// When the rename was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A multi-room group's membership changed (one or more
+    /// devices added or removed in the same edit). Carries
+    /// the post-change member set plus the per-edit
+    /// add / remove lists so consumers can diff the change
+    /// without comparing against prior state.
+    GroupMembershipChanged {
+        /// Canonical group id.
+        group_id: String,
+        /// Group's current display name.
+        display_name: String,
+        /// Post-change member set.
+        #[coalesce_labels(skip)]
+        members: Vec<String>,
+        /// Devices added in this edit.
+        #[coalesce_labels(skip)]
+        added: Vec<String>,
+        /// Devices removed in this edit.
+        #[coalesce_labels(skip)]
+        removed: Vec<String>,
+        /// When the change was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A device's operator-declared multi-room role was set
+    /// or changed. Carries the prior and new role strings so
+    /// operator surfaces can render the transition without
+    /// comparing against a prior snapshot; `prior_role` is
+    /// `None` on the first operator gesture for a device
+    /// (transition from substrate-empty `Auto` default).
+    DeviceRoleChanged {
+        /// Canonical device id.
+        device_id: String,
+        /// Role before the gesture, as a stable string
+        /// (`source` / `receiver` / `auto`). `None` on first
+        /// set.
+        #[coalesce_labels(skip)]
+        prior_role: Option<String>,
+        /// Role after the gesture, as a stable string.
+        new_role: String,
+        /// Optional operator / surface identifier that
+        /// issued the gesture (CLI session, wire-op caller).
+        #[coalesce_labels(skip)]
+        set_by: Option<String>,
+        /// When the change was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A multi-room group's `leader_ms` per-group latency
+    /// budget was changed by an operator gesture. Carries the
+    /// prior and new values so operator surfaces can render
+    /// the transition without comparing against a prior
+    /// snapshot.
+    GroupLeaderMsChanged {
+        /// Canonical group id.
+        group_id: String,
+        /// Group's current display name.
+        display_name: String,
+        /// Per-group latency budget before the gesture.
+        prior_leader_ms: u32,
+        /// Per-group latency budget after the gesture.
+        new_leader_ms: u32,
+        /// When the change was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A multi-room group was deleted. Carries the
+    /// canonical id and the last-known display name so
+    /// operator surfaces can present the removal even if
+    /// the group is gone from the substrate by the time the
+    /// happening is observed.
+    GroupDeleted {
+        /// Canonical group id.
+        group_id: String,
+        /// Group's last-known display name.
+        display_name: String,
+        /// When the delete was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// The local node's source-host election for one
+    /// multi-room group transitioned. Carries the new and
+    /// prior elected device ids alongside the group's
+    /// display label and the candidate-set size at decision
+    /// time. Emitted only on actual transitions; idempotent
+    /// re-evaluations against an unchanged view emit
+    /// nothing. The `source_host_device_id` is `None` when
+    /// no group member is currently reachable.
+    SourceHostElected {
+        /// Canonical group id the election applies to.
+        group_id: String,
+        /// Group's current display name.
+        display_name: String,
+        /// Newly-elected source-host device id, or `None`
+        /// when no candidate was live at decision time.
+        #[coalesce_labels(skip)]
+        source_host_device_id: Option<String>,
+        /// Prior elected device id, or `None` for first
+        /// election.
+        #[coalesce_labels(skip)]
+        prior_source_host_device_id: Option<String>,
+        /// Candidate-set size at decision time.
+        #[coalesce_labels(skip)]
+        candidate_count: u32,
+        /// When the transition was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A multi-room peer audio-plane TCP connection was
+    /// established (post-handshake). Carries the peer's
+    /// canonical id and the connection direction
+    /// (`"inbound"` / `"outbound"`).
+    PeerConnected {
+        /// Peer's canonical device id.
+        device_id: String,
+        /// Connection direction string.
+        direction: String,
+        /// When the connection was established.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A multi-room peer audio-plane TCP connection was
+    /// torn down — either via heartbeat timeout or graceful
+    /// `Goodbye`.
+    PeerDisconnected {
+        /// Peer's canonical device id.
+        device_id: String,
+        /// When the disconnect was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// The local device's operator-editable `display_name`
+    /// changed. Emitted on the fan-out channel after
+    /// `set_device_display_name` persists the new name and the
+    /// mDNS-SD advert has been re-registered. Remote operator
+    /// UIs subscribe to this so cached peer names invalidate
+    /// reactively rather than waiting for the next discovery
+    /// roundtrip.
+    DeviceDisplayNameChanged {
+        /// Canonical device id of the renamed local device.
+        device_id: String,
+        /// New display name (post-update).
+        display_name: String,
+        /// When the rename was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A device was admitted to the local domain trust
+    /// ledger. Emitted by the framework's trust ledger on
+    /// every successful admit. Operator surfaces subscribe so
+    /// the domain roster grows reactively without polling.
+    DomainMemberAdmitted {
+        /// Canonical id of the newly-admitted device.
+        device_id: String,
+        /// Display name captured at admit time.
+        display_name: String,
+        /// Wall-clock ms timestamp of the admission, mirroring
+        /// the ledger row.
+        #[coalesce_labels(skip)]
+        admitted_at_ms: u64,
+        /// Canonical id of the device whose operator UI
+        /// initiated the admission. `None` for the seed device.
+        #[coalesce_labels(skip)]
+        admitted_by_device_id: Option<String>,
+        /// When the admission was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A device's domain admission was rescinded (soft
+    /// revoke — the row remains for "previously admitted"
+    /// history). Operator surfaces show the device with a
+    /// Revoked badge so the operator can re-admit without
+    /// rebuilding state from scratch.
+    DomainMemberRevoked {
+        /// Canonical id of the revoked device.
+        device_id: String,
+        /// Wall-clock ms timestamp of the revoke.
+        #[coalesce_labels(skip)]
+        revoked_at_ms: u64,
+        /// When the revoke was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// The persistent display-name cache for a domain
+    /// member updated from a fresh observation (peer renamed
+    /// itself; collision resolver rewrote a peer's auto name).
+    /// Operator surfaces subscribe so cached labels invalidate
+    /// reactively.
+    DomainMemberDisplayNameObserved {
+        /// Canonical id of the observed domain member.
+        device_id: String,
+        /// Newly-observed display name (post-update).
+        display_name: String,
+        /// Wall-clock ms timestamp of the observation.
+        #[coalesce_labels(skip)]
+        observed_at_ms: u64,
+        /// When the observation was processed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// `add_group_member` refused an admission whose
+    /// `device_id` is not present in the local trust ledger as
+    /// an admitted (non-revoked) domain member. Audit +
+    /// operator-UI surface signal so the operator can admit
+    /// the device into the domain before retrying.
+    GroupMemberAddRefused {
+        /// Canonical id of the group the admission targeted.
+        group_id: String,
+        /// Canonical id of the rejected non-domain member.
+        device_id: String,
+        /// Machine-readable reason token. Today the only
+        /// value is `"device_not_in_domain"`; future
+        /// refusal kinds extend this enum-like field rather
+        /// than adding sibling happenings.
+        reason: String,
+        /// When the refusal was emitted.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Operator-driven `remove_group_member` targeted the
+    /// current source-host AND the post-removal member count
+    /// would still be \u{2265} 2. Framework refuses to
+    /// auto-elect a successor; operator must call
+    /// `select_group_leader_successor` (or
+    /// `cancel_group_leader_successor`) before the removal
+    /// commits. Every domain UI surfaces the pending
+    /// decision via this happening.
+    GroupLeaderSuccessorRequired {
+        /// Group whose leader the operator is removing.
+        group_id: String,
+        /// Canonical id of the leader being removed.
+        departing_device_id: String,
+        /// Canonical ids the operator may pick as successor —
+        /// the live group membership minus the departing
+        /// leader.
+        #[coalesce_labels(skip)]
+        eligible_member_ids: Vec<String>,
+        /// When the protocol was entered.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Operator cancelled a pending leader-successor decision
+    /// via `cancel_group_leader_successor`. Other domain UIs
+    /// dismiss the in-flight successor picker. The leader
+    /// stays in place; no group state changed.
+    GroupLeaderSuccessorCancelled {
+        /// Group the cancellation applies to.
+        group_id: String,
+        /// Canonical id of the leader that was being removed.
+        departing_device_id: String,
+        /// When the cancellation was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Atomic leader-handoff completed via
+    /// `select_group_leader_successor`. The departing leader
+    /// was removed from the group; the operator-chosen
+    /// successor was pinned as source-host; the next election
+    /// round respects the pin. One happening covers both the
+    /// pin and the removal.
+    MultiroomLeaderHandoff {
+        /// Group the handoff applies to.
+        group_id: String,
+        /// Canonical id of the leader that was removed.
+        departing_device_id: String,
+        /// Canonical id of the operator-chosen successor now
+        /// pinned as source-host.
+        successor_device_id: String,
+        /// When the handoff was committed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Atomic cross-group member move via `move_group_member`.
+    /// The named device transitioned from `from_group_id` to
+    /// `to_group_id` in a single state change — observers do
+    /// NOT see separate `GroupMembershipChanged` events on
+    /// either side; this happening is the canonical transition
+    /// signal. When `source_dissolved` is `true` the source
+    /// group dropped below the 2-member floor and was
+    /// auto-dissolved as part of the same transaction; a
+    /// `GroupDeleted` happening fires alongside.
+    MultiroomMemberMoved {
+        /// Canonical id of the source group.
+        from_group_id: String,
+        /// Canonical id of the target group.
+        to_group_id: String,
+        /// Canonical id of the moved device.
+        device_id: String,
+        /// Member device ids the source group has after the
+        /// move. Empty when `source_dissolved` is `true`.
+        #[coalesce_labels(skip)]
+        from_members_after: Vec<String>,
+        /// Member device ids the target group has after the
+        /// move.
+        #[coalesce_labels(skip)]
+        to_members_after: Vec<String>,
+        /// `true` when the source group auto-dissolved as part
+        /// of this transaction.
+        #[coalesce_labels(skip)]
+        source_dissolved: bool,
+        /// When the move was committed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A connecting peer claimed a source-host role for a
+    /// group that disagrees with the local node's election.
+    /// Carries both views plus the deterministic resolution
+    /// (lowest canonical id wins). Both peers receive this
+    /// happening and converge on the same answer once they
+    /// share a view of the live device set.
+    SplitBrainDetected {
+        /// Group the disagreement is about.
+        group_id: String,
+        /// Local node's view of the source-host (or `None`
+        /// when local has no election yet).
+        #[coalesce_labels(skip)]
+        local_view_source_host: Option<String>,
+        /// Remote peer's claimed source-host.
+        #[coalesce_labels(skip)]
+        peer_view_source_host: String,
+        /// Deterministic resolution.
+        #[coalesce_labels(skip)]
+        resolution_source_host: String,
+        /// When the disagreement was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// The steward is about to restart its process image
+    /// via `execve`. Final notification before the running
+    /// steward replaces itself with the target binary;
+    /// connected wire clients use this to drop their
+    /// subscription cleanly + plan to reconnect after the
+    /// expected downtime.
+    StewardRestarting {
+        /// Operator-supplied free-form reason.
+        reason: String,
+        /// Approximate downtime in milliseconds — sum of
+        /// the drain delay and the child-reap timeout the
+        /// coordinator applies before exec.
+        #[coalesce_labels(skip)]
+        expected_downtime_ms: u64,
+        /// Resolved target binary path the steward will
+        /// execve into.
+        #[coalesce_labels(skip)]
+        target_binary: String,
+        /// Operator principal recorded for the audit
+        /// trail.
+        approved_by: String,
+        /// When the coordinator initiated the restart.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A plugin's UI stockings on one shelf changed:
+    /// admitted, replaced (manifest reload), or withdrawn
+    /// (plugin removal). UI clients subscribe with
+    /// `variants = ["ui_shelf_changed"]` and observe the
+    /// shelf-keyed feed; an explicit `--coalesce-labels
+    /// variant,shelf` collapses bursty admission storms into
+    /// one delivered envelope per shelf within the window.
+    UiShelfChanged {
+        /// Target UI shelf id (e.g. `library.sources`,
+        /// `system.diagnostics`).
+        shelf: String,
+        /// Canonical plugin name whose stockings on `shelf`
+        /// changed.
+        plugin: String,
+        /// What kind of change happened.
+        change: UiShelfChange,
+        /// Stocking count this plugin currently has on
+        /// `shelf` after the change. Zero on `Withdrawn`.
+        #[coalesce_labels(skip)]
+        stockings_after: u32,
+        /// When the admission gate (or removal path)
+        /// recorded the change.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A theme artefact was admitted into the framework's
+    /// theme registry. UI clients subscribe to track the
+    /// available-themes set in real time without polling.
+    UiThemeAdmitted {
+        /// Canonical plugin name of the admitted theme.
+        plugin: String,
+        /// Plugin version (semver string).
+        version: String,
+        /// When admission completed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A UI shell artefact was admitted into the framework's
+    /// shell registry. Mirror of [`Self::UiThemeAdmitted`]
+    /// for the `ui_shell` artefact kind.
+    UiShellAdmitted {
+        /// Canonical plugin name of the admitted shell.
+        plugin: String,
+        /// Plugin version.
+        version: String,
+        /// When admission completed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A widget kind pack was admitted: its declared kinds
+    /// have been folded into the framework's widget-kind
+    /// registry. UI clients subscribe to invalidate widget
+    /// resolution caches when the available kind set
+    /// changes.
+    UiWidgetPackAdmitted {
+        /// Canonical plugin name of the admitted pack.
+        plugin: String,
+        /// Plugin version.
+        version: String,
+        /// Number of widget kinds the pack contributed to
+        /// the registry.
+        #[coalesce_labels(skip)]
+        kind_count: u32,
+        /// When admission completed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A theme artefact was unadmitted: removed from the
+    /// theme registry. Paired with [`Self::UiThemeAdmitted`].
+    /// UI clients drop the theme from their available-set
+    /// view; if it was the active theme, a separate
+    /// [`Self::UiActiveThemeChanged`] fires first
+    /// (active-selection auto-clear) so subscribers see the
+    /// active swap before the available-set drop.
+    UiThemeUnadmitted {
+        /// Canonical plugin name of the unadmitted theme.
+        plugin: String,
+        /// When unadmission completed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A UI shell artefact was unadmitted. Mirror of
+    /// [`Self::UiThemeUnadmitted`] for the `ui_shell` slot.
+    UiShellUnadmitted {
+        /// Canonical plugin name.
+        plugin: String,
+        /// When unadmission completed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A widget kind pack was unadmitted: its declared
+    /// kinds were rolled back from the framework's widget-
+    /// kind registry. UI clients invalidate widget
+    /// resolution caches that referenced any of the rolled-
+    /// back kinds.
+    UiWidgetPackUnadmitted {
+        /// Canonical plugin name of the unadmitted pack.
+        plugin: String,
+        /// Number of widget kinds rolled back from the
+        /// registry — equals the kind_count from the
+        /// matching `UiWidgetPackAdmitted` event.
+        #[coalesce_labels(skip)]
+        kind_count: u32,
+        /// When unadmission completed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// The active theme selection changed. Connected UI
+    /// clients consume this to swap their token bindings
+    /// (and any theme-overridden widget renderers) without
+    /// polling. `previous` and `current` are each the
+    /// canonical plugin name when set, or `None` for
+    /// "no theme active" — the four-way table covers
+    /// activate / clear / swap / re-activate-same-name.
+    UiActiveThemeChanged {
+        /// Plugin name that was active before the change,
+        /// or `None` when no theme was active.
+        #[coalesce_labels(skip)]
+        previous: Option<String>,
+        /// Plugin name that is active after the change, or
+        /// `None` when the slot was cleared.
+        #[coalesce_labels(skip)]
+        current: Option<String>,
+        /// Operator principal recorded on the call (verified
+        /// step-up principal when an `AuthService` is
+        /// configured, `peer:<uid>` form otherwise).
+        principal: String,
+        /// When the change was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// The active UI shell selection changed. Mirror of
+    /// [`Self::UiActiveThemeChanged`] for the `ui_shell`
+    /// slot. Operator-driven shell swaps cause connected UI
+    /// clients to load the new entry-point bundle on the
+    /// next frame.
+    UiActiveShellChanged {
+        /// Plugin name that was active before the change.
+        #[coalesce_labels(skip)]
+        previous: Option<String>,
+        /// Plugin name that is active after the change.
+        #[coalesce_labels(skip)]
+        current: Option<String>,
+        /// Operator principal.
+        principal: String,
+        /// When the change was recorded.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// One update source began a check against its
+    /// upstream. Paired with `UpdateCheckCompleted` (or a
+    /// log-warn when the check fails). Carries the source
+    /// id so subscribers can filter per-source.
+    UpdateCheckStarted {
+        /// Source id (`"plugins"` / `"core"` / `"os"` /
+        /// vendor-minted).
+        source_id: String,
+        /// When the check began.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// One update source completed a check. Carries the
+    /// count of updates the source reported as available.
+    /// Failures emit `available_count = 0` plus a warn-
+    /// level log entry.
+    UpdateCheckCompleted {
+        /// Source id.
+        source_id: String,
+        /// Count of updates currently available.
+        #[coalesce_labels(skip)]
+        available_count: u32,
+        /// When the check finished.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// One source surfaced an available update during a
+    /// check. Emitted per-update so subscribers can
+    /// filter / route on component / severity.
+    UpdateAvailableObserved {
+        /// Source id.
+        source_id: String,
+        /// Component name (e.g. `com.tidal`, `evo`).
+        component: String,
+        /// Currently-installed version.
+        current_version: String,
+        /// Available version.
+        available_version: String,
+        /// Severity classification (`routine` / `recommended`
+        /// / `security` / `critical`).
+        severity: String,
+        /// When observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// An update apply began. Paired with
+    /// `UpdateApplySucceeded` or `UpdateApplyFailed`.
+    UpdateApplyStarted {
+        /// Source id.
+        source_id: String,
+        /// Source-defined update id.
+        update_id: String,
+        /// Component name.
+        component: String,
+        /// Operator principal (or `auto_apply` for policy-
+        /// driven applies).
+        approved_by: String,
+        /// When the apply began.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// An update apply completed successfully.
+    UpdateApplySucceeded {
+        /// Source id.
+        source_id: String,
+        /// Source-defined update id.
+        update_id: String,
+        /// Component name.
+        component: String,
+        /// Version now active after the apply.
+        applied_version: String,
+        /// `true` when this was a dry-run apply.
+        #[coalesce_labels(skip)]
+        dry_run: bool,
+        /// When the apply completed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// An update apply failed. The error string is the
+    /// source's `UpdateError` rendering.
+    UpdateApplyFailed {
+        /// Source id.
+        source_id: String,
+        /// Source-defined update id.
+        update_id: String,
+        /// Component name.
+        component: String,
+        /// Error message from the source.
+        error: String,
+        /// When the failure was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// The local node's clock-sync state for one multi-room
+    /// group changed materially. Emitted on quality
+    /// transitions (Unknown / Warming / Locked / Stale) and
+    /// on offset drift after a fresh sync sample lands.
+    /// Idempotent re-applications against unchanged state
+    /// emit nothing.
+    ClockSyncChanged {
+        /// Canonical group id this state applies to.
+        group_id: String,
+        /// Group's current display name.
+        display_name: String,
+        /// Elected source-host device id, or `None`.
+        #[coalesce_labels(skip)]
+        source_host_device_id: Option<String>,
+        /// `true` when the local node is the source-host
+        /// for this group.
+        #[coalesce_labels(skip)]
+        is_local_host: bool,
+        /// Signed millisecond offset (source-host clock
+        /// minus local clock).
+        #[coalesce_labels(skip)]
+        offset_ms: i64,
+        /// Measurement uncertainty in milliseconds.
+        #[coalesce_labels(skip)]
+        uncertainty_ms: u32,
+        /// Quality classification — one of `unknown` /
+        /// `warming` / `locked` / `stale`.
+        #[coalesce_labels(skip)]
+        quality: String,
+        /// When the change was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// The domain witness chain head advanced. Fires both on
+    /// locally-appended gestures and on remotely-received
+    /// witnesses. Subscribers (UI, plugins) invalidate cached
+    /// projections and re-render on receipt.
+    ChainHeadChanged {
+        /// New chain head, base64 SHA-256 of the canonical
+        /// encoding of the most recent witness.
+        new_head_b64: String,
+        /// Chain length post-advance.
+        #[coalesce_labels(skip)]
+        chain_length: usize,
+        /// When the head changed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A domain-state gesture was applied to the local
+    /// chain — either signed by this device or received
+    /// from a peer. UI lifecycle tracking subscribes for
+    /// the "applied locally" / "confirmed" indicator.
+    GestureApplied {
+        /// Witness id of the applied entry.
+        witness_id: String,
+        /// Op kind label (snake_case identifier from the
+        /// op variant).
+        op_kind: String,
+        /// Originator device id (whoever signed the
+        /// witness).
+        originator_device_id: String,
+        /// Whether this device originated the witness.
+        #[coalesce_labels(skip)]
+        was_local: bool,
+        /// When the apply occurred.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A peer acknowledged a gesture. Reserved for a
+    /// future per-gesture explicit-ack mechanism; in the
+    /// current substrate, the chain itself is the ack
+    /// (a peer's chain head advancing reflects its
+    /// having applied the witness). This variant exists
+    /// so subscribers can subscribe to a stable shape
+    /// when the ack mechanism is added.
+    GestureConfirmedByPeer {
+        /// Witness id being confirmed.
+        witness_id: String,
+        /// Peer that confirmed.
+        peer_device_id: String,
+        /// When the confirmation was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A concurrent gesture fork was reconciled. The chain
+    /// linearised by `(timestamp_ms, originator_uuid)`;
+    /// subscribers (UI) show "your gesture was superseded
+    /// by a later one from <originator>."
+    GestureReconciled {
+        /// Witness id that won the linearisation.
+        winning_witness_id: String,
+        /// Originator of the winning witness.
+        winning_originator_device_id: String,
+        /// When the reconciliation was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A peer's runtime presence state transitioned (one
+    /// of Live / Quiet / Stalled / Absent / Discarded).
+    /// UI re-renders the row badge sub-second.
+    PeerPresenceChanged {
+        /// Device id whose state transitioned.
+        peer_device_id: String,
+        /// Previous state.
+        old_state: String,
+        /// New state.
+        new_state: String,
+        /// When the transition was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A chain-admitted peer was observed at a new
+    /// endpoint not present in its sticky-endpoint
+    /// history. Operator can confirm via
+    /// `update_peer_endpoints` to make the new endpoint
+    /// sticky.
+    PeerObservedAtNewEndpoint {
+        /// Device id observed.
+        peer_device_id: String,
+        /// New endpoint address.
+        endpoint_address: String,
+        /// Network the observation was made on.
+        network_id: String,
+        /// When the observation occurred.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Mass presence transition detected (multiple
+    /// simultaneous transitions to Absent within a short
+    /// window). UI surfaces a single batched alarm rather
+    /// than N individual alarms.
+    PresenceMassEventDetected {
+        /// Affected peer device ids.
+        #[coalesce_labels(skip)]
+        affected_peer_ids: Vec<String>,
+        /// Coarse root-cause hint
+        /// (`likely_network_event` /
+        /// `likely_power_event` / `unknown`).
+        event_kind_hint: String,
+        /// When the mass event was detected.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// One step of a brass-trumpet reconnect storm fired.
+    /// UI streams the per-carrier progress as the storm
+    /// runs.
+    ReconnectProgress {
+        /// Device id the reconnect is targeting.
+        peer_device_id: String,
+        /// Carrier being tried (`mdns` / `udp_broadcast`
+        /// / `subnet_sweep` / `tcp_stored_endpoint` /
+        /// `ble` / `wol` / `audio_plane`).
+        carrier: String,
+        /// Status (`attempting` / `responded` /
+        /// `failed`).
+        status: String,
+        /// Elapsed milliseconds since storm start.
+        #[coalesce_labels(skip)]
+        elapsed_ms: u64,
+        /// When the step occurred.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// A device declared itself as a chain-aware relay.
+    /// UI surfaces the relay in the cross-VLAN status
+    /// panel.
+    RelayDeclared {
+        /// Relay's device id.
+        relay_device_id: String,
+        /// Networks bridged (network_id list).
+        #[coalesce_labels(skip)]
+        networks: Vec<String>,
+        /// When the declaration was applied.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+    /// Health of a chain-aware relay's bridge between two
+    /// networks changed. UI badges the relay row.
+    RelayBridgeHealthChanged {
+        /// Relay's device id.
+        relay_device_id: String,
+        /// Pair description (e.g. `audio-vlan-10↔control-vlan-20`).
+        network_pair: String,
+        /// Health (`healthy` / `degraded` /
+        /// `unreachable`).
+        health: String,
+        /// When the change was observed.
+        #[coalesce_labels(skip)]
+        at: SystemTime,
+    },
+}
+
+/// Discriminator for the [`Happening::UiShelfChanged`] payload.
+/// Reports the operator-visible change kind on the shelf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiShelfChange {
+    /// First time this plugin admitted any stockings on
+    /// this shelf in the current steward lifetime.
+    Stocked,
+    /// Plugin had stockings on this shelf and re-admitted
+    /// (manifest reload, capability re-evaluation, etc.).
+    /// `stockings_after` reflects the post-reload state.
+    Restocked,
+    /// Plugin's stockings on this shelf were withdrawn —
+    /// either the plugin was removed or its manifest reload
+    /// dropped its stockings on this shelf.
+    Withdrawn,
+}
+
+impl UiShelfChange {
+    /// Stable on-wire snake_case form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stocked => "stocked",
+            Self::Restocked => "restocked",
+            Self::Withdrawn => "withdrawn",
+        }
+    }
+}
+
+impl std::fmt::Display for UiShelfChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// The happenings bus.
@@ -1822,6 +3045,47 @@ pub struct HappeningBus {
     /// and broadcast steps such that the receiver observes seq
     /// values out of order. The synchronous [`Self::emit`] path
     /// remains lock-free because it has no durability obligation.
+    ///
+    /// **Lock posture (per audit Finding F3):** the lock is held
+    /// across the async persistence `.await` (a `tokio::sync::Mutex`,
+    /// not `std::sync::Mutex`, so this is contention not deadlock).
+    /// This is intentional: it pins the
+    /// "subscribe-at-current-seq" atomicity invariant that
+    /// [`Self::subscribe_with_current_seq`] depends on. A
+    /// subscriber that observes `current_seq = N` MUST be able
+    /// to assume that every seq <= N is durable in the
+    /// happenings_log AND that every subsequent broadcast carries
+    /// seq > N. If the persistence write moved outside the lock,
+    /// emit_durable for seq N+1 could mint+queue+broadcast before
+    /// the subscriber's load_happenings_since(N) sees it on disk,
+    /// allowing a real-data-loss path for replay-aware
+    /// subscribers (`run_https_wiring_e2e` and the wire-side
+    /// `subscribe_happenings` handler are both load-bearing on
+    /// this invariant).
+    ///
+    /// **Retirement criterion (per audit Finding F3):** at
+    /// current emit cadence (operator-paced gestures +
+    /// 5-second time-trust ticks + peer-discovery events) the
+    /// lock-held-through-persistence shape produces no observed
+    /// contention; SQLite's deadpool-mediated write throughput
+    /// is well above the emit rate. This shape is acceptable
+    /// at present load and unacceptable at high-frequency emit
+    /// load (per-frame audio-trace happenings, per-tick
+    /// presence happenings, etc.). The shape retires before any
+    /// of these — whichever is first: (a) a high-frequency
+    /// emit site lands on the durable path (audio-frame trace,
+    /// presence-tick at >= 10 Hz, or per-resolve discovery emit
+    /// after F4 retires its persist debounce); (b) operator-
+    /// reported `emit_durable` latency exceeds 50ms p99 in
+    /// observability data. Replacement shape: queue-based
+    /// single-writer task — emit_durable mints seq + queues +
+    /// awaits persistence ack via oneshot, with a paired
+    /// reworking of `subscribe_with_current_seq` to also wait
+    /// for the persistence drain to catch up before returning.
+    /// ~200 LoC, gated on either retirement trigger above
+    /// because the rework changes the atomicity surface that
+    /// subscribers compose against; the rework lands when
+    /// contention is observed and not before.
     emit_lock: Mutex<()>,
 }
 
@@ -2016,6 +3280,87 @@ impl HappeningBus {
         });
         let _ = self.tx.send(happening);
         Ok(seq)
+    }
+
+    /// Batched durable emit: persist and broadcast N happenings
+    /// under one fsync.
+    ///
+    /// The single-emit path is 1 fsync per call. For hot paths that
+    /// produce many durable happenings from one logical operation
+    /// (grammar orphan migration: one `SubjectMigrated` per subject;
+    /// merge / split / mass tombstone: one entry per touched
+    /// subject) the per-call fsync dominates wall-clock at
+    /// storage-latency-times-N. This entry point serialises all N
+    /// under one persistence transaction so wall-clock is
+    /// storage-latency + per-row-serialise cost.
+    ///
+    /// Seq minting is contiguous: the bus mints `happenings.len()`
+    /// consecutive seqs starting from the next-available cursor.
+    /// The store inserts in the supplied order to preserve seq
+    /// monotonicity through the batch. Broadcast fires row-by-row
+    /// in supplied order AFTER the batch commits, mirroring the
+    /// single-emit invariant that a subscriber recording a seq
+    /// never observes one whose row is missing on disk.
+    ///
+    /// Falls back to a per-happening non-durable emit (with a
+    /// warning trace) when the bus has no persistence handle, same
+    /// as the single-emit path.
+    ///
+    /// An empty `happenings` returns `Ok(vec![])` without touching
+    /// the store or the broadcast channels.
+    pub async fn emit_durable_batch(
+        &self,
+        happenings: Vec<Happening>,
+    ) -> Result<Vec<u64>, crate::persistence::PersistenceError> {
+        if happenings.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(persistence) = self.persistence.as_ref() else {
+            // LOGGING.md §2: warn (recoverable anomaly — the caller
+            // asked for durability but the bus has no persistence
+            // configured; auto-fallback engaged, operator should
+            // audit configuration).
+            tracing::warn!(
+                "emit_durable_batch called on a non-durable bus; \
+                 falling back to transient per-happening emit"
+            );
+            let seqs = happenings
+                .into_iter()
+                .map(|h| self.emit(h))
+                .collect::<Vec<u64>>();
+            return Ok(seqs);
+        };
+        let _guard = self.emit_lock.lock().await;
+        let n = happenings.len();
+        let start_seq = self.next_seq.fetch_add(n as u64, Ordering::Relaxed);
+        let at_ms = system_time_to_ms(SystemTime::now());
+        let mut rows: Vec<crate::persistence::HappeningBatchRow> =
+            Vec::with_capacity(n);
+        for (i, happening) in happenings.iter().enumerate() {
+            let payload = serde_json::to_value(happening).map_err(|e| {
+                crate::persistence::PersistenceError::Invalid(format!(
+                    "serialising Happening for happenings_log batch: {e}"
+                ))
+            })?;
+            rows.push(crate::persistence::HappeningBatchRow {
+                seq: start_seq + i as u64,
+                kind: happening_kind_str(happening).to_string(),
+                payload,
+                at_ms,
+            });
+        }
+        persistence.record_happenings_batch(rows).await?;
+        let mut seqs = Vec::with_capacity(n);
+        for (i, happening) in happenings.into_iter().enumerate() {
+            let seq = start_seq + i as u64;
+            let _ = self.tx_env.send(HappeningEnvelope {
+                seq,
+                happening: happening.clone(),
+            });
+            let _ = self.tx.send(happening);
+            seqs.push(seq);
+        }
+        Ok(seqs)
     }
 
     /// Subscribe to happenings.
@@ -2276,6 +3621,9 @@ impl Happening {
             // Catalogue-fallback events are framework-level; no
             // plugin actor is involved.
             Happening::CatalogueFallback { .. } => None,
+            // Persistence-ready barrier is a framework-level boot
+            // signal; no plugin actor is involved.
+            Happening::PersistenceReady { .. } => None,
             // Clock-trust events are framework-level; no plugin
             // actor is involved.
             Happening::ClockTrustChanged { .. }
@@ -2318,6 +3666,84 @@ impl Happening {
             // Generic plugin-emit envelope: the plugin field is
             // exactly the actor.
             Happening::PluginEvent { plugin, .. } => Some(plugin.as_str()),
+            // Audio playback ended: the source plugin reporting
+            // is the actor, the same shape as PluginEvent.
+            Happening::AudioPlaybackEnded { source_plugin, .. } => {
+                Some(source_plugin.as_str())
+            }
+            // Audio topology changed: framework-emitted, no
+            // single plugin actor (the chain spans multiple).
+            Happening::AudioTopologyChanged { .. } => None,
+            // Multi-room peer events are framework-emitted,
+            // not driven by any plugin.
+            Happening::PeerDiscovered { .. }
+            | Happening::PeerUpdated { .. }
+            | Happening::PeerLost { .. }
+            | Happening::PeerAnnounced { .. }
+            | Happening::PeerDisappeared { .. }
+            | Happening::RosterSnapped { .. } => None,
+            // Multi-room group lifecycle events are
+            // framework-emitted, not driven by any plugin.
+            Happening::DomainJoinModeEntered { .. }
+            | Happening::GroupCreated { .. }
+            | Happening::GroupRenamed { .. }
+            | Happening::GroupMembershipChanged { .. }
+            | Happening::GroupLeaderMsChanged { .. }
+            | Happening::DeviceRoleChanged { .. }
+            | Happening::GroupDeleted { .. }
+            | Happening::SourceHostElected { .. }
+            | Happening::ClockSyncChanged { .. }
+            | Happening::PeerConnected { .. }
+            | Happening::PeerDisconnected { .. }
+            | Happening::DeviceDisplayNameChanged { .. }
+            | Happening::DomainMemberAdmitted { .. }
+            | Happening::DomainMemberRevoked { .. }
+            | Happening::DomainMemberDisplayNameObserved { .. }
+            | Happening::GroupMemberAddRefused { .. }
+            | Happening::GroupLeaderSuccessorRequired { .. }
+            | Happening::GroupLeaderSuccessorCancelled { .. }
+            | Happening::MultiroomLeaderHandoff { .. }
+            | Happening::MultiroomMemberMoved { .. }
+            | Happening::SplitBrainDetected { .. }
+            | Happening::ChainHeadChanged { .. }
+            | Happening::GestureApplied { .. }
+            | Happening::GestureConfirmedByPeer { .. }
+            | Happening::GestureReconciled { .. }
+            | Happening::PeerPresenceChanged { .. }
+            | Happening::PeerObservedAtNewEndpoint { .. }
+            | Happening::PresenceMassEventDetected { .. }
+            | Happening::ReconnectProgress { .. }
+            | Happening::RelayDeclared { .. }
+            | Happening::RelayBridgeHealthChanged { .. } => None,
+            // Update lifecycle events are framework-emitted,
+            // routed through the update registry runtime.
+            Happening::UpdateCheckStarted { .. }
+            | Happening::UpdateCheckCompleted { .. }
+            | Happening::UpdateAvailableObserved { .. }
+            | Happening::UpdateApplyStarted { .. }
+            | Happening::UpdateApplySucceeded { .. }
+            | Happening::UpdateApplyFailed { .. } => None,
+            // Steward-restart notification is framework-
+            // emitted from the restart coordinator.
+            Happening::StewardRestarting { .. } => None,
+            // UI shelf change names the contributing plugin
+            // so subscribers filtering by plugin see them.
+            Happening::UiShelfChanged { plugin, .. } => Some(plugin.as_str()),
+            // UI artefact admission events name the
+            // contributing plugin; subscribers filtering by
+            // plugin see them. The active-selection-changed
+            // pair are framework-level (no single plugin
+            // owns the change).
+            Happening::UiThemeAdmitted { plugin, .. }
+            | Happening::UiShellAdmitted { plugin, .. }
+            | Happening::UiWidgetPackAdmitted { plugin, .. }
+            | Happening::UiThemeUnadmitted { plugin, .. }
+            | Happening::UiShellUnadmitted { plugin, .. }
+            | Happening::UiWidgetPackUnadmitted { plugin, .. } => {
+                Some(plugin.as_str())
+            }
+            Happening::UiActiveThemeChanged { .. }
+            | Happening::UiActiveShellChanged { .. } => None,
             // Drift / skew warnings name the affected plugin so
             // consumers filtering by plugin see them.
             Happening::PluginManifestDrift { plugin, .. }
@@ -2347,6 +3773,15 @@ impl Happening {
             Happening::PluginAdmissionSkipped { plugin, .. } => {
                 Some(plugin.as_str())
             }
+            // Lifecycle dispatch decisions name the plugin
+            // whose reload request was acted on (or refused).
+            Happening::PluginReloadDispatched { plugin, .. } => {
+                Some(plugin.as_str())
+            }
+            // Degraded transitions + restore clears both name
+            // the plugin whose registry slot changed.
+            Happening::PluginDegraded { plugin, .. } => Some(plugin.as_str()),
+            Happening::PluginRestored { plugin, .. } => Some(plugin.as_str()),
             // Reconciliation events are pair-keyed, not plugin-
             // keyed; no plugin actor.
             Happening::ReconciliationApplied { .. }
@@ -2546,6 +3981,9 @@ impl Happening {
             // Catalogue-fallback is a framework-level boot event;
             // it does not affect any subject's projection.
             Happening::CatalogueFallback { .. } => false,
+            // Persistence-ready is a framework-level boot barrier;
+            // it does not affect any subject's projection.
+            Happening::PersistenceReady { .. } => false,
             // Clock-trust events are framework-level; they do not
             // affect any subject's projection.
             Happening::ClockTrustChanged { .. }
@@ -2590,6 +4028,78 @@ impl Happening {
             // payload may carry subject references but the
             // framework does not interpret them.
             Happening::PluginEvent { .. } => false,
+            // Audio playback ended is plugin-keyed (source
+            // plugin reporting), not subject-keyed.
+            Happening::AudioPlaybackEnded { .. } => false,
+            // Audio topology changed is target-key-keyed, not
+            // subject-keyed.
+            Happening::AudioTopologyChanged { .. } => false,
+            // Multi-room peer events are device-id-keyed, not
+            // subject-keyed.
+            Happening::PeerDiscovered { .. }
+            | Happening::PeerUpdated { .. }
+            | Happening::PeerLost { .. }
+            | Happening::PeerAnnounced { .. }
+            | Happening::PeerDisappeared { .. }
+            | Happening::RosterSnapped { .. } => false,
+            // Multi-room group lifecycle events are
+            // group-id-keyed, not subject-keyed.
+            Happening::DomainJoinModeEntered { .. }
+            | Happening::GroupCreated { .. }
+            | Happening::GroupRenamed { .. }
+            | Happening::GroupMembershipChanged { .. }
+            | Happening::GroupLeaderMsChanged { .. }
+            | Happening::DeviceRoleChanged { .. }
+            | Happening::GroupDeleted { .. }
+            | Happening::SourceHostElected { .. }
+            | Happening::ClockSyncChanged { .. }
+            | Happening::PeerConnected { .. }
+            | Happening::PeerDisconnected { .. }
+            | Happening::DeviceDisplayNameChanged { .. }
+            | Happening::DomainMemberAdmitted { .. }
+            | Happening::DomainMemberRevoked { .. }
+            | Happening::DomainMemberDisplayNameObserved { .. }
+            | Happening::GroupMemberAddRefused { .. }
+            | Happening::GroupLeaderSuccessorRequired { .. }
+            | Happening::GroupLeaderSuccessorCancelled { .. }
+            | Happening::MultiroomLeaderHandoff { .. }
+            | Happening::MultiroomMemberMoved { .. }
+            | Happening::SplitBrainDetected { .. }
+            | Happening::ChainHeadChanged { .. }
+            | Happening::GestureApplied { .. }
+            | Happening::GestureConfirmedByPeer { .. }
+            | Happening::GestureReconciled { .. }
+            | Happening::PeerPresenceChanged { .. }
+            | Happening::PeerObservedAtNewEndpoint { .. }
+            | Happening::PresenceMassEventDetected { .. }
+            | Happening::ReconnectProgress { .. }
+            | Happening::RelayDeclared { .. }
+            | Happening::RelayBridgeHealthChanged { .. } => false,
+            // Update lifecycle events are component-id-keyed
+            // (source + component), not subject-keyed.
+            Happening::UpdateCheckStarted { .. }
+            | Happening::UpdateCheckCompleted { .. }
+            | Happening::UpdateAvailableObserved { .. }
+            | Happening::UpdateApplyStarted { .. }
+            | Happening::UpdateApplySucceeded { .. }
+            | Happening::UpdateApplyFailed { .. } => false,
+            // Steward-restart notification is process-
+            // level, not subject-keyed.
+            Happening::StewardRestarting { .. } => false,
+            // UI shelf change is shelf-keyed, not catalogue-
+            // subject-keyed.
+            Happening::UiShelfChanged { .. } => false,
+            // UI artefact admission / unadmission +
+            // active-selection changes are UI-substrate-
+            // level, not bound to any catalogue subject.
+            Happening::UiThemeAdmitted { .. }
+            | Happening::UiShellAdmitted { .. }
+            | Happening::UiWidgetPackAdmitted { .. }
+            | Happening::UiThemeUnadmitted { .. }
+            | Happening::UiShellUnadmitted { .. }
+            | Happening::UiWidgetPackUnadmitted { .. }
+            | Happening::UiActiveThemeChanged { .. }
+            | Happening::UiActiveShellChanged { .. } => false,
             // Drift / skew warnings are framework-level
             // diagnostics; they do not affect any subject's
             // projection.
@@ -2616,6 +4126,17 @@ impl Happening {
             // not admitting a plugin doesn't affect any
             // subject's projection.
             Happening::PluginAdmissionSkipped { .. } => false,
+            // Lifecycle dispatch decision is framework-level
+            // observability; the subject graph stays in its
+            // present projection regardless of dispatch
+            // outcome (the teardown + re-admit emits its own
+            // separate PluginLiveReload* trio).
+            Happening::PluginReloadDispatched { .. } => false,
+            // Plugin degraded-state transitions are framework
+            // observability; they don't change any subject's
+            // projection — the registry is its own substrate.
+            Happening::PluginDegraded { .. }
+            | Happening::PluginRestored { .. } => false,
             // Reconciliation events are pair-scoped pipeline
             // transitions; subjects projection effects ride the
             // warden's separate per-subject events.
@@ -2654,6 +4175,24 @@ pub struct HappeningFilter {
     /// Permitted shelf names (`Happening::shelf()` targets).
     /// Empty: no shelf filtering.
     pub shelves: Vec<String>,
+    /// Permitted subject_type allow-list on
+    /// [`Happening::SubjectStateChanged`] events. Empty: no
+    /// allow filter — every state-changed event passes the
+    /// subject_type dimension. Non-empty: only state-changed
+    /// events whose `subject_type` is in this list pass. Other
+    /// happening variants (not state-changed) pass the
+    /// subject_type dimension trivially. Composes with
+    /// [`Self::subject_types_deny`] — both checks must accept.
+    pub subject_types: Vec<String>,
+    /// Subject_type deny-list on
+    /// [`Happening::SubjectStateChanged`] events. Empty: no
+    /// deny filter. Non-empty: state-changed events whose
+    /// `subject_type` is in this list are dropped; other
+    /// variants pass. The dominant use case (UI consumers
+    /// dropping high-frequency subject types they don't
+    /// render) is expressed by setting only this dimension,
+    /// leaving every other dimension empty.
+    pub subject_types_deny: Vec<String>,
 }
 
 impl HappeningFilter {
@@ -2663,6 +4202,8 @@ impl HappeningFilter {
         self.variants.is_empty()
             && self.plugins.is_empty()
             && self.shelves.is_empty()
+            && self.subject_types.is_empty()
+            && self.subject_types_deny.is_empty()
     }
 
     /// Decide whether `h` passes the filter.
@@ -2682,6 +4223,19 @@ impl HappeningFilter {
             match h.shelf() {
                 Some(s) if self.shelves.iter().any(|x| x == s) => {}
                 _ => return false,
+            }
+        }
+        // Subject-type allow + deny dimensions. Both apply only
+        // to SubjectStateChanged events; other variants pass
+        // these dimensions unconditionally.
+        if let Happening::SubjectStateChanged { subject_type, .. } = h {
+            if !self.subject_types.is_empty()
+                && !self.subject_types.iter().any(|t| t == subject_type)
+            {
+                return false;
+            }
+            if self.subject_types_deny.iter().any(|t| t == subject_type) {
+                return false;
             }
         }
         true
@@ -2736,6 +4290,7 @@ fn happening_kind_str(h: &Happening) -> &'static str {
             "factory_instance_retracted"
         }
         Happening::CatalogueFallback { .. } => "catalogue_fallback",
+        Happening::PersistenceReady { .. } => "persistence_ready",
         Happening::ClockTrustChanged { .. } => "clock_trust_changed",
         Happening::ClockAdjusted { .. } => "clock_adjusted",
         Happening::FlightModeChanged { .. } => "flight_mode_changed",
@@ -2756,6 +4311,77 @@ fn happening_kind_str(h: &Happening) -> &'static str {
         }
         Happening::GrammarOrphansAccepted { .. } => "grammar_orphans_accepted",
         Happening::PluginEvent { .. } => "plugin_event",
+        Happening::AudioPlaybackEnded { .. } => "audio_playback_ended",
+        Happening::AudioTopologyChanged { .. } => "audio_topology_changed",
+        Happening::PeerDiscovered { .. } => "peer_discovered",
+        Happening::PeerUpdated { .. } => "peer_updated",
+        Happening::PeerLost { .. } => "peer_lost",
+        Happening::PeerAnnounced { .. } => "peer_announced",
+        Happening::PeerDisappeared { .. } => "peer_disappeared",
+        Happening::RosterSnapped { .. } => "roster_snapped",
+        Happening::DomainJoinModeEntered { .. } => "domain_join_mode_entered",
+        Happening::GroupCreated { .. } => "group_created",
+        Happening::GroupRenamed { .. } => "group_renamed",
+        Happening::GroupMembershipChanged { .. } => "group_membership_changed",
+        Happening::GroupLeaderMsChanged { .. } => "group_leader_ms_changed",
+        Happening::DeviceRoleChanged { .. } => "device_role_changed",
+        Happening::GroupDeleted { .. } => "group_deleted",
+        Happening::SourceHostElected { .. } => "source_host_elected",
+        Happening::ClockSyncChanged { .. } => "clock_sync_changed",
+        Happening::DeviceDisplayNameChanged { .. } => {
+            "device_display_name_changed"
+        }
+        Happening::DomainMemberAdmitted { .. } => "domain_member_admitted",
+        Happening::DomainMemberRevoked { .. } => "domain_member_revoked",
+        Happening::DomainMemberDisplayNameObserved { .. } => {
+            "domain_member_display_name_observed"
+        }
+        Happening::GroupMemberAddRefused { .. } => "group_member_add_refused",
+        Happening::GroupLeaderSuccessorRequired { .. } => {
+            "group_leader_successor_required"
+        }
+        Happening::GroupLeaderSuccessorCancelled { .. } => {
+            "group_leader_successor_cancelled"
+        }
+        Happening::MultiroomLeaderHandoff { .. } => "multiroom_leader_handoff",
+        Happening::MultiroomMemberMoved { .. } => "multiroom_member_moved",
+        Happening::ChainHeadChanged { .. } => "chain_head_changed",
+        Happening::GestureApplied { .. } => "gesture_applied",
+        Happening::GestureConfirmedByPeer { .. } => "gesture_confirmed_by_peer",
+        Happening::GestureReconciled { .. } => "gesture_reconciled",
+        Happening::PeerPresenceChanged { .. } => "peer_presence_changed",
+        Happening::PeerObservedAtNewEndpoint { .. } => {
+            "peer_observed_at_new_endpoint"
+        }
+        Happening::PresenceMassEventDetected { .. } => {
+            "presence_mass_event_detected"
+        }
+        Happening::ReconnectProgress { .. } => "reconnect_progress",
+        Happening::RelayDeclared { .. } => "relay_declared",
+        Happening::RelayBridgeHealthChanged { .. } => {
+            "relay_bridge_health_changed"
+        }
+        Happening::StewardRestarting { .. } => "steward_restarting",
+        Happening::UiShelfChanged { .. } => "ui_shelf_changed",
+        Happening::UiThemeAdmitted { .. } => "ui_theme_admitted",
+        Happening::UiShellAdmitted { .. } => "ui_shell_admitted",
+        Happening::UiWidgetPackAdmitted { .. } => "ui_widget_pack_admitted",
+        Happening::UiThemeUnadmitted { .. } => "ui_theme_unadmitted",
+        Happening::UiShellUnadmitted { .. } => "ui_shell_unadmitted",
+        Happening::UiWidgetPackUnadmitted { .. } => "ui_widget_pack_unadmitted",
+        Happening::UiActiveThemeChanged { .. } => "ui_active_theme_changed",
+        Happening::UiActiveShellChanged { .. } => "ui_active_shell_changed",
+        Happening::UpdateCheckStarted { .. } => "update_check_started",
+        Happening::UpdateCheckCompleted { .. } => "update_check_completed",
+        Happening::UpdateAvailableObserved { .. } => {
+            "update_available_observed"
+        }
+        Happening::UpdateApplyStarted { .. } => "update_apply_started",
+        Happening::UpdateApplySucceeded { .. } => "update_apply_succeeded",
+        Happening::UpdateApplyFailed { .. } => "update_apply_failed",
+        Happening::PeerConnected { .. } => "peer_connected",
+        Happening::PeerDisconnected { .. } => "peer_disconnected",
+        Happening::SplitBrainDetected { .. } => "split_brain_detected",
         Happening::PluginManifestDrift { .. } => "plugin_manifest_drift",
         Happening::PluginVersionSkewWarning { .. } => {
             "plugin_version_skew_warning"
@@ -2773,6 +4399,9 @@ fn happening_kind_str(h: &Happening) -> &'static str {
         Happening::CatalogueInvalid { .. } => "catalogue_invalid",
         Happening::CardinalityViolation { .. } => "cardinality_violation",
         Happening::PluginAdmissionSkipped { .. } => "plugin_admission_skipped",
+        Happening::PluginReloadDispatched { .. } => "plugin_reload_dispatched",
+        Happening::PluginDegraded { .. } => "plugin_degraded",
+        Happening::PluginRestored { .. } => "plugin_restored",
         Happening::ReconciliationApplied { .. } => "reconciliation_applied",
         Happening::ReconciliationFailed { .. } => "reconciliation_failed",
     }
@@ -2857,6 +4486,7 @@ mod filter_tests {
             variants: vec!["custody_taken".into()],
             plugins: vec!["org.target".into()],
             shelves: vec!["audio.transport".into()],
+            ..Default::default()
         };
         // All three match.
         assert!(f.accepts(&taken_for("org.target", "audio.transport")));
@@ -2868,6 +4498,81 @@ mod filter_tests {
         // `released_for` doesn't carry a shelf either, so it
         // fails on the shelves dimension regardless.
         assert!(!f.accepts(&released_for("org.target")));
+    }
+
+    // ----- subject_types allow + deny -----
+
+    fn subject_state_changed(subject_type: &str) -> Happening {
+        Happening::SubjectStateChanged {
+            plugin: "org.test".into(),
+            canonical_id: "subject-1".into(),
+            subject_type: subject_type.into(),
+            prev_state: serde_json::Value::Null,
+            new_state: serde_json::Value::Null,
+            at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn subject_types_allow_admits_listed_types_only() {
+        let f = HappeningFilter {
+            subject_types: vec!["audio_playback_now_playing".into()],
+            ..Default::default()
+        };
+        assert!(!f.is_noop());
+        assert!(f.accepts(&subject_state_changed("audio_playback_now_playing")));
+        assert!(
+            !f.accepts(&subject_state_changed("audio_playback_spectrum_frame"))
+        );
+    }
+
+    #[test]
+    fn subject_types_allow_does_not_gate_non_state_changed_variants() {
+        // A subscriber asking for only `audio_playback_now_playing`
+        // state changes still receives custody / lifecycle events.
+        let f = HappeningFilter {
+            subject_types: vec!["audio_playback_now_playing".into()],
+            ..Default::default()
+        };
+        assert!(f.accepts(&taken_for("org.x", "audio.transport")));
+        assert!(f.accepts(&released_for("org.x")));
+    }
+
+    #[test]
+    fn subject_types_deny_drops_listed_types_only() {
+        // Reference-UI dominant use case: drop the high-frequency
+        // spectrum subject without enumerating every other type.
+        let f = HappeningFilter {
+            subject_types_deny: vec!["audio_playback_spectrum_frame".into()],
+            ..Default::default()
+        };
+        assert!(!f.is_noop());
+        assert!(
+            !f.accepts(&subject_state_changed("audio_playback_spectrum_frame"))
+        );
+        assert!(f.accepts(&subject_state_changed("audio_playback_now_playing")));
+        // Non-state-changed variants pass.
+        assert!(f.accepts(&taken_for("org.x", "audio.transport")));
+        assert!(f.accepts(&released_for("org.x")));
+    }
+
+    #[test]
+    fn subject_types_allow_and_deny_compose() {
+        let f = HappeningFilter {
+            subject_types: vec![
+                "audio_playback_now_playing".into(),
+                "audio_playback_spectrum_frame".into(),
+            ],
+            subject_types_deny: vec!["audio_playback_spectrum_frame".into()],
+            ..Default::default()
+        };
+        assert!(f.accepts(&subject_state_changed("audio_playback_now_playing")));
+        // Spectrum is in allow but deny wins.
+        assert!(
+            !f.accepts(&subject_state_changed("audio_playback_spectrum_frame"))
+        );
+        // Type not in allow.
+        assert!(!f.accepts(&subject_state_changed("audio_library_state")));
     }
 }
 
@@ -3438,6 +5143,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emit_durable_batch_persists_all_under_one_fsync_and_broadcasts_in_order(
+    ) {
+        // Regression pin for the batched-emit primitive that
+        // closes the grammar-orphan migration NVMe budget: grammar
+        // migration produces one Happening::SubjectMigrated per
+        // migrated subject; the per-emit fsync path made a 50k
+        // migration wall-clock-bound to 50k * fsync_latency
+        // regardless of the batched subject-migration write above
+        // it. `emit_durable_batch`
+        // must (1) persist every row, (2) mint contiguous seqs, and
+        // (3) broadcast every row in supplied order.
+        let store: Arc<dyn PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        let bus = HappeningBus::with_persistence(Arc::clone(&store))
+            .await
+            .expect("seed bus");
+        let mut rx = bus.subscribe();
+
+        let n = 128usize;
+        let events: Vec<Happening> = (0..n)
+            .map(|i| Happening::CustodyReleased {
+                handle_id: format!("h-batch-{i}"),
+                plugin: "test.plugin".into(),
+                at: SystemTime::now(),
+            })
+            .collect();
+
+        let seqs = bus.emit_durable_batch(events).await.expect("batch");
+
+        // Contiguous seqs 1..=n from a fresh bus.
+        assert_eq!(seqs.len(), n);
+        assert_eq!(seqs[0], 1);
+        assert_eq!(seqs[n - 1], n as u64);
+        for i in 1..n {
+            assert_eq!(seqs[i], seqs[i - 1] + 1, "seqs must be contiguous");
+        }
+
+        // Every row persisted.
+        let rows = store.load_happenings_since(0, u32::MAX).await.unwrap();
+        assert_eq!(rows.len(), n);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.seq, (i + 1) as u64);
+            assert_eq!(row.kind, "custody_released");
+        }
+
+        // Broadcast in supplied order.
+        for _ in 0..n {
+            let live = rx.recv().await.unwrap();
+            assert!(matches!(live, Happening::CustodyReleased { .. }));
+        }
+
+        // A subsequent single emit continues past the batch's tail.
+        let next_seq = bus
+            .emit_durable(sample_taken())
+            .await
+            .expect("post-batch single emit");
+        assert_eq!(next_seq, (n as u64) + 1);
+    }
+
+    #[tokio::test]
+    async fn emit_durable_batch_empty_input_is_a_noop() {
+        let store: Arc<dyn PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        let bus = HappeningBus::with_persistence(Arc::clone(&store))
+            .await
+            .expect("seed bus");
+
+        let seqs = bus.emit_durable_batch(Vec::new()).await.expect("no-op");
+        assert!(seqs.is_empty());
+
+        let rows = store.load_happenings_since(0, u32::MAX).await.unwrap();
+        assert!(rows.is_empty(), "empty batch must not touch the store");
+
+        // Seq cursor was not consumed either.
+        let seq = bus.emit_durable(sample_taken()).await.unwrap();
+        assert_eq!(seq, 1, "seq cursor must be unchanged by an empty batch");
+    }
+
+    #[tokio::test]
     async fn emit_increments_seq_even_without_persistence() {
         let bus = HappeningBus::new();
         let s1 = bus.emit(sample_taken());
@@ -3786,5 +5570,49 @@ mod tests {
             at: SystemTime::now(),
         };
         assert_eq!(happening_kind_str(&h), "flight_mode_changed");
+    }
+
+    #[test]
+    fn plugin_degraded_variant_name() {
+        let h = Happening::PluginDegraded {
+            plugin: "com.example.audio".into(),
+            reason: "admit_failures_exhausted".into(),
+            detail: "count=3".into(),
+            at: SystemTime::now(),
+        };
+        assert_eq!(happening_kind_str(&h), "plugin_degraded");
+    }
+
+    #[test]
+    fn plugin_restored_variant_name() {
+        let h = Happening::PluginRestored {
+            plugin: "com.example.audio".into(),
+            source: "operator_restore".into(),
+            at: SystemTime::now(),
+        };
+        assert_eq!(happening_kind_str(&h), "plugin_restored");
+    }
+
+    #[test]
+    fn plugin_degraded_does_not_affect_any_subject() {
+        // Degraded transitions are framework observability; the
+        // subject graph stays in its present projection.
+        let h = Happening::PluginDegraded {
+            plugin: "com.example.audio".into(),
+            reason: "plugin_panic".into(),
+            detail: "stack overflow".into(),
+            at: SystemTime::now(),
+        };
+        assert!(!h.affects_subject("any.subject.id"));
+    }
+
+    #[test]
+    fn plugin_restored_names_plugin_as_primary_actor() {
+        let h = Happening::PluginRestored {
+            plugin: "com.example.audio".into(),
+            source: "operator_restore".into(),
+            at: SystemTime::now(),
+        };
+        assert_eq!(h.primary_plugin(), Some("com.example.audio"));
     }
 }

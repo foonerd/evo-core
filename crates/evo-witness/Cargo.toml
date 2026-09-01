@@ -1,0 +1,21 @@
+[package]
+name = "evo-witness"
+description = "Capability witness chain substrate. Every privileged dispatch produces a typed Witness — a cryptographically signed envelope linking the request to its principal, capability requirement, wire op, outcome, and trace_root, anchored by the hash of the previous witness. The chain is tamper-evident: modifying any past witness invalidates every later signature. Witnesses ARE the audit ledger; the wire envelope is the only durable record required."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64 = "0.22"
+ed25519-dalek = { version = "2.1", features = ["std", "rand_core"] }
+evo-observatory = { path = "../evo-observatory" }
+rand_core = { version = "0.6", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+
+[lints]
+workspace = true

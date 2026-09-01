@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Synthetic reconciliation composer plugin.
 //!
 //! Respondent on the synthetic `acceptance.composition` shelf.
@@ -131,7 +134,7 @@ impl Plugin for SyntheticComposerPlugin {
 
 impl Respondent for SyntheticComposerPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Subject identity types.
 //!
 //! Carries the data types plugins use to address and announce subjects,
@@ -175,9 +178,14 @@ pub struct SubjectAnnouncement {
     /// `HappeningEmitter`-sibling `SubjectAnnouncer::update_state`
     /// surface.
     ///
-    /// Persistence across steward restarts is NOT yet implemented
-    /// (v0.1.12.1 scope is in-memory only); plugins re-announce
-    /// state on load.
+    /// The framework mirrors announced state to its durable
+    /// `subject_states` table so it survives an unexpected steward
+    /// crash. Graceful unload + reload still requires the plugin
+    /// to re-announce: drain-side cleanup retracts the plugin's
+    /// claimed addressings, and a subject with no remaining
+    /// claimants is forgotten (state cleared symmetrically). If
+    /// the plugin needs cross-graceful-restart state it tracks
+    /// it itself in its state directory.
     #[serde(default, skip_serializing_if = "is_null_value")]
     pub state: serde_json::Value,
     /// When the announcement was generated on the plugin side.
@@ -441,6 +449,115 @@ pub struct ExplicitRelationAssignment {
     /// than `partitions.len()`; the framework validates this
     /// pre-mint and refuses out-of-bounds indices.
     pub target_new_id_index: usize,
+}
+
+/// One subject-state change observed by the framework's subject
+/// registry. Delivered through
+/// [`SubjectStateStream::recv`] to plugin subscribers.
+///
+/// `state` is `None` when the registry's state for the subject
+/// was cleared (operator passed JSON null to update_state).
+/// `state` is `Some(payload)` for set / replace operations.
+#[derive(Debug, Clone)]
+pub struct SubjectStateUpdate {
+    /// Canonical id of the subject whose state changed.
+    pub canonical_id: String,
+    /// Subject type at the time of the change.
+    pub subject_type: String,
+    /// New state payload, or `None` when cleared.
+    pub state: Option<serde_json::Value>,
+    /// Wall-clock millisecond at the change.
+    pub modified_at_ms: u64,
+}
+
+/// Stream of [`SubjectStateUpdate`] events filtered to a single
+/// canonical subject id.
+///
+/// Obtained from
+/// [`SubjectStateSubscriber::subscribe_subject`](super::context::SubjectStateSubscriber::subscribe_subject).
+/// Each `recv` call awaits the next state change for the
+/// subscribed subject; updates for other subjects are filtered
+/// out by the stream wrapper before yielding.
+///
+/// The stream owns a bounded buffer of updates. Slow consumers
+/// that fall behind the registry's broadcast capacity see
+/// [`SubjectStateStreamError::Lagged`] on the next recv and
+/// rejoin at the live frame; the stream does NOT block the
+/// registry writer.
+pub struct SubjectStateStream {
+    inner: tokio::sync::broadcast::Receiver<SubjectStateUpdate>,
+    canonical_id: String,
+}
+
+impl SubjectStateStream {
+    /// Construct a filtered stream. Framework-side implementation
+    /// detail; plugins receive a fully-constructed
+    /// [`SubjectStateStream`] from
+    /// [`SubjectStateSubscriber::subscribe_subject`](super::context::SubjectStateSubscriber::subscribe_subject).
+    #[doc(hidden)]
+    pub fn new(
+        inner: tokio::sync::broadcast::Receiver<SubjectStateUpdate>,
+        canonical_id: String,
+    ) -> Self {
+        Self {
+            inner,
+            canonical_id,
+        }
+    }
+
+    /// Canonical id this stream is filtered to.
+    pub fn canonical_id(&self) -> &str {
+        &self.canonical_id
+    }
+
+    /// Await the next state change for the subscribed subject.
+    ///
+    /// Filters the registry's bus-wide broadcast to deliver only
+    /// updates whose `canonical_id` matches the subscription;
+    /// updates for other subjects are silently dropped (the
+    /// stream's bookkeeping continues across them so the lag
+    /// signal remains meaningful).
+    pub async fn recv(
+        &mut self,
+    ) -> Result<SubjectStateUpdate, SubjectStateStreamError> {
+        loop {
+            match self.inner.recv().await {
+                Ok(update) => {
+                    if update.canonical_id == self.canonical_id {
+                        return Ok(update);
+                    }
+                    // Update for a different subject; keep waiting.
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    return Err(SubjectStateStreamError::Lagged { dropped: n });
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(SubjectStateStreamError::Closed);
+                }
+            }
+        }
+    }
+}
+
+/// Failure modes of [`SubjectStateStream::recv`].
+#[derive(Debug, thiserror::Error)]
+pub enum SubjectStateStreamError {
+    /// The registry's broadcast buffer overflowed because the
+    /// subscriber consumed too slowly. The runtime returns the
+    /// count of dropped events; the subscriber's next recv
+    /// rejoins at the live frame. Plugins handling this read the
+    /// current state through the subject querier to resync.
+    #[error("subject-state stream lagged: dropped {dropped} updates")]
+    Lagged {
+        /// Count of dropped updates between the previous recv
+        /// and the lag signal.
+        dropped: u64,
+    },
+    /// The registry's broadcast sender was dropped. The
+    /// registry is shutting down; the subscriber should
+    /// terminate cleanly.
+    #[error("subject-state stream closed")]
+    Closed,
 }
 
 #[cfg(test)]

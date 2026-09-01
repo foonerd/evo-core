@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Synthetic live-reload plugin.
 //!
 //! Declares `lifecycle.hot_reload = "live"` so the steward's
@@ -285,7 +288,7 @@ impl Plugin for ReloadPlugin {
 
 impl Respondent for ReloadPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         _req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {
@@ -327,7 +330,7 @@ mod tests {
     fn manifest_declares_live_hot_reload() {
         let m = manifest();
         assert!(matches!(
-            m.lifecycle.hot_reload,
+            m.require_lifecycle().hot_reload,
             evo_plugin_sdk::manifest::HotReloadPolicy::Live
         ));
     }
@@ -339,12 +342,13 @@ mod tests {
             m.plugin.name,
             "org.evoframework.acceptance.reload-plugin-raised-cap"
         );
+        let lifecycle = m.require_lifecycle();
         assert!(matches!(
-            m.lifecycle.hot_reload,
+            lifecycle.hot_reload,
             evo_plugin_sdk::manifest::HotReloadPolicy::Live
         ));
         assert_eq!(
-            m.lifecycle.live_blob_max,
+            lifecycle.live_blob_max,
             Some(32 * 1024 * 1024),
             "raised-cap variant must declare 32 MiB to demonstrate the \
              per-plugin raise; if this fires the manifest's \

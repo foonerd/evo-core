@@ -35,7 +35,7 @@ contract is documented in `BUILDING.md`.
 ## 2. Tags
 
 - **Format:** `v<MAJOR>.<MINOR>.<PATCH>[-<pre>]` per semver.
-  Examples: `v0.1.9`, `v0.1.10`, `v0.2.0-rc.1`.
+  Examples: `v1.2.3`, `v1.2.4`, `v1.3.0-rc.1`.
 - **Promotion:** every tag triggers the publish workflow
   (`.github/workflows/publish.yml`). A pre-release tag (`-rc.N`,
   `-alpha.N`, etc.) builds and publishes binaries the same way a
@@ -74,7 +74,7 @@ clone at that tag is the reproducibility material.
     stable
   ```
 
-- **Targets** (v0.1.10 minimum):
+- **Targets** (current minimum):
   - `x86_64-unknown-linux-gnu` (amd64, prototype VMs and dev boxes)
   - `aarch64-unknown-linux-gnu` (arm64, Pi 4 / Pi 5)
   - `armv7-unknown-linux-gnueabihf` (armhf, Pi 2 / Pi 3 32-bit)
@@ -109,7 +109,7 @@ A single delivery surface would not serve every consumer:
   surface is non-trivial (workspace with eight crates, cross
   dependencies). Forcing a from-source compile on every developer
   before they can run a steward at all is the friction that
-  killed the v0.1.9 plugin-developer-testing claim.
+  killed the earlier plugin-developer-testing claim.
 - **Binary-only** would hide the engineering substance. evo-core's
   source carries the architectural substance; consumers reading
   the code is a feature, not a tax. Distributions building from
@@ -139,20 +139,20 @@ Each surface serves a real audience; none is redundant.
 
 ## 5. What this changes vs. earlier policy
 
-Before v0.1.10, the implicit policy was "evo-core ships source and
-tags, never binaries". A stop-gap binary publishing pipeline lived
-on `evo-device-audio` (the reference device) signing evo-core
+Earlier policy was "evo-core ships source and tags, never
+binaries". A stop-gap binary publishing pipeline lived on
+`evo-device-audio` (the reference device) signing evo-core
 binaries with the **commons** signing key. The arrangement worked
 operationally but inverted the trust hierarchy: the reference
 device was authorising framework releases.
 
-v0.1.10 reverses this: the framework signs its own binaries, the
-reference device signs its own binaries, vendors sign their own
-binaries. Each release plane stands on its own trust root; no
-plane authorises another plane's artefacts.
+The current policy reverses this: the framework signs its own
+binaries, the reference device signs its own binaries, vendors
+sign their own binaries. Each release plane stands on its own
+trust root; no plane authorises another plane's artefacts.
 
-The stop-gap on `evo-device-audio` retired with v0.1.10's first
-published artefact manifest. The reference device thereafter
+The stop-gap on `evo-device-audio` retired with the framework's
+first published artefact manifest. The reference device thereafter
 consumes evo-core binaries from `foonerd/evo-core-artefacts` like
 any other distribution.
 
@@ -174,8 +174,8 @@ any other distribution.
   own; this document does not cover it.
 - **Container images.** Future release planes MAY publish container
   images alongside the per-arch binaries. The schema in
-  `RELEASE_PLANE.md` extends naturally; v0.1.10 does not include
-  containers.
+  `RELEASE_PLANE.md` extends naturally; the current substrate
+  does not include containers.
 
 ## References
 

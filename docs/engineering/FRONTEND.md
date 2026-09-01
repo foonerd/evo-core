@@ -307,7 +307,45 @@ Some distributions ship no on-device frontend at all. The device is operated ent
 
 The device is a component inside a larger product (an automotive infotainment system, an industrial control cabinet, a smart-home hub). The upstream product has its own HMI framework and operates the device through a proprietary bridge. The "primary UI" from the end user's perspective is the upstream product's UI, not ours.
 
-## 8. What a Frontend Must Not Do
+## 8. Consuming the UI artefact substrate
+
+The framework's UI artefact substrate gives frontends a typed, queryable, reactive vocabulary for the device's UI. Themes, UI shells, and widget kind packs admit through dedicated paths into dedicated registries; the operator drives active selection; happenings fire on every state transition. A frontend that consumes the substrate can render against admitted artefacts without polling and without distribution-specific assumptions.
+
+### 8.1 The four surfaces
+
+A frontend reads from three queryable surfaces and one reactive surface:
+
+- **Available themes / shells / widget packs** — query via `describe_ui_stockings` for the per-shelf widget vocabulary; query a vendor-specific (or framework-future) wire op for the admitted-theme / admitted-shell / admitted-pack lists once the operator-facing surface lands. Today these are observable through the same `subscribe_happenings` stream the reactive surface uses.
+- **Active theme + active shell** — query `describe_active_ui_selection` for `{ theme, ui_shell }`. Each is `null` when the slot is unset.
+- **Hot-swap happenings** — `subscribe_happenings { variants = ["ui_theme_admitted", "ui_shell_admitted", "ui_widget_pack_admitted", "ui_theme_unadmitted", "ui_shell_unadmitted", "ui_widget_pack_unadmitted", "ui_active_theme_changed", "ui_active_shell_changed", "ui_shelf_changed"] }` — see `HAPPENINGS.md` §3.1 for the full per-variant payloads.
+- **Operator drive** — `activate_theme { plugin_name }` / `activate_ui_shell { plugin_name }` switch the active selection. Capability-gated by `plugins_admin` and step-up-aware; refuses with `theme_not_admitted` / `ui_shell_not_admitted` for unknown plugin names. Pass `plugin_name: null` to clear.
+
+### 8.2 Render-side composition
+
+The active theme contributes design tokens (colour pairs, spacing, motion) and asset overrides. The active UI shell contributes the entry-point bundle. Widget kind packs contribute the renderers the shell mounts. A frontend's render loop is:
+
+1. On startup, query `describe_active_ui_selection` to learn which theme + shell to compose.
+2. Subscribe to the artefact-lifecycle happenings for reactive updates.
+3. On `UiActiveThemeChanged` / `UiActiveShellChanged`, swap token bindings / load the new entry-point bundle.
+4. On `UiThemeAdmitted` / `UiShellAdmitted` / `UiWidgetPackAdmitted`, refresh the available-set view (operator UI surfaces).
+5. On `UiThemeUnadmitted` / `UiShellUnadmitted` / `UiWidgetPackUnadmitted`, drop the named artefact from the available-set view; auto-clear of the active slot has already fired a separate `UiActive*Changed` event by this point (clear-then-drop ordering).
+
+### 8.3 Auto-clear discipline
+
+When an artefact is unadmitted, if it was the currently-active artefact in its slot, the framework clears the active slot FIRST (firing `UiActiveThemeChanged` / `UiActiveShellChanged` with `current: null`), THEN the unadmission proceeds. Subscribers consuming both event classes see the active swap before the available-set drop. A renderer subscribing only to active-selection events sees a clean `current: null` event; one subscribing only to available-set events sees the drop after the active slot has already been cleared. Either subscription pattern is correct; the ordering means neither sees an inconsistent intermediate state.
+
+### 8.4 Why this is enough
+
+The substrate gives the frontend everything it needs to render the device's UI without distribution-specific assumptions:
+
+- Every admitted theme / shell / pack is queryable.
+- The active selection is queryable and reactively notifying.
+- Operator activate verbs work over the same wire surface every other operator op uses.
+- Trust verification, signature checking, and trust-class enforcement apply uniformly to artefact bundles — the renderer trusts what the registry contains because admission already enforced the gauntlet.
+
+A vendor-specific renderer composes themes, shells, and packs into the device's visible UI. The framework's job is to enforce the admission contract and surface the queryable + reactive substrate. The renderer's job is to consume them.
+
+## 9. What a Frontend Must Not Do
 
 The framework imposes one constraint on frontends: they must not address plugins directly. Every interaction with a plugin goes through the steward via the client socket. The bridge pattern preserves this: the bridge talks to the steward through its own client socket, not to plugins via shortcut paths.
 
@@ -320,7 +358,7 @@ In practice, this rules out:
 
 If a frontend needs something a plugin has but the steward does not expose, the fix is to widen the plugin's request interface (a new `request_type`), not to bypass the steward. This is the same discipline that keeps the plugin ecosystem coordination-free.
 
-## 9. Security and Trust
+## 10. Security and Trust
 
 Security considerations for frontends are deployment-shape-specific:
 
@@ -335,7 +373,7 @@ Security considerations for frontends are deployment-shape-specific:
 
 The steward itself has no authentication layer. Every security boundary is at a bridge plugin. This is a deliberate split: the steward is the trusted core; the bridge is the distribution-specific policy enforcement point. A distribution that gets its bridges right can safely expose the device anywhere; a distribution that skips the bridge layer must keep the steward strictly local.
 
-## 10. Non-Prescription
+## 11. Non-Prescription
 
 This document names technologies, patterns, and combinations. It does not prescribe any of them. A distribution is sovereign over:
 
@@ -348,7 +386,7 @@ This document names technologies, patterns, and combinations. It does not prescr
 
 The framework provides: a stable client protocol, a plugin SDK, a documented boundary, and reference examples. What you build on top of those is yours.
 
-## 11. Further Reading
+## 12. Further Reading
 
 - `BOUNDARY.md` section 6 - frontend is a distribution component.
 - `CLIENT_API.md` - the protocol every frontend speaks, with language examples.

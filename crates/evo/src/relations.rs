@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! The relation graph.
 //!
 //! Implements the contract specified in
@@ -46,7 +49,7 @@
 //! - Provenance tracking (section 11): every claim carries claimant,
 //!   timestamp, and optional reason.
 //!
-//! ## What's deferred
+//! ## What's not currently in this module
 //!
 //! - Persistence to disk (section 13).
 //! - Relation happenings stream (section 14): custody, cardinality,

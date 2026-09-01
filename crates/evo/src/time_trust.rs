@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Framework-owned trust signal over the OS-synchronised wall-clock.
 //!
 //! The framework does not run an NTP / PTP / GPS client; OS daemons
@@ -131,7 +134,7 @@ pub const CLOCK_JUMP_THRESHOLD_SECS: i64 = 2;
 /// `T2.time-trust-untrusted-on-no-ntp` to exercise the framework's
 /// state-machine response (Trusted → Stale → Untrusted +
 /// `ClockTrustChanged`) deterministically, without tampering with
-/// the host's real clock state on the validation rig.
+/// the host's real clock state.
 ///
 /// The framework's adjtimex syscall path is unit-tested separately
 /// in `evo-os-clock`; this env exercises only the state-machine
@@ -146,7 +149,7 @@ const ENV_FORCE_UNSYNCED: &str = "EVO_TIME_TRUST_FORCE_UNSYNCED";
 /// [`ENV_FORCE_UNSYNCED`] on, so the eventual transition to
 /// Untrusted is a real state change (and emits
 /// `ClockTrustChanged`) rather than a same-state no-op. Necessary
-/// on validation rigs whose kernel reports `STA_UNSYNC` despite a
+/// on hosts whose kernel reports `STA_UNSYNC` despite a
 /// running NTP daemon — the framework would otherwise sit at
 /// boot-Untrusted and never emit a transition. When both
 /// FORCE_SYNCED and FORCE_UNSYNCED are set, FORCE_UNSYNCED wins
@@ -236,6 +239,56 @@ pub fn new_shared() -> SharedTimeTrust {
     Arc::new(RwLock::new(TimeTrust::Untrusted))
 }
 
+/// Snapshot of the most recent detected wall-clock jump.
+/// Persisted across state transitions so an operator polling
+/// `describe_capabilities` sees the magnitude of any recent NTP
+/// step even after the tracker has returned from `Adjusting`
+/// to `Trusted`. Without this, an 11-second correction reads as
+/// a single-poll `Adjusting` blip followed by silence — a
+/// silent-surface class that hides real clock instability from
+/// operators of trust-critical devices (ledger, peer-trust
+/// chain, appointments).
+///
+/// Reset never happens automatically; the last-observed jump
+/// stays visible until the steward restarts or another jump
+/// overwrites it. Consumers wanting a change-driven signal
+/// subscribe to the durable `ClockAdjusted` happening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastClockStep {
+    /// Signed magnitude of the wall-clock jump. Positive =
+    /// clock stepped forward; negative = stepped backward.
+    pub delta_seconds: i64,
+    /// Wall-clock instant the step was detected, as unix
+    /// millis. Read by `describe_capabilities` and rendered by
+    /// operator tools as a human-readable timestamp.
+    pub at_ms: u64,
+}
+
+/// Shared last-clock-step slot. Populated by the time-trust
+/// tracker whenever it detects a wall-clock jump; read by the
+/// server's `describe_capabilities` handler to surface the most
+/// recent adjustment on every capability poll.
+pub type SharedLastClockStep = Arc<RwLock<Option<LastClockStep>>>;
+
+/// Construct an initial shared last-clock-step handle. Boot
+/// starts with no recorded step; the first jump populates it.
+pub fn new_shared_last_step() -> SharedLastClockStep {
+    Arc::new(RwLock::new(None))
+}
+
+/// Synchronous non-blocking read of the current last-step
+/// snapshot. Matches the [`current_trust`] convenience so the
+/// `describe_capabilities` handler (synchronous context) can
+/// read both slots without `.await`. `None` if the read lock is
+/// contended at the exact instant of the call — treated as "no
+/// recorded step" (the tracker will re-populate on its next
+/// detected jump).
+pub fn current_last_step(
+    shared: &SharedLastClockStep,
+) -> Option<LastClockStep> {
+    shared.try_read().ok().and_then(|guard| *guard)
+}
+
 /// Synchronous accessor for the current trust state.
 ///
 /// The describe-capabilities handler runs in synchronous context
@@ -289,6 +342,7 @@ impl Default for TrackerConfig {
 /// returns when `shutdown` is notified.
 pub async fn run_tracker(
     shared: SharedTimeTrust,
+    last_step: SharedLastClockStep,
     bus: Arc<HappeningBus>,
     config: TrackerConfig,
     shutdown: Arc<tokio::sync::Notify>,
@@ -307,6 +361,7 @@ pub async fn run_tracker(
             _ = interval.tick() => {
                 tick(
                     &shared,
+                    &last_step,
                     &bus,
                     &config,
                     &mut last_observed_synced_at,
@@ -323,6 +378,7 @@ pub async fn run_tracker(
 /// [`run_tracker`] glues this to a `tokio::interval`.
 async fn tick(
     shared: &SharedTimeTrust,
+    last_step: &SharedLastClockStep,
     bus: &Arc<HappeningBus>,
     config: &TrackerConfig,
     last_observed_synced_at: &mut Option<SystemTime>,
@@ -336,9 +392,8 @@ async fn tick(
     // clock source, otherwise the staleness check
     // (`SystemTime::now().duration_since(at)`) can report a
     // negative duration when the two sources disagree. Linux
-    // adjtimex's `timex.time` field has been observed (Pi 5,
-    // Trixie 13.4, kernel 6.12) to drift from
-    // clock_gettime(CLOCK_REALTIME) by tens of seconds to tens
+    // adjtimex's `timex.time` field has been observed to drift
+    // from clock_gettime(CLOCK_REALTIME) by tens of seconds to tens
     // of minutes depending on NTP discipline state, large enough
     // that storing the kernel's reported time and comparing it
     // against SystemTime::now() later would silently break the
@@ -446,10 +501,26 @@ async fn tick(
     }
 
     if let Some(delta) = clock_jump_delta_secs {
+        let jump_at = SystemTime::now();
+        // Record the jump on the durable last-step slot BEFORE
+        // emitting the happening, so a subscriber reacting to
+        // `ClockAdjusted` can already read the same value via
+        // `describe_capabilities`.
+        let at_ms = jump_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        {
+            let mut guard = last_step.write().await;
+            *guard = Some(LastClockStep {
+                delta_seconds: delta,
+                at_ms,
+            });
+        }
         let _ = bus
             .emit_durable(Happening::ClockAdjusted {
                 delta_seconds: delta,
-                at: SystemTime::now(),
+                at: jump_at,
             })
             .await;
     }
@@ -654,6 +725,7 @@ mod tests {
 
         tick(
             &shared,
+            &new_shared_last_step(),
             &bus,
             &config,
             &mut last_synced_at,
@@ -690,6 +762,7 @@ mod tests {
 
         tick(
             &shared,
+            &new_shared_last_step(),
             &bus,
             &config,
             &mut last_synced_at,
@@ -737,6 +810,7 @@ mod tests {
 
         tick(
             &shared,
+            &new_shared_last_step(),
             &bus,
             &config,
             &mut last_synced_at,
@@ -778,6 +852,7 @@ mod tests {
 
         tick(
             &shared,
+            &new_shared_last_step(),
             &bus,
             &config,
             &mut last_synced_at,
@@ -823,6 +898,7 @@ mod tests {
 
         tick(
             &shared,
+            &new_shared_last_step(),
             &bus,
             &config,
             &mut last_synced_at,
@@ -863,6 +939,7 @@ mod tests {
 
         tick(
             &shared,
+            &new_shared_last_step(),
             &bus,
             &config,
             &mut last_synced_at,
@@ -907,6 +984,7 @@ mod tests {
 
         tick(
             &shared,
+            &new_shared_last_step(),
             &bus,
             &config,
             &mut last_synced_at,
@@ -930,5 +1008,112 @@ mod tests {
             );
         }
         std::env::remove_var(ENV_FORCE_UNSYNCED);
+    }
+
+    // ------------------------------------------------------------
+    // LastClockStep surface tests
+    // ------------------------------------------------------------
+
+    #[test]
+    fn new_shared_last_step_starts_empty() {
+        let slot = new_shared_last_step();
+        assert!(
+            current_last_step(&slot).is_none(),
+            "boot must start with no recorded step"
+        );
+    }
+
+    #[tokio::test]
+    async fn last_step_populates_via_write_guard_and_reads_via_current() {
+        let slot = new_shared_last_step();
+        {
+            let mut guard = slot.write().await;
+            *guard = Some(LastClockStep {
+                delta_seconds: 11,
+                at_ms: 1_786_300_000_000,
+            });
+        }
+        let snap = current_last_step(&slot).expect("populated");
+        assert_eq!(snap.delta_seconds, 11);
+        assert_eq!(snap.at_ms, 1_786_300_000_000);
+    }
+
+    #[tokio::test]
+    async fn last_step_overwrites_on_subsequent_jump() {
+        // Later jump replaces earlier one — the surface is a
+        // durable "most recent" snapshot, not a history log.
+        // Consumers wanting a stream subscribe to the durable
+        // ClockAdjusted happening.
+        let slot = new_shared_last_step();
+        {
+            let mut g = slot.write().await;
+            *g = Some(LastClockStep {
+                delta_seconds: 3,
+                at_ms: 100,
+            });
+        }
+        {
+            let mut g = slot.write().await;
+            *g = Some(LastClockStep {
+                delta_seconds: -8,
+                at_ms: 200,
+            });
+        }
+        let snap = current_last_step(&slot).unwrap();
+        assert_eq!(snap.delta_seconds, -8);
+        assert_eq!(snap.at_ms, 200);
+    }
+
+    #[tokio::test]
+    async fn last_step_survives_state_machine_transition_out_of_adjusting() {
+        // Property under regression: after the tracker returns
+        // from `Adjusting` to `Trusted` (the pre-fix behaviour
+        // where the operator-facing signal disappeared on the
+        // next poll), the LastClockStep slot MUST still carry
+        // the magnitude. Simulated via direct writes because
+        // driving the real tracker through adjtimex is out of
+        // scope for a unit test.
+        let trust = new_shared();
+        let last = new_shared_last_step();
+
+        // Simulate a jump detected in one poll.
+        {
+            let mut g = trust.write().await;
+            *g = TimeTrust::Adjusting {
+                last_sync_at: SystemTime::UNIX_EPOCH,
+            };
+        }
+        {
+            let mut g = last.write().await;
+            *g = Some(LastClockStep {
+                delta_seconds: 11,
+                at_ms: 1_786_300_000_000,
+            });
+        }
+
+        // Tracker returns to Trusted on the next poll.
+        {
+            let mut g = trust.write().await;
+            *g = TimeTrust::Trusted {
+                last_sync_at: SystemTime::UNIX_EPOCH,
+            };
+        }
+
+        // LastClockStep is still visible — the operator polling
+        // describe_capabilities after the return-to-Trusted
+        // still sees the magnitude.
+        let snap = current_last_step(&last).expect("still populated");
+        assert_eq!(snap.delta_seconds, 11);
+    }
+
+    #[test]
+    fn last_clock_step_serializes_with_expected_wire_shape() {
+        let s = LastClockStep {
+            delta_seconds: -7,
+            at_ms: 1_786_300_123_456,
+        };
+        let v = serde_json::to_value(s).unwrap();
+        assert_eq!(v["delta_seconds"].as_i64(), Some(-7));
+        assert_eq!(v["at_ms"].as_u64(), Some(1_786_300_123_456));
     }
 }

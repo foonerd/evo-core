@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end tests for plugin discovery.
 //!
 //! Exercises [`plugin_discovery::discover_and_admit`], the walker the
@@ -151,6 +154,33 @@ response_budget_ms = 1000
 
     std::fs::write(bundle_dir.join("manifest.toml"), manifest_text)
         .expect("writing test manifest.toml");
+    write_privileges(bundle_dir, "org.evo.example.echo");
+}
+
+/// Write a minimal `privileges.yaml` next to the manifest so the
+/// steward's compulsory admission-time OS-dependency parity gate
+/// finds the record it requires. `has_os_dependencies: false`
+/// matches the echo plugin's actual runtime footprint (no
+/// external binaries), so the gate returns Ok immediately.
+fn write_privileges(bundle_dir: &Path, plugin_name: &str) {
+    let yaml = format!(
+        r#"schema_version: "1.0"
+plugin: {plugin_name}
+owner: evo-framework-core
+isolation: oop
+has_os_dependencies: false
+capability_intent: []
+required_binaries: []
+required_kernel_modules: []
+required_system_services: []
+verification:
+  commands: ["true"]
+  expected: ["fixture: parity gate reads empty required_* vectors"]
+host_provisioning: {{}}
+"#
+    );
+    std::fs::write(bundle_dir.join("privileges.yaml"), yaml)
+        .expect("writing test privileges.yaml");
 }
 
 /// Build a `StewardConfig` whose `[plugins]` section points at the
@@ -259,6 +289,8 @@ async fn discover_and_admit_staged_layout() {
         deadline: None,
 
         instance_id: None,
+        principal_scope: None,
+        has_step_up: false,
     };
     let resp = tokio::time::timeout(
         REQUEST_TIMEOUT,
@@ -311,6 +343,8 @@ async fn discover_and_admit_flat_layout() {
         deadline: None,
 
         instance_id: None,
+        principal_scope: None,
+        has_step_up: false,
     };
     let resp = tokio::time::timeout(
         REQUEST_TIMEOUT,

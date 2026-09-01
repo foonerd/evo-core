@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 #![allow(missing_docs)]
 //! Adaptive acceptance harness: target descriptor + scenario plan in,
 //! readiness report out.

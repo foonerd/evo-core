@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: Apache-2.0
+
 //! Plugin name against prefix patterns in `name_prefixes`.
 
 use evo_plugin_sdk::manifest::TrustClass;

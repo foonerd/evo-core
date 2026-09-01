@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Synthetic watch-cooldown-burst plugin.
 //!
 //! Exercises `WatchTrigger::Level { cooldown_ms }` against a
@@ -243,7 +246,7 @@ impl Plugin for WatchCooldownBurstPlugin {
 
 impl Respondent for WatchCooldownBurstPlugin {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         async move {

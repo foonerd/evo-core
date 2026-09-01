@@ -1,0 +1,53 @@
+# Catalogue of the framework's validation distribution.
+#
+# A distribution is a curated catalogue plus plugin set plus
+# branding (CONCEPT.md section 1.1). This catalogue declares the
+# concerns of the framework's own validation distribution: the
+# instance shipped on prototype hardware to exercise the fabric
+# end-to-end without coupling to a domain distribution.
+#
+# Slots declared here are stocked by plugins curated for this
+# distribution. The fabric rule "PLUGINS stock slots" is honoured:
+# every shelf below has a corresponding plugin in the distribution's
+# plugin set. Adding a shelf requires adding a plugin to stock it
+# (or removing the shelf).
+#
+# This distribution is distinct from:
+#   - evo-example-distribution (skeleton catalogue + example.* racks
+#     for in-tree reference plugins).
+#   - evo-device-audio (the audio-player domain reference distribution).
+#   - any vendor distribution.
+#
+# The validation distribution exists so the framework project itself
+# can run the fabric on real hardware against synthetic plugins
+# purpose-built for end-to-end exercise.
+
+schema_version = 1
+
+# Acceptance rack: synthetic fixtures purpose-built to exercise
+# specific framework behaviours from the acceptance test plan.
+# Plugins stocking this rack live under
+# `crates/evo-acceptance-synthetic` and are signed by the
+# acceptance signing key. Their canonical names live under the
+# `org.evoframework.acceptance.*` namespace.
+[[racks]]
+name = "acceptance"
+family = "domain"
+kinds = ["registrar"]
+charter = "Synthetic fixtures that exercise the fabric end-to-end on real hardware. Each shelf is stocked by a plugin under crates/evo-acceptance-synthetic curated for one specific framework behaviour."
+
+# test-source: stocked by org.evoframework.acceptance.synthetic-test-source.
+# Owns the `evo-test` URI scheme; handles play_now / play_now_collection /
+# stop verbs; emits typed Happening::AudioPlaybackEnded after a
+# configurable simulated-playback delay so plans with
+# SegmentDuration::UntilCompletion observe natural end-of-playback
+# without depending on real audio rendering.
+[[racks.shelves]]
+name = "test-source"
+shape = 1
+description = "Synthetic source-plugin shelf. Stocked by the test-source plugin to drive end-to-end plan-firing-with-real-source verification."
+
+# Subjects this distribution declares. The track type is what
+# plays through the test-source plugin.
+[[subjects]]
+name = "track"

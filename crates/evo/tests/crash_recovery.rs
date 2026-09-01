@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Persistence crash-recovery integration test.
 //!
 //! Spawns the `crash_writer` example as a child process so that

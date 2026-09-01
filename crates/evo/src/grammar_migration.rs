@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Subject-grammar migration runtime — orchestrates the
 //! `migrate_grammar_orphans` verb.
 //!
@@ -178,7 +181,7 @@ pub async fn scan_grammar_orphans(
 
 /// Operator-issued migration strategy. `Rename` is fully
 /// implemented; `Map` and `Filter` are wire-stable but their
-/// runtime evaluators are deferred because both require
+/// runtime evaluators are not yet wired because both require
 /// projection-engine access for the `discriminator_field` /
 /// `predicate` look-up. Today the runtime refuses calls under
 /// those strategies with
@@ -377,8 +380,8 @@ pub async fn migrate_grammar_orphans(
     }
 
     // 2. Refuse undeclared target types. Map / Filter route
-    //    to a deferred branch below; we only validate the
-    //    Rename target here.
+    //    to the not-yet-implemented branch below; we only
+    //    validate the Rename target here.
     let to_type = match &request.strategy {
         MigrationStrategy::Rename { to_type } => to_type.clone(),
         MigrationStrategy::Map { .. } => {
@@ -425,9 +428,9 @@ pub async fn migrate_grammar_orphans(
     }
 
     // 4. Walk every persisted subject and select the ones
-    //    matching from_type. The first cut uses
-    //    load_all_subjects + filter; the streaming-paginated
-    //    accessor lands in a follow-up so dry-runs against
+    //    matching from_type. This implementation uses
+    //    load_all_subjects + filter; a streaming-paginated
+    //    accessor is a follow-on primitive so dry-runs against
     //    huge installations stay constant-memory. `max_subjects`
     //    truncates the candidate set so the operator can chunk
     //    a large migration across windows.
@@ -507,21 +510,29 @@ pub async fn migrate_grammar_orphans(
             .await?;
         // Emit the per-subject SubjectMigrated events after the
         // batch has committed so consumers observing the event
-        // see the post-state. Same emission ordering as merge /
-        // split.
-        for (subject, new_id) in batch.iter().zip(new_ids) {
-            let _ = bus
-                .emit_durable(Happening::SubjectMigrated {
-                    old_id: subject.id.clone(),
-                    new_id,
-                    from_type: request.from_type.clone(),
-                    to_type: to_type.clone(),
-                    migration_id: migration_id.clone(),
-                    at: SystemTime::now(),
-                })
-                .await;
-            migrated += 1;
-        }
+        // see the post-state. Single-fsync batched emit — one
+        // `emit_durable` per subject would produce N fsyncs
+        // regardless of the batch above, dominating wall-clock
+        // at storage-latency-times-N (measured 61s vs <10s NVMe
+        // budget on 50k). `emit_durable_batch` writes all N
+        // under one persistence transaction and broadcasts each
+        // row in supplied order after the batch commits.
+        let now = SystemTime::now();
+        let events: Vec<Happening> = batch
+            .iter()
+            .zip(new_ids)
+            .map(|(subject, new_id)| Happening::SubjectMigrated {
+                old_id: subject.id.clone(),
+                new_id,
+                from_type: request.from_type.clone(),
+                to_type: to_type.clone(),
+                migration_id: migration_id.clone(),
+                at: now,
+            })
+            .collect();
+        let events_len = events.len() as u64;
+        let _ = bus.emit_durable_batch(events).await;
+        migrated += events_len;
         let _ = bus
             .emit_durable(Happening::GrammarMigrationProgress {
                 migration_id: migration_id.clone(),

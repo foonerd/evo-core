@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Just a Nerd
+// SPDX-License-Identifier: BUSL-1.1
+
 //! Concurrency proof: dispatch through the [`PluginRouter`] does not
 //! serialise on the admission-engine mutex.
 //!
@@ -166,7 +169,7 @@ impl Plugin for SlowRespondent {
 
 impl Respondent for SlowRespondent {
     fn handle_request<'a>(
-        &'a mut self,
+        &'a self,
         req: &'a Request,
     ) -> impl Future<Output = Result<Response, PluginError>> + Send + 'a {
         let tracker = Arc::clone(&self.tracker);
@@ -468,25 +471,27 @@ async fn wait_for_socket(
 }
 
 // ---------------------------------------------------------------------
-// Same-shelf serialisation pin.
+// Same-shelf concurrent-dispatch pin (LAYER A retired).
 //
-// Two requests on the SAME shelf MUST serialise on the
-// `entry.handle: AsyncMutex` because the underlying `&mut self`
-// shape on `Respondent::handle_request` cannot accept overlapping
-// invocations. The cross-shelf overlap is covered by the existing
-// concurrent_requests_to_different_plugins_run_in_parallel test
-// above; this complementary case pins the negative side: same-shelf
-// requests must NOT overlap.
+// Under the framework's concurrent-dispatch contract
+// (Respondent::handle_request is `&self`; router entry.handle is
+// RwLock), two requests on the SAME shelf overlap — the router's
+// read guard permits many concurrent handle_request calls on one
+// plugin. This is the Sources-freeze-bug fix's fingerprint:
+// pre-fix (AsyncMutex on entry.handle across the await) a
+// mutation awaiting a credential prompt froze peer reads on the
+// same shelf; post-fix (RwLock, read guard released per
+// handler) peer reads proceed.
 //
-// The proof is symmetric to the cross-shelf case: with handler
-// sleep S, sequential dispatch produces wall time >= 2*S; concurrent
-// dispatch produces wall time near S. We assert wall time is at
-// least the sequential floor for two same-shelf requests, which is
-// only possible if the per-entry mutex prevented overlap.
+// The proof mirrors the cross-shelf overlap test: with handler
+// sleep S, LAYER-A-retired dispatch produces wall time near S
+// even for two same-shelf requests, and the OverlapTracker
+// records overlap where the pre-fix code would have serialised
+// on entry.handle: AsyncMutex.
 // ---------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_requests_to_same_shelf_serialise_on_entry_mutex() {
+async fn concurrent_requests_to_same_shelf_overlap_under_layer_a_retired() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let socket_path = tmp.path().join("evo.sock");
 
@@ -588,17 +593,19 @@ async fn concurrent_requests_to_same_shelf_serialise_on_entry_mutex() {
         "response 2 missing payload_b64: {v2}"
     );
 
-    // Sequential floor: 2 handlers x 100ms each = 200ms minimum
-    // when serialised on the per-entry mutex. The overlap test above
-    // proved wall time can be << 200ms when two distinct entries are
-    // hit; here we want the opposite — wall time must be at or above
-    // the sequential floor, with slack for scheduler/IO jitter.
+    // Sequential floor is 2 handlers × 100 ms = 200 ms. Post-
+    // LAYER-A wall time is near 100 ms because the router's
+    // RwLock read guards let both handlers run concurrently on
+    // the same plugin. If this fires, the router's entry.handle
+    // is again holding an exclusive lock across handle_request's
+    // await — LAYER A has regressed.
     assert!(
-        wall_elapsed >= Duration::from_millis(190),
-        "two same-shelf requests took {wall_elapsed:?}; expected at \
-         least ~200ms (the per-entry mutex must serialise them). If \
-         this fires, the entry handle: AsyncMutex no longer enforces \
-         the &mut self contract on Respondent::handle_request"
+        wall_elapsed < Duration::from_millis(180),
+        "two same-shelf requests took {wall_elapsed:?}; expected \
+         well under 200 ms (concurrent dispatch via router \
+         RwLock read guards). If this exceeds the sequential \
+         floor, LAYER A has regressed — the router is again \
+         serialising handle_request on entry.handle"
     );
 
     drop(s1);
