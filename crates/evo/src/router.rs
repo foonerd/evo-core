@@ -146,7 +146,7 @@ pub struct PluginEntry {
     /// [`unload_handle`] takes it during drain.
     ///
     /// Behind a [`tokio::sync::RwLock`] so concurrent
-    /// [`handle_request`] calls on the same plugin can hold a
+    /// `handle_request` calls on the same plugin can hold a
     /// shared read guard across the plugin's `.await` — the
     /// framework's concurrent-dispatch contract (LAYER A retired,
     /// see the "Concurrency" section in
@@ -276,7 +276,7 @@ pub struct EnforcementPolicy {
     /// the dispatcher treats an absent or `VerbCapability::None`
     /// entry as anonymous-OK (legacy behaviour preserved).
     ///
-    /// Consulted by [`crate::server::handle_plugin_request`] before
+    /// Consulted by `crate::server::handle_plugin_request` before
     /// it forwards a request through this router; a failed gate
     /// check refuses with the structured `permission_denied` error
     /// and never reaches the plugin.
@@ -1150,14 +1150,16 @@ impl PluginRouter {
         shelf: &str,
         mut request: Request,
     ) -> Result<Response, StewardError> {
-        // Per `docs/engineering/LOGGING.md` §2: every verb
-        // invocation emits debug. The router is the cross-plugin
-        // dispatch entry — every framework-mediated request from
-        // operator → plugin or plugin → plugin lands here. The
-        // payload body is excluded; consumers needing it filter
-        // by cid and inspect downstream debug logs in the
-        // plugin's wire-side announcer / handler.
-        tracing::debug!(
+        // Every verb invocation emits trace. The router is the
+        // cross-plugin dispatch entry — every framework-mediated
+        // request from operator → plugin or plugin → plugin
+        // lands here. Payload body is excluded; consumers
+        // needing it filter by cid and inspect downstream trace
+        // logs in the plugin's wire-side announcer / handler.
+        // TRACE (not DEBUG) so per-verb dispatch — which fires
+        // at UI subject-refresh cadence — stays off default
+        // journals and remains reachable under `RUST_LOG=trace`.
+        tracing::trace!(
             shelf = %shelf,
             request_type = %request.request_type,
             cid = request.correlation_id,
@@ -1306,11 +1308,11 @@ impl PluginRouter {
                     )));
                 }
             };
-            // Per LOGGING.md §2 (each verb invocation fires at debug):
-            // entry-debug for the warden's take_custody verb. The
-            // happening + info-level lifecycle line lands further
-            // down once the ledger row is written.
-            tracing::debug!(
+            // Per LOGGING.md §2 (each verb invocation fires at
+            // trace): entry-trace for the warden's take_custody
+            // verb. The happening + info-level lifecycle line
+            // lands further down once the ledger row is written.
+            tracing::trace!(
                 plugin = %plugin_name,
                 shelf = %shelf_qualified,
                 custody_type = %custody_type_for_ledger,
@@ -1322,7 +1324,7 @@ impl PluginRouter {
                 .take_custody(assignment)
                 .await
                 .map_err(StewardError::from);
-            tracing::debug!(
+            tracing::trace!(
                 plugin = %plugin_name,
                 shelf = %shelf_qualified,
                 cid = correlation_id,
@@ -1594,9 +1596,9 @@ impl PluginRouter {
             }
         };
 
-        // Per LOGGING.md §2: course_correct is a verb invocation;
-        // bracket with debug entry/return.
-        tracing::debug!(
+        // Per LOGGING.md §2: course_correct is a verb
+        // invocation; bracket with trace entry/return.
+        tracing::trace!(
             shelf = %shelf,
             handle_id = %handle.id,
             correction_type = %correction.correction_type,
@@ -1630,7 +1632,7 @@ impl PluginRouter {
                 .await
                 .map_err(Into::into),
         };
-        tracing::debug!(
+        tracing::trace!(
             shelf = %shelf,
             duration_ms = cc_start.elapsed().as_millis() as u64,
             outcome = if result.is_ok() { "ok" } else { "err" },
@@ -1747,9 +1749,9 @@ impl PluginRouter {
                 }
             };
 
-            // Per LOGGING.md §2: warden release_custody is a verb
-            // invocation; bracket with debug entry/return.
-            tracing::debug!(
+            // Per LOGGING.md §2: warden release_custody is a
+            // verb invocation; bracket with trace entry/return.
+            tracing::trace!(
                 plugin = %plugin_name,
                 shelf = %shelf,
                 handle_id = %handle.id,
@@ -1760,7 +1762,7 @@ impl PluginRouter {
                 .release_custody(handle)
                 .await
                 .map_err(StewardError::from);
-            tracing::debug!(
+            tracing::trace!(
                 plugin = %plugin_name,
                 shelf = %shelf,
                 handle_id = %handle_id,

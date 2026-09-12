@@ -113,6 +113,12 @@ pub struct StewardState {
     /// failed; the mint wire-op refuses with a descriptive error
     /// in that state.
     pub bearer_token_issuer: OnceLock<Arc<BearerTokenIssuer>>,
+    /// Ids of live kiosk-minted bearers, written by the kiosk socket
+    /// handler after a successful mint and read by the
+    /// household-protection dispatch gate. See
+    /// [`crate::kiosk_session::KioskBearerRegistry`] for why the
+    /// discriminator lives here rather than on the token.
+    pub kiosk_bearers: Arc<crate::kiosk_session::KioskBearerRegistry>,
     /// Operator credential inventory store. Each minted
     /// bearer token persists a [`evo_auth_bearer::CredentialRecord`]
     /// here so the operator can list, revoke, and audit
@@ -339,6 +345,9 @@ impl StewardStateBuilder {
                 .conflict_index
                 .unwrap_or_else(|| Arc::new(SubjectConflictIndex::new())),
             bearer_token_issuer: OnceLock::new(),
+            kiosk_bearers: Arc::new(
+                crate::kiosk_session::KioskBearerRegistry::new(),
+            ),
             credential_store: OnceLock::new(),
             revocation_list: OnceLock::new(),
             credential_vault: OnceLock::new(),
@@ -371,6 +380,9 @@ impl StewardState {
     /// subject-type, or relation-predicate validation.
     pub fn for_tests_with_catalogue(catalogue: Arc<Catalogue>) -> Arc<Self> {
         Arc::new(Self {
+            kiosk_bearers: Arc::new(
+                crate::kiosk_session::KioskBearerRegistry::new(),
+            ),
             catalogue: arc_swap::ArcSwap::new(catalogue),
             subjects: Arc::new(SubjectRegistry::new()),
             relations: Arc::new(RelationGraph::new()),

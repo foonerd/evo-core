@@ -305,7 +305,7 @@ pub fn negotiate_format(
 }
 
 /// Plugin-side handle for the streaming wire primitive. Plugins
-/// receive an `Arc<dyn StreamHost>` on their [`LoadContext`] (gated
+/// receive an `Arc<dyn StreamHost>` on their `LoadContext` (gated
 /// by the `streams` capability flag in the manifest); the handle
 /// proxies producer-side operations onto the framework's
 /// in-memory stream coordinator. Consumers (UI clients, other

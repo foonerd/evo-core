@@ -12,7 +12,7 @@
 //!
 //! The shipped JSON Schema at `schemas/privileges.v1.json` is the canonical
 //! contract for IDE / external tooling. The Rust types here, together with
-//! the [`validator`] module, are the framework's independent enforcement.
+//! the `validator` module, are the framework's independent enforcement.
 //!
 //! ## Loading a record
 //!

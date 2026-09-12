@@ -10,7 +10,7 @@
 //! Every projection layer (REST, WebSocket, gRPC, GraphQL,
 //! HTTP/3) calls into this crate to verify the inbound
 //! operator credential against the dispatched wire op's
-//! [`CapabilityRequirement`]. Tokens are issued by the
+//! [`evo_projection_core::CapabilityRequirement`]. Tokens are issued by the
 //! framework's auth layer (typically after a successful
 //! step-up flow), carry the operator's capability set
 //! inline, and are signed by a per-device ed25519 key the

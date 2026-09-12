@@ -11,7 +11,7 @@
 //!
 //! # Rule
 //!
-//! Given a plugin whose catalogue [`Target`] declares `shelf
+//! Given a plugin whose catalogue `Target` declares `shelf
 //! = "metadata.providers"`:
 //!
 //! 1. Look up `metadata.providers` in the [`ShelfRegistry`].

@@ -302,6 +302,30 @@ impl AssetCache for FilesystemAssetCache {
         })
     }
 
+    fn has<'a>(
+        &'a self,
+        content_hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, AssetCacheError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            Self::validate_hash(content_hash)?;
+            // stat-only probe: a full `get` would fault the
+            // whole payload into memory just to answer a
+            // yes/no question. Callers here — the resolve-
+            // index short-circuit in particular — invoke
+            // `has` per browse tile; reading a 100 kB thumb
+            // per tile just to validate mapping freshness
+            // would burn library-scale I/O for no purpose.
+            let path = self.path_for(content_hash);
+            match tokio::fs::metadata(&path).await {
+                Ok(meta) if meta.is_file() => Ok(true),
+                Ok(_) => Ok(false),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(AssetCacheError::Io(e)),
+            }
+        })
+    }
+
     fn put<'a>(
         &'a self,
         content_hash: &'a str,

@@ -132,10 +132,6 @@ pub mod admission_policy;
 pub mod appointments;
 pub mod arp;
 pub mod asset_cache;
-pub mod audio_plane;
-pub mod audio_policy;
-pub mod audio_routing;
-pub mod audio_topology;
 pub mod audit;
 pub mod auth;
 pub mod auth_shadow;
@@ -164,8 +160,8 @@ pub mod grammar_migration;
 pub mod group_topology;
 pub mod groups;
 pub mod happenings;
-pub mod hardware_profile;
 pub mod heartbeat;
+pub mod household_protection;
 pub mod http_dispatcher;
 pub mod https_boot;
 pub mod icmp;
@@ -238,7 +234,6 @@ pub mod subjects;
 pub mod sync;
 pub mod tier;
 pub mod time_trust;
-pub mod topology_scoring;
 pub mod trust_ledger;
 pub mod ui_active;
 pub mod ui_convergence;
@@ -285,88 +280,31 @@ pub type AdmissionSetup = Box<
         > + Send,
 >;
 
-/// Context handed to a [`PostAdmissionSetup`] closure. Carries
-/// the framework substrates a distribution-supplied hook
-/// might reach after every plugin has admitted — typically to
-/// publish defaults that seed framework reconciliation engines
-/// from boot rather than waiting for an operator wire-op call.
+/// Context handed to a [`PostAdmissionSetup`] closure.
 ///
-/// ## Boundary discipline
+/// Empty, and deliberately so: this hook is a timing point, not
+/// a substrate handout. A distribution that needs to touch its
+/// own runtimes after admission closes over them from the
+/// [`RuntimeSetup`] closure that built them. Handing framework
+/// substrates back through this context is what let domain
+/// stores accumulate in the engine in the first place.
 ///
-/// The framework owns DATA-PLANE primitives (the substrates
-/// exposed here) but never DOMAIN SEMANTICS (e.g. specific
-/// audio-pipeline shapes, MPD as a source choice, ALSA as a
-/// delivery mechanism, audiophile preferences, distribution-
-/// specific filesystem paths). Each substrate is grouped under
-/// a typed sub-struct named after its data-plane domain
-/// (`audio`, future `plans`, `subjects`, ...); a distribution
-/// wires the groups it cares about and never touches the rest.
-///
-/// Reference-device-tier semantics (e.g. evo-device-audio's
-/// modular ALSA pipeline composition, choice of `pcm.evo` as
-/// the entry name, MPD as the source mechanism) live in the
-/// distribution's post-admission closure that consumes this
-/// context, NOT in the framework substrates the context
-/// exposes.
-///
-/// ## Extending
-///
-/// Both this struct and every substrate sub-struct are
-/// `non_exhaustive`. New fields land as additive evolutions
-/// without a major-version bump:
-///
-/// - To expose a new substrate within an existing domain
-///   (e.g. a future audio-policy store), add a field to the
-///   relevant `*Substrates` sub-struct.
-/// - To expose a new data-plane domain (e.g. plans, group
-///   topology), add a new sub-struct + field to this
-///   `PostAdmissionContext`.
-///
-/// Distributions remain forward-compatible: their closures
-/// access only the substrates they need; new substrates flow
-/// through silently.
+/// `non_exhaustive` so a genuinely framework-owned handle can
+/// be added later without a major-version bump.
 #[non_exhaustive]
-pub struct PostAdmissionContext {
-    /// Framework-tier audio data plane substrates. Audio
-    /// distributions (e.g. evo-device-audio) build + publish
-    /// a default `ActiveAudioTopology` here so the
-    /// route-change reactor cycle in source / delivery
-    /// plugins fires from boot. Non-audio distributions
-    /// ignore this group entirely; the substrates are still
-    /// constructed by the framework but no one consumes them.
-    pub audio: AudioSubstrates,
-}
+pub struct PostAdmissionContext {}
 
-/// Framework-tier audio data plane substrates accessible to
-/// a [`PostAdmissionSetup`] closure.
+/// Distribution-supplied closure invoked AFTER every plugin
+/// has admitted.
 ///
-/// Strictly DATA-PLANE: endpoint negotiation, topology
-/// publish + persistence, format intersection. NO audio
-/// SEMANTICS (codec choice, mixer policy, pipeline modules,
-/// hardware-specific paths). Those belong to the reference
-/// device distribution.
-#[non_exhaustive]
-pub struct AudioSubstrates {
-    /// Audio topology store. Distribution closures call
-    /// `topology_store.publish(active_topology,
-    /// principal_str)` to seed the reconciliation engine
-    /// with a default chain. The store handles persistence
-    /// and per-plugin endpoint propagation through each
-    /// plugin's
-    /// [`crate::audio_routing::RouterAudioRouting`] handle.
-    pub topology_store: Arc<crate::audio_topology::AudioTopologyStore>,
-}
-
-/// Distribution-supplied closure invoked AFTER admission has
-/// completed and AFTER the framework's audio_topology_store
-/// has rehydrated from persistence. Distributions that need to
-/// publish a default audio topology (so the route-change
-/// reactor cycle fires from boot rather than waiting for an
-/// operator wire-op call) provide a closure here.
+/// Distributions use it to seed their own runtimes with the
+/// defaults that make a reconciliation cycle start from boot
+/// rather than waiting for an operator wire-op call — the
+/// runtimes themselves having been built in the earlier
+/// [`RuntimeSetup`] closure, which this one closes over.
 ///
 /// Distinct from [`AdmissionSetup`]: that hook admits plugins;
-/// this hook runs after every plugin has admitted and can
-/// reach across the framework's audio substrates.
+/// this one runs once admission is complete.
 pub type PostAdmissionSetup = Box<
     dyn FnOnce(
             PostAdmissionContext,
@@ -439,16 +377,441 @@ pub struct RuntimeSetupContext {
     /// the framework reads the slot when threading
     /// `LoadContext.multiroom_substrate` during admission.
     pub multiroom_substrate_slot: MultiroomSubstrateSlot,
-    /// Audio-plane runtime handle. Election liveness reads
-    /// channel-activity timestamps from this; the runtime
-    /// wires it post-construction via its own injection
-    /// surface.
-    pub audio_plane_runtime: Arc<audio_plane::AudioPlaneRuntime>,
+    /// Slot the distribution writes its audio plane into, if it
+    /// ships one.
+    ///
+    /// The framework constructs no plane. It holds two faces of
+    /// whatever is installed — a narrow control face for the wire
+    /// ops the steward owns, and the SDK handle plugins consume.
+    /// A vanilla binary leaves both empty.
+    pub audio_plane_slot: AudioPlaneSlot,
+    /// Audio product-plane slot. A distribution that ships
+    /// audio constructs its topology, routing and policy stores
+    /// here and calls [`AudioTopologySlot::set`]. Left empty,
+    /// every audio wire op still registers and answers its
+    /// not-configured degrade.
+    pub audio_topology_slot: AudioTopologySlot,
+
+    /// The domain-witness runtime, once booted.
+    ///
+    /// Supplied so a distribution can bridge its own transport
+    /// into the witness chain. `None` when the witness did not
+    /// boot; a distribution that finds it empty spawns no bridge
+    /// rather than inventing one.
+    pub domain_witness_runtime:
+        Option<Arc<crate::domain_witness::runtime::DomainWitnessRuntime>>,
+
+    /// The multi-carrier announce runtime, once booted.
+    ///
+    /// Same contract as the witness runtime: present so a
+    /// distribution can bridge announce observations into its own
+    /// dial path, `None` when there is nothing to bridge.
+    pub announce_runtime: Option<
+        Arc<crate::domain_witness::announce::MultiCarrierAnnounceRuntime>,
+    >,
+
+    /// Discovery runtime. Framework-owned; a plane needs it to
+    /// learn which peers exist before it can connect to any.
+    pub discovery_runtime: Arc<crate::discovery::DiscoveryRuntime>,
+
+    /// Clock-sync runtime. Framework-owned; a plane feeds sync
+    /// samples into it so receivers can align to a source host.
+    pub clock_sync_runtime: Arc<crate::clock_sync::ClockSyncRuntime>,
+
+    /// Control port the framework advertises for the audio plane.
+    ///
+    /// Operator configuration, read by the framework and handed
+    /// over so a distribution binds its plane to the port the
+    /// steward already announced. Without it the distribution
+    /// would have to guess, and a guess that differs from the
+    /// advertised record is a peer that cannot be dialled.
+    pub multiroom_control_port: u16,
     /// Shutdown registry. The runtime registers its async
     /// shutdown closure into this; the framework's drain
     /// path invokes every registered hook (in registration
     /// order) before the steward returns.
     pub shutdown_registry: RuntimeShutdownRegistry,
+}
+
+/// Why an audio store refused a call.
+///
+/// The steward does not score a chain, so it cannot say what is
+/// wrong with one — it only needs to tell a validation refusal
+/// (the operator sent something the installed policy rejects)
+/// apart from anything else, because those two answer with
+/// different error classes on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioTopologyRefusal {
+    /// The installed policy rejected the input. Carries the
+    /// reason verbatim for the operator.
+    Validation(String),
+    /// Anything else — persistence, encoding, an unavailable
+    /// store.
+    Other(String),
+}
+
+impl std::fmt::Display for AudioTopologyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(m) | Self::Other(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for AudioTopologyRefusal {}
+
+/// What an audio store hands back: a borrowed-for-the-call
+/// future resolving to a value or a refusal.
+pub type AudioStoreFuture<'a, T> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<T, AudioTopologyRefusal>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// The active-topology store, as the steward uses it.
+///
+/// Four methods, because the steward has four call sites: three
+/// wire ops and the group-topology composer. It stores what it
+/// is given and returns it; deciding whether a chain is any good
+/// belongs to whoever installed the store.
+pub trait AudioTopologyControl: Send + Sync {
+    /// Read one target's active topology.
+    fn get<'a>(
+        &'a self,
+        target_key: &'a str,
+    ) -> AudioStoreFuture<'a, Option<crate::server::ActiveAudioTopology>>;
+
+    /// Read every stored topology.
+    fn list(
+        &self,
+    ) -> AudioStoreFuture<'_, Vec<crate::server::ActiveAudioTopology>>;
+
+    /// Store a topology and return it as persisted.
+    fn publish<'a>(
+        &'a self,
+        topology: crate::server::ActiveAudioTopology,
+        principal: &'a str,
+    ) -> AudioStoreFuture<'a, crate::server::ActiveAudioTopology>;
+
+    /// Forget one target's topology.
+    fn clear<'a>(&'a self, target_key: &'a str) -> AudioStoreFuture<'a, ()>;
+}
+
+/// Per-plugin routing, as the steward reaches it.
+///
+/// `role` is an opaque string the steward passes through. It
+/// does not name the roles here: which strings exist is the
+/// installed plane's vocabulary, and an unrecognised one is that
+/// plane's business to refuse.
+pub trait AudioRoutingControl: Send + Sync {
+    /// Mint the SDK routing handle a plugin of this role
+    /// receives on its `LoadContext`.
+    fn handle_for_plugin(
+        &self,
+        plugin_name: &str,
+        role: &str,
+    ) -> Option<Arc<dyn evo_plugin_sdk::contract::audio_routing::AudioRouting>>;
+
+    /// Wire a freshly-admitted plugin's routing handle to the
+    /// sink that fans state changes out over its wire
+    /// connection, and push the current state if there is one.
+    ///
+    /// Called once per admitted audio-capable plugin, after
+    /// `load` completes.
+    fn install_forwarder(
+        &self,
+        local_handle: Arc<
+            dyn evo_plugin_sdk::contract::audio_routing::AudioRouting,
+        >,
+        sink: crate::wire_client::AudioRoutingForwarderSink,
+        plugin_name: String,
+    );
+}
+
+/// Operator policy and volume mode, as the steward's wire ops
+/// read and write them.
+///
+/// Eight methods, matching the eight ops already on the wire.
+pub trait AudioPolicyControl: Send + Sync {
+    /// Read one target's operator policy.
+    fn get_policy<'a>(
+        &'a self,
+        target_key: &'a str,
+    ) -> AudioStoreFuture<'a, Option<crate::server::AudioOperatorPolicyRecord>>;
+
+    /// Read every stored operator policy.
+    fn list_policies(
+        &self,
+    ) -> AudioStoreFuture<'_, Vec<crate::server::AudioOperatorPolicyRecord>>;
+
+    /// Record one target's operator policy.
+    fn put_policy<'a>(
+        &'a self,
+        target_key: &'a str,
+        policy: crate::server::OperatorPolicy,
+        principal: &'a str,
+    ) -> AudioStoreFuture<'a, crate::server::AudioOperatorPolicyRecord>;
+
+    /// Forget one target's operator policy.
+    fn clear_policy<'a>(
+        &'a self,
+        target_key: &'a str,
+    ) -> AudioStoreFuture<'a, ()>;
+
+    /// Read one target's volume mode.
+    fn get_volume_mode<'a>(
+        &'a self,
+        target_key: &'a str,
+    ) -> AudioStoreFuture<'a, Option<crate::server::AudioVolumeModeRecord>>;
+
+    /// Read every stored volume mode.
+    fn list_volume_modes(
+        &self,
+    ) -> AudioStoreFuture<'_, Vec<crate::server::AudioVolumeModeRecord>>;
+
+    /// Record one target's volume mode.
+    fn put_volume_mode<'a>(
+        &'a self,
+        target_key: &'a str,
+        volume_mode: crate::server::VolumeMode,
+        principal: &'a str,
+    ) -> AudioStoreFuture<'a, crate::server::AudioVolumeModeRecord>;
+
+    /// Forget one target's volume mode.
+    fn clear_volume_mode<'a>(
+        &'a self,
+        target_key: &'a str,
+    ) -> AudioStoreFuture<'a, ()>;
+}
+
+/// Operator overrides on hardware profiles, as the steward's
+/// wire ops read and write them.
+///
+/// Four methods, matching the four ops. The steward stores an
+/// override and hands it back; what a tier means, or whether a
+/// DAC's volume stage preserves bit-perfect, is the installed
+/// plane's to know.
+pub trait HardwareProfileControl: Send + Sync {
+    /// Record one target's override.
+    fn put<'a>(
+        &'a self,
+        identity: crate::server::HardwareIdentity,
+        override_: crate::server::HardwareProfileOverride,
+        principal: &'a str,
+    ) -> AudioStoreFuture<'a, crate::server::HardwareProfileOverrideRecord>;
+
+    /// Read one target's override.
+    fn get<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> AudioStoreFuture<
+        'a,
+        Option<crate::server::HardwareProfileOverrideRecord>,
+    >;
+
+    /// Read every stored override.
+    fn list(
+        &self,
+    ) -> AudioStoreFuture<'_, Vec<crate::server::HardwareProfileOverrideRecord>>;
+
+    /// Forget one target's override.
+    fn clear<'a>(&'a self, key: &'a str) -> AudioStoreFuture<'a, ()>;
+}
+
+/// The audio product plane a distribution installs, if it ships
+/// one.
+///
+/// Four faces of one cluster, written together from the
+/// distribution's runtime setup. Empty is a vanilla binary: the
+/// wire ops stay registered and answer their existing
+/// not-configured degrade.
+#[derive(Clone, Default)]
+pub struct AudioTopologySlot {
+    topology: Arc<std::sync::Mutex<Option<Arc<dyn AudioTopologyControl>>>>,
+    routing: Arc<std::sync::Mutex<Option<Arc<dyn AudioRoutingControl>>>>,
+    policy: Arc<std::sync::Mutex<Option<Arc<dyn AudioPolicyControl>>>>,
+    hardware: Arc<std::sync::Mutex<Option<Arc<dyn HardwareProfileControl>>>>,
+}
+
+impl AudioTopologySlot {
+    /// Construct an empty slot.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install all four faces. A second call replaces them.
+    pub fn set(
+        &self,
+        topology: Arc<dyn AudioTopologyControl>,
+        routing: Arc<dyn AudioRoutingControl>,
+        policy: Arc<dyn AudioPolicyControl>,
+        hardware: Arc<dyn HardwareProfileControl>,
+    ) {
+        *self.topology.lock().expect("AudioTopologySlot poisoned") =
+            Some(topology);
+        *self.routing.lock().expect("AudioTopologySlot poisoned") =
+            Some(routing);
+        *self.policy.lock().expect("AudioTopologySlot poisoned") = Some(policy);
+        *self.hardware.lock().expect("AudioTopologySlot poisoned") =
+            Some(hardware);
+    }
+
+    /// The topology store, or `None` on a vanilla binary.
+    pub fn topology(&self) -> Option<Arc<dyn AudioTopologyControl>> {
+        self.topology
+            .lock()
+            .expect("AudioTopologySlot poisoned")
+            .clone()
+    }
+
+    /// The routing runtime, or `None` on a vanilla binary.
+    pub fn routing(&self) -> Option<Arc<dyn AudioRoutingControl>> {
+        self.routing
+            .lock()
+            .expect("AudioTopologySlot poisoned")
+            .clone()
+    }
+
+    /// The policy store, or `None` on a vanilla binary.
+    pub fn policy(&self) -> Option<Arc<dyn AudioPolicyControl>> {
+        self.policy
+            .lock()
+            .expect("AudioTopologySlot poisoned")
+            .clone()
+    }
+
+    /// The hardware-profile store, or `None` on a vanilla
+    /// binary.
+    pub fn hardware(&self) -> Option<Arc<dyn HardwareProfileControl>> {
+        self.hardware
+            .lock()
+            .expect("AudioTopologySlot poisoned")
+            .clone()
+    }
+}
+
+impl std::fmt::Debug for AudioTopologySlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioTopologySlot")
+            .field("installed", &self.topology().is_some())
+            .finish()
+    }
+}
+
+/// What the steward needs from an audio plane to answer wire ops
+/// it owns.
+///
+/// The plane is distribution product and lives outside this crate.
+/// Two methods, because two is what the steward actually calls:
+/// the connection listing behind `list_audio_plane_connections`
+/// and group topology, and the chain-tail request `join_domain`
+/// broadcasts after dialling a peer.
+///
+/// Deliberately not the SDK's `AudioPlaneHandle` — that trait is
+/// the plugin-facing contract and gains nothing from the steward's
+/// reporting needs. Deliberately narrow, too: the plane's message
+/// enum stays on the plane's side of the seam, so a request is
+/// named by what it is rather than by handing the steward a frame
+/// type to construct.
+pub trait AudioPlaneControl: Send + Sync {
+    /// Snapshot every peer connection the plane currently holds.
+    fn list_connections<'a>(
+        &'a self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Vec<crate::server::PeerConnectionInfo>,
+                > + Send
+                + 'a,
+        >,
+    >;
+
+    /// Ask every known peer for its chain from `from_hash_b64`.
+    fn broadcast_domain_witness_request<'a>(
+        &'a self,
+        from_hash_b64: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+}
+
+/// Idle threshold the domain-member listing reports when no plane
+/// is installed.
+///
+/// The plane carries the same value in its own config; this
+/// constant exists so the empty path can answer without a plane to
+/// ask, and so the number an operator reads is one number rather
+/// than a default invented at the call site.
+pub const AUDIO_PLANE_IDLE_REAP_THRESHOLD: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
+/// Both faces of an installed audio plane, written by the
+/// distribution's runtime setup from one concrete runtime.
+///
+/// Empty is both `None`, which is a vanilla binary: the wire ops
+/// stay registered and answer their existing not-configured
+/// degrade rather than disappearing from the surface.
+#[derive(Clone, Default)]
+pub struct AudioPlaneSlot {
+    control: Arc<std::sync::Mutex<Option<Arc<dyn AudioPlaneControl>>>>,
+    handle: Arc<
+        std::sync::Mutex<
+            Option<
+                Arc<
+                    dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle,
+                >,
+            >,
+        >,
+    >,
+}
+
+impl AudioPlaneSlot {
+    /// Construct an empty slot.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install both faces of one runtime. A second call replaces
+    /// the prior values.
+    pub fn set(
+        &self,
+        control: Arc<dyn AudioPlaneControl>,
+        handle: Arc<
+            dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle,
+        >,
+    ) {
+        *self.control.lock().expect("AudioPlaneSlot mutex poisoned") =
+            Some(control);
+        *self.handle.lock().expect("AudioPlaneSlot mutex poisoned") =
+            Some(handle);
+    }
+
+    /// The steward-facing face, or `None` on a vanilla binary.
+    pub fn control(&self) -> Option<Arc<dyn AudioPlaneControl>> {
+        self.control
+            .lock()
+            .expect("AudioPlaneSlot mutex poisoned")
+            .clone()
+    }
+
+    /// The plugin-facing face, or `None` on a vanilla binary.
+    pub fn handle(
+        &self,
+    ) -> Option<Arc<dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle>>
+    {
+        self.handle
+            .lock()
+            .expect("AudioPlaneSlot mutex poisoned")
+            .clone()
+    }
+}
+
+impl std::fmt::Debug for AudioPlaneSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioPlaneSlot")
+            .field("installed", &self.control().is_some())
+            .finish()
+    }
 }
 
 /// Slot the [`RuntimeSetup`] closure writes the concrete
@@ -611,6 +974,101 @@ pub type RuntimeSetup = Box<
         + Send,
 >;
 
+/// Context handed to an [`HttpsSetup`] hookup. Framework
+/// substrate plus an identity — deliberately not a cascade, not a
+/// presenter, and not anything that knows a domain.
+///
+/// The hookup receives the router the framework has finished
+/// building and returns it, having mounted whatever product
+/// surfaces its distribution ships. That is the seam domain HTTP
+/// belongs on: the steward stays domain-neutral fabric, and the
+/// distribution that ships a product owns the routes that serve
+/// it.
+///
+/// Every field here is substrate the framework already owns. If a
+/// future field can only be described in terms of one domain, it
+/// belongs on the far side of this seam instead.
+#[non_exhaustive]
+pub struct HttpsSetupContext {
+    /// The router the framework has finished mounting: schema-driven
+    /// wire ops, TLS, auth, observatory, witness. The hookup adds to
+    /// it and returns it.
+    pub router: evo_runtime_http::Router,
+    /// Request/response dispatch into admitted plugins. A hookup
+    /// composes plugin calls through this rather than calling
+    /// plugins from one another, which the plugin contract forbids.
+    pub dispatcher: Arc<dyn evo_runtime_http::Dispatcher>,
+    /// Content-addressed blob store, when the steward has one wired.
+    /// A distribution that caches bytes puts them here.
+    pub asset_cache:
+        Option<Arc<dyn evo_plugin_sdk::contract::asset_cache::AssetCache>>,
+    /// Bearer-token validator, so hookup-mounted routes gate on the
+    /// same identities as framework routes.
+    pub validator: Arc<evo_auth_bearer::BearerTokenValidator>,
+    /// The happenings bus. A hookup announces its own events here as
+    /// [`happenings::Happening::PluginEvent`] with an opaque
+    /// `event_type` — the steward's event vocabulary does not grow a
+    /// variant per domain.
+    pub bus: Arc<happenings::HappeningBus>,
+    /// Directory the steward keeps its state under. A hookup that
+    /// persists anything sites it here rather than choosing its own
+    /// location.
+    pub state_dir: std::path::PathBuf,
+    /// API path prefix the framework mounted its own routes under,
+    /// so hookup-mounted routes sit in the same space rather than
+    /// hardcoding it.
+    pub api_prefix: String,
+    /// Auth-tier provider, so hookup-mounted routes admit the same
+    /// identities on the same terms as framework routes.
+    pub tier_provider: Arc<dyn evo_runtime_http::AuthTierProvider>,
+    /// Capability set granted to LAN-trusted callers, applied by
+    /// hookup routes exactly as the framework applies it to its own.
+    pub lan_trust_caps: evo_auth_bearer::CapabilitySet,
+    /// The name the distribution claims as the actor for events its
+    /// hookup emits, echoed back from [`HttpsSetup::claimant_name`].
+    ///
+    /// The framework mints a claimant token for whatever string it
+    /// is given and invents nothing. It must not be borrowed from an
+    /// admitted plugin that merely fetches on the hookup's behalf:
+    /// naming the wrong actor is a lie the operator cannot see
+    /// through.
+    pub claimant_name: String,
+}
+
+/// The closure half of an [`HttpsSetup`]. Takes the built router,
+/// returns it.
+pub type HttpsRouterHook = Box<
+    dyn FnOnce(
+            HttpsSetupContext,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = anyhow::Result<evo_runtime_http::Router>>
+                    + Send,
+            >,
+        > + Send,
+>;
+
+/// Distribution-supplied HTTPS hookup — the seam where product
+/// routes attach.
+///
+/// The fifth member of the closure family a distribution uses to
+/// extend the steward without patching it, alongside
+/// [`AdmissionSetup`], [`PostAdmissionSetup`], [`RuntimeSetup`]
+/// and the RTC wake callback.
+///
+/// Identity travels with the hookup rather than beside it: a
+/// hookup that emits happenings needs an actor name, and two
+/// independent optional fields that must agree is a trap. Absent
+/// on the shipped `evo` binary, which therefore mounts no product
+/// routes at all.
+pub struct HttpsSetup {
+    /// Actor name for happenings the hookup emits. See
+    /// [`HttpsSetupContext::claimant_name`].
+    pub claimant_name: String,
+    /// The hookup itself.
+    pub hook: HttpsRouterHook,
+}
+
 /// Default admission strategy: run [`plugin_discovery::discover_and_admit`]
 /// against the configured `plugins.search_roots`. Out-of-process
 /// singletons are admitted; factory and in-process bundles are
@@ -676,6 +1134,36 @@ pub struct RunOptions {
     /// returns empty / `None`, which is a valid state for
     /// non-multi-room distributions.
     pub runtime_setup: Option<RuntimeSetup>,
+
+    /// Optional distribution-supplied HTTPS hookup. See
+    /// [`HttpsSetup`]. The shipped `evo` binary leaves this absent
+    /// and mounts no product routes; a distribution that ships
+    /// product HTTP supplies one here rather than having the
+    /// framework's router know about its domain.
+    pub https_setup: Option<HttpsSetup>,
+
+    /// Optional distribution-supplied household-protection group
+    /// table. See
+    /// [`HouseholdGroupTable`](household_protection::HouseholdGroupTable).
+    ///
+    /// The framework owns the protection *mechanism* — the policy
+    /// object, the level ladder, persistence, the wire ops, the
+    /// change happening, the origin-aware stamp and the dispatch
+    /// gate. It does not own the product's Settings groups: names
+    /// like "file sharing" or "metadata" are domain vocabulary and
+    /// would fail `BOUNDARY.md` §5's test (would this still make
+    /// sense in an `evo-device-<non-audio>` repository?).
+    ///
+    /// A distribution supplies one table here mapping its own
+    /// opaque group keys to capability scopes. Plugins never
+    /// register groups — there is exactly one table, and the
+    /// distribution owns it.
+    ///
+    /// When absent — the shipped `evo` binary, and any image whose
+    /// author has not written a table — the ladder still binds
+    /// through framework scope names, so `lend` is never a silent
+    /// no-op.
+    pub household_groups: Option<household_protection::GroupTable>,
 }
 
 impl RunOptions {
@@ -690,6 +1178,8 @@ impl RunOptions {
             rtc_wake: None,
             post_admission: None,
             runtime_setup: None,
+            https_setup: None,
+            household_groups: None,
         }
     }
 
@@ -701,6 +1191,8 @@ impl RunOptions {
             rtc_wake: None,
             post_admission: None,
             runtime_setup: None,
+            https_setup: None,
+            household_groups: None,
         }
     }
 
@@ -728,6 +1220,28 @@ impl RunOptions {
     /// the [`Self::runtime_setup`] field for semantics.
     pub fn with_runtime_setup(mut self, runtime_setup: RuntimeSetup) -> Self {
         self.runtime_setup = Some(runtime_setup);
+        self
+    }
+
+    /// Attach a distribution-supplied HTTPS hookup. See
+    /// [`HttpsSetup`]. Absent by default: the shipped `evo` binary
+    /// mounts no product routes.
+    #[must_use]
+    pub fn with_https_setup(mut self, https_setup: HttpsSetup) -> Self {
+        self.https_setup = Some(https_setup);
+        self
+    }
+
+    /// Attach a distribution-supplied household-protection group
+    /// table. See the [`Self::household_groups`] field for
+    /// semantics. Absent by default: the shipped `evo` binary
+    /// falls back to the framework ladder.
+    #[must_use]
+    pub fn with_household_groups(
+        mut self,
+        household_groups: household_protection::GroupTable,
+    ) -> Self {
+        self.household_groups = Some(household_groups);
         self
     }
 }
@@ -758,6 +1272,7 @@ pub async fn maybe_boot_https(
     asset_cache: Option<
         std::sync::Arc<dyn evo_plugin_sdk::contract::asset_cache::AssetCache>,
     >,
+    https_setup: Option<HttpsSetup>,
 ) -> anyhow::Result<Option<https_boot::HttpsBootHandles>> {
     let Some(listen_raw) = std::env::var_os("EVO_HTTPS_LISTEN_ADDR") else {
         return Ok(None);
@@ -788,7 +1303,17 @@ pub async fn maybe_boot_https(
         config.client_ca_pem_path = Some(std::path::PathBuf::from(path));
     }
     config.asset_cache = asset_cache;
-    let handles = https_boot::boot_https(server, config).await?;
+    // Couple the privileged LAN arm to the existence of the gate.
+    // The scopes that let a household change Wi-Fi or rotate the
+    // panel without a pairing ceremony are offered only when a
+    // household-protection runtime is attached to police them at
+    // dispatch. No runtime, no privileged stamp — the LAN arm stays
+    // on the playback floor, and a missing gate can never hand LAN a
+    // scope no policy sees. WAN is unaffected either way.
+    config.lan_privileged_capabilities = server
+        .household_protection()
+        .map(|_| https_boot::lan_privileged_capability_set());
+    let handles = https_boot::boot_https(server, config, https_setup).await?;
     tracing::info!(
         listen = %handles.server.local_addr,
         "evo https listener ready"
@@ -1569,7 +2094,6 @@ fn load_or_generate_domain_signing_key(
 async fn boot_domain_witness_runtime(
     domain_state_dir: &std::path::Path,
     identity: &evo_primitives::DeviceIdentity,
-    audio_plane_runtime: Arc<crate::audio_plane::AudioPlaneRuntime>,
     bus: Arc<crate::happenings::HappeningBus>,
     group_store: Arc<crate::groups::GroupStore>,
     control_port: u16,
@@ -1584,14 +2108,13 @@ async fn boot_domain_witness_runtime(
         )
         .map_err(|e| anyhow::anyhow!("domain chain load/create: {e}"))?,
     );
-    let broadcaster =
-        Arc::new(crate::domain_witness::AudioPlaneWitnessBroadcaster::new(
-            Arc::clone(&audio_plane_runtime),
-        ));
-    let requester =
-        Arc::new(crate::domain_witness::AudioPlaneWitnessBroadcaster::new(
-            Arc::clone(&audio_plane_runtime),
-        ));
+    // No broadcaster or requester is bound here. Both carry
+    // witnesses over a transport, and the framework ships none —
+    // a distribution that has one binds its own through
+    // `with_broadcaster` / `with_requester` after this returns.
+    // Left unbound, the runtime keeps its null defaults and the
+    // chain is local-only, which is the honest state for a device
+    // with nothing to replicate over.
     let emitter = Arc::new(
         crate::domain_witness::HappeningBusWitnessEmitter::new(Arc::clone(
             &bus,
@@ -1604,8 +2127,6 @@ async fn boot_domain_witness_runtime(
             signing_key,
             identity.device_id.as_str().to_string(),
         )
-        .with_broadcaster(broadcaster)
-        .with_requester(requester)
         .with_emitter(emitter),
     );
     // Genesis is gated on an explicit operator gesture
@@ -1838,6 +2359,8 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         rtc_wake,
         post_admission,
         runtime_setup,
+        https_setup,
+        household_groups,
     } = opts;
     let mut runtime_setup = runtime_setup;
 
@@ -2545,131 +3068,17 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
             Arc::clone(&persistence),
         ));
 
-    // Hardware-profile override store: operator-authored
-    // override layer of the four-source hardware profile
-    // composer (probed-live + manifest-declared +
-    // database-lookup + override). The framework owns only the
-    // override layer persistently; the other three layers come
-    // from delivery plugins / vendor distributions / live
-    // probes and are computed on demand by the topology scorer
-    // (sub-primitive C).
-    let hardware_profile_store =
-        Arc::new(crate::hardware_profile::HardwareProfileStore::new(
-            Arc::clone(&persistence),
-        ));
-    match hardware_profile_store.list_overrides().await {
-        Ok(rows) => tracing::info!(
-            entries = rows.len(),
-            "hardware profile store: rehydrated from substrate"
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "hardware profile store: list failed; substrate may be \
-             uninitialised or corrupt"
-        ),
-    }
-
-    // Audio operator preferences store: per-delivery-target
-    // policy (Auto / StrictBitPerfect / Pinned) + volume mode
-    // (Software / Hardware / None) the topology scorer
-    // consumes alongside the consolidated hardware profile.
-    // Two separate substrate tables sharing the canonical
-    // hardware-identity key — different mutation cadences
-    // (policy changes rarely; volume mode is operator-touched
-    // per session) and different operator surfaces.
-    let audio_policy_store = Arc::new(
-        crate::audio_policy::AudioPolicyStore::new(Arc::clone(&persistence)),
-    );
-
-    // Audio routing runtime: framework-side broker for the
-    // per-plugin AudioRouting handle stamped on LoadContext.
-    // The audio topology store (below) populates per-plugin
-    // resolved-routing snapshots when the vendor distribution
-    // pushes an active topology snapshot; until then
-    // audio-capable plugins see EndpointNotConfigured from
-    // their handle, the honest shape for "framework hasn't
-    // received a chain yet".
-    let audio_routing_runtime =
-        Arc::new(crate::audio_routing::AudioRoutingRuntime::new());
-    tracing::info!("audio routing runtime: ready");
-
-    // Audio topology store: framework owns the publish
-    // primitive + persistence + propagation; the vendor
-    // distribution drives the actual chain decision and
-    // pushes the snapshot. Wraps the same persistence handle
-    // + the audio routing runtime so the publish path updates
-    // both substrates atomically.
-    let audio_topology_store =
-        Arc::new(crate::audio_topology::AudioTopologyStore::new(
-            Arc::clone(&persistence),
-            Arc::clone(&audio_routing_runtime),
-        ));
-    let topologies_count = match audio_topology_store.list().await {
-        Ok(rows) => rows.len(),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "audio topology store: list failed; substrate may be \
-                 uninitialised or corrupt"
-            );
-            0
-        }
-    };
-    tracing::info!(
-        topologies = topologies_count,
-        "audio topology store: rehydrated from substrate"
-    );
-    // Re-publish each persisted topology to the routing
-    // runtime so the per-plugin AudioRouting handles see the
-    // resolved endpoints from the moment plugins admit. The
-    // store's publish() method handles propagation; here we
-    // re-issue the publish for every persisted snapshot.
-    if topologies_count > 0 {
-        if let Ok(rows) = audio_topology_store.list().await {
-            for topology in rows {
-                let target = topology.target_key.clone();
-                if let Err(e) = audio_topology_store
-                    .publish(topology, "system:rehydrate")
-                    .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        target_key = %target,
-                        "audio topology store: re-publish on rehydrate \
-                         failed"
-                    );
-                }
-            }
-        }
-    }
-    let policies_count = match audio_policy_store.list_policies().await {
-        Ok(rows) => rows.len(),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "audio policy store: list_policies failed; substrate may be \
-                 uninitialised or corrupt"
-            );
-            0
-        }
-    };
-    let volume_modes_count = match audio_policy_store.list_volume_modes().await
-    {
-        Ok(rows) => rows.len(),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "audio policy store: list_volume_modes failed; \
-                 substrate may be uninitialised or corrupt"
-            );
-            0
-        }
-    };
-    tracing::info!(
-        policies = policies_count,
-        volume_modes = volume_modes_count,
-        "audio policy store: rehydrated from substrate"
-    );
+    // Audio product plane: the topology, routing, policy and
+    // hardware-profile stores a distribution installs if it
+    // ships audio. Empty
+    // here — a vanilla binary registers every audio wire op and
+    // answers each with its not-configured degrade. The
+    // distribution fills the slot from its runtime-setup hook,
+    // which is also where rehydrating persisted topologies
+    // belongs: what a persisted chain means, and whether
+    // re-publishing one on boot is right, is the installed
+    // plane's decision, not this engine's.
+    let audio_topology_slot = AudioTopologySlot::new();
 
     // Device identity: singleton substrate carrying the
     // canonical device id + operator-editable display name +
@@ -2816,6 +3225,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     // None`; reactive-only multi-room plugins degrade
     // gracefully on that signal.
     let multiroom_substrate_slot = MultiroomSubstrateSlot::new();
+    let audio_plane_slot = AudioPlaneSlot::new();
     let groups_count = match group_store.list().await {
         Ok(rows) => rows.len(),
         Err(e) => {
@@ -2869,38 +3279,12 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     // before the steward returns.
     let runtime_shutdown_registry = RuntimeShutdownRegistry::new();
 
-    // Audio-plane runtime: TCP control + data channel
-    // between source-host and group receivers. Carries the
-    // network-coordinated heartbeat, the NTP-lite sync
-    // protocol that feeds ClockSyncRuntime::record_sync_sample,
-    // and the split-brain detection signal. Listener binds
-    // to the same control_port advertised in mDNS-SD.
-    let audio_plane_runtime =
-        Arc::new(crate::audio_plane::AudioPlaneRuntime::new(
-            crate::audio_plane::AudioPlaneConfig {
-                enabled: config.multiroom.discovery_enabled,
-                control_port: config.multiroom.control_port,
-                ..Default::default()
-            },
-            Arc::clone(&bus),
-            Arc::clone(&discovery_runtime),
-            shared_election_state.clone(),
-            Arc::clone(&clock_sync_runtime),
-            Arc::clone(&group_store),
-            identity.device_id.clone(),
-        ));
-    if let Err(e) = audio_plane_runtime.start().await {
-        tracing::warn!(
-            error = %e,
-            "audio-plane runtime: start failed; multi-room transport \
-             will not function on this boot"
-        );
-    } else {
-        tracing::info!(
-            control_port = config.multiroom.control_port,
-            "audio-plane runtime: ready"
-        );
-    }
+    // No audio plane is constructed here. It is distribution
+    // product: a plane only makes sense on a device that moves
+    // audio between a source host and receivers, and a steward
+    // that built one would be shipping that assumption to every
+    // distribution. A distribution that ships a plane installs it
+    // through its runtime-setup hook, into `AudioPlaneSlot`.
 
     // Compute the domain state dir up-front so the heartbeat
     // substrate can load the per-device signing key from the
@@ -3122,42 +3506,6 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         );
     }
 
-    // Domain-runtime setup hook. Distributions that ship a
-    // multi-room (or other domain-tier) runtime construct it
-    // here, install the concrete implementor into
-    // `shared_election_state`, and register an async
-    // shutdown closure into `runtime_shutdown_registry` so
-    // the drain path terminates the runtime cleanly. The
-    // shipped `evo` binary leaves this absent, in which case
-    // `shared_election_state` remains `NoElection` and every
-    // election query returns empty / None — a valid state
-    // for non-multi-room distributions. Runs AFTER the audio
-    // plane has started so the runtime can hold a started
-    // handle for its liveness predicate; runs BEFORE
-    // admission begins so a freshly-admitted plugin's
-    // `load` handler observes a fully-wired domain plane.
-    if let Some(runtime_setup) = runtime_setup.take() {
-        let setup_ctx = RuntimeSetupContext {
-            bus: Arc::clone(&bus),
-            persistence: Arc::clone(&persistence),
-            group_store: Arc::clone(&group_store),
-            device_id: identity.device_id.clone(),
-            shared_election_state: shared_election_state.clone(),
-            shared_role_store: shared_role_store.clone(),
-            multiroom_substrate_slot: multiroom_substrate_slot.clone(),
-            audio_plane_runtime: Arc::clone(&audio_plane_runtime),
-            shutdown_registry: runtime_shutdown_registry.clone(),
-        };
-        if let Err(e) = runtime_setup(setup_ctx).await {
-            tracing::warn!(
-                error = %e,
-                "runtime setup: distribution-supplied closure failed; \
-                 domain-tier runtimes (multi-room election, etc.) may \
-                 be absent on this boot"
-            );
-        }
-    }
-
     // The heartbeat-based `presence_correlator` constructed
     // above is no longer wired into the election path. With
     // the heartbeat substrate dormant (chain-announce takes
@@ -3186,9 +3534,8 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/evo/domain"));
 
     // Construct the chain runtime, bind it as the projection
-    // source on `TrustLedger` + `GroupStore`, spawn the
-    // inbound pump that drains audio-plane chain messages
-    // into the runtime, then construct the announce /
+    // source on `TrustLedger` + `GroupStore`, then construct
+    // the announce /
     // presence / relay runtimes that ride above the chain.
     // Reconnect runtime is on-demand (no spawn) and registers
     // with the server below.
@@ -3198,11 +3545,9 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         presence_correlator,
         relay_runtime,
         reconnect_runtime,
-        inbound_pump,
     ) = match boot_domain_witness_runtime(
         &domain_state_dir,
         &identity,
-        Arc::clone(&audio_plane_runtime),
         Arc::clone(&bus),
         Arc::clone(&group_store),
         config.multiroom.control_port,
@@ -3212,10 +3557,6 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         Ok(runtime) => {
             trust_ledger.set_witness_runtime(Arc::clone(&runtime));
             group_store.set_witness_runtime(Arc::clone(&runtime));
-            let pump = crate::domain_witness::InboundPump::spawn(
-                Arc::clone(&audio_plane_runtime),
-                Arc::clone(&runtime),
-            );
             let (announce, presence, relay) = boot_announce_and_presence(
                 &domain_state_dir,
                 Arc::clone(&runtime),
@@ -3224,21 +3565,6 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
                 config.multiroom.control_port,
             )
             .await;
-            // Bridge UDP-announce observations into audio-plane
-            // dial + tail-request: when a peer's announced chain
-            // head differs from local, dial the peer once and
-            // send a `DomainWitnessRequest`. Without this pump,
-            // the UDP carrier delivers awareness (we see them)
-            // but no reconciliation (we never pull their
-            // entries). The pump is the connecting tissue.
-            let announce_pump = announce.as_ref().map(|ar| {
-                crate::domain_witness::AnnouncePump::spawn(
-                    Arc::clone(&audio_plane_runtime),
-                    Arc::clone(ar),
-                    Arc::clone(&runtime),
-                )
-            });
-            let _ = announce_pump;
             // Bridge UDP-announce observations into the
             // discovery cache: refresh `last_seen_ms` +
             // addresses + `public_key_b64` on every 1 Hz
@@ -3262,14 +3588,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
                     Arc::clone(&runtime),
                     Arc::clone(&bus),
                 ));
-            (
-                Some(runtime),
-                announce,
-                presence,
-                relay,
-                Some(reconnect),
-                Some(pump),
-            )
+            (Some(runtime), announce, presence, relay, Some(reconnect))
         }
         Err(e) => {
             tracing::warn!(
@@ -3278,19 +3597,59 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
                  group-store reads fall back to per-seat persistence and \
                  cross-device propagation is not active on this boot"
             );
-            (None, None, None, None, None, None)
+            (None, None, None, None, None)
         }
     };
     // Hold these handles in `run`'s scope so their internal
     // task handles + Arc-references stay alive for the
     // lifetime of the steward. Background tasks die when the
     // owning runtime is dropped.
-    let _ = (
-        &announce_runtime,
-        &presence_correlator,
-        &relay_runtime,
-        &inbound_pump,
-    );
+    let _ = (&announce_runtime, &presence_correlator, &relay_runtime);
+
+    // Domain-runtime setup hook. Distributions that ship a
+    // multi-room (or other domain-tier) runtime construct it
+    // here, install the concrete implementor into
+    // `shared_election_state`, and register an async
+    // shutdown closure into `runtime_shutdown_registry` so
+    // the drain path terminates the runtime cleanly. The
+    // shipped `evo` binary leaves this absent, in which case
+    // `shared_election_state` remains `NoElection` and every
+    // election query returns empty / None — a valid state
+    // for non-multi-room distributions. This is where a plane
+    // starts, if the distribution ships one: it constructs the
+    // plane, writes both faces into the slot, and bridges the
+    // plane into the witness chain. Runs AFTER the witness and
+    // announce runtimes exist so those bridges have something to
+    // attach to, and BEFORE admission so a freshly-admitted
+    // plugin's `load` handler observes a fully-wired domain
+    // plane.
+    if let Some(runtime_setup) = runtime_setup.take() {
+        let setup_ctx = RuntimeSetupContext {
+            bus: Arc::clone(&bus),
+            persistence: Arc::clone(&persistence),
+            group_store: Arc::clone(&group_store),
+            device_id: identity.device_id.clone(),
+            shared_election_state: shared_election_state.clone(),
+            shared_role_store: shared_role_store.clone(),
+            multiroom_substrate_slot: multiroom_substrate_slot.clone(),
+            audio_plane_slot: audio_plane_slot.clone(),
+            audio_topology_slot: audio_topology_slot.clone(),
+            domain_witness_runtime: domain_witness_runtime.clone(),
+            announce_runtime: announce_runtime.clone(),
+            discovery_runtime: Arc::clone(&discovery_runtime),
+            clock_sync_runtime: Arc::clone(&clock_sync_runtime),
+            multiroom_control_port: config.multiroom.control_port,
+            shutdown_registry: runtime_shutdown_registry.clone(),
+        };
+        if let Err(e) = runtime_setup(setup_ctx).await {
+            tracing::warn!(
+                error = %e,
+                "runtime setup: distribution-supplied closure failed; \
+                 domain-tier runtimes (multi-room election, etc.) may \
+                 be absent on this boot"
+            );
+        }
+    }
 
     // Group topology runtime: composite snapshot composer
     // (source-host audio topology + receiver-leg connection
@@ -3301,8 +3660,8 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
             Arc::clone(&group_store),
             shared_election_state.clone(),
             Arc::clone(&clock_sync_runtime),
-            Arc::clone(&audio_plane_runtime),
-            Arc::clone(&audio_topology_store),
+            audio_plane_slot.control(),
+            audio_topology_slot.topology(),
             identity.device_id.clone(),
         ));
     tracing::info!("group topology runtime: ready");
@@ -3367,8 +3726,6 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         .with_ledger(Arc::clone(&lifecycle_ledger))
         .with_uri_schemes(Arc::clone(&uri_schemes))
         .with_capability_grant_store(Arc::clone(&capability_grant_store))
-        .with_audio_routing(Arc::clone(&audio_routing_runtime))
-        .with_audio_plane(Arc::clone(&audio_plane_runtime))
         .with_group_store(Arc::clone(&group_store))
         .with_asset_cache(Arc::clone(&asset_cache))
         .with_ui_shelves(Arc::clone(&ui_shelves))
@@ -3387,6 +3744,19 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     // and reactive-only multi-room plugins degrade gracefully.
     if let Some(adapter) = multiroom_substrate_slot.get() {
         engine = engine.with_multiroom_substrate(adapter);
+    }
+    // Same shape for the plane. A plugin declaring
+    // `capabilities.audio_plane` gets its handle only if the
+    // engine was given one, and a plugin that transports frames
+    // reports itself unhealthy without it — so a distribution
+    // that installed a plane and an engine that never read the
+    // slot would look like a broken plugin rather than a missing
+    // wire. Vanilla leaves this `None`.
+    if let Some(handle) = audio_plane_slot.handle() {
+        engine = engine.with_audio_plane(handle);
+    }
+    if let Some(routing) = audio_topology_slot.routing() {
+        engine = engine.with_audio_routing(routing);
     }
 
     // Persistence-ready barrier. Every framework-owned substrate
@@ -3435,11 +3805,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     // do not opt in (the default `evo` binary, the validation
     // distribution) leave RunOptions.post_admission absent.
     if let Some(hook) = post_admission {
-        let ctx = PostAdmissionContext {
-            audio: AudioSubstrates {
-                topology_store: Arc::clone(&audio_topology_store),
-            },
-        };
+        let ctx = PostAdmissionContext {};
         hook(ctx)
             .await
             .map_err(|e| anyhow::anyhow!("post-admission hook failed: {e}"))?;
@@ -3731,6 +4097,21 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
             crate::restart::RestartConfig::default(),
             std::env::args().collect::<Vec<_>>(),
         ));
+
+    // Household protection: load the persisted policy (or the
+    // first-start default) and bind the distribution's group table
+    // when one was supplied on RunOptions. Absent table is the
+    // shipped `evo` shape — the ladder still binds through framework
+    // scope names, so `lend` is never a silent no-op.
+    let household_protection = Arc::new(
+        crate::household_protection::HouseholdProtectionRuntime::load(
+            crate::household_protection::state_dir_from_persistence_path(
+                &config.persistence.path,
+            ),
+            household_groups.clone(),
+            crate::https_boot::operator_bootstrap_capability_set(),
+        ),
+    );
 
     // Framework-default `core` update source. Registers when
     // (a) the operator has not disabled it via
@@ -4088,7 +4469,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     // the admission engine through the wire dispatcher; the
     // reconciliation coordinator is wired so the operator-issued
     // reconciliation read-only and admin verbs reach it.
-    let server = server::Server::with_acl(
+    let mut server = server::Server::with_acl(
         socket_path.clone(),
         router,
         Arc::clone(&state),
@@ -4120,16 +4501,27 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     .with_admission_policy_store(Arc::clone(&admission_policy_store))
     .with_capability_grant_store(Arc::clone(&capability_grant_store))
     .with_migration_bundle_store(Arc::clone(&migration_bundle_store))
-    .with_hardware_profile_store(Arc::clone(&hardware_profile_store))
-    .with_audio_policy_store(Arc::clone(&audio_policy_store))
-    .with_audio_topology_store(Arc::clone(&audio_topology_store))
+    .with_hardware_profile_store(audio_topology_slot.hardware())
+    .with_audio_policy_store(audio_topology_slot.policy())
+    .with_audio_topology_store(audio_topology_slot.topology())
     .with_device_identity_store(Arc::clone(&device_identity_store))
     .with_discovery_runtime(Arc::clone(&discovery_runtime))
     .with_group_store(Arc::clone(&group_store))
     .with_role_store(shared_role_store.clone())
     .with_election_runtime(shared_election_state.clone())
     .with_clock_sync_runtime(Arc::clone(&clock_sync_runtime))
-    .with_audio_plane_runtime(Arc::clone(&audio_plane_runtime));
+    .with_multiroom_control_port(config.multiroom.control_port);
+    // Hand the server whatever plane the distribution installed.
+    // Both faces or neither: they are two views of one runtime,
+    // and a half-wired server would answer one op and refuse its
+    // sibling for no reason an operator could see.
+    if let (Some(control), Some(handle)) =
+        (audio_plane_slot.control(), audio_plane_slot.handle())
+    {
+        server = server
+            .with_audio_plane_runtime(control)
+            .with_audio_plane_handle(handle);
+    }
     // Attach the shared-secret file path when the distribution
     // set one; without this, set_kiosk_password refuses with
     // secret_store_unconfigured (the kiosk shell surfaces this
@@ -4232,6 +4624,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         .with_active_ui_selection_runtime(Arc::clone(&active_ui_selection))
         .with_wizard_runtime(Arc::clone(&wizard_runtime))
         .with_restart_coordinator(Arc::clone(&restart_coordinator))
+        .with_household_protection(Arc::clone(&household_protection))
         .with_bundled_roots(config.plugins.bundled_roots.clone());
     let server = server
         // Activate the Fast Path accept loop alongside the slow-path
@@ -4276,6 +4669,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         Arc::clone(&server),
         &persistence_path,
         Some(Arc::clone(&asset_cache)),
+        https_setup,
     )
     .await
     {
@@ -4722,15 +5116,14 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     // deterministic ordering and a clean log.
     //
     // Order: discovery first (stops announcing the device,
-    // unregisters the SRV record), then audio_plane (sends
-    // peer goodbyes), then clock_sync, election,
+    // unregisters the SRV record), then clock_sync, then the
+    // registered runtime hooks — which is where a distribution's
+    // plane sends its peer goodbyes — then election,
     // group_topology. This sequencing surfaces the
     // device-leaving signal to peers before the local
     // listeners close.
     discovery_runtime.shutdown().await;
     tracing::info!("discovery runtime: stopped");
-    audio_plane_runtime.shutdown().await;
-    tracing::info!("audio-plane runtime: stopped");
     clock_sync_runtime.shutdown().await;
     tracing::info!("clock-sync runtime: stopped");
 

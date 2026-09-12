@@ -112,6 +112,10 @@ struct WsCtx {
     schema_by_id: Arc<HashMap<String, CapabilityRequirement>>,
     tier_provider: Arc<dyn crate::auth_tier::AuthTierProvider>,
     lan_trust_caps: evo_auth_bearer::CapabilitySet,
+    /// LAN-origin set granted when a household-protection runtime
+    /// exists to police it at dispatch. See
+    /// [`crate::middleware::AuthLayer::lan_privileged_caps`].
+    lan_privileged_caps: Option<evo_auth_bearer::CapabilitySet>,
 }
 
 /// Attach the WebSocket endpoint to the supplied router.
@@ -127,6 +131,7 @@ pub(crate) fn attach_ws_endpoint(
     witness_chain: Option<Arc<WitnessChain>>,
     tier_provider: Arc<dyn crate::auth_tier::AuthTierProvider>,
     lan_trust_caps: evo_auth_bearer::CapabilitySet,
+    lan_privileged_caps: Option<evo_auth_bearer::CapabilitySet>,
 ) -> Router {
     let table = Arc::new(WsDispatchTable::from_schema(schema));
     let mut by_id: HashMap<String, CapabilityRequirement> = HashMap::new();
@@ -143,11 +148,43 @@ pub(crate) fn attach_ws_endpoint(
         schema_by_id: Arc::new(by_id),
         tier_provider,
         lan_trust_caps,
+        lan_privileged_caps,
     };
     let path = format!("{api_prefix}/ws");
     router.route(&path, get(ws_handler).with_state(ctx))
 }
 
+/// HTTP-upgrade handler for the operator WebSocket.
+///
+/// # UI recovery contract
+///
+/// The operator UI's stale-bearer auto-recover path relies on
+/// two upgrade-time behaviours to distinguish "device
+/// reincarnated / bearer dead" from "device down". A browser
+/// only observes the WS close as 1006 with no status or
+/// reason, so the recovery is keyed off the presence or
+/// absence of the 101 upgrade itself:
+///
+/// 1. **Invalid bearer → HTTP 401 at upgrade.** A bearer
+///    whose envelope decodes but whose signature the current
+///    validator refuses (the exact shape a browser holds
+///    after `evo-install.sh --mode=reinstall`) is refused
+///    with 401. Never accepted-then-limited, never left
+///    hanging. This lets the UI purge the dead bearer and
+///    enter the pair flow.
+/// 2. **No-bearer LAN upgrade → HTTP 101 with LAN-trust
+///    caps.** A handshake carrying no bearer from a
+///    LAN-trusted origin is admitted and the principal
+///    carries the configured `lan_trust_caps`. This lets the
+///    UI's "reopen anonymously and see if the read lands"
+///    step succeed so the shares surface loads read-only
+///    while the pair prompt shows.
+///
+/// Both properties are pinned as CI regression tests in
+/// `tests/ws_endpoint_recovery_contract.rs`. Do not weaken
+/// either without joint sign-off with the UI team — a
+/// silent drift breaks the UI's recovery irrecoverably (the
+/// browser has no side-channel to detect it).
 async fn ws_handler(
     State(ctx): State<WsCtx>,
     axum::Extension(peer): axum::Extension<std::net::SocketAddr>,
@@ -178,9 +215,20 @@ async fn ws_handler(
                     | (crate::auth_tier::AuthTier::SecureIndustrial, true)
             );
             if admit {
+                // Same coupling as the HTTP arm: LAN gets the
+                // privileged set only when a runtime exists to
+                // police it; WAN and runtime-less builds get the
+                // playback floor.
+                let admitted_caps = if lan_origin {
+                    ctx.lan_privileged_caps
+                        .clone()
+                        .unwrap_or_else(|| ctx.lan_trust_caps.clone())
+                } else {
+                    ctx.lan_trust_caps.clone()
+                };
                 let principal = Principal::new(
                     crate::middleware::LAN_TRUST_TOKEN_ID,
-                    ctx.lan_trust_caps.clone(),
+                    admitted_caps,
                 );
                 return upgrade
                     .on_upgrade(move |socket| {
@@ -434,7 +482,65 @@ async fn handle_socket(socket: WebSocket, ctx: WsCtx, principal: Principal) {
             }
         };
 
-        handle_frame(&out_tx, &ctx, &principal, frame, &mut active_subs).await;
+        // Request frames dispatch concurrently — each frame carries
+        // its own `request_id` and the client correlates responses
+        // by that id, not by frame arrival order, so serialising
+        // requests on the read loop just makes one slow request
+        // block every other request on the same socket.
+        //
+        // Live rig evidence pre-fix: painting one screen fired a
+        // burst of frames that each waited on a network round
+        // trip, and the single frame the operator had just
+        // gestured for sat behind the whole burst — a stall of
+        // minutes on an action that touches nothing the burst
+        // touches. Which shelf served the burst is not the
+        // steward's business; that any shelf can is the point.
+        //
+        // Subscribe / Unsubscribe stay serial. They mutate
+        // `active_subs` (owned by this task) and their ordering
+        // matters for wire semantics — a subscribe followed by
+        // an unsubscribe under the same id must land in that
+        // order or the substrate leaks a live forwarder.
+        match frame {
+            IncomingFrame::Request { .. } => {
+                let out_tx_clone = out_tx.clone();
+                let ctx_clone = ctx.clone();
+                let principal_clone = principal.clone();
+                // Spawn a detached task per request. The task
+                // sends its response through `out_tx_clone`; the
+                // tx-pump forwards to the socket. Panics inside
+                // the handler do not affect the read loop.
+                tokio::spawn(async move {
+                    if let IncomingFrame::Request {
+                        request_id,
+                        op,
+                        payload,
+                    } = frame
+                    {
+                        handle_request(
+                            &out_tx_clone,
+                            &ctx_clone,
+                            &principal_clone,
+                            request_id,
+                            op,
+                            payload,
+                        )
+                        .await;
+                    }
+                });
+            }
+            IncomingFrame::Subscribe { .. }
+            | IncomingFrame::Unsubscribe { .. } => {
+                handle_frame(
+                    &out_tx,
+                    &ctx,
+                    &principal,
+                    frame,
+                    &mut active_subs,
+                )
+                .await;
+            }
+        }
     }
 
     // Connection going down. Abort every live subscription so
@@ -597,10 +703,12 @@ async fn handle_subscribe(
                 }
                 DispatchError::Internal(m) => format!("internal: {m}"),
                 // WS surface does not carry HTTP status; report
-                // the refusal with its status code and the
-                // framework-supplied body's error subclass /
-                // message via `err.to_string()` (which formats
-                // `refused: {status}` via the Display impl).
+                // the refusal with its status code via
+                // `err.to_string()` (which formats
+                // `refused: {status}`). A SubscriptionEnded frame
+                // carries only a reason string, so the subclass
+                // has nowhere to go here: a narrower surface, not
+                // a second copy of the defect.
                 DispatchError::Refused { .. } => format!("refused: {err}"),
             };
             let _ = out_tx
@@ -677,6 +785,7 @@ async fn handle_request(
                 outcome: ResponseOutcome::Err {
                     code: "unknown_op".to_string(),
                     message: format!("invalid wire op id: {e:?}"),
+                    subclass: None,
                 },
             };
             let _ = send_frame(out_tx, &resp).await;
@@ -693,6 +802,7 @@ async fn handle_request(
                 outcome: ResponseOutcome::Err {
                     code: "unknown_op".to_string(),
                     message: format!("wire op `{op_str}` not in schema"),
+                    subclass: None,
                 },
             };
             let _ = send_frame(out_tx, &resp).await;
@@ -713,6 +823,7 @@ async fn handle_request(
                         "wire op `{op_str}` requires a {} frame, not a request frame",
                         entry.class.as_str()
                     ),
+                    subclass: None,
                 },
             };
             let _ = send_frame(out_tx, &resp).await;
@@ -778,6 +889,7 @@ async fn handle_request(
                     op_id.as_str(),
                     requirement_to_str(&requirement),
                 ),
+                subclass: None,
             },
         };
         let _ = send_frame(out_tx, &resp).await;
@@ -834,14 +946,17 @@ async fn handle_request(
                 // Framework-classified refusal on the WS
                 // request/response surface. The WS frame doesn't
                 // carry an HTTP status field, so the class is
-                // labelled `refused` and the specific status +
-                // subclass ride in the message field.
+                // labelled `refused` and the status rides in the
+                // message. The subclass rides in its own field
+                // below; it used to be claimed as part of the
+                // message and was never actually there.
                 DispatchError::Refused { .. } => "refused",
             };
             (
                 ResponseOutcome::Err {
                     code: code.to_string(),
                     message: err.to_string(),
+                    subclass: err.refusal_subclass().map(str::to_owned),
                 },
                 Outcome::Declined,
                 WitnessOutcome::Failure,
@@ -907,6 +1022,7 @@ async fn send_protocol_error(
         outcome: ResponseOutcome::Err {
             code: code.to_string(),
             message: message.to_string(),
+            subclass: None,
         },
     };
     send_frame(out_tx, &frame).await

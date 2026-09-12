@@ -88,7 +88,53 @@ fn rustls_client_config_for(ca_pem: &str) -> Arc<rustls::ClientConfig> {
     Arc::new(cfg)
 }
 
+/// Refuses every op with the framework's own error envelope —
+/// the shape `ClientResponse::Error` serialises to, carrying
+/// `details.subclass`. This is what a lent
+/// `household_protection_set` without a step-up token produces
+/// after `validate_step_up_for_operation` classifies it.
+struct RefusingDispatcher {
+    subclass: &'static str,
+}
+
+#[async_trait]
+impl Dispatcher for RefusingDispatcher {
+    async fn dispatch(
+        &self,
+        _op_id: &WireOpId,
+        _payload: Value,
+        _principal: &Principal,
+    ) -> Result<Value, DispatchError> {
+        Err(DispatchError::Refused {
+            status: http::StatusCode::FORBIDDEN,
+            body: serde_json::json!({
+                "error": {
+                    "class": "permission_denied",
+                    "message": "household_protection_set: step-up required",
+                    "details": { "subclass": self.subclass },
+                }
+            }),
+        })
+    }
+}
+
 async fn boot() -> (
+    SocketAddr,
+    Arc<Observatory>,
+    Arc<WitnessChain>,
+    BearerTokenIssuer,
+    String,
+    Arc<tokio::sync::Notify>,
+    tokio::task::JoinHandle<()>,
+) {
+    boot_with(Arc::new(EchoDispatcher)).await
+}
+
+/// Same harness, any dispatcher. Kept as one boot so the TLS +
+/// router + observatory wiring cannot drift between tests.
+async fn boot_with(
+    dispatcher: Arc<dyn Dispatcher>,
+) -> (
     SocketAddr,
     Arc<Observatory>,
     Arc<WitnessChain>,
@@ -119,18 +165,17 @@ async fn boot() -> (
     let router = build_router(
         &schema(),
         "/api/v1",
-        Arc::new(EchoDispatcher),
+        dispatcher,
         evo_runtime_http::NoopSubscriptionDispatcher::shared(),
         validator,
         NoopAuditSink::shared(),
         Some(Arc::clone(&observatory)),
         Some(Arc::clone(&chain)),
-        None,
-        None,
         Arc::new(evo_runtime_http::StaticAuthTier::new(
             evo_runtime_http::AuthTier::Secure,
         )) as Arc<dyn evo_runtime_http::AuthTierProvider>,
         evo_auth_bearer::CapabilitySet::default(),
+        None,
     )
     .unwrap();
 
@@ -225,7 +270,7 @@ async fn ws_round_trips_anonymous_op_through_same_dispatcher() {
                     assert_eq!(value["op"], "describe_capabilities");
                     assert_eq!(value["token_id"], token_id);
                 }
-                ResponseOutcome::Err { code, message } => {
+                ResponseOutcome::Err { code, message, .. } => {
                     panic!("expected Ok, got Err {code} / {message}");
                 }
             }
@@ -302,7 +347,7 @@ async fn ws_gates_capability_per_frame() {
     match frame {
         OutgoingFrame::Response {
             response_to,
-            outcome: ResponseOutcome::Err { code, message: _ },
+            outcome: ResponseOutcome::Err { code, .. },
         } => {
             assert_eq!(response_to, 7);
             assert_eq!(code, "permission_denied");
@@ -452,6 +497,115 @@ async fn ws_request_and_rest_request_share_observatory() {
         "expected ≥1 WS RequestReceived observation; got {ws_obs}"
     );
 
+    shutdown.notify_waiters();
+    let _ = join.await;
+}
+
+/// The row: a refusal the framework subclassed must arrive on the
+/// WS response frame with that subclass, not only `code: refused`.
+///
+/// Before this, `ws_endpoint` mapped `DispatchError::Refused` to
+/// `Err { code: "refused", message: err.to_string() }` — and
+/// `Display` for `Refused` is `refused: {status}`. The body, and
+/// with it `details.subclass`, died at the steward. A surface on
+/// the socket saw `refused: 403 Forbidden` and could not tell a
+/// step-up from a household lock from a scope miss, so the glass
+/// painted 403 where it should have opened the password card.
+#[tokio::test]
+async fn ws_refusal_frame_carries_the_subclass() {
+    let (addr, _obs, _chain, issuer, ca_pem, shutdown, join) =
+        boot_with(Arc::new(RefusingDispatcher {
+            subclass: "step_up_required",
+        }))
+        .await;
+
+    let token = issuer
+        .issue(CapabilitySet::default(), DEFAULT_TOKEN_TTL_MS, now_ms())
+        .unwrap();
+    let mut ws = open_ws(addr, &ca_pem, &token.encode()).await;
+
+    let req = IncomingFrame::Request {
+        request_id: 7,
+        op: "describe_capabilities".to_string(),
+        payload: serde_json::json!({}),
+    };
+    ws.send(Message::Text(serde_json::to_string(&req).unwrap()))
+        .await
+        .unwrap();
+
+    let msg = ws.next().await.unwrap().unwrap();
+    let body = match msg {
+        Message::Text(t) => t,
+        other => panic!("expected text, got {other:?}"),
+    };
+
+    // Assert on the JSON actually on the wire, not only on the
+    // typed round-trip: the field has to be SERIALISED, and a
+    // `skip_serializing_if` mistake would still type-check.
+    let raw: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(raw["outcome"]["outcome"], "err");
+    assert_eq!(raw["outcome"]["code"], "refused");
+    assert_eq!(
+        raw["outcome"]["subclass"], "step_up_required",
+        "the WS err frame must carry the subclass; frame was {body}"
+    );
+
+    let frame: OutgoingFrame = serde_json::from_str(&body).unwrap();
+    match frame {
+        OutgoingFrame::Response { outcome, .. } => match outcome {
+            ResponseOutcome::Err {
+                code,
+                subclass,
+                message,
+            } => {
+                assert_eq!(code, "refused");
+                assert_eq!(subclass.as_deref(), Some("step_up_required"));
+                // The status still rides in the message; the
+                // subclass is additive, not a replacement.
+                assert!(
+                    message.contains("403"),
+                    "status should still be readable: {message}"
+                );
+            }
+            other => panic!("expected Err, got {other:?}"),
+        },
+        other => panic!("expected Response, got {other:?}"),
+    }
+
+    let _ = ws.close(None).await;
+    shutdown.notify_waiters();
+    let _ = join.await;
+}
+
+/// A refusal the framework did NOT subclass must not grow one.
+#[tokio::test]
+async fn ws_refusal_without_a_subclass_omits_the_field() {
+    let (addr, _obs, _chain, issuer, ca_pem, shutdown, join) =
+        boot_with(Arc::new(EchoDispatcher)).await;
+    let token = issuer
+        .issue(CapabilitySet::default(), DEFAULT_TOKEN_TTL_MS, now_ms())
+        .unwrap();
+    let mut ws = open_ws(addr, &ca_pem, &token.encode()).await;
+    let req = IncomingFrame::Request {
+        request_id: 9,
+        op: "no_such_op".to_string(),
+        payload: serde_json::json!({}),
+    };
+    ws.send(Message::Text(serde_json::to_string(&req).unwrap()))
+        .await
+        .unwrap();
+    let msg = ws.next().await.unwrap().unwrap();
+    let body = match msg {
+        Message::Text(t) => t,
+        other => panic!("expected text, got {other:?}"),
+    };
+    let raw: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(raw["outcome"]["outcome"], "err");
+    assert!(
+        raw["outcome"].get("subclass").is_none(),
+        "an unsubclassed refusal must not carry the field: {body}"
+    );
+    let _ = ws.close(None).await;
     shutdown.notify_waiters();
     let _ = join.await;
 }

@@ -214,6 +214,10 @@ tempfile = "3"
 proptest = "1"
 rand_core = { version = "0.6", features = ["std"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots", "json"] }
+# Test-only: the distribution HTTPS hookup hands back a router, so
+# exercising that seam means mounting a route. Dev-only on purpose —
+# the steward itself takes no direct dependency on the HTTP library.
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
 
 # Loom model-checking tests for the router's lookup-clone-drop
 # discipline live in the stand-alone `crates/evo-loom` crate, NOT in

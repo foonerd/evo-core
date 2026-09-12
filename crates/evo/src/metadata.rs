@@ -1049,7 +1049,13 @@ pub fn canonical_query_digest(query: &Query) -> String {
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
     let bytes = hasher.finalize();
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    // fold into one String rather than allocating a 2-char String
+    // per byte and collecting them.
+    bytes.iter().fold(String::new(), |mut acc, b| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
 }
 
 #[cfg(test)]

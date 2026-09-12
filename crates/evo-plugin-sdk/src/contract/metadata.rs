@@ -891,7 +891,7 @@ pub struct ResultStream {
 }
 
 /// Plugin-side handle for the metadata chain. Plugins receive an
-/// `Arc<dyn MetadataConsumer>` on their [`LoadContext`] (gated by
+/// `Arc<dyn MetadataConsumer>` on their `LoadContext` (gated by
 /// the `metadata` capability flag in the manifest) when they want
 /// to consult the framework's metadata chain — e.g., a queue
 /// plugin asking "what do we know about this URI", a smart-

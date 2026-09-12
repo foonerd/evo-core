@@ -930,6 +930,19 @@ pub fn canonical_schema() -> Vec<WireOp> {
         "Mint an operator bearer for the device-local kiosk shell \
          via SO_PEERCRED against the compositor UID allowlist.",
     );
+    s.read(
+        "household_protection_get",
+        "auth",
+        "Read the household-protection policy plus the distribution's \
+         group catalog. LAN-trust admitted; never step-up.",
+    );
+    s.write(
+        "household_protection_set",
+        "auth",
+        "Set the household-protection level, the guest overlay, and \
+         the protected group marks. First-start and same-or-narrower \
+         changes need no sitting; widening requires step-up.",
+    );
     s.write(
         "pair_begin",
         "auth",
@@ -1070,6 +1083,11 @@ pub fn canonical_schema() -> Vec<WireOp> {
         "Toggle the enable flag on one online provider. Publishes on the framework's online-provider-config change bus so plugin reactors re-resolve live.",
     );
     s.write(
+        "online_providers_set_privacy_mode",
+        "online_providers",
+        "Set the device metadata privacy posture (enhanced | anonymous_only | offline); non-bypassable, outranking every per-provider enable flag and credential in every cascade.",
+    );
+    s.write(
         "online_providers_set_priority",
         "online_providers",
         "Set the cascade priority (0..=999) on one online provider. Publishes on the framework's online-provider-config change bus so plugin reactors re-resolve live.",
@@ -1201,7 +1219,7 @@ mod tests {
     /// `schema_count_matches_client_request_variant_count` test
     /// asserts the schema matches; bumping the enum and not
     /// bumping this number flags a missing schema entry.
-    const EXPECTED_SCHEMA_COUNT: usize = 176;
+    const EXPECTED_SCHEMA_COUNT: usize = 179;
 
     #[test]
     fn schema_count_matches_client_request_variant_count() {

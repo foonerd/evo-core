@@ -62,7 +62,7 @@ use crate::server::{HttpDispatchError, Server};
 ///
 /// The Weak (rather than strong Arc) sidesteps a memory cycle:
 /// the steward holds the Server, which holds the engine, which
-/// holds the dispatcher. A strong Arc<Server> here would close
+/// holds the dispatcher. A strong `Arc<Server>` here would close
 /// the cycle and leak the entire steward graph on shutdown.
 ///
 /// Dispatches before the Weak is set surface as

@@ -392,7 +392,7 @@ pub enum RecurrenceError {
     /// outside the `HH:MM` 24-hour range. OneShot specs may
     /// omit `time`; every other recurrence variant requires it.
     InvalidTimeOfDay {
-        /// The offending `time` value (or "<none>" if absent).
+        /// The offending `time` value (or `"<none>"` if absent).
         value: String,
     },
     /// `Monthly { day_of_month }` outside 1..=31.

@@ -101,12 +101,11 @@ async fn handshake_negotiates_x25519_mlkem768_when_feature_enabled() {
         NoopAuditSink::shared(),
         Some(Arc::clone(&observatory)),
         None,
-        None,
-        None,
         Arc::new(evo_runtime_http::StaticAuthTier::new(
             evo_runtime_http::AuthTier::Secure,
         )) as Arc<dyn evo_runtime_http::AuthTierProvider>,
         evo_auth_bearer::CapabilitySet::default(),
+        None,
     )
     .unwrap();
     let addr =

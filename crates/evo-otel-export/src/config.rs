@@ -51,16 +51,16 @@ pub struct OtelExporterConfig {
 
     /// Service name on the OTel `Resource`. Becomes
     /// `service.name` in the exported traces; defaults to
-    /// [`DEFAULT_SERVICE_NAME`].
+    /// `DEFAULT_SERVICE_NAME`.
     pub service_name: String,
 
     /// How often the background task snapshots the
     /// observatory and exports new observations. Defaults
-    /// to [`DEFAULT_BATCH_INTERVAL`].
+    /// to `DEFAULT_BATCH_INTERVAL`.
     pub batch_interval: Duration,
 
     /// Cap on the number of observations exported in one
-    /// OTLP request. Defaults to [`DEFAULT_MAX_BATCH_SIZE`].
+    /// OTLP request. Defaults to `DEFAULT_MAX_BATCH_SIZE`.
     pub max_batch_size: usize,
 
     /// Optional HTTP headers to send with every OTLP

@@ -7,13 +7,11 @@
 -- (chain stages + volume mode + bit-perfect verdict + score
 -- breakdown + warnings). Keyed by the canonical hardware-
 -- identity string the framework derives from
--- `HardwareIdentity::key()`. The reconciliation flow (vendor-
--- driven; the framework provides the publish primitive)
--- pushes a complete snapshot via `publish_active_audio_topology`;
--- the framework validates the chain, persists the snapshot,
--- emits an `AudioTopologyChanged` happening, and propagates
--- the resolved endpoints to each chain stage's plugin via
--- `AudioRoutingRuntime::publish_topology`.
+-- `HardwareIdentity::key()`. An operator pushes a complete
+-- snapshot via `publish_active_audio_topology`; the installed
+-- topology store validates the chain, persists the snapshot,
+-- announces the change, and propagates the resolved endpoints
+-- to each chain stage's plugin.
 --
 -- Columns:
 --

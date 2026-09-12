@@ -517,7 +517,7 @@ impl AuthService for SharedSecretAuthService {
 /// validates it before the operation executes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivilegedSession {
-    /// URL-safe base64 of [`TOKEN_RANDOM_BYTES`] random bytes.
+    /// URL-safe base64 of `TOKEN_RANDOM_BYTES` random bytes.
     pub token: String,
     /// Principal the verification call authenticated.
     pub principal: VerifiedPrincipal,
@@ -529,9 +529,13 @@ pub struct PrivilegedSession {
     /// expires. Computed at issuance from the requested or default
     /// TTL, capped by the framework ceiling.
     pub expires_at_ms: u64,
-    /// OS UID of the peer that performed the verification. Token
-    /// validation requires the presenting peer's UID to match this.
-    pub bound_peer_uid: u32,
+    /// Caller identity that performed the verification, from
+    /// [`caller_identity`]. Validation requires the presenting
+    /// caller's identity to equal this string.
+    ///
+    /// Not a uid: on TCP the peer uid is a constant, so it
+    /// cannot distinguish callers.
+    pub bound_identity: String,
 }
 
 /// Validation outcomes. Distinct from
@@ -546,9 +550,8 @@ pub enum SessionValidationError {
     /// Token exists but its `expires_at_ms` has passed. Reaped on
     /// next access.
     Expired,
-    /// Token exists and is not expired but the presenting peer's
-    /// UID does not match the UID the token was bound to at
-    /// issuance.
+    /// Token exists and is not expired but the presenting caller
+    /// is not the caller it was issued to.
     WrongPeer,
 }
 
@@ -597,7 +600,7 @@ impl AuthSessionStore {
     pub fn issue(
         &self,
         principal: VerifiedPrincipal,
-        peer_uid: u32,
+        identity: String,
         ttl_override: Option<Duration>,
     ) -> PrivilegedSession {
         let ttl = ttl_override
@@ -613,7 +616,7 @@ impl AuthSessionStore {
             principal,
             issued_at_ms,
             expires_at_ms,
-            bound_peer_uid: peer_uid,
+            bound_identity: identity,
         };
 
         self.sessions
@@ -631,7 +634,7 @@ impl AuthSessionStore {
     pub fn validate(
         &self,
         token: &str,
-        peer_uid: u32,
+        identity: &str,
     ) -> Result<PrivilegedSession, SessionValidationError> {
         let now_ms = system_time_to_ms(SystemTime::now());
         let mut guard = self
@@ -646,7 +649,7 @@ impl AuthSessionStore {
             guard.remove(token);
             return Err(SessionValidationError::Expired);
         }
-        if session.bound_peer_uid != peer_uid {
+        if session.bound_identity != identity {
             return Err(SessionValidationError::WrongPeer);
         }
         Ok(session)
@@ -743,12 +746,44 @@ pub enum NonceOutcome {
     Reused,
 }
 
+/// The caller identity a step-up session and a rate-limit bucket
+/// bind to.
+///
+/// Unix socket: `uid:<peer-uid>` — a real PEERCRED uid.
+/// HTTPS / WSS: `bearer:<bearer-token-id>` — one identity per
+/// minted bearer, so a paired browser, the kiosk panel and a
+/// private session are three identities, not one.
+///
+/// A TCP peer uid is not an identity: the HTTPS dispatcher stamps
+/// a constant on every connection. The presence of a token id is
+/// what separates the transports — the Unix socket carries none.
+pub fn caller_identity(
+    peer_uid: Option<u32>,
+    bearer_token_id: Option<&str>,
+) -> String {
+    match bearer_token_id {
+        Some(id) if !id.is_empty() => format!("bearer:{id}"),
+        _ => format!("uid:{}", peer_uid.unwrap_or(0)),
+    }
+}
+
+/// Whether an identity from [`caller_identity`] names a bearer
+/// rather than a Unix peer.
+///
+/// The two take different refusals when a presented step-up
+/// session does not belong to the caller: a bearer identity has
+/// not performed step-up, a uid identity is presenting another
+/// peer's token.
+pub fn identity_is_bearer(identity: &str) -> bool {
+    identity.starts_with("bearer:")
+}
+
 /// Failed step-up attempts recorded per identity so the framework
 /// can refuse further calls when the rate ceiling is crossed.
-/// Identity is a caller-chosen string: on the Unix socket the
-/// convention is `uid:<peer-uid>`; on the WSS surface the
-/// convention is `bearer:<bearer-token-id>`. The store does not
-/// interpret the identity — it is opaque.
+/// Identity is a caller-chosen string built by [`caller_identity`]:
+/// on the Unix socket `uid:<peer-uid>`, on the WSS surface
+/// `bearer:<bearer-token-id>`. The store does not interpret the
+/// identity — it is opaque.
 #[derive(Debug, Default)]
 pub struct StepUpRateLimiter {
     buckets: Mutex<HashMap<String, Vec<u64>>>,
@@ -1151,8 +1186,8 @@ mod tests {
     #[test]
     fn store_issue_yields_unique_url_safe_token() {
         let store = AuthSessionStore::with_defaults();
-        let s1 = store.issue(principal("alice"), 1000, None);
-        let s2 = store.issue(principal("alice"), 1000, None);
+        let s1 = store.issue(principal("alice"), "uid:1000".to_owned(), None);
+        let s2 = store.issue(principal("alice"), "uid:1000".to_owned(), None);
         assert_ne!(s1.token, s2.token);
         // URL-safe base64, no padding: only [A-Za-z0-9_-]
         for ch in s1.token.chars() {
@@ -1168,7 +1203,7 @@ mod tests {
         let store = AuthSessionStore::with_defaults();
         let session = store.issue(
             principal("alice"),
-            1000,
+            "uid:1000".to_owned(),
             Some(Duration::from_secs(60 * 60 * 24)),
         );
         let actual_ttl_ms = session.expires_at_ms - session.issued_at_ms;
@@ -1193,8 +1228,9 @@ mod tests {
     #[test]
     fn validate_returns_session_for_valid_token() {
         let store = AuthSessionStore::with_defaults();
-        let issued = store.issue(principal("alice"), 1000, None);
-        let validated = store.validate(&issued.token, 1000).unwrap();
+        let issued =
+            store.issue(principal("alice"), "uid:1000".to_owned(), None);
+        let validated = store.validate(&issued.token, "uid:1000").unwrap();
         assert_eq!(validated.token, issued.token);
         assert_eq!(validated.principal, issued.principal);
     }
@@ -1202,38 +1238,41 @@ mod tests {
     #[test]
     fn validate_unknown_token_errors_unknown() {
         let store = AuthSessionStore::with_defaults();
-        let err = store.validate("not-a-real-token", 1000).unwrap_err();
+        let err = store.validate("not-a-real-token", "uid:1000").unwrap_err();
         assert_eq!(err, SessionValidationError::Unknown);
     }
 
     #[test]
     fn validate_wrong_peer_errors_wrong_peer() {
         let store = AuthSessionStore::with_defaults();
-        let issued = store.issue(principal("alice"), 1000, None);
-        let err = store.validate(&issued.token, 2000).unwrap_err();
+        let issued =
+            store.issue(principal("alice"), "uid:1000".to_owned(), None);
+        let err = store.validate(&issued.token, "uid:2000").unwrap_err();
         assert_eq!(err, SessionValidationError::WrongPeer);
     }
 
     #[test]
     fn validate_expired_token_errors_expired_and_reaps() {
         let store = AuthSessionStore::new(Duration::from_millis(1));
-        let issued = store.issue(principal("alice"), 1000, None);
+        let issued =
+            store.issue(principal("alice"), "uid:1000".to_owned(), None);
         std::thread::sleep(Duration::from_millis(10));
-        let err = store.validate(&issued.token, 1000).unwrap_err();
+        let err = store.validate(&issued.token, "uid:1000").unwrap_err();
         assert_eq!(err, SessionValidationError::Expired);
         // Subsequent validation should report Unknown — reaped.
-        let err2 = store.validate(&issued.token, 1000).unwrap_err();
+        let err2 = store.validate(&issued.token, "uid:1000").unwrap_err();
         assert_eq!(err2, SessionValidationError::Unknown);
     }
 
     #[test]
     fn revoke_removes_active_session() {
         let store = AuthSessionStore::with_defaults();
-        let issued = store.issue(principal("alice"), 1000, None);
+        let issued =
+            store.issue(principal("alice"), "uid:1000".to_owned(), None);
         assert_eq!(store.live_session_count(), 1);
         assert!(store.revoke(&issued.token));
         assert_eq!(store.live_session_count(), 0);
-        let err = store.validate(&issued.token, 1000).unwrap_err();
+        let err = store.validate(&issued.token, "uid:1000").unwrap_err();
         assert_eq!(err, SessionValidationError::Unknown);
     }
 
@@ -1246,10 +1285,12 @@ mod tests {
     #[test]
     fn purge_expired_removes_only_expired() {
         let store = AuthSessionStore::with_defaults();
-        let _alive = store.issue(principal("alice"), 1000, None);
+        let _alive =
+            store.issue(principal("alice"), "uid:1000".to_owned(), None);
 
         let short = AuthSessionStore::new(Duration::from_millis(1));
-        let _doomed = short.issue(principal("bob"), 1001, None);
+        let _doomed =
+            short.issue(principal("bob"), "uid:1001".to_owned(), None);
         std::thread::sleep(Duration::from_millis(10));
 
         assert_eq!(store.purge_expired(), 0);

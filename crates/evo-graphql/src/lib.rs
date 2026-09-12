@@ -103,9 +103,9 @@ mod imp {
     impl Query {
         /// Capability probe. Returns the same JSON the HTTPS
         /// `/api/v1/describe_capabilities` endpoint serves.
-        async fn describe_capabilities<'a>(
+        async fn describe_capabilities(
             &self,
-            ctx: &Context<'a>,
+            ctx: &Context<'_>,
         ) -> async_graphql::Result<DispatchResult> {
             let state = ctx
                 .data::<Arc<GraphQlState<DynDispatcher>>>()
@@ -127,9 +127,9 @@ mod imp {
     #[Object]
     impl Mutation {
         /// Generic wire-op dispatch.
-        async fn dispatch<'a>(
+        async fn dispatch(
             &self,
-            ctx: &Context<'a>,
+            ctx: &Context<'_>,
             op_id: String,
             #[graphql(default)] payload_json: String,
             #[graphql(default)] bearer_token: String,

@@ -350,6 +350,29 @@ pub struct HappeningEnvelope {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Happening {
+    /// The household-protection policy changed. Emitted on every
+    /// successful `household_protection_set` so both operator
+    /// surfaces — the panel on the appliance and a browser on the
+    /// LAN — refresh from one signal rather than polling.
+    ///
+    /// Core fields only: the catalog is deliberately absent. It does
+    /// not change when the operator flips `lend`, so a surface
+    /// re-uses the catalog from its last `household_protection_get`
+    /// instead of paying for it on every change.
+    HouseholdProtectionChanged {
+        /// Whether the first-start choice has been made.
+        chosen: bool,
+        /// Wire spelling of the level now in force.
+        level: String,
+        /// Whether the guest overlay is raised.
+        lend: bool,
+        /// Group ids the owner has marked protected.
+        #[coalesce_labels(skip)]
+        protected_groups: Vec<String>,
+        /// Level to restore when the overlay is lifted.
+        #[coalesce_labels(skip)]
+        prior_level: Option<String>,
+    },
     /// A warden accepted custody. Emitted by the admission engine
     /// from `take_custody` after the ledger `record_custody` call
     /// succeeds.
@@ -1911,38 +1934,6 @@ pub enum Happening {
         #[coalesce_labels(skip)]
         at: SystemTime,
     },
-    /// The active audio topology for one delivery target
-    /// changed. Emitted by the framework after the vendor
-    /// distribution pushes a new
-    /// [`crate::audio_topology::ActiveAudioTopology`] snapshot
-    /// through `publish_active_audio_topology`. Operator UIs
-    /// subscribe to this to render Roon-style signal-path
-    /// updates the moment the chain rewires.
-    ///
-    /// The full topology snapshot is intentionally NOT carried
-    /// on the happening — snapshots can be large (every chain
-    /// stage's endpoint + format + score breakdown). Subscribers
-    /// receive the change notification + identity key + summary
-    /// fields and call `get_active_audio_topology` for the full
-    /// snapshot.
-    AudioTopologyChanged {
-        /// Canonical hardware-identity key the chain
-        /// terminates at. Subscribers filter on this to listen
-        /// to a specific delivery target.
-        target_key: String,
-        /// Operator-readable display name (mirrors the
-        /// snapshot's `display_name` field).
-        display_name: String,
-        /// `true` when the chain genuinely preserves
-        /// bit-perfect.
-        bit_perfect: bool,
-        /// Total score for the chain (the topology scorer's
-        /// weighted breakdown total).
-        score_total: i32,
-        /// When the topology was published.
-        #[coalesce_labels(skip)]
-        at: SystemTime,
-    },
     /// A source plugin's dispatched playback ended naturally.
     /// Emitted by source plugins when the queue they were
     /// playing reaches end-of-content (last item finished, no
@@ -2839,7 +2830,7 @@ pub enum Happening {
     /// A concurrent gesture fork was reconciled. The chain
     /// linearised by `(timestamp_ms, originator_uuid)`;
     /// subscribers (UI) show "your gesture was superseded
-    /// by a later one from <originator>."
+    /// by a later one from `<originator>`."
     GestureReconciled {
         /// Witness id that won the linearisation.
         winning_witness_id: String,
@@ -3558,6 +3549,8 @@ impl Happening {
     /// compatibility hedge against future variants).
     pub fn primary_plugin(&self) -> Option<&str> {
         match self {
+            // Device policy, not a plugin event.
+            Happening::HouseholdProtectionChanged { .. } => None,
             // Variants whose `plugin` field names the actor and the
             // subject of the event in one — custody-touching and
             // claim-tracking events emitted by the same plugin
@@ -3671,9 +3664,6 @@ impl Happening {
             Happening::AudioPlaybackEnded { source_plugin, .. } => {
                 Some(source_plugin.as_str())
             }
-            // Audio topology changed: framework-emitted, no
-            // single plugin actor (the chain spans multiple).
-            Happening::AudioTopologyChanged { .. } => None,
             // Multi-room peer events are framework-emitted,
             // not driven by any plugin.
             Happening::PeerDiscovered { .. }
@@ -3808,6 +3798,8 @@ impl Happening {
             | Happening::FactoryInstanceRetracted { shelf, .. } => {
                 Some(shelf.as_str())
             }
+            // Device policy, not a plugin event.
+            Happening::HouseholdProtectionChanged { .. } => None,
             _ => None,
         }
     }
@@ -3992,6 +3984,9 @@ impl Happening {
             // subject-keyed. Subscribing consumers branch on
             // `rack_class`.
             Happening::FlightModeChanged { .. } => false,
+
+            // Device-wide policy; names no subject.
+            Happening::HouseholdProtectionChanged { .. } => false,
             // Appointment events project onto the appointment
             // subject's lifecycle but the framework does not
             // mark them as subject-keyed for the
@@ -4031,9 +4026,6 @@ impl Happening {
             // Audio playback ended is plugin-keyed (source
             // plugin reporting), not subject-keyed.
             Happening::AudioPlaybackEnded { .. } => false,
-            // Audio topology changed is target-key-keyed, not
-            // subject-keyed.
-            Happening::AudioTopologyChanged { .. } => false,
             // Multi-room peer events are device-id-keyed, not
             // subject-keyed.
             Happening::PeerDiscovered { .. }
@@ -4247,6 +4239,9 @@ impl HappeningFilter {
 /// for filtered queries without parsing the full payload.
 fn happening_kind_str(h: &Happening) -> &'static str {
     match h {
+        Happening::HouseholdProtectionChanged { .. } => {
+            "household_protection_changed"
+        }
         Happening::CustodyTaken { .. } => "custody_taken",
         Happening::CustodyReleased { .. } => "custody_released",
         Happening::CustodyStateReported { .. } => "custody_state_reported",
@@ -4312,7 +4307,6 @@ fn happening_kind_str(h: &Happening) -> &'static str {
         Happening::GrammarOrphansAccepted { .. } => "grammar_orphans_accepted",
         Happening::PluginEvent { .. } => "plugin_event",
         Happening::AudioPlaybackEnded { .. } => "audio_playback_ended",
-        Happening::AudioTopologyChanged { .. } => "audio_topology_changed",
         Happening::PeerDiscovered { .. } => "peer_discovered",
         Happening::PeerUpdated { .. } => "peer_updated",
         Happening::PeerLost { .. } => "peer_lost",

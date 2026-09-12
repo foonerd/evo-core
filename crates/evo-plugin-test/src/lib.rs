@@ -45,7 +45,7 @@
 //!
 //! For plugin authors who want to inspect the drift report rather
 //! than panic, [`compute_drift`] returns the same
-//! [`DriftReport`](evo_plugin_sdk::drift::DriftReport) the
+//! [`evo_plugin_sdk::drift::DriftReport`] the
 //! framework's admission engine consumes.
 
 #![warn(missing_docs)]

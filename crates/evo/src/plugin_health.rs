@@ -180,7 +180,7 @@ impl std::fmt::Debug for PluginHealthAggregator {
 impl PluginHealthAggregator {
     /// Construct an aggregator wrapping the supplied
     /// persistence handle. The degraded-registry projection
-    /// surfaces empty until [`with_degraded_registry`] supplies
+    /// surfaces empty until `with_degraded_registry` supplies
     /// the canonical source.
     pub fn new(persistence: Arc<dyn PersistenceStore>) -> Self {
         Self {

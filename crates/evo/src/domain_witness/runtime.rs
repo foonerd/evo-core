@@ -100,9 +100,33 @@ pub enum DomainWitnessRuntimeError {
     },
 }
 
-/// Outbound delivery hook. Production binds the
-/// audio-plane runtime + the multi-carrier announce
-/// runtime; tests bind a recording mock.
+/// Holds a shared carrier inside a sized box.
+///
+/// `arc_swap` can only store `Arc<T>` for sized `T`, so a trait
+/// object cannot go in the cell directly. Boxing the `Arc` rather
+/// than the carrier keeps the caller's sharing intact: the same
+/// instance can serve as both broadcaster and requester, which is
+/// how a transport that does both is actually wired.
+struct SharedBroadcaster(Arc<dyn WitnessBroadcaster>);
+
+impl WitnessBroadcaster for SharedBroadcaster {
+    fn broadcast_witness(&self, witness: &DomainWitness) {
+        self.0.broadcast_witness(witness);
+    }
+}
+
+/// Requester half of [`SharedBroadcaster`].
+struct SharedRequester(Arc<dyn ChainRequester>);
+
+impl ChainRequester for SharedRequester {
+    fn request_tail_from_peer(&self, peer_id: &str, from_hash: &str) {
+        self.0.request_tail_from_peer(peer_id, from_hash);
+    }
+}
+
+/// Outbound delivery hook. A distribution binds its own
+/// transport; tests bind a recording mock. Unbound, the runtime
+/// keeps a null carrier and the chain stays local.
 pub trait WitnessBroadcaster: Send + Sync {
     /// Broadcast a freshly-appended witness to every peer
     /// the runtime believes is admitted. Implementations
@@ -185,8 +209,8 @@ pub struct DomainWitnessRuntime {
     /// advances under a known order even when called from
     /// multiple async tasks.
     append_lock: AsyncMutex<()>,
-    broadcaster: Arc<dyn WitnessBroadcaster>,
-    requester: Arc<dyn ChainRequester>,
+    broadcaster: arc_swap::ArcSwapOption<Box<dyn WitnessBroadcaster>>,
+    requester: arc_swap::ArcSwapOption<Box<dyn ChainRequester>>,
     emitter: Arc<dyn WitnessEventEmitter>,
 }
 
@@ -206,30 +230,48 @@ impl DomainWitnessRuntime {
             local_device_id,
             projection: ArcSwap::from_pointee(initial),
             append_lock: AsyncMutex::new(()),
-            broadcaster: Arc::new(NullBroadcaster),
-            requester: Arc::new(NullBroadcaster),
+            broadcaster: arc_swap::ArcSwapOption::const_empty(),
+            requester: arc_swap::ArcSwapOption::const_empty(),
             emitter: Arc::new(NullEventEmitter),
         }
     }
 
-    /// Builder: bind the production broadcaster (typically
-    /// the audio-plane runtime + multi-carrier announce).
+    /// Bind the production broadcaster after construction.
+    ///
+    /// A carrier is a transport, and the framework ships none. A
+    /// distribution that has one binds it here once its own
+    /// transport is up, which is necessarily after this runtime
+    /// exists — so this takes `&self` rather than consuming.
+    /// Until it is called the runtime keeps its null carrier and
+    /// the chain stays local, which is the honest state for a
+    /// device with nothing to replicate over.
+    pub fn set_broadcaster(&self, broadcaster: Arc<dyn WitnessBroadcaster>) {
+        self.broadcaster
+            .store(Some(Arc::new(Box::new(SharedBroadcaster(broadcaster))
+                as Box<dyn WitnessBroadcaster>)));
+    }
+
+    /// Bind the production chain requester after construction.
+    /// Same contract as [`Self::set_broadcaster`].
+    pub fn set_requester(&self, requester: Arc<dyn ChainRequester>) {
+        self.requester.store(Some(Arc::new(
+            Box::new(SharedRequester(requester)) as Box<dyn ChainRequester>,
+        )));
+    }
+
+    /// Builder form of [`Self::set_broadcaster`], for callers
+    /// that still hold the runtime by value.
     pub fn with_broadcaster(
-        mut self,
+        self,
         broadcaster: Arc<dyn WitnessBroadcaster>,
     ) -> Self {
-        self.broadcaster = broadcaster;
+        self.set_broadcaster(broadcaster);
         self
     }
 
-    /// Builder: bind the production chain requester
-    /// (typically the audio-plane runtime dispatching
-    /// `DomainWitnessRequest`).
-    pub fn with_requester(
-        mut self,
-        requester: Arc<dyn ChainRequester>,
-    ) -> Self {
-        self.requester = requester;
+    /// Builder form of [`Self::set_requester`].
+    pub fn with_requester(self, requester: Arc<dyn ChainRequester>) -> Self {
+        self.set_requester(requester);
         self
     }
 
@@ -354,7 +396,10 @@ impl DomainWitnessRuntime {
                 self.chain.len(),
             );
             self.emitter.gesture_applied(&witness, true);
-            self.broadcaster.broadcast_witness(&witness);
+            match self.broadcaster.load().as_ref() {
+                Some(b) => b.broadcast_witness(&witness),
+                None => NullBroadcaster.broadcast_witness(&witness),
+            }
         }
         Ok((witness, outcome))
     }
@@ -405,8 +450,13 @@ impl DomainWitnessRuntime {
                 // Request the tail starting from our head;
                 // the peer should respond with the
                 // missing entries.
-                self.requester
-                    .request_tail_from_peer(from_peer_id, &expected);
+                match self.requester.load().as_ref() {
+                    Some(r) => {
+                        r.request_tail_from_peer(from_peer_id, &expected)
+                    }
+                    None => NullBroadcaster
+                        .request_tail_from_peer(from_peer_id, &expected),
+                }
                 Err(DomainWitnessRuntimeError::StaleChain {
                     local_head: expected,
                     witness_prev: actual,

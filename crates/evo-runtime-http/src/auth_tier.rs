@@ -8,10 +8,10 @@
 //! set satisfies the route's requirement. The auth tier shapes
 //! the **bearer-absent** path:
 //!
-//! - `Open` — admit the request anyway with a synthetic
-//!   operator [`Principal`] carrying every operator scope.
-//!   The operator on a trusted LAN opens the browser and
-//!   works; no credential, no pairing, no typing.
+//! - `Open` — admit a synthetic operator [`Principal`]
+//!   carrying the configured LAN-trust capability set when
+//!   that set satisfies the route. Not every operator
+//!   scope: privileged writers stay off the set.
 //! - `Secure` — admit on LAN origin (RFC1918, loopback,
 //!   link-local, IPv6 unique-local) so the operator's own
 //!   browser on a trusted LAN works without a credential;
@@ -38,7 +38,8 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthTier {
     /// LAN-trust everywhere. Requests without a bearer
-    /// header are admitted as the operator. Default tier.
+    /// header are admitted when the LAN-trust set satisfies
+    /// the route. Default tier.
     Open,
     /// LAN-trust for the operator's own browser only.
     /// External API consumers reaching the device from

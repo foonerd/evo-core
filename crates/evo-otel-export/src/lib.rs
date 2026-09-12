@@ -14,7 +14,7 @@
 //!
 //! This crate adds a SECOND consumer of the same data stream:
 //! a background task that translates each observation into an
-//! OpenTelemetry [`SpanData`] record, batches them by
+//! OpenTelemetry `SpanData` record, batches them by
 //! configurable interval, and pushes them via OTLP / HTTP-
 //! protobuf to an OTLP-compatible collector. The observatory
 //! remains the in-process source of truth; the OTLP exporter

@@ -357,7 +357,7 @@ impl std::fmt::Display for NotificationHandle {
 }
 
 /// Plugin-side handle for the notifications plane. Plugins receive
-/// an `Arc<dyn NotificationEmitter>` on their [`LoadContext`]
+/// an `Arc<dyn NotificationEmitter>` on their `LoadContext`
 /// (gated by the `notifications` capability flag in the manifest);
 /// the handle proxies producer-side operations onto the
 /// framework's notification dispatcher.

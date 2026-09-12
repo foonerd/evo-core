@@ -397,17 +397,16 @@ pub struct AdmissionEngine {
     /// authority).
     capability_grant_store:
         Option<Arc<crate::capability_grant::CapabilityGrantStore>>,
-    /// Audio routing runtime handle. Populated via
-    /// [`Self::with_audio_routing`]; the engine stamps each
-    /// audio-capable plugin's [`LoadContext`] with a per-plugin
-    /// [`crate::audio_routing::RouterAudioRouting`] handle so
-    /// the plugin can fetch the OS-native endpoint the
-    /// framework configured for its chain stage. Engines built
-    /// without this handle leave the LoadContext field `None`
-    /// for every plugin — useful for in-process test harnesses
+    /// Audio routing handle. Populated via
+    /// [`Self::with_audio_routing`]; the engine asks it for a
+    /// per-plugin handle and stamps that onto each audio-capable
+    /// plugin's [`LoadContext`], so the plugin can fetch the
+    /// OS-native endpoint configured for its chain stage.
+    /// Engines built without this handle leave the LoadContext
+    /// field `None` for every plugin — the shape on a device
+    /// that moves no audio, and on in-process test harnesses
     /// that do not exercise the audio data plane.
-    audio_routing_runtime:
-        Option<Arc<crate::audio_routing::AudioRoutingRuntime>>,
+    audio_routing_runtime: Option<Arc<dyn crate::AudioRoutingControl>>,
 
     /// Optional audio-plane runtime handle. Populated at boot
     /// via [`Self::with_audio_plane`]; the engine threads it
@@ -416,7 +415,9 @@ pub struct AdmissionEngine {
     /// Engines built without it leave `LoadContext::audio_plane`
     /// at `None` for every plugin — useful for in-process test
     /// harnesses that do not exercise multi-room fan-out.
-    audio_plane_runtime: Option<Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    audio_plane_runtime: Option<
+        Arc<dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle>,
+    >,
 
     /// Optional group store handle. Required alongside
     /// `audio_plane_runtime` so the SDK-side
@@ -843,7 +844,7 @@ impl AdmissionEngine {
     /// Builder-style setter for the per-capability grant
     /// revocation store. When set, every admission entry point
     /// consults the store and passes the revoked-capability set
-    /// for the plugin into [`build_load_context`], which then
+    /// for the plugin into `build_load_context`, which then
     /// suppresses the corresponding LoadContext handles regardless
     /// of the manifest's per-capability flag. When unset, every
     /// plugin is treated as having an empty revoked set —
@@ -857,18 +858,18 @@ impl AdmissionEngine {
         self
     }
 
-    /// Builder-style setter for the audio-routing runtime. When
-    /// set, the engine stamps each audio-capable plugin's
-    /// [`LoadContext`] with a per-plugin
-    /// [`crate::audio_routing::RouterAudioRouting`] handle so
-    /// the plugin can fetch the OS-native endpoint the framework
-    /// configured for its chain stage. When unset, every plugin
-    /// sees `None` for `LoadContext.audio_routing` — supported
-    /// for in-process test harnesses that do not exercise the
-    /// audio data plane.
+    /// Builder-style setter for the audio routing handle. When
+    /// set, the engine asks it for a per-plugin handle and
+    /// stamps that onto each audio-capable plugin's
+    /// [`LoadContext`], so the plugin can fetch the OS-native
+    /// endpoint configured for its chain stage. When unset,
+    /// every plugin sees `None` for `LoadContext.audio_routing`
+    /// — the shape on a device that moves no audio, and on
+    /// in-process test harnesses that do not exercise the audio
+    /// data plane.
     pub fn with_audio_routing(
         mut self,
-        runtime: Arc<crate::audio_routing::AudioRoutingRuntime>,
+        runtime: Arc<dyn crate::AudioRoutingControl>,
     ) -> Self {
         self.audio_routing_runtime = Some(runtime);
         self
@@ -882,9 +883,11 @@ impl AdmissionEngine {
     /// do not exercise multi-room fan-out.
     pub fn with_audio_plane(
         mut self,
-        runtime: Arc<crate::audio_plane::AudioPlaneRuntime>,
+        handle: Arc<
+            dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle,
+        >,
     ) -> Self {
-        self.audio_plane_runtime = Some(runtime);
+        self.audio_plane_runtime = Some(handle);
         self
     }
 
@@ -2805,8 +2808,7 @@ impl AdmissionEngine {
             self.audio_routing_runtime.as_ref(),
             ctx.audio_routing.as_ref(),
         ) {
-            crate::audio_routing::install_audio_routing_forwarder(
-                Arc::clone(runtime),
+            runtime.install_forwarder(
                 Arc::clone(local_handle),
                 audio_routing_forwarder_sink,
                 manifest.plugin.name.clone(),
@@ -3152,8 +3154,7 @@ impl AdmissionEngine {
             self.audio_routing_runtime.as_ref(),
             ctx.audio_routing.as_ref(),
         ) {
-            crate::audio_routing::install_audio_routing_forwarder(
-                Arc::clone(runtime),
+            runtime.install_forwarder(
                 Arc::clone(local_handle),
                 audio_routing_forwarder_sink,
                 manifest.plugin.name.clone(),
@@ -3484,8 +3485,7 @@ impl AdmissionEngine {
             self.audio_routing_runtime.as_ref(),
             ctx.audio_routing.as_ref(),
         ) {
-            crate::audio_routing::install_audio_routing_forwarder(
-                Arc::clone(runtime),
+            runtime.install_forwarder(
                 Arc::clone(local_handle),
                 audio_routing_forwarder_sink,
                 manifest.plugin.name.clone(),
@@ -4859,7 +4859,7 @@ impl AdmissionEngine {
     ///    drift refuses with a structured error.
     /// 6. Atomic swap (only after every check passes): the
     ///    entry's stored manifest and enforcement policy are
-    ///    replaced via the entry's [`ArcSwap`] so dispatch
+    ///    replaced via the entry's `ArcSwap` so dispatch
     ///    reads stay lock-free.
     ///
     /// `dry_run = true` runs the pipeline through validation
@@ -6652,10 +6652,10 @@ fn build_load_context(
     metadata_chain: Option<Arc<crate::metadata::MetadataChain>>,
     scheduler_runtime: Option<Arc<crate::scheduler::SchedulerRuntime>>,
     ledger: Option<Arc<crate::ledger::LedgerPrimitive>>,
-    audio_routing_runtime: Option<
-        Arc<crate::audio_routing::AudioRoutingRuntime>,
+    audio_routing_runtime: Option<Arc<dyn crate::AudioRoutingControl>>,
+    audio_plane_runtime: Option<
+        Arc<dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle>,
     >,
-    audio_plane_runtime: Option<Arc<crate::audio_plane::AudioPlaneRuntime>>,
     group_store: Option<Arc<crate::groups::GroupStore>>,
     multiroom_substrate: Option<
         Arc<dyn evo_plugin_sdk::multiroom_substrate::MultiroomSubstrateHandle>,
@@ -6901,10 +6901,10 @@ fn build_load_context(
     let audio_routing: Option<
         Arc<dyn evo_plugin_sdk::contract::audio_routing::AudioRouting>,
     > = match (&audio_routing_runtime, audio_capable) {
-        (Some(runtime), true) => Some(runtime.handle_for_plugin(
+        (Some(runtime), true) => runtime.handle_for_plugin(
             &manifest.plugin.name,
             audio_routing_role(manifest).expect("checked above"),
-        )),
+        ),
         _ => None,
     };
 
@@ -7026,7 +7026,7 @@ fn build_load_context(
             )),
         )),
         // Audio-plane handle. Populated only when the engine
-        // was constructed via `with_audio_plane(...)` AND the
+        // was given a handle via `with_audio_plane(...)` AND the
         // plugin's manifest declares `capabilities.audio_plane
         // = true`. Manifest gate enforced here; runtime-
         // absence (test harnesses) yields None unconditionally.
@@ -7035,15 +7035,11 @@ fn build_load_context(
             group_store.as_ref(),
             manifest.capabilities.audio_plane,
         ) {
-            (Some(runtime), Some(store), true) => Some(Arc::new(
-                crate::context::RuntimeAudioPlaneHandle::new(
-                    Arc::clone(runtime),
-                    Arc::clone(store),
-                ),
-            )
-                as Arc<
-                    dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle,
-                >),
+            // The handle arrives already built. The distribution
+            // that ships a plane wraps it for the SDK contract on
+            // its own side, because the wrapping needs the plane
+            // — which the framework does not have.
+            (Some(handle), Some(_store), true) => Some(Arc::clone(handle)),
             _ => None,
         },
         // Framework asset cache. Populated when the steward
@@ -7114,21 +7110,23 @@ fn build_load_context(
 /// (Source role) — `None` otherwise.
 ///
 /// Used by [`build_load_context`] to gate the
-/// [`crate::audio_routing::RouterAudioRouting`] LoadContext
-/// stamping.
-fn audio_routing_role(
-    manifest: &Manifest,
-) -> Option<crate::audio_routing::PluginAudioRole> {
+/// `LoadContext.audio_routing` stamping.
+/// Which routing role a manifest declares, as an opaque token.
+///
+/// The string is passed through to whatever routing runtime is
+/// installed; this engine does not know what the roles mean, and
+/// an installed plane that does not recognise one refuses it.
+fn audio_routing_role(manifest: &Manifest) -> Option<&'static str> {
     if manifest.capabilities.delivery.is_some() {
-        return Some(crate::audio_routing::PluginAudioRole::Delivery);
+        return Some("delivery");
     }
     if manifest.capabilities.composition.is_some() {
-        return Some(crate::audio_routing::PluginAudioRole::Composition);
+        return Some("composition");
     }
     if let Some(source) = &manifest.capabilities.source {
         if let Some(kind) = &source.output_kind {
             if matches!(kind.as_str(), "audio.pcm" | "audio.encoded") {
-                return Some(crate::audio_routing::PluginAudioRole::Source);
+                return Some("source");
             }
         }
     }
@@ -9055,10 +9053,10 @@ host_provisioning: {{}}
     }
 
     impl Warden for TestWarden {
-        fn take_custody<'a>(
-            &'a mut self,
+        fn take_custody(
+            &mut self,
             _assignment: Assignment,
-        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a
+        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + '_
         {
             let name = self.name.clone();
             async move { Ok(CustodyHandle::new(name)) }
@@ -9072,10 +9070,10 @@ host_provisioning: {{}}
             async move { Ok(()) }
         }
 
-        fn release_custody<'a>(
-            &'a mut self,
+        fn release_custody(
+            &mut self,
             _handle: CustodyHandle,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
             async move { Ok(()) }
         }
     }
@@ -12249,10 +12247,10 @@ custody_failure_mode = "abort"
     }
 
     impl Warden for RejectingReleaseWarden {
-        fn take_custody<'a>(
-            &'a mut self,
+        fn take_custody(
+            &mut self,
             _assignment: Assignment,
-        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a
+        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + '_
         {
             let name = self.name.clone();
             async move { Ok(CustodyHandle::new(name)) }
@@ -12266,10 +12264,10 @@ custody_failure_mode = "abort"
             async move { Ok(()) }
         }
 
-        fn release_custody<'a>(
-            &'a mut self,
+        fn release_custody(
+            &mut self,
             _handle: CustodyHandle,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
             async move {
                 Err(PluginError::Permanent("unknown custody handle".into()))
             }
@@ -12520,10 +12518,10 @@ custody_failure_mode = "abort"
     }
 
     impl Warden for TestFactoryWarden {
-        fn take_custody<'a>(
-            &'a mut self,
+        fn take_custody(
+            &mut self,
             _assignment: Assignment,
-        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a
+        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + '_
         {
             let name = self.name.clone();
             async move { Ok(CustodyHandle::new(name)) }
@@ -12537,10 +12535,10 @@ custody_failure_mode = "abort"
             async move { Ok(()) }
         }
 
-        fn release_custody<'a>(
-            &'a mut self,
+        fn release_custody(
+            &mut self,
             _handle: CustodyHandle,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
             async move { Ok(()) }
         }
     }

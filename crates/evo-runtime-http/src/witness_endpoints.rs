@@ -68,6 +68,11 @@ pub(crate) fn attach_witness_endpoints(
         observatory,
         tier_provider,
         lan_trust_caps,
+        // Diagnostic surfaces never carry the privileged LAN arm.
+        // Hard-coded rather than threaded: it must not be possible
+        // to hand an observatory / witness route network_admin or
+        // system_admin by wiring a parameter wrong.
+        lan_privileged_caps: None,
     };
 
     let recent_path = format!("{api_prefix}/_witness/recent");

@@ -12,7 +12,7 @@
 //! Verb behaviour:
 //!
 //! - `play_now { uri }`: log to event log, schedule a typed
-//!   [`Happening::AudioPlaybackEnded`] emission after
+//!   `Happening::AudioPlaybackEnded` emission after
 //!   `EVO_TEST_SOURCE_PLAYBACK_DELAY_MS` (default 250 ms).
 //! - `play_now_collection { uris }`: log every URI; emit one
 //!   `AudioPlaybackEnded` per URI back-to-back with the

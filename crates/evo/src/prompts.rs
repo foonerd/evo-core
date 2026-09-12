@@ -43,7 +43,7 @@
 //!
 //! Each `issue` and state transition mirrors to the durable
 //! `prompts` table through an attached
-//! [`PersistenceStore`](crate::persistence::PersistenceStore).
+//! [`crate::persistence::PersistenceStore`].
 //! The in-memory ledger is the hot read path; the table is the
 //! restart-resilient backing. On steward boot,
 //! [`PromptLedger::rehydrate_from_persistence`] replays every
@@ -278,21 +278,34 @@ impl PromptLedger {
             self.responder.lock().expect("responder mutex poisoned");
         match *guard {
             Some(existing) if existing == connection => {
-                // LOGGING.md §2: info — lifecycle narrative on
-                // idempotent same-holder re-claim (mid-session
-                // renegotiate).
-                tracing::info!(
+                // DEBUG, not INFO. The claim runs inside capability
+                // negotiation, so this fires on every renegotiate
+                // by the current holder — a per-attempt event, not
+                // a lifecycle transition. Nothing changed state.
+                tracing::debug!(
                     connection_id = connection.0,
                     "user_interaction_responder re-claim by current holder (idempotent)"
                 );
                 Ok(())
             }
             Some(existing) => {
-                // LOGGING.md §2: info — lifecycle narrative on
-                // refused claim. A caller diagnosing "granted: []"
-                // sees this + the holder's id and can correlate
-                // with the earlier claim log.
-                tracing::info!(
+                // DEBUG, not INFO, for the same reason and with
+                // sharper evidence: the claim is attempted during
+                // capability negotiation, so EVERY reconnect by
+                // any non-holder logs one of these. On a device
+                // whose UI reconnects on a timer that is a line
+                // every few seconds, forever, describing a steady
+                // state rather than an event — rig-observed at
+                // 12 lines/minute, ~17k/day, drowning real signal
+                // in exactly the way the verb-dispatch flood did.
+                //
+                // Losing nothing: the caller already receives a
+                // structured `AlreadyHeld { by }`, so a consumer
+                // diagnosing "granted: []" has the holder id in
+                // hand without reading the journal, and the
+                // grant/release pair either side remains at INFO
+                // so the lifecycle story is still legible.
+                tracing::debug!(
                     requested_by = connection.0,
                     held_by = existing.0,
                     "user_interaction_responder claim refused (slot held)"

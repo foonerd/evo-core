@@ -67,14 +67,9 @@ pub fn build_router(
     audit_sink: Arc<dyn AuditSink>,
     observatory: Option<Arc<Observatory>>,
     witness_chain: Option<Arc<WitnessChain>>,
-    asset_cache: Option<
-        Arc<dyn evo_plugin_sdk::contract::asset_cache::AssetCache>,
-    >,
-    artwork_resolve_index: Option<
-        Arc<crate::artwork_resolve_index::ArtworkResolveIndex>,
-    >,
     tier_provider: Arc<dyn AuthTierProvider>,
     lan_trust_caps: CapabilitySet,
+    lan_privileged_caps: Option<CapabilitySet>,
 ) -> Result<Router, RuntimeHttpError> {
     if schema.is_empty() {
         return Err(RuntimeHttpError::EmptySchema);
@@ -113,6 +108,7 @@ pub fn build_router(
             observatory: observatory.clone(),
             tier_provider: Arc::clone(&tier_provider),
             lan_trust_caps: lan_trust_caps.clone(),
+            lan_privileged_caps: lan_privileged_caps.clone(),
         };
 
         let method_router: MethodRouter<HandlerCtx> = match method {
@@ -155,6 +151,7 @@ pub fn build_router(
         witness_chain.clone(),
         Arc::clone(&tier_provider),
         lan_trust_caps.clone(),
+        lan_privileged_caps.clone(),
     );
 
     if let Some(chain) = witness_chain {
@@ -169,102 +166,24 @@ pub fn build_router(
         );
     }
 
-    // Optional artwork endpoint. Mounted only when the steward
-    // has wired an asset cache; absent leaves the route
-    // unmounted and a fetch attempt returns the framework's
-    // default 404. Receivers fetching artwork from the leader
-    // hit the leader's endpoint; the leader's missing-cache
-    // case is the leader's responsibility to surface honestly
-    // (placeholder fallback per the universal
-    // artwork-first-or-icon rule).
-    let asset_cache_for_cascade = asset_cache.clone();
-    if let Some(cache) = asset_cache {
-        router = crate::artwork_endpoint::attach_artwork_endpoint(
-            router,
-            api_prefix,
-            cache,
-            Arc::clone(&validator),
-            Arc::clone(&tier_provider),
-            lan_trust_caps.clone(),
-        )?;
-    }
-
-    // One shared artwork cascade primitive — same instance
-    // consumed by BOTH the resolve-by-target endpoint and the
-    // composite track-detail endpoint below. Constructing it
-    // once at the router seam is what guarantees a single
-    // artwork resolution path across every framework surface:
-    // the standalone `/api/v1/audio/artwork?scheme=…&value=…`
-    // and the composite `/api/v1/audio/track/detail` are
-    // structurally forced to return the same content_hash for
-    // the same target because they run through one negative
-    // memo, one coalescer, one admission bucket, and one
-    // local→identity-synth→online tier chain. The cascade
-    // also carries the asset cache handle so the
-    // positive-index eviction path on `?refresh=1` reaches
-    // the actual bytes.
-    let artwork_cascade = crate::artwork_cascade::ArtworkCascade::new(
-        Arc::clone(&dispatcher),
-        asset_cache_for_cascade,
-        artwork_resolve_index,
-    );
-
-    // Resolve-by-target artwork endpoint. Sits alongside the
-    // hash-addressed byte-serving endpoint above and the
-    // existing plugin-shelf dispatchers: takes target params
-    // (scheme + value + optional size), delegates to the
-    // shared cascade, and 302-redirects to
-    // /api/v1/audio/artwork/:content_hash. The split keeps
-    // the hash endpoint immutable-cacheable while the resolve
-    // hop honours operator-side tag edits (short cache).
-    router = crate::artwork_resolve_endpoint::attach_artwork_resolve_endpoint(
-        router,
-        api_prefix,
-        Arc::clone(&artwork_cascade),
-        Arc::clone(&validator),
-        Arc::clone(&tier_provider),
-        lan_trust_caps.clone(),
-    )?;
-
-    // Composite track-detail endpoint (piece 7 of the
-    // complete-track-data delivery arc). Aggregates local
-    // metadata + artwork + reconciliation + lyrics + bio +
-    // album notes into one response; every sub-source
-    // carries its own status so honest partial results are
-    // preserved when a provider is unconfigured or a lookup
-    // misses. The artwork sub-source runs through the SAME
-    // shared cascade the resolve endpoint uses — one
-    // resolution path, both call sites.
-    router = crate::track_detail_endpoint::attach_track_detail_endpoint(
-        router,
-        api_prefix,
-        Arc::clone(&dispatcher),
-        Arc::clone(&artwork_cascade),
-        Arc::clone(&validator),
-        Arc::clone(&tier_provider),
-        lan_trust_caps.clone(),
-    )?;
-
-    // Device-proxied captive-portal session endpoint. Serves
-    // `/api/v1/network/captive/session/{sid}[/*path]` — the
-    // same-origin surface the operator UI iframes on the
-    // management plane. Every request routes to the network
-    // plugin's `network.nm.captive.upstream.fetch` verb via
-    // the shared dispatcher; the plugin fetches upstream over
-    // the captive-carrying interface (SO_BINDTODEVICE) so the
-    // operator's remote LAN browser never has to reach the
-    // venue portal directly. Absent the network plugin (or
-    // when no captive session is open) requests return
-    // 502 Bad Gateway; presence of the route itself does not
-    // depend on the plugin.
-    router = crate::captive_session_endpoint::attach_captive_session_endpoint(
-        router,
-        api_prefix,
-        Arc::clone(&dispatcher),
-        Arc::clone(&validator),
-        Arc::clone(&tier_provider),
-        lan_trust_caps.clone(),
-    )?;
+    // Product presenters used to be constructed and mounted
+    // here: media-asset resolve/serve, composite-detail
+    // aggregation, and the device-proxied captive-portal
+    // session surface. Each knew something the steward has no
+    // business knowing — what an album is, which online
+    // services exist, or that a venue portal has to be fetched
+    // over the interface carrying it.
+    //
+    // They now live in the distribution that ships them and
+    // attach through the HTTPS hookup, on the router this
+    // function returns. Their paths did not change when they
+    // moved; ownership did.
+    //
+    // Nothing below this line should reintroduce them, and the
+    // domain-neutrality preflight refuses it if anything tries.
+    // With the last of them gone that preflight's domain
+    // allowlist is empty, which is the state it was written to
+    // reach.
 
     Ok(router)
 }
@@ -278,7 +197,7 @@ pub fn build_router(
 /// shell's entry point — the hash router within the shell then
 /// dispatches the path.
 ///
-/// Used by [`crate::https_boot`] (and equivalent boot paths in
+/// Used by `crate::https_boot` (and equivalent boot paths in
 /// peer wire-protocol projections) to serve the framework's
 /// reference UI shell, vendor `ui_shell` artefacts, or any other
 /// static asset bundle the operator-configured
@@ -527,10 +446,9 @@ mod tests {
             NoopAuditSink::shared(),
             None,
             None,
-            None,
-            None,
             open_tier_provider(),
             lan_trust_caps(),
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, RuntimeHttpError::EmptySchema));
@@ -549,10 +467,9 @@ mod tests {
             NoopAuditSink::shared(),
             None,
             None,
-            None,
-            None,
             open_tier_provider(),
             lan_trust_caps(),
+            None,
         )
         .is_ok());
     }
@@ -580,10 +497,9 @@ mod tests {
             NoopAuditSink::shared(),
             None,
             None,
-            None,
-            None,
             open_tier_provider(),
             lan_trust_caps(),
+            None,
         )
         .is_ok());
     }
@@ -602,10 +518,9 @@ mod tests {
             NoopAuditSink::shared(),
             Some(observatory),
             None,
-            None,
-            None,
             open_tier_provider(),
             lan_trust_caps(),
+            None,
         )
         .is_ok());
     }

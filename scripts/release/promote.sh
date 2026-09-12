@@ -77,6 +77,25 @@
 #     local public-repo state, run additional manual checks,
 #     and trigger the push from a separate command.
 #
+# Toolchain:
+#
+#   The staging-tree cargo gates in section 5 (fmt, clippy, test)
+#   run on the workspace MSRV — `rust-version = "1.85"` in
+#   Cargo.toml — because the product must compile on 1.85. That is
+#   a floor the promoted tree has to keep clearing. It is not a
+#   claim about which compiler builds a release: release and fleet
+#   binaries are built with whatever the build host carries, and
+#   that is not 1.85.
+#
+#   The host's `stable` is not the floor. A staging tree that is
+#   green on a newer stable can still break the public repo's own
+#   `msrv` CI job the moment it lands — and by then the cut is
+#   already public, which is the expensive place to find it.
+#
+#   Override deliberately, never by default:
+#
+#     CARGO_TOOLCHAIN=stable scripts/release/promote.sh ...
+#
 # Preconditions enforced:
 #
 #   - eng working tree clean (`git status --porcelain` empty).
@@ -102,6 +121,11 @@ PUBLIC_REPO=""
 PREV_TAG=""
 DRY_RUN=0
 NO_PUSH=0
+
+# Toolchain for the staging-tree cargo gates in section 5. The
+# workspace MSRV, not the host default; see "Toolchain" in the
+# header before changing this.
+TOOLCHAIN="${CARGO_TOOLCHAIN:-1.85}"
 
 print_usage() {
     sed -n '2,/^# Refuses/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -421,7 +445,7 @@ rm -f "${STAGE_DIR}/Cargo.lock"
 # 4. Leak grep on staging tree
 # -------------------------------------------------------------
 
-log_step "Step 4/8: Running leak-grep on staging tree"
+log_step "Step 4/8: Running leak-grep + domain-neutrality guard on staging tree"
 
 (
     cd "${STAGE_DIR}"
@@ -431,28 +455,38 @@ log_step "Step 4/8: Running leak-grep on staging tree"
         log_error "staging tree missing leak-grep script"
         exit 4
     fi
+    # Domain neutrality of the steward. The staging tree is what
+    # reaches the public repository, so this is the last place a
+    # product route or a hardcoded shelf dispatch can be caught
+    # before it ships as framework surface.
+    if [[ -x "scripts/preflight/check-domain-http-in-steward.sh" ]]; then
+        bash scripts/preflight/check-domain-http-in-steward.sh
+    else
+        log_error "staging tree missing domain-neutrality guard"
+        exit 4
+    fi
 )
 
 # -------------------------------------------------------------
 # 5. fmt + clippy + test on staging tree
 # -------------------------------------------------------------
 
-log_step "Step 5/8: Running cargo fmt --check on staging tree"
+log_step "Step 5/8: Running cargo +${TOOLCHAIN} fmt --check on staging tree"
 (
     cd "${STAGE_DIR}"
-    cargo fmt --all -- --check
+    cargo "+${TOOLCHAIN}" fmt --all -- --check
 )
 
-log_step "Step 6/8: Running cargo clippy on staging tree"
+log_step "Step 6/8: Running cargo +${TOOLCHAIN} clippy on staging tree"
 (
     cd "${STAGE_DIR}"
-    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo "+${TOOLCHAIN}" clippy --workspace --all-targets --locked -- -D warnings
 )
 
-log_step "Step 7/8: Running cargo test --workspace --lib on staging tree"
+log_step "Step 7/8: Running cargo +${TOOLCHAIN} test --workspace --lib on staging tree"
 (
     cd "${STAGE_DIR}"
-    cargo test --workspace --lib --locked
+    cargo "+${TOOLCHAIN}" test --workspace --lib --locked
 )
 
 # -------------------------------------------------------------

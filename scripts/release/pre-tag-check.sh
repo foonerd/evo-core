@@ -55,49 +55,23 @@ log_fail() {
 }
 
 # -------------------------------------------------------------
-# Gate 1: cargo fmt --all -- --check
+# Gates 1-3 + rustdoc: compulsory cargo workout
+# (clean, fmt, clippy -D warnings, test --locked, rustdoc -D)
 # -------------------------------------------------------------
 
-log_step "Gate 1/7: cargo fmt --all -- --check"
-if ! cargo fmt --all -- --check; then
-    log_fail "cargo fmt drift detected"
-    log_fail "Fix: cargo fmt --all"
-    log_fail "Then commit the fmt delta and re-run this gate."
+log_step "Gates 1-3 + rustdoc: scripts/preflight/check-cargo-workout.sh"
+if ! bash "${REPO_ROOT}/scripts/preflight/check-cargo-workout.sh"; then
+    log_fail "cargo workout (clean / fmt / clippy / test / rustdoc) failed"
     exit 1
 fi
-log_ok "fmt clean"
-
-# -------------------------------------------------------------
-# Gate 2: cargo clippy --workspace --all-targets --locked -- -D warnings
-# -------------------------------------------------------------
-
-log_step "Gate 2/7: cargo clippy --workspace --all-targets --locked -- -D warnings"
-if ! cargo clippy --workspace --all-targets --locked -- -D warnings; then
-    log_fail "clippy reported warnings (treated as errors via -D warnings)"
-    log_fail "Fix: address the lints; do not allow individual hits without an"
-    log_fail "explicit, justified #[allow] attribute and a code-comment explaining why."
-    exit 1
-fi
+log_ok "cargo workout clean"
 log_ok "clippy clean"
-
-# -------------------------------------------------------------
-# Gate 3: cargo test --workspace --locked
-# -------------------------------------------------------------
-
-log_step "Gate 3/7: cargo test --workspace --locked"
-if ! cargo test --workspace --locked; then
-    log_fail "test failure"
-    log_fail "Fix: re-run with output captured (cargo test --workspace --locked -- --nocapture)"
-    log_fail "to see the offending assertion; address before tag mint."
-    exit 1
-fi
-log_ok "tests pass"
 
 # -------------------------------------------------------------
 # Gate 4: leak grep
 # -------------------------------------------------------------
 
-log_step "Gate 4/7: scripts/preflight/check-public-leaks.sh"
+log_step "Gate 4/8: scripts/preflight/check-public-leaks.sh"
 if ! bash "${REPO_ROOT}/scripts/preflight/check-public-leaks.sh"; then
     log_fail "leak gate hit"
     log_fail "Fix: rewrite the offending lines as descriptive prose."
@@ -113,7 +87,7 @@ fi
 # Gate 5: cargo-lock fresh
 # -------------------------------------------------------------
 
-log_step "Gate 5/7: scripts/preflight/check-cargo-lock-fresh.sh"
+log_step "Gate 5/8: scripts/preflight/check-cargo-lock-fresh.sh"
 if ! bash "${REPO_ROOT}/scripts/preflight/check-cargo-lock-fresh.sh"; then
     log_fail "Cargo.lock drift"
     log_fail "Fix: cargo metadata --format-version 1 > /dev/null"
@@ -147,7 +121,7 @@ fi
 # line if it appears — it flags a broken checkout layout that
 # will let a shelf-gap regression through.
 
-log_step "Gate 6/7: scripts/preflight/check-plugin-manifest-shelf-coverage.sh"
+log_step "Gate 6/8: scripts/preflight/check-plugin-manifest-shelf-coverage.sh"
 if ! bash "${REPO_ROOT}/scripts/preflight/check-plugin-manifest-shelf-coverage.sh"; then
     log_fail "plugin-manifest shelf coverage gap"
     log_fail "Fix: either add the missing shelf to the offending"
@@ -168,7 +142,7 @@ fi
 # positively-claimed Status identifier is missing from HEAD source.
 # -------------------------------------------------------------
 
-log_step "Gate 7/7: scripts/preflight/check-identifier-freshness.sh (fail)"
+log_step "Gate 7/8: scripts/preflight/check-identifier-freshness.sh (fail)"
 if ! EVO_IDENTIFIER_FRESHNESS_MODE=fail \
     bash "${REPO_ROOT}/scripts/preflight/check-identifier-freshness.sh"; then
     log_fail "identifier freshness gap on Realised Status claims"
@@ -179,12 +153,36 @@ if ! EVO_IDENTIFIER_FRESHNESS_MODE=fail \
 fi
 
 # -------------------------------------------------------------
+# Gate 8: domain neutrality of the steward
+#
+# Refuses product HTTP, dispatch envelopes built around a
+# hardcoded shelf, new happening vocabulary, and new presenters
+# in the framework crates. Structural — it holds no list of
+# service names, deliberately.
+#
+# This boundary has been crossed twice, both times by moving a
+# domain walk into the framework because plugins cannot compose
+# with each other and the framework was the only place that
+# could. A review-time rule was the agreed control after the
+# first crossing; it did not survive the second.
+# -------------------------------------------------------------
+
+log_step "Gate 8/8: scripts/preflight/check-domain-http-in-steward.sh"
+if ! bash "${REPO_ROOT}/scripts/preflight/check-domain-http-in-steward.sh"; then
+    log_fail "domain policy present in crates/evo or crates/evo-runtime-http"
+    log_fail "Fix: mount it from the distribution's router hookup, or take"
+    log_fail "the shelf from the caller. See docs/engineering/BOUNDARY.md"
+    log_fail "section 5 and section 11 invariant 4."
+    exit 1
+fi
+
+# -------------------------------------------------------------
 # All gates clean
 # -------------------------------------------------------------
 
 cat >&2 <<'BANNER'
 
-[pre-tag] All seven gates clean. Ready for tag mint.
+[pre-tag] All eight gates clean. Ready for tag mint.
 
 Next step: mint the tag with the agreed format
   v<MAJOR>.<MINOR>.<PATCH>[.<CLOSURE>][-<PRERELEASE>]

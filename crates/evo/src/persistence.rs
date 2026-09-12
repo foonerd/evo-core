@@ -443,6 +443,23 @@ pub const SCHEMA_VERSION_ONLINE_PROVIDERS: u32 = 41;
 /// legitimate priority=100 gestures exist on any deployed rig.
 pub const SCHEMA_VERSION_ONLINE_PROVIDERS_PRIORITY_SENTINEL: u32 = 42;
 
+/// Device-level metadata privacy mode, singleton row.
+///
+/// Privacy mode was plugin-local configuration read by exactly
+/// one plugin, which is why `metadata.online` enforced the
+/// non-bypassable identity-bearing suppression and
+/// `artwork.online` — carrying fanart.tv and Discogs — did not.
+/// An operator selecting a privacy posture is making a statement
+/// about the device; the setting belongs to the framework so
+/// every cascade reads one source and no per-plugin copy can
+/// diverge from it again.
+pub const SCHEMA_VERSION_METADATA_PRIVACY_MODE: u32 = 43;
+
+/// Schema version that un-flattens `online_providers.priority`,
+/// resetting rows re-stamped to 100 after 042 back to the
+/// "operator has not set a priority" sentinel.
+pub const SCHEMA_VERSION_ONLINE_PROVIDERS_PRIORITY_UNFLATTEN: u32 = 44;
+
 /// Maximum schema version this build of the steward understands.
 ///
 /// On open, [`SqlitePersistenceStore`] refuses to operate on a
@@ -451,7 +468,7 @@ pub const SCHEMA_VERSION_ONLINE_PROVIDERS_PRIORITY_SENTINEL: u32 = 42;
 /// running an older steward against a newer database must restore
 /// from a pre-upgrade backup.
 pub const SUPPORTED_SCHEMA_VERSION: u32 =
-    SCHEMA_VERSION_ONLINE_PROVIDERS_PRIORITY_SENTINEL;
+    SCHEMA_VERSION_ONLINE_PROVIDERS_PRIORITY_UNFLATTEN;
 
 /// Logical keys used in the `meta` table. Constants are kept in one
 /// place so a misspelling produces a compile error rather than a
@@ -625,11 +642,10 @@ const MIGRATION_025_AUDIO_OPERATOR_PREFERENCES: &str =
 /// Migration 026 source — installs the active audio topology
 /// substrate (`audio_active_topology`). One row per delivery
 /// target storing the most recently-published topology
-/// snapshot. The vendor distribution pushes snapshots through
-/// the framework's `publish_active_audio_topology` primitive;
-/// the framework validates + persists + emits the
-/// `AudioTopologyChanged` happening + propagates to the
-/// `AudioRoutingRuntime`.
+/// snapshot. Operators push snapshots through the
+/// `publish_active_audio_topology` wire op; the steward hands
+/// each to the installed topology store, which validates,
+/// persists and propagates it, and announces the change.
 const MIGRATION_026_AUDIO_ACTIVE_TOPOLOGY: &str =
     include_str!("../migrations/026_audio_active_topology.sql");
 
@@ -718,6 +734,21 @@ const MIGRATION_041_ONLINE_PROVIDERS: &str =
 /// treat negative priorities as "keep my compile-time default".
 const MIGRATION_042_ONLINE_PROVIDERS_PRIORITY_SENTINEL: &str =
     include_str!("../migrations/042_online_providers_priority_sentinel.sql");
+
+/// Device-level privacy posture, singleton row. Read by every
+/// enrichment and artwork cascade so the non-bypassable
+/// identity-bearing suppression cannot hold in one plugin and be
+/// absent from another.
+const MIGRATION_043_METADATA_PRIVACY_MODE: &str =
+    include_str!("../migrations/043_metadata_privacy_mode.sql");
+
+/// Repair for rows re-flattened to priority 100 after 042. The
+/// compile-time default still fabricated a priority, and
+/// `set_enabled` persisted what it read, so every operator
+/// toggle wrote 100 back over the sentinel and collapsed the
+/// cascade order to dispatch order.
+const MIGRATION_044_ONLINE_PROVIDERS_PRIORITY_UNFLATTEN: &str =
+    include_str!("../migrations/044_online_providers_priority_unflatten.sql");
 
 /// Errors raised by the persistence layer.
 ///
@@ -902,7 +933,7 @@ pub struct HappeningBatchRow {
 /// negligible against the value of preserving them.
 ///
 /// Each entry MUST match the kind string produced by
-/// [`crate::happenings::happening_kind_str`] for the corresponding
+/// `crate::happenings::happening_kind_str` for the corresponding
 /// [`crate::happenings::Happening`] variant.
 pub const STICKY_HAPPENING_KINDS: &[&str] = &["plugin_admission_skipped"];
 
@@ -1702,7 +1733,7 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
     /// Batch write of multiple happenings under a single fsync.
     ///
     /// Each row is `(seq, kind, payload, at_ms)` in the same shape
-    /// [`record_happening`] takes for a single row. All rows commit
+    /// `record_happening` takes for a single row. All rows commit
     /// under one explicit transaction so the durable-emit boundary
     /// is one fsync regardless of `rows.len()`.
     ///
@@ -2394,7 +2425,7 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
 
     /// Update the post-fire snapshot of an existing scheduled-
     /// task row. Called from
-    /// [`crate::scheduler::ScheduleLedger::mark_fired`] after
+    /// `crate::scheduler::ScheduleLedger::mark_fired` after
     /// the framework's runtime tick advances the entry. For a
     /// recurring entry the ledger recomputes a fresh
     /// `next_fire_at_ms` and the row stays `Pending`. For a
@@ -2694,6 +2725,32 @@ pub trait PersistenceStore: Send + Sync + std::fmt::Debug {
                 + 'a,
         >,
     >;
+
+    /// Read the device-level metadata privacy mode.
+    ///
+    /// `Ok(None)` means no row — the device has never had a
+    /// posture set, which readers treat as `enhanced`. Callers
+    /// MUST treat an `Err` as the most restrictive posture rather
+    /// than as `enhanced`: a storage fault must not silently
+    /// unlock identity-bearing providers.
+    fn get_metadata_privacy_mode<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<String>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Write the device-level metadata privacy mode. Replaces the
+    /// singleton row; `mode` must be one of `enhanced`,
+    /// `anonymous_only`, `offline` (enforced by CHECK).
+    fn set_metadata_privacy_mode<'a>(
+        &'a self,
+        mode: &'a str,
+        now_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>;
 
     /// Register a URI scheme as owned by `source_plugin`. The
     /// substrate refuses to overwrite an existing registration:
@@ -3819,7 +3876,7 @@ pub struct PersistedHardwareProfileOverride {
     /// Full hardware identity. Serialised as a typed JSON
     /// payload at the wire-op layer; the substrate stores the
     /// runtime form via the layer above.
-    pub identity: crate::hardware_profile::HardwareIdentity,
+    pub identity: crate::server::HardwareIdentity,
     /// `HardwareProfileOverride` serde JSON. Sparse — the
     /// operator authors only the fields they explicitly
     /// intend to override.
@@ -4721,7 +4778,7 @@ pub struct PersistedAppointment {
 /// Lifecycle states for a row in `appointments`. Mirrors the
 /// SQLite `CHECK` constraint on the `state` column and is the
 /// persistence-side counterpart to
-/// [`crate::appointments::AppointmentState`]. The persistence
+/// `crate::appointments::AppointmentState`. The persistence
 /// layer keeps a private copy because the in-memory enum lives in
 /// `crate::appointments` and the persistence trait is module-
 /// boundary-agnostic.
@@ -5510,6 +5567,22 @@ fn run_migrations(conn: &mut Connection) -> Result<(), PersistenceError> {
         conn.execute_batch(MIGRATION_042_ONLINE_PROVIDERS_PRIORITY_SENTINEL)
             .map_err(|e| PersistenceError::MigrationFailed {
                 version: SCHEMA_VERSION_ONLINE_PROVIDERS_PRIORITY_SENTINEL,
+                detail: e.to_string(),
+            })?;
+    }
+
+    if current < SCHEMA_VERSION_METADATA_PRIVACY_MODE {
+        conn.execute_batch(MIGRATION_043_METADATA_PRIVACY_MODE)
+            .map_err(|e| PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_METADATA_PRIVACY_MODE,
+                detail: e.to_string(),
+            })?;
+    }
+
+    if current < SCHEMA_VERSION_ONLINE_PROVIDERS_PRIORITY_UNFLATTEN {
+        conn.execute_batch(MIGRATION_044_ONLINE_PROVIDERS_PRIORITY_UNFLATTEN)
+            .map_err(|e| PersistenceError::MigrationFailed {
+                version: SCHEMA_VERSION_ONLINE_PROVIDERS_PRIORITY_UNFLATTEN,
                 detail: e.to_string(),
             })?;
     }
@@ -9478,6 +9551,67 @@ impl PersistenceStore for SqlitePersistenceStore {
                     })?);
                 }
                 Ok(out)
+            })
+            .await
+        })
+    }
+
+    fn get_metadata_privacy_mode<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<String>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.interact("get_metadata_privacy_mode", move |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT mode FROM metadata_privacy_mode WHERE id = 1",
+                    )
+                    .map_err(|e| {
+                        sqlite_err("prepare get_metadata_privacy_mode", e)
+                    })?;
+                let mut rows = stmt.query([]).map_err(|e| {
+                    sqlite_err("execute get_metadata_privacy_mode", e)
+                })?;
+                match rows.next().map_err(|e| {
+                    sqlite_err("read metadata_privacy_mode row", e)
+                })? {
+                    Some(r) => {
+                        Ok(Some(r.get::<_, String>(0).map_err(|e| {
+                            sqlite_err("decode metadata_privacy_mode.mode", e)
+                        })?))
+                    }
+                    None => Ok(None),
+                }
+            })
+            .await
+        })
+    }
+
+    fn set_metadata_privacy_mode<'a>(
+        &'a self,
+        mode: &'a str,
+        now_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let mode = mode.to_string();
+        Box::pin(async move {
+            self.interact("set_metadata_privacy_mode", move |conn| {
+                conn.execute(
+                    "INSERT INTO metadata_privacy_mode \
+                         (id, mode, updated_at_ms) \
+                     VALUES (1, ?1, ?2) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                         mode = excluded.mode, \
+                         updated_at_ms = excluded.updated_at_ms",
+                    rusqlite::params![mode, now_ms as i64],
+                )
+                .map_err(|e| sqlite_err("set_metadata_privacy_mode", e))?;
+                Ok(())
             })
             .await
         })
@@ -13479,6 +13613,9 @@ struct MemoryState {
     /// `provider_id`. Backs the per-provider enable/priority
     /// store the multi-source metadata cascade consults.
     online_providers: HashMap<String, PersistedOnlineProvider>,
+    /// Device-level privacy posture. `None` = never set, which
+    /// readers treat as `enhanced`.
+    metadata_privacy_mode: Option<String>,
     /// Mirror of the `queue_items` table, partitioned by
     /// `queue_id` and ordered densely by `position`. Mutations
     /// renumber the affected range to keep positions contiguous.
@@ -15519,6 +15656,35 @@ impl PersistenceStore for MemoryPersistenceStore {
                     .then_with(|| a.provider_id.cmp(&b.provider_id))
             });
             Ok(v)
+        })
+    }
+
+    fn get_metadata_privacy_mode<'a>(
+        &'a self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<String>, PersistenceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let g = self.inner.lock().await;
+            Ok(g.metadata_privacy_mode.clone())
+        })
+    }
+
+    fn set_metadata_privacy_mode<'a>(
+        &'a self,
+        mode: &'a str,
+        _now_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + 'a>>
+    {
+        let mode = mode.to_string();
+        Box::pin(async move {
+            let mut g = self.inner.lock().await;
+            g.metadata_privacy_mode = Some(mode);
+            Ok(())
         })
     }
 
@@ -17679,6 +17845,107 @@ mod tests {
         let store =
             SqlitePersistenceStore::open(path).expect("open sqlite store");
         (dir, store)
+    }
+
+    #[tokio::test]
+    async fn privacy_mode_absent_on_a_fresh_database() {
+        // No row on a device nobody has configured. Readers treat
+        // this as `enhanced` — the framework default — but the
+        // store reports absence honestly rather than inventing a
+        // value, so a caller can tell "never set" from "set to
+        // enhanced" if it ever needs to.
+        let (_dir, store) = open_temp();
+        assert_eq!(store.get_metadata_privacy_mode().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn privacy_mode_round_trips_every_valid_posture() {
+        let (_dir, store) = open_temp();
+        for mode in ["enhanced", "anonymous_only", "offline"] {
+            store
+                .set_metadata_privacy_mode(mode, 1_700_000_000_000)
+                .await
+                .unwrap_or_else(|e| panic!("set {mode}: {e}"));
+            assert_eq!(
+                store.get_metadata_privacy_mode().await.unwrap().as_deref(),
+                Some(mode),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn privacy_mode_stays_a_singleton_across_writes() {
+        // The CHECK(id = 1) pin means repeated writes replace the
+        // one row rather than accumulating competing postures.
+        // Two rows would be two answers to "what is this device's
+        // privacy posture", which is the divergence this table
+        // exists to prevent.
+        let (_dir, store) = open_temp();
+        store.set_metadata_privacy_mode("offline", 1).await.unwrap();
+        store
+            .set_metadata_privacy_mode("anonymous_only", 2)
+            .await
+            .unwrap();
+        store
+            .set_metadata_privacy_mode("enhanced", 3)
+            .await
+            .unwrap();
+
+        let conn = Connection::open(store.path()).expect("side open");
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM metadata_privacy_mode", [], |r| {
+                r.get(0)
+            })
+            .expect("count rows");
+        assert_eq!(count, 1, "privacy mode must remain a singleton row");
+        assert_eq!(
+            store.get_metadata_privacy_mode().await.unwrap().as_deref(),
+            Some("enhanced"),
+        );
+    }
+
+    #[tokio::test]
+    async fn privacy_mode_refuses_a_posture_outside_the_vocabulary() {
+        // The CHECK constraint is the last line against a typo or
+        // a caller inventing a mode. An unrecognised posture must
+        // fail loudly at write time rather than land in the table
+        // where a reader would have to guess how to treat it —
+        // and guessing, on this setting, means guessing whether
+        // to send the operator's credentials off-device.
+        let (_dir, store) = open_temp();
+        let err = store
+            .set_metadata_privacy_mode("anonymous", 1)
+            .await
+            .expect_err("misspelled posture must be refused");
+        let _ = err;
+        // The valid neighbour still writes, proving the refusal
+        // was the value and not the path.
+        store
+            .set_metadata_privacy_mode("anonymous_only", 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_metadata_privacy_mode().await.unwrap().as_deref(),
+            Some("anonymous_only"),
+        );
+    }
+
+    #[tokio::test]
+    async fn privacy_mode_survives_reopen() {
+        // Posture is durable. An operator who sets `offline` and
+        // reboots must still be offline.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("evo.db");
+        {
+            let store =
+                SqlitePersistenceStore::open(path.clone()).expect("first open");
+            store.set_metadata_privacy_mode("offline", 1).await.unwrap();
+        }
+        let store = SqlitePersistenceStore::open(path).expect("reopen");
+        assert_eq!(
+            store.get_metadata_privacy_mode().await.unwrap().as_deref(),
+            Some("offline"),
+        );
     }
 
     #[tokio::test]
@@ -19984,7 +20251,7 @@ mod tests {
         }
     }
 
-    fn ledger_filter<'a>(ledger_id: &'a str) -> LedgerEntryFilter<'a> {
+    fn ledger_filter(ledger_id: &str) -> LedgerEntryFilter<'_> {
         LedgerEntryFilter {
             ledger_id,
             time_range: None,

@@ -23,19 +23,22 @@
 //!   same bytes are a no-op cache-wise.
 //! - Cross-node propagation (the multi-room artwork case in
 //!   `MULTIROOM-DESIGN.md` §10.13) checks for cache identity
-//!   on the hash, fetches over the framework's HTTPS artwork
-//!   endpoint on miss, write-through caches the response.
+//!   on the hash, fetches over HTTPS on miss, write-through
+//!   caches the response.
 //!
-//! ## First consumers
+//! ## What the framework supplies, and what it does not
 //!
-//! The first consumer is the multi-room metadata + artwork
-//! propagation surface. The framework's HTTPS artwork endpoint
-//! at `/api/v1/audio/artwork/{sha256}` serves bytes from the
-//! local cache; on miss the leader's endpoint fetches upstream
-//! and write-through caches. The same primitive composes for
-//! every later blob-asset surface (browse-tree art, podcast
-//! covers, lyrics, etc.) — any consumer whose identity model
-//! is the bytes themselves.
+//! The framework supplies the store: bytes in, content hash
+//! out, bytes back for that hash. It mounts no route over it
+//! and names no media type. A distribution that wants those
+//! bytes reachable over HTTP mounts its own serving surface
+//! through the router hookup and chooses its own URL shape.
+//!
+//! The first consumer is multi-room asset propagation: the
+//! emitter populates the cache, receivers fetch by hash from
+//! whatever surface the distribution mounted. The same
+//! primitive composes for every later blob-asset surface — any
+//! consumer whose identity model is the bytes themselves.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -69,6 +72,31 @@ pub trait AssetCache: Send + Sync {
                 + 'a,
         >,
     >;
+
+    /// Existence check without paying the cost of reading the
+    /// bytes. Returns `Ok(true)` when the hash resolves to a
+    /// stored asset, `Ok(false)` on miss. The default
+    /// implementation delegates to `get` and discards the
+    /// bytes; implementers backed by disk or a remote store
+    /// SHOULD override with a cheaper probe (e.g. `stat`) so
+    /// callers that verify "bytes still present under this
+    /// hash" — the resolve-index short-circuit, admission
+    /// gates, LRU book-keeping — do not fault whole payloads
+    /// into memory per check.
+    ///
+    /// Freshness contract mirrors `get`: a `true` at time
+    /// T does not guarantee bytes at time T + delta; a
+    /// concurrent `delete` or LRU eviction may fire between
+    /// the check and the subsequent `get`. Callers still
+    /// handle a subsequent `Ok(None)` from `get` as a real
+    /// miss.
+    fn has<'a>(
+        &'a self,
+        content_hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, AssetCacheError>> + Send + 'a>>
+    {
+        Box::pin(async move { Ok(self.get(content_hash).await?.is_some()) })
+    }
 
     /// Store an asset under its content hash. The framework's
     /// implementation verifies that the supplied bytes hash to
@@ -116,8 +144,8 @@ pub trait AssetCache: Send + Sync {
     /// not an error).
     ///
     /// The framework implementation MUST refuse a syntactically
-    /// invalid hash with the same [`AssetCacheError::InvalidHash`]
-    /// shape [`get`] and [`put`] use — a wrongly-formatted hash
+    /// invalid hash with the same `AssetCacheError::InvalidHash`
+    /// shape `get` and `put` use — a wrongly-formatted hash
     /// is a caller error, not a cache miss.
     ///
     /// ## Concurrency

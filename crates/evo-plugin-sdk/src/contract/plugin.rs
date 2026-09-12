@@ -161,7 +161,7 @@ pub trait Plugin: Send + Sync {
     /// access_path / failure_mode); this method declares the
     /// matching machine-readable probe spec. Authors keep
     /// the two in lockstep by convention (the intent.id is
-    /// the [`ProbePlan::intent_id`] field).
+    /// the `ProbePlan::intent_id` field).
     ///
     /// Plugins without privileges contracts return the
     /// default empty Vec and observe the no-op

@@ -232,11 +232,102 @@ impl DispatchError {
             _ => None,
         }
     }
+
+    /// Refusal subclass carried inside a [`DispatchError::Refused`]
+    /// body, when the framework attached one.
+    ///
+    /// The HTTP surface hands the whole body to the client, so it
+    /// never needed this. A transport that cannot carry a body —
+    /// the WS response frame — does: without it every refusal
+    /// arrives as `refused: {status}` and a surface cannot tell a
+    /// step-up from a household lock from a scope miss.
+    ///
+    /// Canonical shape is the framework error envelope,
+    /// `{"error": {"details": {"subclass": …}}}`. A flattened
+    /// `{"error": {"subclass": …}}` is accepted as a fallback so a
+    /// producer that skips the `details` wrapper is not silently
+    /// dropped. Nothing is parsed out of the message text, and no
+    /// subclass is invented: absent means absent.
+    pub fn refusal_subclass(&self) -> Option<&str> {
+        let DispatchError::Refused { body, .. } = self else {
+            return None;
+        };
+        let error = body.get("error")?;
+        error
+            .get("details")
+            .and_then(|d| d.get("subclass"))
+            .and_then(Value::as_str)
+            .or_else(|| error.get("subclass").and_then(Value::as_str))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refused(body: Value) -> DispatchError {
+        DispatchError::Refused {
+            status: http::StatusCode::FORBIDDEN,
+            body,
+        }
+    }
+
+    #[test]
+    fn refusal_subclass_reads_the_canonical_details_shape() {
+        let e = refused(serde_json::json!({
+            "error": {
+                "class": "permission_denied",
+                "message": "step-up required",
+                "details": { "subclass": "step_up_required" }
+            }
+        }));
+        assert_eq!(e.refusal_subclass(), Some("step_up_required"));
+    }
+
+    #[test]
+    fn refusal_subclass_falls_back_to_a_flattened_subclass() {
+        let e = refused(serde_json::json!({
+            "error": { "class": "permission_denied", "subclass": "pair_expired" }
+        }));
+        assert_eq!(e.refusal_subclass(), Some("pair_expired"));
+    }
+
+    #[test]
+    fn refusal_subclass_is_none_when_the_framework_attached_none() {
+        let e = refused(serde_json::json!({
+            "error": { "class": "internal", "message": "boom" }
+        }));
+        assert_eq!(e.refusal_subclass(), None);
+        // and for a body that is not an error envelope at all
+        assert_eq!(
+            refused(serde_json::json!({"ok": true})).refusal_subclass(),
+            None
+        );
+    }
+
+    #[test]
+    fn refusal_subclass_never_parses_the_message_text() {
+        // The message says step_up_required; the structured body
+        // does not. Nothing may be lifted out of prose.
+        let e = refused(serde_json::json!({
+            "error": { "class": "permission_denied",
+                       "message": "step_up_required: type the password" }
+        }));
+        assert_eq!(e.refusal_subclass(), None);
+    }
+
+    #[test]
+    fn refusal_subclass_is_none_for_every_non_refused_variant() {
+        for e in [
+            DispatchError::UnknownOp("x".into()),
+            DispatchError::InvalidPayload("x".into()),
+            DispatchError::Forbidden("x".into()),
+            DispatchError::Internal("x".into()),
+            DispatchError::NotImplemented("x".into()),
+        ] {
+            assert_eq!(e.refusal_subclass(), None, "{e}");
+        }
+    }
 
     #[test]
     fn each_variant_maps_to_distinct_http_status() {

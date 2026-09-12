@@ -369,7 +369,7 @@ impl DiscoveryRuntime {
     ///
     /// Unregisters the prior advert (by recorded fullname) and
     /// registers a new [`ServiceInfo`] with a TXT record rebuilt
-    /// from [`build_local_txt`]. Updates the recorded fullname
+    /// from `build_local_txt`. Updates the recorded fullname
     /// under the runtime's lock so subsequent `shutdown` /
     /// `re_advertise` calls target the new advert.
     ///

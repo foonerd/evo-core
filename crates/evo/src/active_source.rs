@@ -32,14 +32,14 @@
 //!
 //! The substrate distinguishes three states per custody-id:
 //!
-//! - **Row absent**: custody never claimed for this id. [`Self::current`]
+//! - **Row absent**: custody never claimed for this id. `Self::current`
 //!   returns `Ok(None)`.
 //! - **Row present, holder = None**: custody was claimed and then
-//!   released. [`Self::current`] returns `Ok(Some(claim))` with
+//!   released. `Self::current` returns `Ok(Some(claim))` with
 //!   `claim.holder_plugin == None`. Distinguishes "released" from
 //!   "never claimed" so audit consumers can tell the difference.
 //! - **Row present, holder = Some(plugin)**: a plugin currently
-//!   holds custody. [`Self::current`] returns `Ok(Some(claim))`
+//!   holds custody. `Self::current` returns `Ok(Some(claim))`
 //!   with the holder + claim parameters.
 
 use crate::persistence::{

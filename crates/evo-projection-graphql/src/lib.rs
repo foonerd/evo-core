@@ -24,7 +24,7 @@
 //! - Else write or step-up capability → `Mutation`
 //! - Else (anonymous or read capability) → `Query`
 //!
-//! See [`classify_root`](root::classify_root) for the
+//! See [`root::classify_root`] for the
 //! authoritative implementation.
 //!
 //! ## Field naming

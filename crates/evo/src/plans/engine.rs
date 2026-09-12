@@ -252,9 +252,9 @@ pub struct PlanRegistration {
 ///
 /// The engine holds [`Weak`] references to the runtimes (rather
 /// than [`Arc`]) so the strong reference graph stays acyclic:
-/// the steward owns Arc<AppointmentRuntime> and Arc<PlanEngine>,
-/// the runtime holds Arc<dyn FrameworkFireHandler> (= the plan
-/// engine), and the plan engine holds Weak<AppointmentRuntime>.
+/// the steward owns `Arc<AppointmentRuntime>` and `Arc<PlanEngine>`,
+/// the runtime holds `Arc<dyn FrameworkFireHandler>` (= the plan
+/// engine), and the plan engine holds `Weak<AppointmentRuntime>`.
 /// Drop semantics work cleanly when the steward shuts down.
 pub struct PlanEngine {
     storage: Arc<dyn PlanStorage>,
@@ -531,7 +531,7 @@ impl PlanEngine {
 
     /// Wire the appointment and watch runtimes the engine
     /// schedules triggers against. Held as
-    /// [`Weak`](std::sync::Weak) so the strong-reference graph
+    /// [`std::sync::Weak`] so the strong-reference graph
     /// stays acyclic. Boot wiring calls this once after both
     /// runtimes and the engine have been constructed.
     ///
@@ -4213,11 +4213,11 @@ mod tests {
     }
 
     impl SourceVerbDispatcher for RecordingDispatcher {
-        fn dispatch<'a>(
-            &'a self,
+        fn dispatch(
+            &self,
             approver: VerbApprover,
             call: VerbCall,
-        ) -> crate::source_verb_dispatch::DispatchFuture<'a> {
+        ) -> crate::source_verb_dispatch::DispatchFuture<'_> {
             Box::pin(async move {
                 self.calls.lock().await.push((approver, call));
                 if self.force_error {
@@ -4651,11 +4651,11 @@ mod tests {
     }
 
     impl SourceVerbDispatcher for ShelfDispatcher {
-        fn dispatch<'a>(
-            &'a self,
+        fn dispatch(
+            &self,
             _approver: VerbApprover,
             _call: VerbCall,
-        ) -> crate::source_verb_dispatch::DispatchFuture<'a> {
+        ) -> crate::source_verb_dispatch::DispatchFuture<'_> {
             let shelf = self.shelf.clone();
             Box::pin(async move {
                 Ok(crate::source_verb_dispatch::DispatchOutcome {

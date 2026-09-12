@@ -88,7 +88,7 @@ sha256 = "<64 hex chars>"
 | Field | Type | Notes |
 |-------|------|-------|
 | `schema_version` | `u32` | Bumps on additive changes. Consumers MUST tolerate higher versions for fields they recognise (forward compat). `0` is the current schema version. |
-| `kind` | string | Bundle taxonomy. The current schema publishes `"core-binaries"` (the steward + tooling) and `"plugin-bundle"` (signed OOP plugin bundles, see §2.3); future releases add `"image"`, `"toolchain"`. |
+| `kind` | string | Bundle taxonomy. Schema 0 publishes `"core-binaries"` (the steward + tooling) and `"plugin-bundle"` (signed OOP plugin bundles, see §2.3). Additive kinds for a reference-device plane are `"ui-shell"`, `"ui-runtime"`, `"kiosk-session"`, `"boot-theme"`, `"audio-dist"` (see §2.4), and `"distribution-bundle"` (see §2.5). Future framework kinds still include `"image"` and `"toolchain"`. |
 | `evo_core_tag` | string | Source tag the binaries were built from. Format: `v<MAJOR>.<MINOR>.<PATCH>[-<pre>]`. The tag is in the evo-core repository; consumers can clone evo-core at this tag for full reproducibility. |
 | `target` | string | rustc target triple. Consumers match this against their device's triple. |
 | `binaries` | array of strings | Files in this directory. Each file `<name>` has a sibling `<name>.sig` (signature) and `<name>.sha256` (digest). |
@@ -166,6 +166,59 @@ for `armv7-unknown-linux-gnueabihf`. Operators install the bundle
 matching their device's triple. Channels for `plugin-bundle`
 artefacts mirror the `core-binaries` channel scheme described in
 §3 below.
+
+### 2.4 Reference-device piece kinds
+
+A reference-device release plane (evo-device-audio) mints every
+shippable part as its own append-only piece. First-boot composition
+assembles those pieces into one installer tarball; everyday change
+moves one piece. These kinds are additive (`schema_version` stays
+`0`). Consumers that only recognise `core-binaries` and
+`plugin-bundle` ignore them.
+
+| `kind` | Piece name | Slot |
+|--------|------------|------|
+| `audio-steward` | `evo-device-audio` | `binaries/evo-device-audio/<version>/<target>/` |
+| `plugin-bundle` | `org.evoframework.*` | `bundles/<plugin>/<target>/<plugin>-<version>-<target>.tar.gz` |
+| `ui-shell` | `evo-ui-shell` | `bundles/evo-ui-shell/<version>/` |
+| `ui-runtime` | `evo-ui-runtime` | `binaries/evo-ui-runtime/<version>/<target>/` |
+| `kiosk-session` | `evo-kiosk` | `bundles/evo-kiosk/<version>/` |
+| `boot-theme` | `evo-device-boot` | `bundles/evo-device-boot/<version>/` |
+| `audio-dist` | `evo-device-audio-dist` | `bundles/evo-device-audio-dist/<version>/` |
+
+Tree pieces (`ui-shell`, `kiosk-session`, `boot-theme`,
+`audio-dist`) ship `tree.tar.gz` plus `tree.tar.gz.sig`,
+`tree.tar.gz.sha256`, `build-info.toml`, and `build-info.sig`.
+The device commons key signs them (the same key that signs
+audio plugin bundles). A published `<piece>/<version>` directory
+is frozen. Between cuts, if the bytes would change, the piece
+version bumps before the next mint.
+
+Publish lives on the owning public repository. All pieces land
+in `foonerd/evo-device-audio-artefacts`. Promotion is a channel
+pointer move on that repo (`promote.yml` on evo-device-audio).
+
+### 2.5 First-boot distribution bundle (`kind = "distribution-bundle"`)
+
+The audio installer tarball is first-boot composition (~110 MB
+per triple). GitHub rejects git blobs over 100 MB. The tarball
+is therefore a **GitHub Release asset** on
+`foonerd/evo-device-audio-artefacts`, not a git object.
+
+Testers fetch:
+
+```
+https://github.com/foonerd/evo-device-audio-artefacts/releases/latest/download/evo-device-audio-<triple>-<version>.tar.gz
+```
+
+A cut is `releases/download/<tag>/` (for example `v0.1.13.0`).
+Git holds only a thin pointer,
+`bundles/distribution/<version>.toml` plus `.sig`, naming the
+release URL, sha256, and size. Re-publish of the same release
+tag is a refuse. Piece slots that stay under 100 MB remain git
+blobs (`binaries/`, `bundles/<plugin>/`). The leftover
+`pieces/` tree is stub catalogue from a deleted workflow;
+promote ignores it.
 
 ## 3. Channels and pointers
 
@@ -338,9 +391,13 @@ pointer move is what consumers wait for, not the bytes' arrival.
   packages to crates.io as a tagged release; that path is
   Rust-ecosystem-standard and orthogonal to the binary release
   plane this document covers.
-- **GitHub Releases.** The `gh release` artefact tied to a tag is
-  optional metadata; the binary release plane is the canonical
-  source of binaries, not GitHub Releases.
+- **GitHub Releases (evo-core binaries).** The `gh release`
+  artefact tied to an evo-core tag is optional metadata; the
+  artefacts git tree is the canonical source of framework
+  binaries.
+- **GitHub Releases (audio first-boot tarball).** Exception:
+  `kind = "distribution-bundle"` on evo-device-audio-artefacts
+  **is** the store. See §2.5. Git cannot hold those files.
 - **OS package formats.** A distribution wrapping evo-core into a
   `.deb`, `.rpm`, or Yocto recipe MAY consume the artefacts repo as
   a source; this document does not cover that wrapping.

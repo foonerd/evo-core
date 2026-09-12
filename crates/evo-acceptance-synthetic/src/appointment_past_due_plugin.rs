@@ -4,7 +4,7 @@
 //! Synthetic appointment-past-due plugin.
 //!
 //! Exercises the boot-rehydration + Catchup-miss-policy path the
-//! framework's [`AppointmentRuntime::rehydrate_from`] enables. On
+//! framework's `AppointmentRuntime::rehydrate_from` enables. On
 //! the very first `load()` (no marker file present) the plugin
 //! registers a OneShot appointment for `now + INITIAL_OFFSET_MS`
 //! and drops a marker in `{state_dir}/registered`. On subsequent
@@ -14,7 +14,7 @@
 //!
 //! The acceptance scenario stops the steward during the
 //! INITIAL_OFFSET_MS window, waits past the fire time, then
-//! restarts. The framework's [`AppointmentRuntime`] rehydrates
+//! restarts. The framework's `AppointmentRuntime` rehydrates
 //! the now-past-due row from durable storage; the Catchup
 //! miss-policy fires it once on the first runtime tick after
 //! boot. The fire dispatches request_type `appointment_fired`

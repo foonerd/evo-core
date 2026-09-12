@@ -51,22 +51,36 @@ use crate::persistence::{
 // avoided in favour of direct `evo_primitives` imports at each
 // call site.
 
+/// OS-hostname values that are structurally unfit as a first-
+/// boot `display_name` seed. Case-insensitive match against
+/// the ASCII-lowercased hostname; every entry here is stored
+/// lowercase.
+///
+/// Scope is deliberately narrow: only generic placeholders no
+/// operator would knowingly name a device (`localhost`,
+/// `(none)`). Any other hostname is the operator's choice and
+/// is adopted as-is (subject to the length + control-character
+/// sanity checks in [`sane_hostname_seed`]).
+const BANNED_HOSTNAME_CLASSES: &[&str] = &["localhost", "(none)"];
+
 /// Sanity-check an OS hostname before adopting it as the
-/// first-boot `display_name` seed. Rejects empty strings,
-/// whitespace-only strings, the conventional placeholder
-/// "localhost" / "(none)", any string longer than
-/// [`DISPLAY_NAME_MAX_LEN`] bytes, and any string containing
-/// ASCII control characters. Returns the trimmed sane form on
-/// success.
+/// first-boot `display_name` seed. Rejects:
+///
+/// - empty / whitespace-only strings;
+/// - any string in [`BANNED_HOSTNAME_CLASSES`] (generic
+///   placeholders unfit as a device name);
+/// - any string longer than [`DISPLAY_NAME_MAX_LEN`] bytes;
+/// - any string containing ASCII control characters.
+///
+/// Returns the trimmed sane form on success. Any other
+/// hostname is the operator's choice and passes through.
 fn sane_hostname_seed(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
-    // Common placeholder values surfaced by systemd-hostnamed
-    // / Debian first-boot images / containers.
     let lc = trimmed.to_ascii_lowercase();
-    if matches!(lc.as_str(), "localhost" | "(none)" | "raspberrypi") {
+    if BANNED_HOSTNAME_CLASSES.contains(&lc.as_str()) {
         return None;
     }
     if trimmed.len() > DISPLAY_NAME_MAX_LEN {
@@ -471,14 +485,13 @@ mod tests {
         assert_eq!(sane_hostname_seed("localhost"), None);
         assert_eq!(sane_hostname_seed("LocalHost"), None);
         assert_eq!(sane_hostname_seed("(none)"), None);
-        assert_eq!(sane_hostname_seed("raspberrypi"), None);
         let too_long: String = "a".repeat(64);
         assert_eq!(sane_hostname_seed(&too_long), None);
         assert_eq!(sane_hostname_seed("bed\nroom"), None);
     }
 
     #[test]
-    fn sane_hostname_seed_accepts_room_like_names() {
+    fn sane_hostname_seed_accepts_operator_chosen_names() {
         assert_eq!(sane_hostname_seed("bedroom").as_deref(), Some("bedroom"));
         assert_eq!(
             sane_hostname_seed("  kitchen  ").as_deref(),

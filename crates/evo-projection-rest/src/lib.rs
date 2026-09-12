@@ -12,7 +12,7 @@
 //! `projection_schema::canonical_schema()`) and generates the
 //! in-memory REST endpoint table: one [`RestEndpoint`] per
 //! wire op, carrying the derived HTTP method, the URL path,
-//! and the original [`WireOp`] metadata for capability /
+//! and the original [`evo_projection_core::WireOp`] metadata for capability /
 //! audit dispatch.
 //!
 //! The crate is generation-first and listener-agnostic: it
@@ -36,7 +36,7 @@
 //! - `put_*` / `set_*` → `PUT`
 //! - Everything else (Write / StepUp default) → `POST`
 //!
-//! See [`derive_method`](method::derive_method) for the
+//! See [`method::derive_method`] for the
 //! authoritative implementation; the tests in `method` cover
 //! every wire op in the framework's canonical schema.
 //!

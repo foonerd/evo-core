@@ -110,12 +110,11 @@ async fn boot() -> (
         NoopAuditSink::shared(),
         Some(Arc::clone(&observatory)),
         None,
-        None,
-        None,
         Arc::new(evo_runtime_http::StaticAuthTier::new(
             evo_runtime_http::AuthTier::Secure,
         )) as Arc<dyn evo_runtime_http::AuthTierProvider>,
         evo_auth_bearer::CapabilitySet::default(),
+        None,
     )
     .unwrap();
 
@@ -358,12 +357,11 @@ async fn observatory_stays_silent_when_not_mounted() {
         NoopAuditSink::shared(),
         None,
         None,
-        None,
-        None,
         Arc::new(evo_runtime_http::StaticAuthTier::new(
             evo_runtime_http::AuthTier::Secure,
         )) as Arc<dyn evo_runtime_http::AuthTierProvider>,
         evo_auth_bearer::CapabilitySet::default(),
+        None,
     )
     .unwrap();
     let addr =

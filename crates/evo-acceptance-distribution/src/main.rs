@@ -13,7 +13,7 @@
 //!
 //! The two paths exercise different framework code: in-process
 //! Live skips the spawn / `prepare_for_live_reload` over-the-wire /
-//! successor-socket sequence and passes the [`StateBlob`] directly
+//! successor-socket sequence and passes the `StateBlob` directly
 //! between calls on the same Plugin trait object. That's the
 //! validation gap T2.hot-reload-live-inproc closes.
 //!

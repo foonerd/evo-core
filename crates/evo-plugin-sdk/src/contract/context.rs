@@ -474,9 +474,9 @@ pub struct LoadContext {
     /// that did not opt in see `None`.
     ///
     /// Source-host-role plugins call
-    /// [`AudioPlaneHandle::fan_out_audio_frame`] per encoded
+    /// `AudioPlaneHandle::fan_out_audio_frame` per encoded
     /// audio chunk. Receiver-role plugins call
-    /// [`AudioPlaneHandle::subscribe_audio_frames`] to
+    /// `AudioPlaneHandle::subscribe_audio_frames` to
     /// consume every received frame across every connected
     /// peer. The plugin's role flips dynamically as the
     /// framework's source-host election arbitrates; the same
@@ -537,13 +537,12 @@ pub struct LoadContext {
     /// rather than refusing to load.
     ///
     /// First consumer: the audio reference distribution's
-    /// playback warden calls `artwork.resolve` via this
-    /// dispatcher when emitting now-playing / queue / library
-    /// envelopes, embedding the resolved content hash so the
-    /// operator UI loads artwork from the framework's existing
-    /// `/api/v1/audio/artwork/:content_hash` endpoint without
-    /// a per-envelope round-trip to discover what hash to
-    /// fetch.
+    /// playback warden reaches its own asset shelf through
+    /// this dispatcher when emitting now-playing / queue /
+    /// library envelopes, embedding the resolved content hash
+    /// so the operator UI can load the bytes from that
+    /// distribution's serving surface without a per-envelope
+    /// round-trip to discover what hash to fetch.
     pub shelf_request_dispatcher: Option<
         Arc<dyn crate::contract::shelf_dispatch::ShelfRequestDispatcher>,
     >,
@@ -562,7 +561,7 @@ pub struct LoadContext {
     /// Plugins use [`CredentialVaultHandle::request_from_operator`]
     /// as the standard prompt-on-missing pattern: check the vault
     /// via [`fetch`](CredentialVaultHandle::fetch); on `None`,
-    /// raise a [`PromptRequest::Password`] via
+    /// raise a `PromptRequest::Password` via
     /// [`user_interaction_requester`](LoadContext::user_interaction_requester);
     /// on operator response, store the value and return it. This
     /// helper is the framework-blessed shape for operator-friendly
@@ -3075,7 +3074,7 @@ pub trait RelationAdmin: Send + Sync {
 /// subject identity + state (one-shot reads), this trait is the
 /// push-mode counterpart: plugins subscribe to a canonical id
 /// and receive every state change as a stream of typed
-/// [`SubjectStateUpdate`] events. The framework filters per-
+/// `SubjectStateUpdate` events. The framework filters per-
 /// subscription so each consumer only sees updates for the
 /// subjects it asked about.
 ///
@@ -3104,7 +3103,7 @@ pub trait SubjectStateSubscriber: Send + Sync {
     /// canonical subject id.
     ///
     /// Returns a [`SubjectStateStream`] that yields each
-    /// subsequent [`SubjectStateUpdate`] for the named subject.
+    /// subsequent `SubjectStateUpdate` for the named subject.
     /// Updates for other subjects are filtered out by the
     /// stream wrapper.
     ///
@@ -3338,29 +3337,68 @@ pub type CredentialRequestFuture<'a> = Pin<
 pub trait CredentialVaultHandle: Send + Sync {
     /// Fetch the credential value for `key`. Returns `Ok(None)`
     /// when no row exists for this plugin under that key.
-    fn fetch<'a>(&'a self, key: String) -> CredentialFetchFuture<'a>;
+    fn fetch(&self, key: String) -> CredentialFetchFuture<'_>;
+
+    /// Fetch a *provider* credential, which may be stored in
+    /// another plugin's vault scope.
+    ///
+    /// [`Self::fetch`] addresses this plugin's own scope and
+    /// cannot reach outside it. That boundary is structural and
+    /// stays. This method is the one governed exception, and it
+    /// exists for a concrete operator reason: a credential is
+    /// entered once, but a provider can serve surfaces that live
+    /// in different plugins. The Discogs token an operator stores
+    /// for release-credits and artist-bio is the same token needed
+    /// to fetch that artist's photograph, and those two surfaces
+    /// are not in the same plugin. Making the operator paste the
+    /// key a second time to satisfy our internal partition would
+    /// be our structure leaking into their workflow.
+    ///
+    /// The caller names a **provider**, never a scope or a key.
+    /// The framework maps the provider to its owning
+    /// `(plugin_id, vault_key)` and answers only when its registry
+    /// names this plugin the owner or an explicit reader for that
+    /// provider. A caller cannot address another plugin's vault
+    /// directly and cannot widen its own access — grants live in
+    /// framework source and ship in a release.
+    ///
+    /// Returns `Ok(None)` for an absent key, an unknown provider,
+    /// AND a refused grant. The three are deliberately
+    /// indistinguishable so a caller cannot probe the registry for
+    /// which providers hold credentials it may not read.
+    ///
+    /// The default implementation returns `Ok(None)`, so an
+    /// out-of-tree handle that predates this method keeps
+    /// compiling and simply reports no cross-scope credential.
+    fn fetch_for_provider(
+        &self,
+        provider_id: String,
+    ) -> CredentialFetchFuture<'_> {
+        let _ = provider_id;
+        Box::pin(async move { Ok(None) })
+    }
 
     /// Store `value` under `key`. Overwrites any prior entry;
     /// substrate preserves the original `created_at_ms` and
     /// advances `updated_at_ms`.
-    fn store<'a>(
-        &'a self,
+    fn store(
+        &self,
         key: String,
         value: Vec<u8>,
         metadata: CredentialMetadata,
-    ) -> CredentialMutateFuture<'a>;
+    ) -> CredentialMutateFuture<'_>;
 
     /// Remove the vault entry for `key`. Idempotent — deleting an
     /// already-absent entry succeeds silently.
-    fn delete<'a>(&'a self, key: String) -> CredentialMutateFuture<'a>;
+    fn delete(&self, key: String) -> CredentialMutateFuture<'_>;
 
     /// Enumerate every credential this plugin holds. Values are
     /// not returned; only the `key_hash + metadata + timestamps`
     /// tuple. Order is stable: `key_hash` ascending.
-    fn list_keys<'a>(&'a self) -> CredentialListingsFuture<'a>;
+    fn list_keys(&self) -> CredentialListingsFuture<'_>;
 
     /// Prompt-on-missing helper. First tries `fetch(key)`; on
-    /// `Ok(None)`, raises a [`PromptRequest::Password`] via the
+    /// `Ok(None)`, raises a `PromptRequest::Password` via the
     /// framework's user-interaction substrate with the supplied
     /// prompt text; on operator response, stores the value with
     /// the supplied metadata and returns it.
@@ -3368,12 +3406,12 @@ pub trait CredentialVaultHandle: Send + Sync {
     /// The standard shape for operator-friendly credential entry:
     /// no manual file drops on the device, no plugin-side
     /// re-implementation of the prompt / store cycle.
-    fn request_from_operator<'a>(
-        &'a self,
+    fn request_from_operator(
+        &self,
         key: String,
         prompt_text: String,
         metadata: CredentialMetadata,
-    ) -> CredentialRequestFuture<'a>;
+    ) -> CredentialRequestFuture<'_>;
 
     /// Subscribe to credential-change notifications for this
     /// plugin. The returned `broadcast::Receiver` yields a
@@ -3457,6 +3495,55 @@ impl OnlineProviderConfigChangeEvent {
     }
 }
 
+/// What a provider's use costs the operator in identity terms.
+///
+/// Declared by the plugin that owns the provider and carried to
+/// the store at registration. The framework does not infer it:
+/// inference would mean recognising provider names, and a
+/// steward that knows brand names has taken on domain knowledge
+/// it cannot keep current.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderPrivacyClass {
+    /// No account. Nothing beyond the query itself leaves the
+    /// device, so the provider is useful the moment it is
+    /// admitted and is seeded enabled.
+    Anonymous,
+    /// An operator-supplied credential ties queries to a
+    /// registered account. Seeded disabled, so switching it on
+    /// stays the operator's deliberate act.
+    IdentityBearing,
+}
+
+impl ProviderPrivacyClass {
+    /// The enable posture a fresh row for this class is seeded
+    /// with.
+    pub fn seeds_enabled(self) -> bool {
+        matches!(self, Self::Anonymous)
+    }
+
+    /// Parse the wire spelling (`"anonymous"` /
+    /// `"identity_bearing"`).
+    ///
+    /// An unrecognised spelling is `None` rather than a guess.
+    /// Callers decide what to do with that; silently choosing
+    /// `Anonymous` would enable a keyed provider on a typo.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "anonymous" => Some(Self::Anonymous),
+            "identity_bearing" => Some(Self::IdentityBearing),
+            _ => None,
+        }
+    }
+
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anonymous => "anonymous",
+            Self::IdentityBearing => "identity_bearing",
+        }
+    }
+}
+
 /// Boxed future returning the full listing.
 pub type OnlineProviderListFuture<'a> =
     Pin<Box<dyn Future<Output = OnlineProviderListResult> + Send + 'a>>;
@@ -3466,6 +3553,21 @@ pub type OnlineProviderListFuture<'a> =
 /// [`OnlineProviderConfigError`].
 pub type OnlineProviderListResult =
     Result<Vec<OnlineProviderConfig>, OnlineProviderConfigError>;
+
+/// Boxed future returning the config in force after a
+/// registration — the row just seeded, or the one already
+/// stored.
+pub type OnlineProviderRegisterFuture<'a> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    OnlineProviderConfig,
+                    OnlineProviderConfigError,
+                >,
+            > + Send
+            + 'a,
+    >,
+>;
 
 /// Errors raised by [`OnlineProviderConfigHandle`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3503,7 +3605,34 @@ pub trait OnlineProviderConfigHandle: Send + Sync {
     /// Read every registered provider's config, ordered
     /// (priority ascending, provider_id ascending) — the
     /// operator's canonical cascade order.
-    fn list_all<'a>(&'a self) -> OnlineProviderListFuture<'a>;
+    fn list_all(&self) -> OnlineProviderListFuture<'_>;
+
+    /// Declare a provider this plugin owns, and its privacy
+    /// class, seeding the store row when none exists.
+    ///
+    /// Call this at load, for every provider, **before reading
+    /// any config for that id**. The store cannot infer whether
+    /// a provider costs the operator an identity — it does not
+    /// know provider names, and a framework that learned them
+    /// would drift the moment a plugin added a source. So the
+    /// declaration is the only thing that seeds an
+    /// identity-bearing provider disabled, and being disabled is
+    /// what makes the operator's later enable gesture the
+    /// change-event the credential prompt hangs off.
+    ///
+    /// Registering late is a defect rather than a delay: the
+    /// earlier read has already returned the anonymous default,
+    /// which for a keyed provider means enabled with no key, no
+    /// prompt, and a cascade leg that silently answers nothing.
+    ///
+    /// Idempotent. An existing row is returned untouched — the
+    /// row is the operator's word, and this runs on every boot
+    /// and every reload.
+    fn register<'a>(
+        &'a self,
+        provider_id: &'a str,
+        privacy_class: ProviderPrivacyClass,
+    ) -> OnlineProviderRegisterFuture<'a>;
 
     /// Subscribe to config-change notifications. The returned
     /// `broadcast::Receiver` yields one
@@ -3514,12 +3643,183 @@ pub trait OnlineProviderConfigHandle: Send + Sync {
     fn subscribe_changes(
         &self,
     ) -> broadcast::Receiver<OnlineProviderConfigChangeEvent>;
+
+    /// Read the device's metadata privacy posture.
+    ///
+    /// This is a DEVICE setting, not a per-plugin one. It was
+    /// plugin-local configuration read by exactly one plugin,
+    /// which is precisely why the non-bypassable
+    /// identity-bearing suppression held in the text cascade and
+    /// was absent from the artwork cascade — the artwork plugin
+    /// had no notion of privacy mode at all while carrying two
+    /// identity-bearing providers. An operator selecting a
+    /// posture is making a statement about the device; every
+    /// cascade must read the same answer.
+    ///
+    /// **Callers MUST fail safe.** On `Err`, or on a value this
+    /// build does not recognise, treat the device as the most
+    /// restrictive posture and suppress identity-bearing
+    /// providers. A storage fault or a newer vocabulary must
+    /// never be the reason credentials leave the device. The
+    /// helper [`PrivacyPosture::from_wire_fail_safe`] encodes
+    /// that rule so each call site does not re-derive it.
+    ///
+    /// The default implementation returns
+    /// [`PrivacyPosture::Enhanced`], so an out-of-tree handle
+    /// that predates this method keeps compiling and behaves
+    /// exactly as it did before privacy mode existed.
+    fn privacy_mode(&self) -> PrivacyPostureFuture<'_> {
+        Box::pin(async move { Ok(PrivacyPosture::Enhanced) })
+    }
 }
+
+/// Device metadata privacy posture, as read through
+/// [`OnlineProviderConfigHandle::privacy_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PrivacyPosture {
+    /// The operator's per-provider selection stands as-is.
+    Enhanced,
+    /// Non-bypassable: every identity-bearing provider is treated
+    /// as disabled, in every cascade, regardless of its own
+    /// enable flag or whether its credential is present.
+    AnonymousOnly,
+    /// Non-bypassable: every network provider is treated as
+    /// disabled. Local sources only.
+    Offline,
+}
+
+impl PrivacyPosture {
+    /// Wire spelling, matching the framework store's CHECK
+    /// vocabulary.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            PrivacyPosture::Enhanced => "enhanced",
+            PrivacyPosture::AnonymousOnly => "anonymous_only",
+            PrivacyPosture::Offline => "offline",
+        }
+    }
+
+    /// Parse a wire value, failing safe.
+    ///
+    /// An absent value means the device has never had a posture
+    /// set, which is `Enhanced` — the framework default and the
+    /// documented behaviour for an unconfigured device.
+    ///
+    /// An UNRECOGNISED value is a different matter and does NOT
+    /// fall back to `Enhanced`. A value this build cannot parse
+    /// most likely comes from a newer build that added a
+    /// stricter posture; treating it as the permissive default
+    /// would silently downgrade the operator's privacy on a
+    /// rollback. It resolves to `Offline`, the most restrictive
+    /// posture, so the failure mode is "too little data" rather
+    /// than "credentials sent that the operator forbade".
+    pub fn from_wire_fail_safe(value: Option<&str>) -> Self {
+        match value {
+            None => PrivacyPosture::Enhanced,
+            Some("enhanced") => PrivacyPosture::Enhanced,
+            Some("anonymous_only") => PrivacyPosture::AnonymousOnly,
+            Some("offline") => PrivacyPosture::Offline,
+            Some(_unrecognised) => PrivacyPosture::Offline,
+        }
+    }
+
+    /// Whether an identity-bearing provider may dispatch under
+    /// this posture. `false` for anything but `Enhanced`.
+    pub fn permits_identity_bearing(self) -> bool {
+        matches!(self, PrivacyPosture::Enhanced)
+    }
+
+    /// Whether any network provider may dispatch under this
+    /// posture. `false` only for `Offline`.
+    pub fn permits_network(self) -> bool {
+        !matches!(self, PrivacyPosture::Offline)
+    }
+}
+
+/// Future returned by
+/// [`OnlineProviderConfigHandle::privacy_mode`].
+pub type PrivacyPostureFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<PrivacyPosture, OnlineProviderConfigError>>
+            + Send
+            + 'a,
+    >,
+>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn privacy_posture_round_trips_every_wire_spelling() {
+        for p in [
+            PrivacyPosture::Enhanced,
+            PrivacyPosture::AnonymousOnly,
+            PrivacyPosture::Offline,
+        ] {
+            assert_eq!(
+                PrivacyPosture::from_wire_fail_safe(Some(p.as_wire())),
+                p,
+                "`{}` must round-trip",
+                p.as_wire()
+            );
+        }
+    }
+
+    #[test]
+    fn absent_posture_is_enhanced() {
+        // A device nobody has configured has no row. That is the
+        // framework default and the documented behaviour — not a
+        // failure, so it does not trip the fail-safe.
+        assert_eq!(
+            PrivacyPosture::from_wire_fail_safe(None),
+            PrivacyPosture::Enhanced
+        );
+    }
+
+    #[test]
+    fn unrecognised_posture_fails_safe_to_offline() {
+        // The safety property. A value this build cannot parse
+        // most plausibly comes from a NEWER build that added a
+        // stricter posture; resolving it to the permissive
+        // default would silently downgrade the operator's privacy
+        // on a rollback and send credentials they had forbidden.
+        // It resolves to the most restrictive posture instead —
+        // the failure mode is missing enrichment, never leaked
+        // identity.
+        for bogus in [
+            "anonymous", // plausible misspelling
+            "Enhanced",  // wrong case
+            "paranoid",  // hypothetical future posture
+            "",          // empty
+            "offline ",  // stray whitespace
+        ] {
+            assert_eq!(
+                PrivacyPosture::from_wire_fail_safe(Some(bogus)),
+                PrivacyPosture::Offline,
+                "unrecognised posture {bogus:?} must fail safe to Offline"
+            );
+        }
+    }
+
+    #[test]
+    fn posture_gates_match_the_invariant() {
+        // Enhanced permits everything.
+        assert!(PrivacyPosture::Enhanced.permits_identity_bearing());
+        assert!(PrivacyPosture::Enhanced.permits_network());
+
+        // anonymous_only suppresses identity-bearing providers but
+        // leaves the keyless baseline reachable — the operator
+        // still gets enrichment, just nothing tied to an account.
+        assert!(!PrivacyPosture::AnonymousOnly.permits_identity_bearing());
+        assert!(PrivacyPosture::AnonymousOnly.permits_network());
+
+        // offline suppresses every network provider, which
+        // necessarily includes the identity-bearing ones.
+        assert!(!PrivacyPosture::Offline.permits_identity_bearing());
+        assert!(!PrivacyPosture::Offline.permits_network());
+    }
 
     #[test]
     fn call_deadline_in_duration_is_future() {

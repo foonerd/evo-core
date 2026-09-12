@@ -280,7 +280,7 @@ pub struct EventSink {
     >,
     /// Where to route plugin-initiated `asset_cache_get` /
     /// `asset_cache_put` frames. The framework's content-
-    /// addressed [`AssetCache`] is shared between in-process
+    /// addressed `AssetCache` is shared between in-process
     /// and out-of-process plugins so artwork-emission, browse
     /// thumbnails, podcast covers, and the multi-room
     /// artwork-propagation path all hit the same store. `None`
@@ -506,6 +506,21 @@ pub struct AudioRoutingForwarderSink {
 }
 
 impl AudioRoutingForwarderSink {
+    /// Construct a sink that fans onto an arbitrary channel.
+    ///
+    /// The steward mints one per admitted plugin from that
+    /// plugin's wire connection. This constructor exists so
+    /// whoever installs a routing plane can drive the same type
+    /// against a plain channel and read back the frames it
+    /// queues, without standing up a wire connection to do it.
+    pub fn new(out_tx: mpsc::Sender<WireFrame>, plugin_name: String) -> Self {
+        Self {
+            out_tx,
+            cid: Arc::new(AtomicU64::new(0)),
+            plugin_name,
+        }
+    }
+
     /// Push a state-change frame onto the outbound channel.
     /// Non-blocking; drops the frame and logs a warning if the
     /// channel is full.
@@ -2317,10 +2332,10 @@ async fn handle_inbound_frame(
         }
     } else if frame.is_event_ack() {
         // Plugin's ack of a steward-emitted event frame (e.g.
-        // the audio-routing state-change push the OOP
-        // forwarder fires synchronously inside
-        // `AudioRoutingRuntime::publish_topology`). The
-        // framework does not await these acks today — the
+        // an audio-routing state-change push, which the
+        // installed routing plane's forwarder fires
+        // synchronously). The framework does not await these
+        // acks today — the
         // forwarder's `AudioRoutingForwarderSink::push` is
         // fire-and-forget — so the pending map carries no
         // matching entry. Log + drop is the correct shape;
@@ -2437,13 +2452,17 @@ async fn forward_plugin_request(
     sink: &EventSink,
     out_tx: &mpsc::Sender<WireFrame>,
 ) {
-    // Per `docs/engineering/LOGGING.md` §2: every verb invocation
-    // emits debug. The plugin-request path is one of the four
+    // High-frequency per-verb-invocation tracing lives at TRACE,
+    // not DEBUG. The plugin-request path is one of the four
     // major verb-dispatch entries (alongside dispatch_request,
     // forward_event, and the router's handle_request); each
-    // frame here is one verb. Envelope fields are cheap to log.
+    // frame here is one verb, firing on the UI subject-tick +
+    // reactive-state pump cadence (typically a couple of times
+    // per second on a connected device). TRACE keeps this off
+    // default journals while remaining available under
+    // `RUST_LOG=trace` for diagnostics.
     let (_v, cid, plugin) = frame.envelope();
-    tracing::debug!(
+    tracing::trace!(
         op = variant_name(&frame),
         cid,
         plugin = %plugin,
@@ -3810,6 +3829,59 @@ async fn forward_plugin_request(
                 ),
             }
         }
+        // Governed cross-scope read. The sink's vault handle is
+        // still the caller's own scoped handle — the grant check
+        // and the owner-scope fetch both happen inside
+        // `PluginScopedCredentialVault::fetch_for_provider`, which
+        // consults the framework's provider registry. Nothing here
+        // can steer the read; this arm only carries the provider
+        // id across the wire and marshals the answer back. A
+        // refused grant arrives as `found: false`, identical to an
+        // absent key.
+        WireFrame::CredentialFetchForProvider {
+            v,
+            cid,
+            plugin,
+            provider_id,
+        } => {
+            match sink.credential_vault.as_ref() {
+                Some(vault) => {
+                    match vault.fetch_for_provider(provider_id).await {
+                        Ok(Some(value)) => {
+                            WireFrame::CredentialFetchForProviderResponse {
+                                v,
+                                cid,
+                                plugin,
+                                found: true,
+                                value,
+                            }
+                        }
+                        Ok(None) => {
+                            WireFrame::CredentialFetchForProviderResponse {
+                                v,
+                                cid,
+                                plugin,
+                                found: false,
+                                value: Vec::new(),
+                            }
+                        }
+                        Err(e) => credential_vault_error_to_wire_error(
+                            v,
+                            cid,
+                            plugin,
+                            "credential_fetch_for_provider",
+                            e,
+                        ),
+                    }
+                }
+                None => credential_vault_unavailable_error(
+                    v,
+                    cid,
+                    plugin,
+                    "credential_fetch_for_provider",
+                ),
+            }
+        }
         WireFrame::CredentialStore {
             v,
             cid,
@@ -3890,6 +3962,54 @@ async fn forward_plugin_request(
                 ),
             }
         }
+        WireFrame::OnlineProviderConfigRegister {
+            v,
+            cid,
+            plugin,
+            provider_id,
+            privacy_class,
+        } => {
+            match sink.online_provider_config.as_ref() {
+                Some(handle) => {
+                    match handle.register(&provider_id, privacy_class).await {
+                        Ok(config) => {
+                            WireFrame::OnlineProviderConfigRegisterResponse {
+                                v,
+                                cid,
+                                plugin,
+                                config,
+                            }
+                        }
+                        Err(e) => WireFrame::Error {
+                            v,
+                            cid,
+                            plugin,
+                            class: ErrorClass::Internal,
+                            message: format!(
+                                "online_provider_config_register: seed failed: {e}"
+                            ),
+                            details: Some(serde_json::json!({
+                                "subclass": "provider_config_register_failed",
+                                "provider_id": provider_id,
+                            })),
+                        },
+                    }
+                }
+                None => WireFrame::Error {
+                    v,
+                    cid,
+                    plugin,
+                    class: ErrorClass::Internal,
+                    message:
+                        "online_provider_config_register: store unwired"
+                            .to_string(),
+                    details: Some(serde_json::json!({
+                        "subclass": "provider_config_store_unwired",
+                        "provider_id": provider_id,
+                    })),
+                },
+            }
+        }
         WireFrame::OnlineProviderConfigList { v, cid, plugin } => {
             match sink.online_provider_config.as_ref() {
                 Some(handle) => match handle.list_all().await {
@@ -3921,6 +4041,51 @@ async fn forward_plugin_request(
                         "online_provider_config_list: provider config store \
                          not wired on this steward"
                             .into(),
+                    details: Some(serde_json::json!({
+                        "subclass": "provider_config_unavailable",
+                    })),
+                },
+            }
+        }
+
+        WireFrame::OnlineProviderPrivacyMode { v, cid, plugin } => {
+            match sink.online_provider_config.as_ref() {
+                Some(handle) => match handle.privacy_mode().await {
+                    Ok(posture) => {
+                        WireFrame::OnlineProviderPrivacyModeResponse {
+                            v,
+                            cid,
+                            plugin,
+                            mode: posture.as_wire().to_string(),
+                        }
+                    }
+                    // Surface the failure rather than substituting
+                    // a posture. The plugin's fail-safe rule turns
+                    // an error into the most restrictive posture;
+                    // answering `enhanced` here would quietly
+                    // convert a storage fault into permission to
+                    // send credentials off-device.
+                    Err(e) => WireFrame::Error {
+                        v,
+                        cid,
+                        plugin,
+                        class: ErrorClass::Internal,
+                        message: format!(
+                            "online_provider_privacy_mode: read failed: {e}"
+                        ),
+                        details: Some(serde_json::json!({
+                            "subclass": "privacy_mode_read_failed",
+                        })),
+                    },
+                },
+                None => WireFrame::Error {
+                    v,
+                    cid,
+                    plugin,
+                    class: ErrorClass::Internal,
+                    message: "online_provider_privacy_mode: provider config \
+                              store not wired on this steward"
+                        .into(),
                     details: Some(serde_json::json!({
                         "subclass": "provider_config_unavailable",
                     })),
@@ -4761,6 +4926,12 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::CredentialFetchResponse { .. } => {
             "credential_fetch_response"
         }
+        WireFrame::CredentialFetchForProvider { .. } => {
+            "credential_fetch_for_provider"
+        }
+        WireFrame::CredentialFetchForProviderResponse { .. } => {
+            "credential_fetch_for_provider_response"
+        }
         WireFrame::CredentialStore { .. } => "credential_store",
         WireFrame::CredentialStoreResponse { .. } => {
             "credential_store_response"
@@ -4774,8 +4945,20 @@ fn variant_name(frame: &WireFrame) -> &'static str {
             "credential_list_keys_response"
         }
         WireFrame::CredentialSetChanged { .. } => "credential_set_changed",
+        WireFrame::OnlineProviderPrivacyMode { .. } => {
+            "online_provider_privacy_mode"
+        }
+        WireFrame::OnlineProviderPrivacyModeResponse { .. } => {
+            "online_provider_privacy_mode_response"
+        }
         WireFrame::OnlineProviderConfigList { .. } => {
             "online_provider_config_list"
+        }
+        WireFrame::OnlineProviderConfigRegister { .. } => {
+            "online_provider_config_register"
+        }
+        WireFrame::OnlineProviderConfigRegisterResponse { .. } => {
+            "online_provider_config_register_response"
         }
         WireFrame::OnlineProviderConfigListResponse { .. } => {
             "online_provider_config_list_response"
@@ -6788,10 +6971,10 @@ target_type = "album"
     }
 
     impl Warden for TestWarden {
-        fn take_custody<'a>(
-            &'a mut self,
+        fn take_custody(
+            &mut self,
             assignment: Assignment,
-        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a
+        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + '_
         {
             async move {
                 if self.fail_take {
@@ -6824,10 +7007,10 @@ target_type = "album"
             async move { Ok(()) }
         }
 
-        fn release_custody<'a>(
-            &'a mut self,
+        fn release_custody(
+            &mut self,
             _handle: CustodyHandle,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
             async move { Ok(()) }
         }
     }
@@ -9519,29 +9702,28 @@ name = "track"
     // ---------------------------------------------------------------------
     // Audio-routing OOP wire-proxy round-trip.
     //
-    // Asserts the full flow:
+    // Asserts the half of the flow this crate owns:
     //
-    //   framework AudioRoutingRuntime.publish_topology
-    //     → install_audio_routing_forwarder callback fires
-    //     → AudioRoutingForwarderSink.push WireFrame::AudioRoutingStateChanged
+    //   AudioRoutingForwarderSink.push WireFrame::AudioRoutingStateChanged
     //     → SDK host dispatcher routes into WireAudioRouting.apply_state_change
-    //     → plugin's ctx.audio_routing trait reads return the published values
+    //     → plugin's ctx.audio_routing trait reads return the pushed values
     //     → plugin's on_route_change callback fires with new format + reason
     //
     // Plus the initial state push at admission and the
-    // EndpointNotConfigured shape when no topology is published.
+    // EndpointNotConfigured shape before anything is pushed.
+    //
+    // What produces a push — a chain being published, the
+    // forwarder fanning it out — belongs to whichever routing
+    // plane is installed, and is asserted there.
     // ---------------------------------------------------------------------
 
     mod audio_routing_wire_proxy {
         use super::*;
-        use crate::audio_routing::{
-            install_audio_routing_forwarder, AudioRoutingRuntime,
-            PluginAudioRole, ResolvedRouting,
-        };
         use evo_plugin_sdk::audio::{AudioFormat, PcmCodec};
         use evo_plugin_sdk::contract::audio_routing::{
-            AudioRouting, AudioRoutingError, EndpointKind, ReadEndpoint,
-            RouteChange, RouteChangeCallback,
+            AudioRouting, AudioRoutingError, CompositionEndpoints,
+            EndpointKind, ReadEndpoint, ResolvedRouting, RouteChange,
+            RouteChangeCallback, WriteEndpoint,
         };
         use evo_plugin_sdk::host::{serve, HostConfig};
         use std::path::PathBuf;
@@ -9561,6 +9743,44 @@ name = "track"
                 format: pcm(),
                 buffer_frames: 1024,
             }
+        }
+
+        fn resolved() -> ResolvedRouting {
+            ResolvedRouting {
+                write: None,
+                read: Some(re()),
+                format: pcm(),
+            }
+        }
+
+        /// Steward-side handle stamped on
+        /// `LoadContext.audio_routing` so `load` tells the
+        /// plugin it has routing. Nothing reads it: every
+        /// assertion below is against the plugin-side SDK proxy
+        /// the wire frames populate. Whatever mints the real
+        /// steward handle is the installed routing plane's
+        /// business and lives outside this crate.
+        #[derive(Debug)]
+        struct StewardSideHandle;
+
+        impl AudioRouting for StewardSideHandle {
+            fn write_endpoint(
+                &self,
+            ) -> Result<WriteEndpoint, AudioRoutingError> {
+                Err(AudioRoutingError::EndpointNotConfigured)
+            }
+            fn read_endpoint(&self) -> Result<ReadEndpoint, AudioRoutingError> {
+                Err(AudioRoutingError::EndpointNotConfigured)
+            }
+            fn composition_endpoints(
+                &self,
+            ) -> Result<CompositionEndpoints, AudioRoutingError> {
+                Err(AudioRoutingError::EndpointNotConfigured)
+            }
+            fn current_format(&self) -> Result<AudioFormat, AudioRoutingError> {
+                Err(AudioRoutingError::EndpointNotConfigured)
+            }
+            fn on_route_change(&self, _cb: Option<RouteChangeCallback>) {}
         }
 
         /// Captures from the plugin side: a clone of
@@ -9676,12 +9896,17 @@ name = "track"
             panic!("condition not observed within 2 s");
         }
 
-        /// End-to-end: the framework's `publish_topology` should
-        /// flow over the wire and surface as both a populated
-        /// plugin-side cache (`write_endpoint()` etc.) AND a
-        /// route-change callback firing with the right reason.
+        /// A state push should flow over the wire and surface
+        /// as both a populated plugin-side cache
+        /// (`read_endpoint()` etc.) AND a route-change callback
+        /// firing with the right reason — and the path should
+        /// stay open across repeated pushes.
+        ///
+        /// What produces the push is the installed routing
+        /// plane's business; this asserts the wire the framework
+        /// owns between the sink and the plugin's SDK proxy.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn publish_topology_round_trips_to_oop_plugin() {
+        async fn sink_push_round_trips_to_oop_plugin() {
             let plugin_name = "org.test.audio.delivery".to_string();
             let capture = Arc::new(AudioRoutingCapture::default());
 
@@ -9711,13 +9936,12 @@ name = "track"
             .await
             .unwrap();
 
-            // Steward-side runtime + per-plugin handle. The
-            // forwarder will register a route-change callback on
-            // this handle that fans state pushes out over the
-            // wire.
-            let runtime = Arc::new(AudioRoutingRuntime::new());
-            let local_handle = runtime
-                .handle_for_plugin(&plugin_name, PluginAudioRole::Delivery);
+            // The sink is the framework's end of the path: an
+            // installed routing plane pushes onto it, and the
+            // frames it queues are what the plugin's SDK proxy
+            // applies.
+            let local_handle: Arc<dyn AudioRouting> =
+                Arc::new(StewardSideHandle);
             let sink = respondent.client().audio_routing_forwarder_sink();
 
             // Build a LoadContext stamped with the per-plugin
@@ -9736,9 +9960,8 @@ name = "track"
             respondent.load(&ctx).await.unwrap();
 
             // Confirm the plugin captured a handle and the
-            // initial-cache shape is EndpointNotConfigured —
-            // the forwarder has not yet been installed, no push
-            // has crossed the wire.
+            // initial-cache shape is EndpointNotConfigured — no
+            // push has crossed the wire yet.
             let captured = capture
                 .handle
                 .lock()
@@ -9750,37 +9973,15 @@ name = "track"
                 AudioRoutingError::EndpointNotConfigured
             );
 
-            // Install the forwarder. Since the runtime has no
-            // topology published yet, the initial-push branch
-            // is skipped; the plugin-side cache stays empty.
-            install_audio_routing_forwarder(
-                Arc::clone(&runtime),
-                Arc::clone(&local_handle),
-                sink,
-                plugin_name.clone(),
-            );
-            // The forwarder may not be observable yet because
-            // the framework has not published any topology. The
-            // plugin's cache remains EndpointNotConfigured.
             assert_eq!(
                 captured.read_endpoint().unwrap_err(),
                 AudioRoutingError::EndpointNotConfigured
             );
 
-            // Publish the first topology. The forwarder fires
-            // synchronously inside publish_topology, queueing
-            // the wire frame onto the outbound channel; the
-            // plugin-side host dispatch loop applies it on its
-            // next read.
-            runtime.publish_topology(
-                &plugin_name,
-                ResolvedRouting {
-                    write: None,
-                    read: Some(re()),
-                    format: pcm(),
-                    reason: "first publish".into(),
-                },
-            );
+            // First push. `push` queues the wire frame on the
+            // outbound channel synchronously; the plugin-side
+            // host dispatch loop applies it on its next read.
+            sink.push(Some(resolved()), "first publish".into());
 
             // Wait until the plugin's callback observed the
             // change. Same channel guarantees ordering, so
@@ -9804,17 +10005,9 @@ name = "track"
             assert_eq!(changes[0].new_format, pcm());
             assert_eq!(changes[0].reason, "first publish");
 
-            // Second publish proves the forwarder stays
-            // registered across rewires.
-            runtime.publish_topology(
-                &plugin_name,
-                ResolvedRouting {
-                    write: None,
-                    read: Some(re()),
-                    format: pcm(),
-                    reason: "second publish".into(),
-                },
-            );
+            // Second push proves the path stays open across
+            // rewires rather than delivering once.
+            sink.push(Some(resolved()), "second publish".into());
             let cap_for_wait = Arc::clone(&capture);
             wait_for(move || {
                 cap_for_wait.route_changes.lock().unwrap().len() >= 2
@@ -9829,11 +10022,16 @@ name = "track"
             let _ = host.await;
         }
 
-        /// Pre-load topology: `install_audio_routing_forwarder`
-        /// should emit an initial state push immediately, so
-        /// the SDK proxy's cache is populated by the time the
-        /// next plugin trait read fires (modulo wire latency,
-        /// which the round-trip awaits).
+        /// State that already existed before the plugin
+        /// admitted arrives as the plugin's very first frame,
+        /// with no empty-cache observation in between: the SDK
+        /// proxy is populated by the time the next plugin trait
+        /// read fires (modulo wire latency, which the
+        /// round-trip awaits).
+        ///
+        /// The push happens immediately after `load` returns —
+        /// the earliest legal moment, since the SDK dispatcher
+        /// rejects state frames received before `Load`.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn initial_state_push_populates_plugin_cache() {
             let plugin_name = "org.test.audio.delivery.initial".to_string();
@@ -9863,24 +10061,9 @@ name = "track"
             .await
             .unwrap();
 
-            let runtime = Arc::new(AudioRoutingRuntime::new());
-            let local_handle = runtime
-                .handle_for_plugin(&plugin_name, PluginAudioRole::Delivery);
+            let local_handle: Arc<dyn AudioRouting> =
+                Arc::new(StewardSideHandle);
             let sink = respondent.client().audio_routing_forwarder_sink();
-
-            // Publish a topology BEFORE installing the
-            // forwarder, mirroring the order that occurs when
-            // reconciliation runs early and a plugin admits
-            // afterwards.
-            runtime.publish_topology(
-                &plugin_name,
-                ResolvedRouting {
-                    write: None,
-                    read: Some(re()),
-                    format: pcm(),
-                    reason: "pre-admission topology".into(),
-                },
-            );
 
             let registry = Arc::new(SubjectRegistry::new());
             let graph = Arc::new(RelationGraph::new());
@@ -9894,12 +10077,9 @@ name = "track"
             use crate::admission::ErasedRespondent;
             respondent.load(&ctx).await.unwrap();
 
-            install_audio_routing_forwarder(
-                Arc::clone(&runtime),
-                Arc::clone(&local_handle),
-                sink,
-                plugin_name.clone(),
-            );
+            // The state predates admission; it reaches the
+            // plugin as its first frame.
+            sink.push(Some(resolved()), "pre-admission topology".into());
 
             // Wait for the initial-push frame to traverse the
             // wire.

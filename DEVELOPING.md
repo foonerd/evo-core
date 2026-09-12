@@ -356,7 +356,8 @@ Quick reference for the things you will do repeatedly.
 | Send a request from a shell | see section 6.1 |
 | Format code | `cargo fmt --all` |
 | Lint code | `cargo clippy --workspace --all-targets -- -D warnings` |
-| Check everything CI checks | `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` |
+| Check everything CI checks | `cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked` |
+| Commit entry gate (compulsory) | `scripts/preflight/check-cargo-workout.sh` — `cargo clean`, then the CI trio, then `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked`. rustdoc is not optional. |
 
 ## 12. Where To Go Next
 

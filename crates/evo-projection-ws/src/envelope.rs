@@ -161,6 +161,24 @@ pub enum ResponseOutcome {
         code: String,
         /// Operator-readable error message.
         message: String,
+        /// Refusal subclass the framework attached to the error,
+        /// when it produced one — `"step_up_required"`,
+        /// `"household_policy_locked"`, a pair-ceremony subclass.
+        ///
+        /// A refusal arrives here as `code: "refused"`, because
+        /// the WS frame carries no HTTP status to classify on.
+        /// Without this field the subclass died at the steward:
+        /// HTTP surfaces the framework's envelope verbatim, WS
+        /// surfaced only `refused: 403 Forbidden`, and a surface
+        /// on the socket could not tell a step-up from a lock
+        /// from a scope miss. It is the same token the HTTP body
+        /// carries at `error.details.subclass`, so one classifier
+        /// serves both transports.
+        ///
+        /// Absent on success and on errors the framework raised
+        /// without a subclass; never invented here.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        subclass: Option<String>,
     },
 }
 
@@ -240,6 +258,7 @@ mod tests {
             outcome: ResponseOutcome::Err {
                 code: "permission_denied".into(),
                 message: "capability scope missing: plugins_admin".into(),
+                subclass: None,
             },
         };
         let json = serde_json::to_string(&frame).unwrap();

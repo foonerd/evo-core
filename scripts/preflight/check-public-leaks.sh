@@ -87,10 +87,12 @@ EXCLUDE_ARGS=(
     "--exclude-dir=target"
     "--exclude-dir=.cargo"
     "--exclude-dir=node_modules"
-    # The preflight script itself encodes the patterns it scans
-    # for; excluding it is the only way the script can co-exist
-    # with the gate.
+    # The guard family: this script encodes the patterns it scans
+    # for, and the control beside it carries the samples it plants
+    # to prove each class fires. Excluding both by exact filename is
+    # the only way either can co-exist with the gate.
     "--exclude=check-public-leaks.sh"
+    "--exclude=check-public-leaks-positive.sh"
 )
 
 declare -a FAILURES=()

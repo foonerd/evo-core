@@ -64,7 +64,7 @@
 //! This module is not consumed by any framework runtime today.
 //! The reactive-admission substrate it was authored to support
 //! was refused in favour of the surgical parity-gate fix in
-//! [`crate::privileges::parity_gate`] (loaded-but-inactive
+//! `crate::privileges::parity_gate` (loaded-but-inactive
 //! services satisfy the gate). The types are retained
 //! transiently; a follow-up cycle deletes this module unless a
 //! separately justified consumer appears.
@@ -203,7 +203,7 @@ pub enum AdmissionState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrerequisiteRecord {
     /// What kind of prerequisite this record describes. Mirrors
-    /// the SDK's existing [`crate::privileges::PrerequisiteKind`].
+    /// the SDK's existing `crate::privileges::PrerequisiteKind`.
     pub kind: PrerequisiteKind,
     /// The declared identifier (binary name like `mount.cifs`,
     /// unit name like `smbd.service`).

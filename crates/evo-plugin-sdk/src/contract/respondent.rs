@@ -98,7 +98,7 @@ pub struct Request {
     /// [`VerbCapability::Read`](crate::manifest::VerbCapability::Read) /
     /// [`Write`](crate::manifest::VerbCapability::Write) /
     /// [`StepUp`](crate::manifest::VerbCapability::StepUp). `None` when
-    /// the verb's manifest entry is [`VerbCapability::None`] or absent
+    /// the verb's manifest entry is `VerbCapability::None` or absent
     /// (the legacy default; the verb accepts anonymous dispatches).
     ///
     /// Plugins use this field for structured logging

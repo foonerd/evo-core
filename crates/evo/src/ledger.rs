@@ -505,7 +505,7 @@ pub enum LifecycleEventType {
     /// log-level change, diagnostics export, update apply, SSH
     /// state, or any other entry in the operations control plane.
     /// Recorded after every successful execution; the matching
-    /// [`OperationDenied`] variant covers refused calls. Payload
+    /// `OperationDenied` variant covers refused calls. Payload
     /// is an [`OperationExecutedPayload`] with the operation's
     /// canonical name, the capability key the gate consulted, the
     /// step-up principal (when one was presented), and the
@@ -1167,7 +1167,7 @@ impl LedgerPrimitive {
     /// one-shot `link_ledger_withdrawal`.
     ///
     /// On a substrate
-    /// [`PersistenceError::AlreadyWithdrawn`](crate::persistence::PersistenceError::AlreadyWithdrawn),
+    /// [`crate::persistence::PersistenceError::AlreadyWithdrawn`],
     /// the withdrawal entry has been appended but is not linked —
     /// the operator surface should surface this as "withdrawal
     /// recorded but not linked" so audit history is preserved.

@@ -378,7 +378,7 @@ pub struct FrameSendEvent {
 
 /// One receiver's back-reported per-frame trace observed by
 /// the source-host's subscriber. The framework wraps incoming
-/// [`AudioPlaneMessage::FrameTraceReport`] messages into
+/// `AudioPlaneMessage::FrameTraceReport` messages into
 /// these and broadcasts them to source-role plugins that
 /// subscribed via
 /// [`AudioPlaneHandle::subscribe_frame_trace_reports`].

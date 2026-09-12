@@ -48,7 +48,7 @@ Each tier's signing root is distinct (per `PLUGIN_PACKAGING.md` §5 Trust root l
 
 ## 3. The Interface
 
-Four contracts cross the boundary. Every contract is declared inside `evo-core`. A distribution consumes all four as a stable surface and ships only artefacts shaped to fit.
+Contracts cross the boundary in three families: the plugin surface, two soft data contracts, and the composition closures a distribution supplies when it builds its own steward binary. Every one of them is declared inside `evo-core`. A distribution consumes them as a stable surface and ships only artefacts shaped to fit.
 
 | Contract | Where it lives in evo-core | What a distribution does with it |
 |----------|----------------------------|----------------------------------|
@@ -66,7 +66,20 @@ Two soft contracts:
 
 Soft because they are data, not code, and the framework tolerates variation within validated limits.
 
-Nothing else crosses. A distribution does not patch the steward, does not extend the SDK trait set, does not inject code into evo-core's build. If a distribution needs something that none of the four contracts provides, the right move is to propose a change to the contract, not to bypass it.
+The third family is code the distribution supplies at compile-link, carried on `RunOptions`. A distribution composing its own steward binary fills in the hooks it needs and leaves the rest absent; the shipped `evo` binary leaves all of them absent and is a complete, working steward without them.
+
+| Closure | Where it lives in evo-core | What a distribution does with it |
+|----------|----------------------------|----------------------------------|
+| **`AdmissionSetup`** | `crates/evo/src/lib.rs` | Decide which plugins are admitted and how they are discovered. |
+| **`RtcWakeCallback`** | `crates/evo/src/appointments.rs` | Supply the OS-specific sleep/wake plumbing for must-wake appointments. |
+| **`PostAdmissionSetup`** | `crates/evo/src/lib.rs` | Run once every plugin has admitted, to publish domain state the framework's reconciliation cycles then act on. |
+| **`RuntimeSetup`** | `crates/evo/src/lib.rs` | Construct a domain-tier runtime and inject it into the framework's shared handles. |
+| **`HttpsSetup`** | `crates/evo/src/lib.rs` | Mount the product's own HTTP surfaces. Receives the router the framework has finished building, returns it. Carries the claimant name the distribution owns; the framework mints a token for that string and invents none of its own. |
+| **`HouseholdGroupTable`** | `crates/evo/src/household_protection.rs` | Name the product's Settings groups and map each to capability scopes. The framework owns the protection mechanism entire — policy object, level ladder, persistence, wire ops, change happening, origin-aware stamp, dispatch gate — and owns no group names: "file sharing" or "metadata" are domain vocabulary that would fail §5. One table per distribution, supplied here; plugins never register groups. Absent on the shipped `evo` binary, where the ladder binds through framework scope names instead so the guest overlay is never a silent no-op. |
+
+These are the seam where domain composition belongs. Plugins may not call one another, so something has to compose them — and that something must be on the distribution's side of the boundary, not compiled into the steward. A domain walk that ends up in `crates/evo` or `crates/evo-runtime-http` because "there was nowhere else to put it" belongs on one of these hooks instead. `scripts/preflight/check-domain-http-in-steward.sh` refuses the alternative mechanically.
+
+A distribution does not patch the steward, does not extend the SDK trait set, and does not inject code into evo-core's build. If it needs something none of these contracts provides, the right move is to propose a change to the contract, not to bypass it.
 
 ## 4. What evo-core Contains
 

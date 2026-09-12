@@ -31,12 +31,6 @@ axum = { version = "0.7", default-features = false, features = ["http1", "http2"
 evo-projection-ws = { path = "../evo-projection-ws" }
 base64 = "0.22"
 bytes = "1"
-# Captive-session proxy: decompress upstream gzip/deflate
-# before HTML rewrite / JSON handoff. Portal-agnostic —
-# UniFi, CoovaChilli, and most venue controllers compress
-# JSON/API responses when the browser advertises
-# Accept-Encoding.
-flate2 = "1"
 evo-auth-bearer = { path = "../evo-auth-bearer" }
 evo-observatory = { path = "../evo-observatory" }
 evo-plugin-sdk = { path = "../evo-plugin-sdk" }
@@ -76,10 +70,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Powers the artwork_resolve_index sidecar: SHA-256 of the
-# (scheme, value, size) triple names the sharded file the
-# (scheme, value, size) -> content_hash mapping is stored in.
-sha2 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

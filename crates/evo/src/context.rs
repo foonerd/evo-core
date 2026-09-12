@@ -4426,7 +4426,7 @@ impl evo_plugin_sdk::contract::StreamHost for CoordinatorStreamHost {
 
 /// [`evo_plugin_sdk::contract::NotificationEmitter`] implementation
 /// that forwards trait calls to the `system.notifications` shelf via
-/// the framework's [`ShelfRequestDispatcher`]. The reference plugin
+/// the framework's `ShelfRequestDispatcher`. The reference plugin
 /// stocking that shelf
 /// (`org.evoframework.system.notifications`) owns the actual
 /// dispatcher state (active list + operator base mode + quiet-hours
@@ -4445,7 +4445,7 @@ impl evo_plugin_sdk::contract::StreamHost for CoordinatorStreamHost {
 ///
 /// ## Source-plugin attribution
 ///
-/// The trait surface accepts a [`Notification`] whose
+/// The trait surface accepts a `Notification` whose
 /// `source_plugin` field the plugin supplies. This adapter records
 /// the caller's canonical name on construction and overwrites
 /// `notification.source_plugin` with it before serialisation. A
@@ -4455,7 +4455,7 @@ impl evo_plugin_sdk::contract::StreamHost for CoordinatorStreamHost {
 ///
 /// ## Error mapping
 ///
-/// [`ShelfDispatchError`] flattens onto [`NotificationError`]:
+/// `ShelfDispatchError` flattens onto `NotificationError`:
 ///
 /// - `NoPluginOnShelf` / `VerbNotStockedOnShelf` → `Invalid(msg)`
 ///   with a message naming the shelf/verb — plugin author knows the
@@ -4979,253 +4979,11 @@ impl evo_plugin_sdk::contract::SubjectStateSubscriber
     }
 }
 
-/// Framework-side adapter binding
-/// [`crate::audio_plane::AudioPlaneRuntime`] to the plugin SDK's
-/// [`evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle`]
-/// trait. The admission engine wraps the shared runtime in one
-/// of these per plugin whose manifest declares
-/// `capabilities.audio_plane = true` and populates
-/// `LoadContext::audio_plane` so the plugin can fan audio
-/// frames out to multi-room receivers + subscribe to incoming
-/// frames from a source-host peer.
-pub struct RuntimeAudioPlaneHandle {
-    runtime: Arc<crate::audio_plane::AudioPlaneRuntime>,
-    /// Group store the audio plane consults when fanning frames
-    /// out. Kept as a direct handle on this wrapper so the
-    /// SDK-side `upsert_group` method (used by source-host
-    /// plugins to instantiate their group from operator config)
-    /// reaches the same store the runtime reads from.
-    group_store: Arc<crate::groups::GroupStore>,
-}
-
-impl RuntimeAudioPlaneHandle {
-    /// Construct against a shared [`crate::audio_plane::AudioPlaneRuntime`]
-    /// + the framework's [`crate::groups::GroupStore`].
-    pub fn new(
-        runtime: Arc<crate::audio_plane::AudioPlaneRuntime>,
-        group_store: Arc<crate::groups::GroupStore>,
-    ) -> Self {
-        Self {
-            runtime,
-            group_store,
-        }
-    }
-}
-
-impl evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle
-    for RuntimeAudioPlaneHandle
-{
-    fn subscribe_audio_frames<'a>(
-        &'a self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        evo_plugin_sdk::contract::audio_plane::AudioFrameStream,
-                        evo_plugin_sdk::contract::PluginError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        let runtime = Arc::clone(&self.runtime);
-        Box::pin(async move {
-            // The framework's broadcast item type re-exports the
-            // SDK's AudioFrameReceived, so the receiver matches
-            // the SDK's AudioFrameStream constructor without an
-            // adapter step.
-            let rx = runtime.subscribe_audio_frames();
-            Ok(
-                evo_plugin_sdk::contract::audio_plane::AudioFrameStream::new(
-                    rx,
-                ),
-            )
-        })
-    }
-
-    fn fan_out_audio_frame<'a>(
-        &'a self,
-        group_id: String,
-        frame: evo_plugin_sdk::contract::audio_plane::AudioFrameSeed,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<(), evo_plugin_sdk::contract::PluginError>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        let runtime = Arc::clone(&self.runtime);
-        Box::pin(async move {
-            // Map the SDK envelope to the runtime's seed type.
-            // The runtime's fan_out_audio_frame consumes its
-            // own AudioFrameSeed; the SDK type carries the same
-            // fields so the conversion is a trivial struct
-            // re-pack.
-            let seed = crate::audio_plane::AudioFrameSeed {
-                sequence: frame.sequence,
-                presentation_time_ms: frame.presentation_time_ms,
-                codec: frame.codec,
-                rate_hz: frame.rate_hz,
-                channels: frame.channels,
-                payload_b64: frame.payload_b64,
-            };
-            runtime.fan_out_audio_frame(&group_id, seed).await;
-            Ok(())
-        })
-    }
-
-    fn upsert_group<'a>(
-        &'a self,
-        group_id: String,
-        display_name: String,
-        members: Vec<String>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<(), evo_plugin_sdk::contract::PluginError>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        let group_store = Arc::clone(&self.group_store);
-        Box::pin(async move {
-            group_store
-                .upsert_with_id(&group_id, &display_name, &members)
-                .await
-                .map(|_| ())
-                .map_err(|e| {
-                    evo_plugin_sdk::contract::PluginError::Permanent(format!(
-                        "upsert_group({group_id}) failed: {e}"
-                    ))
-                })?;
-            Ok(())
-        })
-    }
-
-    fn dial_peer<'a>(
-        &'a self,
-        addr: String,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<(), evo_plugin_sdk::contract::PluginError>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        let runtime = Arc::clone(&self.runtime);
-        Box::pin(async move {
-            let sock = addr.parse::<std::net::SocketAddr>().map_err(|e| {
-                evo_plugin_sdk::contract::PluginError::Permanent(format!(
-                    "dial_peer({addr}) address parse failed: {e}"
-                ))
-            })?;
-            runtime.dial_peer(sock).await.map_err(|e| {
-                evo_plugin_sdk::contract::PluginError::Permanent(format!(
-                    "dial_peer({addr}) failed: {e}"
-                ))
-            })
-        })
-    }
-
-    fn close_outbound_connections<'a>(
-        &'a self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<(), evo_plugin_sdk::contract::PluginError>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        let runtime = Arc::clone(&self.runtime);
-        Box::pin(async move {
-            runtime.close_outbound_connections().await;
-            Ok(())
-        })
-    }
-
-    fn subscribe_frame_send_events<'a>(
-        &'a self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        evo_plugin_sdk::contract::audio_plane::FrameSendEventStream,
-                        evo_plugin_sdk::contract::PluginError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    >{
-        let runtime = Arc::clone(&self.runtime);
-        Box::pin(async move {
-            let rx = runtime.subscribe_frame_send_events();
-            Ok(
-                evo_plugin_sdk::contract::audio_plane::FrameSendEventStream::new(
-                    rx,
-                ),
-            )
-        })
-    }
-
-    fn report_frame_trace<'a>(
-        &'a self,
-        report: evo_plugin_sdk::contract::audio_plane::ReceiverFrameTraceReport,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<(), evo_plugin_sdk::contract::PluginError>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        let runtime = Arc::clone(&self.runtime);
-        Box::pin(async move {
-            runtime.route_frame_trace_report(report).await;
-            Ok(())
-        })
-    }
-
-    fn subscribe_frame_trace_reports<'a>(
-        &'a self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        evo_plugin_sdk::contract::audio_plane::FrameTraceReportStream,
-                        evo_plugin_sdk::contract::PluginError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    >{
-        let runtime = Arc::clone(&self.runtime);
-        Box::pin(async move {
-            let rx = runtime.subscribe_frame_trace_reports();
-            Ok(
-                evo_plugin_sdk::contract::audio_plane::FrameTraceReportStream::new(
-                    rx,
-                ),
-            )
-        })
-    }
-
-    fn monotonic_ns(&self) -> u64 {
-        self.runtime.monotonic_ns()
-    }
-
-    fn local_device_id(&self) -> String {
-        self.runtime.local_device_id().to_string()
-    }
-}
-
-/// Per-plugin scoped handle to the framework's [`CredentialVault`].
+/// Per-plugin scoped handle to the framework's `CredentialVault`.
 ///
 /// Binds the plugin's canonical id at construction time so every
 /// method operates on this plugin's rows only. Plugins receive
-/// one of these on their [`LoadContext::credential_vault`] slot.
+/// one of these on their `LoadContext::credential_vault` slot.
 ///
 /// See [`crate::credentials::CredentialVault`] for the underlying
 /// primitive contract.
@@ -5287,7 +5045,7 @@ impl PluginScopedCredentialVault {
     /// Sender end of the change bus. The framework publishes on
     /// this end when a credential mutation touches this plugin's
     /// rows; every currently-active
-    /// [`CredentialVaultHandle::subscribe_changes`] receiver on
+    /// `CredentialVaultHandle::subscribe_changes` receiver on
     /// this handle observes the event.
     pub fn change_bus(
         &self,
@@ -5364,10 +5122,10 @@ impl PluginScopedCredentialVault {
 impl evo_plugin_sdk::contract::context::CredentialVaultHandle
     for PluginScopedCredentialVault
 {
-    fn fetch<'a>(
-        &'a self,
+    fn fetch(
+        &self,
         key: String,
-    ) -> evo_plugin_sdk::contract::context::CredentialFetchFuture<'a> {
+    ) -> evo_plugin_sdk::contract::context::CredentialFetchFuture<'_> {
         Box::pin(async move {
             self.vault
                 .fetch(&self.plugin_id, &key)
@@ -5376,12 +5134,58 @@ impl evo_plugin_sdk::contract::context::CredentialVaultHandle
         })
     }
 
-    fn store<'a>(
-        &'a self,
+    /// Governed cross-scope read, keyed on a provider rather than
+    /// a vault key.
+    ///
+    /// `fetch` above is sealed to `self.plugin_id` and stays that
+    /// way. This is the single exception, and the decision about
+    /// whether it is allowed is not made here — it is made by the
+    /// framework's provider registry, which names each provider's
+    /// owning `(plugin_id, vault_key)` and the plugin ids
+    /// explicitly permitted to read it.
+    ///
+    /// The caller supplies only a provider id. If the registry
+    /// does not name this plugin as the owner or a listed reader,
+    /// the resolver returns `None` and so do we — the caller
+    /// cannot distinguish a refused grant from an absent key, so
+    /// it cannot probe the registry for credentials it may not
+    /// have.
+    ///
+    /// On a permitted read the fetch is issued against the
+    /// **owner's** scope, so the secret exists in exactly one
+    /// place and is read through rather than copied.
+    fn fetch_for_provider(
+        &self,
+        provider_id: String,
+    ) -> evo_plugin_sdk::contract::context::CredentialFetchFuture<'_> {
+        Box::pin(async move {
+            let Some((owner_plugin_id, vault_key)) =
+                crate::server::resolve_provider_credential_scope(
+                    &provider_id,
+                    &self.plugin_id,
+                )
+            else {
+                tracing::debug!(
+                    plugin = %self.plugin_id,
+                    provider_id = %provider_id,
+                    "credential vault: no provider-credential grant for \
+                     this plugin; reporting absent"
+                );
+                return Ok(None);
+            };
+            self.vault
+                .fetch(owner_plugin_id, vault_key)
+                .await
+                .map_err(Self::map_error)
+        })
+    }
+
+    fn store(
+        &self,
         key: String,
         value: Vec<u8>,
         metadata: evo_plugin_sdk::contract::context::CredentialMetadata,
-    ) -> evo_plugin_sdk::contract::context::CredentialMutateFuture<'a> {
+    ) -> evo_plugin_sdk::contract::context::CredentialMutateFuture<'_> {
         Box::pin(async move {
             let evo_meta = Self::map_sdk_metadata(&metadata);
             self.vault
@@ -5391,10 +5195,10 @@ impl evo_plugin_sdk::contract::context::CredentialVaultHandle
         })
     }
 
-    fn delete<'a>(
-        &'a self,
+    fn delete(
+        &self,
         key: String,
-    ) -> evo_plugin_sdk::contract::context::CredentialMutateFuture<'a> {
+    ) -> evo_plugin_sdk::contract::context::CredentialMutateFuture<'_> {
         Box::pin(async move {
             self.vault
                 .delete(&self.plugin_id, &key)
@@ -5403,9 +5207,9 @@ impl evo_plugin_sdk::contract::context::CredentialVaultHandle
         })
     }
 
-    fn list_keys<'a>(
-        &'a self,
-    ) -> evo_plugin_sdk::contract::context::CredentialListingsFuture<'a> {
+    fn list_keys(
+        &self,
+    ) -> evo_plugin_sdk::contract::context::CredentialListingsFuture<'_> {
         Box::pin(async move {
             let rows = self
                 .vault
@@ -5434,12 +5238,12 @@ impl evo_plugin_sdk::contract::context::CredentialVaultHandle
         self.change_bus.subscribe()
     }
 
-    fn request_from_operator<'a>(
-        &'a self,
+    fn request_from_operator(
+        &self,
         key: String,
         prompt_text: String,
         metadata: evo_plugin_sdk::contract::context::CredentialMetadata,
-    ) -> evo_plugin_sdk::contract::context::CredentialRequestFuture<'a> {
+    ) -> evo_plugin_sdk::contract::context::CredentialRequestFuture<'_> {
         Box::pin(async move {
             use evo_plugin_sdk::contract::context::CredentialVaultError as E;
             // First try the vault.

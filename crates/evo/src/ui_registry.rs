@@ -417,7 +417,7 @@ impl AdmittedStockingsStore {
             .count()
     }
 
-    /// Same as [`count_on_shelf`] but excludes any stockings
+    /// Same as `count_on_shelf` but excludes any stockings
     /// recorded against `excluding_plugin`. The admission
     /// path uses this when re-validating a plugin's
     /// stockings after the plugin's prior recording would

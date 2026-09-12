@@ -248,6 +248,78 @@ pub fn mint_kiosk_bearer(
     })
 }
 
+/// Registry of kiosk-minted bearer ids, consulted by the
+/// household-protection dispatch gate.
+///
+/// A kiosk token id comes from the same issuer a pair mint uses, so
+/// there is no honest discriminator on the token or on its
+/// capability set. Rather than change the mint's output shape or
+/// smuggle a sentinel scope into the set, the socket handler records
+/// what it just issued and the gate asks this.
+///
+/// Deliberately written *after* [`mint_kiosk_bearer`] returns, not
+/// inside it: the mint stays a pure function of issuer, capabilities
+/// and admission, and its crypto, TTL and UID allowlist are
+/// untouched. Pair (`pair_complete`, `pair_authenticate`) and
+/// operator `mint-bearer-token` never write here — this sitting
+/// gates LAN-trust and kiosk-minted ids only.
+///
+/// An id minted *before* the operator raised `lend` stays in the set
+/// until it expires. That is the requirement, not a leak: lending
+/// has to lock the panel without a remint.
+#[derive(Debug, Default)]
+pub struct KioskBearerRegistry {
+    entries: std::sync::RwLock<std::collections::HashMap<String, u64>>,
+}
+
+impl KioskBearerRegistry {
+    /// Empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a freshly minted kiosk bearer, evicting anything that
+    /// has since expired so the set cannot grow without bound across
+    /// renewals.
+    pub fn record(&self, token_id: impl Into<String>, expires_at_ms: u64) {
+        let now = now_ms();
+        if let Ok(mut guard) = self.entries.write() {
+            guard.retain(|_, exp| *exp > now);
+            guard.insert(token_id.into(), expires_at_ms);
+        }
+    }
+
+    /// Whether this token id is a live kiosk mint. Evicts on consult
+    /// as well as on insert, so an expired id stops being
+    /// broad-audience the moment it lapses.
+    pub fn is_live_kiosk_bearer(&self, token_id: &str) -> bool {
+        let now = now_ms();
+        if let Ok(mut guard) = self.entries.write() {
+            guard.retain(|_, exp| *exp > now);
+            return guard.get(token_id).is_some_and(|exp| *exp > now);
+        }
+        false
+    }
+
+    /// Current entry count. Test/diagnostic surface.
+    pub fn len(&self) -> usize {
+        self.entries.read().map(|g| g.len()).unwrap_or(0)
+    }
+
+    /// Whether the registry holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Successful mint outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KioskMintOk {
@@ -578,13 +650,21 @@ async fn handle_kiosk_connection(
         KioskMintReason(req.reason),
         ttl_seconds,
     ) {
-        Ok(ok) => serde_json::to_vec(&serde_json::json!({
-            "local_kiosk_session_minted": true,
-            "token": ok.encoded_token,
-            "token_id": ok.token_id,
-            "expires_at_ms": ok.expires_at_ms,
-        }))
-        .expect("mint OK response serialises"),
+        Ok(ok) => {
+            // Record what was just issued so the household-protection
+            // gate can tell a kiosk panel from an operator bearer.
+            // Deliberately here and not inside `mint_kiosk_bearer`:
+            // the mint stays pure, and its crypto, TTL and UID
+            // allowlist are untouched.
+            state.kiosk_bearers.record(&ok.token_id, ok.expires_at_ms);
+            serde_json::to_vec(&serde_json::json!({
+                "local_kiosk_session_minted": true,
+                "token": ok.encoded_token,
+                "token_id": ok.token_id,
+                "expires_at_ms": ok.expires_at_ms,
+            }))
+            .expect("mint OK response serialises")
+        }
         Err(err) => error_frame(err.subclass(), &err.message()),
     };
     write_frame(&mut stream, &resp).await?;

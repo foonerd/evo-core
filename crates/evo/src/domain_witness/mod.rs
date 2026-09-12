@@ -48,14 +48,11 @@
 //! plan rather than a frozen marker.
 
 pub mod announce;
-pub mod announce_pump;
-pub mod audio_plane_integration;
 pub mod ble;
 pub mod chain;
 pub mod discovery_freshness_pump;
 pub mod endpoints;
 pub mod happening_integration;
-pub mod inbound_pump;
 pub mod presence;
 pub mod projection;
 pub mod reconnect;
@@ -63,15 +60,12 @@ pub mod relay;
 pub mod runtime;
 pub mod wol;
 
-pub use announce_pump::AnnouncePump;
 pub use discovery_freshness_pump::DiscoveryFreshnessPump;
-pub use inbound_pump::InboundPump;
 
 pub use announce::{
     AnnounceEnvelope, AnnounceObservation, MultiCarrierAnnounceConfig,
     MultiCarrierAnnounceRuntime,
 };
-pub use audio_plane_integration::AudioPlaneWitnessBroadcaster;
 pub use happening_integration::HappeningBusWitnessEmitter;
 pub use presence::{
     PeerPresence, PresenceCorrelator, PresenceCorrelatorConfig, PresenceState,

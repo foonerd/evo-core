@@ -126,7 +126,7 @@ impl ReprobeTask {
 ///
 /// Returns `None` when the plugin declares no probes (no map
 /// to maintain). Callers store the returned [`ReprobeTask`] on
-/// the plugin's [`PluginEntry`] and shut it down at unload.
+/// the plugin's `PluginEntry` and shut it down at unload.
 ///
 /// Replaces the prior in-line `run_plugin_probes` helper. The
 /// initial-map shape is unchanged — plugins that read

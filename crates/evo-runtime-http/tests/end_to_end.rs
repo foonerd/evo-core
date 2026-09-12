@@ -123,10 +123,16 @@ async fn boot() -> (
         Arc::clone(&audit) as Arc<_>,
         None,
         None,
-        None,
-        None,
         secure_tier,
-        evo_auth_bearer::CapabilitySet::default(),
+        // A representative LAN-trust set, not an empty one. On a
+        // device this set carries the read and non-privileged-write
+        // scopes an operator's own browser needs; it deliberately
+        // does not carry privileged writers. An empty set here would
+        // make every LAN-trust assertion below vacuous.
+        evo_auth_bearer::CapabilitySet::new(vec![
+            evo_auth_bearer::Capability::read("plugins"),
+        ]),
+        None,
     )
     .unwrap();
 
@@ -171,6 +177,36 @@ async fn anonymous_route_responds_without_token() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["op"], "describe_capabilities");
     assert_eq!(body["token_id"], "anonymous");
+
+    shutdown.notify_waiters();
+    let _ = join.await;
+}
+
+#[tokio::test]
+async fn lan_trust_refuses_a_privileged_route_without_bearer() {
+    // The field defect, end to end over real HTTPS: a LAN-origin
+    // request with no credential reached a privileged writer,
+    // because the LAN-trust arm admitted on origin alone and never
+    // asked whether its capability set satisfied the route.
+    //
+    // install_plugin requires write:plugins_admin, which the
+    // LAN-trust set does not carry. Origin is still trusted; the
+    // set is what refuses.
+    let (addr, _audit, _issuer, ca_pem, shutdown, join) = boot().await;
+    let client = client_with_ca(&ca_pem);
+
+    let url = format!("https://{addr}/api/v1/install_plugin");
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "LAN origin must not reach a privileged writer without a bearer"
+    );
 
     shutdown.notify_waiters();
     let _ = join.await;

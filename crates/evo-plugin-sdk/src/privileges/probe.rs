@@ -139,7 +139,7 @@ impl ProbeOutcome {
 pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A read-only, non-escalating probe of a single
-/// [`CapabilityIntent`]. Implementations must honour the probe
+/// `CapabilityIntent`. Implementations must honour the probe
 /// discipline documented at module level.
 pub trait Probe: Debug + Send + Sync {
     /// Run the probe against the current host. Implementations

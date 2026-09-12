@@ -16,14 +16,16 @@
 //! origin (read from the peer [`SocketAddr`] injected at
 //! connection accept):
 //!
-//! - `Open` (default) — admit with a synthetic operator
-//!   [`Principal`] carrying every operator scope.
-//!   Origin-independent; the operator anywhere reaches the
-//!   device with no credential ceremony.
-//! - `Secure` / `SecureIndustrial` — admit on LAN origin
-//!   (RFC1918, loopback, link-local, IPv6 unique-local) so
-//!   the operator's own browser on a trusted LAN works
-//!   without a credential; refuse WAN-origin requests with
+//! - `Open` (default) — admit a synthetic [`Principal`]
+//!   carrying [`AuthLayer::lan_trust_caps`] when that set
+//!   **satisfies** the route's [`AuthLayer::requirement`].
+//!   Origin-independent. The set is a floor, not every
+//!   operator scope: privileged writers (`network_admin`,
+//!   `system_admin`) stay off it. A route those scopes
+//!   gate is `403 Forbidden` until a bearer is presented.
+//! - `Secure` / `SecureIndustrial` — same set-vs-requirement
+//!   check on LAN origin (RFC1918, loopback, link-local,
+//!   IPv6 unique-local); refuse WAN-origin requests with
 //!   `401 Unauthorized`. External API consumers reaching
 //!   the device from WAN must present a bearer credential.
 
@@ -53,20 +55,47 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// entries so an operator can correlate a request with the
 /// admission rule that authorised it (no minted bearer was
 /// involved).
-pub(crate) const LAN_TRUST_TOKEN_ID: &str = "lan-trust-operator";
+pub const LAN_TRUST_TOKEN_ID: &str = "lan-trust-operator";
 
 /// Per-route state the middleware needs: which capability
 /// the route requires, how to validate tokens, the
 /// observatory + wire op id used to emit decisions, and the
 /// auth-tier provider + LAN-trust operator capability set.
 #[derive(Clone)]
-pub(crate) struct AuthLayer {
-    pub(crate) requirement: CapabilityRequirement,
-    pub(crate) validator: Arc<BearerTokenValidator>,
-    pub(crate) op_id: WireOpId,
-    pub(crate) observatory: Option<Arc<Observatory>>,
-    pub(crate) tier_provider: Arc<dyn AuthTierProvider>,
-    pub(crate) lan_trust_caps: CapabilitySet,
+/// Auth state a route layer carries.
+///
+/// Public because a distribution mounting its own routes through
+/// the HTTPS hookup must gate them on the same identities and
+/// capabilities as framework routes. The alternative is a
+/// distribution inventing its own gate, which is how two auth
+/// models end up in one device.
+pub struct AuthLayer {
+    /// Capability a caller must satisfy for the gated route.
+    pub requirement: CapabilityRequirement,
+    /// Bearer validator, shared with framework routes.
+    pub validator: Arc<BearerTokenValidator>,
+    /// Wire-op id the gate observes under.
+    pub op_id: WireOpId,
+    /// Observatory sink, when one is wired.
+    pub observatory: Option<Arc<Observatory>>,
+    /// Auth-tier provider consulted for unauthenticated callers.
+    pub tier_provider: Arc<dyn AuthTierProvider>,
+    /// Capabilities granted to LAN-trusted callers.
+    pub lan_trust_caps: CapabilitySet,
+    /// Capability set granted to a no-bearer principal whose
+    /// effective origin is LAN, when the steward carries a
+    /// household-protection runtime.
+    ///
+    /// `None` means the runtime was never attached (tests, embedded
+    /// builds): the LAN arm then falls back to
+    /// [`Self::lan_trust_caps`], the playback floor. That coupling
+    /// is deliberate — a privileged scope is only ever stamped when
+    /// something exists to police it at dispatch, so a missing gate
+    /// can never hand LAN a scope no policy sees.
+    ///
+    /// WAN never reads this field. `AuthTier::Open` admits WAN with
+    /// the floor and only the floor.
+    pub lan_privileged_caps: Option<CapabilitySet>,
 }
 
 /// Middleware function that gates a route on bearer-token
@@ -80,7 +109,9 @@ pub(crate) struct AuthLayer {
 /// [`SpanContext`] is created on every admitted request
 /// and stashed into the request extensions so the per-
 /// route handler can attach child spans for dispatch.
-pub(crate) async fn capability_gate(
+/// Capability gate for a mounted route. See [`AuthLayer`] for why
+/// this is public.
+pub async fn capability_gate(
     State(layer): State<AuthLayer>,
     mut req: Request<Body>,
     next: Next,
@@ -123,12 +154,11 @@ pub(crate) async fn capability_gate(
         Some(s) => s,
         None => {
             // No bearer header presented. The configured
-            // auth tier shapes the admission decision:
-            // Open admits unconditionally; Secure /
-            // SecureIndustrial admit LAN-origin requests
-            // (the operator's own browser on a trusted LAN)
-            // and refuse WAN-origin requests (which must
-            // present a credential).
+            // auth tier shapes *whether* LAN-trust may
+            // run: Open always; Secure / SecureIndustrial
+            // only on LAN origin. Admission still requires
+            // `lan_trust_caps` to satisfy this route.
+            // Privileged writers are not in that set.
             // Effective origin honours a trusted-proxy
             // `X-Forwarded-For` header when the immediate
             // peer is loopback (the framework's reverse-proxy
@@ -148,11 +178,50 @@ pub(crate) async fn capability_gate(
                 (AuthTier::Secure, false)
                 | (AuthTier::SecureIndustrial, false) => None,
             };
+            // Origin decides which set is stamped. The Open arm used
+            // to discard `lan_origin`, which meant one frozen set
+            // served LAN and WAN alike — widening it for the
+            // household-protection row would have widened WAN with
+            // it. WAN keeps the floor; LAN gets the privileged set
+            // only when a runtime exists to police it.
+            let admitted_caps: &CapabilitySet = if lan_origin {
+                layer
+                    .lan_privileged_caps
+                    .as_ref()
+                    .unwrap_or(&layer.lan_trust_caps)
+            } else {
+                &layer.lan_trust_caps
+            };
             match admit_reason {
                 Some(reason) => {
+                    if !admitted_caps.satisfies(&layer.requirement) {
+                        emit_decline(
+                            &layer.observatory,
+                            span,
+                            &layer.op_id,
+                            DeclineCause::Capability {
+                                required: requirement_to_str(
+                                    &layer.requirement,
+                                ),
+                                held: admitted_caps
+                                    .capabilities()
+                                    .iter()
+                                    .map(|c| {
+                                        format!(
+                                            "{}:{}",
+                                            capability_rank_label(c),
+                                            c.scope()
+                                        )
+                                    })
+                                    .collect(),
+                                op_id: layer.op_id.as_str().to_string(),
+                            },
+                        );
+                        return Err(StatusCode::FORBIDDEN);
+                    }
                     let principal = Principal::new(
                         LAN_TRUST_TOKEN_ID,
-                        layer.lan_trust_caps.clone(),
+                        admitted_caps.clone(),
                     );
                     if let Some(obs) = &layer.observatory {
                         obs.record(
@@ -348,7 +417,50 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body as AxumBody;
     use axum::http::Request;
+    use axum::routing::get;
+    use axum::Router;
+    use evo_auth_bearer::{
+        BearerTokenIssuer, BearerTokenValidator, RevocationList,
+    };
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tower::ServiceExt;
+
+    fn test_validator() -> Arc<BearerTokenValidator> {
+        let key = BearerTokenIssuer::generate_signing_key();
+        let verifying = key.verifying_key();
+        let revs = Arc::new(RevocationList::new());
+        Arc::new(BearerTokenValidator::new(verifying, revs))
+    }
+
+    fn test_layer(
+        requirement: CapabilityRequirement,
+        caps: CapabilitySet,
+    ) -> AuthLayer {
+        AuthLayer {
+            requirement,
+            validator: test_validator(),
+            op_id: WireOpId::new("test_op").unwrap(),
+            observatory: None,
+            tier_provider: Arc::new(crate::auth_tier::StaticAuthTier::new(
+                AuthTier::Open,
+            )),
+            lan_trust_caps: caps,
+            lan_privileged_caps: None,
+        }
+    }
+
+    async fn open_no_bearer(layer: AuthLayer) -> StatusCode {
+        let app = Router::new().route("/", get(|| async { "ok" })).layer(
+            axum::middleware::from_fn_with_state(layer, capability_gate),
+        );
+        let mut req =
+            Request::builder().uri("/").body(AxumBody::empty()).unwrap();
+        req.extensions_mut()
+            .insert(SocketAddr::from((Ipv4Addr::new(192, 168, 1, 10), 9)));
+        app.oneshot(req).await.unwrap().status()
+    }
 
     #[test]
     fn extract_bearer_returns_token_after_prefix() {
@@ -436,5 +548,40 @@ mod tests {
             bearer_reason_for(&TE::DecodeError("x".into())),
             BearerReason::Malformed
         ));
+    }
+
+    #[tokio::test]
+    async fn lan_trust_open_refuses_when_set_does_not_satisfy_route() {
+        let layer = test_layer(
+            CapabilityRequirement::write("system_admin"),
+            CapabilitySet::new(vec![evo_auth_bearer::Capability::read(
+                "plugins",
+            )]),
+        );
+        assert_eq!(open_no_bearer(layer).await, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn lan_trust_open_still_admits_an_anonymous_ok_route() {
+        // `CapabilityRequirement::None` is anonymous-OK: discovery
+        // ops whose own response shape drives the client's gating
+        // decisions. The set-vs-requirement check must not close
+        // them. An empty set satisfies None by design, and a client
+        // that cannot call `describe_capabilities` cannot learn what
+        // it is allowed to do.
+        let layer =
+            test_layer(CapabilityRequirement::None, CapabilitySet::new(vec![]));
+        assert_eq!(open_no_bearer(layer).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn lan_trust_open_admits_when_set_satisfies_route() {
+        let layer = test_layer(
+            CapabilityRequirement::read("plugins"),
+            CapabilitySet::new(vec![evo_auth_bearer::Capability::read(
+                "plugins",
+            )]),
+        );
+        assert_eq!(open_no_bearer(layer).await, StatusCode::OK);
     }
 }

@@ -492,7 +492,7 @@ pub enum WireFrame {
         /// dominate the steward's write budget for zero operator
         /// benefit. Default `false` — pre-existing frames without
         /// this field deserialise to the durable path unchanged.
-        /// See [`SubjectAnnouncer::update_state_volatile`] on the
+        /// See `SubjectAnnouncer::update_state_volatile` on the
         /// plugin-SDK side.
         #[serde(default)]
         volatile: bool,
@@ -1163,7 +1163,7 @@ pub enum WireFrame {
         /// Canonical plugin name.
         plugin: String,
         /// `true` on cache hit; `false` on miss. The boolean
-        /// discriminator avoids an Option<Vec<u8>> codec helper
+        /// discriminator avoids an `Option<Vec<u8>>` codec helper
         /// while keeping the wire-shape unambiguous.
         found: bool,
         /// Cached bytes on hit; empty vector on miss. Encoded as
@@ -2233,6 +2233,61 @@ pub enum WireFrame {
         value: Vec<u8>,
     },
 
+    /// Plugin-originated fetch of a *provider* credential, which
+    /// may live in another plugin's vault scope.
+    ///
+    /// [`Self::CredentialFetch`] addresses the caller's own scope
+    /// and cannot reach outside it — that boundary is structural
+    /// and stays. This frame is the one governed exception, and it
+    /// exists because an operator enters a provider credential
+    /// once while a provider can serve surfaces in more than one
+    /// plugin. The steward resolves the request against its
+    /// provider registry: the caller receives the value only when
+    /// the registry names it the credential's owner or lists it as
+    /// an explicit reader for that provider. Any other caller gets
+    /// `found: false`, indistinguishable from an absent key.
+    ///
+    /// The caller names a provider, never a scope or a key — it
+    /// cannot address another plugin's vault directly, and it
+    /// cannot widen its own access. Grants live in framework
+    /// source and ship in a release.
+    CredentialFetchForProvider {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical name of the plugin issuing the request. The
+        /// steward validates this against the connection identity
+        /// and uses it as the subject of the grant check.
+        plugin: String,
+        /// Provider id whose credential is wanted (`"discogs"`,
+        /// `"fanart_tv"`, …). The steward maps this to the owning
+        /// `(plugin_id, vault_key)` itself; the caller never names
+        /// a scope or a key.
+        provider_id: String,
+    },
+
+    /// Response to [`Self::CredentialFetchForProvider`]. `found`
+    /// discriminates hit vs miss; a refused grant is reported as a
+    /// miss so a caller cannot probe the registry for which
+    /// providers hold credentials it may not read.
+    CredentialFetchForProviderResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// `true` when the grant allowed the read AND a value was
+        /// stored; `false` on absent key, unknown provider, or
+        /// refused grant — the three are deliberately
+        /// indistinguishable to the caller.
+        found: bool,
+        /// Stored bytes on hit; empty vector otherwise.
+        #[serde(with = "crate::codec::base64_bytes")]
+        value: Vec<u8>,
+    },
+
     /// Plugin-originated credential store request.
     CredentialStore {
         /// Protocol version.
@@ -2374,6 +2429,75 @@ pub enum WireFrame {
         plugin: String,
         /// The ordered per-provider config listing.
         configs: Vec<crate::contract::context::OnlineProviderConfig>,
+    },
+
+    /// Plugin-originated `online_provider_config_register`
+    /// request: declare a provider this plugin owns and its
+    /// privacy class, so the steward can seed the row before
+    /// anything reads it.
+    OnlineProviderConfigRegister {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Provider identifier being declared.
+        provider_id: String,
+        /// Declared privacy class.
+        privacy_class: crate::contract::context::ProviderPrivacyClass,
+    },
+
+    /// Plugin-originated `online_provider_config_register`
+    /// response: the config in force after registration — the
+    /// row just seeded, or the operator's existing row left
+    /// untouched.
+    OnlineProviderConfigRegisterResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Config in force after registration.
+        config: crate::contract::context::OnlineProviderConfig,
+    },
+
+    /// Plugin-originated read of the device's metadata privacy
+    /// posture.
+    ///
+    /// Separate from [`Self::OnlineProviderConfigList`] because a
+    /// cascade needs the posture on the dispatch path even when it
+    /// is not re-reading the per-provider listing, and because a
+    /// posture read must be answerable without paying for the
+    /// whole provider table.
+    OnlineProviderPrivacyMode {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID minted by the plugin.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+    },
+
+    /// Response to [`Self::OnlineProviderPrivacyMode`].
+    ///
+    /// `mode` carries the wire spelling (`enhanced`,
+    /// `anonymous_only`, `offline`). A plugin that does not
+    /// recognise the value MUST fail safe to the most restrictive
+    /// posture rather than to the permissive default — a newer
+    /// steward may name a stricter posture this plugin predates,
+    /// and guessing permissively would send credentials the
+    /// operator forbade.
+    OnlineProviderPrivacyModeResponse {
+        /// Protocol version.
+        v: u16,
+        /// Correlation ID echoing the request.
+        cid: u64,
+        /// Canonical plugin name.
+        plugin: String,
+        /// Wire spelling of the device's posture.
+        mode: String,
     },
 
     // ---------------------------------------------------------------
@@ -2549,10 +2673,13 @@ impl WireFrame {
             | Self::GetMetadataItem { .. }
             | Self::EnrichMetadata { .. }
             | Self::CredentialFetch { .. }
+            | Self::CredentialFetchForProvider { .. }
             | Self::CredentialStore { .. }
             | Self::CredentialDelete { .. }
             | Self::CredentialListKeys { .. }
-            | Self::OnlineProviderConfigList { .. } => FrameKind::PluginRequest,
+            | Self::OnlineProviderConfigList { .. }
+            | Self::OnlineProviderConfigRegister { .. }
+            | Self::OnlineProviderPrivacyMode { .. } => FrameKind::PluginRequest,
 
             // Paired responses (either direction).
             Self::DescribeResponse { .. }
@@ -2607,10 +2734,13 @@ impl WireFrame {
             | Self::GetMetadataItemResponse { .. }
             | Self::EnrichMetadataResponse { .. }
             | Self::CredentialFetchResponse { .. }
+            | Self::CredentialFetchForProviderResponse { .. }
             | Self::CredentialStoreResponse { .. }
             | Self::CredentialDeleteResponse { .. }
             | Self::CredentialListKeysResponse { .. }
-            | Self::OnlineProviderConfigListResponse { .. } => {
+            | Self::OnlineProviderConfigListResponse { .. }
+            | Self::OnlineProviderConfigRegisterResponse { .. }
+            | Self::OnlineProviderPrivacyModeResponse { .. } => {
                 FrameKind::Response
             }
 
@@ -2770,6 +2900,10 @@ impl WireFrame {
             | Self::EnrichMetadataResponse { v, cid, plugin, .. }
             | Self::CredentialFetch { v, cid, plugin, .. }
             | Self::CredentialFetchResponse { v, cid, plugin, .. }
+            | Self::CredentialFetchForProvider { v, cid, plugin, .. }
+            | Self::CredentialFetchForProviderResponse {
+                v, cid, plugin, ..
+            }
             | Self::CredentialStore { v, cid, plugin, .. }
             | Self::CredentialStoreResponse { v, cid, plugin }
             | Self::CredentialDelete { v, cid, plugin, .. }
@@ -2778,7 +2912,18 @@ impl WireFrame {
             | Self::CredentialListKeysResponse { v, cid, plugin, .. }
             | Self::CredentialSetChanged { v, cid, plugin, .. }
             | Self::OnlineProviderConfigList { v, cid, plugin }
+            | Self::OnlineProviderPrivacyMode { v, cid, plugin }
+            | Self::OnlineProviderConfigRegister { v, cid, plugin, .. }
+            | Self::OnlineProviderConfigRegisterResponse {
+                v,
+                cid,
+                plugin,
+                ..
+            }
             | Self::OnlineProviderConfigListResponse {
+                v, cid, plugin, ..
+            }
+            | Self::OnlineProviderPrivacyModeResponse {
                 v, cid, plugin, ..
             }
             | Self::OnlineProviderConfigChanged { v, cid, plugin, .. } => {

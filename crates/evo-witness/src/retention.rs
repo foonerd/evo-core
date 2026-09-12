@@ -71,7 +71,7 @@ pub struct AggregateCount {
 /// A signed roll-up summary covering a contiguous prefix of
 /// the witness chain.
 ///
-/// Issued by [`WitnessChain::prune_older_than`] when one or
+/// Issued by [`crate::WitnessChain::prune_older_than`] when one or
 /// more entries fall outside the retention window. Replaces
 /// the pruned entries in the chain ring as a single record.
 /// Subsequent prunes either absorb the prior summary (its

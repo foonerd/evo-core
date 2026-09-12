@@ -14,7 +14,7 @@
 //!
 //! This module owns that path. [`FrameworkFireHandler`] is the
 //! trait every framework-internal scheduled-work consumer
-//! implements. [`AppointmentRuntime`] and [`WatchRuntime`] each
+//! implements. `AppointmentRuntime` and `WatchRuntime` each
 //! carry an optional handler slot; when a fire arrives whose
 //! `creator` matches the framework-reserved prefix
 //! [`FRAMEWORK_CREATOR_PREFIX`] and a handler is registered, the

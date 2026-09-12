@@ -547,7 +547,7 @@ impl SubjectRegistry {
     /// at `{ count: 0, at_ms: 0 }` if not already present.
     ///
     /// Producer plugins call this on load (via
-    /// [`crate::context::RegistrySubjectAnnouncer::seed_interest_zero`],
+    /// `crate::context::RegistrySubjectAnnouncer::seed_interest_zero`,
     /// which the SDK's [`evo_plugin_sdk::contract::SubjectAnnouncer::seed_interest_zero`]
     /// trait method delegates to) so their own
     /// `interest_subscriber` resolves on first attempt without

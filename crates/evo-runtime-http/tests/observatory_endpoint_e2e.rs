@@ -114,12 +114,11 @@ async fn boot() -> (
         NoopAuditSink::shared(),
         Some(Arc::clone(&observatory)),
         None,
-        None,
-        None,
         Arc::new(evo_runtime_http::StaticAuthTier::new(
             evo_runtime_http::AuthTier::Secure,
         )) as Arc<dyn evo_runtime_http::AuthTierProvider>,
         evo_auth_bearer::CapabilitySet::default(),
+        None,
     )
     .unwrap();
 

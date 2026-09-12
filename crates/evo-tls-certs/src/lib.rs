@@ -36,7 +36,7 @@
 //! bind a TCP listener, run a TLS handshake, or implement
 //! the ACME protocol. The runtime mount that stitches the
 //! certs onto a concrete HTTPS listener (rustls + axum)
-//! consumes [`CertBundle::to_rustls`] (forthcoming when the
+//! consumes `CertBundle::to_rustls` (forthcoming when the
 //! runtime mount lands).
 
 #![forbid(unsafe_code)]

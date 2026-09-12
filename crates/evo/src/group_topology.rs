@@ -17,11 +17,12 @@
 //! The runtime composes the snapshot from substrate the
 //! framework already owns:
 //!
-//! - The local node's [`crate::audio_topology::AudioTopologyStore`]
-//!   when the local node is the source-host or a receiver
-//!   for at least one of the group's delivery targets.
+//! - The installed active-topology store, via
+//!   [`crate::AudioTopologyControl::list`], when the local node
+//!   is the source-host or a receiver for at least one of the
+//!   group's delivery targets.
 //! - The audio-plane's per-peer connection state via
-//!   [`crate::audio_plane::AudioPlaneRuntime::list_connections`].
+//!   [`crate::AudioPlaneControl::list_connections`].
 //! - The clock-sync state per group via
 //!   [`crate::clock_sync::ClockSyncRuntime`].
 //!
@@ -34,12 +35,13 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::audio_plane::{AudioPlaneRuntime, ConnectionState};
+use crate::server::PeerConnectionState;
+use crate::{AudioPlaneControl, AudioTopologyControl};
 use evo_primitives::DeviceId;
 
-use crate::audio_topology::{ActiveAudioTopology, AudioTopologyStore};
 use crate::clock_sync::ClockSyncRuntime;
 use crate::groups::{Group, GroupError, GroupStore};
+use crate::server::ActiveAudioTopology;
 
 /// Composite topology snapshot for one multi-room group.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -99,14 +101,21 @@ pub struct ReceiverLeg {
 
 /// Composes the group topology snapshot on demand. Cheap to
 /// share via `Arc`; reads from substrate handles only.
-#[derive(Debug)]
 pub struct GroupTopologyRuntime {
     group_store: Arc<GroupStore>,
     election: evo_primitives::SharedElectionState,
     clock_sync: Arc<ClockSyncRuntime>,
-    audio_plane: Arc<AudioPlaneRuntime>,
-    audio_topology_store: Arc<AudioTopologyStore>,
+    audio_plane: Option<Arc<dyn AudioPlaneControl>>,
+    audio_topology_store: Option<Arc<dyn AudioTopologyControl>>,
     local_device_id: DeviceId,
+}
+
+impl std::fmt::Debug for GroupTopologyRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupTopologyRuntime")
+            .field("audio_plane_installed", &self.audio_plane.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl GroupTopologyRuntime {
@@ -115,8 +124,8 @@ impl GroupTopologyRuntime {
         group_store: Arc<GroupStore>,
         election: evo_primitives::SharedElectionState,
         clock_sync: Arc<ClockSyncRuntime>,
-        audio_plane: Arc<AudioPlaneRuntime>,
-        audio_topology_store: Arc<AudioTopologyStore>,
+        audio_plane: Option<Arc<dyn AudioPlaneControl>>,
+        audio_topology_store: Option<Arc<dyn AudioTopologyControl>>,
         local_device_id: DeviceId,
     ) -> Self {
         Self {
@@ -165,21 +174,29 @@ impl GroupTopologyRuntime {
         // delivery target. The current substrate returns the
         // most-recently-published (last in the list-ordered
         // sweep). Cross-network querying is a future extension.
-        let source_host_audio_topology = if is_local_host {
-            match self.audio_topology_store.list().await {
-                Ok(rows) => rows.into_iter().next_back(),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
+        // No store installed means no topology to report — the
+        // truthful answer for a device that publishes none.
+        let source_host_audio_topology =
+            match (is_local_host, self.audio_topology_store.as_ref()) {
+                (true, Some(store)) => match store.list().await {
+                    Ok(rows) => rows.into_iter().next_back(),
+                    Err(_) => None,
+                },
+                _ => None,
+            };
 
         // Receiver legs: every non-source-host group member.
         // For each, look up the audio-plane connection state
         // (when the local node is source-host) and the clock-
         // sync state (when the local node is a receiver and
         // the peer is source-host).
-        let plane_connections = self.audio_plane.list_connections().await;
+        // No plane installed means no receiver legs to report.
+        // An empty snapshot is the truthful answer for a device
+        // that moves no audio, not a degraded one.
+        let plane_connections = match self.audio_plane.as_ref() {
+            Some(p) => p.list_connections().await,
+            None => Vec::new(),
+        };
         let mut receiver_legs = Vec::new();
         let mut all_receivers_observed = true;
         for member in &group.members {
@@ -190,9 +207,9 @@ impl GroupTopologyRuntime {
                 .iter()
                 .find(|c| c.remote_device_id == *member);
             let connection_state = conn.map(|c| match c.state {
-                ConnectionState::Handshaking => "handshaking".to_string(),
-                ConnectionState::Connected => "connected".to_string(),
-                ConnectionState::Disconnected => "disconnected".to_string(),
+                PeerConnectionState::Handshaking => "handshaking".to_string(),
+                PeerConnectionState::Connected => "connected".to_string(),
+                PeerConnectionState::Disconnected => "disconnected".to_string(),
             });
             if connection_state.is_none() {
                 all_receivers_observed = false;
@@ -239,9 +256,6 @@ impl GroupTopologyRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio_plane::{AudioPlaneConfig, AudioPlaneRuntime};
-    use crate::audio_routing::AudioRoutingRuntime;
-    use crate::audio_topology::AudioTopologyStore;
     use crate::clock_sync::{ClockSyncConfig, ClockSyncRuntime};
     use crate::discovery::{DiscoveryConfig, DiscoveryRuntime};
     use crate::happenings::HappeningBus;
@@ -331,7 +345,7 @@ mod tests {
             Arc::clone(&persistence),
             Arc::clone(&bus),
         ));
-        let discovery = Arc::new(DiscoveryRuntime::new(
+        let _discovery = Arc::new(DiscoveryRuntime::new(
             Arc::clone(&persistence),
             Arc::clone(&bus),
             DiscoveryConfig {
@@ -346,27 +360,16 @@ mod tests {
             DeviceId(local_id.to_string()),
             ClockSyncConfig::default(),
         ));
-        let audio_routing = Arc::new(AudioRoutingRuntime::new());
-        let audio_topology = Arc::new(AudioTopologyStore::new(
-            Arc::clone(&persistence),
-            Arc::clone(&audio_routing),
-        ));
         let shared_election = evo_primitives::SharedElectionState::new(
             Arc::clone(&test_election)
                 as Arc<dyn evo_primitives::ElectionState>,
         );
-        let plane = Arc::new(AudioPlaneRuntime::new(
-            AudioPlaneConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            Arc::clone(&bus),
-            Arc::clone(&discovery),
-            shared_election.clone(),
-            Arc::clone(&clock),
-            Arc::clone(&groups),
-            DeviceId(local_id.to_string()),
-        ));
+        // No plane and no topology store: the composer's own
+        // behaviour is what these tests cover, and a device that
+        // moves no audio is a first-class configuration rather
+        // than a stub.
+        let plane = None;
+        let audio_topology = None;
         let runtime = Arc::new(GroupTopologyRuntime::new(
             groups,
             shared_election,

@@ -22,24 +22,34 @@
 //! the event and re-resolves its local provider set in-place
 //! without a lifecycle teardown.
 //!
-//! ## Defaults on missing rows
+//! ## Defaults, and where the identity posture comes from
 //!
 //! The table is not exhaustive at migration time — the row set
-//! grows lazily as plugins register providers. Callers that read
-//! a provider before it has been registered receive the
-//! compile-time default via [`OnlineProviderConfig::default_for`]:
-//! priority = 100 for every provider; `enabled` is `true` for
-//! anonymous providers (keyless-first — bio / notes /
-//! artwork populate without any operator action) and `false` for
-//! identity-bearing providers (`lastfm`, `discogs`, `genius`,
-//! `fanart_tv`). The identity-bearing default is deliberate: the
-//! plugin's prompt-on-missing reactor triggers on the
+//! grows lazily as plugins register providers. A read for an id
+//! with no row yields [`OnlineProviderConfig::default_for`]:
+//! `enabled = true`, priority [`PRIORITY_UNSET`]. That is the
+//! only default this module knows. It does not match on provider
+//! id, because a framework primitive that recognises brand names
+//! is a domain list living in the steward, and it drifts the
+//! moment a plugin adds a source.
+//!
+//! The identity-bearing posture arrives instead at
+//! **registration**: a plugin declares each provider's
+//! [`ProviderPrivacyClass`] through
+//! [`OnlineProviderConfigStore::register`], and registration
+//! seeds a row when none exists — `IdentityBearing` seeds
+//! `enabled = false`, `Anonymous` seeds `enabled = true`, and
+//! neither seeds a priority.
+//!
+//! Seeding an identity-bearing provider disabled is what makes
+//! the credential prompt reachable. The plugin's
+//! prompt-on-missing reactor triggers on the
 //! `online_provider_config` bus's `enabled=true` change-event,
-//! which never fires if `enabled=true` was already the default
-//! at boot. Defaulting to `false` makes enabling a keyed
-//! provider the operator's explicit gesture — which IS the
-//! change-event the reactor consumes to raise the credential
-//! prompt.
+//! which never fires if `enabled=true` was already true at boot.
+//! Registration must therefore land before the first read for
+//! that id; a provider read before it registers is treated as
+//! anonymous, and a keyed source that reaches the cascade that
+//! way is enabled with no key, no prompt and no affordance.
 //!
 //! ## Boundary
 //!
@@ -58,6 +68,8 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+pub use evo_plugin_sdk::contract::context::ProviderPrivacyClass;
+
 use crate::persistence::{
     PersistedOnlineProvider, PersistenceError, PersistenceStore,
 };
@@ -69,62 +81,62 @@ use crate::persistence::{
 /// plus `updated_at_ms` for audit purposes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnlineProviderConfig {
-    /// Provider identifier string (`"musicbrainz"`,
-    /// `"wikipedia"`, `"lastfm"`, `"theaudiodb"`, `"deezer"`,
-    /// `"fanart_tv"`, …). Stable identifier consumed by cascade
-    /// wiring.
+    /// Provider identifier string, opaque to the framework.
+    /// Stable identifier consumed by cascade wiring; its meaning
+    /// belongs to the plugin that registers it.
     pub provider_id: String,
-    /// Enable flag. Anonymous providers (`musicbrainz`,
-    /// `wikipedia`, `wikidata`, `lrclib`, `theaudiodb`,
-    /// `cover_art_archive`, `itunes`, `deezer`) default `true`
-    /// (keyless-first posture). Identity-bearing providers
-    /// (`lastfm`, `discogs`, `genius`, `fanart_tv`) default
-    /// `false` so first-run is honest opt-in and the plugin's
-    /// prompt-on-missing reactor actually fires on the
-    /// operator's enable gesture. `false` disables cascade
-    /// dispatch.
+    /// Enable flag. `false` disables cascade dispatch.
+    ///
+    /// Anonymous providers are seeded `true` at registration
+    /// (keyless-first: bio / notes / artwork populate with no
+    /// operator action). Identity-bearing providers are seeded
+    /// `false`, so first run is an honest opt-in and the
+    /// operator's enable gesture is the change-event the
+    /// plugin's prompt-on-missing reactor consumes. Which class
+    /// a provider is comes from the plugin at registration, not
+    /// from any list held here.
     pub enabled: bool,
-    /// Cascade priority. Lower values sort earlier; 100 is the
-    /// compile-time default, 0 the highest priority, 999 the
-    /// lowest.
+    /// Cascade priority. Lower values sort earlier; 0 is the
+    /// highest operator-settable priority and 999 the lowest.
+    ///
+    /// [`PRIORITY_UNSET`] means the operator has expressed no
+    /// opinion, and the plugin's own cascade defaults hold. The
+    /// framework does not know per-plugin priorities and must
+    /// never invent one — a fabricated value outranks nothing
+    /// but silently flattens every provider to a single tie,
+    /// which turns "priority" into "whichever leg dispatched
+    /// first".
     pub priority: i32,
 }
 
+/// Stored priority meaning "the operator has not set one".
+///
+/// Mirrors the `online_providers.priority DEFAULT -1` sentinel.
+/// Plugin overlays treat a negative priority as "keep my own
+/// cascade default"; operator wire gestures are validated
+/// 0..=999, so no gesture can land this value.
+pub const PRIORITY_UNSET: i32 = -1;
+
 impl OnlineProviderConfig {
-    /// The compile-time default for a provider that has not yet
-    /// been registered in the store. Anonymous providers ship
-    /// `enabled = true`; identity-bearing providers ship
-    /// `enabled = false` so operator toggles fire the
-    /// `online_provider_config` change-event the plugin's
-    /// prompt-on-missing reactor waits for. Priority = 100 for
-    /// every provider (plugin cascade defaults tune real
-    /// per-provider priorities via the migration-042 sentinel).
+    /// The value a read yields for an id with no stored row.
     ///
-    /// The set of identity-bearing provider ids is duplicated
-    /// intentionally with the plugin's `ProviderId::privacy_class`
-    /// and the framework's `online_provider_registry` — this
-    /// helper is called from persistence + wire paths that must
-    /// answer without a plugin round trip.
+    /// `enabled = true`, priority [`PRIORITY_UNSET`], for every
+    /// id. There is no match on provider id here: the identity
+    /// posture is a plugin fact and reaches the store through
+    /// [`OnlineProviderConfigStore::register`], which seeds the
+    /// row before anything reads it.
+    ///
+    /// Priority stays unset because the framework has no
+    /// per-plugin priority knowledge. An invented value outranks
+    /// nothing and flattens every provider to one tie, which
+    /// turns ordering into dispatch order.
     pub fn default_for(provider_id: impl Into<String>) -> Self {
-        let id: String = provider_id.into();
-        let enabled = !is_identity_bearing_default(&id);
         Self {
-            provider_id: id,
-            enabled,
-            priority: 100,
+            provider_id: provider_id.into(),
+            enabled: true,
+            priority: PRIORITY_UNSET,
         }
     }
-}
-
-/// Whether the provider id is a known identity-bearing source.
-/// Kept in step with the plugin's `ProviderId::privacy_class` and
-/// the framework's `online_provider_registry` in `server.rs`.
-/// Unknown providers are treated as anonymous — a defensive
-/// choice: a new keyless source shouldn't accidentally land off
-/// by default, and a genuinely new keyed source will be
-/// registered explicitly.
-fn is_identity_bearing_default(provider_id: &str) -> bool {
-    matches!(provider_id, "lastfm" | "discogs" | "genius" | "fanart_tv")
 }
 
 impl From<PersistedOnlineProvider> for OnlineProviderConfig {
@@ -218,6 +230,45 @@ impl OnlineProviderConfigStore {
             .get(provider_id)
             .await?
             .unwrap_or_else(|| OnlineProviderConfig::default_for(provider_id)))
+    }
+
+    /// Declare a provider and its privacy class, seeding its
+    /// row when the store has none.
+    ///
+    /// This is how the identity posture reaches the store. A
+    /// plugin calls it for each provider it owns, at load,
+    /// before anything reads that id: `IdentityBearing` seeds
+    /// `enabled = false`, `Anonymous` seeds `enabled = true`,
+    /// and neither seeds a priority.
+    ///
+    /// **An existing row is left exactly as it is.** The row is
+    /// the operator's word; re-registration happens on every
+    /// boot and on every plugin reload, and a seed that
+    /// overwrote would silently revert an operator's choice on
+    /// the next restart. Returns the config now in force, seeded
+    /// or pre-existing.
+    ///
+    /// Ordering is the property that matters. Registering after
+    /// a read for the same id is a defect, not a late seed: the
+    /// read has already returned the anonymous default, and for
+    /// a keyed provider that means enabled with no credential,
+    /// no change-event, and therefore no prompt.
+    pub async fn register(
+        &self,
+        provider_id: &str,
+        privacy_class: ProviderPrivacyClass,
+        now_ms: u64,
+    ) -> Result<OnlineProviderConfig, PersistenceError> {
+        if let Some(existing) = self.get(provider_id).await? {
+            return Ok(existing);
+        }
+        let seeded = OnlineProviderConfig {
+            provider_id: provider_id.to_string(),
+            enabled: privacy_class.seeds_enabled(),
+            priority: PRIORITY_UNSET,
+        };
+        self.upsert(&seeded, now_ms).await?;
+        Ok(seeded)
     }
 
     /// Toggle the enable flag on a provider. Preserves the
@@ -442,12 +493,43 @@ impl SharedOnlineProviderConfigHandle {
     }
 }
 
+impl OnlineProviderConfigStore {
+    /// Read the device's metadata privacy posture.
+    ///
+    /// Absence means the device has never had one set, which is
+    /// `Enhanced`. An unrecognised stored value resolves to the
+    /// most restrictive posture rather than the permissive
+    /// default — see
+    /// [`PrivacyPosture::from_wire_fail_safe`](evo_plugin_sdk::contract::context::PrivacyPosture::from_wire_fail_safe).
+    pub async fn privacy_mode(
+        &self,
+    ) -> Result<
+        evo_plugin_sdk::contract::context::PrivacyPosture,
+        PersistenceError,
+    > {
+        use evo_plugin_sdk::contract::context::PrivacyPosture;
+        let raw = self.persistence.get_metadata_privacy_mode().await?;
+        Ok(PrivacyPosture::from_wire_fail_safe(raw.as_deref()))
+    }
+
+    /// Write the device's metadata privacy posture.
+    pub async fn set_privacy_mode(
+        &self,
+        posture: evo_plugin_sdk::contract::context::PrivacyPosture,
+        now_ms: u64,
+    ) -> Result<(), PersistenceError> {
+        self.persistence
+            .set_metadata_privacy_mode(posture.as_wire(), now_ms)
+            .await
+    }
+}
+
 impl evo_plugin_sdk::contract::context::OnlineProviderConfigHandle
     for SharedOnlineProviderConfigHandle
 {
-    fn list_all<'a>(
-        &'a self,
-    ) -> evo_plugin_sdk::contract::context::OnlineProviderListFuture<'a> {
+    fn list_all(
+        &self,
+    ) -> evo_plugin_sdk::contract::context::OnlineProviderListFuture<'_> {
         Box::pin(async move {
             use evo_plugin_sdk::contract::context::OnlineProviderConfigError as E;
             let rows = self
@@ -466,6 +548,48 @@ impl evo_plugin_sdk::contract::context::OnlineProviderConfigHandle
                 })
                 .collect();
             Ok(out)
+        })
+    }
+
+    fn register<'a>(
+        &'a self,
+        provider_id: &'a str,
+        privacy_class: ProviderPrivacyClass,
+    ) -> evo_plugin_sdk::contract::context::OnlineProviderRegisterFuture<'a>
+    {
+        Box::pin(async move {
+            use evo_plugin_sdk::contract::context::OnlineProviderConfigError as E;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let cfg = self
+                .store
+                .register(provider_id, privacy_class, now_ms)
+                .await
+                .map_err(|e| E::Transport(format!("{e}")))?;
+            Ok(evo_plugin_sdk::contract::context::OnlineProviderConfig {
+                provider_id: cfg.provider_id,
+                enabled: cfg.enabled,
+                priority: cfg.priority,
+            })
+        })
+    }
+
+    fn privacy_mode(
+        &self,
+    ) -> evo_plugin_sdk::contract::context::PrivacyPostureFuture<'_> {
+        Box::pin(async move {
+            use evo_plugin_sdk::contract::context::OnlineProviderConfigError as E;
+            // A storage fault must NOT read as `Enhanced`. The
+            // caller's fail-safe rule says the most restrictive
+            // posture wins on any uncertainty, and surfacing the
+            // error lets the caller apply it rather than silently
+            // inheriting a permissive default here.
+            self.store
+                .privacy_mode()
+                .await
+                .map_err(|e| E::Transport(format!("{e}")))
         })
     }
 
@@ -523,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn default_for_anonymous_is_enabled_at_priority_100() {
+    fn default_for_anonymous_is_enabled_with_no_priority_opinion() {
         for id in [
             "musicbrainz",
             "wikipedia",
@@ -534,37 +658,113 @@ mod tests {
             let c = OnlineProviderConfig::default_for(id);
             assert_eq!(c.provider_id, id);
             assert!(c.enabled, "anonymous provider {id} must default enabled");
-            assert_eq!(c.priority, 100);
+            assert_eq!(c.priority, PRIORITY_UNSET);
         }
     }
 
     #[test]
-    fn default_for_identity_bearing_is_disabled_at_priority_100() {
-        // Identity-bearing providers default DISABLED so the
-        // operator's enable gesture is the change-event the
-        // plugin's prompt-on-missing reactor waits for. Without
-        // this, `enabled=true` at boot means the reactor never
-        // fires, the cascade silently skips because
-        // `catalogue.<provider>.is_none()` (no vault key), and
-        // the operator gets no prompt / no source / no
-        // affordance.
+    fn default_for_matches_no_provider_id() {
+        // The default is the same for every id, including ones a
+        // previous build recognised by name. The identity
+        // posture is not inferred here — it arrives at
+        // registration, which is what the seed tests below pin.
         for id in ["lastfm", "discogs", "genius", "fanart_tv"] {
             let c = OnlineProviderConfig::default_for(id);
             assert_eq!(c.provider_id, id);
             assert!(
-                !c.enabled,
-                "identity-bearing provider {id} must default disabled"
+                c.enabled,
+                "{id} must take the same unregistered default as any other id"
             );
-            assert_eq!(c.priority, 100);
+            assert_eq!(c.priority, PRIORITY_UNSET);
+        }
+    }
+
+    #[tokio::test]
+    async fn register_seeds_identity_bearing_disabled_and_anonymous_enabled() {
+        // Identity-bearing providers seed DISABLED so the
+        // operator's enable gesture is the change-event the
+        // plugin's prompt-on-missing reactor waits for. Without
+        // it, `enabled=true` at boot means the reactor never
+        // fires, the cascade silently skips because there is no
+        // vault key, and the operator gets no prompt, no source
+        // and no affordance.
+        let s = store();
+        let keyed = s
+            .register("keyed_source", ProviderPrivacyClass::IdentityBearing, 1)
+            .await
+            .unwrap();
+        assert!(!keyed.enabled, "identity-bearing seeds disabled");
+        assert_eq!(keyed.priority, PRIORITY_UNSET);
+
+        let keyless = s
+            .register("keyless_source", ProviderPrivacyClass::Anonymous, 1)
+            .await
+            .unwrap();
+        assert!(keyless.enabled, "anonymous seeds enabled");
+        assert_eq!(keyless.priority, PRIORITY_UNSET);
+
+        // The seed is persisted, not merely returned — a later
+        // read must not fall through to the anonymous default.
+        let stored = s.get("keyed_source").await.unwrap().expect("row seeded");
+        assert!(!stored.enabled);
+    }
+
+    #[tokio::test]
+    async fn register_never_overwrites_an_operator_row() {
+        // Registration runs on every boot and every plugin
+        // reload. If it overwrote, an operator who enabled a
+        // keyed provider would find it off again after the next
+        // restart, with nothing to say why.
+        let s = store();
+        s.register("keyed_source", ProviderPrivacyClass::IdentityBearing, 1)
+            .await
+            .unwrap();
+        s.set_enabled("keyed_source", true, 2).await.unwrap();
+        s.set_priority("keyed_source", 42, 3).await.unwrap();
+
+        let after = s
+            .register("keyed_source", ProviderPrivacyClass::IdentityBearing, 4)
+            .await
+            .unwrap();
+        assert!(after.enabled, "operator enable survives re-registration");
+        assert_eq!(after.priority, 42, "operator priority survives too");
+    }
+
+    /// The defect this sentinel closes: an enable gesture on a
+    /// provider with no row used to persist a fabricated
+    /// priority, so every provider landed on the same value.
+    /// A uniform priority is not an ordering — it collapses to
+    /// whichever leg happened to dispatch first, silently
+    /// discarding the plugin's cascade design across artwork,
+    /// text metadata and lyrics alike.
+    #[test]
+    fn default_carries_no_priority_so_an_enable_gesture_cannot_flatten_the_cascade(
+    ) {
+        for id in [
+            "musicbrainz",
+            "wikipedia",
+            "lastfm",
+            "discogs",
+            "fanart_tv",
+            "deezer",
+            "cover_art_archive",
+            "itunes",
+        ] {
+            let c = OnlineProviderConfig::default_for(id);
+            assert!(
+                c.priority < 0,
+                "{id} default must carry no priority opinion, got {}",
+                c.priority
+            );
         }
     }
 
     #[test]
     fn default_for_unknown_provider_defaults_enabled() {
-        // Defensive: a new keyless provider added later shouldn't
-        // land off by default (that would drop content silently);
-        // a new keyed provider must be added to the
-        // `is_identity_bearing_default` list explicitly.
+        // A provider the store has never seen reads as enabled
+        // with no priority opinion. A keyed provider avoids that
+        // by registering before anything reads it — see the
+        // register seed tests.
         let c = OnlineProviderConfig::default_for("some_future_source");
         assert!(c.enabled);
     }
@@ -618,13 +818,34 @@ mod tests {
         assert_eq!(updated.priority, 50);
     }
 
+    /// An enable gesture must not invent a priority. This is the
+    /// exact path that re-flattened every provider to 100 after
+    /// migration 042: `set_enabled` reads `get_or_default` for a
+    /// provider with no row and persists what it read, so a
+    /// fabricated default landed in the store as though the
+    /// operator had chosen it.
     #[tokio::test]
-    async fn set_enabled_on_missing_row_registers_at_default_priority() {
+    async fn set_enabled_on_missing_row_registers_with_no_priority_opinion() {
         let s = store();
         let updated = s.set_enabled("fanart_tv", true, 1_000).await.unwrap();
         assert!(updated.enabled);
-        assert_eq!(updated.priority, 100);
-        assert!(s.get("fanart_tv").await.unwrap().is_some());
+        assert_eq!(updated.priority, PRIORITY_UNSET);
+        let stored = s.get("fanart_tv").await.unwrap().expect("row registered");
+        assert!(
+            stored.priority < 0,
+            "stored priority must stay the sentinel, got {}",
+            stored.priority
+        );
+    }
+
+    /// An explicit operator gesture is intent and must survive a
+    /// later enable/disable toggle untouched.
+    #[tokio::test]
+    async fn an_explicit_priority_survives_a_later_enable_toggle() {
+        let s = store();
+        s.set_priority("fanart_tv", 40, 1_000).await.unwrap();
+        let updated = s.set_enabled("fanart_tv", false, 2_000).await.unwrap();
+        assert_eq!(updated.priority, 40);
     }
 
     #[tokio::test]

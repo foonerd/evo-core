@@ -107,7 +107,7 @@ pub struct Manifest {
     /// See the Stocking primitive for the contract.
     ///
     /// **Bucket: Enforced.** When the file declares `[target]` only,
-    /// [`Manifest::normalize_stockings`] synthesizes a one-element
+    /// `Manifest::normalize_stockings` synthesizes a one-element
     /// `stockings` vector covering the plugin's entire request_types
     /// set under a role derived from `[kind].interaction`. When the
     /// file declares `[[stockings]]` only, the parser populates
@@ -872,10 +872,10 @@ pub struct Plugin {
 /// Preserved for back-compat. Plugins authoring against the
 /// single-shelf shape continue to declare `[target] shelf=... shape=...`;
 /// the parser auto-derives a one-element `stockings` vector on
-/// [`Manifest::normalize_stockings`]. New multi-shelf plugins declare
+/// `Manifest::normalize_stockings`. New multi-shelf plugins declare
 /// `[[stockings]]` directly; the parser populates `target` from the
 /// primary stocking. The two forms are mutually exclusive at the
-/// file layer; [`Manifest::normalize_stockings`] refuses a manifest
+/// file layer; `Manifest::normalize_stockings` refuses a manifest
 /// that declares both.
 ///
 /// **Bucket: Enforced.** See `PLUGIN_PACKAGING.md` §2.
@@ -962,7 +962,7 @@ pub enum StockingRole {
 impl StockingRole {
     /// Derive a stocking role from the plugin's
     /// `[kind].interaction`. Used by
-    /// [`Manifest::normalize_stockings`] when synthesizing the
+    /// `Manifest::normalize_stockings` when synthesizing the
     /// single-stocking representation from the legacy `[target]`
     /// form.
     pub fn from_interaction(interaction: InteractionShape) -> Self {

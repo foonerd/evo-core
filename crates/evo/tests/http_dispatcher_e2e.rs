@@ -166,12 +166,11 @@ async fn describe_capabilities_round_trips_through_https_into_steward() {
         audit,
         None,
         None,
-        None,
-        None,
         Arc::new(evo_runtime_http::StaticAuthTier::new(
             evo_runtime_http::AuthTier::Secure,
         )) as Arc<dyn evo_runtime_http::AuthTierProvider>,
         evo_auth_bearer::CapabilitySet::default(),
+        None,
     )
     .unwrap();
 
@@ -234,12 +233,11 @@ async fn list_active_custodies_round_trips_against_empty_ledger() {
         NoopAuditSink::shared(),
         None,
         None,
-        None,
-        None,
         Arc::new(evo_runtime_http::StaticAuthTier::new(
             evo_runtime_http::AuthTier::Secure,
         )) as Arc<dyn evo_runtime_http::AuthTierProvider>,
         evo_auth_bearer::CapabilitySet::default(),
+        None,
     )
     .unwrap();
 
@@ -295,12 +293,11 @@ async fn dispatcher_path_with_bearer_token_carries_principal_through() {
         NoopAuditSink::shared(),
         None,
         None,
-        None,
-        None,
         Arc::new(evo_runtime_http::StaticAuthTier::new(
             evo_runtime_http::AuthTier::Secure,
         )) as Arc<dyn evo_runtime_http::AuthTierProvider>,
         evo_auth_bearer::CapabilitySet::default(),
+        None,
     )
     .unwrap();
 

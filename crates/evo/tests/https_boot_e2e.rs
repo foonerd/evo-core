@@ -117,7 +117,7 @@ async fn first_boot_provisions_state_dir_and_serves_traffic() {
         ..HttpsBootConfig::new(loopback_addr(), state_dir.path().to_path_buf())
     };
 
-    let handles = boot_https(Arc::clone(&server), config).await.unwrap();
+    let handles = boot_https(Arc::clone(&server), config, None).await.unwrap();
     let local = handles.server.local_addr;
     let bootstrap_token = handles
         .bootstrap_token_b64
@@ -196,6 +196,7 @@ async fn second_boot_reloads_persisted_material() {
                 state_dir.path().to_path_buf(),
             )
         },
+        None,
     )
     .await
     .unwrap();
@@ -227,6 +228,7 @@ async fn second_boot_reloads_persisted_material() {
                 state_dir.path().to_path_buf(),
             )
         },
+        None,
     )
     .await
     .unwrap();
@@ -250,4 +252,100 @@ async fn second_boot_reloads_persisted_material() {
     second_handles.server.shutdown.notify_waiters();
     let _ = second_handles.listener_task.await;
     let _ = second_handles.rotator_task.await;
+}
+
+/// The distribution HTTPS hookup is the seam product routes attach
+/// to. This proves the wire end to end: the hookup receives the
+/// router the framework finished building, mounts something of its
+/// own, returns it, and that route serves.
+///
+/// It matters because the alternative — compiling product HTTP into
+/// the steward because there is nowhere else to put it — is exactly
+/// how the boundary has been crossed before.
+#[tokio::test]
+async fn distribution_hookup_mounts_a_route_and_is_served() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let server = build_minimal_server();
+
+    static RAN: AtomicBool = AtomicBool::new(false);
+
+    let hookup = evo::HttpsSetup {
+        claimant_name: "test.distribution".to_string(),
+        hook: Box::new(|ctx: evo::HttpsSetupContext| {
+            Box::pin(async move {
+                // The framework hands the distribution its own name
+                // back and mints a token for that string; it invents
+                // no actor of its own.
+                assert_eq!(ctx.claimant_name, "test.distribution");
+                RAN.store(true, Ordering::SeqCst);
+                Ok(ctx.router.route(
+                    "/_hookup_probe",
+                    axum::routing::get(|| async { "mounted-by-distribution" }),
+                ))
+            })
+        }),
+    };
+
+    let config = HttpsBootConfig {
+        rotation_policy: CertRotationPolicy {
+            rotation_interval: Duration::from_secs(3600),
+            initial_delay: Duration::from_secs(3600),
+        },
+        ..HttpsBootConfig::new(loopback_addr(), state_dir.path().to_path_buf())
+    };
+
+    let handles = boot_https(Arc::clone(&server), config, Some(hookup))
+        .await
+        .expect("boot with a distribution hookup");
+
+    assert!(RAN.load(Ordering::SeqCst), "hookup must be invoked");
+
+    let local = handles.server.local_addr;
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("client");
+    let resp = client
+        .get(format!("https://{local}/_hookup_probe"))
+        .send()
+        .await
+        .expect("probe request");
+    assert_eq!(resp.status(), 200, "hookup-mounted route must serve");
+    assert_eq!(resp.text().await.unwrap(), "mounted-by-distribution");
+
+    handles.server.shutdown.notify_waiters();
+    let _ = handles.listener_task.await;
+}
+
+/// Absent hookup is the shipped `evo` binary's shape: it mounts no
+/// product routes at all, and boot is unaffected.
+#[tokio::test]
+async fn no_hookup_mounts_no_product_routes() {
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    let server = build_minimal_server();
+    let config = HttpsBootConfig {
+        rotation_policy: CertRotationPolicy {
+            rotation_interval: Duration::from_secs(3600),
+            initial_delay: Duration::from_secs(3600),
+        },
+        ..HttpsBootConfig::new(loopback_addr(), state_dir.path().to_path_buf())
+    };
+    let handles = boot_https(Arc::clone(&server), config, None)
+        .await
+        .expect("boot without a hookup");
+    let local = handles.server.local_addr;
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("client");
+    let resp = client
+        .get(format!("https://{local}/_hookup_probe"))
+        .send()
+        .await
+        .expect("probe request");
+    assert_eq!(resp.status(), 404, "no hookup means no such route");
+    handles.server.shutdown.notify_waiters();
+    let _ = handles.listener_task.await;
 }

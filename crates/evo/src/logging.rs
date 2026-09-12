@@ -72,15 +72,40 @@ pub fn init(
     config: &StewardConfig,
     cli_override: Option<&str>,
 ) -> Result<LoggingGuard, StewardError> {
-    let filter = resolve_filter(&config.steward.log_level, cli_override);
+    let (filter, resolved_directive, resolution_source) =
+        resolve_filter_with_source(&config.steward.log_level, cli_override);
+    // Boot-time diagnostic emitted BEFORE the tracing subscriber
+    // is installed — always reaches the journal via systemd's
+    // stderr capture regardless of the filter directive (a
+    // `warn`-filtered subscriber would drop this at INFO, so
+    // eprintln! is the only path that's guaranteed to surface
+    // the resolved filter for post-hoc journal inspection).
+    // Lets operators + support workflows verify which filter is
+    // actually installed on a shipping binary without re-reading
+    // the config-resolution code path.
+    eprintln!(
+        "evo: tracing subscriber installed — filter directive: {} \
+         (source: {})",
+        resolved_directive, resolution_source
+    );
 
+    // Per-layer filter attachment via `.with_filter(...)`. The
+    // shape `Registry::default().with(filter).with(sink)` composes
+    // the EnvFilter as a global filter layer, but the interest
+    // computation between the registry-level filter and the
+    // subsequent sink layer can leave DEBUG events reaching
+    // sinks even under a `warn` directive. Per-layer filtering
+    // (`sink.with_filter(filter)`) attaches the filter directly
+    // to the specific sink, so every event the filter rejects is
+    // guaranteed to never reach the sink's `on_event` — the
+    // recommended pattern for tracing-subscriber 0.3+ per the
+    // crate's own layer-composition documentation.
     #[cfg(target_os = "linux")]
     {
         match tracing_journald::layer() {
             Ok(journald_layer) => {
                 Registry::default()
-                    .with(filter)
-                    .with(journald_layer)
+                    .with(journald_layer.with_filter(filter))
                     .try_init()
                     .map_err(|e| {
                         StewardError::Config(format!(
@@ -103,8 +128,7 @@ pub fn init(
                     .with_target(true)
                     .with_writer(non_blocking);
                 Registry::default()
-                    .with(filter)
-                    .with(fmt_layer)
+                    .with(fmt_layer.with_filter(filter))
                     .try_init()
                     .map_err(|init_err| {
                         StewardError::Config(format!(
@@ -131,8 +155,7 @@ pub fn init(
             .with_target(true)
             .with_writer(non_blocking);
         Registry::default()
-            .with(filter)
-            .with(fmt_layer)
+            .with(fmt_layer.with_filter(filter))
             .try_init()
             .map_err(|e| {
                 StewardError::Config(format!("tracing subscriber init: {e}"))
@@ -160,10 +183,21 @@ pub fn init(
 /// If `cli_override` is supplied but fails to parse, a warning is
 /// written to stderr (tracing is not yet initialised here) and the
 /// resolution falls through to the next precedence level.
-fn resolve_filter(config_level: &str, cli_override: Option<&str>) -> EnvFilter {
+/// Additionally returns the resolved directive string and its
+/// source tag so [`init`] can emit a boot-time diagnostic naming
+/// what filter is actually installed. The `_with_source` suffix
+/// is the canonical entrypoint; a thin `resolve_filter` wrapper
+/// is retained under `#[cfg(test)]` below so the pre-existing
+/// test surface (which only exercises filter construction, not
+/// the source tag) continues to work without per-test tuple
+/// destructuring boilerplate.
+fn resolve_filter_with_source(
+    config_level: &str,
+    cli_override: Option<&str>,
+) -> (EnvFilter, String, &'static str) {
     if let Some(level) = cli_override {
         match EnvFilter::try_new(level) {
-            Ok(f) => return f,
+            Ok(f) => return (f, level.to_string(), "cli --log-level"),
             Err(e) => {
                 eprintln!(
                     "evo: warning: invalid --log-level '{level}': {e}; falling back"
@@ -174,13 +208,25 @@ fn resolve_filter(config_level: &str, cli_override: Option<&str>) -> EnvFilter {
 
     if let Ok(s) = std::env::var("RUST_LOG") {
         if let Ok(f) = EnvFilter::try_new(&s) {
-            return f;
+            return (f, s, "RUST_LOG env");
         }
     }
 
-    EnvFilter::try_new(config_level).unwrap_or_else(|_| {
-        EnvFilter::new(evo_plugin_sdk::wire_logging::DEFAULT_WIRE_ENV_FILTER)
-    })
+    match EnvFilter::try_new(config_level) {
+        Ok(f) => (f, config_level.to_string(), "config [steward] log_level"),
+        Err(_) => (
+            EnvFilter::new(
+                evo_plugin_sdk::wire_logging::DEFAULT_WIRE_ENV_FILTER,
+            ),
+            evo_plugin_sdk::wire_logging::DEFAULT_WIRE_ENV_FILTER.to_string(),
+            "DEFAULT_WIRE_ENV_FILTER fallback",
+        ),
+    }
+}
+
+#[cfg(test)]
+fn resolve_filter(config_level: &str, cli_override: Option<&str>) -> EnvFilter {
+    resolve_filter_with_source(config_level, cli_override).0
 }
 
 #[cfg(test)]

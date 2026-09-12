@@ -69,11 +69,15 @@ pull request and on direct pushes to the main branch.
 2. Implement your change. Follow the existing patterns in the
    relevant crate or directory; if you are adding a new public
    surface, document its behaviour with rustdoc.
-3. Run the project's local quality gates before opening a pull
-   request:
-   - `cargo fmt --all` (formatting)
-   - `cargo clippy --workspace --all-targets -- -D warnings` (lints)
-   - `cargo test --workspace --lib` (unit tests)
+3. Run the compulsory cargo workout before every commit (and
+   again before opening a pull request):
+   `scripts/preflight/check-cargo-workout.sh`
+   That is `cargo clean`, `cargo fmt --all -- --check`,
+   `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+   `cargo test --workspace --locked`, and
+   `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked`.
+   rustdoc intra-doc links are part of the gate. Do not `#[allow]`
+   rustdoc or clippy to silence it.
 4. Commit your change with a `Signed-off-by` line (`git commit -s`).
 5. Open a pull request describing the change, the motivation, and
    any decisions worth highlighting to a reviewer.

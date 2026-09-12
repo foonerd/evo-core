@@ -1703,6 +1703,12 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::CredentialFetchResponse { .. } => {
             "credential_fetch_response"
         }
+        WireFrame::CredentialFetchForProvider { .. } => {
+            "credential_fetch_for_provider"
+        }
+        WireFrame::CredentialFetchForProviderResponse { .. } => {
+            "credential_fetch_for_provider_response"
+        }
         WireFrame::CredentialStore { .. } => "credential_store",
         WireFrame::CredentialStoreResponse { .. } => {
             "credential_store_response"
@@ -1718,6 +1724,18 @@ fn variant_name(frame: &WireFrame) -> &'static str {
         WireFrame::CredentialSetChanged { .. } => "credential_set_changed",
         WireFrame::OnlineProviderConfigList { .. } => {
             "online_provider_config_list"
+        }
+        WireFrame::OnlineProviderConfigRegister { .. } => {
+            "online_provider_config_register"
+        }
+        WireFrame::OnlineProviderConfigRegisterResponse { .. } => {
+            "online_provider_config_register_response"
+        }
+        WireFrame::OnlineProviderPrivacyMode { .. } => {
+            "online_provider_privacy_mode"
+        }
+        WireFrame::OnlineProviderPrivacyModeResponse { .. } => {
+            "online_provider_privacy_mode_response"
         }
         WireFrame::OnlineProviderConfigListResponse { .. } => {
             "online_provider_config_list_response"
@@ -5487,10 +5505,10 @@ impl WireCredentialVaultProxy {
 impl crate::contract::context::CredentialVaultHandle
     for WireCredentialVaultProxy
 {
-    fn fetch<'a>(
-        &'a self,
+    fn fetch(
+        &self,
         key: String,
-    ) -> crate::contract::context::CredentialFetchFuture<'a> {
+    ) -> crate::contract::context::CredentialFetchFuture<'_> {
         let tx = self.tx.clone();
         let pending = Arc::clone(&self.pending);
         let plugin = self.plugin_name.clone();
@@ -5524,12 +5542,51 @@ impl crate::contract::context::CredentialVaultHandle
         })
     }
 
-    fn store<'a>(
-        &'a self,
+    fn fetch_for_provider(
+        &self,
+        provider_id: String,
+    ) -> crate::contract::context::CredentialFetchFuture<'_> {
+        let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
+        let plugin = self.plugin_name.clone();
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            use crate::contract::context::CredentialVaultError as E;
+            let rx = register_pending(&pending, cid);
+            let frame = WireFrame::CredentialFetchForProvider {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                provider_id,
+            };
+            if tx.send(frame).await.is_err() {
+                remove_pending(&pending, cid);
+                return Err(E::Persistence("wire transport closed".into()));
+            }
+            match rx.await {
+                Ok(WireFrame::CredentialFetchForProviderResponse {
+                    found,
+                    value,
+                    ..
+                }) => Ok(if found { Some(value) } else { None }),
+                Ok(WireFrame::Error { message, .. }) => {
+                    Err(E::Persistence(message))
+                }
+                Ok(other) => Err(E::Persistence(format!(
+                    "unexpected response frame: {}",
+                    variant_name(&other)
+                ))),
+                Err(_) => Err(E::Persistence("wire transport closed".into())),
+            }
+        })
+    }
+
+    fn store(
+        &self,
         key: String,
         value: Vec<u8>,
         metadata: crate::contract::context::CredentialMetadata,
-    ) -> crate::contract::context::CredentialMutateFuture<'a> {
+    ) -> crate::contract::context::CredentialMutateFuture<'_> {
         let tx = self.tx.clone();
         let pending = Arc::clone(&self.pending);
         let plugin = self.plugin_name.clone();
@@ -5563,10 +5620,10 @@ impl crate::contract::context::CredentialVaultHandle
         })
     }
 
-    fn delete<'a>(
-        &'a self,
+    fn delete(
+        &self,
         key: String,
-    ) -> crate::contract::context::CredentialMutateFuture<'a> {
+    ) -> crate::contract::context::CredentialMutateFuture<'_> {
         let tx = self.tx.clone();
         let pending = Arc::clone(&self.pending);
         let plugin = self.plugin_name.clone();
@@ -5598,9 +5655,9 @@ impl crate::contract::context::CredentialVaultHandle
         })
     }
 
-    fn list_keys<'a>(
-        &'a self,
-    ) -> crate::contract::context::CredentialListingsFuture<'a> {
+    fn list_keys(
+        &self,
+    ) -> crate::contract::context::CredentialListingsFuture<'_> {
         let tx = self.tx.clone();
         let pending = Arc::clone(&self.pending);
         let plugin = self.plugin_name.clone();
@@ -5640,12 +5697,12 @@ impl crate::contract::context::CredentialVaultHandle
         self.change_bus.subscribe()
     }
 
-    fn request_from_operator<'a>(
-        &'a self,
+    fn request_from_operator(
+        &self,
         key: String,
         prompt_text: String,
         metadata: crate::contract::context::CredentialMetadata,
-    ) -> crate::contract::context::CredentialRequestFuture<'a> {
+    ) -> crate::contract::context::CredentialRequestFuture<'_> {
         Box::pin(async move {
             use crate::contract::context::CredentialVaultError as E;
             // Fetch first — the common path once the operator has
@@ -5778,9 +5835,9 @@ impl WireOnlineProviderConfigProxy {
 impl crate::contract::context::OnlineProviderConfigHandle
     for WireOnlineProviderConfigProxy
 {
-    fn list_all<'a>(
-        &'a self,
-    ) -> crate::contract::context::OnlineProviderListFuture<'a> {
+    fn list_all(
+        &self,
+    ) -> crate::contract::context::OnlineProviderListFuture<'_> {
         let tx = self.tx.clone();
         let pending = Arc::clone(&self.pending);
         let plugin = self.plugin_name.clone();
@@ -5802,6 +5859,91 @@ impl crate::contract::context::OnlineProviderConfigHandle
                     configs,
                     ..
                 }) => Ok(configs),
+                Ok(WireFrame::Error { message, .. }) => {
+                    Err(E::Refused(message))
+                }
+                Ok(other) => Err(E::Transport(format!(
+                    "unexpected response frame: {}",
+                    variant_name(&other)
+                ))),
+                Err(_) => Err(E::Transport("wire transport closed".into())),
+            }
+        })
+    }
+
+    fn register<'a>(
+        &'a self,
+        provider_id: &'a str,
+        privacy_class: crate::contract::context::ProviderPrivacyClass,
+    ) -> crate::contract::context::OnlineProviderRegisterFuture<'a> {
+        let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
+        let plugin = self.plugin_name.clone();
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        let provider_id = provider_id.to_string();
+        Box::pin(async move {
+            use crate::contract::context::OnlineProviderConfigError as E;
+            let rx = register_pending(&pending, cid);
+            let frame = WireFrame::OnlineProviderConfigRegister {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+                provider_id,
+                privacy_class,
+            };
+            if tx.send(frame).await.is_err() {
+                remove_pending(&pending, cid);
+                return Err(E::Transport("wire transport closed".into()));
+            }
+            match rx.await {
+                Ok(WireFrame::OnlineProviderConfigRegisterResponse {
+                    config,
+                    ..
+                }) => Ok(config),
+                Ok(WireFrame::Error { message, .. }) => {
+                    Err(E::Refused(message))
+                }
+                Ok(other) => Err(E::Transport(format!(
+                    "unexpected response frame: {}",
+                    variant_name(&other)
+                ))),
+                Err(_) => Err(E::Transport("wire transport closed".into())),
+            }
+        })
+    }
+
+    fn privacy_mode(
+        &self,
+    ) -> crate::contract::context::PrivacyPostureFuture<'_> {
+        let tx = self.tx.clone();
+        let pending = Arc::clone(&self.pending);
+        let plugin = self.plugin_name.clone();
+        let cid = self.event_cid.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            use crate::contract::context::OnlineProviderConfigError as E;
+            use crate::contract::context::PrivacyPosture;
+            let rx = register_pending(&pending, cid);
+            let frame = WireFrame::OnlineProviderPrivacyMode {
+                v: PROTOCOL_VERSION,
+                cid,
+                plugin,
+            };
+            if tx.send(frame).await.is_err() {
+                remove_pending(&pending, cid);
+                return Err(E::Transport("wire transport closed".into()));
+            }
+            match rx.await {
+                Ok(WireFrame::OnlineProviderPrivacyModeResponse {
+                    mode,
+                    ..
+                }) => {
+                    // A posture this build does not recognise
+                    // resolves to the most restrictive one, not
+                    // the permissive default — a newer steward
+                    // may name a stricter posture this plugin
+                    // predates.
+                    Ok(PrivacyPosture::from_wire_fail_safe(Some(&mode)))
+                }
                 Ok(WireFrame::Error { message, .. }) => {
                     Err(E::Refused(message))
                 }
@@ -7127,7 +7269,7 @@ fn arm_exit_watchdog() {
 /// the SDK dispatch cleanup / runtime drop deadlocks
 /// (rig-observed on plugins whose `unload()` leaves orphaned
 /// background tasks), the process still exits within
-/// [`EXIT_WATCHDOG`] and the framework's `wait_or_kill_child`
+/// `EXIT_WATCHDOG` and the framework's `wait_or_kill_child`
 /// never trips its own 5 s timeout WARN.
 ///
 /// Never returns — the process terminates via
@@ -8479,10 +8621,10 @@ mod tests {
     }
 
     impl Warden for TestWarden {
-        fn take_custody<'a>(
-            &'a mut self,
+        fn take_custody(
+            &mut self,
             assignment: Assignment,
-        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a
+        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + '_
         {
             async move {
                 if self.fail_take {
@@ -8524,10 +8666,10 @@ mod tests {
             }
         }
 
-        fn release_custody<'a>(
-            &'a mut self,
+        fn release_custody(
+            &mut self,
             handle: CustodyHandle,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
             async move {
                 self.custodies_released.lock().unwrap().push(handle);
                 Ok(())
@@ -9855,10 +9997,10 @@ mod tests {
     }
 
     impl Warden for TestCombined {
-        fn take_custody<'a>(
-            &'a mut self,
+        fn take_custody(
+            &mut self,
             assignment: Assignment,
-        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a
+        ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + '_
         {
             async move {
                 let handle = CustodyHandle::new(format!(
@@ -9881,10 +10023,10 @@ mod tests {
             }
         }
 
-        fn release_custody<'a>(
-            &'a mut self,
+        fn release_custody(
+            &mut self,
             _handle: CustodyHandle,
-        ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+        ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
             async move { Ok(()) }
         }
     }

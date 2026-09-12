@@ -142,10 +142,10 @@ impl Plugin for FastPathWardenPlugin {
 }
 
 impl Warden for FastPathWardenPlugin {
-    fn take_custody<'a>(
-        &'a mut self,
+    fn take_custody(
+        &mut self,
         assignment: Assignment,
-    ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a
+    ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + '_
     {
         async move {
             tracing::debug!(plugin = PLUGIN_NAME, verb = "take_custody", custody_type = %assignment.custody_type, cid = assignment.correlation_id, "warden verb invoking");
@@ -204,10 +204,10 @@ impl Warden for FastPathWardenPlugin {
         }
     }
 
-    fn release_custody<'a>(
-        &'a mut self,
+    fn release_custody(
+        &mut self,
         handle: CustodyHandle,
-    ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a {
+    ) -> impl Future<Output = Result<(), PluginError>> + Send + '_ {
         async move {
             tracing::debug!(plugin = PLUGIN_NAME, verb = "release_custody", handle = %handle.id, "warden verb invoking");
             if !self.loaded {

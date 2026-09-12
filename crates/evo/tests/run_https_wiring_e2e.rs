@@ -108,9 +108,13 @@ async fn maybe_boot_https_returns_none_when_env_var_unset() {
     std::env::remove_var("EVO_HTTPS_LISTEN_ADDR");
 
     let server = build_minimal_server();
-    let result =
-        maybe_boot_https(server, std::path::Path::new("/tmp/unused"), None)
-            .await;
+    let result = maybe_boot_https(
+        server,
+        std::path::Path::new("/tmp/unused"),
+        None,
+        None,
+    )
+    .await;
     match &result {
         Ok(None) => {}
         Ok(Some(_)) => panic!("expected None when env unset; got Some"),
@@ -140,6 +144,7 @@ async fn maybe_boot_https_boots_listener_when_env_var_set() {
     let handles = maybe_boot_https(
         server,
         &persistence_parent.join("persistence.sqlite"),
+        None,
         None,
     )
     .await
@@ -253,6 +258,7 @@ async fn secure_tier_refuses_request_without_bearer() {
         server,
         &persistence_parent.join("persistence.sqlite"),
         None,
+        None,
     )
     .await
     .expect("maybe_boot_https Ok")
@@ -339,9 +345,13 @@ async fn maybe_boot_https_errors_on_malformed_listen_addr() {
     std::env::set_var("EVO_HTTPS_LISTEN_ADDR", "not:a:socket:addr");
 
     let server = build_minimal_server();
-    let result =
-        maybe_boot_https(server, std::path::Path::new("/tmp/unused"), None)
-            .await;
+    let result = maybe_boot_https(
+        server,
+        std::path::Path::new("/tmp/unused"),
+        None,
+        None,
+    )
+    .await;
     assert!(
         result.is_err(),
         "malformed EVO_HTTPS_LISTEN_ADDR must surface as an error"

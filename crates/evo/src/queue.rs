@@ -10,13 +10,18 @@
 //!
 //! ## Concrete types
 //!
-//! [`ItemType`] discriminates the queue's playback shape:
-//! `Track` and `Episode` are finite, advance on completion;
-//! `Stream` and `Mix` are continuous and do not auto-advance;
-//! `AdBreak` honours per-source ad markers; `LiveEvent` is
-//! time-bound; `Audiobook` and `Podcast` carry chapter markers.
-//! [`LifecycleType`] expresses the same shape from the queue's
-//! advancement perspective.
+//! `item_type` is an opaque string the source plugin chooses and
+//! the queue stores verbatim. The framework does not enumerate
+//! playback kinds: a catalogue of them is domain knowledge, and a
+//! steward that owns the list cannot serve a distribution whose
+//! kinds it never heard of. Whichever shelf actually carries those
+//! kinds is where they belong; this module is not it.
+//!
+//! [`LifecycleType`] is the queue's own concern and stays typed —
+//! it says what advancement does when an item completes, which is
+//! behaviour the queue implements rather than vocabulary it
+//! borrows. It is set explicitly by the caller, never inferred
+//! from what an item is called.
 //!
 //! [`ResumeCapability`] captures the per-source's ability to
 //! resume from a saved position. [`ItemMetadata`] carries the
@@ -25,8 +30,9 @@
 //!
 //! ## URI scheme registry
 //!
-//! Each URI scheme (`tidal:`, `mpd:`, `spotify:`, `bbc:`, ...) is
-//! registered to exactly one source plugin at admission time.
+//! Each URI scheme is registered to exactly one source plugin at
+//! admission time. The registry is a map of strings filled by
+//! whoever is admitted; the framework names no scheme itself.
 //! Conflicting registrations are refused with a structured error
 //! the admission gate can surface to the operator. The framework
 //! resolves a queued item's `source_plugin` by matching the URI's
@@ -58,68 +64,6 @@ use std::sync::Arc;
 // =========================================================================
 // Concrete types
 // =========================================================================
-
-/// Item-type discriminator. Drives UI rendering (track shows
-/// duration; podcast shows chapters; live stream shows neither)
-/// and lifecycle dispatch (finite advances on completion;
-/// continuous does not).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ItemType {
-    /// Finite duration, advances on completion. The default for
-    /// most music.
-    Track,
-    /// Finite, may have chapter markers. Distinct from `Track`
-    /// for UI purposes.
-    Episode,
-    /// Continuous, does not auto-advance. Internet radio,
-    /// ambient channel.
-    Stream,
-    /// Continuous; may have track boundaries (e.g., a DJ mix or
-    /// an artist radio).
-    Mix,
-    /// Finite, honours ad markers per the source's rules. May or
-    /// may not be skippable.
-    AdBreak,
-    /// Time-bound (e.g., a live concert at a specific time).
-    LiveEvent,
-    /// Long-form with chapter markers.
-    Audiobook,
-    /// Similar to `Episode`; distinct discriminator for UI.
-    Podcast,
-}
-
-impl ItemType {
-    /// Stable wire string for the substrate row's `item_type`
-    /// column.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ItemType::Track => "track",
-            ItemType::Episode => "episode",
-            ItemType::Stream => "stream",
-            ItemType::Mix => "mix",
-            ItemType::AdBreak => "ad_break",
-            ItemType::LiveEvent => "live_event",
-            ItemType::Audiobook => "audiobook",
-            ItemType::Podcast => "podcast",
-        }
-    }
-
-    /// Parse from the substrate row's `item_type` column.
-    pub fn parse_wire(s: &str) -> Option<Self> {
-        match s {
-            "track" => Some(ItemType::Track),
-            "episode" => Some(ItemType::Episode),
-            "stream" => Some(ItemType::Stream),
-            "mix" => Some(ItemType::Mix),
-            "ad_break" => Some(ItemType::AdBreak),
-            "live_event" => Some(ItemType::LiveEvent),
-            "audiobook" => Some(ItemType::Audiobook),
-            "podcast" => Some(ItemType::Podcast),
-            _ => None,
-        }
-    }
-}
 
 /// Lifecycle discriminator. Drives the queue's advancement
 /// behaviour on item completion.
@@ -211,7 +155,8 @@ pub struct ExternalIds {
     pub mbid: Option<String>,
     /// International Standard Recording Code.
     pub isrc: Option<String>,
-    /// Free-form per-provider ids (e.g., `"tidal" -> "12345"`).
+    /// Free-form per-provider ids, keyed by whatever the
+    /// providing plugin calls itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub other: Vec<(String, String)>,
 }
@@ -342,7 +287,7 @@ pub struct QueueItem {
     /// Operator-visible item URI.
     pub uri: String,
     /// Item type (track / episode / stream / ...).
-    pub item_type: ItemType,
+    pub item_type: String,
     /// Lifecycle (advances or not, on completion).
     pub lifecycle: LifecycleType,
     /// Resume capability flags.
@@ -374,7 +319,7 @@ pub struct QueueHistoryEntry {
     /// Operator-visible item URI.
     pub uri: String,
     /// Item type.
-    pub item_type: ItemType,
+    pub item_type: String,
     /// Operator-visible metadata snapshot at history-write time.
     pub metadata: ItemMetadata,
     /// Source-plugin binding.
@@ -796,12 +741,15 @@ fn queue_item_from_row(
     queued_at_ms: u64,
     queued_by: String,
 ) -> Result<QueueItem, QueueError> {
-    let item_type_enum = ItemType::parse_wire(&item_type).ok_or_else(|| {
-        QueueError::UnknownWireString {
-            field: "item_type",
-            value: item_type.clone(),
-        }
-    })?;
+    // `item_type` is stored and returned verbatim. A kind this
+    // build has never seen is not an error: the queue does not
+    // own the catalogue, so it has no standing to reject a value
+    // a source plugin chose. Refusing an unrecognised kind here
+    // would mean a distribution could not queue its own content
+    // without the framework being taught about it first.
+    if item_type.is_empty() {
+        return Err(QueueError::Invalid("item_type is empty".into()));
+    }
     let lifecycle_enum =
         LifecycleType::parse_wire(&lifecycle).ok_or_else(|| {
             QueueError::UnknownWireString {
@@ -819,7 +767,7 @@ fn queue_item_from_row(
         .map_err(QueueError::DecodeMetadata)?;
     Ok(QueueItem {
         uri,
-        item_type: item_type_enum,
+        item_type,
         lifecycle: lifecycle_enum,
         resume_capability: ResumeCapability {
             seekable,
@@ -836,13 +784,13 @@ fn queue_item_from_row(
 fn history_entry_from_row(
     row: PersistedQueueHistoryEntry,
 ) -> Result<QueueHistoryEntry, QueueError> {
-    let item_type_enum =
-        ItemType::parse_wire(&row.item_type).ok_or_else(|| {
-            QueueError::UnknownWireString {
-                field: "item_type",
-                value: row.item_type.clone(),
-            }
-        })?;
+    // Stored verbatim on the way in, returned verbatim on the way
+    // out. History that could not be read back because this build
+    // does not recognise a kind would be history lost to a
+    // vocabulary change.
+    if row.item_type.is_empty() {
+        return Err(QueueError::Invalid("item_type is empty".into()));
+    }
     let kind_enum = CompletionKind::parse_wire(&row.completion_kind)
         .ok_or_else(|| QueueError::UnknownWireString {
             field: "completion_kind",
@@ -853,7 +801,7 @@ fn history_entry_from_row(
     Ok(QueueHistoryEntry {
         history_id: row.history_id,
         uri: row.uri,
-        item_type: item_type_enum,
+        item_type: row.item_type,
         metadata,
         source_plugin: row.source_plugin,
         queued_at_ms: row.queued_at_ms,
@@ -872,25 +820,25 @@ mod tests {
         Arc::new(MemoryPersistenceStore::new())
     }
 
+    /// Build an item with the kind and lifecycle stated
+    /// separately.
+    ///
+    /// Lifecycle is a parameter, not something derived from the
+    /// kind string. Deriving it would rebuild the deleted
+    /// catalogue inside the fixture and quietly re-couple the two:
+    /// the queue's advancement behaviour is its own, and a kind it
+    /// has never seen must still be able to say which it wants.
     fn sample_item(
         uri: &str,
-        item_type: ItemType,
+        item_type: &str,
+        lifecycle: LifecycleType,
         plugin: &str,
         queued_at_ms: u64,
     ) -> QueueItem {
         QueueItem {
             uri: uri.to_string(),
-            item_type,
-            lifecycle: match item_type {
-                ItemType::Stream | ItemType::Mix => {
-                    LifecycleType::ContinuousNoAdvance
-                }
-                ItemType::Audiobook | ItemType::Podcast | ItemType::Episode => {
-                    LifecycleType::FiniteWithChapters
-                }
-                ItemType::AdBreak => LifecycleType::AdSegment,
-                _ => LifecycleType::FiniteProgress,
-            },
+            item_type: item_type.to_string(),
+            lifecycle,
             resume_capability: ResumeCapability::default(),
             metadata: ItemMetadata {
                 title: Some(format!("title for {uri}")),
@@ -907,35 +855,32 @@ mod tests {
     #[tokio::test]
     async fn uri_scheme_register_lookup_unregister() {
         let registry = UriSchemeRegistry::new(store());
-        registry.register("tidal", "com.tidal").await.unwrap();
-        let row = registry.lookup("tidal").await.unwrap().unwrap();
-        assert_eq!(row.source_plugin, "com.tidal");
+        registry.register("scheme-a", "plugin.a").await.unwrap();
+        let row = registry.lookup("scheme-a").await.unwrap().unwrap();
+        assert_eq!(row.source_plugin, "plugin.a");
         // Idempotent re-register.
-        registry.register("tidal", "com.tidal").await.unwrap();
+        registry.register("scheme-a", "plugin.a").await.unwrap();
         // Lookup absent.
         assert!(registry.lookup("never").await.unwrap().is_none());
         // Unregister.
-        registry.unregister("tidal").await.unwrap();
-        assert!(registry.lookup("tidal").await.unwrap().is_none());
+        registry.unregister("scheme-a").await.unwrap();
+        assert!(registry.lookup("scheme-a").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn uri_scheme_register_conflict_returns_typed_error() {
         let registry = UriSchemeRegistry::new(store());
-        registry.register("tidal", "com.tidal").await.unwrap();
-        let err = registry
-            .register("tidal", "com.imposter")
-            .await
-            .unwrap_err();
+        registry.register("scheme-a", "plugin.a").await.unwrap();
+        let err = registry.register("scheme-a", "plugin.b").await.unwrap_err();
         match err {
             QueueError::SchemeConflict {
                 scheme,
                 existing_plugin,
                 requested_plugin,
             } => {
-                assert_eq!(scheme, "tidal");
-                assert_eq!(existing_plugin, "com.tidal");
-                assert_eq!(requested_plugin, "com.imposter");
+                assert_eq!(scheme, "scheme-a");
+                assert_eq!(existing_plugin, "plugin.a");
+                assert_eq!(requested_plugin, "plugin.b");
             }
             other => panic!("expected SchemeConflict, got {other:?}"),
         }
@@ -944,13 +889,13 @@ mod tests {
     #[tokio::test]
     async fn uri_scheme_lookup_for_uri_extracts_scheme() {
         let registry = UriSchemeRegistry::new(store());
-        registry.register("tidal", "com.tidal").await.unwrap();
+        registry.register("scheme-a", "plugin.a").await.unwrap();
         let row = registry
-            .lookup_for_uri("tidal:track:abc123")
+            .lookup_for_uri("scheme-a:item:abc123")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.source_plugin, "com.tidal");
+        assert_eq!(row.source_plugin, "plugin.a");
         // No colon -> None (not an error).
         assert!(registry
             .lookup_for_uri("no-scheme-here")
@@ -959,7 +904,7 @@ mod tests {
             .is_none());
         // Unregistered scheme -> None.
         assert!(registry
-            .lookup_for_uri("spotify:track:xyz")
+            .lookup_for_uri("scheme-b:item:xyz")
             .await
             .unwrap()
             .is_none());
@@ -995,20 +940,25 @@ mod tests {
     #[tokio::test]
     async fn queue_append_round_trip() {
         let q = Queue::new(store());
-        let item =
-            sample_item("tidal:track:1", ItemType::Track, "com.tidal", 100);
+        let item = sample_item(
+            "scheme-a:item:1",
+            "track",
+            LifecycleType::FiniteProgress,
+            "plugin.a",
+            100,
+        );
         let p = q.append(ACTIVE_QUEUE_ID, &item).await.unwrap();
         assert_eq!(p, 0);
         let listed = q.list(ACTIVE_QUEUE_ID).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].position, 0);
         assert_eq!(listed[0].item.uri, item.uri);
-        assert_eq!(listed[0].item.item_type, ItemType::Track);
+        assert_eq!(listed[0].item.item_type, "track");
         assert_eq!(listed[0].item.lifecycle, LifecycleType::FiniteProgress);
         assert_eq!(listed[0].item.queued_by, QueuedBy::UserVerb);
         assert_eq!(
             listed[0].item.metadata.title.as_deref(),
-            Some("title for tidal:track:1")
+            Some("title for scheme-a:item:1")
         );
     }
 
@@ -1017,25 +967,31 @@ mod tests {
         let q = Queue::new(store());
         for i in 0..3 {
             let item = sample_item(
-                &format!("tidal:track:{i}"),
-                ItemType::Track,
-                "com.tidal",
+                &format!("scheme-a:item:{i}"),
+                "track",
+                LifecycleType::FiniteProgress,
+                "plugin.a",
                 100 + i as u64,
             );
             q.append(ACTIVE_QUEUE_ID, &item).await.unwrap();
         }
-        let inserted =
-            sample_item("tidal:track:I", ItemType::Track, "com.tidal", 150);
+        let inserted = sample_item(
+            "scheme-a:item:I",
+            "track",
+            LifecycleType::FiniteProgress,
+            "plugin.a",
+            150,
+        );
         q.insert_at(ACTIVE_QUEUE_ID, &inserted, 1).await.unwrap();
         let listed = q.list(ACTIVE_QUEUE_ID).await.unwrap();
         let uris: Vec<_> = listed.iter().map(|p| p.item.uri.clone()).collect();
         assert_eq!(
             uris,
             vec![
-                "tidal:track:0",
-                "tidal:track:I",
-                "tidal:track:1",
-                "tidal:track:2",
+                "scheme-a:item:0",
+                "scheme-a:item:I",
+                "scheme-a:item:1",
+                "scheme-a:item:2",
             ]
         );
         for (i, p) in listed.iter().enumerate() {
@@ -1048,9 +1004,10 @@ mod tests {
         let q = Queue::new(store());
         for i in 0..4 {
             let item = sample_item(
-                &format!("tidal:track:{i}"),
-                ItemType::Track,
-                "com.tidal",
+                &format!("scheme-a:item:{i}"),
+                "track",
+                LifecycleType::FiniteProgress,
+                "plugin.a",
                 100 + i as u64,
             );
             q.append(ACTIVE_QUEUE_ID, &item).await.unwrap();
@@ -1060,7 +1017,7 @@ mod tests {
         let uris: Vec<_> = listed.iter().map(|p| p.item.uri.clone()).collect();
         assert_eq!(
             uris,
-            vec!["tidal:track:0", "tidal:track:2", "tidal:track:3"]
+            vec!["scheme-a:item:0", "scheme-a:item:2", "scheme-a:item:3"]
         );
         for (i, p) in listed.iter().enumerate() {
             assert_eq!(p.position, i as u32);
@@ -1072,21 +1029,34 @@ mod tests {
         let q = Queue::new(store());
         for i in 0..3 {
             let item = sample_item(
-                &format!("tidal:track:{i}"),
-                ItemType::Track,
-                "com.tidal",
+                &format!("scheme-a:item:{i}"),
+                "track",
+                LifecycleType::FiniteProgress,
+                "plugin.a",
                 100 + i as u64,
             );
             q.append(ACTIVE_QUEUE_ID, &item).await.unwrap();
         }
         let new_items = vec![
-            sample_item("spotify:a", ItemType::Track, "com.spotify", 500),
-            sample_item("spotify:b", ItemType::Track, "com.spotify", 600),
+            sample_item(
+                "scheme-c:a",
+                "track",
+                LifecycleType::FiniteProgress,
+                "plugin.c",
+                500,
+            ),
+            sample_item(
+                "scheme-c:b",
+                "track",
+                LifecycleType::FiniteProgress,
+                "plugin.c",
+                600,
+            ),
         ];
         q.replace(ACTIVE_QUEUE_ID, &new_items).await.unwrap();
         let listed = q.list(ACTIVE_QUEUE_ID).await.unwrap();
         let uris: Vec<_> = listed.iter().map(|p| p.item.uri.clone()).collect();
-        assert_eq!(uris, vec!["spotify:a", "spotify:b"]);
+        assert_eq!(uris, vec!["scheme-c:a", "scheme-c:b"]);
         // Replace with empty clears.
         q.replace(ACTIVE_QUEUE_ID, &[]).await.unwrap();
         assert!(q.list(ACTIVE_QUEUE_ID).await.unwrap().is_empty());
@@ -1094,22 +1064,27 @@ mod tests {
 
     #[tokio::test]
     async fn queue_typed_round_trip_for_each_item_type() {
+        // Kind and lifecycle are independent. Each pair is stated
+        // here rather than derived, because the queue no longer
+        // has a table mapping one to the other and a fixture that
+        // rebuilt it would be testing the fixture.
         let q = Queue::new(store());
-        let types = [
-            ItemType::Track,
-            ItemType::Episode,
-            ItemType::Stream,
-            ItemType::Mix,
-            ItemType::AdBreak,
-            ItemType::LiveEvent,
-            ItemType::Audiobook,
-            ItemType::Podcast,
+        let types: [(&str, LifecycleType); 8] = [
+            ("track", LifecycleType::FiniteProgress),
+            ("episode", LifecycleType::FiniteWithChapters),
+            ("stream", LifecycleType::ContinuousNoAdvance),
+            ("mix", LifecycleType::ContinuousNoAdvance),
+            ("ad_break", LifecycleType::AdSegment),
+            ("live_event", LifecycleType::FiniteProgress),
+            ("audiobook", LifecycleType::FiniteWithChapters),
+            ("podcast", LifecycleType::FiniteWithChapters),
         ];
-        for (i, t) in types.iter().enumerate() {
+        for (i, (kind, lifecycle)) in types.iter().enumerate() {
             let item = sample_item(
-                &format!("test:{i}"),
-                *t,
-                "com.test",
+                &format!("scheme-a:item:{i}"),
+                kind,
+                *lifecycle,
+                "plugin.a",
                 100 + i as u64,
             );
             q.append(ACTIVE_QUEUE_ID, &item).await.unwrap();
@@ -1117,7 +1092,8 @@ mod tests {
         let listed = q.list(ACTIVE_QUEUE_ID).await.unwrap();
         assert_eq!(listed.len(), types.len());
         for (i, p) in listed.iter().enumerate() {
-            assert_eq!(p.item.item_type, types[i]);
+            assert_eq!(p.item.item_type, types[i].0);
+            assert_eq!(p.item.lifecycle, types[i].1);
         }
     }
 
@@ -1126,8 +1102,13 @@ mod tests {
     #[tokio::test]
     async fn queue_history_append_and_list_most_recent_first() {
         let q = Queue::new(store());
-        let item =
-            sample_item("tidal:track:x", ItemType::Track, "com.tidal", 100);
+        let item = sample_item(
+            "scheme-a:item:x",
+            "track",
+            LifecycleType::FiniteProgress,
+            "plugin.a",
+            100,
+        );
         q.append_history(
             ACTIVE_QUEUE_ID,
             &item,
@@ -1139,7 +1120,13 @@ mod tests {
         .unwrap();
         q.append_history(
             ACTIVE_QUEUE_ID,
-            &sample_item("tidal:track:y", ItemType::Track, "com.tidal", 200),
+            &sample_item(
+                "scheme-a:item:y",
+                "track",
+                LifecycleType::FiniteProgress,
+                "plugin.a",
+                200,
+            ),
             CompletionKind::Skipped,
             600,
             Some(45_000),
@@ -1148,7 +1135,13 @@ mod tests {
         .unwrap();
         q.append_history(
             ACTIVE_QUEUE_ID,
-            &sample_item("tidal:track:z", ItemType::Track, "com.tidal", 300),
+            &sample_item(
+                "scheme-a:item:z",
+                "track",
+                LifecycleType::FiniteProgress,
+                "plugin.a",
+                300,
+            ),
             CompletionKind::Preempted,
             700,
             None,
@@ -1158,13 +1151,13 @@ mod tests {
         let history = q.list_history(ACTIVE_QUEUE_ID, 10).await.unwrap();
         assert_eq!(history.len(), 3);
         // Most-recent-first order.
-        assert_eq!(history[0].uri, "tidal:track:z");
+        assert_eq!(history[0].uri, "scheme-a:item:z");
         assert_eq!(history[0].completion_kind, CompletionKind::Preempted);
         assert_eq!(history[0].last_position_ms, None);
-        assert_eq!(history[1].uri, "tidal:track:y");
+        assert_eq!(history[1].uri, "scheme-a:item:y");
         assert_eq!(history[1].completion_kind, CompletionKind::Skipped);
         assert_eq!(history[1].last_position_ms, Some(45_000));
-        assert_eq!(history[2].uri, "tidal:track:x");
+        assert_eq!(history[2].uri, "scheme-a:item:x");
         assert_eq!(history[2].completion_kind, CompletionKind::PlayedThrough);
         assert_eq!(history[2].last_position_ms, Some(180_000));
     }
@@ -1177,7 +1170,8 @@ mod tests {
                 ACTIVE_QUEUE_ID,
                 &sample_item(
                     &format!("uri-{i}"),
-                    ItemType::Track,
+                    "track",
+                    LifecycleType::FiniteProgress,
                     "com.test",
                     100,
                 ),
@@ -1199,21 +1193,35 @@ mod tests {
 
     // --- wire-string round trips ---
 
-    #[test]
-    fn item_type_round_trips_through_wire_strings() {
-        for t in [
-            ItemType::Track,
-            ItemType::Episode,
-            ItemType::Stream,
-            ItemType::Mix,
-            ItemType::AdBreak,
-            ItemType::LiveEvent,
-            ItemType::Audiobook,
-            ItemType::Podcast,
-        ] {
-            assert_eq!(ItemType::parse_wire(t.as_str()), Some(t));
+    #[tokio::test]
+    async fn item_type_is_stored_and_returned_verbatim() {
+        // A kind this build has never seen survives the round
+        // trip unchanged. That is the whole point of dropping the
+        // enum: a distribution can queue its own content without
+        // the framework being taught the vocabulary first, and
+        // history stays readable across a vocabulary change.
+        let q = Queue::new(store());
+        for (i, kind) in ["track", "a-kind-this-build-never-heard-of", "x"]
+            .iter()
+            .enumerate()
+        {
+            let item = sample_item(
+                &format!("scheme-a:item:{i}"),
+                kind,
+                LifecycleType::FiniteProgress,
+                "plugin.a",
+                100 + i as u64,
+            );
+            q.append(ACTIVE_QUEUE_ID, &item).await.unwrap();
         }
-        assert_eq!(ItemType::parse_wire("bogus"), None);
+        let listed = q.list(ACTIVE_QUEUE_ID).await.unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|p| p.item.item_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["track", "a-kind-this-build-never-heard-of", "x"],
+        );
     }
 
     #[test]
@@ -1272,7 +1280,7 @@ mod tests {
                     .expect("first open"),
             );
             let registry = UriSchemeRegistry::new(Arc::clone(&store));
-            registry.register("tidal", "com.tidal").await.unwrap();
+            registry.register("scheme-a", "plugin.a").await.unwrap();
             registry.register("mpd", "org.example.mpd").await.unwrap();
 
             let queue = Queue::new(Arc::clone(&store));
@@ -1280,9 +1288,10 @@ mod tests {
                 .append(
                     ACTIVE_QUEUE_ID,
                     &sample_item(
-                        "tidal:track:abc",
-                        ItemType::Track,
-                        "com.tidal",
+                        "scheme-a:item:abc",
+                        "track",
+                        LifecycleType::FiniteProgress,
+                        "plugin.a",
                         1000,
                     ),
                 )
@@ -1292,8 +1301,9 @@ mod tests {
                 .append(
                     ACTIVE_QUEUE_ID,
                     &sample_item(
-                        "mpd:/path/to/file",
-                        ItemType::Track,
+                        "scheme-a:/path/to/file",
+                        "track",
+                        LifecycleType::FiniteProgress,
                         "org.example.mpd",
                         2000,
                     ),
@@ -1304,9 +1314,10 @@ mod tests {
                 .append_history(
                     ACTIVE_QUEUE_ID,
                     &sample_item(
-                        "tidal:track:earlier",
-                        ItemType::Track,
-                        "com.tidal",
+                        "scheme-a:item:earlier",
+                        "track",
+                        LifecycleType::FiniteProgress,
+                        "plugin.a",
                         500,
                     ),
                     CompletionKind::PlayedThrough,
@@ -1323,28 +1334,28 @@ mod tests {
             SqlitePersistenceStore::open(db_path.clone()).expect("reopen"),
         );
         let registry = UriSchemeRegistry::new(Arc::clone(&store));
-        let row = registry.lookup("tidal").await.unwrap().unwrap();
-        assert_eq!(row.source_plugin, "com.tidal");
+        let row = registry.lookup("scheme-a").await.unwrap().unwrap();
+        assert_eq!(row.source_plugin, "plugin.a");
         assert_eq!(registry.list().await.unwrap().len(), 2);
         let resolved = registry
-            .lookup_for_uri("tidal:track:abc")
+            .lookup_for_uri("scheme-a:item:abc")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(resolved.source_plugin, "com.tidal");
+        assert_eq!(resolved.source_plugin, "plugin.a");
 
         let queue = Queue::new(Arc::clone(&store));
         let listed = queue.list(ACTIVE_QUEUE_ID).await.unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].position, 0);
-        assert_eq!(listed[0].item.uri, "tidal:track:abc");
-        assert_eq!(listed[0].item.item_type, ItemType::Track);
-        assert_eq!(listed[1].item.uri, "mpd:/path/to/file");
+        assert_eq!(listed[0].item.uri, "scheme-a:item:abc");
+        assert_eq!(listed[0].item.item_type, "track");
+        assert_eq!(listed[1].item.uri, "scheme-a:/path/to/file");
         assert_eq!(listed[1].item.source_plugin, "org.example.mpd");
 
         let history = queue.list_history(ACTIVE_QUEUE_ID, 10).await.unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].uri, "tidal:track:earlier");
+        assert_eq!(history[0].uri, "scheme-a:item:earlier");
         assert_eq!(history[0].completion_kind, CompletionKind::PlayedThrough);
         assert_eq!(history[0].last_position_ms, Some(180_000));
     }

@@ -80,11 +80,12 @@ pub struct HttpsBootConfig {
     /// HTTP request is decoded. Unset = no client-cert
     /// verification (the framework default).
     pub client_ca_pem_path: Option<PathBuf>,
-    /// Optional framework asset cache. When supplied the
-    /// router additionally mounts the
-    /// `/api/v1/audio/artwork/:content_hash` endpoint serving
-    /// bytes from the cache for cross-node artwork
-    /// propagation. Absent leaves the route unmounted; the
+    /// Optional content-addressed asset cache. The framework
+    /// stores and retrieves bytes by hash and mounts no route
+    /// over them. When supplied it is handed to plugins
+    /// through their load context, and to the HTTPS hookup so
+    /// a distribution can mount its own serving surface.
+    /// Absent, the store is simply unavailable; the
     /// schema-driven routes + WS endpoint + observatory +
     /// witness endpoints are unaffected.
     pub asset_cache:
@@ -110,6 +111,11 @@ pub struct HttpsBootConfig {
     /// this set further (e.g. drop `plugins:write` on a
     /// kiosk); it may NOT widen past the floor.
     pub lan_trust_capabilities: Option<evo_auth_bearer::CapabilitySet>,
+    /// LAN-origin privileged set, offered only when the steward
+    /// carries a household-protection runtime. `None` keeps the LAN
+    /// arm on the playback floor. See
+    /// [`lan_privileged_capability_set`].
+    pub lan_privileged_capabilities: Option<evo_auth_bearer::CapabilitySet>,
 }
 
 impl std::fmt::Debug for HttpsBootConfig {
@@ -165,6 +171,7 @@ impl HttpsBootConfig {
             asset_cache: None,
             auth_tier_provider: None,
             lan_trust_capabilities: None,
+            lan_privileged_capabilities: None,
         }
     }
 }
@@ -238,6 +245,7 @@ pub struct HttpsBootHandles {
 pub async fn boot_https(
     server: Arc<Server>,
     config: HttpsBootConfig,
+    https_setup: Option<crate::HttpsSetup>,
 ) -> anyhow::Result<HttpsBootHandles> {
     let https_dir = config.state_dir.join("https");
     tokio::fs::create_dir_all(&https_dir).await?;
@@ -407,6 +415,11 @@ pub async fn boot_https(
     //    a request arrives without a bearer header and the
     //    tier admits.
     let dispatcher = StewardHttpDispatcher::new(Arc::clone(&server));
+    // Retained for the distribution hookup below: `build_router`
+    // consumes the dispatcher, and the hookup composes plugin calls
+    // through the same one rather than constructing a second.
+    let dispatcher_for_hookup: Arc<dyn evo_runtime_http::Dispatcher> =
+        Arc::clone(&dispatcher) as Arc<dyn evo_runtime_http::Dispatcher>;
     // Same adapter implements both Dispatcher (request/response)
     // and SubscriptionDispatcher (Subscribe-frame streaming).
     // One canonical object; no parallel adapter.
@@ -423,20 +436,14 @@ pub async fn boot_https(
         .lan_trust_capabilities
         .clone()
         .unwrap_or_else(lan_trust_capability_set);
+    // `build_router` consumes the capability set, and hookup routes
+    // must gate LAN-trusted callers identically.
+    let lan_trust_caps_for_hookup = lan_trust_caps.clone();
+    let lan_privileged_caps = config.lan_privileged_capabilities.clone();
     tracing::info!(
         tier = %tier_provider.current(),
         "evo https listener: auth tier initialised",
     );
-    // Persistent artwork-resolve positive index — sidecar of
-    // the AssetCache root. Populated on every successful
-    // resolve; consulted by the cascade FAST PATH before the
-    // coalescer memo, so browse artwork on a warmed-up
-    // library is O(1) per tile and survives restart.
-    let artwork_resolve_index = Some(Arc::new(
-        evo_runtime_http::artwork_resolve_index::ArtworkResolveIndex::new(
-            config.state_dir.clone(),
-        ),
-    ));
     let mut router = build_router(
         &schema,
         "/api/v1",
@@ -446,10 +453,9 @@ pub async fn boot_https(
         NoopAuditSink::shared(),
         Some(Arc::clone(&observatory)),
         Some(Arc::clone(&witness_chain)),
-        config.asset_cache.clone(),
-        artwork_resolve_index,
         Arc::clone(&tier_provider),
         lan_trust_caps,
+        lan_privileged_caps,
     )?;
 
     // 6b. Optional static-asset serving. When the operator sets
@@ -474,6 +480,43 @@ pub async fn boot_https(
                  is not a directory; static-asset serving disabled",
             );
         }
+    }
+
+    // 6c. Distribution-supplied HTTPS hookup — the seam where
+    //     product routes attach.
+    //
+    //     The framework has now mounted everything it owns:
+    //     schema-driven wire ops, TLS, auth, observatory, witness,
+    //     and the optional static-asset fallback. A distribution
+    //     that ships product HTTP mounts it here, on a router it
+    //     receives and returns, rather than having the framework's
+    //     own router construction know which domain it is serving.
+    //
+    //     Absent on the shipped `evo` binary, which therefore
+    //     mounts no product routes at all. The framework mints a
+    //     claimant token for whatever actor name the hookup
+    //     declares and invents none of its own.
+    if let Some(hookup) = https_setup {
+        let claimant_name = hookup.claimant_name.clone();
+        tracing::info!(
+            claimant = %claimant_name,
+            "evo https listener: invoking distribution HTTPS hookup",
+        );
+        let ctx = crate::HttpsSetupContext {
+            router,
+            dispatcher: dispatcher_for_hookup,
+            asset_cache: config.asset_cache.clone(),
+            validator: Arc::clone(&validator),
+            bus: server.happening_bus(),
+            api_prefix: "/api/v1".to_string(),
+            state_dir: config.state_dir.clone(),
+            tier_provider: Arc::clone(&tier_provider),
+            lan_trust_caps: lan_trust_caps_for_hookup,
+            claimant_name,
+        };
+        router = (hookup.hook)(ctx).await.map_err(|e| {
+            anyhow::anyhow!("distribution HTTPS hookup failed: {e}")
+        })?;
     }
 
     // 7. Bind the HTTPS listener. When `client_ca_pem_path` is
@@ -713,6 +756,15 @@ pub fn operator_bootstrap_capability_set() -> CapabilitySet {
         // cascade view live.
         Capability::write("online_providers"),
         Capability::read("online_providers"),
+        // Settings → Network + Sources → shares / SMB-server.
+        // Pair and kiosk mint from this set. Rank is StepUp so
+        // both write-gated verbs (`network.nm.intent.set`) and
+        // step-up-gated verbs (`flight_mode.set`, share mount)
+        // admit under the current flatten (bearer StepUp counts
+        // as granted + sitting). Must NOT appear on LAN-trust
+        // (see LAN_TRUST_PRIVILEGED_EXCLUDED_SCOPES) — an
+        // anonymous LAN peer must not change Wi-Fi or mounts.
+        Capability::step_up("network_admin"),
     ])
 }
 
@@ -815,17 +867,27 @@ pub(crate) fn merge_bootstrap_with_plugin_scopes<'a>(
 /// user_interaction_responder`).
 const SINGLE_HOLDER_ROLE_SCOPES: &[&str] = &["user_interaction_responder"];
 
+/// Privileged operator scopes that live on the bootstrap set but
+/// must never be granted to an anonymous LAN-trust peer.
+/// `network_admin` mutates Wi-Fi / AP / mounts.
+/// `system_admin` mutates kiosk writers (`set_cursor`, `set_osk`).
+/// Field 2026-09-06: Open HTTPS ran `set_cursor` without a bearer
+/// because the LAN-trust arm never consulted this set.
+const LAN_TRUST_PRIVILEGED_EXCLUDED_SCOPES: &[&str] =
+    &["network_admin", "system_admin"];
+
 /// LAN-trust default capability set — the subset of
 /// [`operator_bootstrap_capability_set`] that is safe to grant
 /// to an anonymous LAN peer under Open / Secure-LAN admission.
 ///
 /// Concretely: every scope from the operator bootstrap set,
-/// minus every scope named in [`SINGLE_HOLDER_ROLE_SCOPES`].
+/// minus `SINGLE_HOLDER_ROLE_SCOPES` and
+/// `LAN_TRUST_PRIVILEGED_EXCLUDED_SCOPES`.
 /// Read + non-step-up-write scopes compose safely with broad-
 /// audience LAN admission (multiple LAN peers can hold them
 /// concurrently without disrupting each other); single-holder
-/// role scopes do not, and are refused here regardless of
-/// distribution config.
+/// roles and privileged writers (network, kiosk) do not, and
+/// are refused here regardless of distribution config.
 ///
 /// Vendor distributions that want to narrow the LAN-trust set
 /// further (e.g. drop `plugins:write` on a kiosk) can override
@@ -833,6 +895,42 @@ const SINGLE_HOLDER_ROLE_SCOPES: &[&str] = &["user_interaction_responder"];
 /// overrides land on top of this floor, they cannot widen
 /// past it.
 pub fn lan_trust_capability_set() -> CapabilitySet {
+    let full = operator_bootstrap_capability_set();
+    let filtered: Vec<Capability> = full
+        .capabilities()
+        .iter()
+        .filter(|c| {
+            !SINGLE_HOLDER_ROLE_SCOPES.contains(&c.scope())
+                && !LAN_TRUST_PRIVILEGED_EXCLUDED_SCOPES.contains(&c.scope())
+        })
+        .cloned()
+        .collect();
+    CapabilitySet::new(filtered)
+}
+
+/// LAN-origin privileged capability set — the operator bootstrap
+/// set minus `SINGLE_HOLDER_ROLE_SCOPES` only.
+///
+/// This is the set stamped on a no-bearer principal whose effective
+/// origin is LAN *when the steward carries a household-protection
+/// runtime*. `network_admin` and `system_admin` return to it, which
+/// is what lets an ordinary household change Wi-Fi or rotate the
+/// panel without a pairing ceremony.
+///
+/// Two things keep that safe, and neither may be dropped:
+///
+/// 1. **Origin.** WAN never receives this set. `AuthTier::Open`
+///    admits WAN with [`lan_trust_capability_set`] — the playback
+///    floor — and only that.
+/// 2. **A gate that exists.** The set is offered only when a
+///    household-protection runtime is attached, so a privileged
+///    scope is never stamped with nothing to police it at dispatch.
+///
+/// `SINGLE_HOLDER_ROLE_SCOPES` stays excluded here for the reason
+/// given at its declaration: a single-holder role composes
+/// catastrophically with broad-audience admission, and no household
+/// policy changes that.
+pub fn lan_privileged_capability_set() -> CapabilitySet {
     let full = operator_bootstrap_capability_set();
     let filtered: Vec<Capability> = full
         .capabilities()
@@ -870,6 +968,7 @@ pub fn _rotation_warmup() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use evo_projection_core::CapabilityRequirement;
 
     #[test]
     fn operator_bootstrap_set_carries_responder() {
@@ -900,6 +999,123 @@ mod tests {
              on the prompt subject) — Write is the honest rank; \
              Read is technically sufficient for the bearer branch \
              but understates what the role does. Actual: {responder:?}"
+        );
+    }
+
+    #[test]
+    fn operator_bootstrap_set_carries_network_admin_step_up() {
+        let set = operator_bootstrap_capability_set();
+        let network_admin = set
+            .capabilities()
+            .iter()
+            .find(|c| c.scope() == "network_admin")
+            .expect(
+                "operator bootstrap must carry network_admin so pair/kiosk \
+                 mint admits Settings → Network and share mutations without \
+                 depending on plugin-merge at mint time",
+            );
+        assert!(
+            matches!(network_admin, Capability::StepUp { .. }),
+            "network_admin must land as StepUp so both write-gated and \
+             step-up-gated network verbs admit under current flatten. \
+             Actual: {network_admin:?}"
+        );
+    }
+
+    #[test]
+    fn playback_floor_excludes_network_admin() {
+        // The floor is what WAN gets, and what LAN gets when no
+        // household-protection runtime exists to police a wider
+        // stamp. network_admin mutates Wi-Fi, AP, flight and share
+        // mounts, so it is never on the floor.
+        let set = lan_trust_capability_set();
+        let scopes: Vec<&str> =
+            set.capabilities().iter().map(|c| c.scope()).collect();
+        assert!(
+            !scopes.contains(&"network_admin"),
+            "playback floor must NOT carry network_admin. \
+             Actual scopes: {scopes:?}"
+        );
+    }
+
+    #[test]
+    fn lan_privileged_set_returns_network_and_system_admin() {
+        // The LAN arm, offered only alongside a runtime. This is
+        // what lets a household change Wi-Fi or rotate the panel
+        // without a pairing ceremony; the dispatch gate is what
+        // refuses it when the policy protects the group.
+        let set = lan_privileged_capability_set();
+        let scopes: Vec<&str> =
+            set.capabilities().iter().map(|c| c.scope()).collect();
+        assert!(scopes.contains(&"network_admin"));
+        assert!(scopes.contains(&"system_admin"));
+        assert!(set.satisfies(&CapabilityRequirement::write("system_admin")));
+    }
+
+    #[test]
+    fn lan_privileged_set_still_excludes_the_single_holder_role() {
+        // No household policy changes this: a single-holder role
+        // composes catastrophically with broad-audience admission,
+        // whatever the operator chose on the ladder.
+        let set = lan_privileged_capability_set();
+        let scopes: Vec<&str> =
+            set.capabilities().iter().map(|c| c.scope()).collect();
+        assert!(
+            !scopes.contains(&"user_interaction_responder"),
+            "privileged LAN set must NOT carry the single-holder \
+             role. Actual scopes: {scopes:?}"
+        );
+    }
+
+    #[test]
+    fn privileged_set_is_the_floor_plus_exactly_the_two_privileged_scopes() {
+        // Pins the delta so a future widening has to be deliberate.
+        use std::collections::BTreeSet;
+        let floor_set = lan_trust_capability_set();
+        let privileged_set = lan_privileged_capability_set();
+        let floor: BTreeSet<String> = floor_set
+            .capabilities()
+            .iter()
+            .map(|c| c.scope().to_owned())
+            .collect();
+        let privileged: BTreeSet<String> = privileged_set
+            .capabilities()
+            .iter()
+            .map(|c| c.scope().to_owned())
+            .collect();
+        let added: BTreeSet<String> =
+            privileged.difference(&floor).cloned().collect();
+        let expected: BTreeSet<String> =
+            ["network_admin".to_owned(), "system_admin".to_owned()]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            added, expected,
+            "the LAN privileged arm must add exactly network_admin and \
+             system_admin over the playback floor"
+        );
+    }
+
+    #[test]
+    fn playback_floor_excludes_system_admin() {
+        // Field 2026-09-06: Open HTTPS ran set_cursor
+        // (write:system_admin) because the LAN-trust arm skipped the
+        // set check and the set still carried system_admin. The
+        // floor still drops the scope; what changed with household
+        // protection is that a LAN principal may now be stamped from
+        // the privileged arm instead — and only when a gate exists.
+        // WAN still lands here.
+        let set = lan_trust_capability_set();
+        let scopes: Vec<&str> =
+            set.capabilities().iter().map(|c| c.scope()).collect();
+        assert!(
+            !scopes.contains(&"system_admin"),
+            "LAN-trust capability set must NOT carry system_admin. \
+             Actual scopes: {scopes:?}"
+        );
+        assert!(
+            !set.satisfies(&CapabilityRequirement::write("system_admin")),
+            "LAN-trust must not satisfy write:system_admin"
         );
     }
 
@@ -1036,21 +1252,26 @@ mod tests {
     }
 
     #[test]
-    fn lan_trust_set_is_operator_bootstrap_minus_single_holder_scopes() {
+    fn lan_trust_set_is_operator_bootstrap_minus_excluded_scopes() {
         // Invariant: LAN-trust set is the operator bootstrap set
-        // minus every scope in SINGLE_HOLDER_ROLE_SCOPES. Guards
-        // against a future edit adding a scope to the bootstrap
-        // set that inadvertently widens LAN-trust.
+        // minus single-holder roles and privileged excluded scopes.
+        // Guards against a future edit adding a privileged scope
+        // to the bootstrap set that inadvertently widens LAN-trust.
         let bootstrap = operator_bootstrap_capability_set();
         let lan_trust = lan_trust_capability_set();
+        let excluded_count = SINGLE_HOLDER_ROLE_SCOPES.len()
+            + LAN_TRUST_PRIVILEGED_EXCLUDED_SCOPES.len();
         assert_eq!(
             lan_trust.len(),
-            bootstrap.len() - SINGLE_HOLDER_ROLE_SCOPES.len(),
-            "LAN-trust set size drifted from bootstrap - single-holder"
+            bootstrap.len() - excluded_count,
+            "LAN-trust set size drifted from bootstrap - excluded"
         );
         let lan_scopes: std::collections::HashSet<&str> =
             lan_trust.capabilities().iter().map(|c| c.scope()).collect();
-        for excluded in SINGLE_HOLDER_ROLE_SCOPES {
+        for excluded in SINGLE_HOLDER_ROLE_SCOPES
+            .iter()
+            .chain(LAN_TRUST_PRIVILEGED_EXCLUDED_SCOPES.iter())
+        {
             assert!(
                 !lan_scopes.contains(excluded),
                 "LAN-trust must exclude {excluded}"

@@ -30,10 +30,10 @@
 //! - Future online-metadata enrichment (artist bio / album story /
 //!   similar artists) consumes the playback shelf data and reaches
 //!   the artwork shelf for similar-artist cards.
-//! - Multi-room artwork propagation populates the content-hash cache
-//!   at the emitter side; receivers fetch by hash through the
-//!   existing `/api/v1/audio/artwork/:content_hash` endpoint with no
-//!   additional substrate.
+//! - Multi-room asset propagation populates the content-hash cache
+//!   at the emitter side; receivers fetch by hash through whatever
+//!   serving surface the distribution mounted, with no additional
+//!   substrate.
 //!
 //! All four paths route through the same primitive. Inline
 //! replication of one plugin's logic into another plugin's address
@@ -250,7 +250,7 @@ pub type ShelfDispatchFuture<'a> = Pin<
 /// are the only legal implementations; out-of-tree implementations
 /// MUST go through the framework's substrate boundary.
 ///
-/// The Arc wrapper does not affect the seal — Arc<dyn Trait> is a
+/// The Arc wrapper does not affect the seal — `Arc<dyn Trait>` is a
 /// type alias for the trait object, not a new trait impl.
 pub fn _arc_object_is_thread_safe()
 where

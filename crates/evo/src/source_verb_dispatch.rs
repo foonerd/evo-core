@@ -76,7 +76,7 @@
 //! adds vendor-specific telemetry on every dispatch). The
 //! framework ships [`DefaultSourceVerbDispatcher`] as the
 //! reference implementation; production wires this through
-//! [`crate::lib::run`] from the realised primitives.
+//! `crate::lib::run` from the realised primitives.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -373,11 +373,11 @@ pub trait SourceVerbDispatcher: Send + Sync {
     /// class verbs, and routes the request through the plugin
     /// router. Returns a [`DispatchOutcome`] on success or a
     /// structured [`DispatchError`] on failure.
-    fn dispatch<'a>(
-        &'a self,
+    fn dispatch(
+        &self,
         approver: VerbApprover,
         call: VerbCall,
-    ) -> DispatchFuture<'a>;
+    ) -> DispatchFuture<'_>;
 }
 
 /// Framework reference implementation of [`SourceVerbDispatcher`].
@@ -781,11 +781,11 @@ impl DefaultSourceVerbDispatcher {
 }
 
 impl SourceVerbDispatcher for DefaultSourceVerbDispatcher {
-    fn dispatch<'a>(
-        &'a self,
+    fn dispatch(
+        &self,
         approver: VerbApprover,
         call: VerbCall,
-    ) -> DispatchFuture<'a> {
+    ) -> DispatchFuture<'_> {
         Box::pin(self.dispatch_inner(approver, call))
     }
 }

@@ -45,10 +45,10 @@ pub trait Warden: Plugin {
     /// The plugin owns the lifecycle of the work under custody from the
     /// moment this future resolves successfully until `release_custody`
     /// completes or `unload` is called.
-    fn take_custody<'a>(
-        &'a mut self,
+    fn take_custody(
+        &mut self,
         assignment: Assignment,
-    ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + 'a;
+    ) -> impl Future<Output = Result<CustodyHandle, PluginError>> + Send + '_;
 
     /// Modify work under ongoing custody without revoking it.
     ///
@@ -70,10 +70,10 @@ pub trait Warden: Plugin {
     /// custody state reporter, and returns. After this future resolves
     /// successfully the plugin MUST NOT emit further state for this
     /// handle.
-    fn release_custody<'a>(
-        &'a mut self,
+    fn release_custody(
+        &mut self,
         handle: CustodyHandle,
-    ) -> impl Future<Output = Result<(), PluginError>> + Send + 'a;
+    ) -> impl Future<Output = Result<(), PluginError>> + Send + '_;
 }
 
 /// An assignment the steward delivers to a warden.

@@ -39,7 +39,7 @@
 //! "this is the lifetime of my reconciliation duty for the named
 //! pair" — and accepts subsequent `course_correct(handle,
 //! "apply", payload)` calls as the per-cycle deltas. The
-//! handle is retained inside [`PairRuntime`] for the steward's
+//! handle is retained inside `PairRuntime` for the steward's
 //! lifetime.
 //!
 //! ## Reserved verbs (manifest contract)

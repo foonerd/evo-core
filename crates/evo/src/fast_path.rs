@@ -194,7 +194,7 @@ pub enum FastPathResponse {
         cid: u64,
     },
     /// Structured failure. Mirrors the slow-path
-    /// [`crate::server::ApiError`] shape so consumers parse one
+    /// `crate::server::ApiError` shape so consumers parse one
     /// error format across both channels.
     Error {
         /// Echoes the request `cid` when the failure was

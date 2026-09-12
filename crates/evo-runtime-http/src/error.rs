@@ -54,16 +54,16 @@ pub enum RuntimeHttpError {
     #[error("server I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// An auxiliary endpoint attachment (artwork, future
-    /// blob-asset surfaces) refused construction. Surfaced
+    /// An auxiliary endpoint attachment refused construction.
+    /// Surfaced
     /// rather than panicked because the framework's
     /// unbreakability invariant requires every developer-mistake
     /// boundary in the boot path to produce a structured error
     /// the operator can read, never an unrecoverable panic.
     #[error("endpoint attach refused: {endpoint}: {reason}")]
     EndpointAttachRefused {
-        /// Human-readable endpoint name (e.g.
-        /// `audio_artwork_fetch`).
+        /// Human-readable endpoint name, supplied by whoever
+        /// attached it.
         endpoint: String,
         /// Underlying reason supplied by the attach helper.
         reason: String,

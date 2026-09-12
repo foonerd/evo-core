@@ -48,16 +48,8 @@
 #![warn(missing_docs)]
 
 pub mod acme;
-pub mod artwork_admission;
-pub mod artwork_cascade;
-pub mod artwork_endpoint;
-pub mod artwork_negative_cache;
-pub mod artwork_resolve_coalescer;
-pub mod artwork_resolve_endpoint;
-pub mod artwork_resolve_index;
 pub mod audit;
 pub mod auth_tier;
-pub mod captive_session_endpoint;
 pub mod cert_resolver;
 pub mod config;
 pub mod dispatcher;
@@ -73,7 +65,6 @@ pub mod rotation_bridge;
 pub mod router;
 pub mod server;
 pub mod tls;
-pub mod track_detail_endpoint;
 pub mod witness_endpoints;
 pub mod ws_endpoint;
 
@@ -87,6 +78,11 @@ pub use auth_tier::{
     auth_tier_from_env, default_auth_tier_provider, AuthTier, AuthTierProvider,
     StaticAuthTier,
 };
+/// Re-exported so the steward crate can name the router type a
+/// distribution-supplied HTTPS hookup receives and returns,
+/// without taking its own direct dependency on the HTTP library.
+/// Framework plumbing; carries no domain meaning.
+pub use axum::Router;
 pub use cert_resolver::HotReloadCertResolver;
 pub use config::{HttpsListenerConfig, ListenAddr};
 pub use dispatcher::{

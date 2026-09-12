@@ -533,20 +533,6 @@ enum ClientRequest {
         /// Operator-supplied reason for the audit trail.
         #[serde(default)]
         reason: Option<String>,
-        /// Optional step-up authentication token returned by a
-        /// prior `step_up_auth_verify`. Required for this op to
-        /// execute against a server that has an `AuthService`
-        /// configured; the server refuses with
-        /// `permission_denied / step_up_required` when the field
-        /// is absent and refuses with `permission_denied /
-        /// step_up_invalid` when the token does not validate
-        /// against the active session store. Servers built
-        /// without an `AuthService` accept omission for backward
-        /// compatibility (the operator surface that ships with
-        /// every distribution is expected to plug an
-        /// `AuthService` in).
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued plugin disable. Drains the running
     /// plugin if admitted and sets the persistent enabled bit
@@ -560,11 +546,6 @@ enum ClientRequest {
         /// Operator-supplied reason for the audit trail.
         #[serde(default)]
         reason: Option<String>,
-        /// Optional step-up token. See
-        /// [`ClientRequest::EnablePlugin`] for the gate semantics
-        /// — same shape applies to every privileged operation.
-        #[serde(default)]
-        step_up_token: Option<String>,
         /// When `true` and the target plugin has admitted
         /// dependents that declare it in their
         /// `[dependencies].required` list, the framework first
@@ -593,10 +574,6 @@ enum ClientRequest {
         /// When `true`, also purge state and credentials.
         #[serde(default)]
         purge_state: bool,
-        /// Optional step-up token. See
-        /// [`ClientRequest::EnablePlugin`] for gate semantics.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued state purge. Wipes
     /// `<plugin_data_root>/<name>/state/` and `credentials/`
@@ -605,10 +582,6 @@ enum ClientRequest {
     PurgePluginState {
         /// Canonical name of the plugin to purge state for.
         plugin: String,
-        /// Optional step-up token. See
-        /// [`ClientRequest::EnablePlugin`] for gate semantics.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued take-custody against a warden. Mirrors
     /// [`crate::router::PluginRouter::take_custody`]; bypasses no
@@ -661,10 +634,6 @@ enum ClientRequest {
     ReloadPlugin {
         /// Canonical name of the plugin to reload.
         plugin: String,
-        /// Optional step-up token. See
-        /// [`ClientRequest::EnablePlugin`] for gate semantics.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued catalogue reload. Validates and
     /// atomically swaps the loaded catalogue declarations.
@@ -677,10 +646,6 @@ enum ClientRequest {
         /// When `true`, validate without mutating.
         #[serde(default)]
         dry_run: bool,
-        /// Optional step-up token. See
-        /// [`ClientRequest::EnablePlugin`] for gate semantics.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued single-plugin manifest reload. Validates
     /// and atomically swaps the named plugin's enforcement
@@ -695,10 +660,6 @@ enum ClientRequest {
         /// When `true`, validate without mutating.
         #[serde(default)]
         dry_run: bool,
-        /// Optional step-up token. See
-        /// [`ClientRequest::EnablePlugin`] for gate semantics.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Read-only enumeration of every active reconciliation
     /// pair. Returns one entry per pair currently held in the
@@ -957,10 +918,6 @@ enum ClientRequest {
         /// for an out-of-band-approved bundle.
         #[serde(default)]
         signature_pin: Option<String>,
-        /// Optional step-up token. See
-        /// [`ClientRequest::EnablePlugin`] for gate semantics.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued plugin-registry registration. Records
     /// the registry's HTTPS manifest URL + signature URL +
@@ -981,10 +938,6 @@ enum ClientRequest {
         /// Absent inherits the framework default.
         #[serde(default)]
         poll_interval_secs: Option<u64>,
-        /// Optional step-up token. See
-        /// [`ClientRequest::EnablePlugin`] for gate semantics.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued unregistration. Forgets the slug and
     /// removes the on-disk cache. Refuses with `not_found /
@@ -992,10 +945,6 @@ enum ClientRequest {
     UnregisterPluginRegistry {
         /// Slug to forget.
         slug: String,
-        /// Optional step-up token. See
-        /// [`ClientRequest::EnablePlugin`] for gate semantics.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued list of registered registries.
     /// Read-only; no capability gate today (registry slugs
@@ -1008,10 +957,6 @@ enum ClientRequest {
     RefreshPluginRegistry {
         /// Slug to refresh.
         slug: String,
-        /// Optional step-up token. See
-        /// [`ClientRequest::EnablePlugin`] for gate semantics.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued grant of trust to a publisher whose
     /// signing key is not shipped in the vendor distribution.
@@ -1032,20 +977,12 @@ enum ClientRequest {
         /// AllPlugins.
         #[serde(default)]
         scope_per_plugin: Option<Vec<String>>,
-        /// Optional step-up token. See
-        /// [`ClientRequest::EnablePlugin`] for gate semantics.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued revocation of a previously-granted
     /// publisher trust.
     RevokePublisherTrust {
         /// Publisher's signing-key fingerprint.
         publisher_id: String,
-        /// Optional step-up token. See
-        /// [`ClientRequest::EnablePlugin`] for gate semantics.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued list of every recorded publisher
     /// trust grant + revocation.
@@ -1066,10 +1003,6 @@ enum ClientRequest {
         target: String,
         /// Channel value (`alpha` / `test` / `production`).
         channel: String,
-        /// Step-up authentication token; see
-        /// [`Self::EnablePlugin`] for gate semantics.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued read of the recorded update-channel
     /// preferences. Read-only; returns one entry per target with
@@ -1128,10 +1061,6 @@ enum ClientRequest {
         /// `None` to clear the active theme.
         #[serde(default)]
         plugin_name: Option<String>,
-        /// Step-up authentication token; see
-        /// [`Self::EnablePlugin`] for gate semantics.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued activation (or clear) of the active UI
     /// shell. Mirror of [`Self::ActivateTheme`] for the
@@ -1143,9 +1072,6 @@ enum ClientRequest {
         /// or `None` to clear.
         #[serde(default)]
         plugin_name: Option<String>,
-        /// Step-up authentication token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued read of the active UI selection. Read-
     /// only; returns the active theme + active UI shell
@@ -1167,9 +1093,6 @@ enum ClientRequest {
         authored_by: String,
         /// Per-plugin entries.
         entries: Vec<PluginProfileEntryWire>,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued read of one profile (with its full
     /// entry list). Read-only.
@@ -1186,9 +1109,6 @@ enum ClientRequest {
     DeletePluginProfile {
         /// Profile id to delete.
         profile_id: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued upsert of one admission policy.
     /// Capability-gated by `plugins_admin` and step-up-aware.
@@ -1207,9 +1127,6 @@ enum ClientRequest {
         /// Rule body (typed shape; see
         /// [`crate::admission_policy::AdmissionPolicyRules`]).
         rules: crate::admission_policy::AdmissionPolicyRules,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued read of one policy. Read-only.
     GetAdmissionPolicy {
@@ -1224,9 +1141,6 @@ enum ClientRequest {
     DeleteAdmissionPolicy {
         /// Policy id to delete.
         policy_id: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued policy activation. Capability-gated by
     /// `plugins_admin` and step-up-aware. `policy_id = None`
@@ -1235,9 +1149,6 @@ enum ClientRequest {
         /// Policy id to activate, or `None` to clear.
         #[serde(default)]
         policy_id: Option<String>,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued capability revocation. Records a
     /// `(plugin_name, capability)` revocation in the substrate.
@@ -1252,9 +1163,6 @@ enum ClientRequest {
         /// Optional operator-supplied free-form reason.
         #[serde(default)]
         reason: Option<String>,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued un-revocation. Removes a previously-
     /// recorded revocation. Idempotent on absent pairs.
@@ -1264,9 +1172,6 @@ enum ClientRequest {
         plugin_name: String,
         /// Capability token to un-revoke.
         capability: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued list of revocations recorded against
     /// one plugin. Read-only.
@@ -1291,9 +1196,6 @@ enum ClientRequest {
     ImportMigrationBundle {
         /// The bundle TOML document to apply.
         bundle_toml: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Record an operator-authored hardware-profile override
     /// for one delivery target. Idempotent on the canonical
@@ -1303,14 +1205,11 @@ enum ClientRequest {
         /// The full hardware identity to which the override
         /// applies. The framework derives the storage key
         /// from the identity's discriminator.
-        identity: crate::hardware_profile::HardwareIdentity,
+        identity: HardwareIdentity,
         /// The sparse override record. Refused if no field is
         /// set.
         #[serde(rename = "override")]
-        override_: crate::hardware_profile::HardwareProfileOverride,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
+        override_: HardwareProfileOverride,
     },
     /// Read one operator-authored override by its canonical
     /// identity key. Read-only; capability-gated by
@@ -1329,9 +1228,6 @@ enum ClientRequest {
     DeleteHardwareProfileOverride {
         /// Canonical identity key.
         key: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Record an operator policy for one delivery target.
     /// Idempotent on the canonical target key. Capability-
@@ -1341,10 +1237,7 @@ enum ClientRequest {
         /// (`HardwareIdentity::key()`).
         target_key: String,
         /// The operator policy to record.
-        policy: crate::topology_scoring::OperatorPolicy,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
+        policy: OperatorPolicy,
     },
     /// Read the operator policy for one delivery target.
     /// Read-only; capability-gated by `plugins_admin`.
@@ -1361,9 +1254,6 @@ enum ClientRequest {
     DeleteAudioOperatorPolicy {
         /// Canonical identity key.
         target_key: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Record a volume-mode preference for one delivery
     /// target. Idempotent on the canonical target key.
@@ -1372,10 +1262,7 @@ enum ClientRequest {
         /// Canonical identity key.
         target_key: String,
         /// The volume mode to record.
-        volume_mode: crate::topology_scoring::VolumeMode,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
+        volume_mode: VolumeMode,
     },
     /// Read the volume-mode preference for one delivery
     /// target. Read-only; capability-gated by
@@ -1393,23 +1280,16 @@ enum ClientRequest {
     DeleteAudioVolumeMode {
         /// Canonical identity key.
         target_key: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
-    /// Vendor-driven push of a complete active audio topology
-    /// snapshot for one delivery target. The framework
-    /// validates the snapshot, persists it, propagates the
-    /// per-stage resolved endpoints to each plugin's
-    /// `AudioRouting` handle, and emits an
-    /// `AudioTopologyChanged` happening. Capability-gated by
-    /// `plugins_admin` and step-up-aware.
+    /// Operator push of a complete active audio topology
+    /// snapshot for one delivery target. The installed topology
+    /// store validates the snapshot, persists it, propagates
+    /// the per-stage resolved endpoints to each plugin's
+    /// `AudioRouting` handle, and announces the change.
+    /// Capability-gated by `plugins_admin` and step-up-aware.
     PublishActiveAudioTopology {
         /// The complete topology snapshot to publish.
-        topology: crate::audio_topology::ActiveAudioTopology,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
+        topology: ActiveAudioTopology,
     },
     /// Read the active audio topology for one delivery
     /// target. Read-only; capability-gated by `plugins_admin`.
@@ -1428,9 +1308,6 @@ enum ClientRequest {
     ClearActiveAudioTopology {
         /// Canonical identity key.
         target_key: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Read-only aggregate plugin-health snapshot. Returns the
     /// counts (admitted / enabled / disabled / suspended) plus
@@ -1486,9 +1363,6 @@ enum ClientRequest {
         /// uniformly to every transition.
         #[serde(default)]
         reason: Option<String>,
-        /// Step-up authentication token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued bulk enable across every plugin matching
     /// the filter. Same shape as `disable_plugins_where`.
@@ -1498,9 +1372,6 @@ enum ClientRequest {
         /// Operator-readable reason.
         #[serde(default)]
         reason: Option<String>,
-        /// Step-up authentication token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued tag assignment. Records `(plugin_name,
     /// tag)` in the `plugin_tags` substrate; idempotent on the
@@ -1511,9 +1382,6 @@ enum ClientRequest {
         plugin_name: String,
         /// Tag string. Lowercase ASCII by convention.
         tag: String,
-        /// Step-up authentication token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued tag removal. Idempotent on absent pair.
     DeletePluginTag {
@@ -1521,9 +1389,6 @@ enum ClientRequest {
         plugin_name: String,
         /// Tag to remove.
         tag: String,
-        /// Step-up authentication token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-issued list of every tag applied to one plugin.
     /// Read-only.
@@ -1549,9 +1414,6 @@ enum ClientRequest {
         /// plan without dispatching transitions.
         #[serde(default)]
         dry_run: bool,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Privileged step-up authentication. The operator presents
     /// a username plus secret; the framework dispatches the
@@ -1824,6 +1686,25 @@ enum ClientRequest {
         /// New enable flag.
         enabled: bool,
     },
+    /// Set the device's metadata privacy posture.
+    ///
+    /// Device-level, not per-provider: the posture is
+    /// non-bypassable and outranks every per-provider enable flag
+    /// and credential in every cascade. `anonymous_only`
+    /// suppresses identity-bearing providers; `offline`
+    /// suppresses every network provider; `enhanced` defers to
+    /// the operator's per-provider selection.
+    ///
+    /// Capability-gated by `online_providers_write` — the same
+    /// gate as the per-provider toggles, since this is the
+    /// stronger control over the same surface.
+    OnlineProvidersSetPrivacyMode {
+        /// One of `enhanced`, `anonymous_only`, `offline`. Any
+        /// other value is refused rather than coerced: silently
+        /// mapping an unrecognised posture onto a permissive one
+        /// is how a privacy control becomes a lie.
+        privacy_mode: String,
+    },
     /// Set the cascade priority on one online provider. Lower
     /// values sort earlier in the operator-selected cascade
     /// order. Refuses priorities outside `0..=999`. Publishes
@@ -1852,9 +1733,6 @@ enum ClientRequest {
         /// New display name. Trimmed; must be non-empty after
         /// trim and at most 128 chars.
         display_name: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Reset the operator-editable display name to its default,
     /// re-seeded from the OS hostname when sane (falls back to
@@ -1862,11 +1740,7 @@ enum ClientRequest {
     /// `name_source` returns to `Auto` so the collision resolver
     /// is once again free to rewrite. Capability-gated by
     /// `plugins_admin` and step-up-aware.
-    ResetDeviceDisplayName {
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
-    },
+    ResetDeviceDisplayName {},
     /// List multi-room peers currently observed by the
     /// mDNS-SD discovery runtime. Read-only; capability-gated
     /// by `plugins_admin`.
@@ -1912,9 +1786,6 @@ enum ClientRequest {
         display_name: String,
         /// Member device ids. Must be non-empty.
         members: Vec<String>,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Read one multi-room group by canonical id with its
     /// full membership. Read-only; capability-gated by
@@ -1935,9 +1806,6 @@ enum ClientRequest {
         group_id: String,
         /// New display name.
         display_name: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Set the per-group `leader_ms` latency budget. Operator
     /// gesture for the multi-room plugin's render-frame budget.
@@ -1949,9 +1817,6 @@ enum ClientRequest {
         group_id: String,
         /// New per-group latency budget in milliseconds.
         leader_ms: u32,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Set the per-device multi-room role
     /// (`source` / `receiver` / `auto`). Idempotent on
@@ -1963,9 +1828,6 @@ enum ClientRequest {
         device_id: String,
         /// Role to set (`source` / `receiver` / `auto`).
         role: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Read the operator-declared role for a device. Returns
     /// `auto` for devices with no explicit gesture (substrate-
@@ -1988,9 +1850,6 @@ enum ClientRequest {
     ClearDeviceRole {
         /// Canonical device id.
         device_id: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-gestured reconnect storm against a peer that
     /// is currently unreachable. Runs the 5-carrier reconnect
@@ -2003,9 +1862,6 @@ enum ClientRequest {
     ReconnectPeer {
         /// Canonical device id of the peer to reconnect.
         device_id: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-gestured plugin reload. Routes through the
     /// plugin lifecycle coordinator's operator-gesture path;
@@ -2018,9 +1874,6 @@ enum ClientRequest {
         /// Canonical plugin name (matches the `[plugin] name`
         /// field in the plugin manifest).
         plugin_name: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-gestured recovery of a degraded plugin. Clears
     /// the plugin's degraded-state slot and resets its
@@ -2032,9 +1885,6 @@ enum ClientRequest {
     PluginRestore {
         /// Canonical plugin name.
         plugin_name: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Add a device to a multi-room group. Idempotent on
     /// already-present device ids. Capability-gated by
@@ -2044,9 +1894,6 @@ enum ClientRequest {
         group_id: String,
         /// Device id to add.
         device_id: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Remove a device from a multi-room group. Refuses
     /// removal of the last remaining member (operator must
@@ -2057,9 +1904,6 @@ enum ClientRequest {
         group_id: String,
         /// Device id to remove.
         device_id: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Delete a multi-room group (cascades to membership).
     /// Idempotent on absent ids — returns `removed = false`
@@ -2068,9 +1912,6 @@ enum ClientRequest {
     DeleteGroup {
         /// Canonical group id.
         group_id: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Move a device atomically from one group to another.
     /// Performs delete-from-source + insert-to-target as a
@@ -2109,9 +1950,6 @@ enum ClientRequest {
         /// moved device is not the source's leader.
         #[serde(default)]
         successor_device_id: Option<String>,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Operator-explicit successor selection following the
     /// `SuccessorRequired` outcome of removing the current
@@ -2126,9 +1964,6 @@ enum ClientRequest {
         departing_device_id: String,
         /// Canonical id of the operator-chosen successor.
         successor_device_id: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Cancel a pending leader-successor decision. The leader
     /// stays in place; no group state changed. Capability-gated
@@ -2150,9 +1985,6 @@ enum ClientRequest {
         group_id: String,
         /// Canonical id of the device to pin as source-host.
         device_id: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Clear the source-host pin for a multi-room group.
     /// Election resumes its standard canonical-min rule.
@@ -2160,9 +1992,6 @@ enum ClientRequest {
     UnpinSourceHost {
         /// Canonical group id.
         group_id: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// List every domain-membership row in the local trust
     /// ledger, composed with live discovery state and the
@@ -2187,9 +2016,6 @@ enum ClientRequest {
         /// Optional public-key bytes captured at admission.
         #[serde(default)]
         public_key_bytes: Option<Vec<u8>>,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Revoke a device's domain admission. Capability-
     /// gated by `plugins_admin` and step-up-aware.
@@ -2202,9 +2028,6 @@ enum ClientRequest {
     RevokePeerFromDomain {
         /// Canonical id of the device being revoked.
         device_id: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Discard a device from the domain. Operator-explicit,
     /// irreversible. Appends a signed entry to the domain
@@ -2218,9 +2041,6 @@ enum ClientRequest {
         /// in the chain entry as audit material.
         #[serde(default)]
         reason: Option<String>,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Found a new multi-room domain on this device. Signs
     /// the genesis chain entry (self-admit) so the local
@@ -2236,9 +2056,6 @@ enum ClientRequest {
         /// device identity store.
         #[serde(default)]
         display_name: Option<String>,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Mark the local device as looking to join an existing
     /// domain. Emits a `JoinModeEntered` happening so an
@@ -2258,9 +2075,6 @@ enum ClientRequest {
         /// waits for announces to arrive.
         #[serde(default)]
         endpoint: Option<String>,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Soft-leave the current domain. Discards the local
     /// chain log + the projection cache so the device
@@ -2270,11 +2084,7 @@ enum ClientRequest {
     /// steward must restart for the discard to take effect
     /// on every in-process runtime. Capability-gated by
     /// `plugins_admin` and step-up-aware.
-    LeaveDomain {
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
-    },
+    LeaveDomain {},
     /// Hard-reset the device's domain state. Discards the
     /// chain log AND the per-device signing key so the
     /// device returns to a fresh-from-factory posture.
@@ -2283,11 +2093,7 @@ enum ClientRequest {
     /// not recoverable. Steward restart required.
     /// Capability-gated by `plugins_admin` and step-up-
     /// aware.
-    FactoryResetDomain {
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
-    },
+    FactoryResetDomain {},
     /// Read the current domain witness chain head hash +
     /// chain length. UI consumers use this as the
     /// freshness oracle (two devices either share the
@@ -2317,9 +2123,6 @@ enum ClientRequest {
         from_group_id: String,
         /// Destination group.
         to_group_id: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Explicit operator-gestured leader handoff for a
     /// group. The new leader must be a current member of
@@ -2330,9 +2133,6 @@ enum ClientRequest {
         group_id: String,
         /// New leader's device id.
         leader_device_id: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Fire a reconnect storm against an absent peer.
     /// Every available carrier is tried in parallel for
@@ -2343,9 +2143,6 @@ enum ClientRequest {
     TriggerReconnect {
         /// Device id of the peer to reconnect.
         device_id: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Export the local domain witness chain as a portable
     /// signed artefact. Used for the pigeon-mode out-of-band
@@ -2364,9 +2161,6 @@ enum ClientRequest {
         /// Chain entries from the source artefact, in
         /// chronological order.
         witnesses: Vec<evo_witness::DomainWitness>,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Refresh a peer's sticky endpoint list. Operator
     /// gesture confirming a new observed endpoint should
@@ -2379,9 +2173,6 @@ enum ClientRequest {
         device_id: String,
         /// New endpoint set, replacing the previous in full.
         endpoints: Vec<evo_witness::NetworkEndpoint>,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Declare this device as a chain-aware relay between
     /// the supplied networks. Auto-emitted at boot when
@@ -2396,9 +2187,6 @@ enum ClientRequest {
         networks: Vec<evo_witness::NetworkDeclaration>,
         /// Capabilities the relay offers.
         capabilities: Vec<evo_witness::RelayCapability>,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Read the local node's last-known source-host election
     /// for one multi-room group. Read-only; capability-gated
@@ -2487,9 +2275,6 @@ enum ClientRequest {
         /// check every registered source.
         #[serde(default)]
         source_id: Option<String>,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Apply one specific update via its source. Capability-
     /// gated by `plugins_admin` and step-up-aware.
@@ -2506,9 +2291,6 @@ enum ClientRequest {
         /// `None` falls back to the wire client's UID.
         #[serde(default)]
         approved_by: Option<String>,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Read every recorded auto-apply policy entry. Read-
     /// only; capability-gated by `plugins_admin`.
@@ -2536,9 +2318,6 @@ enum ClientRequest {
         /// update source has staged a new binary).
         #[serde(default)]
         target_binary: Option<String>,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Set the auto-apply policy for one source.
     /// Capability-gated by `plugins_admin` and step-up-
@@ -2551,9 +2330,6 @@ enum ClientRequest {
         /// Severity threshold — one of `routine` /
         /// `recommended` / `security` / `critical`.
         severity_threshold: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Mint an operator bootstrap bearer for the device-local
     /// kiosk shell. The framework checks `SO_PEERCRED` against
@@ -2656,6 +2432,28 @@ enum ClientRequest {
     /// tracks. Requires `plugins_admin` on the connection.
     /// Returns metadata only — bearer bytes are never
     /// returned post-mint.
+    /// Read the household-protection policy plus the
+    /// distribution's group catalog. LAN-trust admitted; never
+    /// step-up.
+    HouseholdProtectionGet,
+    /// Set the household-protection level, guest overlay and
+    /// protected marks. First-start and same-or-narrower changes
+    /// need no sitting; widening requires step-up.
+    HouseholdProtectionSet {
+        /// `open` | `low` | `standard` | `strict`. Omitted on
+        /// unlock (`lend: false`) so the steward restores
+        /// `prior_level`. There is no wire value `none` — the
+        /// operator's "none" is `open`.
+        #[serde(default)]
+        level: Option<crate::household_protection::ProtectionLevel>,
+        /// The guest overlay.
+        lend: bool,
+        /// Group ids to protect. Omitted means "fill from the
+        /// level's defaults"; while lending, the `low` floor is
+        /// unioned in regardless.
+        #[serde(default)]
+        protected_groups: Option<Vec<String>>,
+    },
     PairList,
     /// Revoke a paired device by id. Idempotent — revoking an
     /// unknown id returns `revoked = false` without erroring.
@@ -2665,9 +2463,6 @@ enum ClientRequest {
         /// `paired_device_id` returned by `pair_complete` or
         /// `pair_list`.
         paired_device_id: String,
-        /// Optional step-up token.
-        #[serde(default)]
-        step_up_token: Option<String>,
     },
     /// Set the operator's kiosk password. Refused on any
     /// transport that has not been tagged as the kiosk
@@ -2735,11 +2530,11 @@ pub struct MapMappingEntry {
 }
 
 /// Wire form of one entry in
-/// [`ClientResponse::UserInteractions`]. Carries the prompt's
+/// `ClientResponse::UserInteractions`. Carries the prompt's
 /// originating plugin, the prompt's content, and the deadline
 /// (in wall-clock milliseconds since epoch) for responder UIs
 /// that render a "expires in" countdown.
-/// One row of a [`ClientResponse::CredentialListing`] response.
+/// One row of a `ClientResponse::CredentialListing` response.
 ///
 /// Never carries the credential value. The operator-visible key
 /// name is never returned — only its SHA-256 hash. The UI keys
@@ -2766,7 +2561,7 @@ pub struct CredentialListingEntry {
     pub updated_at_ms: u64,
 }
 
-/// One row of a [`ClientResponse::OnlineProvidersListing`] response.
+/// One row of a `ClientResponse::OnlineProvidersListing` response.
 ///
 /// Carries the operator's current enable-disable and priority for
 /// one online-metadata provider. The multi-source aggregation
@@ -2823,7 +2618,7 @@ pub struct OnlineProviderEntry {
     pub license: &'static str,
 }
 
-/// One entry of a [`ClientResponse::UserInteractions`] response.
+/// One entry of a `ClientResponse::UserInteractions` response.
 ///
 /// Carries the prompt's originating plugin and the prompt payload
 /// the responder UI renders. Reconstructed by the server from
@@ -2836,8 +2631,8 @@ pub struct UserInteractionWire {
     pub prompt: evo_plugin_sdk::contract::PromptRequest,
 }
 
-/// Wire form of one entry in [`ClientResponse::Appointments`]
-/// and [`ClientResponse::AppointmentProjection`]. Mirrors
+/// Wire form of one entry in `ClientResponse::Appointments`
+/// and `ClientResponse::AppointmentProjection`. Mirrors
 /// [`crate::appointments::AppointmentEntry`] but flattens the
 /// `state` enum to a stable string and projects the next-fire
 /// instant as wall-clock milliseconds since epoch.
@@ -2865,7 +2660,7 @@ pub struct AppointmentEntryWire {
     pub last_fired_ms: Option<u64>,
 }
 
-/// One entry in [`ClientResponse::GrammarMigrationCompleted::target_type_breakdown`].
+/// One entry in `ClientResponse::GrammarMigrationCompleted::target_type_breakdown`.
 #[derive(Debug, Clone, Serialize)]
 pub struct TargetTypeBreakdownWire {
     /// Destination type the strategy routes to.
@@ -2875,7 +2670,7 @@ pub struct TargetTypeBreakdownWire {
 }
 
 /// Wire form of one entry in
-/// [`ClientResponse::GrammarOrphans`]. Mirrors
+/// `ClientResponse::GrammarOrphans`. Mirrors
 /// [`crate::persistence::PersistedGrammarOrphan`] but flattens
 /// the status enum to a stable string for consumers that
 /// don't import the persistence types.
@@ -3166,8 +2961,8 @@ pub struct PluginRegistryEntryWire {
     pub plugin_count: Option<u32>,
 }
 
-/// Wire form of one entry in [`ClientResponse::Watches`] and
-/// [`ClientResponse::WatchProjection`]. Mirrors
+/// Wire form of one entry in `ClientResponse::Watches` and
+/// `ClientResponse::WatchProjection`. Mirrors
 /// [`crate::watches::WatchEntry`] but flattens the `state` enum
 /// to a stable string.
 #[derive(Debug, Clone, Serialize)]
@@ -3189,7 +2984,7 @@ pub struct WatchEntryWire {
 }
 
 /// Wire form of one entry in
-/// [`ClientResponse::ReconciliationPairs`]. Mirrors
+/// `ClientResponse::ReconciliationPairs`. Mirrors
 /// [`crate::reconciliation::ReconciliationPairSnapshot`].
 #[derive(Debug, Serialize)]
 pub struct ReconciliationPairWire {
@@ -3465,9 +3260,634 @@ pub struct DeviceRoleEntry {
     pub role: String,
 }
 
+use evo_plugin_sdk::audio::AudioFormat;
+use evo_plugin_sdk::contract::audio_routing::EndpointKind;
+
+// ---------------------------------------------------------------
+// Audio-topology wire DTOs.
+//
+// The stores that produce and persist these live outside this
+// crate — a steward that reasons about volume placement or
+// bit-perfect chains is a steward that only makes sense on an
+// audio device. What stays is the shape three wire ops return,
+// because this server owns those ops and answers them whether or
+// not a topology store is installed.
+//
+// Data only. Validation scores a chain against operator policy,
+// which is the moved cluster's job, so it travels with the
+// cluster as a free function over these types.
+// ---------------------------------------------------------------
+
+/// One stage of the active audio chain. Carries the
+/// operator-facing fields the UI renders (stage kind + plugin
+/// canonical name + format at that stage). Composition stages
+/// additionally carry the mode name from the composition
+/// plugin's manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum ActiveChainStage {
+    /// The source plugin emits audio bytes into the chain.
+    Source {
+        /// Canonical plugin name.
+        plugin: String,
+        /// Format the source produces.
+        format: AudioFormat,
+        /// Endpoint kind the source writes into. The OS
+        /// substrate (ALSA pcm name / pipe / shm region) the
+        /// plugin uses to write audio bytes.
+        endpoint_kind: EndpointKind,
+        /// Substrate-specific path / identifier.
+        endpoint_path: PathBuf,
+    },
+    /// An intermediate composition stage (passthrough,
+    /// equaliser, resampler, DSD-to-PCM converter, etc.).
+    Composition {
+        /// Canonical plugin name.
+        plugin: String,
+        /// Mode name as declared in the composition plugin's
+        /// manifest (`"passthrough"` / `"eq_only"` /
+        /// `"resampled"` / etc.).
+        mode: String,
+        /// Format on the input side of this stage.
+        format_in: AudioFormat,
+        /// Format on the output side of this stage.
+        format_out: AudioFormat,
+        /// Read endpoint (input side).
+        endpoint_in_kind: EndpointKind,
+        /// Read-side path / identifier.
+        endpoint_in_path: PathBuf,
+        /// Write endpoint (output side).
+        endpoint_out_kind: EndpointKind,
+        /// Write-side path / identifier.
+        endpoint_out_path: PathBuf,
+    },
+    /// The delivery stage owns the underlying DAC / output
+    /// device.
+    Delivery {
+        /// Canonical plugin name.
+        plugin: String,
+        /// Format the delivery accepts.
+        format: AudioFormat,
+        /// Endpoint kind the delivery reads from.
+        endpoint_kind: EndpointKind,
+        /// Substrate-specific path / identifier.
+        endpoint_path: PathBuf,
+    },
+}
+
+/// The active audio topology for one delivery target. The
+/// framework publishes one of these per delivery target every
+/// time the vendor distribution resolves a new chain.
+///
+/// Cannot derive `Eq` because `volume_position` and `volume_db`
+/// are `f32`; equality comparison uses [`PartialEq`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActiveAudioTopology {
+    /// Canonical hardware-identity key
+    /// (`HardwareIdentity::key()`) the chain terminates at.
+    pub target_key: String,
+    /// Operator-readable display name surfaced in the UI
+    /// (typically the resolved hardware profile's display
+    /// name).
+    pub display_name: String,
+    /// The chain stages in source → delivery order. At least
+    /// two entries (source + delivery); composition stages
+    /// are optional and may appear between.
+    pub chain: Vec<ActiveChainStage>,
+    /// Volume mode in effect for the chain.
+    pub volume_mode: VolumeMode,
+    /// Current volume position (0.0 = mute, 1.0 = full).
+    /// `None` when the chain has no volume control
+    /// (`VolumeMode::None`) or when the vendor did not
+    /// surface a numeric position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_position: Option<f32>,
+    /// Current volume in dB. Useful for audiophile UIs that
+    /// surface absolute attenuation. `None` when the chain
+    /// has no volume control or when dB is not available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_db: Option<f32>,
+    /// `true` when the chain genuinely preserves bit-perfect.
+    /// The installed topology store decides this and refuses a
+    /// snapshot that claims it falsely; this field carries the
+    /// verdict it reached.
+    pub bit_perfect: bool,
+    /// Score breakdown in auditable form, so the operator UI
+    /// can render the reason behind each rule's score or
+    /// penalty. Filled in by the installed topology store.
+    pub score: ScoreBreakdown,
+    /// Free-form list of implicit conversions the chain
+    /// inserts (`"linear-phase resampler 192k → 48k, 32-bit
+    /// float intermediate"`). Empty for fully bit-perfect
+    /// chains.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implicit_conversions: Vec<String>,
+    /// Operator-visible warnings (`"HDMI ARC negotiated 48
+    /// kHz; source is 192 kHz"`). Empty when nothing
+    /// warrants attention.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// Volume mode — where the scaling lives in the chain.
+///
+/// The reconciliation engine selects volume mode within the
+/// hardware profile's [`HardwareVolumeCapability`] constraints
+/// per the rules:
+///
+/// - `tier == Audiophile` AND hardware volume available →
+///   default `Hardware`.
+/// - `tier in {Reference, Mainstream, Constrained}` →
+///   default `Software`.
+/// - Operator declares downstream analog preamp present →
+///   default `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeMode {
+    /// Scaling lives in the composition plugin (or upstream
+    /// like MPD). Bit-perfect at 100%; introduces dither /
+    /// truncation at <100%.
+    Software,
+    /// Scaling lives in the delivery plugin's DAC mixer.
+    /// Bit-perfect at every level (analog gain or
+    /// digital-bit-shift attenuator preserves the digital
+    /// path).
+    Hardware,
+    /// No scaling — the digital tap is fully open. Bit-perfect
+    /// at 100% by definition; level is operator-managed
+    /// downstream (analog preamp / professional gear).
+    None,
+}
+
+/// Operator-pickable policy for topology selection. The scorer
+/// is policy-aware: `StrictBitPerfect` post-filters any
+/// candidate that breaks bit-perfect; `Pinned` refuses any
+/// candidate that does not match the pinned chain shape.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OperatorPolicy {
+    /// Opportunistic best-fit. Engine picks. UI shows the
+    /// chain. No prompts. Default.
+    #[default]
+    Auto,
+    /// Refuse any topology that breaks bit-perfect. When no
+    /// compatible topology exists, the engine emits a
+    /// `topology.bit_perfect_unavailable` happening + UI
+    /// notification with actionable next steps.
+    StrictBitPerfect,
+    /// Pinned topology — the operator pins a specific
+    /// source → composition → delivery chain shape. The
+    /// engine refuses to deviate.
+    Pinned {
+        /// Pinned source plugin canonical name.
+        source_plugin: String,
+        /// Pinned composition plugin canonical name. `None`
+        /// means the operator pinned a chain with no
+        /// intermediate stage.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        composition_plugin: Option<String>,
+        /// Pinned delivery plugin canonical name.
+        delivery_plugin: String,
+    },
+}
+
+/// Per-rule contribution to a topology score. The breakdown is
+/// the auditable form — the scorer always returns the full
+/// breakdown so the operator UI can render the reason for each
+/// rule's score / penalty.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ScoreBreakdown {
+    /// Total score = sum of every rule's contribution.
+    pub total: i32,
+    /// `+50` when bit-perfect, `0` otherwise.
+    pub bit_perfect: i32,
+    /// `+20` when delivery rate matches source rate, `0`
+    /// otherwise.
+    pub native_rate_match: i32,
+    /// `+15` when delivery format matches source format, `0`
+    /// otherwise.
+    pub native_format_match: i32,
+    /// `+10` when composition mode is passthrough, `0`
+    /// otherwise.
+    pub minimum_signal_path: i32,
+    /// `+5` when hardware volume is engaged and available,
+    /// `0` otherwise.
+    pub hardware_volume_engaged: i32,
+    /// `−30` when the chain inserts an implicit resampler,
+    /// `0` otherwise.
+    pub implicit_resampler_penalty: i32,
+    /// `−10` when software volume is selected despite
+    /// hardware volume being available, `0` otherwise.
+    pub software_volume_when_hardware_available_penalty: i32,
+    /// `−25` when the chain converts DSD to PCM, `0`
+    /// otherwise.
+    pub dsd_to_pcm_penalty: i32,
+}
+
+/// Stable identifier for one delivery target. The hardware
+/// identity is the key the framework uses to look up the
+/// operator override and (in the composer) the database entry.
+///
+/// Exactly one of `usb_vid_pid` / `hat_eeprom_signature` /
+/// `hdmi_sink_id` is populated for any given hardware; the
+/// `alsa_card_name` is always populated as a coarse
+/// disambiguator. The [`Self::key`] method derives the storage
+/// key from the populated discriminator.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct HardwareIdentity {
+    /// USB Vendor ID + Product ID for USB DACs. Populated by
+    /// the probe routine via USB descriptor inspection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usb_vid_pid: Option<(u16, u16)>,
+    /// ALSA card name (e.g. `"USB-Audio - DragonFly Cobalt"`).
+    /// Always populated — the coarsest disambiguator and the
+    /// fallback discriminator for hardware without a more
+    /// specific identifier.
+    pub alsa_card_name: String,
+    /// Pi HAT EEPROM signature (vendor + product + uuid). Read
+    /// at boot via the HAT EEPROM driver. Populated only for
+    /// HAT-attached audio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hat_eeprom_signature: Option<String>,
+    /// HDMI sink identifier (typically the EDID monitor name).
+    /// Populated only for HDMI audio outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdmi_sink_id: Option<String>,
+    /// Operator-readable display name. Set by the probe
+    /// routine; the operator may override via the override
+    /// layer.
+    pub display_name: String,
+}
+
+impl HardwareIdentity {
+    /// Derive the substrate storage key. The key is stable for
+    /// the lifetime of the hardware (USB DAC moves between
+    /// machines and keeps its key; an HDMI sink moves with the
+    /// monitor). Format:
+    ///
+    /// - USB: `usb:vid={hex},pid={hex}`
+    /// - HAT: `hat:{eeprom_signature}`
+    /// - HDMI: `hdmi:{sink_id}`
+    /// - ALSA-only fallback: `alsa:{card_name}`
+    ///
+    /// The first populated discriminator wins, in the order
+    /// listed above. The fallback `alsa:` shape ensures every
+    /// identity has a key even when no specific bus
+    /// identifier is available.
+    pub fn key(&self) -> String {
+        if let Some((vid, pid)) = self.usb_vid_pid {
+            return format!("usb:vid={vid:#06x},pid={pid:#06x}");
+        }
+        if let Some(sig) = &self.hat_eeprom_signature {
+            return format!("hat:{sig}");
+        }
+        if let Some(sink) = &self.hdmi_sink_id {
+            return format!("hdmi:{sink}");
+        }
+        format!("alsa:{}", self.alsa_card_name)
+    }
+}
+
+/// Hardware tier classification. The topology scorer uses tier
+/// as a coarse signal alongside the per-capability data — a
+/// reclocked audiophile USB DAC scores higher than a generic
+/// USB-Audio Class 1 dongle even when both can play 16/48.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareTier {
+    /// High-end USB DACs, FIFO-reclocked I2S, professional
+    /// gear. The topology scorer biases bit-perfect / native-
+    /// rate / minimum-signal-path selections at this tier.
+    Audiophile,
+    /// Mainstream high-quality audio (mid-range USB DACs,
+    /// quality HATs).
+    Reference,
+    /// On-chip codecs (Realtek ALC1220), basic USB devices.
+    Mainstream,
+    /// Cheap dongles, basic I2S without proper clocking.
+    Constrained,
+    /// Professional broadcast endpoints (AES67, BNC/SDI).
+    Broadcast,
+}
+
+/// Hardware volume capability. The topology scorer uses this
+/// to decide whether to engage hardware volume (preserves
+/// bit-perfect at any level) vs software volume (truncation /
+/// dither at <100%) vs no volume at all (operator-managed
+/// downstream).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HardwareVolumeCapability {
+    /// No hardware volume control. Software is the only
+    /// scaling option (or `none` mode if the operator opts
+    /// out).
+    None,
+    /// Analog gain stage at the DAC output. Bit-perfect
+    /// preserved at every level (the digital path is
+    /// untouched).
+    AnalogOnly,
+    /// DAC-internal digital attenuator using bit-shifting.
+    /// Bit-perfect preserved (the truncated bits are below
+    /// the dynamic range of the device's noise floor).
+    DigitalBitShift,
+    /// Both analog and digital available — the operator
+    /// picks via [`VolumePreferenceClass`].
+    Both {
+        /// Operator preference for which class to use when
+        /// both are available.
+        prefer: VolumePreferenceClass,
+    },
+}
+
+/// Operator preference for which volume class to engage when
+/// the hardware offers both analog and digital. Default
+/// `Analog` — analog gain stages are preferred for audiophile
+/// chains because they sit after the DAC's digital output.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumePreferenceClass {
+    /// Analog gain stage preferred (audiophile baseline).
+    /// Default.
+    #[default]
+    Analog,
+    /// Digital bit-shift attenuator preferred.
+    Digital,
+}
+
+/// Post-processing claims about the hardware. The probe
+/// cannot directly observe these — the database / declared
+/// layers populate them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PostProcessing {
+    /// `true` when the hardware upsamples internally (most
+    /// modern DACs do; the framework records this so the
+    /// topology subject can report the truth even when the
+    /// chain delivers at the source rate).
+    #[serde(default)]
+    pub upsamples_internally: bool,
+    /// `true` when the hardware applies internal DSP (room
+    /// correction, oversampling filters with non-default
+    /// behaviour). Operator-visible in the topology subject.
+    #[serde(default)]
+    pub applies_dsp: bool,
+    /// Free-form vendor capability list — anything not
+    /// covered by the typed flags above. Lowercase ASCII
+    /// tokens by convention.
+    #[serde(default)]
+    pub other: Vec<String>,
+}
+
+/// Topology preferences. Hints to the topology scorer; the
+/// scorer computes the actual selection from the full profile
+/// + operator policy.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize,
+)]
+pub struct TopologyPreferences {
+    /// `true` when the chain should prefer the source's
+    /// native rate (no resampling) when the hardware
+    /// supports it.
+    #[serde(default)]
+    pub prefer_native_rate: bool,
+    /// `true` when the chain should prefer the source's
+    /// native format (no codec conversion) when the hardware
+    /// supports it.
+    #[serde(default)]
+    pub prefer_native_format: bool,
+    /// `true` when the chain should minimise intermediate
+    /// stages (passthrough composition when possible).
+    #[serde(default)]
+    pub minimum_signal_path: bool,
+}
+
+/// Sparse operator-override record. Every field is
+/// `Option<T>`; the operator authors only the fields they
+/// explicitly intend to override, and the composer applies
+/// overrides on top of probed + declared + database.
+///
+/// The override is the substrate this module's store owns.
+/// The composer (sub-primitive C) consumes the override
+/// alongside the other three sources to produce a
+/// `HardwareProfile`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardwareProfileOverride {
+    /// Operator-overridden tier. Forces the topology scorer
+    /// to treat the hardware at this tier regardless of the
+    /// database / probe verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<HardwareTier>,
+    /// Operator-overridden hardware volume capability.
+    /// Force-disable a flaky hardware volume by setting this
+    /// to `Some(HardwareVolumeCapability::None)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_volume: Option<HardwareVolumeCapability>,
+    /// Operator-overridden reclocked-downstream flag. Force
+    /// the framework to skip reclocking shims for a chain
+    /// with an external reclocker the database does not yet
+    /// know about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclocked_downstream: Option<bool>,
+    /// Operator-overridden hardware DSP flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_dsp: Option<bool>,
+    /// Operator-overridden post-processing claims. Replaces
+    /// the database / declared layer's
+    /// [`PostProcessing`] entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_processing: Option<PostProcessing>,
+    /// Operator-overridden topology preferences. Replaces
+    /// the database / declared layer's preferences entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer: Option<TopologyPreferences>,
+    /// Operator-overridden display name. Convenience for
+    /// renaming a generic-named device in the operator UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Optional operator note recorded with the override
+    /// (free-form). The framework persists verbatim and
+    /// surfaces in the operator UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl HardwareProfileOverride {
+    /// Returns `true` when no field is set — an empty
+    /// override is a no-op the substrate could elide. The
+    /// store refuses an empty `put` to keep the override
+    /// table free of meaningless rows.
+    pub fn is_empty(&self) -> bool {
+        self.tier.is_none()
+            && self.hardware_volume.is_none()
+            && self.reclocked_downstream.is_none()
+            && self.hardware_dsp.is_none()
+            && self.post_processing.is_none()
+            && self.prefer.is_none()
+            && self.display_name.is_none()
+            && self.note.is_none()
+    }
+}
+
+/// Typed record returned by `HardwareProfileStore` read
+/// methods. Carries the identity + the operator override +
+/// audit metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardwareProfileOverrideRecord {
+    /// Hardware identity.
+    pub identity: HardwareIdentity,
+    /// Operator-authored override layer.
+    #[serde(rename = "override")]
+    pub override_: HardwareProfileOverride,
+    /// Wall-clock millisecond timestamp of the most recent
+    /// write.
+    pub updated_at_ms: u64,
+    /// Operator principal recorded at the most recent write.
+    pub updated_by_principal: String,
+}
+
+/// Read one persisted override row back as the wire record.
+impl From<crate::persistence::PersistedHardwareProfileOverride>
+    for HardwareProfileOverrideRecord
+{
+    fn from(p: crate::persistence::PersistedHardwareProfileOverride) -> Self {
+        Self {
+            identity: p.identity,
+            override_: serde_json::from_str(&p.override_json)
+                .unwrap_or_default(),
+            updated_at_ms: p.updated_at_ms,
+            updated_by_principal: p.updated_by_principal,
+        }
+    }
+}
+
+/// One stored operator policy, as the wire returns it.
+///
+/// The canonical target key, the policy the operator authored,
+/// and the audit pair recorded at the most recent write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioOperatorPolicyRecord {
+    /// Canonical hardware-identity key.
+    pub target_key: String,
+    /// Operator-authored policy.
+    pub policy: OperatorPolicy,
+    /// Wall-clock millisecond timestamp of the most recent
+    /// write.
+    pub set_at_ms: u64,
+    /// Operator principal recorded at the most recent write.
+    pub set_by_principal: String,
+}
+
+/// One stored volume mode, as the wire returns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioVolumeModeRecord {
+    /// Canonical hardware-identity key.
+    pub target_key: String,
+    /// Operator-authored volume mode.
+    pub volume_mode: VolumeMode,
+    /// Wall-clock millisecond timestamp of the most recent
+    /// write.
+    pub set_at_ms: u64,
+    /// Operator principal recorded at the most recent write.
+    pub set_by_principal: String,
+}
+
+// ---------------------------------------------------------------
+// Audio-plane connection DTOs.
+//
+// The plane itself is distribution product and lives outside this
+// crate. These three types stay because they are the response
+// shape of `list_audio_plane_connections`, a wire op this server
+// owns and keeps registered whether or not a plane is installed.
+//
+// `PeerConnectionState` carries the plane's name on the wire —
+// serde emits the variant, not the type — and is spelled
+// differently here only because this module already has a
+// `ConnectionState` for client sessions.
+// ---------------------------------------------------------------
+
+/// Direction of a peer connection from the local node's
+/// perspective.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionDirection {
+    /// Local node accepted the connection (we are source-
+    /// host for at least one group the remote is a member
+    /// of).
+    Inbound,
+    /// Local node initiated the connection (the remote is
+    /// source-host for at least one group we are a member
+    /// of).
+    Outbound,
+}
+
+/// Lifecycle state of a peer connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerConnectionState {
+    /// TCP socket open; awaiting `Hello` exchange.
+    Handshaking,
+    /// `Hello` exchanged; heartbeat + sync running.
+    Connected,
+    /// Tearing down; will be removed on next sweep.
+    Disconnected,
+}
+
+/// Operator-visible snapshot of one peer connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerConnectionInfo {
+    /// Remote peer's canonical device id (`<unknown>` while
+    /// in [`PeerConnectionState::Handshaking`]).
+    pub remote_device_id: String,
+    /// Remote socket address.
+    pub remote_address: String,
+    /// Connection direction.
+    pub direction: ConnectionDirection,
+    /// Lifecycle state.
+    pub state: PeerConnectionState,
+    /// Remote framework version string from the most recent
+    /// `Hello` (empty until Hello received).
+    pub framework_version: String,
+    /// Group ids the remote claims to be source-host for at
+    /// last Hello / Heartbeat.
+    pub claimed_source_host_groups: Vec<String>,
+    /// Wall-clock millisecond timestamp of the most recent
+    /// inbound message on this connection (any kind: audio
+    /// frame, sync response, hello, goodbye, or legacy
+    /// heartbeat). The framework's connection housekeeping
+    /// reaps connections whose total channel silence exceeds
+    /// `idle_reap_threshold`; source-host election reads
+    /// this field as the flow-derived liveness signal when
+    /// the pair is in active flow. Zero before any inbound
+    /// message has been observed.
+    pub last_channel_activity_ms: u64,
+    /// Most recent measured offset against the remote (when
+    /// the remote is source-host of at least one shared
+    /// group). `None` when no sync sample has landed.
+    pub last_sync_offset_ms: Option<i64>,
+    /// Wall-clock millisecond timestamp of the most recent
+    /// sync sample (zero when no sample has landed).
+    pub last_sync_at_ms: u64,
+    /// Wall-clock millisecond timestamp the connection was
+    /// established.
+    pub connected_at_ms: u64,
+    /// Cumulative count of audio frames the connection has
+    /// delivered to the local node (zero when local is the
+    /// source-host or when no frames have arrived yet).
+    pub frames_received: u64,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum ClientResponse {
+    /// The household-protection snapshot, returned by
+    /// `household_protection_get` and by a successful
+    /// `household_protection_set`. Serialises as the frozen wire
+    /// shape: household_protection / chosen / level / lend /
+    /// protected_groups / prior_level / catalog.
+    HouseholdProtection(
+        crate::household_protection::HouseholdProtectionSnapshot,
+    ),
     /// Plugin-request success.
     Success {
         /// Base64-encoded response payload.
@@ -4307,7 +4727,7 @@ enum ClientResponse {
         /// Per-override entries. The `Get` variant returns at
         /// most one entry; `List` returns every recorded
         /// override.
-        entries: Vec<crate::hardware_profile::HardwareProfileOverrideRecord>,
+        entries: Vec<HardwareProfileOverrideRecord>,
     },
     /// Successful response to
     /// [`ClientRequest::PutAudioOperatorPolicy`].
@@ -4334,7 +4754,7 @@ enum ClientResponse {
         /// Per-policy entries. The `Get` variant returns at
         /// most one entry; `List` returns every recorded
         /// policy.
-        entries: Vec<crate::audio_policy::AudioOperatorPolicyRecord>,
+        entries: Vec<AudioOperatorPolicyRecord>,
     },
     /// Successful response to
     /// [`ClientRequest::PutAudioVolumeMode`].
@@ -4361,7 +4781,7 @@ enum ClientResponse {
         /// Per-volume-mode entries. The `Get` variant returns
         /// at most one entry; `List` returns every recorded
         /// volume mode.
-        entries: Vec<crate::audio_policy::AudioVolumeModeRecord>,
+        entries: Vec<AudioVolumeModeRecord>,
     },
     /// Successful response to
     /// [`ClientRequest::PublishActiveAudioTopology`].
@@ -4392,7 +4812,7 @@ enum ClientResponse {
         /// Per-topology entries. The `Get` variant returns at
         /// most one entry; `List` returns every published
         /// topology.
-        entries: Vec<crate::audio_topology::ActiveAudioTopology>,
+        entries: Vec<ActiveAudioTopology>,
     },
     /// Successful response to
     /// [`ClientRequest::GetPluginHealth`]. Carries the
@@ -4853,6 +5273,19 @@ enum ClientResponse {
     OnlineProvidersListing {
         /// Always `true`; the distinctive top-level key.
         online_providers_listing: bool,
+        /// The device's metadata privacy posture — `enhanced`,
+        /// `anonymous_only`, or `offline`.
+        ///
+        /// Carried here because a consumer cannot render this
+        /// listing honestly without it. `privacy_class` on each
+        /// entry says what a provider IS; this says what the
+        /// device currently PERMITS. Under `anonymous_only` every
+        /// identity-bearing entry is suppressed at dispatch
+        /// regardless of its own `enabled` flag, and under
+        /// `offline` every network provider is — so a UI without
+        /// this field would draw a live-looking toggle over a
+        /// provider the framework is silently refusing to use.
+        privacy_mode: String,
         /// One entry per registered provider.
         entries: Vec<OnlineProviderEntry>,
     },
@@ -4861,6 +5294,16 @@ enum ClientResponse {
     /// [`ClientRequest::OnlineProvidersSetPriority`]. Reports
     /// the post-mutation state so the operator UI can render
     /// the new setting without a follow-on list.
+    /// Successful response to
+    /// [`ClientRequest::OnlineProvidersSetPrivacyMode`]. Echoes
+    /// the stored posture so the operator UI renders what the
+    /// device actually accepted rather than what it sent.
+    OnlineProviderPrivacyModeUpdated {
+        /// Always `true`; the distinctive top-level key.
+        online_provider_privacy_mode_updated: bool,
+        /// The posture now in force.
+        privacy_mode: String,
+    },
     OnlineProviderUpdated {
         /// Always `true`; the distinctive top-level key.
         online_provider_updated: bool,
@@ -5241,7 +5684,7 @@ enum ClientResponse {
         audio_plane_connections: bool,
         /// Per-peer connection entries ordered by remote
         /// device id.
-        entries: Vec<crate::audio_plane::PeerConnectionInfo>,
+        entries: Vec<PeerConnectionInfo>,
     },
     /// Successful response to [`ClientRequest::AudioPlaneDial`].
     /// The TCP connection is established, the Hello handshake
@@ -6584,6 +7027,23 @@ enum HappeningWire {
         /// When the acceptance was recorded, ms since UNIX epoch.
         at_ms: u64,
     },
+    /// Wire form of [`Happening::HouseholdProtectionChanged`].
+    /// Core fields only — the group catalog is deliberately absent,
+    /// because it does not change when the operator flips `lend`.
+    /// A surface re-uses the catalog from its last
+    /// `household_protection_get`.
+    HouseholdProtectionChanged {
+        /// Whether the first-start choice has been made.
+        chosen: bool,
+        /// Wire spelling of the level now in force.
+        level: String,
+        /// Whether the guest overlay is raised.
+        lend: bool,
+        /// Group ids the owner has marked protected.
+        protected_groups: Vec<String>,
+        /// Level to restore when the overlay is lifted.
+        prior_level: Option<String>,
+    },
     /// Wire form of [`Happening::FlightModeChanged`]. Carries
     /// the rack-class identifier (the fully-qualified shelf
     /// name) and the new on/off state.
@@ -6622,23 +7082,6 @@ enum HappeningWire {
         /// the plugin tracks per-claim state.
         claim_uri: Option<String>,
         /// When the playback actually ended, ms since UNIX epoch.
-        at_ms: u64,
-    },
-    /// Wire form of [`Happening::AudioTopologyChanged`]. Active
-    /// audio topology rewired for one delivery target. UI
-    /// subscribers fetch the full snapshot via
-    /// `get_active_audio_topology`.
-    AudioTopologyChanged {
-        /// Canonical hardware-identity key.
-        target_key: String,
-        /// Operator-readable display name.
-        display_name: String,
-        /// Bit-perfect verdict.
-        bit_perfect: bool,
-        /// Total score for the chain.
-        score_total: i32,
-        /// When the topology was published, ms since UNIX
-        /// epoch.
         at_ms: u64,
     },
     /// Wire form of [`Happening::PeerDiscovered`].
@@ -7940,6 +8383,19 @@ impl HappeningWire {
                     at_ms: system_time_to_ms(at),
                 }
             }
+            Happening::HouseholdProtectionChanged {
+                chosen,
+                level,
+                lend,
+                protected_groups,
+                prior_level,
+            } => HappeningWire::HouseholdProtectionChanged {
+                chosen,
+                level,
+                lend,
+                protected_groups,
+                prior_level,
+            },
             Happening::FlightModeChanged { rack_class, on, at } => {
                 HappeningWire::FlightModeChanged {
                     rack_class,
@@ -8113,19 +8569,6 @@ impl HappeningWire {
             } => HappeningWire::AudioPlaybackEnded {
                 claimant_token: issuer.token_for(&source_plugin),
                 claim_uri,
-                at_ms: system_time_to_ms(at),
-            },
-            Happening::AudioTopologyChanged {
-                target_key,
-                display_name,
-                bit_perfect,
-                score_total,
-                at,
-            } => HappeningWire::AudioTopologyChanged {
-                target_key,
-                display_name,
-                bit_perfect,
-                score_total,
                 at_ms: system_time_to_ms(at),
             },
             Happening::PeerDiscovered {
@@ -9160,6 +9603,12 @@ struct ConnectionState {
     /// the key for the single-responder lock on the prompt
     /// ledger; stable for the connection's lifetime.
     connection_id: crate::prompts::ResponderConnectionId,
+    /// Bearer token id of the principal on this connection, when it
+    /// arrived over HTTPS. `None` on the Unix-socket path, which is
+    /// operator-local. The household-protection gate reads this to
+    /// tell a broad-audience principal (LAN-trust, kiosk-minted)
+    /// from an operator bearer.
+    principal_token_id: Option<String>,
 }
 
 impl ConnectionState {
@@ -9170,6 +9619,7 @@ impl ConnectionState {
             granted_capabilities: HashSet::new(),
             step_up_scopes: HashSet::new(),
             connection_id: next_connection_id(),
+            principal_token_id: None,
         }
     }
 
@@ -9351,6 +9801,13 @@ pub struct Server {
     /// shipped `evo` binary always wires the same store the
     /// admission gate populates.
     ui_admitted_store: Option<Arc<crate::ui_registry::AdmittedStockingsStore>>,
+    /// Household-protection runtime: the persisted policy, the
+    /// distribution group table, and the dispatch gate's question.
+    /// `None` on a steward booted without it (tests, embedded
+    /// builds); the gate then locks nothing and the ops refuse with
+    /// `Internal / household_protection_not_configured`.
+    household_protection:
+        Option<Arc<crate::household_protection::HouseholdProtectionRuntime>>,
     /// Optional active UI selection runtime. Backs the
     /// `activate_theme` / `activate_ui_shell` /
     /// `describe_active_ui_selection` wire ops. Without this
@@ -9422,20 +9879,18 @@ pub struct Server {
     /// `delete_hardware_profile_override`). `None` means those
     /// ops refuse with `Internal /
     /// hardware_profile_store_not_configured`.
-    hardware_profile_store:
-        Option<Arc<crate::hardware_profile::HardwareProfileStore>>,
+    hardware_profile_store: Option<Arc<dyn crate::HardwareProfileControl>>,
     /// Audio operator preferences store backing the
     /// per-target policy / volume-mode operator surface
     /// (`put_audio_operator_policy` etc.). `None` means those
     /// ops refuse with `Internal /
     /// audio_policy_store_not_configured`.
-    audio_policy_store: Option<Arc<crate::audio_policy::AudioPolicyStore>>,
+    audio_policy_store: Option<Arc<dyn crate::AudioPolicyControl>>,
     /// Audio topology store backing the publish / get / list
     /// / clear surface for active audio topologies. `None`
     /// means those ops refuse with `Internal /
     /// audio_topology_store_not_configured`.
-    audio_topology_store:
-        Option<Arc<crate::audio_topology::AudioTopologyStore>>,
+    audio_topology_store: Option<Arc<dyn crate::AudioTopologyControl>>,
     /// Device-identity store backing the singleton device
     /// identity surface (`get_device_identity` /
     /// `set_device_display_name`). `None` means those ops
@@ -9489,7 +9944,11 @@ pub struct Server {
     /// `list_audio_plane_connections`. `None` means the op
     /// refuses with `Internal /
     /// audio_plane_runtime_not_configured`.
-    audio_plane_runtime: Option<Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    audio_plane_runtime: Option<Arc<dyn crate::AudioPlaneControl>>,
+    audio_plane_handle: Option<
+        Arc<dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle>,
+    >,
+    multiroom_control_port: u16,
     /// Domain witness chain runtime backing the
     /// chain-substrate wire ops (`get_chain_head`,
     /// `domain_history`, `discard_peer_from_domain`,
@@ -9535,6 +9994,16 @@ pub struct Server {
 }
 
 impl Server {
+    /// The happenings bus this server publishes on.
+    ///
+    /// Exposed so boot wiring can bridge non-plugin fabric events
+    /// onto the same stream subscribers already listen to — the
+    /// artwork cascade's "a resolve landed" signal, for one, which
+    /// originates in a crate that cannot depend on this one.
+    pub(crate) fn happening_bus(&self) -> Arc<crate::happenings::HappeningBus> {
+        Arc::clone(&self.state.bus)
+    }
+
     /// Construct a server bound to a socket path and sharing a plugin
     /// router, the steward's shared state bag, and a projection
     /// engine. The socket is not created until [`run`] is called.
@@ -9648,6 +10117,7 @@ impl Server {
             runtime_user_name: None,
             update_channel_store: None,
             ui_admitted_store: None,
+            household_protection: None,
             active_ui_selection_runtime: None,
             wizard_runtime: None,
             bundled_roots: Vec::new(),
@@ -9668,6 +10138,8 @@ impl Server {
             election_runtime: None,
             clock_sync_runtime: None,
             audio_plane_runtime: None,
+            audio_plane_handle: None,
+            multiroom_control_port: 0,
             domain_witness_runtime: None,
             presence_correlator: None,
             reconnect_runtime: None,
@@ -9706,11 +10178,13 @@ impl Server {
     /// `list_hardware_profile_overrides` /
     /// `delete_hardware_profile_override` against the
     /// operator-override substrate.
+    /// `None` leaves the ops registered and answering their
+    /// not-configured degrade.
     pub fn with_hardware_profile_store(
         mut self,
-        store: Arc<crate::hardware_profile::HardwareProfileStore>,
+        store: Option<Arc<dyn crate::HardwareProfileControl>>,
     ) -> Self {
-        self.hardware_profile_store = Some(store);
+        self.hardware_profile_store = store;
         self
     }
 
@@ -9724,11 +10198,13 @@ impl Server {
     /// `list_audio_volume_modes` /
     /// `delete_audio_volume_mode` against the operator
     /// preferences substrate.
+    /// `None` leaves the ops registered and answering their
+    /// not-configured degrade.
     pub fn with_audio_policy_store(
         mut self,
-        store: Arc<crate::audio_policy::AudioPolicyStore>,
+        store: Option<Arc<dyn crate::AudioPolicyControl>>,
     ) -> Self {
-        self.audio_policy_store = Some(store);
+        self.audio_policy_store = store;
         self
     }
 
@@ -9739,11 +10215,13 @@ impl Server {
     /// `list_active_audio_topologies` /
     /// `clear_active_audio_topology` against the active-
     /// topology substrate.
+    /// `None` leaves the ops registered and answering their
+    /// not-configured degrade.
     pub fn with_audio_topology_store(
         mut self,
-        store: Arc<crate::audio_topology::AudioTopologyStore>,
+        store: Option<Arc<dyn crate::AudioTopologyControl>>,
     ) -> Self {
-        self.audio_topology_store = Some(store);
+        self.audio_topology_store = store;
         self
     }
 
@@ -9839,6 +10317,8 @@ impl Server {
     /// every dispatch-path signature.
     fn substrate_handles(&self) -> SubstrateHandles {
         SubstrateHandles {
+            audio_plane_handle: self.audio_plane_handle.clone(),
+            multiroom_control_port: self.multiroom_control_port,
             prompt_ledger: self.prompt_ledger.clone(),
             appointments: self.appointments.clone(),
             watches: self.watches.clone(),
@@ -9847,6 +10327,7 @@ impl Server {
             publisher_trust: self.publisher_trust.clone(),
             update_channel_store: self.update_channel_store.clone(),
             ui_admitted_store: self.ui_admitted_store.clone(),
+            household_protection: self.household_protection.clone(),
             active_ui_selection_runtime: self
                 .active_ui_selection_runtime
                 .clone(),
@@ -9910,9 +10391,29 @@ impl Server {
     /// per-peer connection map.
     pub fn with_audio_plane_runtime(
         mut self,
-        runtime: Arc<crate::audio_plane::AudioPlaneRuntime>,
+        control: Arc<dyn crate::AudioPlaneControl>,
     ) -> Self {
-        self.audio_plane_runtime = Some(runtime);
+        self.audio_plane_runtime = Some(control);
+        self
+    }
+
+    /// Attach the plugin-facing face of the same plane, used by
+    /// the two ops that dial a peer.
+    pub fn with_audio_plane_handle(
+        mut self,
+        handle: Arc<
+            dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle,
+        >,
+    ) -> Self {
+        self.audio_plane_handle = Some(handle);
+        self
+    }
+
+    /// Set the audio-plane control port this device advertises.
+    /// Framework configuration; independent of whether a plane is
+    /// installed.
+    pub fn with_multiroom_control_port(mut self, port: u16) -> Self {
+        self.multiroom_control_port = port;
         self
     }
 
@@ -10058,6 +10559,25 @@ impl Server {
     ) -> Self {
         self.ui_admitted_store = Some(store);
         self
+    }
+
+    /// Builder-style setter for the household-protection runtime.
+    /// Supplied at boot from `RunOptions::household_groups` plus the
+    /// steward's state directory.
+    pub fn with_household_protection(
+        mut self,
+        runtime: Arc<crate::household_protection::HouseholdProtectionRuntime>,
+    ) -> Self {
+        self.household_protection = Some(runtime);
+        self
+    }
+
+    /// Borrow the household-protection runtime, when configured.
+    pub fn household_protection(
+        &self,
+    ) -> Option<&Arc<crate::household_protection::HouseholdProtectionRuntime>>
+    {
+        self.household_protection.as_ref()
     }
 
     /// Builder-style setter for the active UI selection
@@ -10352,8 +10872,8 @@ impl Server {
     ///   update surfaces as a JSON `SubjectStateUpdate`.
     ///
     /// Unknown subscribe op ids return
-    /// [`DispatchError::NotImplemented`]. Payload parse
-    /// failures return [`DispatchError::InvalidPayload`]. The
+    /// `DispatchError::NotImplemented`. Payload parse
+    /// failures return `DispatchError::InvalidPayload`. The
     /// returned stream ends cleanly when the underlying
     /// broadcast lags repeatedly or closes (server shutdown).
     pub async fn subscribe_http_wire_op(
@@ -10567,6 +11087,10 @@ impl Server {
         payload: serde_json::Value,
         principal: &evo_runtime_http::Principal,
     ) -> Result<serde_json::Value, HttpDispatchError> {
+        // One sitting for the dispatch, taken before typed parse.
+        let mut payload = payload;
+        let step_up_token = take_step_up_token(&mut payload)
+            .map_err(HttpDispatchError::InvalidPayload)?;
         let req = parse_http_wire_request(op_id, payload)?;
         let mut conn = ConnectionState {
             peer: PeerCredentials {
@@ -10576,7 +11100,40 @@ impl Server {
             granted_capabilities: flatten_principal_capabilities(principal),
             step_up_scopes: flatten_step_up_scopes(principal),
             connection_id: connection_id_for_principal(principal),
+            principal_token_id: Some(principal.token_id.clone()),
         };
+        // Household-protection gate, framework-op path. The scope
+        // comes from the same canonical schema the capability check
+        // reads. `household_protection_set` is excluded: changing
+        // the household is how an owner gets out of a lock, so it
+        // cannot be behind that lock. First-start set stays ungated
+        // and widening keeps its own step-up requirement.
+        if op_id != "household_protection_set" {
+            if let Some(refusal) = household_refusal(
+                self.household_protection.as_ref(),
+                &conn,
+                framework_op_scope(op_id),
+                &self.auth_session_store,
+                step_up_token.as_deref(),
+                &format!("op {op_id:?}"),
+            ) {
+                let error = match refusal {
+                    ClientResponse::Error { error } => error,
+                    _ => unreachable!("household_refusal returns Error"),
+                };
+                let response = ClientResponse::Error {
+                    error: error.clone(),
+                };
+                let body = serde_json::to_value(&response).map_err(|e| {
+                    HttpDispatchError::SerializationFailed(e.to_string())
+                })?;
+                return Err(HttpDispatchError::RequestRefused {
+                    status: error_class_to_http_status(error.class),
+                    message: error.message.clone(),
+                    body,
+                });
+            }
+        }
         let handles = self.substrate_handles();
         let response = dispatch_request(
             req,
@@ -10604,6 +11161,7 @@ impl Server {
             &self.bundled_roots,
             &handles,
             &mut conn,
+            step_up_token.as_deref(),
         )
         .await;
         // Wire-honesty: a ClientResponse::Error means the
@@ -10947,7 +11505,43 @@ async fn handle_connection(
             None => return Ok(()),
         };
 
-        let req: ClientRequest = match serde_json::from_slice(&body) {
+        // Same one sitting on the operator-local socket. This path
+        // parses ClientRequest directly, so the take happens on the
+        // decoded value before the typed deserialise.
+        let mut raw: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                write_response_frame(
+                    &mut stream,
+                    &ClientResponse::Error {
+                        error: ApiError::new(
+                            ErrorClass::ProtocolViolation,
+                            format!("invalid JSON: {e}"),
+                        ),
+                    },
+                )
+                .await?;
+                continue;
+            }
+        };
+        let unix_step_up_token = match take_step_up_token(&mut raw) {
+            Ok(t) => t,
+            Err(msg) => {
+                write_response_frame(
+                    &mut stream,
+                    &ClientResponse::Error {
+                        error: ApiError::new(
+                            ErrorClass::ContractViolation,
+                            msg,
+                        )
+                        .with_subclass("invalid_payload"),
+                    },
+                )
+                .await?;
+                continue;
+            }
+        };
+        let req: ClientRequest = match serde_json::from_value(raw) {
             Ok(r) => r,
             Err(e) => {
                 write_response_frame(
@@ -11057,6 +11651,7 @@ async fn handle_connection(
             &bundled_roots,
             &handles,
             &mut conn,
+            unix_step_up_token.as_deref(),
         )
         .await;
         write_response_frame(&mut stream, &response).await?;
@@ -11170,6 +11765,10 @@ pub struct SubstrateHandles {
     /// admitted-stocking surface.
     pub ui_admitted_store:
         Option<Arc<crate::ui_registry::AdmittedStockingsStore>>,
+    /// Household-protection runtime. `None` on a steward booted
+    /// without it; the dispatch gate then locks nothing.
+    pub household_protection:
+        Option<Arc<crate::household_protection::HouseholdProtectionRuntime>>,
     /// Active UI selection runtime backing the operator's
     /// currently-active UI artefact pointer.
     pub active_ui_selection_runtime:
@@ -11194,15 +11793,13 @@ pub struct SubstrateHandles {
         Option<Arc<crate::migration_bundle::MigrationBundleStore>>,
     /// Hardware profile override store backing per-target
     /// profile override surfaces.
-    pub hardware_profile_store:
-        Option<Arc<crate::hardware_profile::HardwareProfileStore>>,
+    pub hardware_profile_store: Option<Arc<dyn crate::HardwareProfileControl>>,
     /// Audio operator-policy store backing per-target audio
     /// policy queries.
-    pub audio_policy_store: Option<Arc<crate::audio_policy::AudioPolicyStore>>,
+    pub audio_policy_store: Option<Arc<dyn crate::AudioPolicyControl>>,
     /// Audio active-topology store backing per-target
     /// reconciliation snapshot queries.
-    pub audio_topology_store:
-        Option<Arc<crate::audio_topology::AudioTopologyStore>>,
+    pub audio_topology_store: Option<Arc<dyn crate::AudioTopologyControl>>,
     /// Local device identity store backing display-name + name
     /// rename verbs.
     pub device_identity_store:
@@ -11234,7 +11831,20 @@ pub struct SubstrateHandles {
     pub clock_sync_runtime: Option<Arc<crate::clock_sync::ClockSyncRuntime>>,
     /// Audio-plane runtime backing the per-peer audio-plane
     /// connection state surface.
-    pub audio_plane_runtime: Option<Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    pub audio_plane_runtime: Option<Arc<dyn crate::AudioPlaneControl>>,
+    /// Plugin-facing face of the same plane. `dial_peer` lives on
+    /// the SDK contract, so the two ops that dial reach it here
+    /// rather than through the steward's narrower control face.
+    pub audio_plane_handle: Option<
+        Arc<dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle>,
+    >,
+    /// Control port this device advertises for the audio plane.
+    ///
+    /// Framework configuration, not plane state: the steward
+    /// advertises it in mDNS whether or not a plane is installed,
+    /// so the endpoints a founder signs do not depend on one
+    /// being present.
+    pub multiroom_control_port: u16,
     /// Domain witness chain runtime backing chain head /
     /// recent-witness queries.
     pub domain_witness_runtime:
@@ -11298,6 +11908,7 @@ async fn dispatch_request(
     bundled_roots: &[PathBuf],
     handles: &SubstrateHandles,
     conn: &mut ConnectionState,
+    step_up_token: Option<&str>,
 ) -> ClientResponse {
     // Destructure the substrate-handles bundle into the local
     // bindings the dispatch arms below already use. Each is
@@ -11305,6 +11916,8 @@ async fn dispatch_request(
     // match-arm bodies that pass these handles into per-op
     // handlers continue to work unchanged.
     let SubstrateHandles {
+        audio_plane_handle,
+        multiroom_control_port,
         prompt_ledger,
         appointments,
         watches,
@@ -11313,6 +11926,7 @@ async fn dispatch_request(
         publisher_trust,
         update_channel_store,
         ui_admitted_store,
+        household_protection,
         active_ui_selection_runtime,
         wizard_runtime,
         plugin_profile_store,
@@ -11374,14 +11988,16 @@ async fn dispatch_request(
     let gateway_registry = gateway_registry.as_ref();
     let update_registry = update_registry.as_ref();
     let restart_coordinator = restart_coordinator.as_ref();
-    // Per `docs/engineering/LOGGING.md` §2: every verb invocation
-    // emits a debug-level log so an engineer enabling
-    // `RUST_LOG=evo=debug` sees the per-request narrative
-    // alongside the info-level lifecycle milestones. The op tag
-    // is the serde-tagged variant name; payload-bearing fields
-    // are excluded here (they may be large; the per-handler
-    // debug logs surface them where useful).
-    tracing::debug!(
+    // Every verb invocation emits a trace-level log so an
+    // engineer enabling `RUST_LOG=evo=trace` sees the per-
+    // request narrative alongside the info-level lifecycle
+    // milestones. The op tag is the serde-tagged variant name;
+    // payload-bearing fields are excluded here (they may be
+    // large; the per-handler logs surface them where useful).
+    // TRACE (not DEBUG) so per-verb dispatch — which fires at
+    // UI subject-refresh cadence — stays off default journals
+    // and remains reachable under `RUST_LOG=trace`.
+    tracing::trace!(
         op = client_request_op_tag(&req),
         peer_uid = conn.peer.uid,
         peer_gid = conn.peer.gid,
@@ -11404,6 +12020,11 @@ async fn dispatch_request(
                 instance_id,
                 &conn.granted_capabilities,
                 &conn.step_up_scopes,
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                step_up_token,
+                household_protection.as_ref(),
             )
             .await
         }
@@ -11463,11 +12084,7 @@ async fn dispatch_request(
         ClientRequest::ResolveClaimants { tokens } => {
             handle_resolve_claimants(state, resolution_ledger, conn, tokens)
         }
-        ClientRequest::EnablePlugin {
-            plugin,
-            reason,
-            step_up_token,
-        } => {
+        ClientRequest::EnablePlugin { plugin, reason } => {
             handle_enable_plugin(
                 engine,
                 auth_service,
@@ -11476,14 +12093,13 @@ async fn dispatch_request(
                 conn,
                 plugin,
                 reason,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
         ClientRequest::DisablePlugin {
             plugin,
             reason,
-            step_up_token,
             cascade_dependents,
         } => {
             handle_disable_plugin(
@@ -11494,7 +12110,7 @@ async fn dispatch_request(
                 conn,
                 plugin,
                 reason,
-                step_up_token,
+                step_up_token.map(str::to_owned),
                 cascade_dependents,
             )
             .await
@@ -11515,7 +12131,6 @@ async fn dispatch_request(
             plugin_name,
             capability,
             reason,
-            step_up_token,
         } => {
             handle_revoke_plugin_capability(
                 capability_grant_store,
@@ -11526,14 +12141,13 @@ async fn dispatch_request(
                 plugin_name,
                 capability,
                 reason,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
         ClientRequest::UnrevokePluginCapability {
             plugin_name,
             capability,
-            step_up_token,
         } => {
             handle_unrevoke_plugin_capability(
                 capability_grant_store,
@@ -11543,7 +12157,7 @@ async fn dispatch_request(
                 conn,
                 plugin_name,
                 capability,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -11567,10 +12181,7 @@ async fn dispatch_request(
             )
             .await
         }
-        ClientRequest::ImportMigrationBundle {
-            bundle_toml,
-            step_up_token,
-        } => {
+        ClientRequest::ImportMigrationBundle { bundle_toml } => {
             handle_import_migration_bundle(
                 migration_bundle_store,
                 auth_service,
@@ -11578,14 +12189,13 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 bundle_toml,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
         ClientRequest::PutHardwareProfileOverride {
             identity,
             override_,
-            step_up_token,
         } => {
             handle_put_hardware_profile_override(
                 hardware_profile_store,
@@ -11595,7 +12205,7 @@ async fn dispatch_request(
                 conn,
                 identity,
                 override_,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -11611,7 +12221,7 @@ async fn dispatch_request(
             handle_list_hardware_profile_overrides(hardware_profile_store, conn)
                 .await
         }
-        ClientRequest::DeleteHardwareProfileOverride { key, step_up_token } => {
+        ClientRequest::DeleteHardwareProfileOverride { key } => {
             handle_delete_hardware_profile_override(
                 hardware_profile_store,
                 auth_service,
@@ -11619,15 +12229,11 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 key,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::PutAudioOperatorPolicy {
-            target_key,
-            policy,
-            step_up_token,
-        } => {
+        ClientRequest::PutAudioOperatorPolicy { target_key, policy } => {
             handle_put_audio_operator_policy(
                 audio_policy_store,
                 auth_service,
@@ -11636,7 +12242,7 @@ async fn dispatch_request(
                 conn,
                 target_key,
                 policy,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -11651,10 +12257,7 @@ async fn dispatch_request(
         ClientRequest::ListAudioOperatorPolicies => {
             handle_list_audio_operator_policies(audio_policy_store, conn).await
         }
-        ClientRequest::DeleteAudioOperatorPolicy {
-            target_key,
-            step_up_token,
-        } => {
+        ClientRequest::DeleteAudioOperatorPolicy { target_key } => {
             handle_delete_audio_operator_policy(
                 audio_policy_store,
                 auth_service,
@@ -11662,14 +12265,13 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 target_key,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
         ClientRequest::PutAudioVolumeMode {
             target_key,
             volume_mode,
-            step_up_token,
         } => {
             handle_put_audio_volume_mode(
                 audio_policy_store,
@@ -11679,7 +12281,7 @@ async fn dispatch_request(
                 conn,
                 target_key,
                 volume_mode,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -11690,10 +12292,7 @@ async fn dispatch_request(
         ClientRequest::ListAudioVolumeModes => {
             handle_list_audio_volume_modes(audio_policy_store, conn).await
         }
-        ClientRequest::DeleteAudioVolumeMode {
-            target_key,
-            step_up_token,
-        } => {
+        ClientRequest::DeleteAudioVolumeMode { target_key } => {
             handle_delete_audio_volume_mode(
                 audio_policy_store,
                 auth_service,
@@ -11701,23 +12300,19 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 target_key,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::PublishActiveAudioTopology {
-            topology,
-            step_up_token,
-        } => {
+        ClientRequest::PublishActiveAudioTopology { topology } => {
             handle_publish_active_audio_topology(
                 audio_topology_store,
-                state,
                 auth_service,
                 auth_session_store,
                 lifecycle_ledger,
                 conn,
                 topology,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -11733,10 +12328,7 @@ async fn dispatch_request(
             handle_list_active_audio_topologies(audio_topology_store, conn)
                 .await
         }
-        ClientRequest::ClearActiveAudioTopology {
-            target_key,
-            step_up_token,
-        } => {
+        ClientRequest::ClearActiveAudioTopology { target_key } => {
             handle_clear_active_audio_topology(
                 audio_topology_store,
                 auth_service,
@@ -11744,7 +12336,7 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 target_key,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -11752,7 +12344,6 @@ async fn dispatch_request(
             plugin,
             reason,
             purge_state,
-            step_up_token,
         } => {
             handle_uninstall_plugin(
                 engine,
@@ -11764,14 +12355,11 @@ async fn dispatch_request(
                 plugin,
                 reason,
                 purge_state,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::PurgePluginState {
-            plugin,
-            step_up_token,
-        } => {
+        ClientRequest::PurgePluginState { plugin } => {
             handle_purge_plugin_state(
                 engine,
                 auth_service,
@@ -11779,15 +12367,11 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 plugin,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::ReloadCatalogue {
-            source,
-            dry_run,
-            step_up_token,
-        } => {
+        ClientRequest::ReloadCatalogue { source, dry_run } => {
             handle_reload_catalogue(
                 engine,
                 auth_service,
@@ -11796,7 +12380,7 @@ async fn dispatch_request(
                 conn,
                 source,
                 dry_run,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -11804,7 +12388,6 @@ async fn dispatch_request(
             plugin,
             source,
             dry_run,
-            step_up_token,
         } => {
             handle_reload_manifest(
                 engine,
@@ -11815,14 +12398,11 @@ async fn dispatch_request(
                 plugin,
                 source,
                 dry_run,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::ReloadPlugin {
-            plugin,
-            step_up_token,
-        } => {
+        ClientRequest::ReloadPlugin { plugin } => {
             handle_reload_plugin(
                 engine,
                 auth_service,
@@ -11830,7 +12410,7 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 plugin,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -11968,11 +12548,7 @@ async fn dispatch_request(
         ClientRequest::FirePlan { plan_id } => {
             handle_fire_plan(plan_engine, conn, plan_id).await
         }
-        ClientRequest::InstallPluginFromUrl {
-            url,
-            signature_pin,
-            step_up_token,
-        } => {
+        ClientRequest::InstallPluginFromUrl { url, signature_pin } => {
             handle_install_plugin_from_url(
                 engine,
                 auth_service,
@@ -11981,7 +12557,7 @@ async fn dispatch_request(
                 conn,
                 url,
                 signature_pin,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -11991,7 +12567,6 @@ async fn dispatch_request(
             signature_url,
             public_key_fingerprint,
             poll_interval_secs,
-            step_up_token,
         } => {
             handle_register_plugin_registry(
                 plugin_registry,
@@ -12004,14 +12579,11 @@ async fn dispatch_request(
                 signature_url,
                 public_key_fingerprint,
                 poll_interval_secs,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::UnregisterPluginRegistry {
-            slug,
-            step_up_token,
-        } => {
+        ClientRequest::UnregisterPluginRegistry { slug } => {
             handle_unregister_plugin_registry(
                 plugin_registry,
                 auth_service,
@@ -12019,17 +12591,14 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 slug,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
         ClientRequest::ListPluginRegistries => {
             handle_list_plugin_registries(plugin_registry).await
         }
-        ClientRequest::RefreshPluginRegistry {
-            slug,
-            step_up_token,
-        } => {
+        ClientRequest::RefreshPluginRegistry { slug } => {
             handle_refresh_plugin_registry(
                 plugin_registry,
                 auth_service,
@@ -12037,7 +12606,7 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 slug,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12046,7 +12615,6 @@ async fn dispatch_request(
             display_name,
             public_key_pem,
             scope_per_plugin,
-            step_up_token,
         } => {
             handle_grant_publisher_trust(
                 publisher_trust,
@@ -12059,14 +12627,11 @@ async fn dispatch_request(
                 display_name,
                 public_key_pem,
                 scope_per_plugin,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::RevokePublisherTrust {
-            publisher_id,
-            step_up_token,
-        } => {
+        ClientRequest::RevokePublisherTrust { publisher_id } => {
             handle_revoke_publisher_trust(
                 publisher_trust,
                 lifecycle_ledger,
@@ -12074,7 +12639,7 @@ async fn dispatch_request(
                 auth_session_store,
                 conn,
                 publisher_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12200,16 +12765,17 @@ async fn dispatch_request(
             )
             .await
         }
+        ClientRequest::OnlineProvidersSetPrivacyMode { privacy_mode } => {
+            handle_online_providers_set_privacy_mode(state, conn, privacy_mode)
+                .await
+        }
         ClientRequest::ResetCredentialsToOpen { reason } => {
             handle_reset_credentials_to_open(state, conn, reason).await
         }
         ClientRequest::GetDeviceIdentity => {
             handle_get_device_identity(device_identity_store, conn).await
         }
-        ClientRequest::SetDeviceDisplayName {
-            display_name,
-            step_up_token,
-        } => {
+        ClientRequest::SetDeviceDisplayName { display_name } => {
             handle_set_device_display_name(
                 device_identity_store,
                 auth_service,
@@ -12219,11 +12785,11 @@ async fn dispatch_request(
                 &state.bus,
                 conn,
                 display_name,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::ResetDeviceDisplayName { step_up_token } => {
+        ClientRequest::ResetDeviceDisplayName {} => {
             handle_reset_device_display_name(
                 device_identity_store,
                 auth_service,
@@ -12232,7 +12798,7 @@ async fn dispatch_request(
                 discovery_runtime,
                 &state.bus,
                 conn,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12262,7 +12828,6 @@ async fn dispatch_request(
         ClientRequest::CreateGroup {
             display_name,
             members,
-            step_up_token,
         } => {
             handle_create_group(
                 group_store,
@@ -12272,7 +12837,7 @@ async fn dispatch_request(
                 conn,
                 display_name,
                 members,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12285,7 +12850,6 @@ async fn dispatch_request(
         ClientRequest::RenameGroup {
             group_id,
             display_name,
-            step_up_token,
         } => {
             handle_rename_group(
                 group_store,
@@ -12295,14 +12859,13 @@ async fn dispatch_request(
                 conn,
                 group_id,
                 display_name,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
         ClientRequest::SetGroupLeaderMs {
             group_id,
             leader_ms,
-            step_up_token,
         } => {
             handle_set_group_leader_ms(
                 group_store,
@@ -12312,15 +12875,11 @@ async fn dispatch_request(
                 conn,
                 group_id,
                 leader_ms,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::SetDeviceRole {
-            device_id,
-            role,
-            step_up_token,
-        } => {
+        ClientRequest::SetDeviceRole { device_id, role } => {
             handle_set_device_role(
                 role_store,
                 auth_service,
@@ -12329,7 +12888,7 @@ async fn dispatch_request(
                 conn,
                 device_id,
                 role,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12345,10 +12904,7 @@ async fn dispatch_request(
         ClientRequest::ListDeviceRoles => {
             handle_list_device_roles(role_store, lifecycle_ledger, conn).await
         }
-        ClientRequest::ClearDeviceRole {
-            device_id,
-            step_up_token,
-        } => {
+        ClientRequest::ClearDeviceRole { device_id } => {
             handle_clear_device_role(
                 role_store,
                 auth_service,
@@ -12356,14 +12912,11 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 device_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::ReconnectPeer {
-            device_id,
-            step_up_token,
-        } => {
+        ClientRequest::ReconnectPeer { device_id } => {
             handle_reconnect_peer(
                 endpoint_cache,
                 auth_service,
@@ -12371,14 +12924,11 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 device_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::PluginReload {
-            plugin_name,
-            step_up_token,
-        } => {
+        ClientRequest::PluginReload { plugin_name } => {
             handle_plugin_reload(
                 plugin_lifecycle_coordinator,
                 auth_service,
@@ -12386,14 +12936,11 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 plugin_name,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::PluginRestore {
-            plugin_name,
-            step_up_token,
-        } => {
+        ClientRequest::PluginRestore { plugin_name } => {
             handle_plugin_restore(
                 plugin_degraded_registry,
                 auth_service,
@@ -12402,14 +12949,13 @@ async fn dispatch_request(
                 state,
                 conn,
                 plugin_name,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
         ClientRequest::AddGroupMember {
             group_id,
             device_id,
-            step_up_token,
         } => {
             handle_add_group_member(
                 group_store,
@@ -12421,14 +12967,13 @@ async fn dispatch_request(
                 conn,
                 group_id,
                 device_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
         ClientRequest::RemoveGroupMember {
             group_id,
             device_id,
-            step_up_token,
         } => {
             handle_remove_group_member(
                 group_store,
@@ -12440,14 +12985,11 @@ async fn dispatch_request(
                 conn,
                 group_id,
                 device_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::DeleteGroup {
-            group_id,
-            step_up_token,
-        } => {
+        ClientRequest::DeleteGroup { group_id } => {
             handle_delete_group(
                 group_store,
                 auth_service,
@@ -12455,7 +12997,7 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 group_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12464,7 +13006,6 @@ async fn dispatch_request(
             to_group_id,
             device_id,
             successor_device_id,
-            step_up_token,
         } => {
             handle_move_group_member(
                 group_store,
@@ -12478,7 +13019,7 @@ async fn dispatch_request(
                 to_group_id,
                 device_id,
                 successor_device_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12486,7 +13027,6 @@ async fn dispatch_request(
             group_id,
             departing_device_id,
             successor_device_id,
-            step_up_token,
         } => {
             handle_select_group_leader_successor(
                 group_store,
@@ -12498,7 +13038,7 @@ async fn dispatch_request(
                 group_id,
                 departing_device_id,
                 successor_device_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12518,7 +13058,6 @@ async fn dispatch_request(
         ClientRequest::PinSourceHost {
             group_id,
             device_id,
-            step_up_token,
         } => {
             handle_pin_source_host(
                 group_store,
@@ -12528,14 +13067,11 @@ async fn dispatch_request(
                 conn,
                 group_id,
                 device_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::UnpinSourceHost {
-            group_id,
-            step_up_token,
-        } => {
+        ClientRequest::UnpinSourceHost { group_id } => {
             handle_unpin_source_host(
                 group_store,
                 auth_service,
@@ -12543,7 +13079,7 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 group_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12563,7 +13099,6 @@ async fn dispatch_request(
             device_id,
             display_name,
             public_key_bytes,
-            step_up_token,
         } => {
             handle_admit_peer_to_domain(
                 &state.persistence,
@@ -12577,14 +13112,11 @@ async fn dispatch_request(
                 device_id,
                 display_name,
                 public_key_bytes,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::RevokePeerFromDomain {
-            device_id,
-            step_up_token,
-        } => {
+        ClientRequest::RevokePeerFromDomain { device_id } => {
             handle_revoke_peer_from_domain(
                 &state.bus,
                 domain_witness_runtime,
@@ -12593,15 +13125,11 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 device_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::DiscardPeerFromDomain {
-            device_id,
-            reason,
-            step_up_token,
-        } => {
+        ClientRequest::DiscardPeerFromDomain { device_id, reason } => {
             handle_discard_peer_from_domain(
                 domain_witness_runtime,
                 auth_service,
@@ -12610,15 +13138,13 @@ async fn dispatch_request(
                 conn,
                 device_id,
                 reason,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::BootstrapDomain {
-            display_name,
-            step_up_token,
-        } => {
+        ClientRequest::BootstrapDomain { display_name } => {
             handle_bootstrap_domain(
+                *multiroom_control_port,
                 domain_witness_runtime,
                 audio_plane_runtime,
                 device_identity_store,
@@ -12627,15 +13153,13 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 display_name,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::JoinDomain {
-            endpoint,
-            step_up_token,
-        } => {
+        ClientRequest::JoinDomain { endpoint } => {
             handle_join_domain(
+                audio_plane_handle.as_ref(),
                 domain_witness_runtime,
                 audio_plane_runtime,
                 &state.bus,
@@ -12644,29 +13168,29 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 endpoint,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::LeaveDomain { step_up_token } => {
+        ClientRequest::LeaveDomain {} => {
             handle_leave_domain(
                 domain_witness_runtime,
                 auth_service,
                 auth_session_store,
                 lifecycle_ledger,
                 conn,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::FactoryResetDomain { step_up_token } => {
+        ClientRequest::FactoryResetDomain {} => {
             handle_factory_reset_domain(
                 domain_witness_runtime,
                 auth_service,
                 auth_session_store,
                 lifecycle_ledger,
                 conn,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12680,7 +13204,6 @@ async fn dispatch_request(
             device_id,
             from_group_id,
             to_group_id,
-            step_up_token,
         } => {
             handle_move_member(
                 domain_witness_runtime,
@@ -12691,14 +13214,13 @@ async fn dispatch_request(
                 device_id,
                 from_group_id,
                 to_group_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
         ClientRequest::SetGroupLeader {
             group_id,
             leader_device_id,
-            step_up_token,
         } => {
             handle_set_group_leader(
                 domain_witness_runtime,
@@ -12708,14 +13230,11 @@ async fn dispatch_request(
                 conn,
                 group_id,
                 leader_device_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::TriggerReconnect {
-            device_id,
-            step_up_token,
-        } => {
+        ClientRequest::TriggerReconnect { device_id } => {
             handle_trigger_reconnect(
                 reconnect_runtime,
                 auth_service,
@@ -12723,17 +13242,14 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 device_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
         ClientRequest::ExportChain => {
             handle_export_chain(domain_witness_runtime, conn).await
         }
-        ClientRequest::ImportChain {
-            witnesses,
-            step_up_token,
-        } => {
+        ClientRequest::ImportChain { witnesses } => {
             handle_import_chain(
                 domain_witness_runtime,
                 auth_service,
@@ -12741,14 +13257,13 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 witnesses,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
         ClientRequest::UpdatePeerEndpoints {
             device_id,
             endpoints,
-            step_up_token,
         } => {
             handle_update_peer_endpoints(
                 domain_witness_runtime,
@@ -12758,14 +13273,13 @@ async fn dispatch_request(
                 conn,
                 device_id,
                 endpoints,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
         ClientRequest::DeclareNetworkRelay {
             networks,
             capabilities,
-            step_up_token,
         } => {
             handle_declare_network_relay(
                 domain_witness_runtime,
@@ -12775,7 +13289,7 @@ async fn dispatch_request(
                 conn,
                 networks,
                 capabilities,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12795,7 +13309,13 @@ async fn dispatch_request(
             handle_list_audio_plane_connections(audio_plane_runtime, conn).await
         }
         ClientRequest::AudioPlaneDial { addr } => {
-            handle_audio_plane_dial(audio_plane_runtime, conn, addr).await
+            handle_audio_plane_dial(
+                audio_plane_handle.as_ref(),
+                audio_plane_runtime,
+                conn,
+                addr,
+            )
+            .await
         }
         ClientRequest::DispatchToGroup { group_id } => {
             handle_dispatch_to_group(
@@ -12824,10 +13344,7 @@ async fn dispatch_request(
         ClientRequest::ListUpdateInventory => {
             handle_list_update_inventory(update_registry, conn).await
         }
-        ClientRequest::CheckUpdatesNow {
-            source_id,
-            step_up_token,
-        } => {
+        ClientRequest::CheckUpdatesNow { source_id } => {
             handle_check_updates_now(
                 update_registry,
                 auth_service,
@@ -12835,7 +13352,7 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 source_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12844,7 +13361,6 @@ async fn dispatch_request(
             update_id,
             dry_run,
             approved_by,
-            step_up_token,
         } => {
             handle_apply_update(
                 update_registry,
@@ -12856,7 +13372,7 @@ async fn dispatch_request(
                 update_id,
                 dry_run,
                 approved_by,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12867,7 +13383,6 @@ async fn dispatch_request(
             source_id,
             enabled,
             severity_threshold,
-            step_up_token,
         } => {
             handle_set_auto_apply_policy(
                 update_registry,
@@ -12878,7 +13393,7 @@ async fn dispatch_request(
                 source_id,
                 enabled,
                 severity_threshold,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12920,17 +13435,35 @@ async fn dispatch_request(
             )
             .await
         }
-        ClientRequest::PairList => handle_pair_list(pairing_store, conn).await,
-        ClientRequest::PairRevoke {
-            paired_device_id,
-            step_up_token,
+        ClientRequest::HouseholdProtectionGet => {
+            handle_household_protection_get(household_protection.as_ref())
+        }
+        ClientRequest::HouseholdProtectionSet {
+            level,
+            lend,
+            protected_groups,
         } => {
+            handle_household_protection_set(
+                household_protection.as_ref(),
+                auth_session_store,
+                lifecycle_ledger,
+                conn,
+                state,
+                level,
+                lend,
+                protected_groups,
+                step_up_token,
+            )
+            .await
+        }
+        ClientRequest::PairList => handle_pair_list(pairing_store, conn).await,
+        ClientRequest::PairRevoke { paired_device_id } => {
             handle_pair_revoke(
                 pairing_store,
                 auth_session_store,
                 conn,
                 paired_device_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12947,7 +13480,6 @@ async fn dispatch_request(
         ClientRequest::RequestStewardRestart {
             reason,
             target_binary,
-            step_up_token,
         } => {
             handle_request_steward_restart(
                 restart_coordinator,
@@ -12957,15 +13489,11 @@ async fn dispatch_request(
                 conn,
                 reason,
                 target_binary,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::SetUpdateChannel {
-            target,
-            channel,
-            step_up_token,
-        } => {
+        ClientRequest::SetUpdateChannel { target, channel } => {
             handle_set_update_channel(
                 update_channel_store,
                 auth_service,
@@ -12974,7 +13502,7 @@ async fn dispatch_request(
                 conn,
                 target,
                 channel,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -12995,10 +13523,7 @@ async fn dispatch_request(
             )
             .await
         }
-        ClientRequest::ActivateTheme {
-            plugin_name,
-            step_up_token,
-        } => {
+        ClientRequest::ActivateTheme { plugin_name } => {
             handle_activate_theme(
                 active_ui_selection_runtime,
                 auth_service,
@@ -13006,14 +13531,11 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 plugin_name,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::ActivateUiShell {
-            plugin_name,
-            step_up_token,
-        } => {
+        ClientRequest::ActivateUiShell { plugin_name } => {
             handle_activate_ui_shell(
                 active_ui_selection_runtime,
                 auth_service,
@@ -13021,7 +13543,7 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 plugin_name,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -13035,7 +13557,6 @@ async fn dispatch_request(
             description,
             authored_by,
             entries,
-            step_up_token,
         } => {
             handle_put_plugin_profile(
                 plugin_profile_store,
@@ -13048,7 +13569,7 @@ async fn dispatch_request(
                 description,
                 authored_by,
                 entries,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -13058,10 +13579,7 @@ async fn dispatch_request(
         ClientRequest::ListPluginProfiles => {
             handle_list_plugin_profiles(plugin_profile_store).await
         }
-        ClientRequest::DeletePluginProfile {
-            profile_id,
-            step_up_token,
-        } => {
+        ClientRequest::DeletePluginProfile { profile_id } => {
             handle_delete_plugin_profile(
                 plugin_profile_store,
                 auth_service,
@@ -13069,14 +13587,13 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 profile_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
         ClientRequest::SetActivePluginProfile {
             profile_id,
             dry_run,
-            step_up_token,
         } => {
             handle_set_active_plugin_profile(
                 plugin_profile_store,
@@ -13087,7 +13604,7 @@ async fn dispatch_request(
                 conn,
                 profile_id,
                 dry_run,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -13097,7 +13614,6 @@ async fn dispatch_request(
             description,
             authored_by,
             rules,
-            step_up_token,
         } => {
             handle_put_admission_policy(
                 admission_policy_store,
@@ -13110,7 +13626,7 @@ async fn dispatch_request(
                 description,
                 authored_by,
                 rules,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -13120,10 +13636,7 @@ async fn dispatch_request(
         ClientRequest::ListAdmissionPolicies => {
             handle_list_admission_policies(admission_policy_store).await
         }
-        ClientRequest::DeleteAdmissionPolicy {
-            policy_id,
-            step_up_token,
-        } => {
+        ClientRequest::DeleteAdmissionPolicy { policy_id } => {
             handle_delete_admission_policy(
                 admission_policy_store,
                 auth_service,
@@ -13131,14 +13644,11 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 policy_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::SetActiveAdmissionPolicy {
-            policy_id,
-            step_up_token,
-        } => {
+        ClientRequest::SetActiveAdmissionPolicy { policy_id } => {
             handle_set_active_admission_policy(
                 admission_policy_store,
                 auth_service,
@@ -13146,7 +13656,7 @@ async fn dispatch_request(
                 lifecycle_ledger,
                 conn,
                 policy_id,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -13164,11 +13674,7 @@ async fn dispatch_request(
         ClientRequest::ListPluginsWhere { filter } => {
             handle_list_plugins_where(state, engine, conn, filter).await
         }
-        ClientRequest::DisablePluginsWhere {
-            filter,
-            reason,
-            step_up_token,
-        } => {
+        ClientRequest::DisablePluginsWhere { filter, reason } => {
             handle_bulk_lifecycle_where(
                 state,
                 engine,
@@ -13178,16 +13684,12 @@ async fn dispatch_request(
                 conn,
                 filter,
                 reason,
-                step_up_token,
+                step_up_token.map(str::to_owned),
                 BulkLifecycleAction::Disable,
             )
             .await
         }
-        ClientRequest::EnablePluginsWhere {
-            filter,
-            reason,
-            step_up_token,
-        } => {
+        ClientRequest::EnablePluginsWhere { filter, reason } => {
             handle_bulk_lifecycle_where(
                 state,
                 engine,
@@ -13197,16 +13699,12 @@ async fn dispatch_request(
                 conn,
                 filter,
                 reason,
-                step_up_token,
+                step_up_token.map(str::to_owned),
                 BulkLifecycleAction::Enable,
             )
             .await
         }
-        ClientRequest::SetPluginTag {
-            plugin_name,
-            tag,
-            step_up_token,
-        } => {
+        ClientRequest::SetPluginTag { plugin_name, tag } => {
             handle_set_plugin_tag(
                 state,
                 auth_service,
@@ -13215,15 +13713,11 @@ async fn dispatch_request(
                 conn,
                 plugin_name,
                 tag,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
-        ClientRequest::DeletePluginTag {
-            plugin_name,
-            tag,
-            step_up_token,
-        } => {
+        ClientRequest::DeletePluginTag { plugin_name, tag } => {
             handle_delete_plugin_tag(
                 state,
                 auth_service,
@@ -13232,7 +13726,7 @@ async fn dispatch_request(
                 conn,
                 plugin_name,
                 tag,
-                step_up_token,
+                step_up_token.map(str::to_owned),
             )
             .await
         }
@@ -13350,6 +13844,9 @@ fn client_request_op_tag(req: &ClientRequest) -> &'static str {
         ClientRequest::OnlineProvidersSetEnabled { .. } => {
             "online_providers_set_enabled"
         }
+        ClientRequest::OnlineProvidersSetPrivacyMode { .. } => {
+            "online_providers_set_privacy_mode"
+        }
         ClientRequest::OnlineProvidersSetPriority { .. } => {
             "online_providers_set_priority"
         }
@@ -13430,6 +13927,10 @@ fn client_request_op_tag(req: &ClientRequest) -> &'static str {
         ClientRequest::PairBegin { .. } => "pair_begin",
         ClientRequest::PairComplete { .. } => "pair_complete",
         ClientRequest::PairAuthenticate { .. } => "pair_authenticate",
+        ClientRequest::HouseholdProtectionGet => "household_protection_get",
+        ClientRequest::HouseholdProtectionSet { .. } => {
+            "household_protection_set"
+        }
         ClientRequest::PairList => "pair_list",
         ClientRequest::PairRevoke { .. } => "pair_revoke",
         ClientRequest::SetKioskPassword { .. } => "set_kiosk_password",
@@ -14508,15 +15009,13 @@ async fn handle_import_migration_bundle(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_put_hardware_profile_override(
-    hardware_profile_store: Option<
-        &Arc<crate::hardware_profile::HardwareProfileStore>,
-    >,
+    hardware_profile_store: Option<&Arc<dyn crate::HardwareProfileControl>>,
     auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
     auth_session_store: &Arc<crate::auth::AuthSessionStore>,
     lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
     conn: &ConnectionState,
-    identity: crate::hardware_profile::HardwareIdentity,
-    override_: crate::hardware_profile::HardwareProfileOverride,
+    identity: HardwareIdentity,
+    override_: HardwareProfileOverride,
     step_up_token: Option<String>,
 ) -> ClientResponse {
     let operation = "put_hardware_profile_override";
@@ -14559,33 +15058,29 @@ async fn handle_put_hardware_profile_override(
         .clone()
         .unwrap_or_else(|| format!("peer:{}", conn.peer.uid.unwrap_or(0)));
     let key = identity.key();
-    let response = match store
-        .put_override(identity, override_, &principal_for_record)
-        .await
-    {
-        Ok(_) => ClientResponse::HardwareProfileOverridePut {
-            hardware_profile_override_put: true,
-            key: key.clone(),
-        },
-        Err(crate::hardware_profile::HardwareProfileError::EmptyOverride) => {
-            ClientResponse::Error {
-                error: ApiError::new(
-                    ErrorClass::ContractViolation,
-                    "put_hardware_profile_override: override has no fields \
-                     set; submit at least one override field"
-                        .to_string(),
-                )
-                .with_subclass("hardware_profile_override_empty"),
+    let response =
+        match store.put(identity, override_, &principal_for_record).await {
+            Ok(_) => ClientResponse::HardwareProfileOverridePut {
+                hardware_profile_override_put: true,
+                key: key.clone(),
+            },
+            Err(crate::AudioTopologyRefusal::Validation(msg)) => {
+                ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::ContractViolation,
+                        format!("put_hardware_profile_override: {msg}"),
+                    )
+                    .with_subclass("hardware_profile_override_empty"),
+                }
             }
-        }
-        Err(e) => ClientResponse::Error {
-            error: ApiError::new(
-                ErrorClass::Internal,
-                format!("put_hardware_profile_override: {e}"),
-            )
-            .with_subclass("hardware_profile_persistence_failed"),
-        },
-    };
+            Err(e) => ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("put_hardware_profile_override: {e}"),
+                )
+                .with_subclass("hardware_profile_persistence_failed"),
+            },
+        };
     emit_operation_executed(
         lifecycle_ledger,
         operation,
@@ -14599,9 +15094,7 @@ async fn handle_put_hardware_profile_override(
 }
 
 async fn handle_get_hardware_profile_override(
-    hardware_profile_store: Option<
-        &Arc<crate::hardware_profile::HardwareProfileStore>,
-    >,
+    hardware_profile_store: Option<&Arc<dyn crate::HardwareProfileControl>>,
     conn: &ConnectionState,
     key: String,
 ) -> ClientResponse {
@@ -14626,7 +15119,7 @@ async fn handle_get_hardware_profile_override(
             .with_subclass("hardware_profile_store_not_configured"),
         };
     };
-    match store.get_override(&key).await {
+    match store.get(&key).await {
         Ok(Some(record)) => ClientResponse::HardwareProfileOverrides {
             hardware_profile_overrides: true,
             entries: vec![record],
@@ -14646,9 +15139,7 @@ async fn handle_get_hardware_profile_override(
 }
 
 async fn handle_list_hardware_profile_overrides(
-    hardware_profile_store: Option<
-        &Arc<crate::hardware_profile::HardwareProfileStore>,
-    >,
+    hardware_profile_store: Option<&Arc<dyn crate::HardwareProfileControl>>,
     conn: &ConnectionState,
 ) -> ClientResponse {
     if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
@@ -14672,7 +15163,7 @@ async fn handle_list_hardware_profile_overrides(
             .with_subclass("hardware_profile_store_not_configured"),
         };
     };
-    match store.list_overrides().await {
+    match store.list().await {
         Ok(entries) => ClientResponse::HardwareProfileOverrides {
             hardware_profile_overrides: true,
             entries,
@@ -14689,9 +15180,7 @@ async fn handle_list_hardware_profile_overrides(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_delete_hardware_profile_override(
-    hardware_profile_store: Option<
-        &Arc<crate::hardware_profile::HardwareProfileStore>,
-    >,
+    hardware_profile_store: Option<&Arc<dyn crate::HardwareProfileControl>>,
     auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
     auth_session_store: &Arc<crate::auth::AuthSessionStore>,
     lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
@@ -14735,7 +15224,7 @@ async fn handle_delete_hardware_profile_override(
             .with_subclass("hardware_profile_store_not_configured"),
         };
     };
-    let response = match store.clear_override(&key).await {
+    let response = match store.clear(&key).await {
         Ok(()) => ClientResponse::HardwareProfileOverrideDeleted {
             hardware_profile_override_deleted: true,
             key: key.clone(),
@@ -14762,13 +15251,13 @@ async fn handle_delete_hardware_profile_override(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_put_audio_operator_policy(
-    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    audio_policy_store: Option<&Arc<dyn crate::AudioPolicyControl>>,
     auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
     auth_session_store: &Arc<crate::auth::AuthSessionStore>,
     lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
     conn: &ConnectionState,
     target_key: String,
-    policy: crate::topology_scoring::OperatorPolicy,
+    policy: OperatorPolicy,
     step_up_token: Option<String>,
 ) -> ClientResponse {
     let operation = "put_audio_operator_policy";
@@ -14838,7 +15327,7 @@ async fn handle_put_audio_operator_policy(
 }
 
 async fn handle_get_audio_operator_policy(
-    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    audio_policy_store: Option<&Arc<dyn crate::AudioPolicyControl>>,
     conn: &ConnectionState,
     target_key: String,
 ) -> ClientResponse {
@@ -14882,7 +15371,7 @@ async fn handle_get_audio_operator_policy(
 }
 
 async fn handle_list_audio_operator_policies(
-    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    audio_policy_store: Option<&Arc<dyn crate::AudioPolicyControl>>,
     conn: &ConnectionState,
 ) -> ClientResponse {
     if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
@@ -14923,7 +15412,7 @@ async fn handle_list_audio_operator_policies(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_delete_audio_operator_policy(
-    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    audio_policy_store: Option<&Arc<dyn crate::AudioPolicyControl>>,
     auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
     auth_session_store: &Arc<crate::auth::AuthSessionStore>,
     lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
@@ -14994,13 +15483,13 @@ async fn handle_delete_audio_operator_policy(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_put_audio_volume_mode(
-    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    audio_policy_store: Option<&Arc<dyn crate::AudioPolicyControl>>,
     auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
     auth_session_store: &Arc<crate::auth::AuthSessionStore>,
     lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
     conn: &ConnectionState,
     target_key: String,
-    volume_mode: crate::topology_scoring::VolumeMode,
+    volume_mode: VolumeMode,
     step_up_token: Option<String>,
 ) -> ClientResponse {
     let operation = "put_audio_volume_mode";
@@ -15069,7 +15558,7 @@ async fn handle_put_audio_volume_mode(
 }
 
 async fn handle_get_audio_volume_mode(
-    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    audio_policy_store: Option<&Arc<dyn crate::AudioPolicyControl>>,
     conn: &ConnectionState,
     target_key: String,
 ) -> ClientResponse {
@@ -15112,7 +15601,7 @@ async fn handle_get_audio_volume_mode(
 }
 
 async fn handle_list_audio_volume_modes(
-    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    audio_policy_store: Option<&Arc<dyn crate::AudioPolicyControl>>,
     conn: &ConnectionState,
 ) -> ClientResponse {
     if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
@@ -15152,7 +15641,7 @@ async fn handle_list_audio_volume_modes(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_delete_audio_volume_mode(
-    audio_policy_store: Option<&Arc<crate::audio_policy::AudioPolicyStore>>,
+    audio_policy_store: Option<&Arc<dyn crate::AudioPolicyControl>>,
     auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
     auth_session_store: &Arc<crate::auth::AuthSessionStore>,
     lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
@@ -15222,15 +15711,12 @@ async fn handle_delete_audio_volume_mode(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_publish_active_audio_topology(
-    audio_topology_store: Option<
-        &Arc<crate::audio_topology::AudioTopologyStore>,
-    >,
-    state: &Arc<StewardState>,
+    audio_topology_store: Option<&Arc<dyn crate::AudioTopologyControl>>,
     auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
     auth_session_store: &Arc<crate::auth::AuthSessionStore>,
     lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
     conn: &ConnectionState,
-    topology: crate::audio_topology::ActiveAudioTopology,
+    topology: ActiveAudioTopology,
     step_up_token: Option<String>,
 ) -> ClientResponse {
     let operation = "publish_active_audio_topology";
@@ -15273,44 +15759,20 @@ async fn handle_publish_active_audio_topology(
         .clone()
         .unwrap_or_else(|| format!("peer:{}", conn.peer.uid.unwrap_or(0)));
     let target_key = topology.target_key.clone();
-    let display_name = topology.display_name.clone();
     let bit_perfect = topology.bit_perfect;
     let score_total = topology.score.total;
     let response = match store.publish(topology, &principal_for_record).await {
-        Ok(_) => {
-            // Emit the typed AudioTopologyChanged happening
-            // so operator UIs receive the live update. Bus
-            // emission may fail if the durable backing store
-            // is full / corrupt; log + carry on so the
-            // publish response still surfaces success to the
-            // operator.
-            if let Err(e) = state
-                .bus
-                .emit_durable(
-                    crate::happenings::Happening::AudioTopologyChanged {
-                        target_key: target_key.clone(),
-                        display_name: display_name.clone(),
-                        bit_perfect,
-                        score_total,
-                        at: std::time::SystemTime::now(),
-                    },
-                )
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    target_key = %target_key,
-                    "failed to emit AudioTopologyChanged happening"
-                );
-            }
-            ClientResponse::ActiveAudioTopologyPublished {
-                active_audio_topology_published: true,
-                target_key: target_key.clone(),
-                bit_perfect,
-                score_total,
-            }
-        }
-        Err(crate::audio_topology::AudioTopologyError::Validation(msg)) => {
+        // Announcing the change is the store's job, not this
+        // handler's: a chain reaches the store from boot
+        // rehydration and from the distribution's own defaults
+        // too, and all three deserve the same notification.
+        Ok(_) => ClientResponse::ActiveAudioTopologyPublished {
+            active_audio_topology_published: true,
+            target_key: target_key.clone(),
+            bit_perfect,
+            score_total,
+        },
+        Err(crate::AudioTopologyRefusal::Validation(msg)) => {
             ClientResponse::Error {
                 error: ApiError::new(
                     ErrorClass::ContractViolation,
@@ -15340,9 +15802,7 @@ async fn handle_publish_active_audio_topology(
 }
 
 async fn handle_get_active_audio_topology(
-    audio_topology_store: Option<
-        &Arc<crate::audio_topology::AudioTopologyStore>,
-    >,
+    audio_topology_store: Option<&Arc<dyn crate::AudioTopologyControl>>,
     conn: &ConnectionState,
     target_key: String,
 ) -> ClientResponse {
@@ -15387,9 +15847,7 @@ async fn handle_get_active_audio_topology(
 }
 
 async fn handle_list_active_audio_topologies(
-    audio_topology_store: Option<
-        &Arc<crate::audio_topology::AudioTopologyStore>,
-    >,
+    audio_topology_store: Option<&Arc<dyn crate::AudioTopologyControl>>,
     conn: &ConnectionState,
 ) -> ClientResponse {
     if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
@@ -15430,9 +15888,7 @@ async fn handle_list_active_audio_topologies(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_clear_active_audio_topology(
-    audio_topology_store: Option<
-        &Arc<crate::audio_topology::AudioTopologyStore>,
-    >,
+    audio_topology_store: Option<&Arc<dyn crate::AudioTopologyControl>>,
     auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
     auth_session_store: &Arc<crate::auth::AuthSessionStore>,
     lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
@@ -16829,7 +17285,12 @@ async fn handle_step_up_auth_verify(
         };
     };
     let peer_gid = conn.peer.gid.unwrap_or(0);
-    let identity = format!("uid:{peer_uid}");
+    // One bucket per caller. On TCP that is the bearer, so one
+    // caller's failures do not lock step-up for the others.
+    let identity = crate::auth::caller_identity(
+        conn.peer.uid,
+        conn.principal_token_id.as_deref(),
+    );
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -16960,7 +17421,7 @@ async fn handle_step_up_auth_verify(
             rate_limiter.record_success(&identity);
             let session = auth_session_store.issue(
                 principal.clone(),
-                peer_uid,
+                identity.clone(),
                 ttl_seconds.map(std::time::Duration::from_secs),
             );
             let payload = StepUpAuthAttemptedPayload {
@@ -17183,8 +17644,11 @@ async fn handle_pair_authenticate(
     let peer_gid = conn.peer.gid.unwrap_or(0);
     // Same identity key as handle_step_up_auth_verify — a password
     // guess is a password guess; the same bucket applies across
-    // both wire ops.
-    let identity = format!("uid:{peer_uid}");
+    // both wire ops, and on TCP that bucket is per bearer.
+    let identity = crate::auth::caller_identity(
+        conn.peer.uid,
+        conn.principal_token_id.as_deref(),
+    );
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -17808,6 +18272,131 @@ async fn handle_pair_complete(
     }
 }
 
+/// `household_protection_get` — the policy plus the distribution's
+/// catalog, in one read so a surface keeps no second map.
+///
+/// Never step-up. On a steward booted without a runtime (harnesses,
+/// embedded builds) it synthesises the first-start snapshot rather
+/// than refusing: a surface asking "what is the policy" on a box
+/// that has none should be told "none", not handed an error.
+fn handle_household_protection_get(
+    household_protection: Option<
+        &Arc<crate::household_protection::HouseholdProtectionRuntime>,
+    >,
+) -> ClientResponse {
+    match household_protection {
+        Some(runtime) => {
+            ClientResponse::HouseholdProtection(runtime.snapshot())
+        }
+        None => ClientResponse::HouseholdProtection(
+            crate::household_protection::snapshot(
+                &crate::household_protection::HouseholdProtectionPolicy::default(),
+                None,
+            ),
+        ),
+    }
+}
+
+/// `household_protection_set` — level, guest overlay and marks.
+///
+/// Three outcomes:
+///
+/// - First start, or a same-or-narrower change: persist, publish,
+///   return the post-write snapshot. No sitting. `chosen` becomes
+///   true.
+/// - A change that *widens* admission — lifting `lend`, or moving
+///   down the ladder while `lend` / `standard` / `strict` is in
+///   force — without a live sitting: `step_up_required`. A guest
+///   must not be able to unlock the panel from the panel.
+/// - No runtime attached: `household_protection_unavailable`. That
+///   branch is for harnesses; it is not an appliance mode.
+#[allow(clippy::too_many_arguments)]
+async fn handle_household_protection_set(
+    household_protection: Option<
+        &Arc<crate::household_protection::HouseholdProtectionRuntime>,
+    >,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    state: &Arc<StewardState>,
+    level: Option<crate::household_protection::ProtectionLevel>,
+    lend: bool,
+    protected_groups: Option<Vec<String>>,
+    step_up_token: Option<&str>,
+) -> ClientResponse {
+    let Some(runtime) = household_protection else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "household protection is not configured on this steward",
+            )
+            .with_subclass("household_protection_unavailable"),
+        };
+    };
+
+    let current = runtime.policy();
+    // Unlock omits level: restore where the operator was before
+    // they lent. A lend that omits level keeps the level in force.
+    // An explicit level is always the operator's choice.
+    let level = match level {
+        Some(level) => level,
+        None if !lend => runtime.restore_level(),
+        None => current.effective_level(),
+    };
+    let next = crate::household_protection::HouseholdProtectionPolicy {
+        chosen: true,
+        level,
+        lend,
+        protected_groups: protected_groups.unwrap_or_default(),
+        prior_level: current.prior_level,
+    };
+
+    if current.widens_to(&next) {
+        if let Err(refusal) = validate_step_up_for_operation(
+            auth_session_store,
+            lifecycle_ledger,
+            conn,
+            "household_protection_set",
+            step_up_token,
+        )
+        .await
+        {
+            return *refusal;
+        }
+    }
+
+    match runtime.apply(next) {
+        Ok(snapshot) => {
+            // One bus signal, so the panel and a LAN browser refresh
+            // from the same event instead of polling.
+            state.bus.emit(
+                crate::happenings::Happening::HouseholdProtectionChanged {
+                    chosen: snapshot.chosen,
+                    level: serde_json::to_value(snapshot.level)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "open".to_owned()),
+                    lend: snapshot.lend,
+                    protected_groups: snapshot.protected_groups.clone(),
+                    prior_level: snapshot.prior_level.and_then(|l| {
+                        serde_json::to_value(l)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_owned))
+                    }),
+                },
+            );
+            ClientResponse::HouseholdProtection(snapshot)
+        }
+        Err(e) => ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!("household protection policy did not persist: {e}"),
+            )
+            .with_subclass("household_protection_not_persisted"),
+        },
+    }
+}
+
 async fn handle_pair_list(
     pairing_store: &Arc<crate::pairing::PairingStore>,
     conn: &ConnectionState,
@@ -17846,14 +18435,16 @@ async fn handle_pair_revoke(
         };
     }
     // Step-up gate — the caller must present a live step-up
-    // token bound to the same peer UID. Skipped when the
-    // caller cannot supply one (Unix-socket local peer with
+    // session bound to its own `caller_identity`. Skipped when
+    // the caller cannot supply one (Unix-socket local peer with
     // an unavailable auth service); the rig-side path uses
     // this branch for CLI demos.
-    if let (Some(token), Some(peer_uid)) =
-        (step_up_token.as_deref(), conn.peer.uid)
-    {
-        if auth_session_store.validate(token, peer_uid).is_err() {
+    if let (Some(token), Some(_)) = (step_up_token.as_deref(), conn.peer.uid) {
+        let identity = crate::auth::caller_identity(
+            conn.peer.uid,
+            conn.principal_token_id.as_deref(),
+        );
+        if auth_session_store.validate(token, &identity).is_err() {
             return ClientResponse::Error {
                 error: ApiError::new(
                     ErrorClass::PermissionDenied,
@@ -18837,17 +19428,46 @@ async fn handle_online_providers_list(
     // the operator-facing typed config; the wire response also
     // carries updated_at_ms for the operator UI's audit line.
     let persistence = &state.persistence;
-    let mut entries: Vec<OnlineProviderEntry> = Vec::with_capacity(rows.len());
-    for cfg in rows {
+    // Enumerate the full registered provider set, not just the
+    // stored rows. The `online_providers` table holds a row only
+    // after an operator has toggled that provider, so a device
+    // nobody has configured has an empty store — listing rows
+    // alone reported zero providers while several were actively
+    // dispatching, and the settings screen cannot render a
+    // toggle for a provider it was never told about. Union the
+    // registry set with whatever the store carries, so a store
+    // row naming a provider the registry does not know still
+    // surfaces (it renders under the catch-all facts) rather
+    // than vanishing.
+    let stored: std::collections::BTreeMap<
+        String,
+        crate::online_providers::OnlineProviderConfig,
+    > = rows
+        .into_iter()
+        .map(|cfg| (cfg.provider_id.clone(), cfg))
+        .collect();
+    let mut provider_ids: Vec<String> = REGISTERED_ONLINE_PROVIDERS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for id in stored.keys() {
+        if !provider_ids.iter().any(|p| p == id) {
+            provider_ids.push(id.clone());
+        }
+    }
+
+    let mut entries: Vec<OnlineProviderEntry> =
+        Vec::with_capacity(provider_ids.len());
+    for provider_id in provider_ids {
         let updated_at_ms =
-            match persistence.get_online_provider(&cfg.provider_id).await {
+            match persistence.get_online_provider(&provider_id).await {
                 Ok(Some(row)) => row.updated_at_ms,
                 Ok(None) => 0,
                 Err(_) => 0,
             };
         // Enrich each row with the static provider registry
         // shape the settings UI needs to render honestly.
-        let facts = online_provider_registry(&cfg.provider_id);
+        let facts = online_provider_registry(&provider_id);
         // has_credential = anonymous providers always true;
         // identity-bearing = vault presence check for the
         // (plugin_id, vault_key) the provider's owning plugin
@@ -18867,10 +19487,74 @@ async fn handle_online_providers_list(
             }
             None => true,
         };
+        // Effective enable state, matching what the consuming
+        // plugins actually do at dispatch time.
+        //
+        // Base is the stored row when the operator has toggled
+        // this provider, else the compile-time default (anonymous
+        // enabled, identity-bearing disabled).
+        //
+        // Then: a stored credential enables its provider. An
+        // operator who stores a key has, by that act, asked for
+        // the provider to be used — there is no second gesture
+        // and there never was a coherent one. The consuming
+        // plugins apply this same rule at load and on every
+        // credential change; reporting the raw store row here
+        // would tell the settings screen a provider is off while
+        // it is actively dispatching. One rule, both surfaces.
+        // An explicit operator row WINS. Credential presence only
+        // supplies the default for a provider the operator has
+        // never touched.
+        //
+        // The distinction is the whole off-switch. A row in this
+        // table exists because someone called
+        // `online_providers_set_enabled` — that is an operator
+        // gesture, and reporting anything other than what they
+        // asked for makes the settings toggle snap back on.
+        // Deriving `enabled` as `row.enabled || has_credential`
+        // did exactly that for all four keyed providers, leaving
+        // "delete the key" as the only way to turn one off — the
+        // bad off-switch the toggle exists to replace.
+        //
+        // With no row, credential presence is the default: an
+        // operator who stored a key has asked for the provider to
+        // be used and there is no second gesture to wait for.
+        // With no row, the posture this listing reports is the
+        // one registration would seed: identity-bearing off,
+        // anonymous on. That comes from the privacy class already
+        // in `facts`, not from the config primitive — the
+        // primitive deliberately knows no provider names, and a
+        // read there would report every unregistered provider as
+        // enabled, including keyed ones.
+        let (base, explicit) = match stored.get(&provider_id) {
+            Some(row) => (row.clone(), true),
+            None => {
+                let seeds_enabled =
+                    crate::online_providers::ProviderPrivacyClass::parse(
+                        facts.privacy_class,
+                    )
+                    .map(|c| c.seeds_enabled())
+                    .unwrap_or(true);
+                (
+                    crate::online_providers::OnlineProviderConfig {
+                        provider_id: provider_id.clone(),
+                        enabled: seeds_enabled,
+                        priority: crate::online_providers::PRIORITY_UNSET,
+                    },
+                    false,
+                )
+            }
+        };
+        let enabled = if explicit {
+            base.enabled
+        } else {
+            base.enabled
+                || has_credential_implies_enabled(&facts, has_credential)
+        };
         entries.push(OnlineProviderEntry {
-            provider_id: cfg.provider_id,
-            enabled: cfg.enabled,
-            priority: cfg.priority,
+            provider_id,
+            enabled,
+            priority: base.priority,
             updated_at_ms,
             privacy_class: facts.privacy_class,
             has_credential,
@@ -18878,8 +19562,29 @@ async fn handle_online_providers_list(
             license: facts.license,
         });
     }
+    // Report the posture alongside the entries. On a read fault
+    // this reports the most restrictive posture rather than the
+    // permissive default — the same fail-safe rule the cascades
+    // apply. A listing that claimed `enhanced` while the cascades
+    // were suppressing would put the operator's UI and the
+    // device's actual behaviour into disagreement, which is the
+    // failure this field exists to prevent.
+    let privacy_mode = match store.privacy_mode().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                reported = "offline",
+                "online_providers_list: privacy-mode read failed; reporting \
+                 the most restrictive posture so the operator UI cannot \
+                 render a permissive state the cascades are not honouring"
+            );
+            evo_plugin_sdk::contract::context::PrivacyPosture::Offline
+        }
+    };
     ClientResponse::OnlineProvidersListing {
         online_providers_listing: true,
+        privacy_mode: privacy_mode.as_wire().to_string(),
         entries,
     }
 }
@@ -18902,6 +19607,118 @@ struct OnlineProviderFacts {
     /// `Some((plugin_id, vault_key))` for identity-bearing
     /// providers; `None` for anonymous.
     credential: Option<(&'static str, &'static str)>,
+    /// Plugin ids permitted to read this provider's credential
+    /// from its owner's vault scope, in addition to the owner
+    /// itself.
+    ///
+    /// Empty for every provider whose credential serves exactly
+    /// one plugin — which is the default and should stay the
+    /// default. A non-empty list is a deliberate, reviewed grant:
+    /// it exists because one operator-entered key legitimately
+    /// serves surfaces that live in different plugins, and making
+    /// the operator paste the same key twice to satisfy our
+    /// internal partition would be our structure leaking into
+    /// their workflow.
+    ///
+    /// Consumed by [`resolve_provider_credential_scope`]. A plugin
+    /// cannot add itself here; widening access is a framework
+    /// source change that ships in a release.
+    credential_readers: &'static [&'static str],
+}
+
+/// Every provider id [`online_provider_registry`] answers for.
+///
+/// The registry itself is a `match` with a catch-all arm, which
+/// cannot be enumerated. `handle_online_providers_list` needs the
+/// enumeration: the `online_providers` store holds a row only
+/// once an operator has toggled that provider, so a device where
+/// nobody has touched the settings screen has an EMPTY store —
+/// and listing store rows alone reported zero providers while
+/// several were actively dispatching. The settings UI cannot
+/// render a toggle for a provider it was never told exists.
+///
+/// Keep in step with the `match` arms in
+/// [`online_provider_registry`]. A provider present in the match
+/// but missing here is invisible to the settings screen; a
+/// provider here but missing from the match falls to the
+/// catch-all and renders as anonymous / unknown-license, which
+/// is wrong but not silent — it shows up in the UI looking
+/// obviously unfinished.
+const REGISTERED_ONLINE_PROVIDERS: &[&str] = &[
+    "musicbrainz",
+    "wikipedia",
+    "wikidata",
+    "lrclib",
+    "theaudiodb",
+    "lastfm",
+    "discogs",
+    "genius",
+    "cover_art_archive",
+    "itunes",
+    "deezer",
+    "fanart_tv",
+];
+
+/// Whether a stored credential should be reported as enabling
+/// this provider.
+///
+/// True only for identity-bearing providers — those are the ones
+/// whose enable bit the consuming plugins derive from credential
+/// presence. Anonymous providers carry `has_credential: true`
+/// unconditionally (they need no key), so folding that into the
+/// enable state would make an operator-disabled anonymous
+/// provider report as enabled, which is the opposite defect.
+fn has_credential_implies_enabled(
+    facts: &OnlineProviderFacts,
+    has_credential: bool,
+) -> bool {
+    facts.credential.is_some() && has_credential
+}
+
+/// Resolve which vault scope holds a provider's credential, for a
+/// caller that wants to read it.
+///
+/// The credential vault is scoped per plugin by construction —
+/// `PluginScopedCredentialVault` binds `plugin_id` at admission and
+/// no wire frame can steer a plugin to another plugin's rows. That
+/// boundary is deliberate and stays.
+///
+/// This function is the one governed exception. An operator enters
+/// a provider credential exactly once, but a provider can serve
+/// more than one plugin: the Discogs token an operator stores for
+/// release-credits and artist-bio is the same token needed to
+/// fetch that artist's photograph, and the two surfaces live in
+/// different plugins. Asking the operator to paste the same key
+/// into a second box to satisfy an internal partition is not a
+/// design, it is a leak of our structure into their workflow.
+///
+/// So the registry — not the caller — decides. Each provider names
+/// its owning `(plugin_id, vault_key)` and, in `credential_readers`,
+/// the additional plugin ids permitted to read it. A caller gets
+/// the scope back only when it is the owner or an explicitly listed
+/// reader; anything else resolves to `None` and the fetch fails
+/// exactly as an unscoped read would.
+///
+/// The grant is per provider, declared in one table, and readable
+/// in one place. It is not a general cross-scope read, and no
+/// plugin can widen its own access — adding a reader is a framework
+/// source change that ships in a release.
+///
+/// Returns `Some((owner_plugin_id, vault_key))` when the caller may
+/// read, `None` otherwise.
+pub(crate) fn resolve_provider_credential_scope(
+    provider_id: &str,
+    caller_plugin_id: &str,
+) -> Option<(&'static str, &'static str)> {
+    let facts = online_provider_registry(provider_id);
+    let (owner, key) = facts.credential?;
+    if caller_plugin_id == owner
+        || facts.credential_readers.contains(&caller_plugin_id)
+    {
+        Some((owner, key))
+    } else {
+        None
+    }
 }
 
 fn online_provider_registry(provider_id: &str) -> OnlineProviderFacts {
@@ -18913,24 +19730,28 @@ fn online_provider_registry(provider_id: &str) -> OnlineProviderFacts {
             kinds: &["release_credits", "reconciliation"],
             license: "CC0",
             credential: None,
+            credential_readers: &[],
         },
         "wikipedia" => OnlineProviderFacts {
             privacy_class: "anonymous",
             kinds: &["bio", "album_notes", "track_annotation", "work_notes"],
             license: "CC BY-SA",
             credential: None,
+            credential_readers: &[],
         },
         "wikidata" => OnlineProviderFacts {
             privacy_class: "anonymous",
             kinds: &["bio", "work_notes"],
             license: "CC0",
             credential: None,
+            credential_readers: &[],
         },
         "lrclib" => OnlineProviderFacts {
             privacy_class: "anonymous",
             kinds: &["lyrics"],
             license: "LRCLIB terms of use",
             credential: None,
+            credential_readers: &[],
         },
         "theaudiodb" => OnlineProviderFacts {
             // Free public test API key `"2"` ships in the client;
@@ -18941,6 +19762,7 @@ fn online_provider_registry(provider_id: &str) -> OnlineProviderFacts {
             kinds: &["bio", "album_notes"],
             license: "TheAudioDB terms of use",
             credential: None,
+            credential_readers: &[],
         },
         "lastfm" => OnlineProviderFacts {
             privacy_class: "identity_bearing",
@@ -18950,15 +19772,31 @@ fn online_provider_registry(provider_id: &str) -> OnlineProviderFacts {
                 "org.evoframework.metadata.online",
                 "lastfm_api_key",
             )),
+            credential_readers: &[],
         },
         "discogs" => OnlineProviderFacts {
             privacy_class: "identity_bearing",
-            kinds: &["album_notes", "release_credits", "bio"],
+            // `artist_artwork` joins the text kinds because the
+            // same operator token now also serves artist
+            // photography in org.evoframework.artwork.online.
+            // Omitting it would have the settings screen tell the
+            // operator Discogs does text only, while it is
+            // actively resolving portraits.
+            kinds: &["album_notes", "release_credits", "bio", "artist_artwork"],
             license: "Discogs terms of use",
             credential: Some((
                 "org.evoframework.metadata.online",
                 "discogs_personal_access_token",
             )),
+            // The operator's Discogs token serves two surfaces in
+            // two plugins: release-credits + artist-bio in
+            // metadata.online (the owner), and artist photography
+            // in artwork.online. Discogs holds real images for
+            // exactly the artist class that falls through every
+            // other artwork provider — fanart is MBID-gated and
+            // skips them, anonymous Deezer returns a blank body
+            // for them. One key, entered once, reaches both.
+            credential_readers: &["org.evoframework.artwork.online"],
         },
         "genius" => OnlineProviderFacts {
             privacy_class: "identity_bearing",
@@ -18968,6 +19806,7 @@ fn online_provider_registry(provider_id: &str) -> OnlineProviderFacts {
                 "org.evoframework.metadata.online",
                 "genius_client_access_token",
             )),
+            credential_readers: &[],
         },
         // Artwork providers (owned by
         // org.evoframework.artwork.online). Listed here so the
@@ -18981,34 +19820,128 @@ fn online_provider_registry(provider_id: &str) -> OnlineProviderFacts {
             kinds: &["album_artwork"],
             license: "CC0",
             credential: None,
+            credential_readers: &[],
         },
         "itunes" => OnlineProviderFacts {
             privacy_class: "anonymous",
             kinds: &["album_artwork"],
             license: "iTunes Search API terms",
             credential: None,
+            credential_readers: &[],
         },
         "deezer" => OnlineProviderFacts {
             privacy_class: "anonymous",
             kinds: &["artist_artwork"],
             license: "Deezer terms of use",
             credential: None,
+            credential_readers: &[],
         },
         "fanart_tv" => OnlineProviderFacts {
             privacy_class: "identity_bearing",
             kinds: &["artist_artwork"],
             license: "fanart.tv terms of use",
+            // Must match `FANART_VAULT_KEY` in
+            // `org.evoframework.artwork.online`. This read
+            // `fanart_tv_api_key` while the plugin stores under
+            // `fanart_tv_personal_api_key`, so the has_credential
+            // probe looked in the wrong slot and reported "no
+            // key" for every operator who had one — the settings
+            // screen showed fanart.tv as unconfigured while the
+            // plugin was dispatching against it happily. A key
+            // name is a contract between two repos with no
+            // compiler to enforce it; the guard test below at
+            // least refuses an empty or obviously-malformed one.
             credential: Some((
                 "org.evoframework.artwork.online",
-                "fanart_tv_api_key",
+                "fanart_tv_personal_api_key",
             )),
+            credential_readers: &[],
         },
         _ => OnlineProviderFacts {
             privacy_class: "anonymous",
             kinds: &[],
             license: "unknown",
             credential: None,
+            credential_readers: &[],
         },
+    }
+}
+
+/// Set the device's metadata privacy posture.
+///
+/// Refuses an unrecognised posture rather than coercing it. The
+/// permissive default is the one value this must never silently
+/// become: an operator who mistypes `anonymous` and is quietly
+/// given `enhanced` believes they are protected and is not.
+/// A refusal is visible and recoverable; a coercion is neither.
+async fn handle_online_providers_set_privacy_mode(
+    state: &Arc<crate::state::StewardState>,
+    conn: &ConnectionState,
+    privacy_mode: String,
+) -> ClientResponse {
+    use evo_plugin_sdk::contract::context::PrivacyPosture;
+
+    if !conn.has(CAP_ONLINE_PROVIDERS_WRITE) && !conn.has("plugins_admin") {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                "online_providers_set_privacy_mode requires \
+                 write:online_providers capability",
+            )
+            .with_subclass("online_providers_write_required"),
+        };
+    }
+    let posture = match privacy_mode.as_str() {
+        "enhanced" => PrivacyPosture::Enhanced,
+        "anonymous_only" => PrivacyPosture::AnonymousOnly,
+        "offline" => PrivacyPosture::Offline,
+        other => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::ContractViolation,
+                    format!(
+                        "online_providers_set_privacy_mode: unknown posture \
+                         {other:?} (expected enhanced | anonymous_only | \
+                         offline); refused rather than coerced so a typo \
+                         cannot silently leave the device more permissive \
+                         than intended"
+                    ),
+                )
+                .with_subclass("unknown_privacy_mode"),
+            };
+        }
+    };
+    let Some(store) = state.online_provider_config_store.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "online_providers_set_privacy_mode: config store not wired",
+            )
+            .with_subclass("provider_store_unavailable"),
+        };
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if let Err(e) = store.set_privacy_mode(posture, now_ms).await {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!(
+                    "online_providers_set_privacy_mode: store write failed: {e}"
+                ),
+            )
+            .with_subclass("privacy_mode_write_failed"),
+        };
+    }
+    tracing::info!(
+        privacy_mode = posture.as_wire(),
+        "operator set device metadata privacy posture"
+    );
+    ClientResponse::OnlineProviderPrivacyModeUpdated {
+        online_provider_privacy_mode_updated: true,
+        privacy_mode: posture.as_wire().to_string(),
     }
 }
 
@@ -21184,7 +22117,7 @@ async fn handle_list_domain_members(
     >,
     discovery_runtime: Option<&Arc<crate::discovery::DiscoveryRuntime>>,
     election_runtime: Option<&evo_primitives::SharedElectionState>,
-    audio_plane_runtime: Option<&Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    audio_plane_runtime: Option<&Arc<dyn crate::AudioPlaneControl>>,
     domain_witness_runtime: Option<
         &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
     >,
@@ -21269,7 +22202,7 @@ async fn handle_list_domain_members(
         std::collections::HashMap<String, u64>,
     ) = match audio_plane_runtime {
         Some(rt) => (
-            rt.idle_reap_threshold().as_millis() as u64,
+            crate::AUDIO_PLANE_IDLE_REAP_THRESHOLD.as_millis() as u64,
             rt.list_connections()
                 .await
                 .into_iter()
@@ -21277,9 +22210,7 @@ async fn handle_list_domain_members(
                 .collect(),
         ),
         None => (
-            crate::audio_plane::AudioPlaneConfig::default()
-                .idle_reap_threshold
-                .as_millis() as u64,
+            crate::AUDIO_PLANE_IDLE_REAP_THRESHOLD.as_millis() as u64,
             std::collections::HashMap::new(),
         ),
     };
@@ -21862,10 +22793,11 @@ fn ipv4_same_subnet(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_bootstrap_domain(
+    multiroom_control_port: u16,
     domain_witness_runtime: Option<
         &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
     >,
-    audio_plane_runtime: Option<&Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    audio_plane_runtime: Option<&Arc<dyn crate::AudioPlaneControl>>,
     device_identity_store: Option<
         &Arc<crate::device_identity::DeviceIdentityStore>,
     >,
@@ -21932,7 +22864,7 @@ async fn handle_bootstrap_domain(
         },
     };
     let endpoints = audio_plane_runtime
-        .map(|ap| enumerate_local_network_endpoints(ap.control_port()))
+        .map(|_| enumerate_local_network_endpoints(multiroom_control_port))
         .unwrap_or_default();
     let witness = match runtime
         .bootstrap_genesis(resolved_display_name, endpoints)
@@ -21979,10 +22911,13 @@ async fn handle_bootstrap_domain(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_join_domain(
+    audio_plane_handle: Option<
+        &Arc<dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle>,
+    >,
     domain_witness_runtime: Option<
         &Arc<crate::domain_witness::runtime::DomainWitnessRuntime>,
     >,
-    audio_plane_runtime: Option<&Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    audio_plane_runtime: Option<&Arc<dyn crate::AudioPlaneControl>>,
     happenings: &Arc<crate::happenings::HappeningBus>,
     auth_service: Option<&Arc<dyn crate::auth::AuthService>>,
     auth_session_store: &Arc<crate::auth::AuthSessionStore>,
@@ -22077,7 +23012,18 @@ async fn handle_join_domain(
                     };
                 }
             };
-        if let Err(e) = Arc::clone(audio_plane).dial_peer(addr).await {
+        let Some(plane_handle) = audio_plane_handle else {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    "join_domain: audio plane not configured".to_string(),
+                )
+                .with_subclass("audio_plane_not_configured"),
+            };
+        };
+        if let Err(e) =
+            Arc::clone(plane_handle).dial_peer(addr.to_string()).await
+        {
             return ClientResponse::Error {
                 error: ApiError::new(
                     ErrorClass::Internal,
@@ -22091,11 +23037,8 @@ async fn handle_join_domain(
         // plane routes the request to every known peer; the
         // freshly-dialed peer is now in that set.
         audio_plane
-            .broadcast_to_peers(
-                crate::audio_plane::AudioPlaneMessage::DomainWitnessRequest {
-                    from_hash_b64:
-                        evo_witness::DomainWitness::zero_prev_hash_b64(),
-                },
+            .broadcast_domain_witness_request(
+                evo_witness::DomainWitness::zero_prev_hash_b64(),
             )
             .await;
     }
@@ -23261,7 +24204,7 @@ async fn handle_list_clock_syncs(
 }
 
 async fn handle_list_audio_plane_connections(
-    audio_plane_runtime: Option<&Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    audio_plane_runtime: Option<&Arc<dyn crate::AudioPlaneControl>>,
     conn: &ConnectionState,
 ) -> ClientResponse {
     if !conn.has(CAPABILITY_PLUGINS_ADMIN) {
@@ -23293,7 +24236,10 @@ async fn handle_list_audio_plane_connections(
 }
 
 async fn handle_audio_plane_dial(
-    audio_plane_runtime: Option<&Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    audio_plane_handle: Option<
+        &Arc<dyn evo_plugin_sdk::contract::audio_plane::AudioPlaneHandle>,
+    >,
+    audio_plane_runtime: Option<&Arc<dyn crate::AudioPlaneControl>>,
     conn: &ConnectionState,
     addr: String,
 ) -> ClientResponse {
@@ -23331,7 +24277,16 @@ async fn handle_audio_plane_dial(
             };
         }
     };
-    if let Err(e) = runtime.clone().dial_peer(parsed).await {
+    let Some(plane_handle) = audio_plane_handle else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "audio_plane_dial: audio plane not configured".to_string(),
+            )
+            .with_subclass("audio_plane_not_configured"),
+        };
+    };
+    if let Err(e) = plane_handle.clone().dial_peer(parsed.to_string()).await {
         return ClientResponse::Error {
             error: ApiError::new(
                 ErrorClass::Internal,
@@ -23360,7 +24315,7 @@ async fn handle_dispatch_to_group(
     group_topology_runtime: Option<
         &Arc<crate::group_topology::GroupTopologyRuntime>,
     >,
-    audio_plane_runtime: Option<&Arc<crate::audio_plane::AudioPlaneRuntime>>,
+    audio_plane_runtime: Option<&Arc<dyn crate::AudioPlaneControl>>,
     conn: &ConnectionState,
     group_id: String,
 ) -> ClientResponse {
@@ -23419,15 +24374,9 @@ async fn handle_dispatch_to_group(
             .into_iter()
             .find(|c| c.remote_device_id == host_id)
             .map(|c| match c.state {
-                crate::audio_plane::ConnectionState::Handshaking => {
-                    "handshaking".to_string()
-                }
-                crate::audio_plane::ConnectionState::Connected => {
-                    "connected".to_string()
-                }
-                crate::audio_plane::ConnectionState::Disconnected => {
-                    "disconnected".to_string()
-                }
+                PeerConnectionState::Handshaking => "handshaking".to_string(),
+                PeerConnectionState::Connected => "connected".to_string(),
+                PeerConnectionState::Disconnected => "disconnected".to_string(),
             }),
         _ => None,
     };
@@ -26187,7 +27136,13 @@ async fn validate_step_up_for_operation(
         }
     };
 
-    match auth_session_store.validate(token, peer_uid) {
+    // The step-up session belongs to the caller, and on TCP the
+    // caller is the bearer, not the peer uid.
+    let identity = crate::auth::caller_identity(
+        conn.peer.uid,
+        conn.principal_token_id.as_deref(),
+    );
+    match auth_session_store.validate(token, &identity) {
         Ok(session) => Ok(session),
         Err(err) => {
             let reason_class = match err {
@@ -26220,6 +27175,22 @@ async fn validate_step_up_for_operation(
                     "step_up_invalid",
                     "step-up token unknown or already revoked",
                 ),
+                // A bearer identity presenting a session bound to a
+                // different caller has not performed step-up: the
+                // refusal is `step_up_required`.
+                // A uid identity presenting another peer's token is
+                // holding a token that is not its own:
+                // `step_up_invalid`.
+                SessionValidationError::WrongPeer
+                    if crate::auth::identity_is_bearer(&identity) =>
+                {
+                    (
+                        "step_up_required",
+                        "step-up required for this session; obtain a \
+                         token via step_up_auth_verify and present it \
+                         in step_up_token",
+                    )
+                }
                 SessionValidationError::WrongPeer => (
                     "step_up_invalid",
                     "step-up token bound to a different peer",
@@ -28331,6 +29302,93 @@ fn compute_projection_wire_value(
     }
 }
 
+/// Declared capability scope of a framework wire op, from the
+/// canonical schema.
+///
+/// Built once from `canonical_schema()` so the gate asks the same
+/// declaration the capability check reads. There is deliberately
+/// no second list of "protected ops" to keep in step.
+fn framework_op_scope(op_id: &str) -> Option<&'static str> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static SCOPES: OnceLock<HashMap<String, String>> = OnceLock::new();
+    SCOPES
+        .get_or_init(|| {
+            crate::projection_schema::canonical_schema()
+                .into_iter()
+                .filter_map(|op| {
+                    op.capability
+                        .scope()
+                        .map(|s| (op.id.as_str().to_owned(), s.to_owned()))
+                })
+                .collect()
+        })
+        .get(op_id)
+        .map(|s| s.as_str())
+}
+
+/// The household-protection gate, for every dispatch path.
+///
+/// Asks one question: is the scope this operation declares
+/// protected under the policy in force? It is not a second
+/// capability system — it runs after the capability check and
+/// cannot grant anything.
+///
+/// Who it binds: every caller arriving with a non-empty token id.
+/// That is the whole rule. LAN-trust carries a fixed id, a kiosk
+/// mint and a pair mint carry theirs, and so does any other
+/// operator-issued bearer; the policy belongs to the device, not
+/// to whoever holds a bearer. The Unix socket carries no token id
+/// and falls through — operator-local, not a browser.
+///
+/// Ways out, in order:
+///   - no runtime attached: lock nothing
+///   - no token id: Unix, operator-local
+///   - operation declares no capability: playback. Never locked.
+///   - scope not protected under the policy in force
+///   - the caller holds a live step-up session of its own: the
+///     owner has proved who they are, so the write proceeds and
+///     the level is unchanged
+fn household_refusal(
+    runtime: Option<
+        &Arc<crate::household_protection::HouseholdProtectionRuntime>,
+    >,
+    conn: &ConnectionState,
+    scope: Option<&str>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    step_up_token: Option<&str>,
+    what: &str,
+) -> Option<ClientResponse> {
+    let runtime = runtime?;
+    let scope = scope?;
+    let token_id = conn.principal_token_id.as_deref()?;
+    if token_id.is_empty() {
+        return None;
+    }
+    if !runtime.is_scope_protected(scope) {
+        return None;
+    }
+    if let Some(token) = step_up_token.filter(|t| !t.is_empty()) {
+        let identity = crate::auth::caller_identity(
+            conn.peer.uid,
+            conn.principal_token_id.as_deref(),
+        );
+        if auth_session_store.validate(token, &identity).is_ok() {
+            return None;
+        }
+    }
+    Some(ClientResponse::Error {
+        error: ApiError::new(
+            ErrorClass::PermissionDenied,
+            format!(
+                "{what} touches a settings group the household policy \
+                 protects; the owner can change this from Settings"
+            ),
+        )
+        .with_subclass("household_policy_locked"),
+    })
+}
+
 /// Dispatch a plugin request (`op = "request"`).
 ///
 /// Routes through the [`PluginRouter`] directly: no admission-engine
@@ -28347,6 +29405,13 @@ async fn handle_plugin_request(
     instance_id: Option<String>,
     granted_capabilities: &HashSet<String>,
     step_up_scopes: &HashSet<String>,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
+    conn: &ConnectionState,
+    step_up_token: Option<&str>,
+    household_protection: Option<
+        &Arc<crate::household_protection::HouseholdProtectionRuntime>,
+    >,
 ) -> ClientResponse {
     let payload = match B64.decode(&payload_b64) {
         Ok(p) => p,
@@ -28467,19 +29532,34 @@ async fn handle_plugin_request(
                             .with_subclass("verb_capability_scope_not_granted"),
                         };
                     }
+                    // The connection's sitting is frozen when it
+                    // is admitted, so a caller who re-authenticated
+                    // afterwards has to be able to say so on the
+                    // call itself. A token presented here is
+                    // validated for this dispatch only — it is not
+                    // recorded on the connection, so the next call
+                    // proves itself again.
+                    //
+                    // The write-scope check above has already
+                    // passed, so this cannot grant a scope the
+                    // principal does not hold; it only supplies the
+                    // sitting for one they do. An anonymous or
+                    // LAN-trust caller has no session to mint a
+                    // token against, and validation binds the token
+                    // to the peer, so neither can elevate here.
                     if !step_up_scopes.contains(scope) {
-                        return ClientResponse::Error {
-                            error: ApiError::new(
-                                ErrorClass::PermissionDenied,
-                                format!(
-                                    "verb {request_type:?} requires active \
-                                     step-up auth on scope {scope:?}; \
-                                     principal holds the write scope but \
-                                     no step-up session"
-                                ),
-                            )
-                            .with_subclass("step_up_required"),
-                        };
+                        match validate_step_up_for_operation(
+                            auth_session_store,
+                            lifecycle_ledger,
+                            conn,
+                            &format!("request:{request_type}"),
+                            step_up_token,
+                        )
+                        .await
+                        {
+                            Ok(_) => {}
+                            Err(refusal) => return *refusal,
+                        }
                     }
                     (Some(scope.clone()), true)
                 }
@@ -28490,6 +29570,21 @@ async fn handle_plugin_request(
         // because the verb has nowhere to land regardless.
         None => (None, false),
     };
+
+    // Household-protection dispatch gate. Runs after the capability
+    // check; a plugin verb declares its scope in its manifest, and
+    // tokens are frozen at mint, so a policy change binds a panel
+    // minted before it without a remint.
+    if let Some(refusal) = household_refusal(
+        household_protection,
+        conn,
+        principal_scope.as_deref(),
+        auth_session_store,
+        step_up_token,
+        &format!("verb {request_type:?}"),
+    ) {
+        return refusal;
+    }
 
     // Warden custody bootstrap for warden+respondent plugins.
     //
@@ -29782,6 +30877,39 @@ fn wall_clock_ms_for_keepalive() -> u64 {
         .unwrap_or(0)
 }
 
+/// Take `step_up_token` off a wire payload before typed parse.
+///
+/// The sitting authorises the caller, not the operation's
+/// arguments, so it is carried once for the whole dispatch rather
+/// than declared on every request shape. `ClientRequest` is
+/// `deny_unknown_fields`, so the key has to leave the map or the
+/// parse refuses every op that does not name it.
+///
+/// A present-but-non-string value is a caller error and refuses;
+/// treating it as absent would answer a malformed sitting with a
+/// prompt for a password the caller already gave.
+fn take_step_up_token(
+    payload: &mut serde_json::Value,
+) -> Result<Option<String>, String> {
+    let Some(map) = payload.as_object_mut() else {
+        return Ok(None);
+    };
+    match map.remove("step_up_token") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(other) => Err(format!(
+            "step_up_token must be a string, got {}",
+            match other {
+                serde_json::Value::Bool(_) => "boolean",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => "object",
+                _ => "a non-string value",
+            }
+        )),
+    }
+}
+
 /// Merge `{"op": op_id}` into `payload` and deserialise as
 /// [`ClientRequest`].
 ///
@@ -29871,6 +30999,931 @@ fn flatten_step_up_scopes(
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as B64;
+
+    #[test]
+    fn every_registered_provider_has_real_registry_facts() {
+        // A provider listed in REGISTERED_ONLINE_PROVIDERS but
+        // missing a `match` arm in `online_provider_registry`
+        // falls to the catch-all and renders in the settings UI
+        // as anonymous / unknown-license. That is wrong and this
+        // test refuses it — the two must stay in step.
+        for id in REGISTERED_ONLINE_PROVIDERS {
+            let facts = online_provider_registry(id);
+            assert_ne!(
+                facts.license, "unknown",
+                "provider `{id}` is enumerated but has no registry \
+                 arm; it would render with catch-all facts"
+            );
+            assert!(
+                !facts.kinds.is_empty(),
+                "provider `{id}` is enumerated but declares no \
+                 content kinds"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_credential_scope_grants_owner_and_listed_readers_only() {
+        // The owner always resolves.
+        assert_eq!(
+            resolve_provider_credential_scope(
+                "discogs",
+                "org.evoframework.metadata.online"
+            ),
+            Some((
+                "org.evoframework.metadata.online",
+                "discogs_personal_access_token"
+            ))
+        );
+
+        // An explicitly granted reader resolves to the OWNER's
+        // scope — one copy of the secret, read through.
+        assert_eq!(
+            resolve_provider_credential_scope(
+                "discogs",
+                "org.evoframework.artwork.online"
+            ),
+            Some((
+                "org.evoframework.metadata.online",
+                "discogs_personal_access_token"
+            ))
+        );
+
+        // Anyone else is refused. This is the boundary — a plugin
+        // that is neither owner nor listed reader gets nothing,
+        // exactly as an unscoped read would.
+        assert_eq!(
+            resolve_provider_credential_scope(
+                "discogs",
+                "org.evoframework.playback.mpd"
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_provider_credential_scope("discogs", "some.random.plugin"),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_credential_scope_refuses_ungranted_keyed_providers() {
+        // Last.fm, Genius and fanart.tv serve exactly one plugin
+        // each and grant no readers. Their owners resolve; nobody
+        // else does — including the plugin that legitimately reads
+        // Discogs. A grant is per provider, not a blanket pass.
+        for (provider, owner) in [
+            ("lastfm", "org.evoframework.metadata.online"),
+            ("genius", "org.evoframework.metadata.online"),
+            ("fanart_tv", "org.evoframework.artwork.online"),
+        ] {
+            assert!(
+                resolve_provider_credential_scope(provider, owner).is_some(),
+                "`{provider}` owner must resolve"
+            );
+            let other = if owner == "org.evoframework.metadata.online" {
+                "org.evoframework.artwork.online"
+            } else {
+                "org.evoframework.metadata.online"
+            };
+            assert_eq!(
+                resolve_provider_credential_scope(provider, other),
+                None,
+                "`{provider}` grants no readers; `{other}` must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_credential_scope_refuses_anonymous_providers() {
+        // Anonymous providers hold no credential at all, so there
+        // is nothing to resolve for anyone.
+        for provider in ["musicbrainz", "wikipedia", "deezer", "itunes"] {
+            for caller in [
+                "org.evoframework.metadata.online",
+                "org.evoframework.artwork.online",
+            ] {
+                assert_eq!(
+                    resolve_provider_credential_scope(provider, caller),
+                    None,
+                    "`{provider}` is anonymous; nothing to grant"
+                );
+            }
+        }
+        // And an id the registry has never heard of.
+        assert_eq!(
+            resolve_provider_credential_scope(
+                "not_a_provider",
+                "org.evoframework.metadata.online"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn credential_readers_are_empty_by_default() {
+        // Cross-scope read is the exception, not the posture. Any
+        // provider gaining a reader is a deliberate reviewed grant
+        // — this test makes the current grant set explicit so a
+        // careless addition shows up as a failing assertion rather
+        // than sliding in unnoticed.
+        let granted: Vec<&str> = REGISTERED_ONLINE_PROVIDERS
+            .iter()
+            .filter(|id| {
+                !online_provider_registry(id).credential_readers.is_empty()
+            })
+            .copied()
+            .collect();
+        assert_eq!(
+            granted,
+            vec!["discogs"],
+            "the set of providers granting cross-scope credential \
+             reads changed; confirm the addition is intended and \
+             update this assertion deliberately"
+        );
+    }
+
+    #[test]
+    fn registry_vault_keys_match_the_owning_plugin_constants() {
+        // A vault key name is a contract between this registry
+        // and a plugin in a different repository. Nothing links
+        // them at compile time, and a mismatch is silent: the
+        // has_credential probe reads an empty slot and reports
+        // "no key" for an operator who has one, while the plugin
+        // dispatches happily against the key it can see. That is
+        // exactly what shipped for fanart.tv — registry said
+        // `fanart_tv_api_key`, plugin stored
+        // `fanart_tv_personal_api_key`.
+        //
+        // These literals mirror the plugin-side constants:
+        //   org.evoframework.metadata.online
+        //     LASTFM_VAULT_KEY  = "lastfm_api_key"
+        //     DISCOGS_VAULT_KEY = "discogs_personal_access_token"
+        //     GENIUS_VAULT_KEY  = "genius_client_access_token"
+        //   org.evoframework.artwork.online
+        //     FANART_VAULT_KEY  = "fanart_tv_personal_api_key"
+        //
+        // Changing a plugin-side constant without changing this
+        // table breaks the settings screen silently; this test
+        // makes the pair fail loudly instead.
+        let expected: &[(&str, &str, &str)] = &[
+            (
+                "lastfm",
+                "org.evoframework.metadata.online",
+                "lastfm_api_key",
+            ),
+            (
+                "discogs",
+                "org.evoframework.metadata.online",
+                "discogs_personal_access_token",
+            ),
+            (
+                "genius",
+                "org.evoframework.metadata.online",
+                "genius_client_access_token",
+            ),
+            (
+                "fanart_tv",
+                "org.evoframework.artwork.online",
+                "fanart_tv_personal_api_key",
+            ),
+        ];
+        for (provider_id, want_plugin, want_key) in expected {
+            let facts = online_provider_registry(provider_id);
+            let (got_plugin, got_key) = facts.credential.unwrap_or_else(|| {
+                panic!("`{provider_id}` must declare a credential location")
+            });
+            assert_eq!(
+                got_plugin, *want_plugin,
+                "`{provider_id}` credential owner drifted from the \
+                 owning plugin"
+            );
+            assert_eq!(
+                got_key, *want_key,
+                "`{provider_id}` vault key drifted from the plugin's \
+                 constant; has_credential will silently read an empty \
+                 slot and the settings screen will report no key"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_bearing_providers_declare_a_credential_location() {
+        // `has_credential` is answered by probing the vault at
+        // the (plugin_id, vault_key) the registry names. An
+        // identity-bearing provider without that pair would
+        // always report has_credential=false and could never be
+        // enabled by storing its key.
+        for id in REGISTERED_ONLINE_PROVIDERS {
+            let facts = online_provider_registry(id);
+            if facts.privacy_class == "identity_bearing" {
+                assert!(
+                    facts.credential.is_some(),
+                    "identity-bearing provider `{id}` names no \
+                     (plugin_id, vault_key); its key could never \
+                     be found"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stored_credential_implies_enabled_only_for_keyed_providers() {
+        // Identity-bearing + key present => reported enabled.
+        let discogs = online_provider_registry("discogs");
+        assert_eq!(discogs.privacy_class, "identity_bearing");
+        assert!(has_credential_implies_enabled(&discogs, true));
+        assert!(!has_credential_implies_enabled(&discogs, false));
+
+        // Anonymous providers carry has_credential=true
+        // unconditionally (they need no key). Folding that into
+        // the enable state would make an operator-disabled
+        // anonymous provider report as enabled — the opposite
+        // defect. Must stay false.
+        let musicbrainz = online_provider_registry("musicbrainz");
+        assert_eq!(musicbrainz.privacy_class, "anonymous");
+        assert!(!has_credential_implies_enabled(&musicbrainz, true));
+    }
+
+    #[test]
+    fn listing_reports_an_explicit_operator_row_verbatim() {
+        // The off-switch, at the listing layer. `enabled` was
+        // derived as `row.enabled || has_credential`, so an
+        // operator who toggled a keyed provider off got
+        // `enabled: true` back on the very next list — the
+        // settings switch snapped on and "delete the key" became
+        // the only way to disable Discogs / Last.fm / Genius /
+        // fanart.tv.
+        //
+        // Mirrors the merge in `handle_online_providers_list`:
+        // an explicit row wins; credential presence supplies the
+        // default only when no row exists.
+        let effective =
+            |explicit: Option<bool>, has_credential: bool| -> bool {
+                let facts = online_provider_registry("discogs");
+                match explicit {
+                    Some(row_enabled) => row_enabled,
+                    None => {
+                        seeded_posture("discogs")
+                            || has_credential_implies_enabled(
+                                &facts,
+                                has_credential,
+                            )
+                    }
+                }
+            };
+
+        // Operator said off, key present → stays off.
+        assert!(
+            !effective(Some(false), true),
+            "an explicit operator off must be reported verbatim \
+             even with the credential present"
+        );
+        // Operator said on → on.
+        assert!(effective(Some(true), true));
+        // Never configured, key present → on by default.
+        assert!(effective(None, true));
+        // Never configured, no key → off.
+        assert!(!effective(None, false));
+    }
+
+    /// The enable posture the listing reports for a provider with
+    /// no stored row: what registration would seed, read off the
+    /// registry's privacy class. Mirrors the production path.
+    fn seeded_posture(provider_id: &str) -> bool {
+        let facts = online_provider_registry(provider_id);
+        crate::online_providers::ProviderPrivacyClass::parse(
+            facts.privacy_class,
+        )
+        .map(|c| c.seeds_enabled())
+        .unwrap_or(true)
+    }
+
+    #[test]
+    fn keyed_providers_default_disabled_but_key_presence_lifts_them() {
+        // The defect this closes end-to-end: on a device where
+        // nobody has ever touched the settings screen the
+        // `online_providers` store is EMPTY, so every provider
+        // falls to the posture registration would seed.
+        // Identity-bearing providers seed disabled — so a stored
+        // Discogs key yielded a listing that said "off" while the
+        // plugin was dispatching. Seeded posture plus credential
+        // authority is what the listing must report.
+        for id in ["discogs", "lastfm", "genius", "fanart_tv"] {
+            assert!(
+                !seeded_posture(id),
+                "`{id}` is identity-bearing; the posture reported \
+                 with no row must stay disabled"
+            );
+            let facts = online_provider_registry(id);
+            let effective = seeded_posture(id)
+                || has_credential_implies_enabled(&facts, true);
+            assert!(
+                effective,
+                "`{id}` with a stored credential must report as \
+                 enabled even with an empty store"
+            );
+        }
+        // Anonymous baseline is untouched by any of this.
+        for id in ["musicbrainz", "wikipedia", "lrclib", "deezer"] {
+            assert!(
+                seeded_posture(id),
+                "`{id}` is anonymous; keyless-first posture keeps \
+                 it enabled with no row"
+            );
+        }
+    }
+
+    /// A connection admitted with the write scope but no active
+    /// sitting — the shape a consumer is in after negotiating and
+    /// then authenticating separately. This is precisely the case
+    /// the gate could not admit before, and why consumers skip
+    /// elevation on this op entirely.
+    fn conn_with_scope_no_sitting(scope: &str) -> ConnectionState {
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        });
+        conn.granted_capabilities.insert(scope.to_string());
+        assert!(
+            conn.step_up_scopes.is_empty(),
+            "the sitting must start empty for these cases to mean anything"
+        );
+        conn
+    }
+
+    /// An anonymous / LAN-trust caller: capabilities but no peer
+    /// identity to bind a session to.
+    fn anonymous_conn_with_scope(scope: &str) -> ConnectionState {
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: None,
+            gid: None,
+        });
+        conn.granted_capabilities.insert(scope.to_string());
+        conn
+    }
+
+    fn principal_for(uid: u32) -> crate::auth::VerifiedPrincipal {
+        crate::auth::VerifiedPrincipal {
+            username: format!("operator{uid}"),
+            uid: Some(uid),
+        }
+    }
+
+    fn refusal_subclass(err: &ApiError) -> Option<String> {
+        err.details
+            .as_ref()
+            .and_then(|d| d.get("subclass"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    #[tokio::test]
+    async fn a_valid_token_supplies_the_sitting_the_connection_lacks() {
+        // The bearer holds the rank; the sitting is empty because
+        // the connection was admitted before the operator
+        // authenticated. A token presented on the call is what
+        // lets that operator through.
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let conn = conn_with_scope_no_sitting("network_admin");
+        let session =
+            store.issue(principal_for(1000), "uid:1000".to_owned(), None);
+
+        let verdict = validate_step_up_for_operation(
+            &store,
+            None,
+            &conn,
+            "request:privileged.verb",
+            Some(session.token.as_str()),
+        )
+        .await;
+        assert!(
+            verdict.is_ok(),
+            "a valid token must supply the sitting, got {:?}",
+            verdict.err().map(|r| *r)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_expired_or_reused_token_refuses() {
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let conn = conn_with_scope_no_sitting("network_admin");
+
+        // No token at all.
+        let none = validate_step_up_for_operation(
+            &store,
+            None,
+            &conn,
+            "request:v",
+            None,
+        )
+        .await;
+        assert_eq!(
+            none.err().and_then(|r| match *r {
+                ClientResponse::Error { error } => refusal_subclass(&error),
+                _ => None,
+            }),
+            Some("step_up_required".to_string())
+        );
+
+        // A token that was never issued.
+        let unknown = validate_step_up_for_operation(
+            &store,
+            None,
+            &conn,
+            "request:v",
+            Some("not-a-real-token"),
+        )
+        .await;
+        assert_eq!(
+            unknown.err().and_then(|r| match *r {
+                ClientResponse::Error { error } => refusal_subclass(&error),
+                _ => None,
+            }),
+            Some("step_up_invalid".to_string())
+        );
+
+        // A token that was issued and then revoked — the reuse
+        // case, where a consumer replays one it already spent.
+        let session =
+            store.issue(principal_for(1000), "uid:1000".to_owned(), None);
+        assert!(store.revoke(&session.token));
+        let reused = validate_step_up_for_operation(
+            &store,
+            None,
+            &conn,
+            "request:v",
+            Some(session.token.as_str()),
+        )
+        .await;
+        assert_eq!(
+            reused.err().and_then(|r| match *r {
+                ClientResponse::Error { error } => refusal_subclass(&error),
+                _ => None,
+            }),
+            Some("step_up_invalid".to_string()),
+            "a spent token must not work a second time"
+        );
+
+        // Expired.
+        let expiring = store.issue(
+            principal_for(1000),
+            "uid:1000".to_owned(),
+            Some(std::time::Duration::from_millis(1)),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let expired = validate_step_up_for_operation(
+            &store,
+            None,
+            &conn,
+            "request:v",
+            Some(expiring.token.as_str()),
+        )
+        .await;
+        assert_eq!(
+            expired.err().and_then(|r| match *r {
+                ClientResponse::Error { error } => refusal_subclass(&error),
+                _ => None,
+            }),
+            Some("step_up_expired".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_or_lan_trust_caller_cannot_elevate() {
+        // A token is bound to the peer it was issued to. An
+        // anonymous caller has no identity to bind one against, so
+        // a token minted for a real operator does not carry over.
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let operators_token =
+            store.issue(principal_for(1000), "uid:1000".to_owned(), None);
+        let anon = anonymous_conn_with_scope("network_admin");
+
+        let verdict = validate_step_up_for_operation(
+            &store,
+            None,
+            &anon,
+            "request:v",
+            Some(operators_token.token.as_str()),
+        )
+        .await;
+        assert_eq!(
+            verdict.err().and_then(|r| match *r {
+                ClientResponse::Error { error } => refusal_subclass(&error),
+                _ => None,
+            }),
+            Some("step_up_invalid".to_string()),
+            "an operator's token must not elevate an anonymous caller"
+        );
+    }
+
+    use crate::admission::{
+        AdmittedHandle, ErasedRespondent, RespondentAdapter,
+    };
+    use evo_plugin_sdk::contract::{
+        BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
+        PluginError, PluginIdentity, Request, Respondent, Response,
+        RuntimeCapabilities,
+    };
+
+    /// The shelf, verb and scope the step-up gate fixtures below
+    /// share. The verb is declared `StepUp` in the entry's policy,
+    /// which is the only shape that reaches the token branch.
+    const GATED_SHELF: &str = "test.step.up";
+    const GATED_VERB: &str = "privileged.verb";
+    const GATED_SCOPE: &str = "network_admin";
+
+    /// What the plugin was actually handed: payload bytes, the
+    /// scope the gate resolved, and whether the gate told it a
+    /// step-up was in force. Recorded so a fixture can read the
+    /// far side of the boundary rather than infer it.
+    type SeenRequest = (Vec<u8>, Option<String>, bool);
+
+    /// A respondent that records each request and echoes the
+    /// payload back unchanged.
+    #[derive(Default)]
+    struct RecordingRespondent {
+        seen: Arc<std::sync::Mutex<Vec<SeenRequest>>>,
+    }
+
+    impl Plugin for RecordingRespondent {
+        fn describe(
+            &self,
+        ) -> impl std::future::Future<Output = PluginDescription> + Send + '_
+        {
+            async move {
+                PluginDescription {
+                    identity: PluginIdentity {
+                        name: "recording".into(),
+                        version: semver::Version::new(0, 1, 0),
+                        contract: 1,
+                    },
+                    runtime_capabilities: RuntimeCapabilities {
+                        request_types: vec![GATED_VERB.into()],
+                        course_correct_verbs: vec![],
+                        accepts_custody: false,
+                        flags: Default::default(),
+                    },
+                    build_info: BuildInfo {
+                        plugin_build: "test".into(),
+                        sdk_version: "0.1.0".into(),
+                        rustc_version: None,
+                        built_at: None,
+                    },
+                }
+            }
+        }
+
+        fn load<'a>(
+            &'a mut self,
+            _ctx: &'a LoadContext,
+        ) -> impl std::future::Future<Output = Result<(), PluginError>> + Send + 'a
+        {
+            async move { Ok(()) }
+        }
+
+        fn unload(
+            &mut self,
+        ) -> impl std::future::Future<Output = Result<(), PluginError>> + Send + '_
+        {
+            async move { Ok(()) }
+        }
+
+        fn health_check(
+            &self,
+        ) -> impl std::future::Future<Output = HealthReport> + Send + '_
+        {
+            async move { HealthReport::healthy() }
+        }
+    }
+
+    impl Respondent for RecordingRespondent {
+        fn handle_request<'a>(
+            &'a self,
+            req: &'a Request,
+        ) -> impl std::future::Future<Output = Result<Response, PluginError>>
+               + Send
+               + 'a {
+            async move {
+                self.seen.lock().unwrap().push((
+                    req.payload.clone(),
+                    req.principal_scope.clone(),
+                    req.has_step_up,
+                ));
+                Ok(Response::for_request(req, req.payload.clone()))
+            }
+        }
+    }
+
+    /// A router carrying one respondent whose verb demands step-up
+    /// on [`GATED_SCOPE`]. Returns the record of what the plugin
+    /// received alongside it, so a fixture can tell "refused at the
+    /// gate" from "dispatched" by evidence rather than by the
+    /// response shape alone.
+    fn router_demanding_step_up(
+        state: &Arc<StewardState>,
+    ) -> (Arc<PluginRouter>, Arc<std::sync::Mutex<Vec<SeenRequest>>>) {
+        let respondent = RecordingRespondent::default();
+        let seen = Arc::clone(&respondent.seen);
+        let erased: Box<dyn ErasedRespondent> =
+            Box::new(RespondentAdapter::new(respondent));
+        let mut policy = crate::router::EnforcementPolicy::permissive();
+        policy.respondent_verb_capabilities.insert(
+            GATED_VERB.to_string(),
+            evo_plugin_sdk::manifest::VerbCapability::StepUp {
+                scope: GATED_SCOPE.to_string(),
+            },
+        );
+        let entry = Arc::new(crate::router::PluginEntry::new_with_policy(
+            "recording".to_string(),
+            GATED_SHELF.to_string(),
+            AdmittedHandle::Respondent(erased),
+            policy,
+        ));
+        let router = Arc::new(PluginRouter::new(Arc::clone(state)));
+        router.insert(entry).expect("respondent admits");
+        (router, seen)
+    }
+
+    #[tokio::test]
+    async fn the_gate_consults_the_token_before_it_refuses() {
+        // The whole point of the cut: a connection holding the
+        // write scope but no sitting used to be refused outright.
+        // With a valid token on the call the dispatch proceeds,
+        // and the plugin is told a step-up is in force.
+        let state = StewardState::for_tests();
+        let (router, seen) = router_demanding_step_up(&state);
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let conn = conn_with_scope_no_sitting(GATED_SCOPE);
+        let session =
+            store.issue(principal_for(1000), "uid:1000".to_owned(), None);
+        let granted: HashSet<String> =
+            [GATED_SCOPE.to_string()].into_iter().collect();
+        let sitting: HashSet<String> = HashSet::new();
+
+        let resp = handle_plugin_request(
+            &router,
+            &state,
+            GATED_SHELF.to_string(),
+            GATED_VERB.to_string(),
+            B64.encode(b"hello"),
+            None,
+            &granted,
+            &sitting,
+            &store,
+            None,
+            &conn,
+            Some(session.token.as_str()),
+            None,
+        )
+        .await;
+
+        match resp {
+            ClientResponse::Success { payload_b64, .. } => {
+                assert_eq!(B64.decode(payload_b64).unwrap(), b"hello");
+            }
+            other => panic!("token must admit the dispatch, got {other:?}"),
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the plugin must have been dispatched");
+        assert_eq!(seen[0].1.as_deref(), Some(GATED_SCOPE));
+        assert!(seen[0].2, "the plugin must be told the step-up is in force");
+    }
+
+    #[tokio::test]
+    async fn the_gate_refuses_and_the_plugin_never_runs_without_a_token() {
+        // Same connection, no token. The refusal has to happen at
+        // the gate, not inside the plugin.
+        let state = StewardState::for_tests();
+        let (router, seen) = router_demanding_step_up(&state);
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let conn = conn_with_scope_no_sitting(GATED_SCOPE);
+        let granted: HashSet<String> =
+            [GATED_SCOPE.to_string()].into_iter().collect();
+        let sitting: HashSet<String> = HashSet::new();
+
+        for token in [None, Some("not-a-real-token")] {
+            let resp = handle_plugin_request(
+                &router,
+                &state,
+                GATED_SHELF.to_string(),
+                GATED_VERB.to_string(),
+                B64.encode(b"hello"),
+                None,
+                &granted,
+                &sitting,
+                &store,
+                None,
+                &conn,
+                token,
+                None,
+            )
+            .await;
+            match resp {
+                ClientResponse::Error { error } => {
+                    let sub = refusal_subclass(&error);
+                    assert!(
+                        matches!(
+                            sub.as_deref(),
+                            Some("step_up_required") | Some("step_up_invalid")
+                        ),
+                        "expected a step-up refusal, got {sub:?}"
+                    );
+                }
+                other => panic!("must refuse without a token, got {other:?}"),
+            }
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a refused call must never reach the plugin"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_plugin_never_receives_the_step_up_token() {
+        // End-to-end on the real dispatch path: the credential
+        // authorising the call is not the plugin's business, so it
+        // must not appear anywhere in what crosses the boundary.
+        let state = StewardState::for_tests();
+        let (router, seen) = router_demanding_step_up(&state);
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        let conn = conn_with_scope_no_sitting(GATED_SCOPE);
+        let session =
+            store.issue(principal_for(1000), "uid:1000".to_owned(), None);
+        let granted: HashSet<String> =
+            [GATED_SCOPE.to_string()].into_iter().collect();
+        let sitting: HashSet<String> = HashSet::new();
+
+        let resp = handle_plugin_request(
+            &router,
+            &state,
+            GATED_SHELF.to_string(),
+            GATED_VERB.to_string(),
+            B64.encode(br#"{"on":true}"#),
+            None,
+            &granted,
+            &sitting,
+            &store,
+            None,
+            &conn,
+            Some(session.token.as_str()),
+            None,
+        )
+        .await;
+
+        let ClientResponse::Success { payload_b64, .. } = resp else {
+            panic!("expected a dispatched response");
+        };
+        let echoed = B64.decode(payload_b64).unwrap();
+        assert_eq!(echoed, br#"{"on":true}"#);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let received = String::from_utf8_lossy(&seen[0].0);
+        assert_eq!(received, r#"{"on":true}"#);
+        assert!(
+            !received.contains(session.token.as_str()),
+            "the token must not reach the plugin payload"
+        );
+    }
+
+    #[test]
+    fn request_accepts_an_optional_step_up_token() {
+        // A consumer that re-authenticated has to be able to say so
+        // on the call. The sitting is taken off the payload before
+        // typed parse and carried for the dispatch; the variant
+        // itself never names it.
+        let mut raw: serde_json::Value = serde_json::from_str(
+            r#"{"shelf":"a.b","request_type":"t","payload_b64":"aGVsbG8=","step_up_token":"tok-123"}"#,
+        )
+        .unwrap();
+        let token = take_step_up_token(&mut raw).unwrap();
+        assert_eq!(token.as_deref(), Some("tok-123"));
+
+        let r = parse_http_wire_request("request", raw).unwrap();
+        match r {
+            ClientRequest::Request { payload_b64, .. } => {
+                // The payload is decoded from its own field, so the
+                // token has no path into what the plugin receives.
+                assert_eq!(B64.decode(payload_b64).unwrap(), b"hello");
+            }
+            other => panic!("expected Request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_non_string_sitting_is_invalid_payload_on_a_declaring_op() {
+        // `request` is one of the ops that used to declare the
+        // field. A malformed sitting refuses rather than reading as
+        // absent — answering it with a password prompt would tell
+        // the caller nothing about what was wrong.
+        for bad in ["42", "true", "[\"a\"]", "{}"] {
+            let mut raw: serde_json::Value = serde_json::from_str(&format!(
+                r#"{{"shelf":"a.b","request_type":"t","payload_b64":"aGVsbG8=","step_up_token":{bad}}}"#,
+            ))
+            .unwrap();
+            assert!(
+                take_step_up_token(&mut raw).is_err(),
+                "a non-string sitting must refuse: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_string_sitting_is_invalid_payload_on_a_non_declaring_op() {
+        // And on an op that never named the field, where the old
+        // shape refused it as an unknown key.
+        let mut raw: serde_json::Value = serde_json::from_str(
+            r#"{"plugin_id":"org.example.plugin","step_up_token":42}"#,
+        )
+        .unwrap();
+        assert!(take_step_up_token(&mut raw).is_err());
+    }
+
+    #[test]
+    fn an_absent_sitting_is_not_an_error() {
+        let mut raw: serde_json::Value =
+            serde_json::from_str(r#"{"plugin_id":"org.example.plugin"}"#)
+                .unwrap();
+        assert_eq!(take_step_up_token(&mut raw).unwrap(), None);
+        // and a null reads as absent, not as malformed
+        let mut null: serde_json::Value = serde_json::from_str(
+            r#"{"plugin_id":"org.example.plugin","step_up_token":null}"#,
+        )
+        .unwrap();
+        assert_eq!(take_step_up_token(&mut null).unwrap(), None);
+    }
+
+    #[test]
+    fn the_sitting_leaves_the_map_so_every_op_parses() {
+        // The reason the field had to go: ClientRequest is
+        // deny_unknown_fields, and most ops never declared it. A
+        // sitting left in the map refuses the op outright.
+        for (op, body) in [
+            (
+                "credential_list_keys",
+                r#"{"plugin_id":"org.example.plugin","step_up_token":"s"}"#,
+            ),
+            (
+                "credential_put",
+                r#"{"plugin_id":"org.example.plugin","key":"k","value_b64":"YQ==","step_up_token":"s"}"#,
+            ),
+        ] {
+            let mut raw: serde_json::Value =
+                serde_json::from_str(body).unwrap();
+            assert!(
+                parse_http_wire_request(op, raw.clone()).is_err(),
+                "{op}: the leftover key is what used to refuse"
+            );
+            let token = take_step_up_token(&mut raw).unwrap();
+            assert_eq!(token.as_deref(), Some("s"));
+            parse_http_wire_request(op, raw)
+                .unwrap_or_else(|e| panic!("{op} must parse once taken: {e}"));
+        }
+    }
+
+    #[test]
+    fn request_still_refuses_any_other_unknown_field() {
+        // deny_unknown_fields is untouched by the transport
+        // extract: a typo is still a parse error rather than a
+        // silently ignored option. `step_up_token` is taken off the
+        // payload before parse, so by the time a request is typed
+        // it is an unknown key like any other.
+        for json in [
+            r#"{"op":"request","shelf":"a.b","request_type":"t","step_up_tokens":"x"}"#,
+            r#"{"op":"request","shelf":"a.b","request_type":"t","stepUpToken":"x"}"#,
+            r#"{"op":"request","shelf":"a.b","request_type":"t","step_up_token":"x","elevate":true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ClientRequest>(json).is_err(),
+                "must refuse unknown fields: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn step_up_token_is_not_part_of_the_plugin_payload() {
+        // What the plugin receives comes from `payload_b64` and
+        // nothing else. A credential authorising this call is not
+        // the plugin's business.
+        let mut raw: serde_json::Value = serde_json::from_str(
+            r#"{"shelf":"a.b","request_type":"t","payload_b64":"aGVsbG8=","step_up_token":"super-secret-token"}"#,
+        )
+        .unwrap();
+        // The sitting leaves the payload at the transport, before
+        // the request is typed at all — so there is no path by
+        // which it could reach the plugin.
+        let taken = take_step_up_token(&mut raw).unwrap();
+        assert_eq!(taken.as_deref(), Some("super-secret-token"));
+        let r = parse_http_wire_request("request", raw).unwrap();
+        let ClientRequest::Request { payload_b64, .. } = r else {
+            panic!("expected Request");
+        };
+        let payload = B64.decode(payload_b64).unwrap();
+        assert_eq!(payload, b"hello");
+        assert!(
+            !String::from_utf8_lossy(&payload).contains("super-secret-token"),
+            "the token must not reach the plugin payload"
+        );
+    }
 
     #[test]
     fn client_request_parses_request_op() {
@@ -32480,14 +34533,9 @@ mod tests {
         let json = r#"{"op":"enable_plugin","plugin":"org.test.x","reason":"because"}"#;
         let r: ClientRequest = serde_json::from_str(json).unwrap();
         match r {
-            ClientRequest::EnablePlugin {
-                plugin,
-                reason,
-                step_up_token,
-            } => {
+            ClientRequest::EnablePlugin { plugin, reason } => {
                 assert_eq!(plugin, "org.test.x");
                 assert_eq!(reason.as_deref(), Some("because"));
-                assert!(step_up_token.is_none());
             }
             other => panic!("expected EnablePlugin, got {other:?}"),
         }
@@ -32502,12 +34550,10 @@ mod tests {
                 plugin,
                 reason,
                 purge_state,
-                step_up_token,
             } => {
                 assert_eq!(plugin, "org.test.x");
                 assert!(reason.is_none());
                 assert!(!purge_state);
-                assert!(step_up_token.is_none());
             }
             other => panic!("expected UninstallPlugin, got {other:?}"),
         }
@@ -32522,13 +34568,8 @@ mod tests {
         }"#;
         let r: ClientRequest = serde_json::from_str(json).unwrap();
         match r {
-            ClientRequest::ReloadCatalogue {
-                source,
-                dry_run,
-                step_up_token,
-            } => {
+            ClientRequest::ReloadCatalogue { source, dry_run } => {
                 assert!(dry_run);
-                assert!(step_up_token.is_none());
                 match source {
                     ReloadSourceWire::Inline { toml } => {
                         assert_eq!(toml, "schema_version = 1");
