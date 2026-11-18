@@ -227,12 +227,9 @@ impl ShelfRequestDispatcher for StewardShelfRequestDispatcher {
     > {
         Box::pin(async move {
             // OOP wire path: principal subject is the calling
-            // plugin. Capability set stays empty for parity with
-            // today's in-process grant model; destination
-            // respondent gates still apply. Tightening to the
-            // caller's admitted manifest CapabilitySet is a
-            // follow-on once admission state is threaded into
-            // the wire EventSink.
+            // plugin. Capability set is the same household
+            // network door the in-process nest holds.
+            // Destination respondent gates still apply.
             let principal = evo_runtime_http::Principal::new(
                 caller_plugin,
                 plugin_system_capabilities(),
@@ -376,26 +373,41 @@ fn plugin_system_principal() -> evo_runtime_http::Principal {
 }
 
 /// Capabilities the framework grants to in-process plugin
-/// dispatches. The set is intentionally broad so the
-/// dispatcher does not become a back-door gate; per-verb
-/// capability requirements live on the destination plugin's
-/// manifest and are honoured at the shelf boundary.
+/// dispatches. Rank is StepUp so a nest flattens as granted
+/// plus sitting: glass `library.remove_source` can reach
+/// `storage.usb.safe_remove` on the household door without a
+/// second password. Destination manifests still gate. This
+/// set is not the operator bootstrap — `system_admin` stays
+/// off it.
 fn plugin_system_capabilities() -> evo_auth_bearer::CapabilitySet {
-    use evo_auth_bearer::CapabilitySet;
-    // The CapabilitySet default is an empty set. The framework's
-    // verb-level capability gate matches on declared
-    // requirements; a broad principal-side grant relies on the
-    // destination plugin to refuse if its verb genuinely needs a
-    // narrower capability. In-process plugins compose through
-    // trust-class alignment; future tightening (per-plugin
-    // capability shaping) lands when admission threads the
-    // caller's declared CapabilitySet into dispatch_as_caller.
-    CapabilitySet::default()
+    use evo_auth_bearer::{Capability, CapabilitySet};
+    CapabilitySet::new(vec![Capability::step_up("network_admin")])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_system_holds_the_household_network_door() {
+        use evo_auth_bearer::Capability;
+        let set = plugin_system_capabilities();
+        let network = set
+            .capabilities()
+            .iter()
+            .find(|c| c.scope() == "network_admin")
+            .expect("plugin-system must hold network_admin");
+        assert!(
+            matches!(network, Capability::StepUp { .. }),
+            "nest must flatten as granted plus sitting: {network:?}"
+        );
+        assert!(
+            !set.capabilities()
+                .iter()
+                .any(|c| c.scope() == "system_admin"),
+            "plugin-system must not hold system_admin"
+        );
+    }
 
     #[test]
     fn classify_known_classes() {

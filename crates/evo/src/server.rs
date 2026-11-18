@@ -12025,6 +12025,7 @@ async fn dispatch_request(
                 conn,
                 step_up_token,
                 household_protection.as_ref(),
+                prompt_ledger,
             )
             .await
         }
@@ -27639,16 +27640,33 @@ fn handle_list_user_interactions(
     ledger: Option<&Arc<crate::prompts::PromptLedger>>,
     conn: &ConnectionState,
 ) -> ClientResponse {
-    let ledger = match require_user_interaction_responder(
+    // Seat first: its holder sees every open prompt, unchanged.
+    let open = match require_user_interaction_responder(
         ledger,
         conn,
         "list_user_interactions",
     ) {
-        Ok(l) => l,
-        Err(resp) => return *resp,
+        Ok(l) => l.open_all(),
+        Err(refusal) => {
+            // Origin door. A connection with no seat still sees
+            // the cards its own dispatches raised — it cannot
+            // answer what it cannot find — and sees nothing
+            // else. A connection that raised none of them is
+            // refused exactly as before rather than handed an
+            // empty success, which would read as "no prompts
+            // pending" to an operator who simply has no standing
+            // here.
+            let Some(l) = ledger else {
+                return *refusal;
+            };
+            let mine = l.open_for_origin(conn.connection_id);
+            if mine.is_empty() {
+                return *refusal;
+            }
+            mine
+        }
     };
-    let prompts = ledger
-        .open_all()
+    let prompts = open
         .into_iter()
         .map(|e| UserInteractionWire {
             plugin: e.plugin,
@@ -27659,6 +27677,43 @@ fn handle_list_user_interactions(
         user_interactions: true,
         prompts,
     }
+}
+
+/// Admit a connection to answer one specific prompt.
+///
+/// Two doors, and the narrow one is tried first. A connection
+/// that is the prompt's stamped origin — the operator whose own
+/// verb raised the question — answers it without holding the
+/// `user_interaction_responder` capability and without the
+/// global seat. That admission is scoped to the single prompt
+/// its dispatch caused: it grants nothing on any other prompt,
+/// and it does not move the seat, which the kiosk still claims
+/// alone.
+///
+/// Everything else falls through to the seat check unchanged,
+/// so the existing `user_interaction_responder_not_granted` /
+/// `responder_slot_held_by_other` / `responder_slot_unclaimed`
+/// refusals are exactly as they were.
+fn admit_prompt_answerer<'a>(
+    ledger: Option<&'a Arc<crate::prompts::PromptLedger>>,
+    conn: &ConnectionState,
+    plugin: &str,
+    prompt_id: &str,
+    op: &'static str,
+) -> Result<&'a Arc<crate::prompts::PromptLedger>, Box<ClientResponse>> {
+    if let Some(l) = ledger {
+        if l.is_stamped_origin(plugin, prompt_id, conn.connection_id) {
+            tracing::info!(
+                op,
+                plugin,
+                prompt_id,
+                answering_conn = conn.connection_id.0,
+                "prompt answered by the dispatch that raised it"
+            );
+            return Ok(l);
+        }
+    }
+    require_user_interaction_responder(ledger, conn, op)
 }
 
 /// Answer an open prompt. Transitions the ledger entry to
@@ -27674,9 +27729,11 @@ fn handle_answer_user_interaction(
     response: evo_plugin_sdk::contract::PromptResponse,
     retain_for: Option<evo_plugin_sdk::contract::RetentionHint>,
 ) -> ClientResponse {
-    let ledger = match require_user_interaction_responder(
+    let ledger = match admit_prompt_answerer(
         ledger,
         conn,
+        &plugin,
+        &prompt_id,
         "answer_user_interaction",
     ) {
         Ok(l) => l,
@@ -27716,9 +27773,11 @@ fn handle_cancel_user_interaction(
     plugin: String,
     prompt_id: String,
 ) -> ClientResponse {
-    let ledger = match require_user_interaction_responder(
+    let ledger = match admit_prompt_answerer(
         ledger,
         conn,
+        &plugin,
+        &prompt_id,
         "cancel_user_interaction",
     ) {
         Ok(l) => l,
@@ -29412,6 +29471,7 @@ async fn handle_plugin_request(
     household_protection: Option<
         &Arc<crate::household_protection::HouseholdProtectionRuntime>,
     >,
+    prompt_ledger: Option<&Arc<crate::prompts::PromptLedger>>,
 ) -> ClientResponse {
     let payload = match B64.decode(&payload_b64) {
         Ok(p) => p,
@@ -29449,6 +29509,10 @@ async fn handle_plugin_request(
     let routed_entry = router
         .lookup_for_verb(&shelf, &request_type)
         .or_else(|| router.lookup(&shelf));
+    // Canonical plugin name for the prompt correlation below.
+    // The same identity the plugin stamps on a prompt frame.
+    let routed_plugin_name: Option<String> =
+        routed_entry.as_ref().map(|e| e.name.clone());
     let (principal_scope, has_step_up) = match routed_entry {
         Some(entry) => {
             // Per-shelf partition gate. Multi-stocking
@@ -29685,6 +29749,16 @@ async fn handle_plugin_request(
         has_step_up,
     };
 
+    // Register this dispatch against the plugin for as long as
+    // it is open. A prompt the plugin raises while it runs is
+    // the operator's own question, so the ledger can stamp it
+    // with this connection and admit that connection to answer
+    // it — without moving the global responder seat, which the
+    // kiosk still holds alone. The guard drops with this scope,
+    // including on an error return from the router.
+    let _dispatch = prompt_ledger.zip(routed_plugin_name.as_ref()).map(
+        |(ledger, plugin)| ledger.enter_dispatch(plugin, conn.connection_id),
+    );
     let result = router.handle_request(&shelf, sdk_request).await;
 
     // Authoritative emission of declared framework happenings on
@@ -31644,6 +31718,87 @@ mod tests {
         (router, seen)
     }
 
+    /// The token has to reach the gate, not merely exist.
+    ///
+    /// `the_gate_*` below drive `handle_plugin_request` directly
+    /// and prove the gate consults a token it is handed. What
+    /// they cannot prove is that a token in the request body ever
+    /// becomes that argument — and severing the wire carriage
+    /// leaves every one of them green.
+    ///
+    /// The carriage cannot be driven from a unit test: it runs on
+    /// `Server::dispatch_http_wire_op`, there is no test
+    /// constructor for a `Server`, and `dispatch_request` is
+    /// reachable only from the two transport paths with a
+    /// `SubstrateHandles` bundle built from a live server. So the
+    /// three links are pinned where they live.
+    ///
+    /// Each link is load-bearing. The take must precede the typed
+    /// parse, because `ClientRequest::Request` denies unknown
+    /// fields and would refuse the frame outright. The binding
+    /// must reach `dispatch_request` unaltered. And the `Request`
+    /// arm must forward it, or a plugin verb declaring a step-up
+    /// capability can never be satisfied by a caller who
+    /// re-authenticated after the connection was admitted.
+    #[test]
+    fn a_body_step_up_token_is_carried_to_the_plugin_gate() {
+        let src = include_str!("server.rs");
+        let body = &src[..src
+            .find("\nmod tests {")
+            .or_else(|| src.find("\n#[cfg(test)]"))
+            .unwrap_or(src.len())];
+
+        // Link 1: taken from the payload, before the typed parse.
+        let take = "        let step_up_token = take_step_up_token(&mut payload)\n            .map_err(HttpDispatchError::InvalidPayload)?;\n";
+        assert!(
+            body.contains(take),
+            "the body token must be taken verbatim and unaltered; \
+             anything wrapping or filtering it severs the carriage"
+        );
+        let take_at = body.find(take).expect("checked above");
+        let parse_at = body
+            .find("let req = parse_http_wire_request(op_id, payload)?;")
+            .expect("the wire op must be parsed");
+        assert!(
+            take_at < parse_at,
+            "the token must be taken before the typed parse, which \
+             denies unknown fields"
+        );
+
+        // Link 2: handed to the dispatcher.
+        let dispatch_at = body[take_at..]
+            .find("let response = dispatch_request(")
+            .map(|i| take_at + i)
+            .expect("the wire op must be dispatched");
+        // Bounded to that call. Scanning past its end finds the
+        // other transport's dispatch and passes while this one
+        // hands the dispatcher nothing.
+        let call_end = body[dispatch_at..]
+            .find(")\n        .await;")
+            .map(|i| dispatch_at + i)
+            .expect("the dispatch call must end");
+        assert!(
+            body[dispatch_at..call_end].contains("step_up_token.as_deref(),"),
+            "the taken token must be passed to dispatch_request on this \
+             path, not merely somewhere in the file"
+        );
+
+        // Link 3: forwarded by the arm that serves a plugin verb.
+        let arm_at = body
+            .find("ClientRequest::Request {")
+            .expect("the request arm must exist");
+        let arm_end = body[arm_at..]
+            .find("ClientRequest::ProjectSubject")
+            .map(|i| arm_at + i)
+            .unwrap_or(body.len());
+        let arm = &body[arm_at..arm_end];
+        assert!(
+            arm.contains("step_up_token,"),
+            "the plugin-request arm must forward the token to \
+             handle_plugin_request: {arm}"
+        );
+    }
+
     #[tokio::test]
     async fn the_gate_consults_the_token_before_it_refuses() {
         // The whole point of the cut: a connection holding the
@@ -31673,6 +31828,7 @@ mod tests {
             None,
             &conn,
             Some(session.token.as_str()),
+            None,
             None,
         )
         .await;
@@ -31715,6 +31871,7 @@ mod tests {
                 None,
                 &conn,
                 token,
+                None,
                 None,
             )
             .await;
@@ -31766,6 +31923,7 @@ mod tests {
             None,
             &conn,
             Some(session.token.as_str()),
+            None,
             None,
         )
         .await;
@@ -35840,6 +35998,482 @@ mod tests {
             .try_claim_responder(conn.connection_id)
             .expect("test setup: ledger must be freshly created");
         conn
+    }
+
+    /// A plain consumer connection: no responder capability, no
+    /// claim on the seat. What a paired browser looks like.
+    fn browser_conn() -> ConnectionState {
+        ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        })
+    }
+
+    /// Issue one open prompt for `plugin` as if `conn` had a
+    /// verb in flight against it — the shape the steward
+    /// produces around `router.handle_request`.
+    fn prompt_raised_inside_dispatch(
+        ledger: &Arc<crate::prompts::PromptLedger>,
+        plugin: &str,
+        prompt_id: &str,
+        conn: &ConnectionState,
+    ) {
+        let guard = ledger.enter_dispatch(plugin, conn.connection_id);
+        ledger.issue(
+            plugin,
+            evo_plugin_sdk::contract::PromptRequest {
+                prompt_id: prompt_id.to_string(),
+                prompt_type: evo_plugin_sdk::contract::PromptType::Password {
+                    label: "NAS password".to_string(),
+                },
+                timeout_ms: None,
+                session_id: None,
+                retention_hint: None,
+                error_context: None,
+                previous_answer: None,
+                priority: None,
+            },
+            std::time::Duration::from_secs(60),
+        );
+        drop(guard);
+    }
+
+    fn password_answer() -> evo_plugin_sdk::contract::PromptResponse {
+        evo_plugin_sdk::contract::PromptResponse::Password {
+            value: "hunter2".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_browser_that_asked_can_answer_its_own_password_card() {
+        // The operator submitted a share add from a paired
+        // browser. The kiosk holds the single responder seat, so
+        // before the origin stamp the card was visible on the
+        // browser and answerable only on the player. It is the
+        // submitter who knows the password.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let kiosk = responder_conn_with_claim(&ledger);
+        let browser = browser_conn();
+        prompt_raised_inside_dispatch(
+            &ledger,
+            "org.evoframework.network.shares",
+            "shares/password/1",
+            &browser,
+        );
+
+        let resp = handle_answer_user_interaction(
+            Some(&ledger),
+            &browser,
+            "org.evoframework.network.shares".to_string(),
+            "shares/password/1".to_string(),
+            password_answer(),
+            None,
+        );
+
+        assert!(
+            matches!(
+                resp,
+                ClientResponse::UserInteractionAnswered { answered: true, .. }
+            ),
+            "the submitter answers the question its own verb raised: \
+             {resp:?}",
+        );
+        // And the seat never moved to get there.
+        assert_eq!(
+            ledger.current_responder(),
+            Some(kiosk.connection_id),
+            "the kiosk is still the single claimant",
+        );
+    }
+
+    #[test]
+    fn the_seat_holder_can_still_answer_a_prompt_it_did_not_raise() {
+        // The other half. A prompt with no origin — raised
+        // outside any dispatch — is the kiosk's to answer,
+        // exactly as before this door existed.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let kiosk = responder_conn_with_claim(&ledger);
+        ledger.issue(
+            "org.evoframework.network.shares",
+            evo_plugin_sdk::contract::PromptRequest {
+                prompt_id: "shares/password/2".to_string(),
+                prompt_type: evo_plugin_sdk::contract::PromptType::Password {
+                    label: "NAS password".to_string(),
+                },
+                timeout_ms: None,
+                session_id: None,
+                retention_hint: None,
+                error_context: None,
+                previous_answer: None,
+                priority: None,
+            },
+            std::time::Duration::from_secs(60),
+        );
+
+        let resp = handle_answer_user_interaction(
+            Some(&ledger),
+            &kiosk,
+            "org.evoframework.network.shares".to_string(),
+            "shares/password/2".to_string(),
+            password_answer(),
+            None,
+        );
+        assert!(
+            matches!(
+                resp,
+                ClientResponse::UserInteractionAnswered { answered: true, .. }
+            ),
+            "the seat still answers an unstamped prompt: {resp:?}",
+        );
+    }
+
+    #[test]
+    fn an_origin_stamped_prompt_stands_with_the_seat_empty() {
+        // Nobody holds the seat — the kiosk is off, or has not
+        // claimed yet. The submitter is still connected and
+        // still waiting on the dispatch that raised the card, so
+        // the prompt has somewhere to land and the wire's
+        // `no_responder_available` fast-refuse must not fire.
+        // That refusal turns on `dispatch_origin` being None;
+        // this pins the term, and that the answer then lands.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        assert_eq!(
+            ledger.current_responder(),
+            None,
+            "test setup: no seat holder",
+        );
+        let browser = browser_conn();
+        let guard = ledger.enter_dispatch(
+            "org.evoframework.network.shares",
+            browser.connection_id,
+        );
+        assert_eq!(
+            ledger.dispatch_origin("org.evoframework.network.shares"),
+            Some(browser.connection_id),
+            "an open dispatch is somewhere for the prompt to land, \
+             so the fast-refuse does not fire",
+        );
+        ledger.issue(
+            "org.evoframework.network.shares",
+            evo_plugin_sdk::contract::PromptRequest {
+                prompt_id: "shares/password/4".to_string(),
+                prompt_type: evo_plugin_sdk::contract::PromptType::Password {
+                    label: "NAS password".to_string(),
+                },
+                timeout_ms: None,
+                session_id: None,
+                retention_hint: None,
+                error_context: None,
+                previous_answer: None,
+                priority: None,
+            },
+            std::time::Duration::from_secs(60),
+        );
+        drop(guard);
+
+        let resp = handle_answer_user_interaction(
+            Some(&ledger),
+            &browser,
+            "org.evoframework.network.shares".to_string(),
+            "shares/password/4".to_string(),
+            password_answer(),
+            None,
+        );
+        assert!(
+            matches!(
+                resp,
+                ClientResponse::UserInteractionAnswered { answered: true, .. }
+            ),
+            "the submitter answers with no seat holder anywhere: {resp:?}",
+        );
+    }
+
+    #[test]
+    fn the_browser_that_asked_can_list_its_own_card() {
+        // An operator cannot answer a card they cannot find.
+        // The submitter lists the prompt its own dispatch
+        // raised — and only that one, not the kiosk's.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let _kiosk = responder_conn_with_claim(&ledger);
+        let browser = browser_conn();
+        prompt_raised_inside_dispatch(
+            &ledger,
+            "org.evoframework.network.shares",
+            "shares/password/mine",
+            &browser,
+        );
+        // A second card the browser had nothing to do with.
+        ledger.issue(
+            "org.evoframework.network.shares",
+            evo_plugin_sdk::contract::PromptRequest {
+                prompt_id: "shares/password/someone-elses".to_string(),
+                prompt_type: evo_plugin_sdk::contract::PromptType::Password {
+                    label: "NAS password".to_string(),
+                },
+                timeout_ms: None,
+                session_id: None,
+                retention_hint: None,
+                error_context: None,
+                previous_answer: None,
+                priority: None,
+            },
+            std::time::Duration::from_secs(60),
+        );
+
+        match handle_list_user_interactions(Some(&ledger), &browser) {
+            ClientResponse::UserInteractions { prompts, .. } => {
+                let ids: Vec<String> = prompts
+                    .iter()
+                    .map(|p| p.prompt.prompt_id.clone())
+                    .collect();
+                assert_eq!(
+                    ids,
+                    vec!["shares/password/mine".to_string()],
+                    "the submitter sees its own card and no other",
+                );
+            }
+            other => panic!("the submitter must be able to list: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_seat_holder_still_lists_every_open_prompt() {
+        // The seat's view did not narrow. It still sees a card
+        // nobody's dispatch raised, and one that a browser's did.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let kiosk = responder_conn_with_claim(&ledger);
+        let browser = browser_conn();
+        prompt_raised_inside_dispatch(
+            &ledger,
+            "org.evoframework.network.shares",
+            "shares/password/from-browser",
+            &browser,
+        );
+        ledger.issue(
+            "org.evoframework.network.shares",
+            evo_plugin_sdk::contract::PromptRequest {
+                prompt_id: "shares/password/unstamped".to_string(),
+                prompt_type: evo_plugin_sdk::contract::PromptType::Password {
+                    label: "NAS password".to_string(),
+                },
+                timeout_ms: None,
+                session_id: None,
+                retention_hint: None,
+                error_context: None,
+                previous_answer: None,
+                priority: None,
+            },
+            std::time::Duration::from_secs(60),
+        );
+
+        match handle_list_user_interactions(Some(&ledger), &kiosk) {
+            ClientResponse::UserInteractions { prompts, .. } => {
+                assert_eq!(
+                    prompts.len(),
+                    2,
+                    "the seat still lists every open prompt",
+                );
+            }
+            other => panic!("the seat holder must still list: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bystander_browser_cannot_list_and_is_refused_as_before() {
+        // No seat, no stamp, no standing. The refusal is the one
+        // that was always there, not an empty success that would
+        // read as "nothing pending".
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let _kiosk = responder_conn_with_claim(&ledger);
+        let asker = browser_conn();
+        let bystander = browser_conn();
+        prompt_raised_inside_dispatch(
+            &ledger,
+            "org.evoframework.network.shares",
+            "shares/password/not-yours",
+            &asker,
+        );
+
+        match handle_list_user_interactions(Some(&ledger), &bystander) {
+            ClientResponse::Error { error } => {
+                assert_eq!(
+                    refusal_subclass(&error).as_deref(),
+                    Some("user_interaction_responder_not_granted"),
+                    "the original refusal is unchanged",
+                );
+            }
+            other => panic!("a bystander must be refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_browser_that_asked_can_cancel_its_own_card() {
+        // Dismissing your own card is the same standing as
+        // answering it. Without this the submitter could answer
+        // but not walk away, and the card burned its TTL.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let kiosk = responder_conn_with_claim(&ledger);
+        let browser = browser_conn();
+        prompt_raised_inside_dispatch(
+            &ledger,
+            "org.evoframework.network.shares",
+            "shares/password/cancel-mine",
+            &browser,
+        );
+
+        let resp = handle_cancel_user_interaction(
+            Some(&ledger),
+            &browser,
+            "org.evoframework.network.shares".to_string(),
+            "shares/password/cancel-mine".to_string(),
+        );
+        assert!(
+            matches!(
+                resp,
+                ClientResponse::UserInteractionCancelled {
+                    cancelled: true,
+                    ..
+                }
+            ),
+            "the submitter dismisses its own card: {resp:?}",
+        );
+        assert_eq!(
+            ledger.current_responder(),
+            Some(kiosk.connection_id),
+            "and the seat never moved to allow it",
+        );
+    }
+
+    #[test]
+    fn the_seat_holder_still_cancels_an_unstamped_prompt() {
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let kiosk = responder_conn_with_claim(&ledger);
+        ledger.issue(
+            "org.evoframework.network.shares",
+            evo_plugin_sdk::contract::PromptRequest {
+                prompt_id: "shares/password/cancel-unstamped".to_string(),
+                prompt_type: evo_plugin_sdk::contract::PromptType::Password {
+                    label: "NAS password".to_string(),
+                },
+                timeout_ms: None,
+                session_id: None,
+                retention_hint: None,
+                error_context: None,
+                previous_answer: None,
+                priority: None,
+            },
+            std::time::Duration::from_secs(60),
+        );
+
+        let resp = handle_cancel_user_interaction(
+            Some(&ledger),
+            &kiosk,
+            "org.evoframework.network.shares".to_string(),
+            "shares/password/cancel-unstamped".to_string(),
+        );
+        assert!(
+            matches!(
+                resp,
+                ClientResponse::UserInteractionCancelled {
+                    cancelled: true,
+                    ..
+                }
+            ),
+            "the seat still cancels a prompt it did not raise: {resp:?}",
+        );
+    }
+
+    #[test]
+    fn a_bystander_browser_cannot_cancel_someone_elses_card() {
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let _kiosk = responder_conn_with_claim(&ledger);
+        let asker = browser_conn();
+        let bystander = browser_conn();
+        prompt_raised_inside_dispatch(
+            &ledger,
+            "org.evoframework.network.shares",
+            "shares/password/cancel-not-yours",
+            &asker,
+        );
+
+        let resp = handle_cancel_user_interaction(
+            Some(&ledger),
+            &bystander,
+            "org.evoframework.network.shares".to_string(),
+            "shares/password/cancel-not-yours".to_string(),
+        );
+        assert!(
+            matches!(resp, ClientResponse::Error { .. }),
+            "a bystander cannot dismiss someone else's card: {resp:?}",
+        );
+    }
+
+    #[test]
+    fn a_bystander_browser_cannot_answer_someone_elses_card() {
+        // The door is one prompt wide. A second browser that
+        // asked for nothing holds no capability, no seat, and no
+        // stamp, and is refused exactly as it was before.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let _kiosk = responder_conn_with_claim(&ledger);
+        let asker = browser_conn();
+        let bystander = browser_conn();
+        prompt_raised_inside_dispatch(
+            &ledger,
+            "org.evoframework.network.shares",
+            "shares/password/3",
+            &asker,
+        );
+
+        let resp = handle_answer_user_interaction(
+            Some(&ledger),
+            &bystander,
+            "org.evoframework.network.shares".to_string(),
+            "shares/password/3".to_string(),
+            password_answer(),
+            None,
+        );
+        assert!(
+            matches!(resp, ClientResponse::Error { .. }),
+            "a bystander is refused: {resp:?}",
+        );
+    }
+
+    #[test]
+    fn two_browsers_waiting_on_one_plugin_stamp_nobody() {
+        // The prompt frame names only the plugin. With two
+        // different connections waiting on it there is nothing
+        // that says which one asked, and handing a password card
+        // to the wrong browser is worse than making the seat
+        // holder answer it.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let _kiosk = responder_conn_with_claim(&ledger);
+        let first = browser_conn();
+        let second = browser_conn();
+        let g1 = ledger.enter_dispatch(
+            "org.evoframework.network.shares",
+            first.connection_id,
+        );
+        let g2 = ledger.enter_dispatch(
+            "org.evoframework.network.shares",
+            second.connection_id,
+        );
+        assert_eq!(
+            ledger.dispatch_origin("org.evoframework.network.shares"),
+            None,
+            "an ambiguous origin is no origin",
+        );
+        drop(g2);
+        assert_eq!(
+            ledger.dispatch_origin("org.evoframework.network.shares"),
+            Some(first.connection_id),
+            "and it resolves again once only one is left",
+        );
+        drop(g1);
+        assert_eq!(
+            ledger.dispatch_origin("org.evoframework.network.shares"),
+            None,
+            "the guard takes the row with it",
+        );
     }
 
     #[test]

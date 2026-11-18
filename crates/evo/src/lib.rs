@@ -1164,6 +1164,42 @@ pub struct RunOptions {
     /// through framework scope names, so `lend` is never a silent
     /// no-op.
     pub household_groups: Option<household_protection::GroupTable>,
+
+    /// Whether a no-bearer caller on the LAN earns the privileged
+    /// capability set. See [`LanPrivilege`].
+    ///
+    /// Defaults to [`LanPrivilege::PolicedByHousehold`], the shape
+    /// every steward has had: LAN origin earns
+    /// [`https_boot::lan_privileged_capability_set`] whenever a
+    /// household-protection runtime is attached to police it. A
+    /// distribution whose LAN must never reach a privileged writer
+    /// without a bearer sets [`LanPrivilege::Withheld`].
+    pub lan_privilege: LanPrivilege,
+}
+
+/// What a no-bearer caller whose effective origin is the LAN is
+/// stamped with when the HTTPS listener admits it.
+///
+/// The household-protection runtime is attached on every steward,
+/// and at [`household_protection::ProtectionLevel::Open`] it protects
+/// nothing. So under the default a LAN caller with no bearer holds
+/// the privileged scopes and passes every writer they gate — the
+/// home-player contract, where anyone in the house may change
+/// Wi-Fi. A device that is not a home player opts out here.
+///
+/// WAN is never affected: it keeps the playback floor either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LanPrivilege {
+    /// LAN origin earns the privileged set while a
+    /// household-protection runtime is attached to police it at
+    /// dispatch. The protection level then decides which of those
+    /// writes the household may make without a step-up sitting.
+    #[default]
+    PolicedByHousehold,
+    /// LAN origin earns the playback floor only, whatever the
+    /// household runtime. Every privileged writer needs a bearer
+    /// that carries its scope.
+    Withheld,
 }
 
 impl RunOptions {
@@ -1180,6 +1216,7 @@ impl RunOptions {
             runtime_setup: None,
             https_setup: None,
             household_groups: None,
+            lan_privilege: LanPrivilege::default(),
         }
     }
 
@@ -1193,6 +1230,7 @@ impl RunOptions {
             runtime_setup: None,
             https_setup: None,
             household_groups: None,
+            lan_privilege: LanPrivilege::default(),
         }
     }
 
@@ -1244,6 +1282,14 @@ impl RunOptions {
         self.household_groups = Some(household_groups);
         self
     }
+
+    /// Choose what a no-bearer LAN caller is stamped with. See the
+    /// [`Self::lan_privilege`] field and [`LanPrivilege`].
+    #[must_use]
+    pub fn with_lan_privilege(mut self, lan_privilege: LanPrivilege) -> Self {
+        self.lan_privilege = lan_privilege;
+        self
+    }
 }
 
 /// Boot, run, and drain the steward.
@@ -1273,6 +1319,7 @@ pub async fn maybe_boot_https(
         std::sync::Arc<dyn evo_plugin_sdk::contract::asset_cache::AssetCache>,
     >,
     https_setup: Option<HttpsSetup>,
+    lan_privilege: LanPrivilege,
 ) -> anyhow::Result<Option<https_boot::HttpsBootHandles>> {
     let Some(listen_raw) = std::env::var_os("EVO_HTTPS_LISTEN_ADDR") else {
         return Ok(None);
@@ -1309,10 +1356,15 @@ pub async fn maybe_boot_https(
     // household-protection runtime is attached to police them at
     // dispatch. No runtime, no privileged stamp — the LAN arm stays
     // on the playback floor, and a missing gate can never hand LAN a
-    // scope no policy sees. WAN is unaffected either way.
-    config.lan_privileged_capabilities = server
-        .household_protection()
-        .map(|_| https_boot::lan_privileged_capability_set());
+    // scope no policy sees. A distribution that withholds LAN
+    // privilege gets the floor even with a runtime attached. WAN is
+    // unaffected either way.
+    config.lan_privileged_capabilities = match lan_privilege {
+        LanPrivilege::PolicedByHousehold => server
+            .household_protection()
+            .map(|_| https_boot::lan_privileged_capability_set()),
+        LanPrivilege::Withheld => None,
+    };
     let handles = https_boot::boot_https(server, config, https_setup).await?;
     tracing::info!(
         listen = %handles.server.local_addr,
@@ -2361,6 +2413,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         runtime_setup,
         https_setup,
         household_groups,
+        lan_privilege,
     } = opts;
     let mut runtime_setup = runtime_setup;
 
@@ -4670,6 +4723,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         &persistence_path,
         Some(Arc::clone(&asset_cache)),
         https_setup,
+        lan_privilege,
     )
     .await
     {

@@ -13,6 +13,21 @@ v0.1.8 is the first tagged release. Versions prior to 0.1.8 existed only as
 workspace-version values in source; they were not tagged and have no release
 artefacts. Consult the git log for pre-0.1.8 history.
 
+## [0.1.13.1] - 2026-11-18
+
+### Added
+
+- **A distribution can withhold LAN privilege.** `RunOptions` carries `lan_privilege: LanPrivilege`, set with `RunOptions::with_lan_privilege()`. Under `LanPrivilege::PolicedByHousehold`, the default, nothing changes: a caller with no bearer whose effective origin is the LAN is stamped with `lan_privileged_capability_set()` while a household-protection runtime is attached, and the protection level decides which of those writes need a step-up sitting. Under `LanPrivilege::Withheld`, that caller stays on the playback floor at every level, so every privileged writer needs a bearer that carries its scope. A caller from the WAN stays on the floor either way.
+- **The dispatch that raised a prompt can answer, list and cancel it.** The steward stamps a prompt raised while it is handling a consumer's dispatch with that dispatch's connection. That connection may answer or cancel that one prompt, and may list the prompts its own dispatches raised, without holding the responder seat. The seat holder's view and rights are unchanged, and the seat never moves. A connection that raised no prompts is refused as before. When two connections are waiting on the same plugin, neither is stamped.
+
+### Fixed
+
+- **A plugin's nested dispatch can reach a `network_admin` writer.** Plugin-to-plugin dispatches run as the `plugin-system` principal, which held no capabilities, so a nested dispatch to a verb gated on `network_admin` was refused. That principal now holds `network_admin` at step-up rank. The destination manifest still gates the verb, and `system_admin` is not in the set. An end-to-end test covers it under both LAN privilege choices.
+
+### Changed
+
+- `maybe_boot_https` takes a new last parameter, `lan_privilege: LanPrivilege`, and `RunOptions` has a new public field, `lan_privilege`. Code that builds `RunOptions` through `new()` or `from_args()` needs no change. Code that builds `RunOptions` with a struct literal, or calls `maybe_boot_https` directly, must supply the new value; `LanPrivilege::default()` keeps the current behaviour.
+
 ## [0.1.13] - 2026-09-01
 
 ### Security

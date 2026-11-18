@@ -4188,7 +4188,14 @@ async fn forward_request_user_interaction(
     // means the steward has no prompt substrate at all (build
     // defect); this subclass means the substrate is in place but
     // no session is currently connected to answer.
-    if ledger.current_responder().is_none() {
+    // An origin-stamped prompt has somewhere to land even with
+    // the seat empty: the operator whose verb raised it is still
+    // connected and waiting on that very dispatch. Refusing fast
+    // here would fail a browser-submitted share add whenever the
+    // kiosk happened to be away.
+    if ledger.current_responder().is_none()
+        && ledger.dispatch_origin(&plugin).is_none()
+    {
         let effective_ms = prompt
             .timeout_ms
             .unwrap_or(evo_plugin_sdk::contract::DEFAULT_PROMPT_TIMEOUT_MS);

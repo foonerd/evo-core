@@ -36,13 +36,13 @@ use evo::household_protection::{
     GroupTable, HouseholdGroupTable, HouseholdProtectionPolicy,
     HouseholdProtectionRuntime, ProtectionLevel,
 };
-use evo::maybe_boot_https;
 use evo::persistence::MemoryPersistenceStore;
 use evo::projections::ProjectionEngine;
 use evo::relations::RelationGraph;
 use evo::server::Server;
 use evo::state::StewardState;
 use evo::subjects::SubjectRegistry;
+use evo::{maybe_boot_https, LanPrivilege};
 use evo_plugin_sdk::contract::{
     BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
     PluginError, PluginIdentity, Request, Respondent, Response,
@@ -63,6 +63,9 @@ const GATED_SCOPE: &str = "system_admin";
 /// Playback transport. No verb capability — the gate must never
 /// lock browse / play / pause / skip / volume, including under lend.
 const PLAY_VERB: &str = "play";
+/// A network writer: `write:network_admin`, the household door a
+/// home player opens to its LAN and a distribution may keep shut.
+const NET_VERB: &str = "set_network";
 
 const CATALOGUE_TOML: &str = r#"
 schema_version = 1
@@ -116,12 +119,16 @@ restart_on_crash = false
 restart_budget = 0
 
 [capabilities.respondent]
-request_types = ["{GATED_VERB}", "{PLAY_VERB}"]
+request_types = ["{GATED_VERB}", "{PLAY_VERB}", "{NET_VERB}"]
 response_budget_ms = 30000
 
 [capabilities.respondent.verb_capabilities.{GATED_VERB}]
 kind = "write"
 scope = "{GATED_SCOPE}"
+
+[capabilities.respondent.verb_capabilities.{NET_VERB}]
+kind = "write"
+scope = "network_admin"
 "#
     );
     Manifest::from_toml(&toml).expect("gate manifest must parse")
@@ -171,6 +178,7 @@ impl Plugin for PanelRespondent {
                     request_types: vec![
                         GATED_VERB.to_string(),
                         PLAY_VERB.to_string(),
+                        NET_VERB.to_string(),
                     ],
                     course_correct_verbs: vec![],
                     accepts_custody: false,
@@ -233,6 +241,14 @@ struct Booted {
 /// admission path and `policy` in force.
 async fn boot(
     policy: HouseholdProtectionPolicy,
+) -> (Booted, tempfile::TempDir) {
+    boot_with(policy, LanPrivilege::default()).await
+}
+
+/// [`boot`], with the distribution's LAN privilege choice.
+async fn boot_with(
+    policy: HouseholdProtectionPolicy,
+    lan_privilege: LanPrivilege,
 ) -> (Booted, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("state tempdir");
     let parent = dir.path().to_path_buf();
@@ -309,6 +325,7 @@ async fn boot(
         &parent.join("persistence.sqlite"),
         None,
         None,
+        lan_privilege,
     )
     .await
     .expect("maybe_boot_https Ok")
@@ -1390,4 +1407,159 @@ async fn file_sharing_read_get_state_needs_no_sitting() {
         .expect("policy applies");
     let (status, out) = post_as(&booted, &pair, "request", play_body()).await;
     assert_eq!(status, 200, "an ungated verb needs no sitting. out={out}");
+}
+
+// ---------------------------------------------------------------
+// The LAN privilege a distribution chooses.
+//
+// A no-bearer LAN caller is stamped by the middleware. Under the
+// default, with a household runtime attached and the level open,
+// that stamp carries `network_admin` and the network writer
+// passes: the home-player contract. A distribution that withholds
+// LAN privilege keeps that caller on the playback floor at every
+// level. WAN is on the floor either way.
+// ---------------------------------------------------------------
+
+/// A private address the same-host proxy forwards for.
+const FORWARDED_LAN: &str = "10.20.30.40";
+/// A documentation address: an origin outside the LAN.
+const FORWARDED_WAN: &str = "203.0.113.9";
+
+fn net_body() -> Value {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    serde_json::json!({
+        "shelf": SHELF,
+        "request_type": NET_VERB,
+        "payload_b64": B64.encode(b"{}"),
+    })
+}
+
+/// One request with no bearer, straight from loopback or as the
+/// same-host proxy forwarding for `forwarded_for`.
+async fn anonymous(
+    booted: &Booted,
+    body: Value,
+    forwarded_for: Option<&str>,
+) -> (u16, Value) {
+    let client = client_with_ca(&booted.ca_pem);
+    let mut req = client
+        .post(format!("https://{}/api/v1/request", booted.addr))
+        .json(&body);
+    if let Some(origin) = forwarded_for {
+        req = req.header("X-Forwarded-For", origin);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status().as_u16();
+    let value: Value = resp.json().await.unwrap_or(Value::Null);
+    (status, value)
+}
+
+fn policy_at(level: ProtectionLevel) -> HouseholdProtectionPolicy {
+    HouseholdProtectionPolicy {
+        chosen: true,
+        level,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn withheld_lan_privilege_refuses_the_network_writer_from_loopback() {
+    let _guard = ENV_LOCK.lock().await;
+    // Open protects nothing, so only the stamp can refuse here.
+    let (booted, _dir) = boot_with(open_policy(), LanPrivilege::Withheld).await;
+
+    let (status, body) = anonymous(&booted, net_body(), None).await;
+    assert_eq!(status, 403, "body={body}");
+    assert_eq!(
+        subclass_of(&body).as_deref(),
+        Some("verb_capability_scope_not_granted"),
+        "a withheld LAN holds no network_admin. body={body}"
+    );
+}
+
+#[tokio::test]
+async fn withheld_lan_privilege_refuses_the_network_writer_through_the_proxy() {
+    let _guard = ENV_LOCK.lock().await;
+    let (booted, _dir) = boot_with(open_policy(), LanPrivilege::Withheld).await;
+
+    let (status, body) =
+        anonymous(&booted, net_body(), Some(FORWARDED_LAN)).await;
+    assert_eq!(status, 403, "body={body}");
+    assert_eq!(
+        subclass_of(&body).as_deref(),
+        Some("verb_capability_scope_not_granted"),
+        "a private origin behind the local proxy is still LAN, and \
+         still withheld. body={body}"
+    );
+}
+
+#[tokio::test]
+async fn withheld_lan_privilege_keeps_the_playback_floor() {
+    let _guard = ENV_LOCK.lock().await;
+    let (booted, _dir) = boot_with(open_policy(), LanPrivilege::Withheld).await;
+
+    for forwarded_for in [None, Some(FORWARDED_LAN)] {
+        let (status, body) =
+            anonymous(&booted, play_body(), forwarded_for).await;
+        assert_eq!(
+            status, 200,
+            "play is on the floor. via={forwarded_for:?} body={body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_default_open_household_lets_lan_reach_the_network_writer() {
+    let _guard = ENV_LOCK.lock().await;
+    // The home player as it ships: no bearer, open level, Wi-Fi
+    // writable from the house.
+    let (booted, _dir) = boot(open_policy()).await;
+    assert_eq!(LanPrivilege::default(), LanPrivilege::PolicedByHousehold);
+
+    for forwarded_for in [None, Some(FORWARDED_LAN)] {
+        let (status, body) =
+            anonymous(&booted, net_body(), forwarded_for).await;
+        assert_eq!(
+            status, 200,
+            "the privileged stamp is still there. via={forwarded_for:?} \
+             body={body}"
+        );
+        assert!(subclass_of(&body).is_none(), "body={body}");
+    }
+}
+
+#[tokio::test]
+async fn the_default_still_refuses_lan_above_open_without_a_sitting() {
+    let _guard = ENV_LOCK.lock().await;
+    // Low keeps the networking surfaces with the owner; Strict keeps
+    // everything. The stamp admits LAN to the writer, and the policy
+    // refuses it, exactly as before.
+    for level in [ProtectionLevel::Low, ProtectionLevel::Strict] {
+        let (booted, _dir) = boot(policy_at(level)).await;
+        let (status, body) = anonymous(&booted, net_body(), None).await;
+        assert_eq!(
+            subclass_of(&body).as_deref(),
+            Some("household_policy_locked"),
+            "level={level:?} status={status} body={body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn wan_stays_on_the_floor_whatever_the_distribution_chooses() {
+    let _guard = ENV_LOCK.lock().await;
+    for lan_privilege in
+        [LanPrivilege::PolicedByHousehold, LanPrivilege::Withheld]
+    {
+        let (booted, _dir) = boot_with(open_policy(), lan_privilege).await;
+        let (status, body) =
+            anonymous(&booted, net_body(), Some(FORWARDED_WAN)).await;
+        assert_eq!(status, 403, "{lan_privilege:?} body={body}");
+        assert_eq!(
+            subclass_of(&body).as_deref(),
+            Some("verb_capability_scope_not_granted"),
+            "{lan_privilege:?} body={body}"
+        );
+    }
 }

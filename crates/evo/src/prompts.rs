@@ -109,6 +109,21 @@ pub struct PromptEntry {
     /// `Instant::now() + timeout_ms` at issue time using the
     /// effective timeout (declared or default).
     pub deadline: Instant,
+    /// The consumer connection entitled to answer this prompt
+    /// without holding the global responder seat.
+    ///
+    /// Stamped at issue time from the dispatch the plugin was
+    /// handling when it raised the prompt — the operator whose
+    /// own gesture caused the question is the one who can see
+    /// it and the one who knows the answer. `None` when the
+    /// plugin raised the prompt outside any dispatch, or when
+    /// the origin was ambiguous; the prompt is then answerable
+    /// by the seat holder alone, exactly as before.
+    ///
+    /// This never widens who may answer *other* prompts, and it
+    /// never touches the seat: the kiosk remains the single
+    /// claimant.
+    pub answerable_by: Option<ResponderConnectionId>,
 }
 
 /// Composite key on the ledger: `(plugin, prompt_id)`.
@@ -213,6 +228,48 @@ pub struct PromptLedger {
     /// [`Self::ui_admitted`] for the reactive emission to
     /// fire; without it the store is updated silently.
     happenings: Option<Arc<HappeningBus>>,
+    /// Consumer verb dispatches currently open against each
+    /// plugin, keyed by canonical plugin name.
+    ///
+    /// The plugin wire contract carries no caller identity, and
+    /// deliberately still does not: a prompt frame names only
+    /// the plugin. The correlation is the steward's, held here
+    /// for exactly as long as the dispatch it describes —
+    /// [`DispatchGuard`] removes the entry on drop, so a verb
+    /// that panics or errors leaves nothing behind to
+    /// mis-attribute a later prompt to.
+    in_flight: Mutex<HashMap<String, Vec<ResponderConnectionId>>>,
+}
+
+/// Registration of one open consumer dispatch against a plugin,
+/// removed from the ledger when this guard drops.
+///
+/// Held across the router await in the steward's plugin-request
+/// path. Drop-on-unwind is the point: an in-flight row that
+/// outlived its verb would hand a later, unrelated prompt to a
+/// connection that has no business answering it.
+pub struct DispatchGuard {
+    ledger: Arc<PromptLedger>,
+    plugin: String,
+    connection: ResponderConnectionId,
+}
+
+impl Drop for DispatchGuard {
+    fn drop(&mut self) {
+        let mut open = self
+            .ledger
+            .in_flight
+            .lock()
+            .expect("prompt ledger in-flight mutex poisoned");
+        if let Some(rows) = open.get_mut(&self.plugin) {
+            if let Some(at) = rows.iter().position(|c| *c == self.connection) {
+                rows.remove(at);
+            }
+            if rows.is_empty() {
+                open.remove(&self.plugin);
+            }
+        }
+    }
 }
 
 impl PromptLedger {
@@ -225,6 +282,7 @@ impl PromptLedger {
             persistence: None,
             ui_admitted: None,
             happenings: None,
+            in_flight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -360,6 +418,78 @@ impl PromptLedger {
         *self.responder.lock().expect("responder mutex poisoned")
     }
 
+    /// Record that `connection` has a verb in flight against
+    /// `plugin`, so a prompt the plugin raises while it is open
+    /// can be answered by the operator who asked for it.
+    ///
+    /// The returned guard removes the row on drop; the caller
+    /// holds it across the dispatch await.
+    pub fn enter_dispatch(
+        self: &Arc<Self>,
+        plugin: &str,
+        connection: ResponderConnectionId,
+    ) -> DispatchGuard {
+        {
+            let mut open = self
+                .in_flight
+                .lock()
+                .expect("prompt ledger in-flight mutex poisoned");
+            open.entry(plugin.to_string()).or_default().push(connection);
+        }
+        DispatchGuard {
+            ledger: Arc::clone(self),
+            plugin: plugin.to_string(),
+            connection,
+        }
+    }
+
+    /// The connection a prompt from `plugin` belongs to, when
+    /// that is unambiguous.
+    ///
+    /// `Some` only while every dispatch open against the plugin
+    /// belongs to one connection — one operator asking one
+    /// question. Two different connections waiting on the same
+    /// plugin answer `None`: the prompt frame carries nothing
+    /// that distinguishes them, and handing a password card to
+    /// the wrong one of two browsers is worse than making the
+    /// seat holder answer it. The same connection with two
+    /// verbs in flight is not ambiguous and still resolves.
+    pub fn dispatch_origin(
+        &self,
+        plugin: &str,
+    ) -> Option<ResponderConnectionId> {
+        let open = self
+            .in_flight
+            .lock()
+            .expect("prompt ledger in-flight mutex poisoned");
+        let rows = open.get(plugin)?;
+        let first = *rows.first()?;
+        rows.iter().all(|c| *c == first).then_some(first)
+    }
+
+    /// Whether `connection` may answer this specific prompt by
+    /// being the dispatch it came from.
+    ///
+    /// Independent of the responder seat and of the
+    /// `user_interaction_responder` capability: this is the
+    /// operator who submitted the verb that raised the
+    /// question, answering that question and nothing else.
+    pub fn is_stamped_origin(
+        &self,
+        plugin: &str,
+        prompt_id: &str,
+        connection: ResponderConnectionId,
+    ) -> bool {
+        let entries = self
+            .entries
+            .lock()
+            .expect("prompt ledger entries mutex poisoned");
+        entries
+            .get(&(plugin.to_string(), prompt_id.to_string()))
+            .and_then(|e| e.answerable_by)
+            == Some(connection)
+    }
+
     /// Issue a new prompt or re-attach to an existing one. When
     /// `(plugin, prompt_id)` is already present, the existing
     /// entry's request and deadline are overwritten and the
@@ -385,11 +515,16 @@ impl PromptLedger {
         let ui_prompt_id = request.prompt_id.clone();
         let ui_priority = request.priority;
         let deadline = Instant::now() + effective_timeout;
+        // Stamp the dispatch this prompt was raised inside, so
+        // the operator who caused the question can answer it
+        // without the global seat.
+        let answerable_by = self.dispatch_origin(plugin);
         let entry = PromptEntry {
             plugin: plugin.to_string(),
             request: request.clone(),
             state: PromptState::Open,
             deadline,
+            answerable_by,
         };
         let mut guard =
             self.entries.lock().expect("prompt ledger mutex poisoned");
@@ -706,6 +841,29 @@ impl PromptLedger {
             .collect()
     }
 
+    /// Snapshot the open prompts `connection` raised — the
+    /// cards its own dispatches caused, and nothing else.
+    ///
+    /// The seat holder's view is [`Self::open_all`]; this is the
+    /// view a connection gets by having asked the question. An
+    /// operator who submitted nothing sees an empty list, which
+    /// the caller turns back into the ordinary seat refusal
+    /// rather than an empty success.
+    pub fn open_for_origin(
+        &self,
+        connection: ResponderConnectionId,
+    ) -> Vec<PromptEntry> {
+        let guard = self.entries.lock().expect("prompt ledger mutex poisoned");
+        guard
+            .values()
+            .filter(|e| {
+                e.state == PromptState::Open
+                    && e.answerable_by == Some(connection)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Number of entries in the ledger (any state). Diagnostic
     /// surface; not consulted on the dispatch path.
     pub fn len(&self) -> usize {
@@ -788,6 +946,12 @@ impl PromptLedger {
                 request,
                 state: PromptState::Open,
                 deadline,
+                // A restored prompt has no live origin to name:
+                // connection ids are process-local and the
+                // connection that raised this one did not
+                // survive the restart. The seat holder answers
+                // it, which is what happened before any of this.
+                answerable_by: None,
             };
             let mut guard =
                 self.entries.lock().expect("prompt ledger mutex poisoned");
