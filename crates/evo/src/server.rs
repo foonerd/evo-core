@@ -11115,6 +11115,7 @@ impl Server {
                 framework_op_scope(op_id),
                 &self.auth_session_store,
                 step_up_token.as_deref(),
+                None,
                 &format!("op {op_id:?}"),
             ) {
                 let error = match refusal {
@@ -29416,6 +29417,7 @@ fn household_refusal(
     scope: Option<&str>,
     auth_session_store: &Arc<crate::auth::AuthSessionStore>,
     step_up_token: Option<&str>,
+    inherited: Option<&crate::nest_sitting::ConsumerSitting>,
     what: &str,
 ) -> Option<ClientResponse> {
     let runtime = runtime?;
@@ -29433,6 +29435,16 @@ fn household_refusal(
             conn.principal_token_id.as_deref(),
         );
         if auth_session_store.validate(token, &identity).is_ok() {
+            return None;
+        }
+    }
+    // A nested dispatch carries the sitting of the consumer it
+    // serves, validated against that consumer's identity now.
+    if let Some(sitting) = inherited {
+        if auth_session_store
+            .validate(sitting.token(), sitting.identity())
+            .is_ok()
+        {
             return None;
         }
     }
@@ -29635,6 +29647,13 @@ async fn handle_plugin_request(
         None => (None, false),
     };
 
+    // A nested dispatch serves the consumer whose request the
+    // calling plugin is answering. Find that consumer, when it is
+    // unambiguous, so the gate below can accept its sitting.
+    let nest_origin = household_protection
+        .zip(crate::nest_sitting::nested_from())
+        .and_then(|(runtime, from)| runtime.nest_sittings().origin_of(&from));
+
     // Household-protection dispatch gate. Runs after the capability
     // check; a plugin verb declares its scope in its manifest, and
     // tokens are frozen at mint, so a policy change binds a panel
@@ -29645,6 +29664,9 @@ async fn handle_plugin_request(
         principal_scope.as_deref(),
         auth_session_store,
         step_up_token,
+        nest_origin
+            .as_ref()
+            .and_then(crate::nest_sitting::NestOrigin::sitting),
         &format!("verb {request_type:?}"),
     ) {
         return refusal;
@@ -29759,7 +29781,37 @@ async fn handle_plugin_request(
     let _dispatch = prompt_ledger.zip(routed_plugin_name.as_ref()).map(
         |(ledger, plugin)| ledger.enter_dispatch(plugin, conn.connection_id),
     );
-    let result = router.handle_request(&shelf, sdk_request).await;
+    // Record the consumer this dispatch serves against the plugin,
+    // for as long as it is open, so a nest the plugin makes can
+    // find it. A nest is recorded under the consumer it inherited,
+    // so a chain of nests keeps the one consumer. The token stays
+    // here; the plugin's request carries none.
+    let _consumer = household_protection.zip(routed_plugin_name.as_ref()).map(
+        |(runtime, plugin)| {
+            let origin = nest_origin.unwrap_or_else(|| {
+                crate::nest_sitting::NestOrigin::new(
+                    conn.connection_id,
+                    step_up_token.filter(|t| !t.is_empty()).map(|token| {
+                        crate::nest_sitting::ConsumerSitting::new(
+                            token,
+                            crate::auth::caller_identity(
+                                conn.peer.uid,
+                                conn.principal_token_id.as_deref(),
+                            ),
+                        )
+                    }),
+                )
+            });
+            runtime.nest_sittings().enter(plugin, origin)
+        },
+    );
+    // The handler runs as the plugin on this task: a nest it makes
+    // in process names it as its origin.
+    let result = crate::nest_sitting::run_as_plugin(
+        routed_plugin_name.clone(),
+        router.handle_request(&shelf, sdk_request),
+    )
+    .await;
 
     // Authoritative emission of declared framework happenings on
     // successful dispatch of well-known operator-issued ops.

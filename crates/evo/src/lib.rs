@@ -172,6 +172,10 @@ pub mod logging;
 pub mod manifest_drift;
 pub mod metadata;
 pub mod migration_bundle;
+// The household sitting a nested dispatch inherits from the
+// consumer request it serves. Crate-internal: the household gate
+// and the shelf dispatcher are its only readers.
+mod nest_sitting;
 pub mod pairing;
 pub mod shelf_dispatcher;
 // The multi-room substrate adapter (bridge implementing the

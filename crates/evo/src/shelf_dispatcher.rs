@@ -38,6 +38,30 @@
 //! `"plugin-system"`). Per-verb capability shaping from the
 //! caller's admitted manifest remains a tightening follow-on;
 //! destination `[capabilities.respondent]` gates still apply.
+//!
+//! ## Household sitting
+//!
+//! A nested dispatch carries no step-up token of its own. At a
+//! household level that protects the nested verb's scope, the gate
+//! accepts the sitting of the consumer whose request the calling
+//! plugin is answering: only while that consumer is the one
+//! connection with a dispatch open on the plugin, and only when its
+//! request presented a sitting. The token is validated against that
+//! consumer's identity and never travels in the nested request.
+//!
+//! The dispatcher's part is to name the calling plugin. For an
+//! out-of-process plugin that is the caller the wire frame names. In
+//! process it is the plugin whose handler is running on the current
+//! task; a dispatch made from a task the plugin spawned names no
+//! plugin, and inherits nothing.
+//!
+//! ## Refusals
+//!
+//! A refusal the steward names (class `permission_denied` with a
+//! `details.subclass`) reaches the calling plugin as
+//! [`ShelfDispatchError::Refused`], subclass intact, so the plugin can
+//! hand its own caller the refusal they would have met asking
+//! directly.
 
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, Weak};
@@ -106,9 +130,13 @@ impl Default for StewardShelfRequestDispatcher {
 }
 
 impl StewardShelfRequestDispatcher {
+    /// `caller` is the plugin the dispatch is made for, when the
+    /// transport names it; `None` takes the plugin whose handler is
+    /// running on this task.
     async fn dispatch_inner(
         &self,
         principal: evo_runtime_http::Principal,
+        caller: Option<&str>,
         shelf: &str,
         request_type: &str,
         payload: Vec<u8>,
@@ -142,9 +170,14 @@ impl StewardShelfRequestDispatcher {
                 });
             }
         };
-        match server
-            .dispatch_http_wire_op("request", request, &principal)
-            .await
+        // The nest names the plugin it comes from, so the household
+        // gate can find the consumer that plugin is serving.
+        let origin = crate::nest_sitting::origin_plugin(caller);
+        match crate::nest_sitting::nest_from(
+            origin,
+            server.dispatch_http_wire_op("request", request, &principal),
+        )
+        .await
         {
             Ok(value) => decode_dispatch_response(value),
             Err(HttpDispatchError::InvalidPayload(detail)) => {
@@ -201,6 +234,7 @@ impl ShelfRequestDispatcher for StewardShelfRequestDispatcher {
             // shelf boundary.
             self.dispatch_inner(
                 plugin_system_principal(),
+                None,
                 shelf,
                 request_type,
                 payload,
@@ -236,6 +270,7 @@ impl ShelfRequestDispatcher for StewardShelfRequestDispatcher {
             );
             self.dispatch_inner(
                 principal,
+                Some(caller_plugin),
                 shelf,
                 request_type,
                 payload,
@@ -342,6 +377,22 @@ fn classify_error_payload(err: &Value) -> ShelfDispatchError {
         "permanent" | "contract_violation" | "bad_request" => {
             ShelfDispatchError::Permanent { detail }
         }
+        // A refusal that names its kind keeps the name: the plugin
+        // that dispatched on an operator's behalf can hand that
+        // operator the refusal they would have met asking directly.
+        "permission_denied" => match map
+            .get("details")
+            .and_then(|d| d.get("subclass"))
+            .and_then(Value::as_str)
+        {
+            Some(subclass) => ShelfDispatchError::Refused {
+                subclass: subclass.to_string(),
+                detail,
+            },
+            None => ShelfDispatchError::SubstrateFailure {
+                detail: format!("class={class} message={detail}"),
+            },
+        },
         _ => ShelfDispatchError::SubstrateFailure {
             detail: format!("class={class} message={detail}"),
         },
@@ -472,6 +523,49 @@ mod tests {
             }
             other => panic!("unexpected classification: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_refusal_keeps_its_subclass() {
+        // The household gate's refusal, as the wire-op layer writes
+        // it.
+        let err = serde_json::json!({
+            "class": "permission_denied",
+            "message": "verb \"set_network\" touches a settings group the \
+                        household policy protects",
+            "details": { "subclass": "household_policy_locked" }
+        });
+        match classify_error_payload(&err) {
+            ShelfDispatchError::Refused { subclass, detail } => {
+                assert_eq!(subclass, "household_policy_locked");
+                assert!(detail.starts_with("verb \"set_network\""), "{detail}");
+            }
+            other => panic!("unexpected classification: {other:?}"),
+        }
+
+        // Any refusal that names itself keeps the name.
+        let err = serde_json::json!({
+            "class": "permission_denied",
+            "message": "principal does not hold it",
+            "details": { "subclass": "verb_capability_scope_not_granted" }
+        });
+        assert!(matches!(
+            classify_error_payload(&err),
+            ShelfDispatchError::Refused { subclass, .. }
+                if subclass == "verb_capability_scope_not_granted"
+        ));
+
+        // A refusal that does not name itself stays a substrate
+        // failure, as before.
+        let err = serde_json::json!({
+            "class": "permission_denied",
+            "message": "denied"
+        });
+        assert!(matches!(
+            classify_error_payload(&err),
+            ShelfDispatchError::SubstrateFailure { detail }
+                if detail == "class=permission_denied message=denied"
+        ));
     }
 
     #[test]

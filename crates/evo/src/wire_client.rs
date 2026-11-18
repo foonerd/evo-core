@@ -3201,38 +3201,7 @@ async fn forward_plugin_request(
                         payload: response_payload,
                     },
                     Err(e) => {
-                        use evo_plugin_sdk::contract::ShelfDispatchError;
-                        let details = match &e {
-                            ShelfDispatchError::NoPluginOnShelf { shelf } => {
-                                serde_json::json!({
-                                    "subclass": "no_plugin_on_shelf",
-                                    "shelf": shelf,
-                                })
-                            }
-                            ShelfDispatchError::VerbNotStockedOnShelf {
-                                shelf,
-                                request_type,
-                            } => serde_json::json!({
-                                "subclass": "verb_not_stocked_on_shelf",
-                                "shelf": shelf,
-                                "request_type": request_type,
-                            }),
-                            ShelfDispatchError::Permanent { .. } => {
-                                serde_json::json!({ "subclass": "permanent" })
-                            }
-                            ShelfDispatchError::Transient { .. } => {
-                                serde_json::json!({ "subclass": "transient" })
-                            }
-                            ShelfDispatchError::DeadlineExceeded { budget_ms } => {
-                                serde_json::json!({
-                                    "subclass": "deadline_exceeded",
-                                    "budget_ms": budget_ms,
-                                })
-                            }
-                            ShelfDispatchError::SubstrateFailure { .. } => {
-                                serde_json::json!({ "subclass": "substrate_failure" })
-                            }
-                        };
+                        let details = e.wire_details();
                         WireFrame::Error {
                             v,
                             cid,
@@ -10160,6 +10129,93 @@ name = "track"
                 assert_eq!(msg, "bad payload");
             }
             other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    // A nested dispatch the steward refuses reaches the plugin as
+    // `Refused`, subclass intact: the steward's own frame, through
+    // the JSON codec, decoded as the SDK host decodes it.
+    struct RefusingDispatcher;
+
+    impl evo_plugin_sdk::contract::ShelfRequestDispatcher for RefusingDispatcher {
+        fn dispatch<'a>(
+            &'a self,
+            _shelf: &'a str,
+            _request_type: &'a str,
+            _payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async {
+                Err(evo_plugin_sdk::contract::ShelfDispatchError::Refused {
+                    subclass: "household_policy_locked".into(),
+                    detail: "verb \"set_network\" touches a settings group \
+                             the household policy protects"
+                        .into(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_nest_reaches_the_plugin_with_its_subclass() {
+        use evo_plugin_sdk::contract::ShelfDispatchError;
+        let mut sink = sink_with_subject_admin(None);
+        sink.shelf_request_dispatcher = Some(Arc::new(RefusingDispatcher));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+
+        let request = WireFrame::ShelfDispatchRequest {
+            v: PROTOCOL_VERSION,
+            cid: 91,
+            plugin: "org.test.relay".into(),
+            shelf: "nest.network".into(),
+            request_type: "set_network".into(),
+            payload: b"{}".to_vec(),
+            instance_id: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let sent = out_rx.recv().await.expect("response frame");
+        let bytes = evo_plugin_sdk::codec::encode_json(&sent).unwrap();
+        let received = evo_plugin_sdk::codec::decode_json(&bytes).unwrap();
+        let WireFrame::Error {
+            cid,
+            message,
+            details,
+            ..
+        } = received
+        else {
+            panic!("expected an Error frame, got {received:?}");
+        };
+        assert_eq!(cid, 91);
+        assert_eq!(
+            details.as_ref().and_then(|d| d.get("subclass")),
+            Some(&serde_json::json!("household_policy_locked")),
+            "details={details:?}"
+        );
+        match ShelfDispatchError::from_wire(
+            &message,
+            details.as_ref(),
+            "nest.network",
+            "set_network",
+        ) {
+            ShelfDispatchError::Refused { subclass, detail } => {
+                assert_eq!(subclass, "household_policy_locked");
+                assert!(
+                    detail.starts_with("verb \"set_network\" touches"),
+                    "the steward's message, not the frame's prefix: {detail}"
+                );
+            }
+            other => panic!("expected Refused, got {other:?}"),
         }
     }
 }

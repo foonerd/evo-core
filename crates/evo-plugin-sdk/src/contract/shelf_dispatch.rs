@@ -145,7 +145,11 @@ pub trait ShelfRequestDispatcher: Send + Sync {
 /// observing the call boundary (telemetry, audit, operator logs)
 /// can correlate dispatcher-originated failures with the same
 /// classification the wire-op layer emits.
+///
+/// Non-exhaustive: the steward may add a failure category, and a
+/// caller that matches the enum keeps a wildcard arm for it.
 #[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
 pub enum ShelfDispatchError {
     /// No plugin currently occupies the requested shelf. The shelf
     /// may be unknown to the catalogue, the owning plugin may be
@@ -215,6 +219,25 @@ pub enum ShelfDispatchError {
         /// Substrate-supplied detail (sanitised for the wire).
         detail: String,
     },
+
+    /// The steward refused the dispatch, and the refusal names its
+    /// kind: a capability the caller does not hold
+    /// (`verb_capability_scope_not_granted`), a settings group the
+    /// household policy protects (`household_policy_locked`), or
+    /// another refusal subclass of the framework's error taxonomy.
+    ///
+    /// The subclass is the same one the wire-op layer returns to a
+    /// client, so a plugin that dispatched on an operator's behalf
+    /// can hand the operator the refusal they would have met had
+    /// they asked directly. Not retryable: the same call is refused
+    /// again until whatever it names changes.
+    #[error("refused ({subclass}): {detail}")]
+    Refused {
+        /// The refusal subclass, as the wire-op layer names it.
+        subclass: String,
+        /// The steward's message for the refusal.
+        detail: String,
+    },
 }
 
 impl ShelfDispatchError {
@@ -223,8 +246,8 @@ impl ShelfDispatchError {
     ///
     /// `Transient` + `DeadlineExceeded` + `SubstrateFailure` are
     /// retry-eligible; `NoPluginOnShelf`, `VerbNotStockedOnShelf`,
-    /// and `Permanent` are structural and re-attempt is wasted
-    /// work.
+    /// `Permanent` and `Refused` are structural and re-attempt is
+    /// wasted work.
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
@@ -232,6 +255,99 @@ impl ShelfDispatchError {
                 | Self::DeadlineExceeded { .. }
                 | Self::SubstrateFailure { .. }
         )
+    }
+
+    /// The `details` object the steward puts on the wire error frame
+    /// it answers an out-of-process plugin's dispatch with.
+    /// [`Self::from_wire`] is the reader on the plugin side; the two
+    /// are the whole encoding.
+    ///
+    /// `details.subclass` names the failure category. For a refusal it
+    /// is the refusal's own subclass, marked with `refused: true` and
+    /// carrying the steward's `detail`: a plugin built against an SDK
+    /// that predates [`Self::Refused`] reads an unknown subclass and
+    /// falls back to [`Self::SubstrateFailure`], as it always has.
+    pub fn wire_details(&self) -> serde_json::Value {
+        match self {
+            Self::NoPluginOnShelf { shelf } => serde_json::json!({
+                "subclass": "no_plugin_on_shelf",
+                "shelf": shelf,
+            }),
+            Self::VerbNotStockedOnShelf {
+                shelf,
+                request_type,
+            } => serde_json::json!({
+                "subclass": "verb_not_stocked_on_shelf",
+                "shelf": shelf,
+                "request_type": request_type,
+            }),
+            Self::Permanent { .. } => {
+                serde_json::json!({ "subclass": "permanent" })
+            }
+            Self::Transient { .. } => {
+                serde_json::json!({ "subclass": "transient" })
+            }
+            Self::DeadlineExceeded { budget_ms } => serde_json::json!({
+                "subclass": "deadline_exceeded",
+                "budget_ms": budget_ms,
+            }),
+            Self::SubstrateFailure { .. } => {
+                serde_json::json!({ "subclass": "substrate_failure" })
+            }
+            Self::Refused { subclass, detail } => serde_json::json!({
+                "subclass": subclass,
+                "refused": true,
+                "detail": detail,
+            }),
+        }
+    }
+
+    /// Rebuild the error from the wire error frame a dispatch was
+    /// answered with: its `message`, its `details` (see
+    /// [`Self::wire_details`]), and the shelf and verb the dispatch
+    /// named.
+    pub fn from_wire(
+        message: &str,
+        details: Option<&serde_json::Value>,
+        shelf: &str,
+        request_type: &str,
+    ) -> Self {
+        let field = |key: &str| details.and_then(|d| d.get(key));
+        let subclass = field("subclass").and_then(|v| v.as_str()).unwrap_or("");
+        if field("refused").and_then(|v| v.as_bool()) == Some(true)
+            && !subclass.is_empty()
+        {
+            return Self::Refused {
+                subclass: subclass.to_string(),
+                detail: field("detail")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(message)
+                    .to_string(),
+            };
+        }
+        match subclass {
+            "no_plugin_on_shelf" => Self::NoPluginOnShelf {
+                shelf: shelf.to_string(),
+            },
+            "verb_not_stocked_on_shelf" => Self::VerbNotStockedOnShelf {
+                shelf: shelf.to_string(),
+                request_type: request_type.to_string(),
+            },
+            "permanent" => Self::Permanent {
+                detail: message.to_string(),
+            },
+            "transient" => Self::Transient {
+                detail: message.to_string(),
+            },
+            "deadline_exceeded" => Self::DeadlineExceeded {
+                budget_ms: field("budget_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+            },
+            _ => Self::SubstrateFailure {
+                detail: message.to_string(),
+            },
+        }
     }
 }
 
@@ -285,6 +401,71 @@ mod tests {
             detail: "router send dropped".into(),
         }
         .is_retryable());
+    }
+
+    #[test]
+    fn every_category_survives_the_wire() {
+        let cases = vec![
+            ShelfDispatchError::NoPluginOnShelf { shelf: "s".into() },
+            ShelfDispatchError::VerbNotStockedOnShelf {
+                shelf: "s".into(),
+                request_type: "v".into(),
+            },
+            ShelfDispatchError::DeadlineExceeded { budget_ms: 1500 },
+            ShelfDispatchError::Refused {
+                subclass: "household_policy_locked".into(),
+                detail: "the household policy protects this group".into(),
+            },
+            ShelfDispatchError::Refused {
+                subclass: "verb_capability_scope_not_granted".into(),
+                detail: "principal does not hold network_admin".into(),
+            },
+        ];
+        for sent in cases {
+            let details = sent.wire_details();
+            let got = ShelfDispatchError::from_wire(
+                &format!("shelf_dispatch: {sent}"),
+                Some(&details),
+                "s",
+                "v",
+            );
+            assert_eq!(got.to_string(), sent.to_string(), "{details}");
+        }
+    }
+
+    #[test]
+    fn an_older_reader_sees_a_refusal_as_a_substrate_failure() {
+        // What an SDK without `Refused` does with the frame: it knows
+        // only the category subclasses, and anything else is a
+        // substrate failure carrying the message.
+        let details = ShelfDispatchError::Refused {
+            subclass: "household_policy_locked".into(),
+            detail: "protected".into(),
+        }
+        .wire_details();
+        assert_eq!(details["subclass"], "household_policy_locked");
+        assert_eq!(details["refused"], true);
+        let without_marker = serde_json::json!({
+            "subclass": details["subclass"].clone(),
+        });
+        assert!(matches!(
+            ShelfDispatchError::from_wire("m", Some(&without_marker), "s", "v"),
+            ShelfDispatchError::SubstrateFailure { .. }
+        ));
+    }
+
+    #[test]
+    fn a_refusal_is_not_retryable_and_names_its_subclass() {
+        let refused = ShelfDispatchError::Refused {
+            subclass: "household_policy_locked".into(),
+            detail: "the household policy protects this group".into(),
+        };
+        assert!(!refused.is_retryable());
+        assert_eq!(
+            refused.to_string(),
+            "refused (household_policy_locked): the household policy \
+             protects this group"
+        );
     }
 
     #[test]

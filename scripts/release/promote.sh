@@ -3,8 +3,8 @@
 # promote.sh — eng-side → public-side squash-and-scrub release cut.
 #
 # Builds a staging tree from the named eng-side tag, scrubs paths
-# listed in `.scrub-exclude`, regenerates Cargo.lock against the
-# filtered workspace, runs the standard preflight gates against
+# listed in `.scrub-exclude`, keeps the tag's Cargo.lock pruned to
+# the filtered workspace, runs the standard preflight gates against
 # the staging tree (leak grep + fmt --check + clippy + test), and
 # applies the result to the public repo's main branch as a single
 # squashed commit on top of `--prev-tag`. Tags + pushes are gated
@@ -357,10 +357,10 @@ else
 fi
 
 # -------------------------------------------------------------
-# 3. Workspace member filter + Cargo.lock refresh
+# 3. Workspace member filter + Cargo.lock prune
 # -------------------------------------------------------------
 
-log_step "Step 3/8: Filtering workspace members and refreshing Cargo.lock"
+log_step "Step 3/8: Filtering workspace members and pruning Cargo.lock"
 
 WORKSPACE_TOML="${STAGE_DIR}/Cargo.toml"
 if [[ ! -f "${WORKSPACE_TOML}" ]]; then
@@ -431,11 +431,17 @@ toml_path.write_text(new_text)
 print("  workspace-member filter: applied", file=sys.stderr)
 PYEOF
 
-# Drop any leftover Cargo.lock and regenerate against the
-# filtered workspace via cargo metadata. The locked-build CI
-# step compares this lockfile against the manifests; it must
-# match the post-filter workspace.
-rm -f "${STAGE_DIR}/Cargo.lock"
+# Keep the tag's Cargo.lock and let cargo metadata prune it to the
+# filtered workspace: entries only a scrubbed member pulled in are
+# dropped, and no other version moves. The locked-build CI step
+# compares this lockfile against the manifests, so it must match the
+# post-filter workspace.
+#
+# Never delete it and resolve afresh. The tag's lock is the one the
+# eng gates built and tested against. A fresh resolution takes
+# whatever crates.io serves on the day of the cut: a lock no gate
+# has seen, and one that can pull a dependency the MSRV cannot
+# build.
 (
     cd "${STAGE_DIR}"
     cargo metadata --format-version 1 > /dev/null

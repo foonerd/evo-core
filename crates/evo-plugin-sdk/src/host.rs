@@ -4523,53 +4523,12 @@ impl crate::contract::ShelfRequestDispatcher for WireShelfRequestDispatcher {
                 }
                 Ok(WireFrame::Error {
                     message, details, ..
-                }) => {
-                    // Map known subclasses to typed dispatch errors;
-                    // unrecognised refusals route through Io.
-                    let subclass = details
-                        .as_ref()
-                        .and_then(|d| d.get("subclass"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    match subclass {
-                        "no_plugin_on_shelf" => Err(
-                            crate::contract::ShelfDispatchError::NoPluginOnShelf {
-                                shelf: shelf.clone(),
-                            },
-                        ),
-                        "verb_not_stocked_on_shelf" => Err(
-                            crate::contract::ShelfDispatchError::VerbNotStockedOnShelf {
-                                shelf: shelf.clone(),
-                                request_type: request_type.clone(),
-                            },
-                        ),
-                        "permanent" => Err(
-                            crate::contract::ShelfDispatchError::Permanent {
-                                detail: message.clone(),
-                            },
-                        ),
-                        "transient" => Err(
-                            crate::contract::ShelfDispatchError::Transient {
-                                detail: message.clone(),
-                            },
-                        ),
-                        "deadline_exceeded" => {
-                            let budget_ms = details
-                                .as_ref()
-                                .and_then(|d| d.get("budget_ms"))
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0) as u32;
-                            Err(
-                                crate::contract::ShelfDispatchError::DeadlineExceeded {
-                                    budget_ms,
-                                },
-                            )
-                        }
-                        _ => Err(crate::contract::ShelfDispatchError::SubstrateFailure {
-                            detail: message.clone(),
-                        }),
-                    }
-                }
+                }) => Err(crate::contract::ShelfDispatchError::from_wire(
+                    &message,
+                    details.as_ref(),
+                    &shelf,
+                    &request_type,
+                )),
                 Ok(other) => {
                     Err(crate::contract::ShelfDispatchError::SubstrateFailure {
                         detail: format!(

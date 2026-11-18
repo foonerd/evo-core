@@ -13,6 +13,17 @@ v0.1.8 is the first tagged release. Versions prior to 0.1.8 existed only as
 workspace-version values in source; they were not tagged and have no release
 artefacts. Consult the git log for pre-0.1.8 history.
 
+## [0.1.13.2] - 2026-11-18
+
+### Added
+
+- **A nested dispatch inherits its consumer's household sitting.** A plugin answering a consumer's request may dispatch another plugin's verb through its shelf request dispatcher. The nested call carries no step-up token of its own, so at a household level that protects the nested verb's scope it was refused, even when the consumer's request presented a valid sitting. The household gate on the nested verb now accepts that consumer's sitting, validated against the consumer's identity, while the consumer is the only connection with a dispatch open on the calling plugin and its request presented a sitting. While two consumers wait on the same plugin, nothing is inherited and a protected nest is refused. The token never enters the nested request or any plugin payload, and the nested verb's manifest still gates it. An in-process nest made from a task the plugin spawned, outside its request handler, inherits nothing.
+- **`ShelfDispatchError::Refused { subclass, detail }`.** A nested dispatch that the steward refuses with class `permission_denied` and a named subclass (for example `household_policy_locked` or `verb_capability_scope_not_granted`) reaches the calling plugin as `Refused`, subclass intact, both in process and over the wire. It used to arrive as `SubstrateFailure`, carrying only text. `ShelfDispatchError::wire_details()` and `ShelfDispatchError::from_wire()` are the encoding the steward and the SDK host share.
+
+### Changed
+
+- **`ShelfDispatchError` is `#[non_exhaustive]` and has a new variant.** A plugin that matches it exhaustively must add a wildcard arm, and may add an arm for `Refused`. `Refused` is not retryable, where the `SubstrateFailure` it replaces was, so a plugin that retries on `is_retryable()` no longer retries a refusal. A plugin built against an earlier SDK still reads a `Refused` frame as `SubstrateFailure`.
+
 ## [0.1.13.1] - 2026-11-18
 
 ### Added

@@ -563,6 +563,9 @@ pub struct HouseholdProtectionRuntime {
     table: Option<GroupTable>,
     bootstrap: CapabilitySet,
     policy: std::sync::RwLock<HouseholdProtectionPolicy>,
+    /// The consumer dispatches open on each plugin, so the gate can
+    /// find the sitting a nested dispatch inherits.
+    nest_sittings: Arc<crate::nest_sitting::NestSittings>,
 }
 
 impl std::fmt::Debug for dyn HouseholdGroupTable {
@@ -586,7 +589,17 @@ impl HouseholdProtectionRuntime {
             table,
             bootstrap,
             policy: std::sync::RwLock::new(policy),
+            nest_sittings: Arc::default(),
         }
+    }
+
+    /// The consumer dispatches open on each plugin. The dispatch
+    /// gate records into it and reads a nest's inherited sitting
+    /// from it.
+    pub(crate) fn nest_sittings(
+        &self,
+    ) -> &Arc<crate::nest_sitting::NestSittings> {
+        &self.nest_sittings
     }
 
     /// Current policy, cloned.
