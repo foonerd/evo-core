@@ -23,8 +23,10 @@ use crate::bundle::CertBundle;
 use crate::device_ca::{GeneratedCa, LeafConfig};
 use crate::error::CertError;
 use crate::lifecycle::CertLifecycle;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::futures::OwnedNotified;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -120,11 +122,21 @@ impl AutoRotator {
     /// Spawn the rotation loop on the current tokio
     /// runtime. Returns a [`JoinHandle`] the caller can
     /// `await` after firing `shutdown`.
+    ///
+    /// A `shutdown.notify_waiters()` at any time after this
+    /// returns, even before the task first runs or while it is
+    /// rotating, ends the loop.
     pub fn spawn(self, shutdown: Arc<Notify>) -> JoinHandle<RotationStats> {
-        tokio::spawn(async move { self.run(shutdown).await })
+        // Made here, before the task exists: `notify_waiters`
+        // reaches only the waiters that exist when it is called, so a
+        // waiter the loop made for itself would miss a stop signalled
+        // before the task first ran, or while it was rotating.
+        let mut stop = Box::pin(shutdown.notified_owned());
+        stop.as_mut().enable();
+        tokio::spawn(async move { self.run(stop).await })
     }
 
-    async fn run(self, shutdown: Arc<Notify>) -> RotationStats {
+    async fn run(self, mut stop: Pin<Box<OwnedNotified>>) -> RotationStats {
         let mut stats = RotationStats::default();
 
         // Honour the initial delay before the first
@@ -133,7 +145,8 @@ impl AutoRotator {
         // small value to drive rotations quickly.
         if !self.policy.initial_delay.is_zero() {
             tokio::select! {
-                _ = shutdown.notified() => return stats,
+                biased;
+                _ = stop.as_mut() => return stats,
                 _ = tokio::time::sleep(self.policy.initial_delay) => {}
             }
         }
@@ -141,7 +154,8 @@ impl AutoRotator {
         loop {
             self.rotate_once(&mut stats).await;
             tokio::select! {
-                _ = shutdown.notified() => return stats,
+                biased;
+                _ = stop.as_mut() => return stats,
                 _ = tokio::time::sleep(self.policy.rotation_interval) => {}
             }
         }
@@ -307,17 +321,45 @@ mod tests {
             AutoRotator::new(ca, leaf_config, lifecycle, swap, policy);
         let shutdown = Arc::new(Notify::new());
         let handle = rotator.spawn(Arc::clone(&shutdown));
-        // Yield until the spawned task is scheduled and has
-        // reached its `shutdown.notified().await` registration.
-        // Without this, `Notify::notify_waiters` only wakes
-        // currently-registered waiters; a notify that fires
-        // before the task is scheduled produces no effect
-        // and the test would hang for 60s.
+        // Let the task reach its initial-delay wait, so the stop
+        // lands there.
         tokio::time::sleep(Duration::from_millis(20)).await;
         shutdown.notify_waiters();
         let stats = handle.await.unwrap();
         assert_eq!(stats.successes, 0);
         assert_eq!(stats.failures, 0);
+    }
+
+    /// A stop signalled the moment `spawn` returns, before the task
+    /// has run at all, still ends the rotator.
+    #[tokio::test]
+    async fn rotator_ends_on_a_stop_signalled_before_it_first_runs() {
+        let observatory =
+            Arc::new(Observatory::new(ObservatoryConfig::small()));
+        let lifecycle =
+            Arc::new(CertLifecycle::with_observatory(Arc::clone(&observatory)));
+        let ca =
+            Arc::new(generate_device_ca(&DeviceCaConfig::default()).unwrap());
+        let leaf_config =
+            LeafConfig::for_hostnames(vec!["device.local".to_string()]);
+        let swap: SwapFn = Arc::new(|_| Ok(()));
+        let rotator = AutoRotator::new(
+            ca,
+            leaf_config,
+            lifecycle,
+            swap,
+            CertRotationPolicy::every(Duration::from_secs(60)),
+        );
+        let shutdown = Arc::new(Notify::new());
+        // On this single-threaded runtime the task cannot run before
+        // the test next yields, so the stop lands before it does.
+        let handle = rotator.spawn(Arc::clone(&shutdown));
+        shutdown.notify_waiters();
+        let stats = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the rotator ended on the stop")
+            .unwrap();
+        assert_eq!(stats, RotationStats::default());
     }
 
     #[tokio::test]

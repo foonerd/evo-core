@@ -14,10 +14,13 @@ use opentelemetry::KeyValue;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::trace::SpanExporter as SpanExporterTrait;
 use opentelemetry_sdk::Resource;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::futures::OwnedNotified;
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 /// Mounted OTLP exporter.
 ///
@@ -98,9 +101,14 @@ impl OtelExporter {
         self.last_exported_ts_ns.load(Ordering::Relaxed)
     }
 
-    /// Run the export loop until the supplied `shutdown`
-    /// notifier fires. On shutdown the loop performs a final
-    /// drain export and returns.
+    /// Spawn the export loop on the current tokio runtime. It runs
+    /// until the supplied `shutdown` notifier fires; on shutdown the
+    /// loop performs a final drain export and returns. The returned
+    /// [`JoinHandle`] can be awaited after firing `shutdown`.
+    ///
+    /// A `shutdown.notify_waiters()` at any time after this returns,
+    /// even before the task first runs or while an export is in
+    /// flight, ends the loop; an export in flight completes first.
     ///
     /// The loop wakes every `config.batch_interval`, snapshots
     /// the observatory, filters observations strictly newer
@@ -109,7 +117,18 @@ impl OtelExporter {
     /// OTLP `SpanExporter::export` call. The watermark
     /// advances on every successful export to the timestamp of
     /// the latest observation in the just-exported batch.
-    pub async fn run(self: Arc<Self>, shutdown: Arc<Notify>) {
+    pub fn spawn(self: Arc<Self>, shutdown: Arc<Notify>) -> JoinHandle<()> {
+        // Made here, before the task exists: a waiter sees every
+        // `notify_waiters` call made after it is created, so one the loop made
+        // for itself would miss a stop signalled before the task first ran, or
+        // while an export was in flight. Enabling it now also queues it for
+        // `notify_one`.
+        let mut stop = Box::pin(shutdown.notified_owned());
+        stop.as_mut().enable();
+        tokio::spawn(async move { self.run(stop).await })
+    }
+
+    async fn run(self: Arc<Self>, mut stop: Pin<Box<OwnedNotified>>) {
         tracing::info!(
             endpoint = %self.config.endpoint,
             service_name = %self.config.service_name,
@@ -120,7 +139,8 @@ impl OtelExporter {
 
         loop {
             tokio::select! {
-                _ = shutdown.notified() => {
+                biased;
+                _ = stop.as_mut() => {
                     tracing::info!(
                         "evo-otel-export: shutdown notified — draining final batch",
                     );
@@ -232,8 +252,7 @@ mod tests {
         let shutdown = Arc::new(Notify::new());
         let task_shutdown = Arc::clone(&shutdown);
         let task_exporter = Arc::clone(&exporter);
-        let handle =
-            tokio::spawn(async move { task_exporter.run(task_shutdown).await });
+        let handle = task_exporter.spawn(task_shutdown);
         // Let the task spin a couple of intervals.
         tokio::time::sleep(Duration::from_millis(120)).await;
         // Drop an observation so the final-drain branch has

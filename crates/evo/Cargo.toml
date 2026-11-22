@@ -61,7 +61,7 @@ async-trait = "0.1"
 http = "1"
 ed25519-dalek = { version = "2.1", features = ["std"] }
 
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.47", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -218,6 +218,13 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 # exercising that seam means mounting a route. Dev-only on purpose —
 # the steward itself takes no direct dependency on the HTTP library.
 axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
+# Test-only: the no-bearer admission pins drive the operator WebSocket
+# the glass uses, over the steward's own TLS, so they need a WS client
+# and a rustls config trusting the test device-CA. Same versions and
+# features `evo-runtime-http` already tests with.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots", "handshake"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
 
 # Loom model-checking tests for the router's lookup-clone-drop
 # discipline live in the stand-alone `crates/evo-loom` crate, NOT in

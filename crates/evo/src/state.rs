@@ -134,6 +134,16 @@ pub struct StewardState {
     /// wire op writes through to both this list and the
     /// persistent file.
     pub revocation_list: OnceLock<Arc<RevocationList>>,
+    /// The directory the HTTPS substrate loaded its material from
+    /// (`<state root>/https`), set with the credential store and the
+    /// revocation list. `revoke_bearer_token` writes `revoked.json`
+    /// here and `reset_credentials_to_open` clears it, so both act on
+    /// the list the next boot reads; each refuses while it is unset.
+    pub https_dir: OnceLock<std::path::PathBuf>,
+    /// The auth tier the HTTPS substrate admits by, set with the
+    /// directory above. `reset_credentials_to_open` holds it at
+    /// `Open`; it refuses while this is unset.
+    pub(crate) auth_tier: OnceLock<Arc<crate::https_boot::StewardAuthTier>>,
     /// Framework credential vault — the single per-plugin-scoped
     /// credential store the operator UI writes into via the
     /// `credential_put` / `credential_delete` / `credential_list_keys`
@@ -230,6 +240,8 @@ impl std::fmt::Debug for StewardState {
                     "<unset>"
                 },
             )
+            .field("https_dir", &self.https_dir.get())
+            .field("auth_tier", &self.auth_tier.get())
             .finish()
     }
 }
@@ -350,6 +362,8 @@ impl StewardStateBuilder {
             ),
             credential_store: OnceLock::new(),
             revocation_list: OnceLock::new(),
+            https_dir: OnceLock::new(),
+            auth_tier: OnceLock::new(),
             credential_vault: OnceLock::new(),
             credential_change_bus: Arc::new(
                 crate::credentials::CredentialChangeBus::new(),
@@ -399,6 +413,8 @@ impl StewardState {
             bearer_token_issuer: OnceLock::new(),
             credential_store: OnceLock::new(),
             revocation_list: OnceLock::new(),
+            https_dir: OnceLock::new(),
+            auth_tier: OnceLock::new(),
             credential_vault: OnceLock::new(),
             credential_change_bus: Arc::new(
                 crate::credentials::CredentialChangeBus::new(),

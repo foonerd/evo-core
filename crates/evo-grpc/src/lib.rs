@@ -131,6 +131,9 @@ mod imp {
 
     /// Mount the gRPC service on the given address. The
     /// listener runs until `shutdown` fires.
+    ///
+    /// A `shutdown.notify_waiters()` at any time after this returns,
+    /// even before the task first runs, ends the listener.
     pub async fn serve_grpc<D: WireOpDispatcher>(
         listen: SocketAddr,
         dispatcher: Arc<D>,
@@ -151,13 +154,16 @@ mod imp {
         let svc =
             DispatcherServer::new(DispatcherService { inner: dispatcher });
         let stream = tokio_stream::wrappers::TcpListenerStream::new(listener);
-        let shutdown_signal = async move {
-            shutdown.notified().await;
-        };
+        // Made here, before the task exists: a waiter sees every
+        // `notify_waiters` call made after it is created, so one made inside
+        // the task would miss a stop signalled before the task first ran.
+        // Enabling it now also queues it for `notify_one`.
+        let mut stop = Box::pin(shutdown.notified_owned());
+        stop.as_mut().enable();
         let task = tokio::spawn(async move {
             let result = Server::builder()
                 .add_service(svc)
-                .serve_with_incoming_shutdown(stream, shutdown_signal)
+                .serve_with_incoming_shutdown(stream, stop)
                 .await;
             if let Err(e) = result {
                 tracing::warn!(error = %e, "evo-grpc: server exited with error");

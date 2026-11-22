@@ -100,7 +100,7 @@ pub use pq::{
     advertised_kx_groups, install_crypto_provider, pq_compiled_in,
     HYBRID_KX_GROUP_NAME,
 };
-pub use principal::Principal;
+pub use principal::{CallerOrigin, Principal, ANONYMOUS_TOKEN_ID};
 pub use redirect::{
     build_redirect_router, build_redirect_router_with_acme,
     serve_http_redirect, serve_http_redirect_with_acme,

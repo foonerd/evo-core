@@ -2427,10 +2427,13 @@ enum AdminAuthSub {
         socket: PathBuf,
     },
     /// Recovery gesture: purge every credential record + every
-    /// revocation entry and flip the steward to Open tier on
-    /// next boot. Used when the operator is locked out of the
-    /// device (lost token, every credential expired).
-    /// Requires step_up:system_admin.
+    /// revocation entry and retire the bearer-token signing key.
+    /// After the steward restarts, every bearer issued before the
+    /// reset is refused. The auth tier is Open from the reset on,
+    /// across restarts, until `evo auth restore-tier` runs with the
+    /// steward stopped. Used when the operator is locked out of the
+    /// device (lost token, every credential expired). Requires
+    /// step_up:system_admin.
     ResetCredentialsToOpen {
         /// Free-form reason recorded in the audit observation.
         #[arg(long, value_name = "TEXT")]

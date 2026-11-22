@@ -242,7 +242,10 @@ async fn handle_request(
     payload: Option<Json<Value>>,
 ) -> Response {
     let principal = principal.map(|Extension(p)| p).unwrap_or_else(|| {
-        Principal::new("anonymous", evo_auth_bearer::CapabilitySet::default())
+        Principal::new(
+            crate::principal::ANONYMOUS_TOKEN_ID,
+            evo_auth_bearer::CapabilitySet::default(),
+        )
     });
     let parent = parent_span
         .map(|Extension(p)| p)

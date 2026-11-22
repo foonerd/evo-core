@@ -4560,6 +4560,9 @@ fn shelf_dispatch_error_to_notification_error(
                  {budget_ms}ms)"
             ))
         }
+        // A refusal, or a category this steward does not know yet:
+        // the error's own message names it.
+        other => NotificationError::Invalid(format!("notifications: {other}")),
     }
 }
 

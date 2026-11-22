@@ -38,12 +38,12 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = ["
 # stable across feature states. The `sync` feature on its own pulls in
 # only `Notify`, `Mutex`, etc — no runtime work-stealer scheduler,
 # which keeps the disabled-feature footprint small.
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1.47", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
 thiserror = "1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time", "sync", "test-util"] }
 serde_json = "1"
 
 [lints]

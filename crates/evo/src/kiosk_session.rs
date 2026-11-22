@@ -248,6 +248,40 @@ pub fn mint_kiosk_bearer(
     })
 }
 
+/// Put a kiosk bearer just minted in the operator inventory, so it can
+/// be listed and revoked like any other bearer. Both kiosk mint paths
+/// call it after [`mint_kiosk_bearer`] and before the bearer is handed
+/// out; a bearer whose record cannot be written is not handed out.
+pub(crate) fn record_kiosk_bearer(
+    store: &evo_auth_bearer::CredentialStore,
+    capabilities: &evo_auth_bearer::CapabilitySet,
+    minted: &KioskMintOk,
+    reason: &str,
+    ttl_seconds: u64,
+) -> Result<(), evo_auth_bearer::CredentialStoreError> {
+    // The mint expires the bearer `ttl` after it issued it.
+    let ttl_ms = ttl_seconds
+        .saturating_mul(1000)
+        .min(evo_auth_bearer::MAX_TOKEN_TTL_MS);
+    let record = crate::bearer_inventory::issued_record(
+        crate::bearer_inventory::Issued {
+            token_id: &minted.token_id,
+            capabilities,
+            issued_at_ms: minted.expires_at_ms.saturating_sub(ttl_ms),
+            expires_at_ms: minted.expires_at_ms,
+        },
+        "kiosk",
+        reason.trim(),
+        evo_auth_bearer::CredentialSource::Kiosk,
+        None,
+    );
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    crate::bearer_inventory::add_record(store, &record, now_ms)
+}
+
 /// Registry of kiosk-minted bearer ids, consulted by the
 /// household-protection dispatch gate.
 ///
@@ -640,17 +674,43 @@ async fn handle_kiosk_connection(
         write_frame(&mut stream, &resp).await?;
         return Ok(());
     };
+    let Some(store) = state.credential_store.get() else {
+        let resp = error_frame(
+            "store_unavailable",
+            "mint_local_kiosk_session: credential store not wired; a \
+             bearer with no record is not handed out",
+        );
+        write_frame(&mut stream, &resp).await?;
+        return Ok(());
+    };
     let capabilities =
         crate::https_boot::merged_operator_bootstrap_capability_set(&router);
 
     let resp = match mint_kiosk_bearer(
         issuer,
-        capabilities,
+        capabilities.clone(),
         admission,
-        KioskMintReason(req.reason),
+        KioskMintReason(req.reason.clone()),
         ttl_seconds,
     ) {
         Ok(ok) => {
+            if let Err(e) = record_kiosk_bearer(
+                store,
+                &capabilities,
+                &ok,
+                &req.reason,
+                ttl_seconds,
+            ) {
+                let resp = error_frame(
+                    "persistence_failed",
+                    &format!(
+                        "mint_local_kiosk_session: persisting credential \
+                         record failed: {e}"
+                    ),
+                );
+                write_frame(&mut stream, &resp).await?;
+                return Ok(());
+            }
             // Record what was just issued so the household-protection
             // gate can tell a kiosk panel from an operator bearer.
             // Deliberately here and not inside `mint_kiosk_bearer`:
@@ -872,5 +932,89 @@ mod tests {
         let mut len_buf = [0u8; 4];
         b.read_exact(&mut len_buf).await.unwrap();
         assert_eq!(u32::from_be_bytes(len_buf), 1);
+    }
+
+    /// A steward state with an issuer and an inventory at `inventory`,
+    /// as the HTTPS boot leaves it.
+    fn minting_state(
+        inventory: &std::path::Path,
+    ) -> (
+        Arc<crate::state::StewardState>,
+        Arc<evo_auth_bearer::CredentialStore>,
+    ) {
+        let state = crate::state::StewardState::for_tests();
+        let issuer = Arc::new(evo_auth_bearer::BearerTokenIssuer::new(
+            evo_auth_bearer::BearerTokenIssuer::generate_signing_key(),
+        ));
+        let _ = state.bearer_token_issuer.set(issuer);
+        let store = Arc::new(
+            evo_auth_bearer::CredentialStore::new(inventory.to_path_buf())
+                .expect("inventory"),
+        );
+        let _ = state.credential_store.set(Arc::clone(&store));
+        (state, store)
+    }
+
+    /// One kiosk mint over the kiosk socket's own handler, from an
+    /// allowlisted compositor.
+    async fn kiosk_mint(
+        state: Arc<crate::state::StewardState>,
+    ) -> serde_json::Value {
+        let router =
+            Arc::new(crate::router::PluginRouter::new(Arc::clone(&state)));
+        let allowlist = Arc::new(KioskUidAllowlist::from_uids([1000]));
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let served = tokio::spawn(handle_kiosk_connection(
+            server,
+            state,
+            router,
+            allowlist,
+            PeerCredentials {
+                uid: Some(1000),
+                gid: Some(1000),
+            },
+            86_400,
+        ));
+        let ask = serde_json::to_vec(&serde_json::json!({
+            "op": "mint_local_kiosk_session",
+            "reason": "kiosk-boot",
+        }))
+        .expect("request");
+        write_frame(&mut client, &ask).await.expect("send");
+        let answer = read_frame(&mut client).await.expect("answer");
+        served.await.expect("handler").expect("handler io");
+        serde_json::from_slice(&answer).expect("answer json")
+    }
+
+    /// A kiosk bearer is in the inventory, so it can be listed and
+    /// revoked like any other.
+    #[tokio::test]
+    async fn a_kiosk_bearer_is_in_the_inventory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, store) = minting_state(dir.path());
+        let answer = kiosk_mint(Arc::clone(&state)).await;
+        let token_id = answer["token_id"].as_str().expect("minted");
+        let record = store.get(token_id).expect("a record for the bearer");
+        assert_eq!(
+            record.source,
+            Some(evo_auth_bearer::CredentialSource::Kiosk)
+        );
+        assert_eq!(record.name, "kiosk");
+        assert_eq!(record.created_reason, "kiosk-boot");
+        assert_eq!(record.expires_at_ms, answer["expires_at_ms"].as_u64());
+        assert!(state.kiosk_bearers.is_live_kiosk_bearer(token_id));
+    }
+
+    /// A kiosk bearer whose record cannot be written is not handed out.
+    #[tokio::test]
+    async fn a_kiosk_bearer_with_no_record_is_not_handed_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inventory = dir.path().join("credentials");
+        let (state, _store) = minting_state(&inventory);
+        std::fs::remove_dir_all(&inventory).expect("take the inventory away");
+        let answer = kiosk_mint(state).await;
+        // Says so without printing the answer: it may hold a bearer.
+        assert!(answer.get("token").is_none(), "a bearer was handed out");
+        assert_eq!(answer["error"]["subclass"], "persistence_failed");
     }
 }

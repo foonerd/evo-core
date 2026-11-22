@@ -17,15 +17,17 @@
 //! 3. Browser calls `pair.complete` with the attempt id + typed
 //!    code. Framework verifies (constant-time compare, single-use
 //!    consume, TTL check), mints a bearer bound to a fresh
-//!    `paired_device_id`, and records the paired device in the
-//!    persistent subject store.
+//!    `paired_device_id`, and records the bearer in the credential
+//!    inventory with that device id.
 //!
 //! Subsequent connections from that browser present the bearer;
-//! the operator never sees the ceremony again. `pair.list` +
-//! `pair.revoke` manage the paired-device set.
+//! the operator never sees the ceremony again. The paired-device
+//! set is the inventory's paired bearers: `pair_list` lists the
+//! devices that have a live one and `pair_revoke` revokes them, so
+//! both survive a restart.
 //!
 //! This module carries the store + the primitives that the wire
-//! handlers wrap. Subject-store persistence + kiosk-display
+//! handlers wrap. The inventory records and kiosk-display
 //! publishing live in the wire integration; here we only own the
 //! in-memory pairing state and the pure-logic operations.
 
@@ -99,9 +101,10 @@ pub struct PairAttempt {
     pub expires_at_ms: u64,
 }
 
-/// A device that completed the pairing ceremony. Persisted across
-/// steward restarts via the subject store; represented in memory
-/// on the current process by the `PairingStore`'s device map.
+/// A device that completed the pairing ceremony. `pair_list` builds
+/// it from the device's paired bearers in the credential inventory,
+/// which outlive a restart; the `PairingStore`'s device map holds the
+/// devices paired in the current process only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairedDevice {
     /// Stable id assigned at completion; never re-used, even
@@ -139,10 +142,10 @@ pub enum PairCompleteError {
     WrongCode,
 }
 
-/// Ephemeral store of pending attempts + in-memory mirror of the
-/// paired-device set. The persistent mirror is the subject store
-/// (`subjects/system/paired_devices/*`); this store is the runtime
-/// index kept in sync with it.
+/// Ephemeral store of pending attempts + the devices paired in the
+/// current process. What outlives a restart is each paired bearer's
+/// record in the credential inventory, which `pair_list` and
+/// `pair_revoke` read.
 #[derive(Debug, Default)]
 pub struct PairingStore {
     attempts: Mutex<HashMap<PairAttemptId, PairAttempt>>,

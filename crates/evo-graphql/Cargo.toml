@@ -34,9 +34,12 @@ async-graphql-parser = { version = "=7.0.16", optional = true }
 async-graphql-value = { version = "=7.0.16", optional = true }
 axum = { version = "0.7", default-features = false, features = ["http1", "http2", "json", "tokio"], optional = true }
 async-trait = "0.1"
-tokio = { version = "1", features = ["macros", "rt", "sync", "net"] }
+tokio = { version = "1.47", features = ["macros", "rt", "sync", "net"] }
 tracing = "0.1"
 thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1.47", features = ["macros", "rt", "time"] }
 
 [lints]
 workspace = true

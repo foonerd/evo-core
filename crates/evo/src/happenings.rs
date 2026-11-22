@@ -3021,7 +3021,7 @@ pub struct HappeningBus {
     /// `replay_window_exceeded` advice.
     ///
     /// Write-side enforcement is provided by
-    /// [`run_happenings_janitor`], spawned by the steward boot path,
+    /// [`spawn_happenings_janitor`], started by the steward boot path,
     /// which periodically calls
     /// [`PersistenceStore::trim_happenings_log`] with this window and
     /// the configured retention capacity. Read-side enforcement
@@ -3463,18 +3463,44 @@ impl HappeningBus {
 /// the steward's "don't crash on a janitor failure" stance.
 ///
 /// The steward boot path spawns this task after constructing the
-/// durable bus and joins it on shutdown.
-pub async fn run_happenings_janitor(
+/// durable bus and joins it on shutdown. A
+/// `shutdown.notify_waiters()` at any time after this returns, even
+/// before the task first runs or while a trim is in flight, ends the
+/// loop.
+pub fn spawn_happenings_janitor(
     persistence: Arc<dyn crate::persistence::PersistenceStore>,
     retention_window_secs: u64,
     retention_capacity: u64,
     interval_secs: u64,
     shutdown: Arc<tokio::sync::Notify>,
+) -> tokio::task::JoinHandle<()> {
+    // Made here, before the task exists: a waiter sees every `notify_waiters`
+    // call made after it is created, so one the loop made for itself would miss
+    // a stop signalled before the task first ran, or while a trim was in
+    // flight. Enabling it now also queues it for `notify_one`.
+    let mut stop = Box::pin(shutdown.notified_owned());
+    stop.as_mut().enable();
+    tokio::spawn(run_happenings_janitor(
+        persistence,
+        retention_window_secs,
+        retention_capacity,
+        interval_secs,
+        stop,
+    ))
+}
+
+async fn run_happenings_janitor(
+    persistence: Arc<dyn crate::persistence::PersistenceStore>,
+    retention_window_secs: u64,
+    retention_capacity: u64,
+    interval_secs: u64,
+    mut stop: std::pin::Pin<Box<tokio::sync::futures::OwnedNotified>>,
 ) {
     let interval = std::time::Duration::from_secs(interval_secs.max(1));
     loop {
         tokio::select! {
-            _ = shutdown.notified() => {
+            biased;
+            _ = stop.as_mut() => {
                 tracing::info!(
                     component = "happenings_janitor",
                     "shutdown notified; exiting"
@@ -5487,6 +5513,29 @@ mod tests {
         );
         let max_after = store.load_max_happening_seq().await.unwrap();
         assert_eq!(max_after, 100, "trim must not touch the most recent seq");
+    }
+
+    /// A stop signalled the moment the janitor is spawned, before its
+    /// task has run at all, ends it.
+    #[tokio::test]
+    async fn a_stop_signalled_before_the_janitor_first_runs_ends_it() {
+        // On this single-threaded runtime nothing else runs between
+        // the spawn and the stop.
+        let store: Arc<dyn crate::persistence::PersistenceStore> =
+            Arc::new(crate::persistence::MemoryPersistenceStore::new());
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let task = spawn_happenings_janitor(
+            store,
+            /*retention_window_secs*/ 3600,
+            /*retention_capacity*/ 1000,
+            /*interval_secs*/ 60,
+            Arc::clone(&stop),
+        );
+        stop.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the janitor ended on the stop")
+            .unwrap();
     }
 
     #[tokio::test]

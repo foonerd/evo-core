@@ -50,14 +50,65 @@ both patterns.
 | Create a named credential (per-credential inventory) | `evo-plugin-tool admin auth create-bearer-token --name <name> --reason <reason> --scope <kind:scope> [--scope ...]` |
 | Mint a one-off narrowed token (SSH/CLI dev path) | `evo-plugin-tool admin auth mint-bearer-token --reason <reason> --ttl-seconds <n> [--scope <capability-name>] [--scope ...]` |
 | Create a time-limited named credential | Add `--expires-in-seconds <n>` (or `0` for never) to `create-bearer-token` |
-| List every credential | `evo-plugin-tool admin auth list-bearer-tokens` |
+| List every credential (every bearer the device has issued) | `evo-plugin-tool admin auth list-bearer-tokens` |
 | Revoke a credential | `evo-plugin-tool admin auth revoke-bearer-token --token-id <id> --reason <reason>` |
 | Reset to open (lockout recovery) | `evo-plugin-tool admin auth reset-credentials-to-open --reason <reason>` |
+| Rotate the bearer-token signing key (steward stopped) | `evo auth rotate-token-key [--state-dir <path>]` |
 
-All four require operator SSH access on the device (or a session
+All of these require operator SSH access on the device (or a session
 already admitted under the operator's UID via the unix socket); the
 HTTPS-side surfaces are gated on `write:auth` / `read:auth` /
 `step_up:system_admin`.
+
+Over HTTPS, creating, listing and revoking credentials also requires
+a bearer of the caller's own. A caller admitted without one — a
+browser on LAN-trust, or any caller under the `Open` tier — is
+refused (`bearer_required`), whatever its tier and origin. A bearer
+creates credentials only from what it holds itself: each requested
+scope must be one it carries at the same kind or a higher one
+(`step_up` > `write` > `read`), or the request is refused
+(`scope_not_held`).
+
+## What the inventory holds
+
+Every bearer the device issues has a record in the inventory, and
+`list-bearer-tokens` lists them all. Each record's `source` says what
+issued it:
+
+| `source` | Issued by | Name in the list |
+| -------- | --------- | ---------------- |
+| `created` | `create-bearer-token` | the name the operator gave |
+| `bootstrap` | the first boot (`bootstrap.token`) | `bootstrap` |
+| `paired` | a browser pairing (code or password) | the browser's device label |
+| `kiosk` | the kiosk panel's session | `kiosk` |
+| `minted` | `mint-bearer-token` on the local socket | `local socket mint` |
+
+A record written by an earlier release has no `source`.
+
+Any of them is revoked with `revoke-bearer-token --token-id <id>`:
+refused at once, and still refused after a restart. A paired
+browser's record also carries its `paired_device_id`. The
+`pair_list` operation lists the paired devices that have a live
+bearer, and `pair_revoke` revokes every live bearer paired to one
+device. Both read the inventory, so they work the same after a
+restart. A kiosk panel asks the steward every 15 seconds whether
+its bearer is still taken; one whose bearer is revoked mints a new
+session within about 15 seconds, with no restart of `evo-kiosk`.
+
+The device does not hand out a bearer without its record: if the
+record cannot be written, the request is refused
+(`persistence_failed`, or `store_unavailable` when the inventory is
+not wired) and no bearer leaves the device.
+
+Records whose bearers have expired are dropped at every start, and
+when a new record is added, at most once a minute. A record that
+expires in between stays listed, marked by its `expires_at_ms`, until
+the next of those; its bearer is refused regardless. Adding a record
+does not read the rest of the inventory, so issuing a bearer costs
+the same however many records it holds. The kiosk panel and paired
+browsers are issued a bearer a day, so the list stays the size of
+what is live. A record that never expires stays, revoked or not, until a
+reset or a key rotation clears the inventory.
 
 ## Scopes
 
@@ -82,6 +133,7 @@ runtime's `describe_capabilities` op for the live list):
 | `subjects` | Subject substrate (state subscribed by UIs). |
 | `system` | Device identity + system-level introspection. |
 | `auth` | Credential management itself. |
+| `pair` | Pairing a browser (`pair_begin`, `pair_complete`, `pair_authenticate`). Every caller holds `write:pair`, with or without a bearer; the device serves pairing to LAN addresses only. |
 | `discovery` | Network discovery / peer enumeration. |
 | `ui` | Schema-first UI surfaces. |
 | `observatory` | Live observatory ring (debugging surface). |
@@ -98,7 +150,9 @@ and nothing else.
 If `--scope` is omitted entirely, the credential carries the
 comprehensive operator set (every read + every write + every
 step_up). This is the right shape for the operator's own personal
-shell scripts, never the right shape for a tier-1 IoT device.
+shell scripts, never the right shape for a tier-1 IoT device. A
+credential created over HTTPS with no scopes carries the creating
+bearer's own set instead.
 
 ## Expiry policy
 
@@ -301,7 +355,9 @@ sequence is:
 3. Confirm the browser is connecting from a LAN address. The
    framework classifies RFC1918 (10/8, 172.16/12, 192.168/16),
    loopback, link-local, and IPv6 unique-local as LAN. Anything
-   else is WAN and requires a credential.
+   else is WAN and requires a credential. Pairing is served to LAN
+   addresses only, in every tier; a browser on a WAN origin cannot
+   pair.
 
 4. If the device is in `Secure` or `Secure-industrial` tier and the
    browser is on a WAN origin, either:
@@ -321,10 +377,70 @@ sequence is:
    ```
 
    This purges every credential record and every revocation entry,
-   and the next boot admits `Open` tier. The operator's browser
-   reaches the device on next visit; external API consumers will
-   need fresh credentials, which the operator can mint once the
-   reset is complete.
+   and retires the bearer-token signing key. The restart replaces
+   the key before it loads one, exactly as
+   [rotating the signing key](#rotating-the-signing-key) does, so
+   every bearer issued before the reset is refused, revoked or not:
+   browsers pair again, the device issues a new `bootstrap.token`,
+   and external API consumers need fresh credentials, which the
+   operator can mint once the restart is complete. Until the restart
+   the old key and its revocations stand.
+
+   A kiosk panel needs no restart: it asks the steward every 15
+   seconds whether its bearer is still taken, and within about 15
+   seconds of the steward's start it mints a new session.
+
+   The reset also puts the device in `Open` tier, at once and at
+   every start after it, whatever `EVO_AUTH_TIER` names. Once fresh
+   credentials are in place, return to the configured tier with the
+   steward stopped:
+
+   ```bash
+   sudo systemctl stop evo
+   sudo evo auth restore-tier
+   sudo systemctl start evo
+   ```
+
+   A distribution's own steward binary takes the same subcommand. It
+   refuses while the steward's socket answers; pass `--state-dir`
+   when the steward boots with `EVO_HTTPS_STATE_DIR` set. The next
+   start runs the tier `EVO_AUTH_TIER` names, `Open` when unset.
+
+   If the reset cannot record the key retirement and the `Open` tier
+   on disk, it is refused with `store_io` and clears nothing.
+
+   If the key cannot be replaced at that start (for example, the
+   state directory is read-only), the steward logs an error naming
+   the directory and runs without its HTTPS listener rather than
+   load the retired key. Each later start tries again.
+
+## Rotating the signing key
+
+Every bearer the device issues — paired browsers, the kiosk session,
+operator credentials — is signed by one key, `tokens.key` under the
+HTTPS state directory. If a bearer may have leaked, or the device sat
+exposed beyond the LAN, rotate the key:
+
+```bash
+# SSH into the device, then:
+sudo systemctl stop evo
+sudo evo auth rotate-token-key
+sudo systemctl start evo
+```
+
+A distribution's own steward binary takes the same subcommand. The
+command refuses while the steward's socket answers, and refuses a
+state directory with no key in it; pass `--state-dir` when the
+steward boots with `EVO_HTTPS_STATE_DIR` set. It writes a fresh key
+(mode `0600`, owned as the old one was), and clears the credential
+records, the revocation list and the first-boot `bootstrap.token`,
+since every bearer they describe is dead.
+
+After the restart every bearer issued before the rotation is refused
+at the handshake: browsers pair again, the device issues a new
+`bootstrap.token`, and external consumers need fresh credentials. A
+kiosk panel mints a new session within about 15 seconds of the
+steward's start, with no restart of `evo-kiosk`.
 
 ## How the operator chooses a tier
 
@@ -337,6 +453,9 @@ The three tiers and their trade-offs:
 | `Secure-industrial` | Same as `Secure` plus the operator wants per-credential expiry warnings + audit visibility ahead of expiry, typical of enterprise integrations. The list output shows credentials expiring within seven days; the operator rotates before lockout. |
 
 The toggle is `EVO_AUTH_TIER` in the systemd unit drop-in (CLI
-control) or, once landed, the UI tier-toggle screen. The
-operator's own browser admits on LAN-trust in every tier so the
-operator never locks themselves out.
+control) or, once landed, the UI tier-toggle screen. After the
+[lockout-recovery gesture](#recovery-i-got-locked-out-what-now) the
+device runs `Open` whatever the toggle says, until
+`evo auth restore-tier`. The operator's own browser admits on
+LAN-trust in every tier so the operator never locks themselves
+out.

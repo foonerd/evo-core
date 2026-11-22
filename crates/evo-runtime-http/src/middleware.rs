@@ -21,8 +21,8 @@
 //!   **satisfies** the route's [`AuthLayer::requirement`].
 //!   Origin-independent. The set is a floor, not every
 //!   operator scope: privileged writers (`network_admin`,
-//!   `system_admin`) stay off it. A route those scopes
-//!   gate is `403 Forbidden` until a bearer is presented.
+//!   `system_admin`, `audio_admin`) stay off it. A route those
+//!   scopes gate is `403 Forbidden` until a bearer is presented.
 //! - `Secure` / `SecureIndustrial` — same set-vs-requirement
 //!   check on LAN origin (RFC1918, loopback, link-local,
 //!   IPv6 unique-local); refuse WAN-origin requests with
@@ -32,7 +32,7 @@
 use crate::auth_tier::{
     effective_origin, is_lan_origin, AuthTier, AuthTierProvider,
 };
-use crate::principal::Principal;
+use crate::principal::{CallerOrigin, Principal, ANONYMOUS_TOKEN_ID};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, Request, StatusCode};
@@ -134,6 +134,17 @@ pub async fn capability_gate(
         );
     }
 
+    // Effective origin honours a trusted-proxy `X-Forwarded-For`
+    // header when the immediate peer is loopback (the framework's
+    // reverse-proxy on the same host); otherwise it is the immediate
+    // peer's IP. Unclassified when no peer address was injected.
+    let origin = req.extensions().get::<SocketAddr>().map(|p| {
+        CallerOrigin::from_lan(is_lan_origin(effective_origin(
+            p.ip(),
+            req.headers(),
+        )))
+    });
+
     if matches!(layer.requirement, CapabilityRequirement::None) {
         if let Some(obs) = &layer.observatory {
             obs.record(
@@ -146,6 +157,13 @@ pub async fn capability_gate(
                 .with_attrs(Attributes::new().with("requirement", "anonymous")),
             );
         }
+        // No bearer is read on an anonymous route, so the caller
+        // holds nothing; the origin still travels, because an
+        // anonymous op may admit by it.
+        let mut principal =
+            Principal::new(ANONYMOUS_TOKEN_ID, CapabilitySet::default());
+        principal.origin = origin;
+        req.extensions_mut().insert(principal);
         req.extensions_mut().insert(span);
         return Ok(next.run(req).await);
     }
@@ -158,16 +176,9 @@ pub async fn capability_gate(
             // run: Open always; Secure / SecureIndustrial
             // only on LAN origin. Admission still requires
             // `lan_trust_caps` to satisfy this route.
-            // Privileged writers are not in that set.
-            // Effective origin honours a trusted-proxy
-            // `X-Forwarded-For` header when the immediate
-            // peer is loopback (the framework's reverse-proxy
-            // on the same host); otherwise it is the
-            // immediate peer's IP.
-            let peer_ip = req.extensions().get::<SocketAddr>().map(|p| p.ip());
-            let lan_origin = peer_ip
-                .map(|ip| is_lan_origin(effective_origin(ip, req.headers())))
-                .unwrap_or(false);
+            // Privileged writers are not in that set. An
+            // unclassified origin is not LAN.
+            let lan_origin = origin == Some(CallerOrigin::Lan);
             let admit_reason = match (layer.tier_provider.current(), lan_origin)
             {
                 (AuthTier::Open, _) => Some("lan_trust_open"),
@@ -219,10 +230,11 @@ pub async fn capability_gate(
                         );
                         return Err(StatusCode::FORBIDDEN);
                     }
-                    let principal = Principal::new(
+                    let mut principal = Principal::new(
                         LAN_TRUST_TOKEN_ID,
                         admitted_caps.clone(),
                     );
+                    principal.origin = origin;
                     if let Some(obs) = &layer.observatory {
                         obs.record(
                             Observation::now(
@@ -323,8 +335,9 @@ pub async fn capability_gate(
         }
     }
 
-    let principal =
+    let mut principal =
         Principal::new(token.id.clone(), token.capabilities.clone());
+    principal.origin = origin;
 
     if let Some(obs) = &layer.observatory {
         obs.record(

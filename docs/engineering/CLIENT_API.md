@@ -111,6 +111,15 @@ For factory-stocked shelves, include `instance_id` to route the request to a spe
 | `request_type` | string | One of the request types the target plugin declared in its manifest. |
 | `payload_b64` | string | Base64-encoded bytes. May be empty. |
 | `instance_id` | string \| null | Optional. Names a specific factory-announced instance. Singleton-stocked shelves ignore the field; factory-stocked shelves MAY refuse the request when the field is absent. |
+| `step_up_token` | string \| null | Optional. A step-up token from `step_up_auth_verify`, for a verb declared `step_up`. It is validated for this call only and never reaches the plugin. Over the WebSocket it is a field of the frame's `payload`, beside `shelf`; the frame itself accepts no extra fields. |
+
+Each verb's capability comes from the target plugin's manifest (`[capabilities.respondent.verb_capabilities]`), and the steward checks it before the plugin sees the request:
+
+- `none` — no check.
+- `read` / `write` — the caller must hold the named scope at that rank or above (`read` < `write` < `step_up`), so a caller holding the scope at `read` does not pass a `write` verb. Over the local socket, `negotiate` grants capability names, and the name is enough. Otherwise the request is refused with `verb_capability_scope_not_granted`.
+- `step_up` — the caller must hold the named scope and a step-up session on this call: the `step_up_token` above, or, for a dispatch one plugin makes while answering a consumer, that consumer's session. Holding the scope at `step_up` rank on a bearer does not count as a session. Otherwise the request is refused with `step_up_required`, `step_up_invalid` or `step_up_expired`.
+
+After that check, a verb whose scope the household policy protects is refused with `household_policy_locked` unless the caller holds a step-up session (see `household_require`).
 
 Response on success:
 

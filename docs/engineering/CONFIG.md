@@ -181,6 +181,8 @@ network listeners. The full env-var contract lives in
 | --- | --- |
 | `EVO_HTTPS_LISTEN_ADDR` | HTTPS listener (REST + WS) |
 | `EVO_HTTPS_STATE_DIR` | Override path for device-CA + bearer-token state |
+| `EVO_HTTPS_HANDSHAKE_TIMEOUT_SECS` | HTTPS: seconds from accept to a connection's first request bytes (default 10) |
+| `EVO_HTTPS_MAX_INCOMPLETE_CONNECTIONS` | HTTPS: connections yet to send a request, at most (default 64) |
 | `EVO_HTTP_REDIRECT_LISTEN_ADDR` | HTTP → HTTPS 308 redirect listener |
 | `EVO_GRPC_LISTEN_ADDR` | gRPC listener (tonic) |
 | `EVO_GRAPHQL_LISTEN_ADDR` | GraphQL listener (async-graphql) |

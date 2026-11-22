@@ -113,6 +113,8 @@ async fn maybe_boot_https_returns_none_when_env_var_unset() {
         std::path::Path::new("/tmp/unused"),
         None,
         None,
+        evo::LanPrivilege::default(),
+        None,
     )
     .await;
     match &result {
@@ -145,6 +147,8 @@ async fn maybe_boot_https_boots_listener_when_env_var_set() {
         server,
         &persistence_parent.join("persistence.sqlite"),
         None,
+        None,
+        evo::LanPrivilege::default(),
         None,
     )
     .await
@@ -259,6 +263,8 @@ async fn secure_tier_refuses_request_without_bearer() {
         &persistence_parent.join("persistence.sqlite"),
         None,
         None,
+        evo::LanPrivilege::default(),
+        None,
     )
     .await
     .expect("maybe_boot_https Ok")
@@ -349,6 +355,8 @@ async fn maybe_boot_https_errors_on_malformed_listen_addr() {
         server,
         std::path::Path::new("/tmp/unused"),
         None,
+        None,
+        evo::LanPrivilege::default(),
         None,
     )
     .await;

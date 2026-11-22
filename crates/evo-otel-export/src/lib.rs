@@ -33,7 +33,7 @@
 //! 2. `OtelExporter::new` wires the SDK's `TracerProvider`
 //!    around the OTLP/HTTP `SpanExporter`, with the resource
 //!    attributes the config carries.
-//! 3. `OtelExporter::run` is the background task. Every
+//! 3. `OtelExporter::spawn` starts the background task. Every
 //!    `batch_interval` it snapshots the observatory, filters
 //!    observations newer than the export watermark, converts
 //!    each to a `SpanData`, calls the SDK exporter's `export`

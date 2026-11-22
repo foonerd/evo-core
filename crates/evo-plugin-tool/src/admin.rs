@@ -4884,9 +4884,11 @@ pub fn revoke_bearer_token(
 }
 
 /// Run the `auth reset-credentials-to-open` subcommand. Purges
-/// every credential record + revocation entry and prepares the
-/// steward to admit Open tier on next boot. Requires
-/// step_up:system_admin.
+/// every credential record + revocation entry and retires the
+/// bearer-token signing key, so after the steward restarts every
+/// bearer issued before the reset is refused. The auth tier is Open
+/// from the reset on, across restarts, until `evo auth restore-tier`
+/// runs with the steward stopped. Requires step_up:system_admin.
 pub fn reset_credentials_to_open(
     socket: &Path,
     reason: &str,
@@ -4907,12 +4909,19 @@ pub fn reset_credentials_to_open(
         .get("revocations_cleared")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    println!("credential substrate reset to Open tier:");
+    println!("credentials reset:");
     println!("  records_purged       = {records_purged}");
     println!("  revocations_cleared  = {revocations_cleared}");
     eprintln!();
-    eprintln!("  Restart the steward (`systemctl restart evo`) to apply the");
-    eprintln!("  Open-tier admission policy on next boot.");
+    eprintln!("  Restart the steward (`systemctl restart evo`). That start");
+    eprintln!("  replaces the bearer-token signing key: every bearer issued");
+    eprintln!("  before the reset is refused, browsers pair again, a new");
+    eprintln!("  bootstrap.token is issued, and external consumers need fresh");
+    eprintln!("  credentials. A kiosk panel, if there is one, mints a new");
+    eprintln!("  session within about 15 seconds of that start; it needs no");
+    eprintln!("  restart. The auth tier is Open from now on, at that start");
+    eprintln!("  and every later one, until `evo auth restore-tier` runs");
+    eprintln!("  with the steward stopped.");
     Ok(())
 }
 

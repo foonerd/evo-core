@@ -36,13 +36,13 @@ use evo::household_protection::{
     GroupTable, HouseholdGroupTable, HouseholdProtectionPolicy,
     HouseholdProtectionRuntime, ProtectionLevel,
 };
-use evo::maybe_boot_https;
 use evo::persistence::MemoryPersistenceStore;
 use evo::projections::ProjectionEngine;
 use evo::relations::RelationGraph;
 use evo::server::Server;
 use evo::state::StewardState;
 use evo::subjects::SubjectRegistry;
+use evo::{maybe_boot_https, LanPrivilege};
 use evo_plugin_sdk::contract::{
     BuildInfo, HealthReport, LoadContext, Plugin, PluginDescription,
     PluginError, PluginIdentity, Request, Respondent, Response,
@@ -63,6 +63,13 @@ const GATED_SCOPE: &str = "system_admin";
 /// Playback transport. No verb capability — the gate must never
 /// lock browse / play / pause / skip / volume, including under lend.
 const PLAY_VERB: &str = "play";
+/// A network writer: `write:network_admin`, the household door a
+/// home player opens to its LAN and a distribution may keep shut.
+const NET_VERB: &str = "set_network";
+/// An audio-hardware writer: `write:audio_admin`, the rank the DAC
+/// and DSP verbs declare. No household group carries the scope, as
+/// on the home player.
+const AUDIO_VERB: &str = "select_dac";
 
 const CATALOGUE_TOML: &str = r#"
 schema_version = 1
@@ -116,12 +123,20 @@ restart_on_crash = false
 restart_budget = 0
 
 [capabilities.respondent]
-request_types = ["{GATED_VERB}", "{PLAY_VERB}"]
+request_types = ["{GATED_VERB}", "{PLAY_VERB}", "{NET_VERB}", "{AUDIO_VERB}"]
 response_budget_ms = 30000
 
 [capabilities.respondent.verb_capabilities.{GATED_VERB}]
 kind = "write"
 scope = "{GATED_SCOPE}"
+
+[capabilities.respondent.verb_capabilities.{NET_VERB}]
+kind = "write"
+scope = "network_admin"
+
+[capabilities.respondent.verb_capabilities.{AUDIO_VERB}]
+kind = "write"
+scope = "audio_admin"
 "#
     );
     Manifest::from_toml(&toml).expect("gate manifest must parse")
@@ -171,6 +186,8 @@ impl Plugin for PanelRespondent {
                     request_types: vec![
                         GATED_VERB.to_string(),
                         PLAY_VERB.to_string(),
+                        NET_VERB.to_string(),
+                        AUDIO_VERB.to_string(),
                     ],
                     course_correct_verbs: vec![],
                     accepts_custody: false,
@@ -233,6 +250,23 @@ struct Booted {
 /// admission path and `policy` in force.
 async fn boot(
     policy: HouseholdProtectionPolicy,
+) -> (Booted, tempfile::TempDir) {
+    boot_with(policy, LanPrivilege::default()).await
+}
+
+/// [`boot`], with the distribution's LAN privilege choice.
+async fn boot_with(
+    policy: HouseholdProtectionPolicy,
+    lan_privilege: LanPrivilege,
+) -> (Booted, tempfile::TempDir) {
+    boot_bounded(policy, lan_privilege, None).await
+}
+
+/// [`boot_with`], with the distribution's bound on no-bearer callers.
+async fn boot_bounded(
+    policy: HouseholdProtectionPolicy,
+    lan_privilege: LanPrivilege,
+    bound: Option<evo_auth_bearer::CapabilitySet>,
 ) -> (Booted, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("state tempdir");
     let parent = dir.path().to_path_buf();
@@ -309,6 +343,8 @@ async fn boot(
         &parent.join("persistence.sqlite"),
         None,
         None,
+        lan_privilege,
+        bound,
     )
     .await
     .expect("maybe_boot_https Ok")
@@ -1390,4 +1426,347 @@ async fn file_sharing_read_get_state_needs_no_sitting() {
         .expect("policy applies");
     let (status, out) = post_as(&booted, &pair, "request", play_body()).await;
     assert_eq!(status, 200, "an ungated verb needs no sitting. out={out}");
+}
+
+// ---------------------------------------------------------------
+// The LAN privilege a distribution chooses.
+//
+// A no-bearer LAN caller is stamped by the middleware. Under the
+// default, with a household runtime attached and the level open,
+// that stamp carries `network_admin` and the network writer
+// passes: the home-player contract. A distribution that withholds
+// LAN privilege keeps that caller on the playback floor at every
+// level. WAN is on the floor either way.
+// ---------------------------------------------------------------
+
+/// A private address the same-host proxy forwards for.
+const FORWARDED_LAN: &str = "10.20.30.40";
+/// A documentation address: an origin outside the LAN.
+const FORWARDED_WAN: &str = "203.0.113.9";
+
+fn net_body() -> Value {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    serde_json::json!({
+        "shelf": SHELF,
+        "request_type": NET_VERB,
+        "payload_b64": B64.encode(b"{}"),
+    })
+}
+
+/// One request with no bearer, straight from loopback or as the
+/// same-host proxy forwarding for `forwarded_for`.
+async fn anonymous(
+    booted: &Booted,
+    body: Value,
+    forwarded_for: Option<&str>,
+) -> (u16, Value) {
+    request_from(booted, None, body, forwarded_for).await
+}
+
+/// One request, with `bearer` when given, straight from loopback or
+/// as the same-host proxy forwarding for `forwarded_for`.
+async fn request_from(
+    booted: &Booted,
+    bearer: Option<&str>,
+    body: Value,
+    forwarded_for: Option<&str>,
+) -> (u16, Value) {
+    let client = client_with_ca(&booted.ca_pem);
+    let mut req = client
+        .post(format!("https://{}/api/v1/request", booted.addr))
+        .json(&body);
+    if let Some(bearer) = bearer {
+        req = req.bearer_auth(bearer);
+    }
+    if let Some(origin) = forwarded_for {
+        req = req.header("X-Forwarded-For", origin);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status().as_u16();
+    let value: Value = resp.json().await.unwrap_or(Value::Null);
+    (status, value)
+}
+
+fn policy_at(level: ProtectionLevel) -> HouseholdProtectionPolicy {
+    HouseholdProtectionPolicy {
+        chosen: true,
+        level,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn withheld_lan_privilege_refuses_the_network_writer_from_loopback() {
+    let _guard = ENV_LOCK.lock().await;
+    // Open protects nothing, so only the stamp can refuse here.
+    let (booted, _dir) = boot_with(open_policy(), LanPrivilege::Withheld).await;
+
+    let (status, body) = anonymous(&booted, net_body(), None).await;
+    assert_eq!(status, 403, "body={body}");
+    assert_eq!(
+        subclass_of(&body).as_deref(),
+        Some("verb_capability_scope_not_granted"),
+        "a withheld LAN holds no network_admin. body={body}"
+    );
+}
+
+#[tokio::test]
+async fn withheld_lan_privilege_refuses_the_network_writer_through_the_proxy() {
+    let _guard = ENV_LOCK.lock().await;
+    let (booted, _dir) = boot_with(open_policy(), LanPrivilege::Withheld).await;
+
+    let (status, body) =
+        anonymous(&booted, net_body(), Some(FORWARDED_LAN)).await;
+    assert_eq!(status, 403, "body={body}");
+    assert_eq!(
+        subclass_of(&body).as_deref(),
+        Some("verb_capability_scope_not_granted"),
+        "a private origin behind the local proxy is still LAN, and \
+         still withheld. body={body}"
+    );
+}
+
+#[tokio::test]
+async fn withheld_lan_privilege_keeps_the_playback_floor() {
+    let _guard = ENV_LOCK.lock().await;
+    let (booted, _dir) = boot_with(open_policy(), LanPrivilege::Withheld).await;
+
+    for forwarded_for in [None, Some(FORWARDED_LAN)] {
+        let (status, body) =
+            anonymous(&booted, play_body(), forwarded_for).await;
+        assert_eq!(
+            status, 200,
+            "play is on the floor. via={forwarded_for:?} body={body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_default_open_household_lets_lan_reach_the_network_writer() {
+    let _guard = ENV_LOCK.lock().await;
+    // The home player as it ships: no bearer, open level, Wi-Fi
+    // writable from the house.
+    let (booted, _dir) = boot(open_policy()).await;
+    assert_eq!(LanPrivilege::default(), LanPrivilege::PolicedByHousehold);
+
+    for forwarded_for in [None, Some(FORWARDED_LAN)] {
+        let (status, body) =
+            anonymous(&booted, net_body(), forwarded_for).await;
+        assert_eq!(
+            status, 200,
+            "the privileged stamp is still there. via={forwarded_for:?} \
+             body={body}"
+        );
+        assert!(subclass_of(&body).is_none(), "body={body}");
+    }
+}
+
+#[tokio::test]
+async fn the_default_still_refuses_lan_above_open_without_a_sitting() {
+    let _guard = ENV_LOCK.lock().await;
+    // Low keeps the networking surfaces with the owner; Strict keeps
+    // everything. The stamp admits LAN to the writer, and the policy
+    // refuses it, exactly as before.
+    for level in [ProtectionLevel::Low, ProtectionLevel::Strict] {
+        let (booted, _dir) = boot(policy_at(level)).await;
+        let (status, body) = anonymous(&booted, net_body(), None).await;
+        assert_eq!(
+            subclass_of(&body).as_deref(),
+            Some("household_policy_locked"),
+            "level={level:?} status={status} body={body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn wan_stays_on_the_floor_whatever_the_distribution_chooses() {
+    let _guard = ENV_LOCK.lock().await;
+    for lan_privilege in
+        [LanPrivilege::PolicedByHousehold, LanPrivilege::Withheld]
+    {
+        let (booted, _dir) = boot_with(open_policy(), lan_privilege).await;
+        let (status, body) =
+            anonymous(&booted, net_body(), Some(FORWARDED_WAN)).await;
+        assert_eq!(status, 403, "{lan_privilege:?} body={body}");
+        assert_eq!(
+            subclass_of(&body).as_deref(),
+            Some("verb_capability_scope_not_granted"),
+            "{lan_privilege:?} body={body}"
+        );
+    }
+}
+
+fn audio_body() -> Value {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    serde_json::json!({
+        "shelf": SHELF,
+        "request_type": AUDIO_VERB,
+        "payload_b64": B64.encode(b"{}"),
+    })
+}
+
+/// A public origin without a bearer does not reach the DAC or DSP
+/// writers under Open, whatever the distribution chose for its LAN.
+#[tokio::test]
+async fn wan_reaches_no_audio_writer_whatever_the_distribution_chooses() {
+    let _guard = ENV_LOCK.lock().await;
+    for lan_privilege in
+        [LanPrivilege::PolicedByHousehold, LanPrivilege::Withheld]
+    {
+        let (booted, _dir) = boot_with(open_policy(), lan_privilege).await;
+        let (status, body) =
+            anonymous(&booted, audio_body(), Some(FORWARDED_WAN)).await;
+        assert_eq!(status, 403, "{lan_privilege:?} body={body}");
+        assert_eq!(
+            subclass_of(&body).as_deref(),
+            Some("verb_capability_scope_not_granted"),
+            "{lan_privilege:?} body={body}"
+        );
+    }
+}
+
+/// The home player's LAN still reaches the audio writer without a
+/// bearer: no household group protects audio_admin.
+#[tokio::test]
+async fn the_default_open_household_lets_lan_reach_the_audio_writer() {
+    let _guard = ENV_LOCK.lock().await;
+    let (booted, _dir) = boot(open_policy()).await;
+    for forwarded_for in [None, Some(FORWARDED_LAN)] {
+        let (status, body) =
+            anonymous(&booted, audio_body(), forwarded_for).await;
+        assert_eq!(
+            status, 200,
+            "the privileged stamp carries audio_admin. \
+             via={forwarded_for:?} body={body}"
+        );
+        assert!(subclass_of(&body).is_none(), "body={body}");
+    }
+}
+
+/// A distribution that withholds LAN privilege keeps its LAN on the
+/// floor, so the audio writer needs a bearer there too.
+#[tokio::test]
+async fn withheld_lan_privilege_refuses_the_audio_writer() {
+    let _guard = ENV_LOCK.lock().await;
+    let (booted, _dir) = boot_with(open_policy(), LanPrivilege::Withheld).await;
+    for forwarded_for in [None, Some(FORWARDED_LAN)] {
+        let (status, body) =
+            anonymous(&booted, audio_body(), forwarded_for).await;
+        assert_eq!(status, 403, "via={forwarded_for:?} body={body}");
+        assert_eq!(
+            subclass_of(&body).as_deref(),
+            Some("verb_capability_scope_not_granted"),
+            "via={forwarded_for:?} body={body}"
+        );
+    }
+}
+
+/// A paired browser holds audio_admin on its bearer, so it reaches
+/// the audio writer from a public origin too.
+#[tokio::test]
+async fn a_pair_bearer_reaches_the_audio_writer_from_a_public_origin() {
+    let _guard = ENV_LOCK.lock().await;
+    let (booted, _dir) = boot(open_policy()).await;
+    let (_id, pair) = mint_pair_bearer(&booted);
+    let (status, body) =
+        request_from(&booted, Some(&pair), audio_body(), Some(FORWARDED_WAN))
+            .await;
+    assert_eq!(status, 200, "body={body}");
+    assert!(subclass_of(&body).is_none(), "body={body}");
+}
+
+// ---------------------------------------------------------------
+// A verb's declared rank.
+//
+// A verb declared `write:S` needs `write:S` or `step_up:S`; a
+// holder of `read:S` alone does not pass it, whether the set came
+// from a bearer or from a distribution's bound on no-bearer callers.
+// ---------------------------------------------------------------
+
+/// A bearer from the steward's own issuer, carrying `caps`.
+fn mint_bearer(
+    booted: &Booted,
+    caps: Vec<evo_auth_bearer::Capability>,
+) -> String {
+    let issuer = booted
+        .state
+        .bearer_token_issuer
+        .get()
+        .expect("issuer wired by boot")
+        .clone();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    issuer
+        .issue(evo_auth_bearer::CapabilitySet::new(caps), 600_000, now_ms)
+        .expect("bearer mint")
+        .encode()
+}
+
+#[tokio::test]
+async fn a_read_bearer_does_not_pass_a_write_verb() {
+    use evo_auth_bearer::Capability;
+    let _guard = ENV_LOCK.lock().await;
+    let (booted, _dir) = boot(open_policy()).await;
+
+    let reader = mint_bearer(
+        &booted,
+        vec![Capability::write("plugins"), Capability::read(GATED_SCOPE)],
+    );
+    let (status, body) =
+        post_as(&booted, &reader, "request", request_body()).await;
+    assert_eq!(status, 403, "body={body}");
+    assert_eq!(
+        subclass_of(&body).as_deref(),
+        Some("verb_capability_scope_not_granted"),
+        "read:{GATED_SCOPE} must not pass a write verb. body={body}"
+    );
+
+    let writer = mint_bearer(
+        &booted,
+        vec![Capability::write("plugins"), Capability::write(GATED_SCOPE)],
+    );
+    let (status, body) =
+        post_as(&booted, &writer, "request", request_body()).await;
+    assert_eq!(status, 200, "write:{GATED_SCOPE} passes. body={body}");
+}
+
+#[tokio::test]
+async fn a_bound_at_read_rank_keeps_the_lan_off_the_network_writer() {
+    use evo_auth_bearer::{Capability, CapabilitySet};
+    let _guard = ENV_LOCK.lock().await;
+    // The bound narrows the LAN privileged set to the lower rank, so
+    // the LAN holds network_admin at read only.
+    let (booted, _dir) = boot_bounded(
+        open_policy(),
+        LanPrivilege::default(),
+        Some(CapabilitySet::new(vec![
+            Capability::write("plugins"),
+            Capability::read("network_admin"),
+        ])),
+    )
+    .await;
+    let (status, body) = anonymous(&booted, net_body(), None).await;
+    assert_eq!(status, 403, "body={body}");
+    assert_eq!(
+        subclass_of(&body).as_deref(),
+        Some("verb_capability_scope_not_granted"),
+        "a bound at read rank holds no write. body={body}"
+    );
+    drop(booted);
+
+    let (booted, _dir) = boot_bounded(
+        open_policy(),
+        LanPrivilege::default(),
+        Some(CapabilitySet::new(vec![
+            Capability::write("plugins"),
+            Capability::write("network_admin"),
+        ])),
+    )
+    .await;
+    let (status, body) = anonymous(&booted, net_body(), None).await;
+    assert_eq!(status, 200, "a bound at write rank keeps it. body={body}");
 }

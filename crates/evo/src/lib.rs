@@ -135,6 +135,7 @@ pub mod asset_cache;
 pub mod audit;
 pub mod auth;
 pub mod auth_shadow;
+mod bearer_inventory;
 pub mod capability_grant;
 pub mod catalogue;
 pub mod claimant;
@@ -142,6 +143,7 @@ pub mod cli;
 pub mod client_acl;
 pub mod clock_sync;
 pub mod coalescer;
+mod commands;
 pub mod config;
 pub mod context;
 pub mod credentials;
@@ -172,6 +174,10 @@ pub mod logging;
 pub mod manifest_drift;
 pub mod metadata;
 pub mod migration_bundle;
+// The household sitting a nested dispatch inherits from the
+// consumer request it serves. Crate-internal: the household gate
+// and the shelf dispatcher are its only readers.
+mod nest_sitting;
 pub mod pairing;
 pub mod shelf_dispatcher;
 // The multi-room substrate adapter (bridge implementing the
@@ -1164,6 +1170,47 @@ pub struct RunOptions {
     /// through framework scope names, so `lend` is never a silent
     /// no-op.
     pub household_groups: Option<household_protection::GroupTable>,
+
+    /// Whether a no-bearer caller on the LAN earns the privileged
+    /// capability set. See [`LanPrivilege`].
+    ///
+    /// Defaults to [`LanPrivilege::PolicedByHousehold`], the shape
+    /// every steward has had: LAN origin earns
+    /// [`https_boot::lan_privileged_capability_set`] whenever a
+    /// household-protection runtime is attached to police it. A
+    /// distribution whose LAN must never reach a privileged writer
+    /// without a bearer sets [`LanPrivilege::Withheld`].
+    pub lan_privilege: LanPrivilege,
+
+    /// The most a caller admitted without a bearer may hold. See
+    /// [`Self::with_no_bearer_capabilities`]. `None` (the default)
+    /// keeps the no-bearer sets every steward has had.
+    pub no_bearer_capabilities: Option<evo_auth_bearer::CapabilitySet>,
+}
+
+/// What a no-bearer caller whose effective origin is the LAN is
+/// stamped with when the HTTPS listener admits it.
+///
+/// The household-protection runtime is attached on every steward,
+/// and at [`household_protection::ProtectionLevel::Open`] it protects
+/// nothing. So under the default a LAN caller with no bearer holds
+/// the privileged scopes and passes every writer they gate — the
+/// home-player contract, where anyone in the house may change
+/// Wi-Fi. A device that is not a home player opts out here.
+///
+/// WAN is never affected: it keeps the playback floor either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LanPrivilege {
+    /// LAN origin earns the privileged set while a
+    /// household-protection runtime is attached to police it at
+    /// dispatch. The protection level then decides which of those
+    /// writes the household may make without a step-up sitting.
+    #[default]
+    PolicedByHousehold,
+    /// LAN origin earns the playback floor only, whatever the
+    /// household runtime. Every privileged writer needs a bearer
+    /// that carries its scope.
+    Withheld,
 }
 
 impl RunOptions {
@@ -1180,6 +1227,8 @@ impl RunOptions {
             runtime_setup: None,
             https_setup: None,
             household_groups: None,
+            lan_privilege: LanPrivilege::default(),
+            no_bearer_capabilities: None,
         }
     }
 
@@ -1193,6 +1242,8 @@ impl RunOptions {
             runtime_setup: None,
             https_setup: None,
             household_groups: None,
+            lan_privilege: LanPrivilege::default(),
+            no_bearer_capabilities: None,
         }
     }
 
@@ -1244,6 +1295,35 @@ impl RunOptions {
         self.household_groups = Some(household_groups);
         self
     }
+
+    /// Choose what a no-bearer LAN caller is stamped with. See the
+    /// [`Self::lan_privilege`] field and [`LanPrivilege`].
+    #[must_use]
+    pub fn with_lan_privilege(mut self, lan_privilege: LanPrivilege) -> Self {
+        self.lan_privilege = lan_privilege;
+        self
+    }
+
+    /// Bound what any caller admitted without a bearer may hold.
+    ///
+    /// The bound narrows and never widens. Every no-bearer arm — the
+    /// floor (WAN under `AuthTier::Open`, and the LAN when privilege
+    /// is withheld) and the LAN privileged set — keeps only the
+    /// scopes `capabilities` also names, at the lower of the two
+    /// ranks. An empty set leaves a no-bearer caller holding nothing:
+    /// it reaches the capability-none ops, discovery and pairing, and
+    /// nothing else.
+    ///
+    /// Independent of [`Self::lan_privilege`], which still chooses
+    /// which set the LAN starts from. Absent by default.
+    #[must_use]
+    pub fn with_no_bearer_capabilities(
+        mut self,
+        capabilities: evo_auth_bearer::CapabilitySet,
+    ) -> Self {
+        self.no_bearer_capabilities = Some(capabilities);
+        self
+    }
 }
 
 /// Boot, run, and drain the steward.
@@ -1273,6 +1353,8 @@ pub async fn maybe_boot_https(
         std::sync::Arc<dyn evo_plugin_sdk::contract::asset_cache::AssetCache>,
     >,
     https_setup: Option<HttpsSetup>,
+    lan_privilege: LanPrivilege,
+    no_bearer_capabilities: Option<evo_auth_bearer::CapabilitySet>,
 ) -> anyhow::Result<Option<https_boot::HttpsBootHandles>> {
     let Some(listen_raw) = std::env::var_os("EVO_HTTPS_LISTEN_ADDR") else {
         return Ok(None);
@@ -1290,15 +1372,10 @@ pub async fn maybe_boot_https(
     // supplied state_dir internally; pass the parent of the
     // persistence file as the substrate root so material lands
     // at `<parent>/https/*` alongside other steward state.
-    let state_dir = match std::env::var_os("EVO_HTTPS_STATE_DIR") {
-        Some(v) => std::path::PathBuf::from(v),
-        None => persistence_path
-            .parent()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/evo")),
-    };
+    let state_dir = https_boot::https_state_root(persistence_path);
 
-    let mut config = https_boot::HttpsBootConfig::new(listen_addr, state_dir);
+    let mut config = https_boot::HttpsBootConfig::new(listen_addr, state_dir)
+        .with_listener_bounds_from_env()?;
     if let Some(path) = std::env::var_os("EVO_MTLS_CLIENT_CA_FILE") {
         config.client_ca_pem_path = Some(std::path::PathBuf::from(path));
     }
@@ -1309,10 +1386,18 @@ pub async fn maybe_boot_https(
     // household-protection runtime is attached to police them at
     // dispatch. No runtime, no privileged stamp — the LAN arm stays
     // on the playback floor, and a missing gate can never hand LAN a
-    // scope no policy sees. WAN is unaffected either way.
-    config.lan_privileged_capabilities = server
-        .household_protection()
-        .map(|_| https_boot::lan_privileged_capability_set());
+    // scope no policy sees. A distribution that withholds LAN
+    // privilege gets the floor even with a runtime attached. WAN is
+    // unaffected either way.
+    config.lan_privileged_capabilities = match lan_privilege {
+        LanPrivilege::PolicedByHousehold => server
+            .household_protection()
+            .map(|_| https_boot::lan_privileged_capability_set()),
+        LanPrivilege::Withheld => None,
+    };
+    // A distribution's bound on no-bearer callers, applied by the
+    // boot to every no-bearer arm. Narrows only.
+    config.lan_trust_capabilities = no_bearer_capabilities;
     let handles = https_boot::boot_https(server, config, https_setup).await?;
     tracing::info!(
         listen = %handles.server.local_addr,
@@ -1465,10 +1550,10 @@ impl evo_grpc::WireOpDispatcher for GrpcWireOpDispatcher {
                 }
             }
         };
-        let principal = evo_runtime_http::Principal {
-            token_id: String::new(),
-            capabilities: evo_auth_bearer::CapabilitySet::default(),
-        };
+        let principal = evo_runtime_http::Principal::new(
+            String::new(),
+            evo_auth_bearer::CapabilitySet::default(),
+        );
         match self
             .server
             .dispatch_http_wire_op(op_id, payload, &principal)
@@ -1581,10 +1666,10 @@ impl evo_http3::WireOpDispatcher for Http3WireOpDispatcher {
                 }
             }
         };
-        let principal = evo_runtime_http::Principal {
-            token_id: String::new(),
-            capabilities: evo_auth_bearer::CapabilitySet::default(),
-        };
+        let principal = evo_runtime_http::Principal::new(
+            String::new(),
+            evo_auth_bearer::CapabilitySet::default(),
+        );
         match self
             .server
             .dispatch_http_wire_op(op_id, payload, &principal)
@@ -1723,10 +1808,10 @@ impl evo_graphql::WireOpDispatcher for GraphqlWireOpDispatcher {
                 }
             }
         };
-        let principal = evo_runtime_http::Principal {
-            token_id: String::new(),
-            capabilities: evo_auth_bearer::CapabilitySet::default(),
-        };
+        let principal = evo_runtime_http::Principal::new(
+            String::new(),
+            evo_auth_bearer::CapabilitySet::default(),
+        );
         match self
             .server
             .dispatch_http_wire_op(op_id, payload, &principal)
@@ -1957,10 +2042,7 @@ pub async fn maybe_boot_acme(
     .map_err(|e| anyhow::anyhow!("ACME issuer init failed: {e}"))?;
     let issuer = std::sync::Arc::new(issuer);
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-    let task_shutdown = std::sync::Arc::clone(&shutdown);
-    let task = tokio::spawn(async move {
-        issuer.run(task_shutdown).await;
-    });
+    let task = issuer.spawn(std::sync::Arc::clone(&shutdown));
     tracing::info!("evo acme issuer ready");
     Ok(Some(AcmeHandles {
         task,
@@ -2028,10 +2110,7 @@ pub async fn maybe_boot_otel_export(
         }
     };
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-    let shutdown_for_task = std::sync::Arc::clone(&shutdown);
-    let task = tokio::spawn(async move {
-        exporter.run(shutdown_for_task).await;
-    });
+    let task = exporter.spawn(std::sync::Arc::clone(&shutdown));
     tracing::info!(
         endpoint = %endpoint,
         "evo otlp exporter ready"
@@ -2352,6 +2431,9 @@ fn enumerate_local_endpoints(
 /// forwarding / janitor join / admission drain / WAL checkpoint)
 /// alongside the optional HTTPS listener when
 /// `EVO_HTTPS_LISTEN_ADDR` is set in the environment.
+///
+/// When `opts.args` carries a subcommand ([`cli::Command`]), `run`
+/// answers it instead and returns without booting anything.
 pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     let RunOptions {
         args,
@@ -2361,7 +2443,16 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         runtime_setup,
         https_setup,
         household_groups,
+        lan_privilege,
+        no_bearer_capabilities,
     } = opts;
+    // A subcommand is an operator command, not a boot. Answer it and
+    // return before anything a steward starts: config, logging,
+    // persistence, sockets. Every distribution binary that hands its
+    // parsed `Args` to `run` carries the commands this way.
+    if let Some(command) = &args.command {
+        return commands::run_command(&args, command);
+    }
     let mut runtime_setup = runtime_setup;
 
     // Load the config. If --config was given, missing file is an
@@ -2556,17 +2647,13 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     let time_trust_shared_for_task = Arc::clone(&time_trust_shared);
     let time_trust_last_step_for_task = Arc::clone(&time_trust_last_step);
     let time_trust_bus_for_task = Arc::clone(&bus);
-    let time_trust_shutdown_for_task = Arc::clone(&time_trust_shutdown);
-    let time_trust_task = tokio::spawn(async move {
-        time_trust::run_tracker(
-            time_trust_shared_for_task,
-            time_trust_last_step_for_task,
-            time_trust_bus_for_task,
-            time_trust_tracker_config,
-            time_trust_shutdown_for_task,
-        )
-        .await;
-    });
+    let time_trust_task = time_trust::spawn_tracker(
+        time_trust_shared_for_task,
+        time_trust_last_step_for_task,
+        time_trust_bus_for_task,
+        time_trust_tracker_config,
+        Arc::clone(&time_trust_shutdown),
+    );
     tracing::info!(
         poll_interval_secs = config.time_trust.poll_interval_secs,
         has_battery_rtc = config.time_trust.has_battery_rtc,
@@ -2579,17 +2666,13 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     let janitor_capacity = config.happenings.retention_capacity as u64;
     let janitor_window = config.happenings.retention_window_secs;
     let janitor_interval = config.happenings.janitor_interval_secs;
-    let janitor_shutdown_for_task = Arc::clone(&janitor_shutdown);
-    let janitor_task = tokio::spawn(async move {
-        happenings::run_happenings_janitor(
-            janitor_persistence,
-            janitor_window,
-            janitor_capacity,
-            janitor_interval,
-            janitor_shutdown_for_task,
-        )
-        .await;
-    });
+    let janitor_task = happenings::spawn_happenings_janitor(
+        janitor_persistence,
+        janitor_window,
+        janitor_capacity,
+        janitor_interval,
+        Arc::clone(&janitor_shutdown),
+    );
 
     // Construct the in-memory conflict index.
     let conflict_index = Arc::new(projections::SubjectConflictIndex::new());
@@ -4670,6 +4753,8 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         &persistence_path,
         Some(Arc::clone(&asset_cache)),
         https_setup,
+        lan_privilege,
+        no_bearer_capabilities,
     )
     .await
     {
@@ -4722,6 +4807,25 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
             tracing::warn!(
                 "revocation list already attached to steward state; \
                  ignoring duplicate set"
+            );
+        }
+        // Where the list above was loaded from, so a revocation and
+        // a reset land where the next boot reads.
+        // LOGGING.md §2: warn (recoverable anomaly — a second wiring
+        // is a developer mistake; the first directory stays in use).
+        if state.https_dir.set(handles.https_dir.clone()).is_err() {
+            tracing::warn!(
+                "HTTPS state directory already attached to steward \
+                 state; ignoring duplicate set"
+            );
+        }
+        // The tier the listener admits by, so a reset opens it.
+        // LOGGING.md §2: warn (recoverable anomaly — a second wiring
+        // is a developer mistake; the first tier stays in use).
+        if state.auth_tier.set(Arc::clone(&handles.auth_tier)).is_err() {
+            tracing::warn!(
+                "auth tier already attached to steward state; ignoring \
+                 duplicate set"
             );
         }
     }

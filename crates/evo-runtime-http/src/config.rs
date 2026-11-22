@@ -4,7 +4,22 @@
 //! Listener configuration for the HTTPS runtime mount.
 
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// How long an accepted connection has to complete its TLS handshake
+/// and send the first bytes of a request, unless the listener is
+/// configured otherwise: ten seconds.
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many accepted connections may be waiting for their first request
+/// bytes at once, unless the listener is configured otherwise: 64.
+pub const DEFAULT_MAX_INCOMPLETE_CONNECTIONS: NonZeroUsize =
+    match NonZeroUsize::new(64) {
+        Some(bound) => bound,
+        None => panic!("the default bound is not zero"),
+    };
 
 /// Where the HTTPS listener should bind.
 #[derive(Debug, Clone)]
@@ -46,6 +61,21 @@ pub struct HttpsListenerConfig {
     /// `/api/v1` so paths compose into
     /// `/api/v1/<wire_op_id>`.
     pub api_prefix: String,
+
+    /// How long an accepted connection has to complete its TLS
+    /// handshake and send the first bytes of a request. A connection
+    /// that has not done both by then is closed. Defaults to
+    /// [`DEFAULT_HANDSHAKE_TIMEOUT`]. A zero timeout closes every
+    /// connection before it is served.
+    pub handshake_timeout: Duration,
+
+    /// How many accepted connections may be waiting for their first
+    /// request bytes at once. While this many are waiting, the listener
+    /// accepts nothing more: further connections wait in the operating
+    /// system's queue until one of these sends a request, fails, or
+    /// runs out of time. Defaults to
+    /// [`DEFAULT_MAX_INCOMPLETE_CONNECTIONS`].
+    pub max_incomplete_connections: NonZeroUsize,
 }
 
 impl HttpsListenerConfig {
@@ -57,6 +87,8 @@ impl HttpsListenerConfig {
             cert_path: None,
             key_path: None,
             api_prefix: "/api/v1".to_string(),
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            max_incomplete_connections: DEFAULT_MAX_INCOMPLETE_CONNECTIONS,
         }
     }
 
@@ -77,6 +109,24 @@ impl HttpsListenerConfig {
         self.api_prefix = prefix.into();
         self
     }
+
+    /// Builder: override how long an accepted connection has to
+    /// complete its TLS handshake and send the first bytes of a
+    /// request.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Builder: override how many accepted connections may be waiting
+    /// for their first request bytes at once.
+    pub fn with_max_incomplete_connections(
+        mut self,
+        bound: NonZeroUsize,
+    ) -> Self {
+        self.max_incomplete_connections = bound;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -92,6 +142,28 @@ mod tests {
         assert_eq!(cfg.api_prefix, "/api/v1");
         assert!(cfg.cert_path.is_none());
         assert!(cfg.key_path.is_none());
+    }
+
+    #[test]
+    fn config_defaults_bound_connections_yet_to_send_a_request() {
+        let addr =
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0));
+        let cfg = HttpsListenerConfig::new(addr);
+        assert_eq!(cfg.handshake_timeout, Duration::from_secs(10));
+        assert_eq!(cfg.max_incomplete_connections.get(), 64);
+    }
+
+    #[test]
+    fn config_builder_overrides_connection_bounds() {
+        let addr =
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 0));
+        let cfg = HttpsListenerConfig::new(addr)
+            .with_handshake_timeout(Duration::from_secs(3))
+            .with_max_incomplete_connections(
+                NonZeroUsize::new(5).expect("not zero"),
+            );
+        assert_eq!(cfg.handshake_timeout, Duration::from_secs(3));
+        assert_eq!(cfg.max_incomplete_connections.get(), 5);
     }
 
     #[test]

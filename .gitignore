@@ -90,3 +90,6 @@ CLAUDE.local.md
 # rather than committed source — vendor / plugin authors run
 # the generator on their own to obtain typed bindings.
 /sdks/
+
+# Promote observability (eng-local; never ship)
+dist/release/promote-reports/

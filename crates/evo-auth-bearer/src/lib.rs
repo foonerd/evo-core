@@ -78,8 +78,8 @@ pub mod validator;
 
 pub use capability::{Capability, CapabilitySet};
 pub use credential_record::{
-    CapabilityRef, CredentialRecord, CredentialStore, CredentialStoreError,
-    ExpiryPolicy,
+    CapabilityRef, CredentialRecord, CredentialSource, CredentialStore,
+    CredentialStoreError, ExpiryPolicy,
 };
 pub use error::TokenError;
 pub use issuer::BearerTokenIssuer;

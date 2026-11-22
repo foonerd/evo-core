@@ -14,7 +14,7 @@ rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 time = { version = "0.3", default-features = false, features = ["std"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 
 [dev-dependencies]

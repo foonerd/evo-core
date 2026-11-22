@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Operator-set expiry policy on a credential. `Never` is
 /// the default for IoT-platform consumers (the operator does
@@ -102,6 +104,25 @@ impl CapabilityRef {
     }
 }
 
+/// How the framework came to issue a credential. Every bearer the
+/// steward issues has a record; this says which path issued it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialSource {
+    /// Created by the operator with `create_bearer_token`.
+    Created,
+    /// The first-boot operator bootstrap token.
+    Bootstrap,
+    /// Issued to a browser by `pair_complete` or
+    /// `pair_authenticate`; the record carries the paired device.
+    Paired,
+    /// Issued to the local kiosk panel by
+    /// `mint_local_kiosk_session`.
+    Kiosk,
+    /// Minted on the local socket with `mint_bearer_token`.
+    Minted,
+}
+
 /// The operator-managed inventory record for one credential.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialRecord {
@@ -130,6 +151,14 @@ pub struct CredentialRecord {
     /// Operator-supplied reason recorded when the
     /// credential was revoked. `None` while active.
     pub revoked_reason: Option<String>,
+    /// Which path issued the credential. `None` on a record
+    /// written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<CredentialSource>,
+    /// The paired device a [`CredentialSource::Paired`] credential
+    /// was issued to. `None` for every other source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_device_id: Option<String>,
 }
 
 impl CredentialRecord {
@@ -163,6 +192,9 @@ impl CredentialRecord {
 #[derive(Debug, Clone)]
 pub struct CredentialStore {
     root: PathBuf,
+    /// When [`Self::prune_expired_at_most_every`] last scanned, shared
+    /// by every clone of the store: they hold the same directory.
+    pruned_at: Arc<Mutex<Option<Instant>>>,
 }
 
 /// Errors raised by [`CredentialStore`].
@@ -200,7 +232,10 @@ impl CredentialStore {
             path: root.to_string_lossy().into_owned(),
             source: e,
         })?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            pruned_at: Arc::new(Mutex::new(None)),
+        })
     }
 
     /// Path of the JSON document holding the named record.
@@ -288,11 +323,19 @@ impl CredentialStore {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let bytes =
-                fs::read(&path).map_err(|e| CredentialStoreError::Io {
-                    path: path.to_string_lossy().into_owned(),
-                    source: e,
-                })?;
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                // Deleted since the directory was read: an expired
+                // record another caller dropped. It is no longer
+                // listed.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(CredentialStoreError::Io {
+                        path: path.to_string_lossy().into_owned(),
+                        source: e,
+                    })
+                }
+            };
             let record: CredentialRecord = serde_json::from_slice(&bytes)
                 .map_err(|e| CredentialStoreError::Json {
                     path: path.to_string_lossy().into_owned(),
@@ -314,6 +357,64 @@ impl CredentialStore {
             .into_iter()
             .filter(|r| r.is_active(now_ms))
             .collect())
+    }
+
+    /// Delete every record whose expiry has passed by `now_ms`,
+    /// revoked or not: the validator refuses its bearer anyway, so
+    /// there is nothing left to list or revoke. Records that never
+    /// expire are kept. Returns how many were deleted.
+    pub fn prune_expired(
+        &self,
+        now_ms: u64,
+    ) -> Result<usize, CredentialStoreError> {
+        let mut removed = 0usize;
+        for record in self.list()? {
+            if !record.is_expired(now_ms) {
+                continue;
+            }
+            let path = self.record_path(&record.token_id);
+            match fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(CredentialStoreError::Io {
+                        path: path.to_string_lossy().into_owned(),
+                        source: e,
+                    })
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    /// [`Self::prune_expired`], unless this store already started one
+    /// less than `every` before `at`. The first call on a store always
+    /// runs. A call that runs claims the interval before it scans, so
+    /// concurrent callers skip rather than scan twice, and a failed
+    /// scan is retried after the interval rather than on every call.
+    ///
+    /// `Ok(None)` when skipped; otherwise how many records were
+    /// deleted. Records are added in O(1) between scans, so adding
+    /// costs the same whatever the inventory holds.
+    pub fn prune_expired_at_most_every(
+        &self,
+        now_ms: u64,
+        at: Instant,
+        every: Duration,
+    ) -> Result<Option<usize>, CredentialStoreError> {
+        {
+            let mut pruned_at = self
+                .pruned_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(last) = *pruned_at {
+                if at.saturating_duration_since(last) < every {
+                    return Ok(None);
+                }
+            }
+            *pruned_at = Some(at);
+        }
+        self.prune_expired(now_ms).map(Some)
     }
 
     /// Delete every record. Used by the reset gesture when
@@ -381,6 +482,8 @@ mod tests {
             expires_at_ms,
             revoked_at_ms: None,
             revoked_reason: None,
+            source: None,
+            paired_device_id: None,
         }
     }
 
@@ -487,5 +590,138 @@ mod tests {
             let back = r.to_capability().unwrap();
             assert_eq!(format!("{cap:?}"), format!("{back:?}"));
         }
+    }
+
+    /// A record written before `source` and `paired_device_id` existed
+    /// still loads, with neither set.
+    #[test]
+    fn a_record_without_the_source_fields_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().to_path_buf()).unwrap();
+        std::fs::write(
+            dir.path().join("old.json"),
+            r#"{"token_id":"old","name":"bootstrap","created_reason":"first-boot bootstrap credential","scopes":[{"kind":"read","scope":"auth"}],"expiry_policy":{"kind":"never"},"created_at_ms":1,"expires_at_ms":null,"revoked_at_ms":null,"revoked_reason":null}"#,
+        )
+        .unwrap();
+        let record = store.get("old").expect("old record loads");
+        assert_eq!(record.name, "bootstrap");
+        assert_eq!(record.source, None);
+        assert_eq!(record.paired_device_id, None);
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    /// The source and the paired device survive a write and a read.
+    #[test]
+    fn source_and_paired_device_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().to_path_buf()).unwrap();
+        let mut record =
+            sample_record("p1", ExpiryPolicy::Seconds { value: 60 });
+        record.source = Some(CredentialSource::Paired);
+        record.paired_device_id = Some("dev-1".to_string());
+        store.put(&record).unwrap();
+        let back = store.get("p1").unwrap();
+        assert_eq!(back.source, Some(CredentialSource::Paired));
+        assert_eq!(back.paired_device_id.as_deref(), Some("dev-1"));
+        let json = std::fs::read_to_string(dir.path().join("p1.json")).unwrap();
+        assert!(json.contains("\"source\": \"paired\""), "{json}");
+    }
+
+    /// Expired records go, revoked or not; live and never-expiring
+    /// records stay.
+    #[test]
+    fn prune_expired_drops_only_the_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().to_path_buf()).unwrap();
+        // sample_record is created at 1_000_000 ms.
+        store
+            .put(&sample_record("gone", ExpiryPolicy::Seconds { value: 10 }))
+            .unwrap();
+        let mut revoked =
+            sample_record("gone-revoked", ExpiryPolicy::Seconds { value: 10 });
+        revoked.revoked_at_ms = Some(1_000_500);
+        store.put(&revoked).unwrap();
+        store
+            .put(&sample_record(
+                "live",
+                ExpiryPolicy::Seconds { value: 3600 },
+            ))
+            .unwrap();
+        store
+            .put(&sample_record("forever", ExpiryPolicy::Never))
+            .unwrap();
+
+        let now = 1_000_000 + 10_000;
+        assert_eq!(store.prune_expired(now).unwrap(), 2);
+        let mut left: Vec<String> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.token_id)
+            .collect();
+        left.sort();
+        assert_eq!(left, ["forever", "live"]);
+        assert_eq!(store.prune_expired(now).unwrap(), 0);
+    }
+
+    /// Within the interval a prune is skipped, whatever lapsed; after
+    /// it the next one runs. The first call always runs.
+    #[test]
+    fn a_prune_within_the_interval_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().to_path_buf()).unwrap();
+        let every = Duration::from_secs(60);
+        let t0 = Instant::now();
+        // sample_record is created at 1_000_000 ms.
+        let now = 1_000_000 + 20_000;
+        store
+            .put(&sample_record("a", ExpiryPolicy::Seconds { value: 10 }))
+            .unwrap();
+        assert_eq!(
+            store.prune_expired_at_most_every(now, t0, every).unwrap(),
+            Some(1),
+            "the first call runs"
+        );
+
+        store
+            .put(&sample_record("b", ExpiryPolicy::Seconds { value: 10 }))
+            .unwrap();
+        assert_eq!(
+            store
+                .prune_expired_at_most_every(
+                    now,
+                    t0 + Duration::from_secs(59),
+                    every
+                )
+                .unwrap(),
+            None,
+            "within the interval: skipped"
+        );
+        assert!(store.get("b").is_ok());
+
+        // A clone shares the interval: it holds the same directory.
+        let clone = store.clone();
+        assert_eq!(
+            clone
+                .prune_expired_at_most_every(
+                    now,
+                    t0 + Duration::from_secs(30),
+                    every
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .prune_expired_at_most_every(
+                    now,
+                    t0 + Duration::from_secs(60),
+                    every
+                )
+                .unwrap(),
+            Some(1),
+            "after the interval: runs"
+        );
+        assert!(store.get("b").is_err());
     }
 }

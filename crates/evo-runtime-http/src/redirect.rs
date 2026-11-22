@@ -175,7 +175,9 @@ async fn redirect_handler(
 /// Returns the bound `SocketAddr` (with the OS-assigned port if
 /// the operator bound `:0`) and a [`JoinHandle`] for the accept
 /// task. Shutdown is graceful: in-flight responses complete; the
-/// listener stops accepting new connections; the task returns.
+/// listener stops accepting new connections; the task returns. A
+/// `shutdown.notify_waiters()` at any time after this returns, even
+/// before the task first runs, starts that shutdown.
 pub async fn serve_http_redirect(
     listen_addr: SocketAddr,
     https_port: u16,
@@ -214,12 +216,15 @@ async fn serve_http_redirect_internal(
 ) -> std::io::Result<(SocketAddr, JoinHandle<()>)> {
     let listener = TcpListener::bind(listen_addr).await?;
     let local_addr = listener.local_addr()?;
+    // Made here, before the task exists: a waiter sees every `notify_waiters`
+    // call made after it is created, so one made inside the task would miss a
+    // stop signalled before the task first ran. Enabling it now also queues it
+    // for `notify_one`.
+    let mut stop = Box::pin(shutdown.notified_owned());
+    stop.as_mut().enable();
     let task = tokio::spawn(async move {
-        let shutdown_signal = async move {
-            shutdown.notified().await;
-        };
         if let Err(e) = axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown_signal)
+            .with_graceful_shutdown(stop)
             .await
         {
             tracing::warn!(

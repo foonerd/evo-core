@@ -185,6 +185,9 @@ mod imp {
     }
 
     /// Bind the GraphQL listener and serve until shutdown.
+    ///
+    /// A `shutdown.notify_waiters()` at any time after this returns,
+    /// even before the task first runs, ends the listener.
     pub async fn serve_graphql(
         listen: SocketAddr,
         dispatcher: Arc<dyn WireOpDispatcher>,
@@ -204,12 +207,15 @@ mod imp {
         let schema = build_schema(dispatcher);
         let graphql_service: MethodRouter = any_service(GraphQL::new(schema));
         let app = Router::new().route("/graphql", graphql_service);
-        let shutdown_signal = async move {
-            shutdown.notified().await;
-        };
+        // Made here, before the task exists: a waiter sees every
+        // `notify_waiters` call made after it is created, so one made inside
+        // the task would miss a stop signalled before the task first ran.
+        // Enabling it now also queues it for `notify_one`.
+        let mut stop = Box::pin(shutdown.notified_owned());
+        stop.as_mut().enable();
         let task = tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal)
+                .with_graceful_shutdown(stop)
                 .await
             {
                 tracing::warn!(error = %e, "evo-graphql: server exited with error");

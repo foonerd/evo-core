@@ -1561,10 +1561,12 @@ enum ClientRequest {
         /// Free-form reason recorded in the audit observation.
         /// Must be non-empty after trim.
         reason: String,
-        /// Scopes the credential carries. Empty list means
-        /// "every operator scope" — sometimes the operator
-        /// wants the full set (e.g. a personal home-script
-        /// credential).
+        /// Scopes the credential carries. Over the network each
+        /// one must be held by the caller's own bearer, at that
+        /// rank or above, and a caller admitted without a bearer
+        /// cannot mint at all. An empty list means "what I hold":
+        /// the caller's own set over the network, every operator
+        /// scope on the local socket.
         #[serde(default)]
         scopes: Vec<evo_auth_bearer::CapabilityRef>,
         /// Operator-set expiry policy. `None` (the default)
@@ -1594,11 +1596,18 @@ enum ClientRequest {
         reason: String,
     },
     /// Recovery gesture: purge every credential record + every
-    /// revocation entry and flip the steward to Open tier on
-    /// next boot. Used by the operator when locked out of
-    /// the device under Secure / Secure-industrial tier
-    /// (every credential expired or unknown to the operator;
-    /// the operator regains LAN-trust admission via Open).
+    /// revocation entry and retire the bearer-token signing
+    /// key. The next start replaces the key before it loads
+    /// one, so every bearer issued before the reset is
+    /// refused: paired browsers pair again, a new
+    /// `bootstrap.token` is issued, and external consumers need
+    /// fresh credentials. A kiosk panel mints a new session
+    /// within about 15 seconds of that start, with no restart.
+    /// The auth tier is `Open` from the reset on, at that start
+    /// and every later one, whatever `EVO_AUTH_TIER` names,
+    /// until the operator runs `evo auth restore-tier` with the
+    /// steward stopped. Used by the operator when every
+    /// credential is expired or unknown.
     /// Requires `step_up:system_admin` (the high-water mark
     /// privilege the framework offers).
     ResetCredentialsToOpen {
@@ -2436,6 +2445,18 @@ enum ClientRequest {
     /// distribution's group catalog. LAN-trust admitted; never
     /// step-up.
     HouseholdProtectionGet,
+    /// Ask whether the caller may change what `scope` protects,
+    /// now: the household door, without the change. Answers
+    /// `household_door: "open"`, or refuses `household_policy_locked`
+    /// as the dispatch gate refuses a verb that declares `scope`. A
+    /// plugin asks it through its shelf request dispatcher, on
+    /// [`evo_plugin_sdk::contract::HOUSEHOLD_SHELF`], for the
+    /// consumer it is answering, when only the payload says whether
+    /// a change is protected.
+    HouseholdRequire {
+        /// The capability scope the change would touch.
+        scope: String,
+    },
     /// Set the household-protection level, guest overlay and
     /// protected marks. First-start and same-or-narrower changes
     /// need no sitting; widening requires step-up.
@@ -2454,9 +2475,14 @@ enum ClientRequest {
         #[serde(default)]
         protected_groups: Option<Vec<String>>,
     },
+    /// List the paired devices: one per device with a live paired
+    /// bearer in the credential inventory, so the list survives a
+    /// restart. Requires `plugins_admin` on the connection.
     PairList,
-    /// Revoke a paired device by id. Idempotent — revoking an
-    /// unknown id returns `revoked = false` without erroring.
+    /// Revoke a paired device by id: every live bearer paired to it
+    /// is refused at once and after a restart, as
+    /// `revoke_bearer_token` refuses one. Idempotent — a device with
+    /// no live bearer returns `revoked = false` without erroring.
     /// Requires `plugins_admin` on the connection and is
     /// step-up-aware.
     PairRevoke {
@@ -3888,6 +3914,11 @@ enum ClientResponse {
     HouseholdProtection(
         crate::household_protection::HouseholdProtectionSnapshot,
     ),
+    /// `household_require`: the caller may make the change.
+    HouseholdDoor {
+        /// Always `"open"`; the distinctive top-level key.
+        household_door: &'static str,
+    },
     /// Plugin-request success.
     Success {
         /// Base64-encoded response payload.
@@ -5221,8 +5252,9 @@ enum ClientResponse {
     /// Successful response to
     /// [`ClientRequest::ResetCredentialsToOpen`]. Reports the
     /// number of records purged and revocations cleared. The
-    /// operator restarts the steward to pick up the
-    /// `Open`-tier admission policy on the next boot.
+    /// operator restarts the steward; that start replaces the
+    /// bearer-token signing key, so every bearer issued before
+    /// the reset is refused.
     CredentialsResetToOpen {
         /// Always `true`; the distinctive top-level key.
         credentials_reset_to_open: bool,
@@ -5885,16 +5917,16 @@ enum ClientResponse {
     PairListed {
         /// Always `true`; the distinctive top-level key.
         pair_listed: bool,
-        /// The registered paired-device set.
+        /// One entry per device with a live paired bearer.
         devices: Vec<crate::pairing::PairedDevice>,
     },
     /// Successful response to
     /// [`ClientRequest::PairRevoke`]. `revoked = false` means
-    /// the id was unknown.
+    /// the device had no live bearer to revoke.
     PairRevoked {
         /// Always `true`; the distinctive top-level key.
         pair_revoked: bool,
-        /// Whether an entry actually left the set.
+        /// Whether any bearer paired to the device was revoked.
         revoked: bool,
     },
     /// Successful response to
@@ -9587,18 +9619,6 @@ struct ConnectionState {
     /// handler. Empty until the consumer sends a `negotiate` frame
     /// and the ACL grants at least one name.
     granted_capabilities: HashSet<String>,
-    /// Subset of `granted_capabilities` for which the connection's
-    /// principal additionally holds an active step-up auth session
-    /// within the step-up TTL. Populated from the bearer-token
-    /// capability set when the HTTPS dispatcher initialises the
-    /// synthetic connection; the legacy Unix-socket path leaves
-    /// this empty and the per-verb gate's StepUp branch refuses
-    /// (Unix-socket dispatch is operator-local and does not
-    /// currently establish step-up tokens). Consulted by the
-    /// plugin-route dispatcher's per-verb capability gate when the
-    /// verb's manifest declaration is
-    /// `VerbCapability::StepUp { scope }`.
-    step_up_scopes: HashSet<String>,
     /// Process-unique identifier for this connection. Used as
     /// the key for the single-responder lock on the prompt
     /// ledger; stable for the connection's lifetime.
@@ -9609,6 +9629,11 @@ struct ConnectionState {
     /// tell a broad-audience principal (LAN-trust, kiosk-minted)
     /// from an operator bearer.
     principal_token_id: Option<String>,
+    /// The principal an HTTPS-family dispatch runs under, whole: its
+    /// capability set at full rank, whether it presented a bearer,
+    /// and where it came from. `None` on the Unix-socket path, which
+    /// is operator-local and admits by peer credentials instead.
+    network_principal: Option<evo_runtime_http::Principal>,
 }
 
 impl ConnectionState {
@@ -9617,9 +9642,9 @@ impl ConnectionState {
         Self {
             peer,
             granted_capabilities: HashSet::new(),
-            step_up_scopes: HashSet::new(),
             connection_id: next_connection_id(),
             principal_token_id: None,
+            network_principal: None,
         }
     }
 
@@ -9627,6 +9652,24 @@ impl ConnectionState {
     /// connection.
     fn has(&self, name: &str) -> bool {
         self.granted_capabilities.contains(name)
+    }
+
+    /// Peer credentials for an admission that trusts them.
+    ///
+    /// A network caller has no peer credentials of its own. The
+    /// HTTPS-family dispatch fills [`Self::peer`] with a synthetic uid
+    /// that serves only as a binding key (step-up sittings and their
+    /// rate-limit buckets). Every admission by peer uid or gid reads
+    /// this instead, so it fails closed for a network caller.
+    fn admission_peer(&self) -> PeerCredentials {
+        if self.network_principal.is_some() {
+            PeerCredentials {
+                uid: None,
+                gid: None,
+            }
+        } else {
+            self.peer
+        }
     }
 
     /// The connection's stable identifier.
@@ -11087,6 +11130,9 @@ impl Server {
         payload: serde_json::Value,
         principal: &evo_runtime_http::Principal,
     ) -> Result<serde_json::Value, HttpDispatchError> {
+        if let Some(refusal) = network_op_refusal(op_id, principal) {
+            return Err(http_refusal(refusal));
+        }
         // One sitting for the dispatch, taken before typed parse.
         let mut payload = payload;
         let step_up_token = take_step_up_token(&mut payload)
@@ -11098,9 +11144,9 @@ impl Server {
                 gid: Some(0),
             },
             granted_capabilities: flatten_principal_capabilities(principal),
-            step_up_scopes: flatten_step_up_scopes(principal),
             connection_id: connection_id_for_principal(principal),
             principal_token_id: Some(principal.token_id.clone()),
+            network_principal: Some(principal.clone()),
         };
         // Household-protection gate, framework-op path. The scope
         // comes from the same canonical schema the capability check
@@ -11115,6 +11161,7 @@ impl Server {
                 framework_op_scope(op_id),
                 &self.auth_session_store,
                 step_up_token.as_deref(),
+                None,
                 &format!("op {op_id:?}"),
             ) {
                 let error = match refusal {
@@ -12019,12 +12066,12 @@ async fn dispatch_request(
                 payload_b64,
                 instance_id,
                 &conn.granted_capabilities,
-                &conn.step_up_scopes,
                 auth_session_store,
                 lifecycle_ledger,
                 conn,
                 step_up_token,
                 household_protection.as_ref(),
+                prompt_ledger,
             )
             .await
         }
@@ -13438,6 +13485,13 @@ async fn dispatch_request(
         ClientRequest::HouseholdProtectionGet => {
             handle_household_protection_get(household_protection.as_ref())
         }
+        ClientRequest::HouseholdRequire { scope } => handle_household_require(
+            household_protection.as_ref(),
+            auth_session_store,
+            conn,
+            &scope,
+            step_up_token,
+        ),
         ClientRequest::HouseholdProtectionSet {
             level,
             lend,
@@ -13456,9 +13510,10 @@ async fn dispatch_request(
             )
             .await
         }
-        ClientRequest::PairList => handle_pair_list(pairing_store, conn).await,
+        ClientRequest::PairList => handle_pair_list(state, conn).await,
         ClientRequest::PairRevoke { paired_device_id } => {
             handle_pair_revoke(
+                state,
                 pairing_store,
                 auth_session_store,
                 conn,
@@ -13928,6 +13983,7 @@ fn client_request_op_tag(req: &ClientRequest) -> &'static str {
         ClientRequest::PairComplete { .. } => "pair_complete",
         ClientRequest::PairAuthenticate { .. } => "pair_authenticate",
         ClientRequest::HouseholdProtectionGet => "household_protection_get",
+        ClientRequest::HouseholdRequire { .. } => "household_require",
         ClientRequest::HouseholdProtectionSet { .. } => {
             "household_protection_set"
         }
@@ -14056,6 +14112,9 @@ fn handle_negotiate(
     prompt_ledger: Option<&Arc<crate::prompts::PromptLedger>>,
     conn: &mut ConnectionState,
 ) -> ClientResponse {
+    // Peer-credential grants are local-socket only: a network caller
+    // has no peer credentials of its own (see `admission_peer`).
+    let peer = conn.admission_peer();
     let mut granted: Vec<String> = Vec::new();
     for requested in &capabilities {
         let known = NEGOTIABLE_CAPABILITIES.contains(&requested.as_str());
@@ -14066,16 +14125,16 @@ fn handle_negotiate(
         }
         let permitted = match requested.as_str() {
             CAPABILITY_RESOLVE_CLAIMANTS => {
-                acl.allows_resolve_claimants(conn.peer, steward_identity)
+                acl.allows_resolve_claimants(peer, steward_identity)
             }
             CAPABILITY_PLUGINS_ADMIN => {
-                acl.allows_plugins_admin(conn.peer, steward_identity)
+                acl.allows_plugins_admin(peer, steward_identity)
             }
             CAPABILITY_RECONCILIATION_ADMIN => {
-                acl.allows_reconciliation_admin(conn.peer, steward_identity)
+                acl.allows_reconciliation_admin(peer, steward_identity)
             }
             CAPABILITY_FAST_PATH_ADMIN => {
-                acl.allows_fast_path_admin(conn.peer, steward_identity)
+                acl.allows_fast_path_admin(peer, steward_identity)
             }
             CAPABILITY_USER_INTERACTION_RESPONDER => {
                 // Two gates compose: authorisation AND the
@@ -14097,10 +14156,8 @@ fn handle_negotiate(
                 // same way at this layer; a responder that wants
                 // to know WHY can probe via a follow-up op or
                 // retry after the previous holder disconnects.
-                let acl_grants = acl.allows_user_interaction_responder(
-                    conn.peer,
-                    steward_identity,
-                );
+                let acl_grants = acl
+                    .allows_user_interaction_responder(peer, steward_identity);
                 let bearer_grants = conn
                     .granted_capabilities
                     .contains(CAPABILITY_USER_INTERACTION_RESPONDER);
@@ -14117,16 +14174,16 @@ fn handle_negotiate(
                 }
             }
             CAPABILITY_APPOINTMENTS_ADMIN => {
-                acl.allows_appointments_admin(conn.peer, steward_identity)
+                acl.allows_appointments_admin(peer, steward_identity)
             }
             CAPABILITY_WATCHES_ADMIN => {
-                acl.allows_watches_admin(conn.peer, steward_identity)
+                acl.allows_watches_admin(peer, steward_identity)
             }
             CAPABILITY_GRAMMAR_ADMIN => {
-                acl.allows_grammar_admin(conn.peer, steward_identity)
+                acl.allows_grammar_admin(peer, steward_identity)
             }
             CAPABILITY_PLANS_ADMIN => {
-                acl.allows_plans_admin(conn.peer, steward_identity)
+                acl.allows_plans_admin(peer, steward_identity)
             }
             // Defensive: a name in NEGOTIABLE_CAPABILITIES without an
             // ACL gate above is a build-time bug. Treat as not
@@ -17811,6 +17868,17 @@ async fn handle_pair_authenticate(
                     };
                 }
             };
+            if let Err(error) = record_issued_bearer(
+                state,
+                &token,
+                &device.label,
+                "pair_authenticate",
+                evo_auth_bearer::CredentialSource::Paired,
+                Some(&device.id.0),
+                now_ms,
+            ) {
+                return ClientResponse::Error { error };
+            }
             tracing::info!(
                 paired_device_id = %device.id.0,
                 token_id = %token.id,
@@ -17960,6 +18028,48 @@ fn narrow_bootstrap_by_scope_names(
     evo_auth_bearer::CapabilitySet::new(narrowed)
 }
 
+/// Put a bearer just issued in the operator inventory, so it can be
+/// listed and revoked like any other. `reason` becomes the record's
+/// `created_reason`. The bearer is handed out only when this succeeds;
+/// otherwise the error is the answer.
+fn record_issued_bearer(
+    state: &crate::state::StewardState,
+    token: &evo_auth_bearer::BearerToken,
+    name: &str,
+    reason: &str,
+    source: evo_auth_bearer::CredentialSource,
+    paired_device_id: Option<&str>,
+    now_ms: u64,
+) -> Result<(), ApiError> {
+    let Some(store) = state.credential_store.get() else {
+        return Err(ApiError::new(
+            ErrorClass::Internal,
+            "credential store not wired; a bearer with no record is not \
+             handed out",
+        )
+        .with_subclass("store_unavailable"));
+    };
+    let record = crate::bearer_inventory::issued_record(
+        crate::bearer_inventory::Issued {
+            token_id: &token.id,
+            capabilities: &token.capabilities,
+            issued_at_ms: token.issued_at_ms,
+            expires_at_ms: token.expires_at_ms,
+        },
+        name,
+        reason,
+        source,
+        paired_device_id,
+    );
+    crate::bearer_inventory::add_record(store, &record, now_ms).map_err(|e| {
+        ApiError::new(
+            ErrorClass::Internal,
+            format!("persisting the bearer's credential record failed: {e}"),
+        )
+        .with_subclass("persistence_failed")
+    })
+}
+
 async fn handle_mint_bearer_token(
     state: &Arc<crate::state::StewardState>,
     router: &Arc<PluginRouter>,
@@ -18071,6 +18181,18 @@ async fn handle_mint_bearer_token(
         }
     };
 
+    if let Err(error) = record_issued_bearer(
+        state,
+        &token,
+        "local socket mint",
+        reason_trimmed,
+        evo_auth_bearer::CredentialSource::Minted,
+        None,
+        now_ms,
+    ) {
+        return ClientResponse::Error { error };
+    }
+
     // Operator-reason + source claim audit trail. The
     // observatory entry comes from `issuer.issue()` itself
     // (`bearer_token_issued` observation, attached at boot
@@ -18114,8 +18236,10 @@ async fn handle_mint_local_kiosk_session(
     conn: &ConnectionState,
     reason: String,
 ) -> ClientResponse {
-    let admission =
-        crate::kiosk_session::evaluate_admission(conn.peer, allowlist);
+    let admission = crate::kiosk_session::evaluate_admission(
+        conn.admission_peer(),
+        allowlist,
+    );
     let Some(issuer) = state.bearer_token_issuer.get() else {
         return ClientResponse::Error {
             error: ApiError::new(
@@ -18126,22 +18250,51 @@ async fn handle_mint_local_kiosk_session(
             .with_subclass("issuer_unavailable"),
         };
     };
+    let Some(store) = state.credential_store.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "mint_local_kiosk_session: credential store not wired",
+            )
+            .with_subclass("store_unavailable"),
+        };
+    };
     let capabilities =
         crate::https_boot::merged_operator_bootstrap_capability_set(router);
     let ttl_seconds = 24 * 60 * 60;
     match crate::kiosk_session::mint_kiosk_bearer(
         issuer,
-        capabilities,
+        capabilities.clone(),
         admission,
-        crate::kiosk_session::KioskMintReason(reason),
+        crate::kiosk_session::KioskMintReason(reason.clone()),
         ttl_seconds,
     ) {
-        Ok(ok) => ClientResponse::LocalKioskSessionMinted {
-            local_kiosk_session_minted: true,
-            token: ok.encoded_token,
-            token_id: ok.token_id,
-            expires_at_ms: ok.expires_at_ms,
-        },
+        Ok(ok) => {
+            if let Err(e) = crate::kiosk_session::record_kiosk_bearer(
+                store,
+                &capabilities,
+                &ok,
+                &reason,
+                ttl_seconds,
+            ) {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::Internal,
+                        format!(
+                            "mint_local_kiosk_session: persisting credential \
+                             record failed: {e}"
+                        ),
+                    )
+                    .with_subclass("persistence_failed"),
+                };
+            }
+            ClientResponse::LocalKioskSessionMinted {
+                local_kiosk_session_minted: true,
+                token: ok.encoded_token,
+                token_id: ok.token_id,
+                expires_at_ms: ok.expires_at_ms,
+            }
+        }
         Err(err) => ClientResponse::Error {
             error: ApiError::new(
                 match err {
@@ -18256,6 +18409,17 @@ async fn handle_pair_complete(
             };
         }
     };
+    if let Err(error) = record_issued_bearer(
+        state,
+        &token,
+        &device.label,
+        "pair_complete",
+        evo_auth_bearer::CredentialSource::Paired,
+        Some(&device.id.0),
+        now_ms,
+    ) {
+        return ClientResponse::Error { error };
+    }
     tracing::info!(
         paired_device_id = %device.id.0,
         token_id = %token.id,
@@ -18295,6 +18459,53 @@ fn handle_household_protection_get(
             ),
         ),
     }
+}
+
+/// `household_require` — the household door for `scope`, asked
+/// without the change.
+///
+/// The same question the dispatch gate asks of a verb that declares
+/// `scope`, with the same ways out: no runtime, no token id (the
+/// Unix socket), a scope the policy does not protect, the caller's
+/// own sitting, or — for a plugin's nested ask — the sitting of the
+/// one consumer the plugin is answering. It grants nothing and
+/// changes nothing.
+fn handle_household_require(
+    household_protection: Option<
+        &Arc<crate::household_protection::HouseholdProtectionRuntime>,
+    >,
+    auth_session_store: &Arc<crate::auth::AuthSessionStore>,
+    conn: &ConnectionState,
+    scope: &str,
+    step_up_token: Option<&str>,
+) -> ClientResponse {
+    let scope = scope.trim();
+    if scope.is_empty() {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::ContractViolation,
+                "household_require: scope must be non-empty",
+            )
+            .with_subclass("blank_scope"),
+        };
+    }
+    let nest_origin = household_protection
+        .zip(crate::nest_sitting::nested_from())
+        .and_then(|(runtime, from)| runtime.nest_sittings().origin_of(&from));
+    household_refusal(
+        household_protection,
+        conn,
+        Some(scope),
+        auth_session_store,
+        step_up_token,
+        nest_origin
+            .as_ref()
+            .and_then(crate::nest_sitting::NestOrigin::sitting),
+        &format!("a change to {scope:?}"),
+    )
+    .unwrap_or(ClientResponse::HouseholdDoor {
+        household_door: "open",
+    })
 }
 
 /// `household_protection_set` — level, guest overlay and marks.
@@ -18398,7 +18609,7 @@ async fn handle_household_protection_set(
 }
 
 async fn handle_pair_list(
-    pairing_store: &Arc<crate::pairing::PairingStore>,
+    state: &Arc<crate::state::StewardState>,
     conn: &ConnectionState,
 ) -> ClientResponse {
     if !conn.has("plugins_admin") {
@@ -18410,7 +18621,32 @@ async fn handle_pair_list(
             .with_subclass("plugins_admin_required"),
         };
     }
-    let mut devices = pairing_store.list_devices();
+    let Some(store) = state.credential_store.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "pair_list: credential store not wired",
+            )
+            .with_subclass("store_unavailable"),
+        };
+    };
+    let records = match store.list() {
+        Ok(records) => records,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("pair_list: store read failed: {e}"),
+                )
+                .with_subclass("store_io"),
+            };
+        }
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut devices = paired_devices(&records, now_ms);
     devices.sort_by_key(|d| d.first_paired_at_ms);
     ClientResponse::PairListed {
         pair_listed: true,
@@ -18418,7 +18654,45 @@ async fn handle_pair_list(
     }
 }
 
+/// The paired devices the inventory knows: one per device with a live
+/// paired bearer, labelled as its latest pairing was, first paired at
+/// its earliest live pairing and last seen at its latest.
+fn paired_devices(
+    records: &[evo_auth_bearer::CredentialRecord],
+    now_ms: u64,
+) -> Vec<crate::pairing::PairedDevice> {
+    let mut by_id: std::collections::BTreeMap<
+        String,
+        crate::pairing::PairedDevice,
+    > = std::collections::BTreeMap::new();
+    for record in records.iter().filter(|r| {
+        r.source == Some(evo_auth_bearer::CredentialSource::Paired)
+            && r.is_active(now_ms)
+    }) {
+        let Some(id) = record.paired_device_id.as_deref() else {
+            continue;
+        };
+        let device = by_id.entry(id.to_string()).or_insert_with(|| {
+            crate::pairing::PairedDevice {
+                id: crate::pairing::PairedDeviceId(id.to_string()),
+                label: record.name.clone(),
+                first_paired_at_ms: record.created_at_ms,
+                last_seen_at_ms: record.created_at_ms,
+            }
+        });
+        if record.created_at_ms < device.first_paired_at_ms {
+            device.first_paired_at_ms = record.created_at_ms;
+        }
+        if record.created_at_ms >= device.last_seen_at_ms {
+            device.last_seen_at_ms = record.created_at_ms;
+            device.label = record.name.clone();
+        }
+    }
+    by_id.into_values().collect()
+}
+
 async fn handle_pair_revoke(
+    state: &Arc<crate::state::StewardState>,
     pairing_store: &Arc<crate::pairing::PairingStore>,
     auth_session_store: &Arc<crate::auth::AuthSessionStore>,
     conn: &ConnectionState,
@@ -18454,7 +18728,58 @@ async fn handle_pair_revoke(
             };
         }
     }
-    let revoked = pairing_store
+    let (Some(store), Some(rev_list), Some(https_dir)) = (
+        state.credential_store.get(),
+        state.revocation_list.get(),
+        state.https_dir.get(),
+    ) else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "pair_revoke: credential store or revocation list not wired",
+            )
+            .with_subclass("revocation_unavailable"),
+        };
+    };
+    let records = match store.list() {
+        Ok(records) => records,
+        Err(e) => {
+            return ClientResponse::Error {
+                error: ApiError::new(
+                    ErrorClass::Internal,
+                    format!("pair_revoke: store read failed: {e}"),
+                )
+                .with_subclass("store_io"),
+            };
+        }
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    // Every live bearer paired to the device: refused at once and
+    // after a restart, through the same path as revoke_bearer_token.
+    let mut revoked = false;
+    for record in records.into_iter().filter(|r| {
+        r.source == Some(evo_auth_bearer::CredentialSource::Paired)
+            && r.paired_device_id.as_deref() == Some(paired_device_id.as_str())
+            && r.is_active(now_ms)
+    }) {
+        if let Err(error) = revoke_record(
+            store,
+            rev_list,
+            https_dir,
+            record,
+            "pair_revoke",
+            now_ms,
+        )
+        .await
+        {
+            return ClientResponse::Error { error };
+        }
+        revoked = true;
+    }
+    pairing_store
         .revoke_device(&crate::pairing::PairedDeviceId(paired_device_id));
     ClientResponse::PairRevoked {
         pair_revoked: true,
@@ -18480,13 +18805,29 @@ async fn handle_set_kiosk_password(
     // opening a new admission axis: `plugins_admin` on the
     // connection means either a code-provenance bearer or a
     // bootstrap-preseed bearer already proved physical presence.
-    let kiosk_admission =
-        crate::kiosk_session::evaluate_admission(conn.peer, allowlist);
+    // A network caller is admitted by its own bearer alone: it must
+    // have presented one, and that bearer must hold plugins_admin at
+    // write rank or above. The kiosk-uid path is local-socket only.
+    if let Some(refusal) = network_bearer_refusal(
+        conn,
+        "set_kiosk_password",
+        &evo_projection_core::CapabilityRequirement::write(
+            CAPABILITY_PLUGINS_ADMIN,
+        ),
+        "password_set_not_admitted",
+    ) {
+        return refusal;
+    }
+    let kiosk_admission = crate::kiosk_session::evaluate_admission(
+        conn.admission_peer(),
+        allowlist,
+    );
     let admitted_via_kiosk = matches!(
         kiosk_admission,
         crate::kiosk_session::KioskAdmission::Admitted { .. }
     );
-    let admitted_via_bearer = conn.has("plugins_admin");
+    let admitted_via_bearer =
+        conn.network_principal.is_some() || conn.has(CAPABILITY_PLUGINS_ADMIN);
     if !admitted_via_kiosk && !admitted_via_bearer {
         return ClientResponse::Error {
             error: ApiError::new(
@@ -18647,11 +18988,25 @@ async fn handle_create_bearer_token(
     scopes: Vec<evo_auth_bearer::CapabilityRef>,
     expires_in_seconds: Option<u64>,
 ) -> ClientResponse {
-    if !conn.has("auth_write") && !conn.has("plugins_admin") {
+    // Who mints decides what may be minted. A network caller mints
+    // only from the set its own bearer carries; the local-socket
+    // operator keeps the operator surface it negotiated by peer
+    // credentials.
+    if let Some(refusal) = network_bearer_refusal(
+        conn,
+        "create_bearer_token",
+        &evo_projection_core::CapabilityRequirement::write("auth"),
+        "auth_write_required",
+    ) {
+        return refusal;
+    }
+    let held = conn.network_principal.as_ref().map(|p| &p.capabilities);
+    if held.is_none() && !conn.has(CAPABILITY_PLUGINS_ADMIN) {
         return ClientResponse::Error {
             error: ApiError::new(
                 ErrorClass::PermissionDenied,
-                "create_bearer_token requires write:auth (or plugins_admin) capability",
+                "create_bearer_token on the local socket requires the \
+                 plugins_admin capability",
             )
             .with_subclass("auth_write_required"),
         };
@@ -18688,8 +19043,8 @@ async fn handle_create_bearer_token(
         };
     };
 
-    let capabilities = if scopes.is_empty() {
-        crate::https_boot::operator_bootstrap_capability_set()
+    let requested = if scopes.is_empty() {
+        None
     } else {
         let mut caps = Vec::with_capacity(scopes.len());
         for sref in &scopes {
@@ -18709,7 +19064,38 @@ async fn handle_create_bearer_token(
                 }
             }
         }
-        evo_auth_bearer::CapabilitySet::new(caps)
+        Some(evo_auth_bearer::CapabilitySet::new(caps))
+    };
+    // Empty scopes mean "what I hold": the caller's own set for a
+    // network caller, the operator bootstrap set on the local socket.
+    // A requested capability must be one the caller holds at that
+    // rank or above.
+    let capabilities = match (held, requested) {
+        (Some(held), None) => held.clone(),
+        (Some(held), Some(requested)) => {
+            if let Some(missing) = requested
+                .capabilities()
+                .iter()
+                .find(|c| !held.satisfies(&capability_requirement_of(c)))
+            {
+                return ClientResponse::Error {
+                    error: ApiError::new(
+                        ErrorClass::PermissionDenied,
+                        format!(
+                            "create_bearer_token: the caller does not hold \
+                             {}:{}; a bearer can only carry what its minter \
+                             holds",
+                            capability_rank_name(missing),
+                            missing.scope()
+                        ),
+                    )
+                    .with_subclass("scope_not_held"),
+                };
+            }
+            requested
+        }
+        (None, None) => crate::https_boot::operator_bootstrap_capability_set(),
+        (None, Some(requested)) => requested,
     };
 
     let (expiry_policy, ttl_ms) = match expires_in_seconds {
@@ -18765,8 +19151,11 @@ async fn handle_create_bearer_token(
         expires_at_ms,
         revoked_at_ms: None,
         revoked_reason: None,
+        source: Some(evo_auth_bearer::CredentialSource::Created),
+        paired_device_id: None,
     };
-    if let Err(e) = store.put(&record) {
+    if let Err(e) = crate::bearer_inventory::add_record(store, &record, now_ms)
+    {
         return ClientResponse::Error {
             error: ApiError::new(
                 ErrorClass::Internal,
@@ -18798,11 +19187,20 @@ async fn handle_list_bearer_tokens(
     state: &Arc<crate::state::StewardState>,
     conn: &ConnectionState,
 ) -> ClientResponse {
-    if !conn.has("auth_read") && !conn.has("plugins_admin") {
+    if let Some(refusal) = network_bearer_refusal(
+        conn,
+        "list_bearer_tokens",
+        &evo_projection_core::CapabilityRequirement::read("auth"),
+        "auth_read_required",
+    ) {
+        return refusal;
+    }
+    if conn.network_principal.is_none() && !conn.has(CAPABILITY_PLUGINS_ADMIN) {
         return ClientResponse::Error {
             error: ApiError::new(
                 ErrorClass::PermissionDenied,
-                "list_bearer_tokens requires read:auth (or plugins_admin) capability",
+                "list_bearer_tokens on the local socket requires the \
+                 plugins_admin capability",
             )
             .with_subclass("auth_read_required"),
         };
@@ -18840,11 +19238,20 @@ async fn handle_revoke_bearer_token(
     token_id: String,
     reason: String,
 ) -> ClientResponse {
-    if !conn.has("auth_write") && !conn.has("plugins_admin") {
+    if let Some(refusal) = network_bearer_refusal(
+        conn,
+        "revoke_bearer_token",
+        &evo_projection_core::CapabilityRequirement::write("auth"),
+        "auth_write_required",
+    ) {
+        return refusal;
+    }
+    if conn.network_principal.is_none() && !conn.has(CAPABILITY_PLUGINS_ADMIN) {
         return ClientResponse::Error {
             error: ApiError::new(
                 ErrorClass::PermissionDenied,
-                "revoke_bearer_token requires write:auth (or plugins_admin) capability",
+                "revoke_bearer_token on the local socket requires the \
+                 plugins_admin capability",
             )
             .with_subclass("auth_write_required"),
         };
@@ -18877,8 +19284,19 @@ async fn handle_revoke_bearer_token(
             .with_subclass("revocation_unavailable"),
         };
     };
+    // The directory the boot loaded the list from; the revocation is
+    // written there so the next boot reads it back.
+    let Some(https_dir) = state.https_dir.get() else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "revoke_bearer_token: HTTPS state directory not wired",
+            )
+            .with_subclass("revocation_unavailable"),
+        };
+    };
 
-    let mut record = match store.get(&token_id) {
+    let record = match store.get(&token_id) {
         Ok(r) => r,
         Err(evo_auth_bearer::CredentialStoreError::NotFound(_)) => {
             return ClientResponse::Error {
@@ -18912,36 +19330,19 @@ async fn handle_revoke_bearer_token(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    record.revoked_at_ms = Some(now_ms);
-    record.revoked_reason = Some(reason_trimmed.to_string());
-    if let Err(e) = store.put(&record) {
-        return ClientResponse::Error {
-            error: ApiError::new(
-                ErrorClass::Internal,
-                format!("revoke_bearer_token: persisting revoked record failed: {e}"),
-            )
-            .with_subclass("persistence_failed"),
-        };
-    }
-
-    rev_list.revoke(&token_id);
-
-    let https_dir = std::env::var("EVO_HTTPS_STATE_DIR")
-        .map(|s| std::path::PathBuf::from(s).join("https"))
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from("/var/lib/evo/https/https")
-        });
-    if let Err(e) =
-        crate::https_boot::persist_revocation(&https_dir, &token_id).await
+    let record = match revoke_record(
+        store,
+        rev_list,
+        https_dir,
+        record,
+        reason_trimmed,
+        now_ms,
+    )
+    .await
     {
-        tracing::warn!(
-            token_id = %token_id,
-            error = %e,
-            "revoke_bearer_token: persisting revocation to disk failed; \
-             in-memory revocation is in effect for this process but will \
-             not survive restart until disk write succeeds"
-        );
-    }
+        Ok(record) => record,
+        Err(error) => return ClientResponse::Error { error },
+    };
 
     tracing::info!(
         token_id = %token_id,
@@ -18953,6 +19354,47 @@ async fn handle_revoke_bearer_token(
         bearer_token_revoked: true,
         record,
     }
+}
+
+/// Revoke the bearer `record` describes: mark the record, refuse the
+/// bearer at once, and add it to the revocation list the next boot
+/// reads. The marked record, or the error that stopped it before the
+/// bearer was refused.
+async fn revoke_record(
+    store: &evo_auth_bearer::CredentialStore,
+    rev_list: &evo_auth_bearer::RevocationList,
+    https_dir: &std::path::Path,
+    mut record: evo_auth_bearer::CredentialRecord,
+    reason: &str,
+    now_ms: u64,
+) -> Result<evo_auth_bearer::CredentialRecord, ApiError> {
+    record.revoked_at_ms = Some(now_ms);
+    record.revoked_reason = Some(reason.to_string());
+    if let Err(e) = store.put(&record) {
+        return Err(ApiError::new(
+            ErrorClass::Internal,
+            format!("persisting the revoked credential record failed: {e}"),
+        )
+        .with_subclass("persistence_failed"));
+    }
+
+    rev_list.revoke(&record.token_id);
+
+    if let Err(e) =
+        crate::https_boot::persist_revocation(https_dir, &record.token_id).await
+    {
+        // LOGGING.md §2: warn (recoverable anomaly — the bearer is
+        // refused for the life of this process; the revocation reaches
+        // disk on the next successful write).
+        tracing::warn!(
+            token_id = %record.token_id,
+            error = %e,
+            "persisting a revocation to disk failed; the in-memory \
+             revocation is in effect for this process but will not \
+             survive restart until a disk write succeeds"
+        );
+    }
+    Ok(record)
 }
 
 async fn handle_reset_credentials_to_open(
@@ -18988,6 +19430,39 @@ async fn handle_reset_credentials_to_open(
             .with_subclass("store_unavailable"),
         };
     };
+    // The directory the boot loaded the revocation list from: the
+    // list cleared here is the one the next boot would read.
+    // The directory the HTTPS substrate loaded its material from and
+    // the tier it admits by are set together.
+    let (Some(https_dir), Some(auth_tier)) =
+        (state.https_dir.get(), state.auth_tier.get())
+    else {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                "reset_credentials_to_open: HTTPS state directory not wired",
+            )
+            .with_subclass("revocation_unavailable"),
+        };
+    };
+    // Mark the reset first: the next start replaces the signing key
+    // before it loads one, so no bearer issued before now is taken
+    // again, revoked or not, and every start runs the Open tier until
+    // the operator restores the configured one. Until the restart the
+    // key and the revocations this process holds stand. If the marks
+    // cannot be written, nothing is cleared.
+    if let Err(e) = crate::https_boot::mark_credentials_reset(https_dir) {
+        return ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::Internal,
+                format!(
+                    "reset_credentials_to_open: retiring the bearer-token \
+                     signing key and leaving the Open tier failed: {e}"
+                ),
+            )
+            .with_subclass("store_io"),
+        };
+    }
     let records_purged = match store.purge() {
         Ok(n) => n,
         Err(e) => {
@@ -19003,11 +19478,6 @@ async fn handle_reset_credentials_to_open(
         }
     };
 
-    let https_dir = std::env::var("EVO_HTTPS_STATE_DIR")
-        .map(|s| std::path::PathBuf::from(s).join("https"))
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from("/var/lib/evo/https/https")
-        });
     let revoked_path = https_dir.join("revoked.json");
     let revocations_cleared = if revoked_path.exists() {
         match tokio::fs::read(&revoked_path).await {
@@ -19030,11 +19500,17 @@ async fn handle_reset_credentials_to_open(
         0
     };
 
+    // The running steward admits by the Open tier from now on.
+    auth_tier.open();
+
     tracing::info!(
         reason = %reason_trimmed,
         records_purged,
         revocations_cleared,
-        "credential substrate reset to Open tier via reset_credentials_to_open"
+        configured_tier = %auth_tier.configured(),
+        "credentials reset via reset_credentials_to_open; the auth tier \
+         is open until `evo auth restore-tier`, and the next start \
+         replaces the bearer-token signing key"
     );
 
     ClientResponse::CredentialsResetToOpen {
@@ -27639,16 +28115,33 @@ fn handle_list_user_interactions(
     ledger: Option<&Arc<crate::prompts::PromptLedger>>,
     conn: &ConnectionState,
 ) -> ClientResponse {
-    let ledger = match require_user_interaction_responder(
+    // Seat first: its holder sees every open prompt, unchanged.
+    let open = match require_user_interaction_responder(
         ledger,
         conn,
         "list_user_interactions",
     ) {
-        Ok(l) => l,
-        Err(resp) => return *resp,
+        Ok(l) => l.open_all(),
+        Err(refusal) => {
+            // Origin door. A connection with no seat still sees
+            // the cards its own dispatches raised — it cannot
+            // answer what it cannot find — and sees nothing
+            // else. A connection that raised none of them is
+            // refused exactly as before rather than handed an
+            // empty success, which would read as "no prompts
+            // pending" to an operator who simply has no standing
+            // here.
+            let Some(l) = ledger else {
+                return *refusal;
+            };
+            let mine = l.open_for_origin(conn.connection_id);
+            if mine.is_empty() {
+                return *refusal;
+            }
+            mine
+        }
     };
-    let prompts = ledger
-        .open_all()
+    let prompts = open
         .into_iter()
         .map(|e| UserInteractionWire {
             plugin: e.plugin,
@@ -27659,6 +28152,43 @@ fn handle_list_user_interactions(
         user_interactions: true,
         prompts,
     }
+}
+
+/// Admit a connection to answer one specific prompt.
+///
+/// Two doors, and the narrow one is tried first. A connection
+/// that is the prompt's stamped origin — the operator whose own
+/// verb raised the question — answers it without holding the
+/// `user_interaction_responder` capability and without the
+/// global seat. That admission is scoped to the single prompt
+/// its dispatch caused: it grants nothing on any other prompt,
+/// and it does not move the seat, which the kiosk still claims
+/// alone.
+///
+/// Everything else falls through to the seat check unchanged,
+/// so the existing `user_interaction_responder_not_granted` /
+/// `responder_slot_held_by_other` / `responder_slot_unclaimed`
+/// refusals are exactly as they were.
+fn admit_prompt_answerer<'a>(
+    ledger: Option<&'a Arc<crate::prompts::PromptLedger>>,
+    conn: &ConnectionState,
+    plugin: &str,
+    prompt_id: &str,
+    op: &'static str,
+) -> Result<&'a Arc<crate::prompts::PromptLedger>, Box<ClientResponse>> {
+    if let Some(l) = ledger {
+        if l.is_stamped_origin(plugin, prompt_id, conn.connection_id) {
+            tracing::info!(
+                op,
+                plugin,
+                prompt_id,
+                answering_conn = conn.connection_id.0,
+                "prompt answered by the dispatch that raised it"
+            );
+            return Ok(l);
+        }
+    }
+    require_user_interaction_responder(ledger, conn, op)
 }
 
 /// Answer an open prompt. Transitions the ledger entry to
@@ -27674,9 +28204,11 @@ fn handle_answer_user_interaction(
     response: evo_plugin_sdk::contract::PromptResponse,
     retain_for: Option<evo_plugin_sdk::contract::RetentionHint>,
 ) -> ClientResponse {
-    let ledger = match require_user_interaction_responder(
+    let ledger = match admit_prompt_answerer(
         ledger,
         conn,
+        &plugin,
+        &prompt_id,
         "answer_user_interaction",
     ) {
         Ok(l) => l,
@@ -27716,9 +28248,11 @@ fn handle_cancel_user_interaction(
     plugin: String,
     prompt_id: String,
 ) -> ClientResponse {
-    let ledger = match require_user_interaction_responder(
+    let ledger = match admit_prompt_answerer(
         ledger,
         conn,
+        &plugin,
+        &prompt_id,
         "cancel_user_interaction",
     ) {
         Ok(l) => l,
@@ -29357,6 +29891,7 @@ fn household_refusal(
     scope: Option<&str>,
     auth_session_store: &Arc<crate::auth::AuthSessionStore>,
     step_up_token: Option<&str>,
+    inherited: Option<&crate::nest_sitting::ConsumerSitting>,
     what: &str,
 ) -> Option<ClientResponse> {
     let runtime = runtime?;
@@ -29377,6 +29912,16 @@ fn household_refusal(
             return None;
         }
     }
+    // A nested dispatch carries the sitting of the consumer it
+    // serves, validated against that consumer's identity now.
+    if let Some(sitting) = inherited {
+        if auth_session_store
+            .validate(sitting.token(), sitting.identity())
+            .is_ok()
+        {
+            return None;
+        }
+    }
     Some(ClientResponse::Error {
         error: ApiError::new(
             ErrorClass::PermissionDenied,
@@ -29386,6 +29931,43 @@ fn household_refusal(
             ),
         )
         .with_subclass("household_policy_locked"),
+    })
+}
+
+/// The refusal for a plugin verb declared `read` or `write` whose
+/// requirement the caller does not hold, or `None` when it holds it.
+///
+/// A network caller (REST, the WebSocket, a nested dispatch) carries
+/// its capability set at full rank, and holds the requirement on the
+/// rank lattice: `read` < `write` < `step_up`. A holder of `read:S`
+/// does not pass a verb declared `write:S`. A local-socket connection
+/// is granted capability names by `negotiate`, which carry no rank, so
+/// there the scope name is the grant.
+fn verb_requirement_refusal(
+    conn: &ConnectionState,
+    granted_capabilities: &HashSet<String>,
+    request_type: &str,
+    requirement: &evo_projection_core::CapabilityRequirement,
+) -> Option<ClientResponse> {
+    let held = match &conn.network_principal {
+        Some(principal) => principal.capabilities.satisfies(requirement),
+        None => requirement
+            .scope()
+            .is_some_and(|scope| granted_capabilities.contains(scope)),
+    };
+    if held {
+        return None;
+    }
+    Some(ClientResponse::Error {
+        error: ApiError::new(
+            ErrorClass::PermissionDenied,
+            format!(
+                "verb {request_type:?} requires {}; principal does not \
+                 hold it",
+                requirement_label(requirement)
+            ),
+        )
+        .with_subclass("verb_capability_scope_not_granted"),
     })
 }
 
@@ -29404,7 +29986,6 @@ async fn handle_plugin_request(
     payload_b64: String,
     instance_id: Option<String>,
     granted_capabilities: &HashSet<String>,
-    step_up_scopes: &HashSet<String>,
     auth_session_store: &Arc<crate::auth::AuthSessionStore>,
     lifecycle_ledger: Option<&Arc<crate::ledger::LedgerPrimitive>>,
     conn: &ConnectionState,
@@ -29412,6 +29993,7 @@ async fn handle_plugin_request(
     household_protection: Option<
         &Arc<crate::household_protection::HouseholdProtectionRuntime>,
     >,
+    prompt_ledger: Option<&Arc<crate::prompts::PromptLedger>>,
 ) -> ClientResponse {
     let payload = match B64.decode(&payload_b64) {
         Ok(p) => p,
@@ -29430,7 +30012,9 @@ async fn handle_plugin_request(
     // plugin's manifest-derived enforcement policy and consult
     // `respondent_verb_capabilities[request_type]`. The declared
     // requirement (when present) is checked against the
-    // principal's granted-capabilities set + step-up-scopes set
+    // principal's capabilities (by rank for a network caller, see
+    // `verb_requirement_refusal`), and a step-up
+    // declaration against a sitting validated on this call,
     // BEFORE the request is forwarded into the router. A failed
     // check refuses with `permission_denied` and never reaches
     // the plugin; the plugin only ever sees requests its declared
@@ -29449,6 +30033,16 @@ async fn handle_plugin_request(
     let routed_entry = router
         .lookup_for_verb(&shelf, &request_type)
         .or_else(|| router.lookup(&shelf));
+    // A nested dispatch serves the consumer whose request the
+    // calling plugin is answering. Find that consumer, when it is
+    // unambiguous, so the gates below can accept its sitting.
+    let nest_origin = household_protection
+        .zip(crate::nest_sitting::nested_from())
+        .and_then(|(runtime, from)| runtime.nest_sittings().origin_of(&from));
+    // Canonical plugin name for the prompt correlation below.
+    // The same identity the plugin stamps on a prompt frame.
+    let routed_plugin_name: Option<String> =
+        routed_entry.as_ref().map(|e| e.name.clone());
     let (principal_scope, has_step_up) = match routed_entry {
         Some(entry) => {
             // Per-shelf partition gate. Multi-stocking
@@ -29496,22 +30090,35 @@ async fn handle_plugin_request(
                 }
                 Some(evo_plugin_sdk::manifest::VerbCapability::Read {
                     scope,
-                })
-                | Some(evo_plugin_sdk::manifest::VerbCapability::Write {
+                }) => {
+                    let requirement =
+                        evo_projection_core::CapabilityRequirement::read(
+                            scope.as_str(),
+                        );
+                    if let Some(refusal) = verb_requirement_refusal(
+                        conn,
+                        granted_capabilities,
+                        &request_type,
+                        &requirement,
+                    ) {
+                        return refusal;
+                    }
+                    (Some(scope.clone()), false)
+                }
+                Some(evo_plugin_sdk::manifest::VerbCapability::Write {
                     scope,
                 }) => {
-                    if !granted_capabilities.contains(scope) {
-                        return ClientResponse::Error {
-                            error: ApiError::new(
-                                ErrorClass::PermissionDenied,
-                                format!(
-                                    "verb {request_type:?} requires \
-                                     capability scope {scope:?}; principal \
-                                     does not hold it"
-                                ),
-                            )
-                            .with_subclass("verb_capability_scope_not_granted"),
-                        };
+                    let requirement =
+                        evo_projection_core::CapabilityRequirement::write(
+                            scope.as_str(),
+                        );
+                    if let Some(refusal) = verb_requirement_refusal(
+                        conn,
+                        granted_capabilities,
+                        &request_type,
+                        &requirement,
+                    ) {
+                        return refusal;
                     }
                     (Some(scope.clone()), false)
                 }
@@ -29532,23 +30139,32 @@ async fn handle_plugin_request(
                             .with_subclass("verb_capability_scope_not_granted"),
                         };
                     }
-                    // The connection's sitting is frozen when it
-                    // is admitted, so a caller who re-authenticated
-                    // afterwards has to be able to say so on the
-                    // call itself. A token presented here is
-                    // validated for this dispatch only — it is not
-                    // recorded on the connection, so the next call
-                    // proves itself again.
+                    // A step-up verb needs a sitting on every call.
+                    // The bearer's step-up rank on the scope says its
+                    // holder may elevate; it is never the sitting.
+                    // The sitting is a step-up session validated now:
+                    // the token presented on this call, or, for a
+                    // nest, the sitting of the consumer it serves.
+                    // Neither is recorded on the connection, so the
+                    // next call proves itself again.
                     //
                     // The write-scope check above has already
                     // passed, so this cannot grant a scope the
                     // principal does not hold; it only supplies the
-                    // sitting for one they do. An anonymous or
-                    // LAN-trust caller has no session to mint a
-                    // token against, and validation binds the token
-                    // to the peer, so neither can elevate here.
-                    if !step_up_scopes.contains(scope) {
-                        match validate_step_up_for_operation(
+                    // sitting for one they do. Validation binds the
+                    // token to the caller it was issued to, so a
+                    // token minted for another browser elevates
+                    // nothing here.
+                    let inherited = nest_origin
+                        .as_ref()
+                        .and_then(crate::nest_sitting::NestOrigin::sitting)
+                        .is_some_and(|sitting| {
+                            auth_session_store
+                                .validate(sitting.token(), sitting.identity())
+                                .is_ok()
+                        });
+                    if !inherited {
+                        if let Err(refusal) = validate_step_up_for_operation(
                             auth_session_store,
                             lifecycle_ledger,
                             conn,
@@ -29557,8 +30173,7 @@ async fn handle_plugin_request(
                         )
                         .await
                         {
-                            Ok(_) => {}
-                            Err(refusal) => return *refusal,
+                            return *refusal;
                         }
                     }
                     (Some(scope.clone()), true)
@@ -29581,6 +30196,9 @@ async fn handle_plugin_request(
         principal_scope.as_deref(),
         auth_session_store,
         step_up_token,
+        nest_origin
+            .as_ref()
+            .and_then(crate::nest_sitting::NestOrigin::sitting),
         &format!("verb {request_type:?}"),
     ) {
         return refusal;
@@ -29685,7 +30303,47 @@ async fn handle_plugin_request(
         has_step_up,
     };
 
-    let result = router.handle_request(&shelf, sdk_request).await;
+    // Register this dispatch against the plugin for as long as
+    // it is open. A prompt the plugin raises while it runs is
+    // the operator's own question, so the ledger can stamp it
+    // with this connection and admit that connection to answer
+    // it — without moving the global responder seat, which the
+    // kiosk still holds alone. The guard drops with this scope,
+    // including on an error return from the router.
+    let _dispatch = prompt_ledger.zip(routed_plugin_name.as_ref()).map(
+        |(ledger, plugin)| ledger.enter_dispatch(plugin, conn.connection_id),
+    );
+    // Record the consumer this dispatch serves against the plugin,
+    // for as long as it is open, so a nest the plugin makes can
+    // find it. A nest is recorded under the consumer it inherited,
+    // so a chain of nests keeps the one consumer. The token stays
+    // here; the plugin's request carries none.
+    let _consumer = household_protection.zip(routed_plugin_name.as_ref()).map(
+        |(runtime, plugin)| {
+            let origin = nest_origin.unwrap_or_else(|| {
+                crate::nest_sitting::NestOrigin::new(
+                    conn.connection_id,
+                    step_up_token.filter(|t| !t.is_empty()).map(|token| {
+                        crate::nest_sitting::ConsumerSitting::new(
+                            token,
+                            crate::auth::caller_identity(
+                                conn.peer.uid,
+                                conn.principal_token_id.as_deref(),
+                            ),
+                        )
+                    }),
+                )
+            });
+            runtime.nest_sittings().enter(plugin, origin)
+        },
+    );
+    // The handler runs as the plugin on this task: a nest it makes
+    // in process names it as its origin.
+    let result = crate::nest_sitting::run_as_plugin(
+        routed_plugin_name.clone(),
+        router.handle_request(&shelf, sdk_request),
+    )
+    .await;
 
     // Authoritative emission of declared framework happenings on
     // successful dispatch of well-known operator-issued ops.
@@ -30917,6 +31575,137 @@ fn take_step_up_token(
 /// `rename_all = "snake_case"`, so the canonical wire op id is
 /// already in the right shape. A `null` payload becomes
 /// `{"op": op_id}` so no-arg ops still deserialise.
+/// Refuse, before dispatch, an op this network caller may not reach.
+///
+/// - `mint_local_kiosk_session` admits by the caller's Unix peer
+///   credentials, which a network caller does not have. It is served
+///   on the device's local socket only; the kiosk mints there.
+/// - Pairing (`pair_begin`, `pair_complete`, `pair_authenticate`)
+///   earns a bearer for a caller that holds none. It is served to a
+///   LAN origin only, and an unclassified origin is not LAN.
+fn network_op_refusal(
+    op_id: &str,
+    principal: &evo_runtime_http::Principal,
+) -> Option<ApiError> {
+    match op_id {
+        "mint_local_kiosk_session" => Some(
+            ApiError::new(
+                ErrorClass::PermissionDenied,
+                "mint_local_kiosk_session is served on the device's local \
+                 socket only",
+            )
+            .with_subclass("local_socket_only"),
+        ),
+        "pair_begin" | "pair_complete" | "pair_authenticate"
+            if !principal.is_lan_origin() =>
+        {
+            Some(
+                ApiError::new(
+                    ErrorClass::PermissionDenied,
+                    format!(
+                        "{op_id}: pairing is served to the local network only"
+                    ),
+                )
+                .with_subclass("pairing_lan_only"),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// The bearer gate a network caller meets on the credential ops.
+///
+/// For a network caller: refuses unless it presented a bearer of its
+/// own, and that bearer holds `requirement` by rank. A caller admitted
+/// without a bearer (the no-bearer sets, an anonymous route) is
+/// refused with `bearer_required`; a bearer that falls short is
+/// refused with `subclass`. Returns `None` when the caller passes, and
+/// for a local-socket connection, which its handler gates by its own
+/// rule.
+fn network_bearer_refusal(
+    conn: &ConnectionState,
+    op: &str,
+    requirement: &evo_projection_core::CapabilityRequirement,
+    subclass: &'static str,
+) -> Option<ClientResponse> {
+    let principal = conn.network_principal.as_ref()?;
+    if !principal.presented_bearer() {
+        return Some(ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                format!(
+                    "{op} needs a bearer: a caller admitted without one is \
+                     refused"
+                ),
+            )
+            .with_subclass("bearer_required"),
+        });
+    }
+    if !principal.capabilities.satisfies(requirement) {
+        return Some(ClientResponse::Error {
+            error: ApiError::new(
+                ErrorClass::PermissionDenied,
+                format!("{op} requires {}", requirement_label(requirement)),
+            )
+            .with_subclass(subclass),
+        });
+    }
+    None
+}
+
+/// The requirement a capability satisfies at its own rank: holding
+/// that requirement is holding the capability.
+fn capability_requirement_of(
+    cap: &evo_auth_bearer::Capability,
+) -> evo_projection_core::CapabilityRequirement {
+    use evo_auth_bearer::Capability;
+    use evo_projection_core::CapabilityRequirement;
+    match cap {
+        Capability::Read { scope } => CapabilityRequirement::read(scope),
+        Capability::Write { scope } => CapabilityRequirement::write(scope),
+        Capability::StepUp { scope } => CapabilityRequirement::step_up(scope),
+    }
+}
+
+/// Wire spelling of a requirement, `<rank>:<scope>`.
+fn requirement_label(
+    req: &evo_projection_core::CapabilityRequirement,
+) -> String {
+    use evo_projection_core::CapabilityRequirement;
+    match req {
+        CapabilityRequirement::None => "nothing".to_string(),
+        CapabilityRequirement::Read { scope } => format!("read:{scope}"),
+        CapabilityRequirement::Write { scope } => format!("write:{scope}"),
+        CapabilityRequirement::StepUp { scope } => format!("step_up:{scope}"),
+    }
+}
+
+/// Wire spelling of a capability's rank.
+fn capability_rank_name(cap: &evo_auth_bearer::Capability) -> &'static str {
+    use evo_auth_bearer::Capability;
+    match cap {
+        Capability::Read { .. } => "read",
+        Capability::Write { .. } => "write",
+        Capability::StepUp { .. } => "step_up",
+    }
+}
+
+/// A pre-dispatch refusal, shaped the way a dispatch refusal reaches
+/// the wire: the error envelope as the body, under the HTTP status its
+/// class maps to.
+fn http_refusal(error: ApiError) -> HttpDispatchError {
+    let status = error_class_to_http_status(error.class);
+    let message = error.message.clone();
+    match serde_json::to_value(&ClientResponse::Error { error }) {
+        Ok(body) => HttpDispatchError::RequestRefused {
+            status,
+            message,
+            body,
+        },
+        Err(e) => HttpDispatchError::SerializationFailed(e.to_string()),
+    }
+}
+
 fn parse_http_wire_request(
     op_id: &str,
     payload: serde_json::Value,
@@ -30964,33 +31753,6 @@ fn flatten_principal_capabilities(
     let mut out = HashSet::new();
     for cap in principal.capabilities.capabilities() {
         out.insert(cap.scope().to_string());
-    }
-    out
-}
-
-/// Subset of [`flatten_principal_capabilities`] restricted to
-/// capability scopes for which the principal holds an active
-/// step-up auth session (the bearer-token capability set carries a
-/// `StepUp { scope }` entry).
-///
-/// Used by the plugin-route per-verb capability gate when a verb's
-/// manifest declaration is
-/// [`VerbCapability::StepUp`](evo_plugin_sdk::manifest::VerbCapability::StepUp);
-/// the gate requires both `granted_capabilities.contains(scope)`
-/// (write-or-higher on that scope) AND
-/// `step_up_scopes.contains(scope)` (step-up auth verified for that
-/// scope by the auth layer at admission). The double-set design
-/// preserves the framework-canonical step-up semantics inside the
-/// plugin dispatch path without re-implementing the rank lattice
-/// at the plugin layer.
-fn flatten_step_up_scopes(
-    principal: &evo_runtime_http::Principal,
-) -> HashSet<String> {
-    let mut out = HashSet::new();
-    for cap in principal.capabilities.capabilities() {
-        if matches!(cap, evo_auth_bearer::Capability::StepUp { .. }) {
-            out.insert(cap.scope().to_string());
-        }
     }
     out
 }
@@ -31333,21 +32095,14 @@ mod tests {
         }
     }
 
-    /// A connection admitted with the write scope but no active
-    /// sitting — the shape a consumer is in after negotiating and
-    /// then authenticating separately. This is precisely the case
-    /// the gate could not admit before, and why consumers skip
-    /// elevation on this op entirely.
+    /// A connection holding the write scope and no sitting: the
+    /// shape every caller is in until it presents a step-up token.
     fn conn_with_scope_no_sitting(scope: &str) -> ConnectionState {
         let mut conn = ConnectionState::new(PeerCredentials {
             uid: Some(1000),
             gid: Some(1000),
         });
         conn.granted_capabilities.insert(scope.to_string());
-        assert!(
-            conn.step_up_scopes.is_empty(),
-            "the sitting must start empty for these cases to mean anything"
-        );
         conn
     }
 
@@ -31644,6 +32399,238 @@ mod tests {
         (router, seen)
     }
 
+    const RANKED_SHELF: &str = "test.ranked";
+    const RANKED_READ_VERB: &str = "ranked.read";
+    const RANKED_WRITE_VERB: &str = "ranked.write";
+    const RANKED_SCOPE: &str = "system_admin";
+
+    /// A router carrying one respondent with a verb declared
+    /// `read:RANKED_SCOPE` and one declared `write:RANKED_SCOPE`.
+    fn router_with_ranked_verbs(
+        state: &Arc<StewardState>,
+    ) -> (Arc<PluginRouter>, Arc<std::sync::Mutex<Vec<SeenRequest>>>) {
+        use evo_plugin_sdk::manifest::VerbCapability;
+        let respondent = RecordingRespondent::default();
+        let seen = Arc::clone(&respondent.seen);
+        let erased: Box<dyn ErasedRespondent> =
+            Box::new(RespondentAdapter::new(respondent));
+        let mut policy = crate::router::EnforcementPolicy::permissive();
+        policy.respondent_verb_capabilities.insert(
+            RANKED_READ_VERB.to_string(),
+            VerbCapability::Read {
+                scope: RANKED_SCOPE.to_string(),
+            },
+        );
+        policy.respondent_verb_capabilities.insert(
+            RANKED_WRITE_VERB.to_string(),
+            VerbCapability::Write {
+                scope: RANKED_SCOPE.to_string(),
+            },
+        );
+        let entry = Arc::new(crate::router::PluginEntry::new_with_policy(
+            "ranked".to_string(),
+            RANKED_SHELF.to_string(),
+            AdmittedHandle::Respondent(erased),
+            policy,
+        ));
+        let router = Arc::new(PluginRouter::new(Arc::clone(state)));
+        router.insert(entry).expect("respondent admits");
+        (router, seen)
+    }
+
+    /// A connection as the HTTPS-family dispatch builds it for a
+    /// network principal holding `caps`.
+    fn network_conn(caps: Vec<evo_auth_bearer::Capability>) -> ConnectionState {
+        let principal = evo_runtime_http::Principal::new(
+            "ranked-bearer",
+            evo_auth_bearer::CapabilitySet::new(caps),
+        );
+        let mut conn = ConnectionState::new(PeerCredentials {
+            uid: Some(0),
+            gid: Some(0),
+        });
+        conn.granted_capabilities = flatten_principal_capabilities(&principal);
+        conn.principal_token_id = Some(principal.token_id.clone());
+        conn.network_principal = Some(principal);
+        conn
+    }
+
+    async fn dispatch_ranked(
+        router: &Arc<PluginRouter>,
+        state: &Arc<StewardState>,
+        conn: &ConnectionState,
+        verb: &str,
+    ) -> ClientResponse {
+        let store = Arc::new(crate::auth::AuthSessionStore::with_defaults());
+        handle_plugin_request(
+            router,
+            state,
+            RANKED_SHELF.to_string(),
+            verb.to_string(),
+            B64.encode(b"{}"),
+            None,
+            &conn.granted_capabilities,
+            &store,
+            None,
+            conn,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_read_holder_does_not_pass_a_write_verb() {
+        use evo_auth_bearer::Capability;
+        let state = StewardState::for_tests();
+        let (router, seen) = router_with_ranked_verbs(&state);
+        let conn = network_conn(vec![Capability::read(RANKED_SCOPE)]);
+
+        match dispatch_ranked(&router, &state, &conn, RANKED_WRITE_VERB).await {
+            ClientResponse::Error { error } => assert_eq!(
+                refusal_subclass(&error).as_deref(),
+                Some("verb_capability_scope_not_granted"),
+                "{error:?}"
+            ),
+            other => panic!("read must not pass a write verb: {other:?}"),
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a refused call must never reach the plugin"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verb_admits_its_rank_and_every_rank_above() {
+        use evo_auth_bearer::Capability;
+        let state = StewardState::for_tests();
+        let (router, seen) = router_with_ranked_verbs(&state);
+        let cases = [
+            (Capability::read(RANKED_SCOPE), RANKED_READ_VERB, true),
+            (Capability::write(RANKED_SCOPE), RANKED_READ_VERB, true),
+            (Capability::step_up(RANKED_SCOPE), RANKED_READ_VERB, true),
+            (Capability::write(RANKED_SCOPE), RANKED_WRITE_VERB, true),
+            (Capability::step_up(RANKED_SCOPE), RANKED_WRITE_VERB, true),
+            (
+                Capability::step_up("network_admin"),
+                RANKED_READ_VERB,
+                false,
+            ),
+        ];
+        let mut admitted = 0;
+        for (cap, verb, admits) in cases {
+            let label = format!("{cap:?} on {verb}");
+            let conn = network_conn(vec![cap]);
+            let resp = dispatch_ranked(&router, &state, &conn, verb).await;
+            match (admits, resp) {
+                (true, ClientResponse::Success { .. }) => admitted += 1,
+                (false, ClientResponse::Error { error }) => assert_eq!(
+                    refusal_subclass(&error).as_deref(),
+                    Some("verb_capability_scope_not_granted"),
+                    "{label}: {error:?}"
+                ),
+                (_, other) => panic!("{label}: {other:?}"),
+            }
+        }
+        assert_eq!(seen.lock().unwrap().len(), admitted);
+    }
+
+    #[tokio::test]
+    async fn the_local_socket_grants_a_verb_by_name() {
+        // Negotiate grants names, which carry no rank.
+        let state = StewardState::for_tests();
+        let (router, seen) = router_with_ranked_verbs(&state);
+        let conn = conn_with_scope_no_sitting(RANKED_SCOPE);
+        assert!(conn.network_principal.is_none());
+
+        let resp =
+            dispatch_ranked(&router, &state, &conn, RANKED_WRITE_VERB).await;
+        assert!(matches!(resp, ClientResponse::Success { .. }), "{resp:?}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// The token has to reach the gate, not merely exist.
+    ///
+    /// `the_gate_*` below drive `handle_plugin_request` directly
+    /// and prove the gate consults a token it is handed. What
+    /// they cannot prove is that a token in the request body ever
+    /// becomes that argument — and severing the wire carriage
+    /// leaves every one of them green.
+    ///
+    /// The carriage cannot be driven from a unit test: it runs on
+    /// `Server::dispatch_http_wire_op`, there is no test
+    /// constructor for a `Server`, and `dispatch_request` is
+    /// reachable only from the two transport paths with a
+    /// `SubstrateHandles` bundle built from a live server. So the
+    /// three links are pinned where they live.
+    ///
+    /// Each link is load-bearing. The take must precede the typed
+    /// parse, because `ClientRequest::Request` denies unknown
+    /// fields and would refuse the frame outright. The binding
+    /// must reach `dispatch_request` unaltered. And the `Request`
+    /// arm must forward it, or a plugin verb declaring a step-up
+    /// capability can never be satisfied by a caller who
+    /// re-authenticated after the connection was admitted.
+    #[test]
+    fn a_body_step_up_token_is_carried_to_the_plugin_gate() {
+        let src = include_str!("server.rs");
+        let body = &src[..src
+            .find("\nmod tests {")
+            .or_else(|| src.find("\n#[cfg(test)]"))
+            .unwrap_or(src.len())];
+
+        // Link 1: taken from the payload, before the typed parse.
+        let take = "        let step_up_token = take_step_up_token(&mut payload)\n            .map_err(HttpDispatchError::InvalidPayload)?;\n";
+        assert!(
+            body.contains(take),
+            "the body token must be taken verbatim and unaltered; \
+             anything wrapping or filtering it severs the carriage"
+        );
+        let take_at = body.find(take).expect("checked above");
+        let parse_at = body
+            .find("let req = parse_http_wire_request(op_id, payload)?;")
+            .expect("the wire op must be parsed");
+        assert!(
+            take_at < parse_at,
+            "the token must be taken before the typed parse, which \
+             denies unknown fields"
+        );
+
+        // Link 2: handed to the dispatcher.
+        let dispatch_at = body[take_at..]
+            .find("let response = dispatch_request(")
+            .map(|i| take_at + i)
+            .expect("the wire op must be dispatched");
+        // Bounded to that call. Scanning past its end finds the
+        // other transport's dispatch and passes while this one
+        // hands the dispatcher nothing.
+        let call_end = body[dispatch_at..]
+            .find(")\n        .await;")
+            .map(|i| dispatch_at + i)
+            .expect("the dispatch call must end");
+        assert!(
+            body[dispatch_at..call_end].contains("step_up_token.as_deref(),"),
+            "the taken token must be passed to dispatch_request on this \
+             path, not merely somewhere in the file"
+        );
+
+        // Link 3: forwarded by the arm that serves a plugin verb.
+        let arm_at = body
+            .find("ClientRequest::Request {")
+            .expect("the request arm must exist");
+        let arm_end = body[arm_at..]
+            .find("ClientRequest::ProjectSubject")
+            .map(|i| arm_at + i)
+            .unwrap_or(body.len());
+        let arm = &body[arm_at..arm_end];
+        assert!(
+            arm.contains("step_up_token,"),
+            "the plugin-request arm must forward the token to \
+             handle_plugin_request: {arm}"
+        );
+    }
+
     #[tokio::test]
     async fn the_gate_consults_the_token_before_it_refuses() {
         // The whole point of the cut: a connection holding the
@@ -31658,7 +32645,6 @@ mod tests {
             store.issue(principal_for(1000), "uid:1000".to_owned(), None);
         let granted: HashSet<String> =
             [GATED_SCOPE.to_string()].into_iter().collect();
-        let sitting: HashSet<String> = HashSet::new();
 
         let resp = handle_plugin_request(
             &router,
@@ -31668,11 +32654,11 @@ mod tests {
             B64.encode(b"hello"),
             None,
             &granted,
-            &sitting,
             &store,
             None,
             &conn,
             Some(session.token.as_str()),
+            None,
             None,
         )
         .await;
@@ -31699,7 +32685,6 @@ mod tests {
         let conn = conn_with_scope_no_sitting(GATED_SCOPE);
         let granted: HashSet<String> =
             [GATED_SCOPE.to_string()].into_iter().collect();
-        let sitting: HashSet<String> = HashSet::new();
 
         for token in [None, Some("not-a-real-token")] {
             let resp = handle_plugin_request(
@@ -31710,11 +32695,11 @@ mod tests {
                 B64.encode(b"hello"),
                 None,
                 &granted,
-                &sitting,
                 &store,
                 None,
                 &conn,
                 token,
+                None,
                 None,
             )
             .await;
@@ -31751,7 +32736,6 @@ mod tests {
             store.issue(principal_for(1000), "uid:1000".to_owned(), None);
         let granted: HashSet<String> =
             [GATED_SCOPE.to_string()].into_iter().collect();
-        let sitting: HashSet<String> = HashSet::new();
 
         let resp = handle_plugin_request(
             &router,
@@ -31761,11 +32745,11 @@ mod tests {
             B64.encode(br#"{"on":true}"#),
             None,
             &granted,
-            &sitting,
             &store,
             None,
             &conn,
             Some(session.token.as_str()),
+            None,
             None,
         )
         .await;
@@ -34757,6 +35741,135 @@ mod tests {
         }
     }
 
+    /// A steward state with an issuer and an inventory at `inventory`,
+    /// as the HTTPS boot leaves it.
+    fn minting_state(
+        inventory: &std::path::Path,
+    ) -> (Arc<StewardState>, Arc<evo_auth_bearer::CredentialStore>) {
+        let state = StewardState::for_tests();
+        let issuer = Arc::new(evo_auth_bearer::BearerTokenIssuer::new(
+            evo_auth_bearer::BearerTokenIssuer::generate_signing_key(),
+        ));
+        let _ = state.bearer_token_issuer.set(issuer);
+        let store = Arc::new(
+            evo_auth_bearer::CredentialStore::new(inventory.to_path_buf())
+                .expect("inventory"),
+        );
+        let _ = state.credential_store.set(Arc::clone(&store));
+        (state, store)
+    }
+
+    /// Pair a browser with the password, as the glass does.
+    async fn pair_with_password(state: &Arc<StewardState>) -> ClientResponse {
+        let router = Arc::new(PluginRouter::new(Arc::clone(state)));
+        let svc: Arc<dyn crate::auth::AuthService> =
+            Arc::new(FixedAuthService {
+                username: "alice".into(),
+                secret: b"password".to_vec(),
+            });
+        handle_pair_authenticate(
+            state,
+            &router,
+            Some(&svc),
+            &Arc::new(crate::pairing::PairingStore::new()),
+            &Arc::new(crate::auth::StepUpRateLimiter::with_defaults()),
+            &Arc::new(crate::auth::NonceReplayStore::with_defaults()),
+            Some("alice"),
+            None,
+            &ConnectionState::new(PeerCredentials {
+                uid: Some(1000),
+                gid: Some(1000),
+            }),
+            "Phone".into(),
+            base64::engine::general_purpose::STANDARD.encode(b"password"),
+            None,
+        )
+        .await
+    }
+
+    /// A browser paired with the password has its bearer in the
+    /// inventory, with the device it was paired to.
+    #[tokio::test]
+    async fn a_password_paired_bearer_is_in_the_inventory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, store) = minting_state(dir.path());
+        match pair_with_password(&state).await {
+            ClientResponse::PairAuthenticated {
+                token_id,
+                paired_device_id,
+                expires_at_ms,
+                ..
+            } => {
+                let record = store.get(&token_id).expect("a record");
+                assert_eq!(
+                    record.source,
+                    Some(evo_auth_bearer::CredentialSource::Paired)
+                );
+                assert_eq!(
+                    record.paired_device_id.as_deref(),
+                    Some(paired_device_id.as_str())
+                );
+                assert_eq!(record.name, "Phone");
+                assert_eq!(record.expires_at_ms, Some(expires_at_ms));
+            }
+            other => panic!("expected a pairing, got {other:?}"),
+        }
+    }
+
+    /// A pairing whose record cannot be written hands out no bearer.
+    #[tokio::test]
+    async fn a_pairing_with_no_record_hands_out_no_bearer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inventory = dir.path().join("credentials");
+        let (state, _store) = minting_state(&inventory);
+        std::fs::remove_dir_all(&inventory).expect("take the inventory away");
+        match pair_with_password(&state).await {
+            ClientResponse::Error { error } => {
+                let details = error.details.as_ref().expect("details");
+                assert_eq!(
+                    details["subclass"].as_str(),
+                    Some("persistence_failed")
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A kiosk bearer minted through the main socket's handler is in the
+    /// inventory too.
+    #[tokio::test]
+    async fn a_kiosk_bearer_from_the_main_socket_is_in_the_inventory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, store) = minting_state(dir.path());
+        let router = Arc::new(PluginRouter::new(Arc::clone(&state)));
+        let allowlist =
+            Arc::new(crate::kiosk_session::KioskUidAllowlist::from_uids([
+                1000,
+            ]));
+        let conn = ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        });
+        match handle_mint_local_kiosk_session(
+            &state,
+            &router,
+            &allowlist,
+            &conn,
+            "kiosk-boot".into(),
+        )
+        .await
+        {
+            ClientResponse::LocalKioskSessionMinted { token_id, .. } => {
+                let record = store.get(&token_id).expect("a record");
+                assert_eq!(
+                    record.source,
+                    Some(evo_auth_bearer::CredentialSource::Kiosk)
+                );
+            }
+            other => panic!("expected a kiosk mint, got {other:?}"),
+        }
+    }
+
     #[test]
     fn step_up_auth_verify_op_parses_inline() {
         let json = r#"{"op":"step_up_auth_verify","username":"alice","secret_b64":"cGFzc3dvcmQ="}"#;
@@ -35840,6 +36953,482 @@ mod tests {
             .try_claim_responder(conn.connection_id)
             .expect("test setup: ledger must be freshly created");
         conn
+    }
+
+    /// A plain consumer connection: no responder capability, no
+    /// claim on the seat. What a paired browser looks like.
+    fn browser_conn() -> ConnectionState {
+        ConnectionState::new(PeerCredentials {
+            uid: Some(1000),
+            gid: Some(1000),
+        })
+    }
+
+    /// Issue one open prompt for `plugin` as if `conn` had a
+    /// verb in flight against it — the shape the steward
+    /// produces around `router.handle_request`.
+    fn prompt_raised_inside_dispatch(
+        ledger: &Arc<crate::prompts::PromptLedger>,
+        plugin: &str,
+        prompt_id: &str,
+        conn: &ConnectionState,
+    ) {
+        let guard = ledger.enter_dispatch(plugin, conn.connection_id);
+        ledger.issue(
+            plugin,
+            evo_plugin_sdk::contract::PromptRequest {
+                prompt_id: prompt_id.to_string(),
+                prompt_type: evo_plugin_sdk::contract::PromptType::Password {
+                    label: "NAS password".to_string(),
+                },
+                timeout_ms: None,
+                session_id: None,
+                retention_hint: None,
+                error_context: None,
+                previous_answer: None,
+                priority: None,
+            },
+            std::time::Duration::from_secs(60),
+        );
+        drop(guard);
+    }
+
+    fn password_answer() -> evo_plugin_sdk::contract::PromptResponse {
+        evo_plugin_sdk::contract::PromptResponse::Password {
+            value: "hunter2".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_browser_that_asked_can_answer_its_own_password_card() {
+        // The operator submitted a share add from a paired
+        // browser. The kiosk holds the single responder seat, so
+        // before the origin stamp the card was visible on the
+        // browser and answerable only on the player. It is the
+        // submitter who knows the password.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let kiosk = responder_conn_with_claim(&ledger);
+        let browser = browser_conn();
+        prompt_raised_inside_dispatch(
+            &ledger,
+            "org.evoframework.network.shares",
+            "shares/password/1",
+            &browser,
+        );
+
+        let resp = handle_answer_user_interaction(
+            Some(&ledger),
+            &browser,
+            "org.evoframework.network.shares".to_string(),
+            "shares/password/1".to_string(),
+            password_answer(),
+            None,
+        );
+
+        assert!(
+            matches!(
+                resp,
+                ClientResponse::UserInteractionAnswered { answered: true, .. }
+            ),
+            "the submitter answers the question its own verb raised: \
+             {resp:?}",
+        );
+        // And the seat never moved to get there.
+        assert_eq!(
+            ledger.current_responder(),
+            Some(kiosk.connection_id),
+            "the kiosk is still the single claimant",
+        );
+    }
+
+    #[test]
+    fn the_seat_holder_can_still_answer_a_prompt_it_did_not_raise() {
+        // The other half. A prompt with no origin — raised
+        // outside any dispatch — is the kiosk's to answer,
+        // exactly as before this door existed.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let kiosk = responder_conn_with_claim(&ledger);
+        ledger.issue(
+            "org.evoframework.network.shares",
+            evo_plugin_sdk::contract::PromptRequest {
+                prompt_id: "shares/password/2".to_string(),
+                prompt_type: evo_plugin_sdk::contract::PromptType::Password {
+                    label: "NAS password".to_string(),
+                },
+                timeout_ms: None,
+                session_id: None,
+                retention_hint: None,
+                error_context: None,
+                previous_answer: None,
+                priority: None,
+            },
+            std::time::Duration::from_secs(60),
+        );
+
+        let resp = handle_answer_user_interaction(
+            Some(&ledger),
+            &kiosk,
+            "org.evoframework.network.shares".to_string(),
+            "shares/password/2".to_string(),
+            password_answer(),
+            None,
+        );
+        assert!(
+            matches!(
+                resp,
+                ClientResponse::UserInteractionAnswered { answered: true, .. }
+            ),
+            "the seat still answers an unstamped prompt: {resp:?}",
+        );
+    }
+
+    #[test]
+    fn an_origin_stamped_prompt_stands_with_the_seat_empty() {
+        // Nobody holds the seat — the kiosk is off, or has not
+        // claimed yet. The submitter is still connected and
+        // still waiting on the dispatch that raised the card, so
+        // the prompt has somewhere to land and the wire's
+        // `no_responder_available` fast-refuse must not fire.
+        // That refusal turns on `dispatch_origin` being None;
+        // this pins the term, and that the answer then lands.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        assert_eq!(
+            ledger.current_responder(),
+            None,
+            "test setup: no seat holder",
+        );
+        let browser = browser_conn();
+        let guard = ledger.enter_dispatch(
+            "org.evoframework.network.shares",
+            browser.connection_id,
+        );
+        assert_eq!(
+            ledger.dispatch_origin("org.evoframework.network.shares"),
+            Some(browser.connection_id),
+            "an open dispatch is somewhere for the prompt to land, \
+             so the fast-refuse does not fire",
+        );
+        ledger.issue(
+            "org.evoframework.network.shares",
+            evo_plugin_sdk::contract::PromptRequest {
+                prompt_id: "shares/password/4".to_string(),
+                prompt_type: evo_plugin_sdk::contract::PromptType::Password {
+                    label: "NAS password".to_string(),
+                },
+                timeout_ms: None,
+                session_id: None,
+                retention_hint: None,
+                error_context: None,
+                previous_answer: None,
+                priority: None,
+            },
+            std::time::Duration::from_secs(60),
+        );
+        drop(guard);
+
+        let resp = handle_answer_user_interaction(
+            Some(&ledger),
+            &browser,
+            "org.evoframework.network.shares".to_string(),
+            "shares/password/4".to_string(),
+            password_answer(),
+            None,
+        );
+        assert!(
+            matches!(
+                resp,
+                ClientResponse::UserInteractionAnswered { answered: true, .. }
+            ),
+            "the submitter answers with no seat holder anywhere: {resp:?}",
+        );
+    }
+
+    #[test]
+    fn the_browser_that_asked_can_list_its_own_card() {
+        // An operator cannot answer a card they cannot find.
+        // The submitter lists the prompt its own dispatch
+        // raised — and only that one, not the kiosk's.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let _kiosk = responder_conn_with_claim(&ledger);
+        let browser = browser_conn();
+        prompt_raised_inside_dispatch(
+            &ledger,
+            "org.evoframework.network.shares",
+            "shares/password/mine",
+            &browser,
+        );
+        // A second card the browser had nothing to do with.
+        ledger.issue(
+            "org.evoframework.network.shares",
+            evo_plugin_sdk::contract::PromptRequest {
+                prompt_id: "shares/password/someone-elses".to_string(),
+                prompt_type: evo_plugin_sdk::contract::PromptType::Password {
+                    label: "NAS password".to_string(),
+                },
+                timeout_ms: None,
+                session_id: None,
+                retention_hint: None,
+                error_context: None,
+                previous_answer: None,
+                priority: None,
+            },
+            std::time::Duration::from_secs(60),
+        );
+
+        match handle_list_user_interactions(Some(&ledger), &browser) {
+            ClientResponse::UserInteractions { prompts, .. } => {
+                let ids: Vec<String> = prompts
+                    .iter()
+                    .map(|p| p.prompt.prompt_id.clone())
+                    .collect();
+                assert_eq!(
+                    ids,
+                    vec!["shares/password/mine".to_string()],
+                    "the submitter sees its own card and no other",
+                );
+            }
+            other => panic!("the submitter must be able to list: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_seat_holder_still_lists_every_open_prompt() {
+        // The seat's view did not narrow. It still sees a card
+        // nobody's dispatch raised, and one that a browser's did.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let kiosk = responder_conn_with_claim(&ledger);
+        let browser = browser_conn();
+        prompt_raised_inside_dispatch(
+            &ledger,
+            "org.evoframework.network.shares",
+            "shares/password/from-browser",
+            &browser,
+        );
+        ledger.issue(
+            "org.evoframework.network.shares",
+            evo_plugin_sdk::contract::PromptRequest {
+                prompt_id: "shares/password/unstamped".to_string(),
+                prompt_type: evo_plugin_sdk::contract::PromptType::Password {
+                    label: "NAS password".to_string(),
+                },
+                timeout_ms: None,
+                session_id: None,
+                retention_hint: None,
+                error_context: None,
+                previous_answer: None,
+                priority: None,
+            },
+            std::time::Duration::from_secs(60),
+        );
+
+        match handle_list_user_interactions(Some(&ledger), &kiosk) {
+            ClientResponse::UserInteractions { prompts, .. } => {
+                assert_eq!(
+                    prompts.len(),
+                    2,
+                    "the seat still lists every open prompt",
+                );
+            }
+            other => panic!("the seat holder must still list: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bystander_browser_cannot_list_and_is_refused_as_before() {
+        // No seat, no stamp, no standing. The refusal is the one
+        // that was always there, not an empty success that would
+        // read as "nothing pending".
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let _kiosk = responder_conn_with_claim(&ledger);
+        let asker = browser_conn();
+        let bystander = browser_conn();
+        prompt_raised_inside_dispatch(
+            &ledger,
+            "org.evoframework.network.shares",
+            "shares/password/not-yours",
+            &asker,
+        );
+
+        match handle_list_user_interactions(Some(&ledger), &bystander) {
+            ClientResponse::Error { error } => {
+                assert_eq!(
+                    refusal_subclass(&error).as_deref(),
+                    Some("user_interaction_responder_not_granted"),
+                    "the original refusal is unchanged",
+                );
+            }
+            other => panic!("a bystander must be refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_browser_that_asked_can_cancel_its_own_card() {
+        // Dismissing your own card is the same standing as
+        // answering it. Without this the submitter could answer
+        // but not walk away, and the card burned its TTL.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let kiosk = responder_conn_with_claim(&ledger);
+        let browser = browser_conn();
+        prompt_raised_inside_dispatch(
+            &ledger,
+            "org.evoframework.network.shares",
+            "shares/password/cancel-mine",
+            &browser,
+        );
+
+        let resp = handle_cancel_user_interaction(
+            Some(&ledger),
+            &browser,
+            "org.evoframework.network.shares".to_string(),
+            "shares/password/cancel-mine".to_string(),
+        );
+        assert!(
+            matches!(
+                resp,
+                ClientResponse::UserInteractionCancelled {
+                    cancelled: true,
+                    ..
+                }
+            ),
+            "the submitter dismisses its own card: {resp:?}",
+        );
+        assert_eq!(
+            ledger.current_responder(),
+            Some(kiosk.connection_id),
+            "and the seat never moved to allow it",
+        );
+    }
+
+    #[test]
+    fn the_seat_holder_still_cancels_an_unstamped_prompt() {
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let kiosk = responder_conn_with_claim(&ledger);
+        ledger.issue(
+            "org.evoframework.network.shares",
+            evo_plugin_sdk::contract::PromptRequest {
+                prompt_id: "shares/password/cancel-unstamped".to_string(),
+                prompt_type: evo_plugin_sdk::contract::PromptType::Password {
+                    label: "NAS password".to_string(),
+                },
+                timeout_ms: None,
+                session_id: None,
+                retention_hint: None,
+                error_context: None,
+                previous_answer: None,
+                priority: None,
+            },
+            std::time::Duration::from_secs(60),
+        );
+
+        let resp = handle_cancel_user_interaction(
+            Some(&ledger),
+            &kiosk,
+            "org.evoframework.network.shares".to_string(),
+            "shares/password/cancel-unstamped".to_string(),
+        );
+        assert!(
+            matches!(
+                resp,
+                ClientResponse::UserInteractionCancelled {
+                    cancelled: true,
+                    ..
+                }
+            ),
+            "the seat still cancels a prompt it did not raise: {resp:?}",
+        );
+    }
+
+    #[test]
+    fn a_bystander_browser_cannot_cancel_someone_elses_card() {
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let _kiosk = responder_conn_with_claim(&ledger);
+        let asker = browser_conn();
+        let bystander = browser_conn();
+        prompt_raised_inside_dispatch(
+            &ledger,
+            "org.evoframework.network.shares",
+            "shares/password/cancel-not-yours",
+            &asker,
+        );
+
+        let resp = handle_cancel_user_interaction(
+            Some(&ledger),
+            &bystander,
+            "org.evoframework.network.shares".to_string(),
+            "shares/password/cancel-not-yours".to_string(),
+        );
+        assert!(
+            matches!(resp, ClientResponse::Error { .. }),
+            "a bystander cannot dismiss someone else's card: {resp:?}",
+        );
+    }
+
+    #[test]
+    fn a_bystander_browser_cannot_answer_someone_elses_card() {
+        // The door is one prompt wide. A second browser that
+        // asked for nothing holds no capability, no seat, and no
+        // stamp, and is refused exactly as it was before.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let _kiosk = responder_conn_with_claim(&ledger);
+        let asker = browser_conn();
+        let bystander = browser_conn();
+        prompt_raised_inside_dispatch(
+            &ledger,
+            "org.evoframework.network.shares",
+            "shares/password/3",
+            &asker,
+        );
+
+        let resp = handle_answer_user_interaction(
+            Some(&ledger),
+            &bystander,
+            "org.evoframework.network.shares".to_string(),
+            "shares/password/3".to_string(),
+            password_answer(),
+            None,
+        );
+        assert!(
+            matches!(resp, ClientResponse::Error { .. }),
+            "a bystander is refused: {resp:?}",
+        );
+    }
+
+    #[test]
+    fn two_browsers_waiting_on_one_plugin_stamp_nobody() {
+        // The prompt frame names only the plugin. With two
+        // different connections waiting on it there is nothing
+        // that says which one asked, and handing a password card
+        // to the wrong browser is worse than making the seat
+        // holder answer it.
+        let ledger = Arc::new(crate::prompts::PromptLedger::new());
+        let _kiosk = responder_conn_with_claim(&ledger);
+        let first = browser_conn();
+        let second = browser_conn();
+        let g1 = ledger.enter_dispatch(
+            "org.evoframework.network.shares",
+            first.connection_id,
+        );
+        let g2 = ledger.enter_dispatch(
+            "org.evoframework.network.shares",
+            second.connection_id,
+        );
+        assert_eq!(
+            ledger.dispatch_origin("org.evoframework.network.shares"),
+            None,
+            "an ambiguous origin is no origin",
+        );
+        drop(g2);
+        assert_eq!(
+            ledger.dispatch_origin("org.evoframework.network.shares"),
+            Some(first.connection_id),
+            "and it resolves again once only one is left",
+        );
+        drop(g1);
+        assert_eq!(
+            ledger.dispatch_origin("org.evoframework.network.shares"),
+            None,
+            "the guard takes the row with it",
+        );
     }
 
     #[test]

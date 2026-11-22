@@ -305,7 +305,7 @@ pub fn current_trust(shared: &SharedTimeTrust) -> TimeTrust {
     }
 }
 
-/// Configuration for [`run_tracker`]. Mirrors the
+/// Configuration for [`spawn_tracker`]. Mirrors the
 /// `[time_trust]` config section.
 #[derive(Debug, Clone, Copy)]
 pub struct TrackerConfig {
@@ -332,20 +332,38 @@ impl Default for TrackerConfig {
     }
 }
 
-/// Run the time-trust tracker until shutdown.
+/// Spawn the time-trust tracker; it runs until shutdown.
 ///
 /// Polls the kernel's NTP state on every tick of `config.poll_interval`,
 /// updates the shared state, and emits
 /// [`Happening::ClockTrustChanged`] on every observed transition
 /// plus [`Happening::ClockAdjusted`] when a wall-clock step is
-/// detected. Designed to run as a long-lived `tokio::spawn` task;
-/// returns when `shutdown` is notified.
-pub async fn run_tracker(
+/// detected. Runs as a long-lived task; the returned handle ends when
+/// `shutdown` is notified. A `shutdown.notify_waiters()` at any time
+/// after this returns, even before the task first runs or while a
+/// poll is in flight, ends it.
+pub fn spawn_tracker(
     shared: SharedTimeTrust,
     last_step: SharedLastClockStep,
     bus: Arc<HappeningBus>,
     config: TrackerConfig,
     shutdown: Arc<tokio::sync::Notify>,
+) -> tokio::task::JoinHandle<()> {
+    // Made here, before the task exists: a waiter sees every `notify_waiters`
+    // call made after it is created, so one the loop made for itself would miss
+    // a stop signalled before the task first ran, or while a poll was in
+    // flight. Enabling it now also queues it for `notify_one`.
+    let mut stop = Box::pin(shutdown.notified_owned());
+    stop.as_mut().enable();
+    tokio::spawn(run_tracker(shared, last_step, bus, config, stop))
+}
+
+async fn run_tracker(
+    shared: SharedTimeTrust,
+    last_step: SharedLastClockStep,
+    bus: Arc<HappeningBus>,
+    config: TrackerConfig,
+    mut stop: std::pin::Pin<Box<tokio::sync::futures::OwnedNotified>>,
 ) {
     let mut last_observed_synced_at: Option<SystemTime> = None;
     let mut last_sample: Option<(Instant, SystemTime)> = None;
@@ -354,7 +372,8 @@ pub async fn run_tracker(
 
     loop {
         tokio::select! {
-            _ = shutdown.notified() => {
+            biased;
+            _ = stop.as_mut() => {
                 tracing::info!("time-trust tracker exiting");
                 return;
             }
@@ -702,6 +721,27 @@ mod tests {
     /// have returned. The state-machine half is exercised by
     /// `compute_state_*` tests above; this test covers the env
     /// gate inside `tick` itself.
+    /// A stop signalled the moment the tracker is spawned, before its
+    /// task has run at all, ends it.
+    #[tokio::test]
+    async fn a_stop_signalled_before_the_tracker_first_runs_ends_it() {
+        // On this single-threaded runtime nothing else runs between
+        // the spawn and the stop.
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let task = spawn_tracker(
+            new_shared(),
+            new_shared_last_step(),
+            Arc::new(HappeningBus::new()),
+            TrackerConfig::default(),
+            Arc::clone(&stop),
+        );
+        stop.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the tracker ended on the stop")
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn tick_with_force_unsynced_env_drives_to_untrusted() {
         let _g = env_test_lock().lock().await;

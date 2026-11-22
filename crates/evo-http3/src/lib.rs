@@ -148,6 +148,9 @@ mod imp {
 
     /// Bind the HTTP/3 listener and run its accept loop until
     /// `shutdown` fires.
+    ///
+    /// A `shutdown.notify_waiters()` at any time after this returns,
+    /// even before the task first runs, ends the loop.
     pub async fn serve_http3(
         listen: SocketAddr,
         bundle: CertBundle,
@@ -168,11 +171,18 @@ mod imp {
                 source,
             })?;
 
+        // Made here, before the task exists: a waiter sees every
+        // `notify_waiters` call made after it is created, so one the loop made
+        // for itself would miss a stop signalled before the task first ran, or
+        // between two turns of the loop. Enabling it now also queues it for
+        // `notify_one`.
+        let mut stop = Box::pin(shutdown.notified_owned());
+        stop.as_mut().enable();
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
-                    _ = shutdown.notified() => {
+                    _ = stop.as_mut() => {
                         tracing::info!(
                             "evo-http3: shutdown notified; exiting accept loop"
                         );

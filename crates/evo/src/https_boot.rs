@@ -31,16 +31,19 @@ use evo_auth_bearer::{
 };
 use evo_observatory::{Observatory, ObservatoryConfig};
 use evo_runtime_http::{
-    build_router, install_auto_rotation, serve_https, HttpsListenerConfig,
-    NoopAuditSink, ServerHandle,
+    build_router, install_auto_rotation, serve_https, AuthTier,
+    AuthTierProvider, HttpsListenerConfig, NoopAuditSink, ServerHandle,
 };
 use evo_tls_certs::{
     generate_device_ca, CertLifecycle, CertRotationPolicy, DeviceCaConfig,
     GeneratedCa, LeafConfig, RotationStats,
 };
 use evo_witness::WitnessChain;
+use std::ffi::OsStr;
 use std::net::SocketAddr;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
@@ -97,25 +100,45 @@ pub struct HttpsBootConfig {
     /// unset. The operator opens the browser on the LAN
     /// under Open and works without credential ceremony.
     pub auth_tier_provider: Option<Arc<dyn evo_runtime_http::AuthTierProvider>>,
-    /// Optional capability set injected on the LAN-trust
-    /// admission path. Defaults to
-    /// [`lan_trust_capability_set`] — the operator bootstrap
-    /// set with every single-holder role scope stripped
-    /// (currently `user_interaction_responder`). The floor is
+    /// Optional bound on what a caller admitted without a bearer
+    /// may hold. Without it the no-bearer arms use
+    /// [`lan_trust_capability_set`] (the floor) and, for a LAN
+    /// origin, [`Self::lan_privileged_capabilities`]. The floor is
     /// deliberate: LAN-trust is broad-audience (any browser on
     /// the LAN is admitted without a bearer under the Open /
     /// Secure-LAN tiers) and a single-holder role composes
     /// catastrophically with broad-audience admission — any
     /// device on the LAN would race the operator's actual UI
-    /// session for the role. A vendor distribution may narrow
-    /// this set further (e.g. drop `plugins:write` on a
-    /// kiosk); it may NOT widen past the floor.
+    /// session for the role.
+    ///
+    /// The bound narrows and never widens: each no-bearer set
+    /// keeps only the scopes the bound also names, at the lower
+    /// of the two ranks (see [`narrow_capability_set`]). One
+    /// capability survives any bound: `write:pair`
+    /// ([`PAIRING_SCOPE`]), because pairing is how a caller with
+    /// no bearer earns one. An empty bound therefore leaves a
+    /// no-bearer caller holding pairing, the capability-none ops,
+    /// and nothing else. A distribution sets it through
+    /// [`crate::RunOptions::with_no_bearer_capabilities`].
     pub lan_trust_capabilities: Option<evo_auth_bearer::CapabilitySet>,
     /// LAN-origin privileged set, offered only when the steward
     /// carries a household-protection runtime. `None` keeps the LAN
     /// arm on the playback floor. See
     /// [`lan_privileged_capability_set`].
     pub lan_privileged_capabilities: Option<evo_auth_bearer::CapabilitySet>,
+    /// How long an accepted connection has to complete its TLS
+    /// handshake and send the first bytes of a request before the
+    /// listener closes it. Default
+    /// [`evo_runtime_http::config::DEFAULT_HANDSHAKE_TIMEOUT`];
+    /// `EVO_HTTPS_HANDSHAKE_TIMEOUT_SECS` overrides it on the steward.
+    pub handshake_timeout: Duration,
+    /// How many accepted connections may be waiting for their first
+    /// request bytes at once; past it, the listener accepts nothing
+    /// more until one completes, fails, or runs out of time. Default
+    /// [`evo_runtime_http::config::DEFAULT_MAX_INCOMPLETE_CONNECTIONS`];
+    /// `EVO_HTTPS_MAX_INCOMPLETE_CONNECTIONS` overrides it on the
+    /// steward.
+    pub max_incomplete_connections: NonZeroUsize,
 }
 
 impl std::fmt::Debug for HttpsBootConfig {
@@ -152,6 +175,11 @@ impl std::fmt::Debug for HttpsBootConfig {
                     .map(|_| "<set>")
                     .unwrap_or("<unset>"),
             )
+            .field("handshake_timeout", &self.handshake_timeout)
+            .field(
+                "max_incomplete_connections",
+                &self.max_incomplete_connections,
+            )
             .finish()
     }
 }
@@ -172,8 +200,59 @@ impl HttpsBootConfig {
             auth_tier_provider: None,
             lan_trust_capabilities: None,
             lan_privileged_capabilities: None,
+            handshake_timeout:
+                evo_runtime_http::config::DEFAULT_HANDSHAKE_TIMEOUT,
+            max_incomplete_connections:
+                evo_runtime_http::config::DEFAULT_MAX_INCOMPLETE_CONNECTIONS,
         }
     }
+
+    /// Take the listener's connection bounds from the environment:
+    /// `EVO_HTTPS_HANDSHAKE_TIMEOUT_SECS` and
+    /// `EVO_HTTPS_MAX_INCOMPLETE_CONNECTIONS`, each a whole number
+    /// greater than zero. An unset variable leaves its bound as it
+    /// was; any other value that is not such a number is an error
+    /// naming the variable.
+    pub fn with_listener_bounds_from_env(mut self) -> anyhow::Result<Self> {
+        if let Some(secs) =
+            positive_from_env("EVO_HTTPS_HANDSHAKE_TIMEOUT_SECS")?
+        {
+            self.handshake_timeout = Duration::from_secs(secs.get());
+        }
+        const BOUND: &str = "EVO_HTTPS_MAX_INCOMPLETE_CONNECTIONS";
+        if let Some(bound) = positive_from_env(BOUND)? {
+            self.max_incomplete_connections = NonZeroUsize::try_from(bound)
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "{BOUND}={bound} is more than this platform can count"
+                    )
+                })?;
+        }
+        Ok(self)
+    }
+}
+
+/// The whole number greater than zero the environment variable `name`
+/// holds; `None` when it is unset.
+fn positive_from_env(name: &str) -> anyhow::Result<Option<NonZeroU64>> {
+    parse_positive(name, std::env::var_os(name).as_deref())
+}
+
+/// `raw` read as a whole number greater than zero; `None` when absent.
+/// Anything else is an error naming `name`.
+fn parse_positive(
+    name: &str,
+    raw: Option<&OsStr>,
+) -> anyhow::Result<Option<NonZeroU64>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let text = raw.to_string_lossy();
+    text.parse::<NonZeroU64>().map(Some).map_err(|e| {
+        anyhow::anyhow!(
+            "{name}={text:?} is not a whole number greater than zero: {e}"
+        )
+    })
 }
 
 /// Handles produced by a successful boot.
@@ -221,6 +300,13 @@ pub struct HttpsBootHandles {
     /// request) and with the revoke wire-op (which writes
     /// through).
     pub revocation_list: Arc<evo_auth_bearer::RevocationList>,
+    /// The directory this boot loaded its material from:
+    /// `state_dir/https/`. The revoke and reset wire ops write the
+    /// revocation list here, where the next boot reads it.
+    pub https_dir: PathBuf,
+    /// The auth tier every admission path consults. The reset wire op
+    /// holds it at `Open`.
+    pub(crate) auth_tier: Arc<StewardAuthTier>,
     /// If this is the device's first boot, the helper
     /// minted a bootstrap operator token bearing every
     /// scope the framework exposes and persisted it under
@@ -268,7 +354,23 @@ pub async fn boot_https(
     };
     let ca = Arc::new(ca);
 
-    // 2. Bearer-token signing key: load-or-generate.
+    // 2. Bearer-token signing key: load-or-generate. A credentials
+    //    reset retired the key it found; that key is replaced before
+    //    anything loads it, or the boot stops here.
+    let retiring_in = https_dir.clone();
+    let retired = tokio::task::spawn_blocking(move || {
+        replace_retired_token_key(&retiring_in)
+    })
+    .await??;
+    if let Some(rotation) = retired {
+        tracing::info!(
+            records_cleared = rotation.records_cleared,
+            revocations_cleared = rotation.revocations_cleared,
+            bootstrap_token_removed = rotation.bootstrap_token_removed,
+            "bearer-token signing key replaced after the credentials reset; \
+             every bearer issued before the reset is refused"
+        );
+    }
     let token_key_path = https_dir.join("tokens.key");
     let token_signing_key = if token_key_path.exists() {
         let raw = tokio::fs::read(&token_key_path).await?;
@@ -335,6 +437,19 @@ pub async fn boot_https(
         Arc::new(CredentialStore::new(credentials_dir).map_err(|e| {
             anyhow::anyhow!("credential store init failed: {e}")
         })?);
+    // Records whose bearers have expired go at every boot; a record is
+    // written for every bearer, and the kiosk and paired browsers are
+    // issued one a day.
+    if let Err(e) = credential_store.prune_expired(now_ms()) {
+        // LOGGING.md §2: warn (recoverable anomaly — the expired records
+        // stay listed until the next bearer is issued; their bearers are
+        // refused regardless).
+        tracing::warn!(
+            error = %e,
+            "dropping expired credential records at boot failed; they \
+             stay listed until the next attempt"
+        );
+    }
 
     let witness_chain = Arc::new(WitnessChain::new(witness_signing_key));
 
@@ -388,6 +503,8 @@ pub async fn boot_https(
             expires_at_ms: Some(token.expires_at_ms),
             revoked_at_ms: None,
             revoked_reason: None,
+            source: Some(evo_auth_bearer::CredentialSource::Bootstrap),
+            paired_device_id: None,
         };
         if let Err(e) = credential_store.put(&record) {
             tracing::warn!(
@@ -428,20 +545,29 @@ pub async fn boot_https(
     > = Arc::clone(&dispatcher)
         as Arc<dyn evo_runtime_http::SubscriptionDispatcher>;
     let schema = canonical_schema();
-    let tier_provider = config
-        .auth_tier_provider
-        .clone()
-        .unwrap_or_else(evo_runtime_http::default_auth_tier_provider);
-    let lan_trust_caps = config
-        .lan_trust_capabilities
-        .clone()
-        .unwrap_or_else(lan_trust_capability_set);
+    // The configured tier, held at `Open` while a credentials reset
+    // says so. Every admission path holds this one provider.
+    let open_after_reset =
+        https_dir.join(OPEN_TIER_AFTER_RESET).try_exists()?;
+    let auth_tier = Arc::new(StewardAuthTier::new(
+        config
+            .auth_tier_provider
+            .clone()
+            .unwrap_or_else(evo_runtime_http::default_auth_tier_provider),
+        open_after_reset,
+    ));
+    let tier_provider: Arc<dyn AuthTierProvider> = auth_tier.clone();
+    let (lan_trust_caps, lan_privileged_caps) = no_bearer_capability_sets(
+        config.lan_trust_capabilities.as_ref(),
+        config.lan_privileged_capabilities.as_ref(),
+    );
     // `build_router` consumes the capability set, and hookup routes
     // must gate LAN-trusted callers identically.
     let lan_trust_caps_for_hookup = lan_trust_caps.clone();
-    let lan_privileged_caps = config.lan_privileged_capabilities.clone();
     tracing::info!(
         tier = %tier_provider.current(),
+        configured = %auth_tier.configured(),
+        open_after_reset,
         "evo https listener: auth tier initialised",
     );
     let mut router = build_router(
@@ -523,7 +649,9 @@ pub async fn boot_https(
     //    set the listener is mounted with mTLS so every TLS
     //    handshake is gated on the client presenting a cert
     //    that chains to one of the trusted CAs.
-    let listener_cfg = HttpsListenerConfig::new(config.listen_addr);
+    let listener_cfg = HttpsListenerConfig::new(config.listen_addr)
+        .with_handshake_timeout(config.handshake_timeout)
+        .with_max_incomplete_connections(config.max_incomplete_connections);
     let (handle, listener_task) = match &config.client_ca_pem_path {
         Some(path) => {
             let verifier = evo_runtime_http::build_client_verifier(path)?;
@@ -562,6 +690,8 @@ pub async fn boot_https(
         issuer,
         credential_store,
         revocation_list: revocations,
+        https_dir,
+        auth_tier,
         bootstrap_token_b64,
     })
 }
@@ -653,6 +783,336 @@ async fn write_raw_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     set_secret_permissions(path).await
 }
 
+/// The directory the HTTPS substrate keeps its material under — the
+/// parent of `https/`: `EVO_HTTPS_STATE_DIR` when set, else the
+/// directory holding the persistence file, else `/var/lib/evo`.
+///
+/// The steward boots from it and `auth rotate-token-key` rewrites it,
+/// so both resolve it here.
+pub fn https_state_root(persistence_path: &Path) -> PathBuf {
+    match std::env::var_os("EVO_HTTPS_STATE_DIR") {
+        Some(v) => PathBuf::from(v),
+        None => persistence_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/var/lib/evo")),
+    }
+}
+
+/// What [`rotate_token_signing_key`] changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenKeyRotation {
+    /// The `https/` directory the new key was written to.
+    pub https_dir: PathBuf,
+    /// Credential records removed from the operator inventory.
+    pub records_cleared: usize,
+    /// Whether a revocation list was present and removed.
+    pub revocations_cleared: bool,
+    /// Whether a first-boot bootstrap token was present and removed.
+    pub bootstrap_token_removed: bool,
+}
+
+/// Replace the bearer-token signing key under `https_dir`, offline.
+///
+/// Every bearer is signed by this key, so once the steward next starts
+/// every bearer issued before the rotation is refused: paired browsers
+/// pair again and operator credentials are minted anew. A kiosk panel
+/// mints a new session within about 15 seconds of that start. What
+/// described the old bearers goes with them: the operator credential
+/// records, the revocation list,
+/// and the first-boot `bootstrap.token` (the next start issues a new
+/// one, as on a first boot).
+///
+/// Refuses while the steward answers on `steward_socket`, because a
+/// running steward keeps the old key in memory and would write records
+/// signed by it. Refuses when `https_dir` holds no `tokens.key`, so a
+/// wrong state directory is never seeded with a key nothing reads.
+///
+/// The new key is written beside the old one at mode `0600`, owned as
+/// the old one was, synced, and renamed over it.
+pub fn rotate_token_signing_key(
+    https_dir: &Path,
+    steward_socket: &Path,
+) -> anyhow::Result<TokenKeyRotation> {
+    #[cfg(unix)]
+    if std::os::unix::net::UnixStream::connect(steward_socket).is_ok() {
+        anyhow::bail!(
+            "the steward is running: its socket {} answers. Stop the \
+             steward service, then rotate.",
+            steward_socket.display()
+        );
+    }
+    replace_token_signing_key(https_dir)
+}
+
+/// The file `reset_credentials_to_open` leaves under `https/`: the
+/// next boot replaces the bearer-token signing key before it loads one.
+pub(crate) const TOKEN_KEY_RETIRED: &str = "tokens.key.retire";
+
+/// Retire the bearer-token signing key under `https_dir`: leave
+/// [`TOKEN_KEY_RETIRED`] there, synced, so the next boot replaces the
+/// key before it loads one and every bearer issued before then is
+/// refused. The running steward keeps the key it loaded until it stops.
+pub(crate) fn retire_token_signing_key(
+    https_dir: &Path,
+) -> std::io::Result<()> {
+    std::fs::File::create(https_dir.join(TOKEN_KEY_RETIRED))?.sync_all()?;
+    std::fs::File::open(https_dir)?.sync_all()
+}
+
+/// The file `reset_credentials_to_open` leaves under `https/`: every
+/// start runs the `Open` auth tier, whatever the configuration names,
+/// until [`restore_configured_tier`] removes it.
+pub(crate) const OPEN_TIER_AFTER_RESET: &str = "tier.open";
+
+/// Leave [`OPEN_TIER_AFTER_RESET`] under `https_dir`, synced.
+fn leave_open_tier(https_dir: &Path) -> std::io::Result<()> {
+    std::fs::File::create(https_dir.join(OPEN_TIER_AFTER_RESET))?.sync_all()?;
+    std::fs::File::open(https_dir)?.sync_all()
+}
+
+/// Mark a credentials reset under `https_dir`: retire the bearer-token
+/// signing key ([`retire_token_signing_key`]) and leave the `Open`
+/// tier ([`OPEN_TIER_AFTER_RESET`]). Both or neither: when the tier
+/// cannot be left, a retirement this call made is taken back, so a
+/// refused reset leaves the device as it was.
+pub(crate) fn mark_credentials_reset(https_dir: &Path) -> std::io::Result<()> {
+    let retire = https_dir.join(TOKEN_KEY_RETIRED);
+    let retired_before = retire.try_exists()?;
+    retire_token_signing_key(https_dir)?;
+    let Err(e) = leave_open_tier(https_dir) else {
+        return Ok(());
+    };
+    if !retired_before {
+        let undone = std::fs::remove_file(&retire)
+            .and_then(|()| std::fs::File::open(https_dir)?.sync_all());
+        if let Err(undo) = undone {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "{e}; taking back the key retirement failed too \
+                     ({undo}), so the next start replaces the key"
+                ),
+            ));
+        }
+    }
+    Err(e)
+}
+
+/// Remove the `Open` tier a credentials reset left under `https_dir`,
+/// offline, so the next start runs the tier the configuration names
+/// (`EVO_AUTH_TIER`, `Open` when unset). `false` when no reset left
+/// one.
+///
+/// Refuses while the steward answers on `steward_socket`: a running
+/// steward holds the tier it runs, and would keep running `Open`.
+pub fn restore_configured_tier(
+    https_dir: &Path,
+    steward_socket: &Path,
+) -> anyhow::Result<bool> {
+    #[cfg(unix)]
+    if std::os::unix::net::UnixStream::connect(steward_socket).is_ok() {
+        anyhow::bail!(
+            "the steward is running: its socket {} answers. Stop the \
+             steward service, then restore the tier.",
+            steward_socket.display()
+        );
+    }
+    let marker = https_dir.join(OPEN_TIER_AFTER_RESET);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "removing {} failed: {e}",
+                marker.display()
+            ))
+        }
+    }
+    std::fs::File::open(https_dir)?.sync_all()?;
+    Ok(true)
+}
+
+/// The steward's auth tier: the one its configuration names, or `Open`
+/// while a credentials reset holds it there.
+///
+/// Every admission path holds this one provider, so a reset opens the
+/// running steward at once; each start reads
+/// [`OPEN_TIER_AFTER_RESET`] again.
+#[derive(Debug)]
+pub(crate) struct StewardAuthTier {
+    configured: Arc<dyn AuthTierProvider>,
+    open_after_reset: AtomicBool,
+}
+
+impl StewardAuthTier {
+    /// `configured`, or `Open` when `open_after_reset`.
+    pub(crate) fn new(
+        configured: Arc<dyn AuthTierProvider>,
+        open_after_reset: bool,
+    ) -> Self {
+        Self {
+            configured,
+            open_after_reset: AtomicBool::new(open_after_reset),
+        }
+    }
+
+    /// The tier the configuration names.
+    pub(crate) fn configured(&self) -> AuthTier {
+        self.configured.current()
+    }
+
+    /// Whether a credentials reset holds the tier at `Open`.
+    pub(crate) fn open_after_reset(&self) -> bool {
+        self.open_after_reset.load(Ordering::Acquire)
+    }
+
+    /// Hold the tier at `Open`: a credentials reset has run.
+    pub(crate) fn open(&self) {
+        self.open_after_reset.store(true, Ordering::Release);
+    }
+}
+
+impl AuthTierProvider for StewardAuthTier {
+    fn current(&self) -> AuthTier {
+        if self.open_after_reset() {
+            AuthTier::Open
+        } else {
+            self.configured()
+        }
+    }
+}
+
+/// Carry out a retirement [`retire_token_signing_key`] left under
+/// `https_dir`, before the boot loads a key: replace the key, as
+/// [`rotate_token_signing_key`] does, then remove the word. `None` when
+/// no key was retired.
+///
+/// When the retired key is already gone, the boot generates a fresh
+/// one; what described the old bearers is cleared all the same. Any
+/// failure is returned before the word is removed, so the retired key
+/// is never loaded and the next boot tries again.
+fn replace_retired_token_key(
+    https_dir: &Path,
+) -> anyhow::Result<Option<TokenKeyRotation>> {
+    let marker = https_dir.join(TOKEN_KEY_RETIRED);
+    let replaced = (|| -> anyhow::Result<Option<TokenKeyRotation>> {
+        if !marker.try_exists()? {
+            return Ok(None);
+        }
+        let rotation = if https_dir.join("tokens.key").try_exists()? {
+            replace_token_signing_key(https_dir)?
+        } else {
+            clear_bearer_records(https_dir)?
+        };
+        std::fs::remove_file(&marker)?;
+        std::fs::File::open(https_dir)?.sync_all()?;
+        Ok(Some(rotation))
+    })();
+    replaced.map_err(|e| {
+        anyhow::anyhow!(
+            "the credentials reset retired the bearer-token signing key \
+             under {}, and replacing it failed: {e}. The retired key is \
+             not loaded; the HTTPS listener stays down until a start \
+             replaces it.",
+            https_dir.display()
+        )
+    })
+}
+
+/// Replace the bearer-token signing key under `https_dir` and clear
+/// what described the bearers it signed. Nothing has loaded the key:
+/// the steward is stopped, or booting and not yet at its key.
+fn replace_token_signing_key(
+    https_dir: &Path,
+) -> anyhow::Result<TokenKeyRotation> {
+    let key_path = https_dir.join("tokens.key");
+    let old = std::fs::metadata(&key_path).map_err(|e| {
+        anyhow::anyhow!(
+            "no bearer-token signing key at {} ({e}); point --state-dir at \
+             the directory the steward boots from",
+            key_path.display()
+        )
+    })?;
+
+    let key = BearerTokenIssuer::generate_signing_key();
+    let tmp_path = https_dir.join("tokens.key.rotating");
+    write_secret_like(&tmp_path, &key.to_bytes(), &old)?;
+    std::fs::rename(&tmp_path, &key_path)?;
+    std::fs::File::open(https_dir)?.sync_all()?;
+
+    clear_bearer_records(https_dir)
+}
+
+/// Clear what described the bearers a retired key signed: the
+/// operator credential records, the revocation list and the first-boot
+/// `bootstrap.token` (the next start issues a new one).
+fn clear_bearer_records(https_dir: &Path) -> anyhow::Result<TokenKeyRotation> {
+    let credentials_dir = https_dir.join("credentials");
+    let records_cleared = if credentials_dir.is_dir() {
+        CredentialStore::new(credentials_dir)
+            .and_then(|store| store.purge())
+            .map_err(|e| anyhow::anyhow!("clearing credential records: {e}"))?
+    } else {
+        0
+    };
+    let revocations_cleared =
+        remove_if_present(&https_dir.join("revoked.json"))?;
+    let bootstrap_token_removed =
+        remove_if_present(&https_dir.join("bootstrap.token"))?;
+
+    Ok(TokenKeyRotation {
+        https_dir: https_dir.to_path_buf(),
+        records_cleared,
+        revocations_cleared,
+        bootstrap_token_removed,
+    })
+}
+
+/// Write `bytes` to a fresh `path` at mode `0600`, owned as `like` is,
+/// and sync it.
+fn write_secret_like(
+    path: &Path,
+    bytes: &[u8],
+    like: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = match options.open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A rotation that died before its rename. Its bytes were
+            // never live; start again.
+            std::fs::remove_file(path)?;
+            options.open(path)?
+        }
+        Err(e) => return Err(e),
+    };
+    file.write_all(bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::os::unix::fs::chown(path, Some(like.uid()), Some(like.gid()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = like;
+    file.sync_all()
+}
+
+fn remove_if_present(path: &Path) -> std::io::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(unix)]
 async fn set_secret_permissions(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -735,6 +1195,10 @@ pub fn operator_bootstrap_capability_set() -> CapabilitySet {
         Capability::write("plans"),
         Capability::write("request"),
         Capability::write("user_interaction_responder"),
+        // The pairing ops. A bearer carries the scope so a paired
+        // browser can pair again on its own socket; every no-bearer
+        // set carries it too (see `PAIRING_SCOPE`).
+        Capability::write(PAIRING_SCOPE),
         // Credential-vault operator surface — the UI writes plugin
         // credentials (third-party API keys / service passwords /
         // OAuth tokens) via `credential_put` / `credential_delete`
@@ -756,14 +1220,13 @@ pub fn operator_bootstrap_capability_set() -> CapabilitySet {
         // cascade view live.
         Capability::write("online_providers"),
         Capability::read("online_providers"),
-        // Settings → Network + Sources → shares / SMB-server.
-        // Pair and kiosk mint from this set. Rank is StepUp so
-        // both write-gated verbs (`network.nm.intent.set`) and
-        // step-up-gated verbs (`flight_mode.set`, share mount)
-        // admit under the current flatten (bearer StepUp counts
-        // as granted + sitting). Must NOT appear on LAN-trust
-        // (see LAN_TRUST_PRIVILEGED_EXCLUDED_SCOPES) — an
-        // anonymous LAN peer must not change Wi-Fi or mounts.
+        // Settings → Network + Sources → shares / SMB-server /
+        // USB. Pair and kiosk mint from this set. The rank is
+        // StepUp: the holder may elevate on the scope. It is not
+        // a sitting — a verb declared step-up still needs a
+        // step-up session on the call. Must NOT appear on
+        // LAN-trust (see LAN_TRUST_PRIVILEGED_EXCLUDED_SCOPES) —
+        // an anonymous LAN peer must not change Wi-Fi or mounts.
         Capability::step_up("network_admin"),
     ])
 }
@@ -867,14 +1330,26 @@ pub(crate) fn merge_bootstrap_with_plugin_scopes<'a>(
 /// user_interaction_responder`).
 const SINGLE_HOLDER_ROLE_SCOPES: &[&str] = &["user_interaction_responder"];
 
+/// The scope the pairing ops (`pair_begin`, `pair_complete`,
+/// `pair_authenticate`) declare, at write rank.
+///
+/// Pairing is how a caller with no bearer earns one, so every
+/// no-bearer set carries `write:pair` and no configured bound removes
+/// it (see [`HttpsBootConfig::lan_trust_capabilities`]). Each op then
+/// authenticates itself, and the steward serves the three to a LAN
+/// origin only.
+pub const PAIRING_SCOPE: &str = "pair";
+
 /// Privileged operator scopes that live on the bootstrap set but
 /// must never be granted to an anonymous LAN-trust peer.
 /// `network_admin` mutates Wi-Fi / AP / mounts.
 /// `system_admin` mutates kiosk writers (`set_cursor`, `set_osk`).
+/// `audio_admin` selects the DAC, sets DSP controls and overlays,
+/// and writes the audio policies and topology.
 /// Field 2026-09-06: Open HTTPS ran `set_cursor` without a bearer
 /// because the LAN-trust arm never consulted this set.
 const LAN_TRUST_PRIVILEGED_EXCLUDED_SCOPES: &[&str] =
-    &["network_admin", "system_admin"];
+    &["network_admin", "system_admin", "audio_admin"];
 
 /// LAN-trust default capability set — the subset of
 /// [`operator_bootstrap_capability_set`] that is safe to grant
@@ -886,8 +1361,8 @@ const LAN_TRUST_PRIVILEGED_EXCLUDED_SCOPES: &[&str] =
 /// Read + non-step-up-write scopes compose safely with broad-
 /// audience LAN admission (multiple LAN peers can hold them
 /// concurrently without disrupting each other); single-holder
-/// roles and privileged writers (network, kiosk) do not, and
-/// are refused here regardless of distribution config.
+/// roles and privileged writers (network, kiosk, audio hardware)
+/// do not, and are refused here regardless of distribution config.
 ///
 /// Vendor distributions that want to narrow the LAN-trust set
 /// further (e.g. drop `plugins:write` on a kiosk) can override
@@ -913,9 +1388,10 @@ pub fn lan_trust_capability_set() -> CapabilitySet {
 ///
 /// This is the set stamped on a no-bearer principal whose effective
 /// origin is LAN *when the steward carries a household-protection
-/// runtime*. `network_admin` and `system_admin` return to it, which
-/// is what lets an ordinary household change Wi-Fi or rotate the
-/// panel without a pairing ceremony.
+/// runtime*. `network_admin`, `system_admin` and `audio_admin`
+/// return to it, which is what lets an ordinary household change
+/// Wi-Fi, rotate the panel or pick the DAC without a pairing
+/// ceremony.
 ///
 /// Two things keep that safe, and neither may be dropped:
 ///
@@ -939,6 +1415,86 @@ pub fn lan_privileged_capability_set() -> CapabilitySet {
         .cloned()
         .collect();
     CapabilitySet::new(filtered)
+}
+
+/// The sets the no-bearer arms stamp: `(floor, lan_privileged)`.
+///
+/// The floor serves WAN under `AuthTier::Open` and the LAN when no
+/// privileged set is offered; `privileged` is the LAN set when one is.
+/// A `bound` narrows both alike and widens neither. Without one, the
+/// floor is [`lan_trust_capability_set`] and `privileged` passes
+/// through. Either way both carry `write:pair` ([`PAIRING_SCOPE`]).
+fn no_bearer_capability_sets(
+    bound: Option<&CapabilitySet>,
+    privileged: Option<&CapabilitySet>,
+) -> (CapabilitySet, Option<CapabilitySet>) {
+    let floor = lan_trust_capability_set();
+    let (floor, privileged) = match bound {
+        Some(bound) => (
+            narrow_capability_set(&floor, bound),
+            privileged.map(|p| narrow_capability_set(p, bound)),
+        ),
+        None => (floor, privileged.cloned()),
+    };
+    (with_pairing(floor), privileged.map(with_pairing))
+}
+
+/// `set` with `write:pair` in it: the one capability no no-bearer set
+/// goes without, whatever bound narrowed it.
+fn with_pairing(set: CapabilitySet) -> CapabilitySet {
+    let pairing =
+        evo_projection_core::CapabilityRequirement::write(PAIRING_SCOPE);
+    if set.satisfies(&pairing) {
+        return set;
+    }
+    let mut caps = set.capabilities().to_vec();
+    caps.push(Capability::write(PAIRING_SCOPE));
+    CapabilitySet::new(caps)
+}
+
+/// Narrow `set` by `bound`: keep each scope both name, at the lower
+/// of the two ranks (read < write < step-up).
+///
+/// The result never holds a scope `set` lacks, nor a rank above the
+/// one `set` gives it, so a bound can only take away. An empty bound
+/// yields an empty set. Order follows `set`; one capability per
+/// scope.
+pub fn narrow_capability_set(
+    set: &CapabilitySet,
+    bound: &CapabilitySet,
+) -> CapabilitySet {
+    fn rank(c: &Capability) -> u8 {
+        match c {
+            Capability::Read { .. } => 0,
+            Capability::Write { .. } => 1,
+            Capability::StepUp { .. } => 2,
+        }
+    }
+    fn highest(set: &CapabilitySet, scope: &str) -> Option<u8> {
+        set.capabilities()
+            .iter()
+            .filter(|c| c.scope() == scope)
+            .map(rank)
+            .max()
+    }
+    let mut out: Vec<Capability> = Vec::new();
+    for cap in set.capabilities() {
+        let scope = cap.scope();
+        if out.iter().any(|c| c.scope() == scope) {
+            continue;
+        }
+        let (Some(held), Some(allowed)) =
+            (highest(set, scope), highest(bound, scope))
+        else {
+            continue;
+        };
+        out.push(match held.min(allowed) {
+            0 => Capability::read(scope),
+            1 => Capability::write(scope),
+            _ => Capability::step_up(scope),
+        });
+    }
+    CapabilitySet::new(out)
 }
 
 /// Shorter convenience: the operator-facing log line summarising what
@@ -969,6 +1525,40 @@ pub fn _rotation_warmup() -> Duration {
 mod tests {
     use super::*;
     use evo_projection_core::CapabilityRequirement;
+
+    #[test]
+    fn a_listener_bound_reads_a_whole_number_greater_than_zero() {
+        let name = "EVO_HTTPS_MAX_INCOMPLETE_CONNECTIONS";
+        assert_eq!(parse_positive(name, None).unwrap(), None);
+        assert_eq!(
+            parse_positive(name, Some(OsStr::new("256")))
+                .unwrap()
+                .map(NonZeroU64::get),
+            Some(256)
+        );
+        for refused in ["0", "-1", "", " 8", "8s", "1.5", "lots"] {
+            let error = parse_positive(name, Some(OsStr::new(refused)))
+                .expect_err(refused)
+                .to_string();
+            assert!(error.contains(name), "{refused:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_listener_bounds_default_to_the_listener_defaults() {
+        let config = HttpsBootConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            PathBuf::from("/nonexistent"),
+        );
+        assert_eq!(
+            config.handshake_timeout,
+            evo_runtime_http::config::DEFAULT_HANDSHAKE_TIMEOUT
+        );
+        assert_eq!(
+            config.max_incomplete_connections,
+            evo_runtime_http::config::DEFAULT_MAX_INCOMPLETE_CONNECTIONS
+        );
+    }
 
     #[test]
     fn operator_bootstrap_set_carries_responder() {
@@ -1016,9 +1606,8 @@ mod tests {
             );
         assert!(
             matches!(network_admin, Capability::StepUp { .. }),
-            "network_admin must land as StepUp so both write-gated and \
-             step-up-gated network verbs admit under current flatten. \
-             Actual: {network_admin:?}"
+            "network_admin must land as StepUp so the holder may elevate \
+             on it. Actual: {network_admin:?}"
         );
     }
 
@@ -1068,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn privileged_set_is_the_floor_plus_exactly_the_two_privileged_scopes() {
+    fn privileged_set_is_the_floor_plus_exactly_the_privileged_scopes() {
         // Pins the delta so a future widening has to be deliberate.
         use std::collections::BTreeSet;
         let floor_set = lan_trust_capability_set();
@@ -1085,14 +1674,49 @@ mod tests {
             .collect();
         let added: BTreeSet<String> =
             privileged.difference(&floor).cloned().collect();
-        let expected: BTreeSet<String> =
-            ["network_admin".to_owned(), "system_admin".to_owned()]
-                .into_iter()
-                .collect();
+        let expected: BTreeSet<String> = [
+            "network_admin".to_owned(),
+            "system_admin".to_owned(),
+            "audio_admin".to_owned(),
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(
             added, expected,
-            "the LAN privileged arm must add exactly network_admin and \
-             system_admin over the playback floor"
+            "the LAN privileged arm must add exactly network_admin, \
+             system_admin and audio_admin over the playback floor"
+        );
+    }
+
+    #[test]
+    fn playback_floor_excludes_audio_admin() {
+        // The floor is what a public origin gets under Open.
+        // audio_admin selects the DAC and sets DSP controls; its
+        // writers declare write rank, which a step-up rank on the
+        // floor would satisfy. A household's LAN reaches them through
+        // the privileged arm, a paired browser through its bearer.
+        let set = lan_trust_capability_set();
+        let scopes: Vec<&str> =
+            set.capabilities().iter().map(|c| c.scope()).collect();
+        assert!(
+            !scopes.contains(&"audio_admin"),
+            "playback floor must NOT carry audio_admin. \
+             Actual scopes: {scopes:?}"
+        );
+        assert!(
+            !set.satisfies(&CapabilityRequirement::write("audio_admin")),
+            "the playback floor must not satisfy write:audio_admin"
+        );
+        assert!(
+            lan_privileged_capability_set()
+                .satisfies(&CapabilityRequirement::write("audio_admin")),
+            "the LAN privileged set keeps write:audio_admin"
+        );
+        assert!(
+            operator_bootstrap_capability_set()
+                .satisfies(&CapabilityRequirement::write("audio_admin")),
+            "pair and kiosk mint from the bootstrap set, which keeps \
+             write:audio_admin"
         );
     }
 
@@ -1277,5 +1901,174 @@ mod tests {
                 "LAN-trust must exclude {excluded}"
             );
         }
+    }
+
+    #[test]
+    fn narrowing_keeps_the_lower_rank_and_never_widens() {
+        let set = CapabilitySet::new(vec![
+            Capability::step_up("plugins_admin"),
+            Capability::write("auth"),
+            Capability::read("auth"),
+            Capability::read("audio"),
+        ]);
+        let bound = CapabilitySet::new(vec![
+            // Lower than held: kept at the bound's rank.
+            Capability::write("plugins_admin"),
+            // Higher than held: kept at the held rank, not raised.
+            Capability::step_up("audio"),
+            // Not held at all: never added.
+            Capability::step_up("network_admin"),
+        ]);
+        let out = narrow_capability_set(&set, &bound);
+        assert_eq!(
+            out,
+            CapabilitySet::new(vec![
+                Capability::write("plugins_admin"),
+                Capability::read("audio"),
+            ]),
+        );
+        assert!(
+            narrow_capability_set(&set, &CapabilitySet::default()).is_empty()
+        );
+    }
+
+    /// Regression pin: a steward that sets no bound stamps the
+    /// no-bearer sets every steward has had. The home player's LAN
+    /// keeps its floor and its privileged set.
+    #[test]
+    fn the_default_floor_keeps_the_home_player() {
+        let privileged = lan_privileged_capability_set();
+        let (floor, lan) = no_bearer_capability_sets(None, Some(&privileged));
+        assert_eq!(floor, lan_trust_capability_set());
+        assert_eq!(lan, Some(privileged));
+        let (floor, lan) = no_bearer_capability_sets(None, None);
+        assert_eq!(floor, lan_trust_capability_set());
+        assert_eq!(lan, None);
+    }
+
+    /// A bound bounds every no-bearer arm, the LAN privileged
+    /// set included; an empty bound leaves both holding nothing.
+    #[test]
+    fn a_bound_narrows_every_no_bearer_arm() {
+        let privileged = lan_privileged_capability_set();
+        let bound = CapabilitySet::new(vec![Capability::read("audio")]);
+        let narrowed = CapabilitySet::new(vec![
+            Capability::read("audio"),
+            Capability::write(PAIRING_SCOPE),
+        ]);
+        let (floor, lan) =
+            no_bearer_capability_sets(Some(&bound), Some(&privileged));
+        assert_eq!(floor, narrowed);
+        assert_eq!(lan, Some(narrowed));
+    }
+
+    /// An empty bound leaves every no-bearer set holding
+    /// pairing and nothing else. No bound can take pairing away.
+    #[test]
+    fn an_empty_floor_holds_nothing_but_pairing() {
+        let pairing_only =
+            CapabilitySet::new(vec![Capability::write(PAIRING_SCOPE)]);
+        let privileged = lan_privileged_capability_set();
+        let empty = CapabilitySet::default();
+        let (floor, lan) =
+            no_bearer_capability_sets(Some(&empty), Some(&privileged));
+        assert_eq!(floor, pairing_only);
+        assert_eq!(lan, Some(pairing_only.clone()));
+        assert!(!floor.satisfies(&CapabilityRequirement::write("auth")));
+        assert!(!floor.satisfies(&CapabilityRequirement::read("auth")));
+    }
+
+    #[test]
+    fn every_bearer_and_every_no_bearer_set_can_pair() {
+        let pairing = CapabilityRequirement::write(PAIRING_SCOPE);
+        assert!(operator_bootstrap_capability_set().satisfies(&pairing));
+        assert!(lan_trust_capability_set().satisfies(&pairing));
+        assert!(lan_privileged_capability_set().satisfies(&pairing));
+        for schema_op in ["pair_begin", "pair_complete", "pair_authenticate"] {
+            let op = crate::projection_schema::canonical_schema()
+                .into_iter()
+                .find(|o| o.id.as_str() == schema_op)
+                .expect("pairing op in the schema");
+            assert_eq!(op.capability, pairing, "{schema_op}");
+        }
+    }
+
+    /// A key the reset retired that is already gone leaves the boot to
+    /// generate a fresh one; what described the old bearers is cleared
+    /// all the same, and the word is used once.
+    #[test]
+    fn a_retired_key_already_gone_still_clears_what_described_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let https = dir.path();
+        std::fs::write(https.join("revoked.json"), r#"["t1"]"#).expect("list");
+        std::fs::write(https.join("bootstrap.token"), "b").expect("token");
+        retire_token_signing_key(https).expect("retire");
+
+        let rotation = replace_retired_token_key(https)
+            .expect("replaced")
+            .expect("a key was retired");
+        assert!(rotation.revocations_cleared);
+        assert!(rotation.bootstrap_token_removed);
+        assert!(!https.join("revoked.json").exists());
+        assert!(!https.join("bootstrap.token").exists());
+        assert!(!https.join(TOKEN_KEY_RETIRED).exists());
+        assert!(!https.join("tokens.key").exists(), "the boot generates it");
+        assert_eq!(replace_retired_token_key(https).expect("again"), None);
+    }
+
+    /// The steward admits by the configured tier until a reset opens
+    /// it; the configured tier is still what the configuration names.
+    #[test]
+    fn the_tier_is_the_configured_one_until_a_reset_opens_it() {
+        let configured: Arc<dyn AuthTierProvider> =
+            Arc::new(evo_runtime_http::StaticAuthTier::new(AuthTier::Secure));
+        let tier = StewardAuthTier::new(Arc::clone(&configured), false);
+        assert_eq!(tier.current(), AuthTier::Secure);
+        tier.open();
+        assert_eq!(tier.current(), AuthTier::Open);
+        assert_eq!(tier.configured(), AuthTier::Secure);
+        let reset_earlier = StewardAuthTier::new(configured, true);
+        assert_eq!(reset_earlier.current(), AuthTier::Open);
+    }
+
+    /// A reset leaves both marks or neither: when the Open tier cannot
+    /// be left, the key retirement this reset made is taken back, and
+    /// one an earlier reset left stays.
+    #[test]
+    fn a_reset_leaves_both_marks_or_neither() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let https = dir.path();
+        mark_credentials_reset(https).expect("marked");
+        assert!(https.join(TOKEN_KEY_RETIRED).exists());
+        assert!(https.join(OPEN_TIER_AFTER_RESET).exists());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let https = dir.path();
+        // A directory where the file goes cannot be created as one.
+        std::fs::create_dir(https.join(OPEN_TIER_AFTER_RESET)).expect("dir");
+        mark_credentials_reset(https).expect_err("the tier cannot be left");
+        assert!(!https.join(TOKEN_KEY_RETIRED).exists(), "taken back");
+
+        retire_token_signing_key(https).expect("an earlier reset");
+        mark_credentials_reset(https).expect_err("the tier cannot be left");
+        assert!(https.join(TOKEN_KEY_RETIRED).exists(), "the earlier stays");
+    }
+
+    /// Restoring the configured tier removes the Open tier a reset
+    /// left, once; with none left it changes nothing.
+    #[test]
+    fn restoring_the_tier_removes_the_open_tier_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let https = dir.path();
+        let socket = https.join("no-steward.sock");
+        assert!(!restore_configured_tier(https, &socket).expect("none"));
+        mark_credentials_reset(https).expect("marked");
+        assert!(restore_configured_tier(https, &socket).expect("removed"));
+        assert!(!https.join(OPEN_TIER_AFTER_RESET).exists());
+        assert!(
+            https.join(TOKEN_KEY_RETIRED).exists(),
+            "the key is still replaced at the next start"
+        );
+        assert!(!restore_configured_tier(https, &socket).expect("again"));
     }
 }

@@ -71,12 +71,50 @@ lands.**
 boot the substrate persists under `<state_dir>/https/`:
 
 - `ca.crt` + `ca.key` — device-CA generated at first boot.
-- `tokens.key` — bearer-token signing key (ed25519 seed).
+- `tokens.key` — bearer-token signing key (ed25519 seed). Rotated
+  offline with `evo auth rotate-token-key`, and replaced at the
+  first start after `reset_credentials_to_open`, which leaves
+  `tokens.key.retire` beside it until then; see `CREDENTIALS.md`.
+- `tier.open` — left by `reset_credentials_to_open`: every start runs
+  the `Open` auth tier until `evo auth restore-tier` removes it; see
+  `CREDENTIALS.md`.
 - `witness.key` — witness-chain signing key (ed25519 seed).
 - `bootstrap.token` — operator bootstrap bearer token, minted once.
 
+The revocation list, `revoked.json`, sits beside them: every boot reads
+it, `revoke_bearer_token` adds to it and `reset_credentials_to_open`
+removes it, all in the same directory.
+
 `EVO_HTTPS_STATE_DIR` overrides the parent dir for `https/`; default is
 the persistence-store parent.
+
+A connection the listener has accepted but that has not yet sent a
+request is bounded two ways:
+
+- **Deadline.** It has `EVO_HTTPS_HANDSHAKE_TIMEOUT_SECS` seconds
+  (default 10) from accept to complete its TLS handshake and send the
+  first bytes of a request. One that has not is closed, including one
+  that completed TLS and then sent nothing. A browser that opens a
+  connection ahead of need and leaves it idle past the deadline sees it
+  closed and opens another.
+- **Count.** At most `EVO_HTTPS_MAX_INCOMPLETE_CONNECTIONS` (default 64)
+  are in that state at once. While that many are, the listener accepts
+  nothing more: new connections wait in the operating system's listen
+  queue, which the listener opens 128 deep, until one of them sends,
+  fails, or reaches the deadline.
+
+Both variables take a whole number greater than zero; any other value
+stops the boot with an error naming the variable. A connection that has
+sent a request is bounded by neither. Capacity for many or slow clients,
+and exposure to the internet, belong to the distribution or to a proxy
+in front of the steward.
+
+When an accept fails for a reason other than the client leaving first,
+most often because the process is out of file descriptors, the listener
+pauses before trying again: 5 ms, doubling to at most 1 s, and no pause
+after the next success. It logs the first failure at `warn`, then at
+most one line a minute carrying the count, and the recovery at `info`.
+Reaching the connection count is logged the same way.
 
 ### 3.2 Cert lifecycle
 
@@ -381,12 +419,16 @@ related operations.
 
 SIGTERM (and SIGINT) fan into a single forwarder that notifies every
 mounted listener's shutdown notifier. Each listener drains in-flight
-requests cleanly before exiting:
+requests cleanly before exiting. Every listener and background task
+below takes the notification from the moment it is started: a stop
+that comes before its task first runs, or while it is busy, is not
+lost.
 
 - UDS slow-path stops accepting; existing connections complete.
 - Fast Path stops accepting; existing connections complete.
-- HTTPS listener's hyper-util `auto::Builder` drains via the cert
-  resolver's graceful path.
+- HTTPS listener stops accepting at once, whatever it is waiting on.
+  Connections it has already accepted are not drained; they close when
+  the steward exits. The leaf-certificate rotator stops with it.
 - HTTP redirect listener drains via axum's `with_graceful_shutdown`.
 - ACME issuer completes its in-flight tick (if any) before exiting the
   renewal loop.

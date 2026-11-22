@@ -198,16 +198,17 @@ async fn ws_handler(
     // SecureIndustrial admit LAN-origin (operator's own
     // browser on a trusted LAN) and refuse WAN-origin (which
     // must present a credential).
+    // Effective origin honours a trusted-proxy `X-Forwarded-For`
+    // header when the immediate peer is loopback; otherwise it is
+    // the immediate peer's IP. Stamped on whichever principal the
+    // socket runs under, so an op that admits by origin can read it.
+    let lan_origin = crate::auth_tier::is_lan_origin(
+        crate::auth_tier::effective_origin(peer.ip(), &headers),
+    );
+    let origin = crate::principal::CallerOrigin::from_lan(lan_origin);
     let (token_str, accepted_subprotocol) = match extract_bearer(&headers) {
         Some(t) => t,
         None => {
-            // Effective origin honours a trusted-proxy
-            // `X-Forwarded-For` header when the immediate
-            // peer is loopback; otherwise it is the immediate
-            // peer's IP.
-            let effective =
-                crate::auth_tier::effective_origin(peer.ip(), &headers);
-            let lan_origin = crate::auth_tier::is_lan_origin(effective);
             let admit = matches!(
                 (ctx.tier_provider.current(), lan_origin),
                 (crate::auth_tier::AuthTier::Open, _)
@@ -229,7 +230,8 @@ async fn ws_handler(
                 let principal = Principal::new(
                     crate::middleware::LAN_TRUST_TOKEN_ID,
                     admitted_caps,
-                );
+                )
+                .with_origin(origin);
                 return upgrade
                     .on_upgrade(move |socket| {
                         handle_socket(socket, ctx, principal)
@@ -260,7 +262,8 @@ async fn ws_handler(
     }
 
     let principal =
-        Principal::new(token.id.clone(), token.capabilities.clone());
+        Principal::new(token.id.clone(), token.capabilities.clone())
+            .with_origin(origin);
 
     // RFC 6455 §4.2.2: when the client offered any subprotocol,
     // the server's 101 response MUST include a

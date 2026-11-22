@@ -32,9 +32,12 @@
 use crate::cert_resolver::HotReloadCertResolver;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio::sync::futures::OwnedNotified;
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 /// Default cadence for the renewal-check loop. The task wakes
 /// this often, evaluates whether the persisted cert needs
@@ -169,7 +172,7 @@ impl AcmeConfig {
 }
 
 /// Errors raised by [`AcmeIssuer::new`] or
-/// [`AcmeIssuer::run`].
+/// [`AcmeIssuer::tick`].
 #[derive(Debug, thiserror::Error)]
 pub enum AcmeError {
     /// `AcmeConfig.hostnames` was empty.
@@ -205,7 +208,7 @@ pub enum AcmeError {
 }
 
 /// The ACME issuer. Construction reads or creates the account
-/// key; `run` drives the renewal loop.
+/// key; [`AcmeIssuer::spawn`] starts the renewal loop.
 pub struct AcmeIssuer {
     config: AcmeConfig,
     challenges: Arc<AcmeChallengeStore>,
@@ -256,9 +259,25 @@ impl AcmeIssuer {
         self.config.state_dir.join("cert.key")
     }
 
-    /// Run the renewal-check loop until `shutdown` fires. The
-    /// loop's behaviour is documented on the module.
-    pub async fn run(self: Arc<Self>, shutdown: Arc<Notify>) {
+    /// Spawn the renewal-check loop on the current tokio runtime.
+    /// Returns a [`JoinHandle`] the caller can `await` after firing
+    /// `shutdown`. The loop's behaviour is documented on the module.
+    ///
+    /// A `shutdown.notify_waiters()` at any time after this returns,
+    /// even before the task first runs or while a renewal tick is in
+    /// flight, ends the loop; a tick in flight completes first.
+    pub fn spawn(self: Arc<Self>, shutdown: Arc<Notify>) -> JoinHandle<()> {
+        // Made here, before the task exists: a waiter sees every
+        // `notify_waiters` call made after it is created, so one the loop made
+        // for itself would miss a stop signalled before the task first ran, or
+        // while a tick was in flight. Enabling it now also queues it for
+        // `notify_one`.
+        let mut stop = Box::pin(shutdown.notified_owned());
+        stop.as_mut().enable();
+        tokio::spawn(async move { self.run(stop).await })
+    }
+
+    async fn run(self: Arc<Self>, mut stop: Pin<Box<OwnedNotified>>) {
         tracing::info!(
             directory_url = %self.config.directory_url,
             contact_email = %self.config.contact_email,
@@ -280,7 +299,8 @@ impl AcmeIssuer {
                 );
             }
             tokio::select! {
-                _ = shutdown.notified() => {
+                biased;
+                _ = stop.as_mut() => {
                     tracing::info!(
                         "evo-runtime-http: ACME issuer shutdown notified; \
                          exiting renewal loop",

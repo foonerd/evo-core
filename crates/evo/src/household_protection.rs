@@ -9,7 +9,10 @@
 //! - the persisted policy object,
 //! - the level ladder and what a level means in steward terms,
 //! - the question the dispatch gate asks — "is scope `S`
-//!   protected under this policy?",
+//!   protected under this policy?" — which `household_require`
+//!   also answers on its own, for a plugin whose verb is protected
+//!   only for some of what it touches
+//!   ([`evo_plugin_sdk::contract::HOUSEHOLD_SHELF`]),
 //! - the seam a distribution uses to name its own Settings
 //!   groups.
 //!
@@ -563,6 +566,9 @@ pub struct HouseholdProtectionRuntime {
     table: Option<GroupTable>,
     bootstrap: CapabilitySet,
     policy: std::sync::RwLock<HouseholdProtectionPolicy>,
+    /// The consumer dispatches open on each plugin, so the gate can
+    /// find the sitting a nested dispatch inherits.
+    nest_sittings: Arc<crate::nest_sitting::NestSittings>,
 }
 
 impl std::fmt::Debug for dyn HouseholdGroupTable {
@@ -586,7 +592,17 @@ impl HouseholdProtectionRuntime {
             table,
             bootstrap,
             policy: std::sync::RwLock::new(policy),
+            nest_sittings: Arc::default(),
         }
+    }
+
+    /// The consumer dispatches open on each plugin. The dispatch
+    /// gate records into it and reads a nest's inherited sitting
+    /// from it.
+    pub(crate) fn nest_sittings(
+        &self,
+    ) -> &Arc<crate::nest_sitting::NestSittings> {
+        &self.nest_sittings
     }
 
     /// Current policy, cloned.

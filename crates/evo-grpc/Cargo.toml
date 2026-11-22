@@ -18,7 +18,7 @@ enabled = ["dep:tonic", "dep:prost"]
 [dependencies]
 tonic = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport", "router"], optional = true }
 prost = { version = "0.13", optional = true }
-tokio = { version = "1", features = ["macros", "rt", "sync", "net"] }
+tokio = { version = "1.47", features = ["macros", "rt", "sync", "net"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tracing = "0.1"
 thiserror = "1"

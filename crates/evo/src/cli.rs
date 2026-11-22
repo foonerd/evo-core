@@ -35,7 +35,8 @@ use std::path::PathBuf;
 /// Default invocation (no subcommand) administers a catalogue, admits
 /// plugins, and serves client requests over a Unix domain socket. The
 /// `audit` subcommand exposes operator-facing read-only queries
-/// against the audit-grade ledger.
+/// against the audit-grade ledger; the `auth` subcommand holds
+/// bearer-credential commands. A subcommand never boots a steward.
 #[derive(Debug, Parser)]
 #[command(name = "evo", version, about, long_about = None)]
 pub struct Args {
@@ -81,6 +82,50 @@ pub enum Command {
         /// Audit subcommand selector.
         #[command(subcommand)]
         audit_command: AuditCommand,
+    },
+    /// Bearer-credential commands. Each runs with the steward
+    /// stopped.
+    Auth {
+        /// Auth subcommand selector.
+        #[command(subcommand)]
+        auth_command: AuthCommand,
+    },
+}
+
+/// Auth-subcommand selector.
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Replace the bearer-token signing key. Run with the steward
+    /// stopped; it refuses while the steward socket answers.
+    ///
+    /// Every bearer is signed by this key, so after the next start
+    /// every bearer issued before the rotation is refused: browsers
+    /// pair again and operator credentials are minted anew. A kiosk
+    /// panel mints a new session within about 15 seconds of that
+    /// start, with no restart. The operator credential records, the
+    /// revocation list and the first-boot bootstrap token are
+    /// cleared with it.
+    RotateTokenKey {
+        /// The HTTPS state directory, with the meaning of
+        /// `EVO_HTTPS_STATE_DIR`: the directory whose `https/` holds
+        /// `tokens.key`. Defaults to `EVO_HTTPS_STATE_DIR` when set,
+        /// else the directory holding the configured persistence
+        /// file.
+        #[arg(long, value_name = "PATH")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Return to the configured auth tier after a credentials reset.
+    /// Run with the steward stopped; it refuses while the steward
+    /// socket answers.
+    ///
+    /// `reset_credentials_to_open` leaves the steward on the Open
+    /// tier, at every start, whatever `EVO_AUTH_TIER` names. This
+    /// removes that, so the next start runs the configured tier
+    /// (`EVO_AUTH_TIER`; Open when unset).
+    RestoreTier {
+        /// The HTTPS state directory, as for `rotate-token-key`.
+        #[arg(long, value_name = "PATH")]
+        state_dir: Option<PathBuf>,
     },
 }
 

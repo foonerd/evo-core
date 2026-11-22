@@ -2,6 +2,9 @@
 #
 # Example configuration for scripts/release/cut-release.sh.
 # Copy to a private location (paths are internal) and pass via --config.
+#
+# Order: schemas → core → audio → evo-ui → evo-kiosk.
+# Do not point UI public at evo-device-audio-ui (retired for shipping glass).
 
 [repos.evo-catalogue-schemas]
 eng = "/path/to/evo-catalogue-schemas"
@@ -16,10 +19,13 @@ eng = "/path/to/evo-device-audio"
 public = "/path/to/evo-device-audio-public"
 artefacts = "/path/to/evo-device-audio-artefacts"
 
-[repos.evo-device-audio-ui]
+[repos.evo-ui]
 eng = "/path/to/evo-ui-eng"
-public = "/path/to/evo-device-audio-ui"
-artefacts = "/path/to/evo-device-audio-ui-artefacts"
+public = "/path/to/evo-ui"
+
+[repos.evo-kiosk]
+eng = "/path/to/evo-kiosk-eng"
+public = "/path/to/evo-kiosk"
 
 [signing]
 release_key = "/path/to/evo-core-release-signing-private.pem"

@@ -936,6 +936,11 @@ pub fn canonical_schema() -> Vec<WireOp> {
         "Read the household-protection policy plus the distribution's \
          group catalog. LAN-trust admitted; never step-up.",
     );
+    s.anonymous(
+        "household_require",
+        "Ask whether the caller may change what a capability scope \
+         protects, now: the household door, without the change.",
+    );
     s.write(
         "household_protection_set",
         "auth",
@@ -943,22 +948,27 @@ pub fn canonical_schema() -> Vec<WireOp> {
          the protected group marks. First-start and same-or-narrower \
          changes need no sitting; widening requires step-up.",
     );
+    // Pairing is how a caller with no bearer earns one. It sits on
+    // its own scope, `pair`, which every no-bearer set carries and no
+    // configured bound removes; each op then authenticates itself
+    // (the code on the device, or the OS password), and the steward
+    // serves the three to a LAN origin only.
     s.write(
         "pair_begin",
-        "auth",
+        "pair",
         "Begin a remote-browser pair-once ceremony; framework \
          publishes an 8-digit code to the kiosk display for the \
          operator to type back through pair_complete.",
     );
     s.write(
         "pair_complete",
-        "auth",
+        "pair",
         "Complete a pair-once ceremony; mints a paired-device bearer \
          on the correct code.",
     );
     s.write(
         "pair_authenticate",
-        "auth",
+        "pair",
         "Establish browser trust by authenticating with the OS \
          password; issues a paired-device bearer in one round-trip. \
          Consumer path.",
@@ -966,12 +976,12 @@ pub fn canonical_schema() -> Vec<WireOp> {
     s.read(
         "pair_list",
         "plugins",
-        "List every paired-device entry the framework tracks.",
+        "List the paired devices: one per device with a live paired bearer in the credential inventory.",
     );
     s.step_up(
         "pair_revoke",
         "plugins_admin",
-        "Revoke a paired device by id.",
+        "Revoke a paired device by id: every live bearer paired to it is refused.",
     );
     s.write(
         "set_kiosk_password",
@@ -1043,7 +1053,7 @@ pub fn canonical_schema() -> Vec<WireOp> {
     s.step_up(
         "reset_credentials_to_open",
         "system_admin",
-        "Recovery gesture: purge every credential record + revocation entry and flip the steward to Open tier on next boot.",
+        "Recovery gesture: purge every credential record + revocation entry, retire the bearer-token signing key at the next start, and run the Open tier until `evo auth restore-tier`.",
     );
 
     // Plugin credential vault — third-party API keys / service
@@ -1219,7 +1229,7 @@ mod tests {
     /// `schema_count_matches_client_request_variant_count` test
     /// asserts the schema matches; bumping the enum and not
     /// bumping this number flags a missing schema entry.
-    const EXPECTED_SCHEMA_COUNT: usize = 179;
+    const EXPECTED_SCHEMA_COUNT: usize = 180;
 
     #[test]
     fn schema_count_matches_client_request_variant_count() {

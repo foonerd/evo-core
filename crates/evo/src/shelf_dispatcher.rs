@@ -38,11 +38,38 @@
 //! `"plugin-system"`). Per-verb capability shaping from the
 //! caller's admitted manifest remains a tightening follow-on;
 //! destination `[capabilities.respondent]` gates still apply.
+//!
+//! ## Household sitting
+//!
+//! A nested dispatch carries no step-up token of its own. At a
+//! household level that protects the nested verb's scope, the gate
+//! accepts the sitting of the consumer whose request the calling
+//! plugin is answering: only while that consumer is the one
+//! connection with a dispatch open on the plugin, and only when its
+//! request presented a sitting. The token is validated against that
+//! consumer's identity and never travels in the nested request.
+//!
+//! The dispatcher's part is to name the calling plugin. For an
+//! out-of-process plugin that is the caller the wire frame names. In
+//! process it is the plugin whose handler is running on the current
+//! task; a dispatch made from a task the plugin spawned names no
+//! plugin, and inherits nothing.
+//!
+//! ## Refusals
+//!
+//! A refusal the steward names (class `permission_denied` with a
+//! `details.subclass`) reaches the calling plugin as
+//! [`ShelfDispatchError::Refused`], subclass intact, so the plugin can
+//! hand its own caller the refusal they would have met asking
+//! directly.
 
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, Weak};
 
-use evo_plugin_sdk::contract::{ShelfDispatchError, ShelfRequestDispatcher};
+use evo_plugin_sdk::contract::{
+    ShelfDispatchError, ShelfRequestDispatcher, HOUSEHOLD_REQUIRE,
+    HOUSEHOLD_SHELF,
+};
 use serde_json::{json, Value};
 
 use crate::server::{HttpDispatchError, Server};
@@ -106,9 +133,13 @@ impl Default for StewardShelfRequestDispatcher {
 }
 
 impl StewardShelfRequestDispatcher {
+    /// `caller` is the plugin the dispatch is made for, when the
+    /// transport names it; `None` takes the plugin whose handler is
+    /// running on this task.
     async fn dispatch_inner(
         &self,
         principal: evo_runtime_http::Principal,
+        caller: Option<&str>,
         shelf: &str,
         request_type: &str,
         payload: Vec<u8>,
@@ -142,9 +173,24 @@ impl StewardShelfRequestDispatcher {
                 });
             }
         };
-        match server
-            .dispatch_http_wire_op("request", request, &principal)
-            .await
+        // The nest names the plugin it comes from, so the household
+        // gate can find the consumer that plugin is serving.
+        let origin = crate::nest_sitting::origin_plugin(caller);
+        if shelf == HOUSEHOLD_SHELF {
+            return household_check(
+                &server,
+                &principal,
+                origin,
+                request_type,
+                &payload,
+            )
+            .await;
+        }
+        match crate::nest_sitting::nest_from(
+            origin,
+            server.dispatch_http_wire_op("request", request, &principal),
+        )
+        .await
         {
             Ok(value) => decode_dispatch_response(value),
             Err(HttpDispatchError::InvalidPayload(detail)) => {
@@ -201,6 +247,7 @@ impl ShelfRequestDispatcher for StewardShelfRequestDispatcher {
             // shelf boundary.
             self.dispatch_inner(
                 plugin_system_principal(),
+                None,
                 shelf,
                 request_type,
                 payload,
@@ -227,18 +274,16 @@ impl ShelfRequestDispatcher for StewardShelfRequestDispatcher {
     > {
         Box::pin(async move {
             // OOP wire path: principal subject is the calling
-            // plugin. Capability set stays empty for parity with
-            // today's in-process grant model; destination
-            // respondent gates still apply. Tightening to the
-            // caller's admitted manifest CapabilitySet is a
-            // follow-on once admission state is threaded into
-            // the wire EventSink.
+            // plugin. Capability set is the same household
+            // network door the in-process nest holds.
+            // Destination respondent gates still apply.
             let principal = evo_runtime_http::Principal::new(
                 caller_plugin,
                 plugin_system_capabilities(),
             );
             self.dispatch_inner(
                 principal,
+                Some(caller_plugin),
                 shelf,
                 request_type,
                 payload,
@@ -261,6 +306,69 @@ impl ShelfRequestDispatcher for StewardShelfRequestDispatcher {
 /// Anything else is treated as a substrate failure so plugin
 /// code observing the dispatcher's failure modes can correlate
 /// to the wire-op layer's behaviour.
+/// Answer a dispatch on [`HOUSEHOLD_SHELF`] with the steward's own
+/// `household_require`, asked for the consumer the calling plugin is
+/// answering. Only `scope` is taken from the plugin's payload, so a
+/// nest presents no sitting of its own. Returns the answer's JSON
+/// bytes, or the refusal by name.
+async fn household_check(
+    server: &Server,
+    principal: &evo_runtime_http::Principal,
+    origin: Option<String>,
+    request_type: &str,
+    payload: &[u8],
+) -> Result<Vec<u8>, ShelfDispatchError> {
+    if request_type != HOUSEHOLD_REQUIRE {
+        return Err(ShelfDispatchError::Permanent {
+            detail: format!(
+                "{HOUSEHOLD_SHELF} answers {HOUSEHOLD_REQUIRE} only, not \
+                 {request_type:?}"
+            ),
+        });
+    }
+    let scope = serde_json::from_slice::<Value>(payload)
+        .ok()
+        .and_then(|asked| {
+            asked.get("scope").and_then(Value::as_str).map(str::to_owned)
+        })
+        .ok_or_else(|| ShelfDispatchError::Permanent {
+            detail: format!(
+                "{HOUSEHOLD_REQUIRE} takes a JSON payload {{\"scope\": \"...\"}}"
+            ),
+        })?;
+    let asked = server.dispatch_http_wire_op(
+        "household_require",
+        json!({ "scope": scope }),
+        principal,
+    );
+    match crate::nest_sitting::nest_from(origin, asked).await {
+        Ok(value) => match value.get("error") {
+            Some(err) => Err(classify_error_payload(err)),
+            None => serde_json::to_vec(&value).map_err(|e| {
+                ShelfDispatchError::SubstrateFailure {
+                    detail: e.to_string(),
+                }
+            }),
+        },
+        Err(HttpDispatchError::InvalidPayload(detail)) => {
+            Err(ShelfDispatchError::Permanent { detail })
+        }
+        Err(HttpDispatchError::SerializationFailed(detail)) => {
+            Err(ShelfDispatchError::SubstrateFailure { detail })
+        }
+        Err(HttpDispatchError::RequestRefused { body, .. }) => {
+            match body.get("error") {
+                Some(err) => Err(classify_error_payload(err)),
+                None => Err(ShelfDispatchError::SubstrateFailure {
+                    detail: format!(
+                        "refused response missing error envelope: {body}"
+                    ),
+                }),
+            }
+        }
+    }
+}
+
 fn decode_dispatch_response(
     value: Value,
 ) -> Result<Vec<u8>, ShelfDispatchError> {
@@ -345,6 +453,22 @@ fn classify_error_payload(err: &Value) -> ShelfDispatchError {
         "permanent" | "contract_violation" | "bad_request" => {
             ShelfDispatchError::Permanent { detail }
         }
+        // A refusal that names its kind keeps the name: the plugin
+        // that dispatched on an operator's behalf can hand that
+        // operator the refusal they would have met asking directly.
+        "permission_denied" => match map
+            .get("details")
+            .and_then(|d| d.get("subclass"))
+            .and_then(Value::as_str)
+        {
+            Some(subclass) => ShelfDispatchError::Refused {
+                subclass: subclass.to_string(),
+                detail,
+            },
+            None => ShelfDispatchError::SubstrateFailure {
+                detail: format!("class={class} message={detail}"),
+            },
+        },
         _ => ShelfDispatchError::SubstrateFailure {
             detail: format!("class={class} message={detail}"),
         },
@@ -376,26 +500,42 @@ fn plugin_system_principal() -> evo_runtime_http::Principal {
 }
 
 /// Capabilities the framework grants to in-process plugin
-/// dispatches. The set is intentionally broad so the
-/// dispatcher does not become a back-door gate; per-verb
-/// capability requirements live on the destination plugin's
-/// manifest and are honoured at the shelf boundary.
+/// dispatches: `network_admin`, the household network door, so a
+/// glass `library.remove_source` can reach the USB writer behind it
+/// without a second password. The rank is StepUp, which lets a nest
+/// carry the sitting of the consumer it serves into a step-up verb;
+/// the rank is never a sitting of its own. Destination manifests
+/// still gate. This set is not the operator bootstrap —
+/// `system_admin` stays off it.
 fn plugin_system_capabilities() -> evo_auth_bearer::CapabilitySet {
-    use evo_auth_bearer::CapabilitySet;
-    // The CapabilitySet default is an empty set. The framework's
-    // verb-level capability gate matches on declared
-    // requirements; a broad principal-side grant relies on the
-    // destination plugin to refuse if its verb genuinely needs a
-    // narrower capability. In-process plugins compose through
-    // trust-class alignment; future tightening (per-plugin
-    // capability shaping) lands when admission threads the
-    // caller's declared CapabilitySet into dispatch_as_caller.
-    CapabilitySet::default()
+    use evo_auth_bearer::{Capability, CapabilitySet};
+    CapabilitySet::new(vec![Capability::step_up("network_admin")])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_system_holds_the_household_network_door() {
+        use evo_auth_bearer::Capability;
+        let set = plugin_system_capabilities();
+        let network = set
+            .capabilities()
+            .iter()
+            .find(|c| c.scope() == "network_admin")
+            .expect("plugin-system must hold network_admin");
+        assert!(
+            matches!(network, Capability::StepUp { .. }),
+            "a nest must be able to carry its consumer's sitting: {network:?}"
+        );
+        assert!(
+            !set.capabilities()
+                .iter()
+                .any(|c| c.scope() == "system_admin"),
+            "plugin-system must not hold system_admin"
+        );
+    }
 
     #[test]
     fn classify_known_classes() {
@@ -460,6 +600,49 @@ mod tests {
             }
             other => panic!("unexpected classification: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_refusal_keeps_its_subclass() {
+        // The household gate's refusal, as the wire-op layer writes
+        // it.
+        let err = serde_json::json!({
+            "class": "permission_denied",
+            "message": "verb \"set_network\" touches a settings group the \
+                        household policy protects",
+            "details": { "subclass": "household_policy_locked" }
+        });
+        match classify_error_payload(&err) {
+            ShelfDispatchError::Refused { subclass, detail } => {
+                assert_eq!(subclass, "household_policy_locked");
+                assert!(detail.starts_with("verb \"set_network\""), "{detail}");
+            }
+            other => panic!("unexpected classification: {other:?}"),
+        }
+
+        // Any refusal that names itself keeps the name.
+        let err = serde_json::json!({
+            "class": "permission_denied",
+            "message": "principal does not hold it",
+            "details": { "subclass": "verb_capability_scope_not_granted" }
+        });
+        assert!(matches!(
+            classify_error_payload(&err),
+            ShelfDispatchError::Refused { subclass, .. }
+                if subclass == "verb_capability_scope_not_granted"
+        ));
+
+        // A refusal that does not name itself stays a substrate
+        // failure, as before.
+        let err = serde_json::json!({
+            "class": "permission_denied",
+            "message": "denied"
+        });
+        assert!(matches!(
+            classify_error_payload(&err),
+            ShelfDispatchError::SubstrateFailure { detail }
+                if detail == "class=permission_denied message=denied"
+        ));
     }
 
     #[test]
