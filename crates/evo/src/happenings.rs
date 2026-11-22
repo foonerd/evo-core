@@ -3560,6 +3560,141 @@ impl Happening {
         happening_kind_str(self)
     }
 
+    /// The read scope a network subscriber must hold to receive this
+    /// happening: the scope of the read ops that report the same
+    /// state. `None` for a plugin's own event, which goes by the
+    /// scopes its plugin declares instead.
+    ///
+    /// The match is exhaustive, so a new variant names its scope where
+    /// it is added.
+    pub fn read_scope(&self) -> Option<&'static str> {
+        match self {
+            // A plugin's own event: see the subscription filter.
+            Self::PluginEvent { .. } => None,
+            // Subjects, relations, claims and grammar: what `project_subject`, `list_relations` and `resolve_claimants` report.
+            Self::RelationCardinalityViolation { .. }
+            | Self::SubjectForgotten { .. }
+            | Self::SubjectStateChanged { .. }
+            | Self::RelationForgotten { .. }
+            | Self::SubjectAddressingForcedRetract { .. }
+            | Self::RelationClaimForcedRetract { .. }
+            | Self::SubjectMerged { .. }
+            | Self::SubjectSplit { .. }
+            | Self::SubjectGrammarOrphan { .. }
+            | Self::SubjectMigrated { .. }
+            | Self::GrammarMigrationProgress { .. }
+            | Self::GrammarOrphansAccepted { .. }
+            | Self::RelationSuppressed { .. }
+            | Self::RelationSuppressionReasonUpdated { .. }
+            | Self::RelationUnsuppressed { .. }
+            | Self::RelationSplitAmbiguous { .. }
+            | Self::RelationRewritten { .. }
+            | Self::RelationCardinalityViolatedPostRewrite { .. }
+            | Self::ClaimReassigned { .. }
+            | Self::RelationClaimSuppressionCollapsed { .. }
+            | Self::SubjectConflictDetected { .. }
+            | Self::CardinalityViolation { .. } => Some("subjects"),
+            // Custody, factory instances, the catalogue, plugin lifecycle and UI admission: what `list_active_custodies`, `list_plugins` and `describe_ui_stockings` report.
+            Self::CustodyTaken { .. }
+            | Self::CustodyReleased { .. }
+            | Self::CustodyStateReported { .. }
+            | Self::CustodyAborted { .. }
+            | Self::CustodyDegraded { .. }
+            | Self::FactoryInstanceAnnounced { .. }
+            | Self::FactoryInstanceRetracted { .. }
+            | Self::CatalogueFallback { .. }
+            | Self::PluginManifestDrift { .. }
+            | Self::PluginVersionSkewWarning { .. }
+            | Self::PluginLiveReloadStarted { .. }
+            | Self::PluginLiveReloadCompleted { .. }
+            | Self::PluginReloadDispatched { .. }
+            | Self::PluginDegraded { .. }
+            | Self::PluginRestored { .. }
+            | Self::PluginAdmissionSkipped { .. }
+            | Self::CatalogueReloaded { .. }
+            | Self::CatalogueInvalid { .. }
+            | Self::PluginManifestReloaded { .. }
+            | Self::PluginManifestInvalid { .. }
+            | Self::PluginLiveReloadFailed { .. }
+            | Self::UiShelfChanged { .. }
+            | Self::UiThemeAdmitted { .. }
+            | Self::UiShellAdmitted { .. }
+            | Self::UiWidgetPackAdmitted { .. }
+            | Self::UiThemeUnadmitted { .. }
+            | Self::UiShellUnadmitted { .. }
+            | Self::UiWidgetPackUnadmitted { .. }
+            | Self::UiActiveThemeChanged { .. }
+            | Self::UiActiveShellChanged { .. } => Some("plugins"),
+            // Device roles: what `get_device_role` reports.
+            Self::DeviceRoleChanged { .. } => Some("plugins_admin"),
+            // Peers, the domain, groups, source hosts, clock sync and the chain: what `list_discovered_peers`, `list_groups` and `get_chain_head` report.
+            Self::PeerDiscovered { .. }
+            | Self::PeerUpdated { .. }
+            | Self::PeerLost { .. }
+            | Self::PeerAnnounced { .. }
+            | Self::PeerDisappeared { .. }
+            | Self::RosterSnapped { .. }
+            | Self::DomainJoinModeEntered { .. }
+            | Self::GroupCreated { .. }
+            | Self::GroupRenamed { .. }
+            | Self::GroupMembershipChanged { .. }
+            | Self::GroupLeaderMsChanged { .. }
+            | Self::GroupDeleted { .. }
+            | Self::SourceHostElected { .. }
+            | Self::PeerConnected { .. }
+            | Self::PeerDisconnected { .. }
+            | Self::DomainMemberAdmitted { .. }
+            | Self::DomainMemberRevoked { .. }
+            | Self::DomainMemberDisplayNameObserved { .. }
+            | Self::GroupMemberAddRefused { .. }
+            | Self::GroupLeaderSuccessorRequired { .. }
+            | Self::GroupLeaderSuccessorCancelled { .. }
+            | Self::MultiroomLeaderHandoff { .. }
+            | Self::MultiroomMemberMoved { .. }
+            | Self::SplitBrainDetected { .. }
+            | Self::ClockSyncChanged { .. }
+            | Self::ChainHeadChanged { .. }
+            | Self::GestureApplied { .. }
+            | Self::GestureConfirmedByPeer { .. }
+            | Self::GestureReconciled { .. }
+            | Self::PeerPresenceChanged { .. }
+            | Self::PeerObservedAtNewEndpoint { .. }
+            | Self::PresenceMassEventDetected { .. }
+            | Self::ReconnectProgress { .. }
+            | Self::RelayDeclared { .. }
+            | Self::RelayBridgeHealthChanged { .. } => Some("multiroom"),
+            // Reconciliation and playback: what `list_reconciliation_pairs` and the audio reads report.
+            Self::ReconciliationApplied { .. }
+            | Self::ReconciliationFailed { .. }
+            | Self::AudioPlaybackEnded { .. } => Some("audio"),
+            // Appointments and watches: what `list_appointments` and `list_watches` report.
+            Self::AppointmentApproaching { .. }
+            | Self::AppointmentFired { .. }
+            | Self::AppointmentMissed { .. }
+            | Self::AppointmentCancelled { .. }
+            | Self::WatchFired { .. }
+            | Self::WatchMissed { .. }
+            | Self::WatchCancelled { .. }
+            | Self::WatchEvaluationThrottled { .. } => Some("plans"),
+            // Updates: what `list_update_inventory` reports.
+            Self::UpdateCheckStarted { .. }
+            | Self::UpdateCheckCompleted { .. }
+            | Self::UpdateAvailableObserved { .. }
+            | Self::UpdateApplyStarted { .. }
+            | Self::UpdateApplySucceeded { .. }
+            | Self::UpdateApplyFailed { .. } => Some("updates"),
+            // The device itself: persistence, clock trust, flight mode, its name and its restart, as `get_device_identity` does.
+            Self::PersistenceReady { .. }
+            | Self::ClockTrustChanged { .. }
+            | Self::ClockAdjusted { .. }
+            | Self::FlightModeChanged { .. }
+            | Self::DeviceDisplayNameChanged { .. }
+            | Self::StewardRestarting { .. } => Some("system"),
+            // The household policy: what `household_protection_get` reports.
+            Self::HouseholdProtectionChanged { .. } => Some("auth"),
+        }
+    }
+
     /// Primary plugin associated with this happening, if any.
     ///
     /// Most variants carry a single `plugin` field naming the
@@ -5657,5 +5792,50 @@ mod tests {
             at: SystemTime::now(),
         };
         assert_eq!(h.primary_plugin(), Some("com.example.audio"));
+    }
+}
+
+#[cfg(test)]
+mod read_scope_tests {
+    use super::*;
+
+    #[test]
+    fn each_happening_names_the_read_scope_of_what_it_reports() {
+        let at = SystemTime::now();
+        let cases = [
+            (
+                Happening::SubjectStateChanged {
+                    plugin: "p".into(),
+                    canonical_id: "c".into(),
+                    subject_type: "t".into(),
+                    prev_state: serde_json::Value::Null,
+                    new_state: serde_json::Value::Null,
+                    at,
+                },
+                Some("subjects"),
+            ),
+            (
+                Happening::HouseholdProtectionChanged {
+                    chosen: true,
+                    level: "open".into(),
+                    lend: false,
+                    protected_groups: vec![],
+                    prior_level: None,
+                },
+                Some("auth"),
+            ),
+            (
+                Happening::PluginEvent {
+                    plugin: "p".into(),
+                    event_type: "e".into(),
+                    payload: serde_json::Value::Null,
+                    at,
+                },
+                None,
+            ),
+        ];
+        for (happening, scope) in cases {
+            assert_eq!(happening.read_scope(), scope, "{}", happening.kind());
+        }
     }
 }

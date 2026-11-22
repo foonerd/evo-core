@@ -129,7 +129,8 @@ runtime's `describe_capabilities` op for the live list):
 | `audio` | Audio playback / transport state. |
 | `multiroom` | Multi-room group composition + audio plane control. |
 | `plans` | Scheduled jobs (playlists, alarms, automations). |
-| `plugins` | Plugin inventory + introspection. |
+| `plugins` | Plugin inventory + introspection, and the plugin verbs that declare no capability (at `write`). |
+| `request` | Dispatching a plugin verb (`op = "request"`). A verb that declares a capability needs that capability as well; one that declares none needs `write:plugins`. |
 | `subjects` | Subject substrate (state subscribed by UIs). |
 | `system` | Device identity + system-level introspection. |
 | `auth` | Credential management itself. |
@@ -138,6 +139,14 @@ runtime's `describe_capabilities` op for the live list):
 | `ui` | Schema-first UI surfaces. |
 | `observatory` | Live observatory ring (debugging surface). |
 | `witness` | Witness chain (audit surface). |
+
+A plugin's manifest can declare scopes of its own on its verbs
+(`[capabilities.respondent.verb_capabilities]`). Each such scope joins
+the operator set at the highest rank its verbs declare: the first-boot
+bearer and every pair and kiosk bearer carry it, and
+`mint-bearer-token --scope <name>` narrows to it. A plugin's
+declaration never changes the rank of a scope the framework already
+names.
 
 Pick the narrowest set that satisfies the consumer. A door-sensor
 that fires a playlist needs `read:audio + write:multiroom`, not
@@ -153,6 +162,24 @@ step_up). This is the right shape for the operator's own personal
 shell scripts, never the right shape for a tier-1 IoT device. A
 credential created over HTTPS with no scopes carries the creating
 bearer's own set instead.
+
+## Screens other than the unit's
+
+The kiosk mint serves the unit's own screen: it is answered on the
+kiosk socket only, to a local process whose uid the distribution
+allows. A screen on another machine (an unattended display, a
+satellite) is the distribution's to enrol. evo keeps no registry of
+remote devices and mints no session on a remote device's own word.
+
+A distribution that keeps such a registry mints each device a bearer
+over the local socket with `mint-bearer-token`, narrowed by scope
+name to `request` and the scopes of the plugin verbs that device may
+ask. Such a bearer reaches those verbs and nothing else: not evo's
+own plugin reads (`list_plugins`, `describe_ui_stockings`, which need
+`read:plugins`), not a plugin verb that declares no capability
+(which needs `write:plugins`), and its happenings stream carries only
+what its scopes may read. `describe_capabilities` stays open to it,
+as it is to every caller.
 
 ## Expiry policy
 

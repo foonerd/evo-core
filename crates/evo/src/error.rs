@@ -232,6 +232,19 @@ impl From<&StewardError> for ApiError {
             return ApiError::new(*class, message.clone())
                 .with_subclass(subclass.clone());
         }
+        // WithValues is WithSubclass with the values the error names,
+        // which ride beside the subclass as `details.values`.
+        if let StewardError::Plugin(
+            err @ PluginError::WithValues { class, message, .. },
+        ) = e
+        {
+            let err_details = err.coded_details();
+            let api = ApiError::new(*class, message.clone());
+            return match err_details {
+                Some(details) => api.with_details(details),
+                None => api,
+            };
+        }
         let mut err = ApiError::new(e.classify(), e.to_string());
         // Surface structured fields on classes that already carry
         // them so consumers can act without parsing the message.
@@ -429,5 +442,30 @@ mod tests {
             .and_then(|d| d.get("subclass"))
             .and_then(|v| v.as_str());
         assert_eq!(subclass, Some("no_responder_available"));
+    }
+
+    #[test]
+    fn api_error_from_with_values_carries_the_values_beside_the_subclass() {
+        let e = StewardError::Plugin(PluginError::WithValues {
+            class: ErrorClass::Transient,
+            subclass: "share_busy".into(),
+            message: "the share is in use".into(),
+            values: [
+                ("share".to_string(), serde_json::json!("Music")),
+                ("minutes".to_string(), serde_json::json!(30)),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        let api: ApiError = (&e).into();
+        assert_eq!(api.class, ErrorClass::Transient);
+        assert_eq!(api.message, "the share is in use");
+        assert_eq!(
+            api.details,
+            Some(serde_json::json!({
+                "subclass": "share_busy",
+                "values": { "share": "Music", "minutes": 30 },
+            }))
+        );
     }
 }

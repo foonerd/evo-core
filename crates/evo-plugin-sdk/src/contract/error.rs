@@ -113,6 +113,26 @@ pub enum PluginError {
         /// (no `"transient error:"` / `"permanent error:"` prefix).
         message: String,
     },
+
+    /// [`Self::WithSubclass`] with the values the error speaks of, each
+    /// under a name: a share's name, a limit, a number of minutes. A
+    /// face that says the error in words of its own reads the code
+    /// from `details.subclass` and the values from `details.values`.
+    ///
+    /// The `message` reaches the wire unwrapped, as for
+    /// [`Self::WithSubclass`]. `values` rides beside the subclass as a
+    /// JSON object, and is left off the wire when empty.
+    #[error("{message}")]
+    WithValues {
+        /// Top-level wire error class the framework surfaces.
+        class: crate::error_taxonomy::ErrorClass,
+        /// Structured subclass token, as for [`Self::WithSubclass`].
+        subclass: String,
+        /// Operator-readable message. Reaches the wire unwrapped.
+        message: String,
+        /// The values the error names, each under its name.
+        values: std::collections::BTreeMap<String, serde_json::Value>,
+    },
 }
 
 impl PluginError {
@@ -186,6 +206,30 @@ impl PluginError {
             PluginError::Internal { .. } => ErrorClass::Internal,
             PluginError::Fatal { .. } => ErrorClass::Internal,
             PluginError::WithSubclass { class, .. } => *class,
+            PluginError::WithValues { class, .. } => *class,
+        }
+    }
+
+    /// The wire `details` of an error that carries a code: the
+    /// subclass, and beside it the values when there are any. `None`
+    /// for an error without a code.
+    pub fn coded_details(&self) -> Option<serde_json::Value> {
+        match self {
+            PluginError::WithSubclass { subclass, .. } => {
+                Some(serde_json::json!({ "subclass": subclass }))
+            }
+            PluginError::WithValues {
+                subclass, values, ..
+            } => {
+                let mut details = serde_json::json!({ "subclass": subclass });
+                if !values.is_empty() {
+                    details["values"] = serde_json::Value::Object(
+                        values.clone().into_iter().collect(),
+                    );
+                }
+                Some(details)
+            }
+            _ => None,
         }
     }
 }
@@ -274,5 +318,64 @@ mod tests {
         };
         let s = format!("{e}");
         assert!(s.contains("memory"));
+    }
+
+    fn named_values() -> std::collections::BTreeMap<String, serde_json::Value> {
+        [
+            ("share".to_string(), serde_json::json!("Music")),
+            ("minutes".to_string(), serde_json::json!(30)),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn with_values_carries_its_values_beside_the_subclass() {
+        use crate::error_taxonomy::ErrorClass;
+        let e = PluginError::WithValues {
+            class: ErrorClass::Transient,
+            subclass: "share_busy".into(),
+            message: "the share is in use".into(),
+            values: named_values(),
+        };
+        assert_eq!(e.class(), ErrorClass::Transient);
+        assert_eq!(format!("{e}"), "the share is in use");
+        assert_eq!(
+            e.coded_details(),
+            Some(serde_json::json!({
+                "subclass": "share_busy",
+                "values": { "share": "Music", "minutes": 30 },
+            }))
+        );
+    }
+
+    #[test]
+    fn with_values_leaves_empty_values_off_the_wire() {
+        use crate::error_taxonomy::ErrorClass;
+        let e = PluginError::WithValues {
+            class: ErrorClass::ContractViolation,
+            subclass: "bad_name".into(),
+            message: "bad name".into(),
+            values: Default::default(),
+        };
+        assert_eq!(
+            e.coded_details(),
+            Some(serde_json::json!({ "subclass": "bad_name" }))
+        );
+    }
+
+    #[test]
+    fn with_subclass_details_are_the_subclass_alone() {
+        use crate::error_taxonomy::ErrorClass;
+        let e = PluginError::WithSubclass {
+            class: ErrorClass::PermissionDenied,
+            subclass: "no_responder_available".into(),
+            message: "no responder".into(),
+        };
+        assert_eq!(
+            e.coded_details(),
+            Some(serde_json::json!({ "subclass": "no_responder_available" }))
+        );
+        assert_eq!(PluginError::Permanent("x".into()).coded_details(), None);
     }
 }

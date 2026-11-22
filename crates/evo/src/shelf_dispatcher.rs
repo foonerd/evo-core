@@ -67,8 +67,8 @@ use std::pin::Pin;
 use std::sync::{Arc, OnceLock, Weak};
 
 use evo_plugin_sdk::contract::{
-    ShelfDispatchError, ShelfRequestDispatcher, HOUSEHOLD_REQUIRE,
-    HOUSEHOLD_SHELF,
+    CodedDispatchError, ShelfDispatchError, ShelfRequestDispatcher,
+    HOUSEHOLD_REQUIRE, HOUSEHOLD_SHELF,
 };
 use serde_json::{json, Value};
 
@@ -144,7 +144,7 @@ impl StewardShelfRequestDispatcher {
         request_type: &str,
         payload: Vec<u8>,
         instance_id: Option<&str>,
-    ) -> Result<Vec<u8>, ShelfDispatchError> {
+    ) -> Result<Vec<u8>, CodedDispatchError> {
         // Base64-encode the payload bytes onto the JSON
         // envelope the framework's wire-op router consumes;
         // the same shape the HTTPS layer uses for
@@ -170,7 +170,8 @@ impl StewardShelfRequestDispatcher {
             None => {
                 return Err(ShelfDispatchError::SubstrateFailure {
                     detail: "shelf request dispatcher not yet wired to server (admission-time dispatch before boot complete; retryable)".into(),
-                });
+                }
+                .into());
             }
         };
         // The nest names the plugin it comes from, so the household
@@ -194,10 +195,10 @@ impl StewardShelfRequestDispatcher {
         {
             Ok(value) => decode_dispatch_response(value),
             Err(HttpDispatchError::InvalidPayload(detail)) => {
-                Err(ShelfDispatchError::Permanent { detail })
+                Err(ShelfDispatchError::Permanent { detail }.into())
             }
             Err(HttpDispatchError::SerializationFailed(detail)) => {
-                Err(ShelfDispatchError::SubstrateFailure { detail })
+                Err(ShelfDispatchError::SubstrateFailure { detail }.into())
             }
             // Wire-honesty: the framework's dispatch classified
             // the request as refused (verb-cap denied, plugin
@@ -211,13 +212,14 @@ impl StewardShelfRequestDispatcher {
             Err(HttpDispatchError::RequestRefused { body, .. }) => {
                 if let Some(err) = body.as_object().and_then(|m| m.get("error"))
                 {
-                    Err(classify_error_payload(err))
+                    Err(coded_error_payload(err))
                 } else {
                     Err(ShelfDispatchError::SubstrateFailure {
                         detail: format!(
                             "refused response missing error envelope: {body}"
                         ),
-                    })
+                    }
+                    .into())
                 }
             }
         }
@@ -254,6 +256,34 @@ impl ShelfRequestDispatcher for StewardShelfRequestDispatcher {
                 instance_id,
             )
             .await
+            .map_err(|coded| coded.kind)
+        })
+    }
+
+    fn dispatch_coded<'a>(
+        &'a self,
+        shelf: &'a str,
+        request_type: &'a str,
+        payload: Vec<u8>,
+        instance_id: Option<&'a str>,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Vec<u8>, CodedDispatchError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.dispatch_inner(
+                plugin_system_principal(),
+                None,
+                shelf,
+                request_type,
+                payload,
+                instance_id,
+            )
+            .await
         })
     }
 
@@ -277,12 +307,37 @@ impl ShelfRequestDispatcher for StewardShelfRequestDispatcher {
             // plugin. Capability set is the same household
             // network door the in-process nest holds.
             // Destination respondent gates still apply.
-            let principal = evo_runtime_http::Principal::new(
-                caller_plugin,
-                plugin_system_capabilities(),
-            );
             self.dispatch_inner(
-                principal,
+                caller_principal(caller_plugin),
+                Some(caller_plugin),
+                shelf,
+                request_type,
+                payload,
+                instance_id,
+            )
+            .await
+            .map_err(|coded| coded.kind)
+        })
+    }
+
+    fn dispatch_coded_as_caller<'a>(
+        &'a self,
+        caller_plugin: &'a str,
+        shelf: &'a str,
+        request_type: &'a str,
+        payload: Vec<u8>,
+        instance_id: Option<&'a str>,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Vec<u8>, CodedDispatchError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.dispatch_inner(
+                caller_principal(caller_plugin),
                 Some(caller_plugin),
                 shelf,
                 request_type,
@@ -292,6 +347,16 @@ impl ShelfRequestDispatcher for StewardShelfRequestDispatcher {
             .await
         })
     }
+}
+
+/// The principal an out-of-process plugin's dispatch runs as: its own
+/// name, holding the same household network door the in-process nest
+/// holds. Destination respondent gates still apply.
+fn caller_principal(caller_plugin: &str) -> evo_runtime_http::Principal {
+    evo_runtime_http::Principal::new(
+        caller_plugin,
+        plugin_system_capabilities(),
+    )
 }
 
 /// Decode the wire-op router's JSON response into either the
@@ -317,14 +382,15 @@ async fn household_check(
     origin: Option<String>,
     request_type: &str,
     payload: &[u8],
-) -> Result<Vec<u8>, ShelfDispatchError> {
+) -> Result<Vec<u8>, CodedDispatchError> {
     if request_type != HOUSEHOLD_REQUIRE {
         return Err(ShelfDispatchError::Permanent {
             detail: format!(
                 "{HOUSEHOLD_SHELF} answers {HOUSEHOLD_REQUIRE} only, not \
                  {request_type:?}"
             ),
-        });
+        }
+        .into());
     }
     let scope = serde_json::from_slice::<Value>(payload)
         .ok()
@@ -343,27 +409,29 @@ async fn household_check(
     );
     match crate::nest_sitting::nest_from(origin, asked).await {
         Ok(value) => match value.get("error") {
-            Some(err) => Err(classify_error_payload(err)),
+            Some(err) => Err(coded_error_payload(err)),
             None => serde_json::to_vec(&value).map_err(|e| {
                 ShelfDispatchError::SubstrateFailure {
                     detail: e.to_string(),
                 }
+                .into()
             }),
         },
         Err(HttpDispatchError::InvalidPayload(detail)) => {
-            Err(ShelfDispatchError::Permanent { detail })
+            Err(ShelfDispatchError::Permanent { detail }.into())
         }
         Err(HttpDispatchError::SerializationFailed(detail)) => {
-            Err(ShelfDispatchError::SubstrateFailure { detail })
+            Err(ShelfDispatchError::SubstrateFailure { detail }.into())
         }
         Err(HttpDispatchError::RequestRefused { body, .. }) => {
             match body.get("error") {
-                Some(err) => Err(classify_error_payload(err)),
+                Some(err) => Err(coded_error_payload(err)),
                 None => Err(ShelfDispatchError::SubstrateFailure {
                     detail: format!(
                         "refused response missing error envelope: {body}"
                     ),
-                }),
+                }
+                .into()),
             }
         }
     }
@@ -371,32 +439,65 @@ async fn household_check(
 
 fn decode_dispatch_response(
     value: Value,
-) -> Result<Vec<u8>, ShelfDispatchError> {
+) -> Result<Vec<u8>, CodedDispatchError> {
     use base64::Engine;
     let map = match value.as_object() {
         Some(m) => m,
         None => {
             return Err(ShelfDispatchError::SubstrateFailure {
                 detail: format!("expected JSON object response, got {value}"),
-            });
+            }
+            .into());
         }
     };
     if let Some(err) = map.get("error") {
-        return Err(classify_error_payload(err));
+        return Err(coded_error_payload(err));
     }
     let payload_b64 = match map.get("payload_b64").and_then(Value::as_str) {
         Some(s) => s,
         None => {
             return Err(ShelfDispatchError::SubstrateFailure {
                 detail: format!("response missing payload_b64 field: {value}"),
-            });
+            }
+            .into());
         }
     };
     base64::engine::general_purpose::STANDARD
         .decode(payload_b64)
-        .map_err(|e| ShelfDispatchError::SubstrateFailure {
-            detail: format!("payload_b64 decode failed: {e}"),
+        .map_err(|e| {
+            ShelfDispatchError::SubstrateFailure {
+                detail: format!("payload_b64 decode failed: {e}"),
+            }
+            .into()
         })
+}
+
+/// [`classify_error_payload`], keeping beside it the code the error
+/// carried, whatever its class: the class, `details.subclass` and
+/// `details.values`.
+fn coded_error_payload(err: &Value) -> CodedDispatchError {
+    let coded = CodedDispatchError::new(classify_error_payload(err));
+    let class = err
+        .get("class")
+        .and_then(|c| serde_json::from_value(c.clone()).ok());
+    let details = err.get("details");
+    let subclass = details
+        .and_then(|d| d.get("subclass"))
+        .and_then(Value::as_str);
+    let (Some(class), Some(subclass)) = (class, subclass) else {
+        return coded;
+    };
+    let values = details
+        .and_then(|d| d.get("values"))
+        .and_then(Value::as_object)
+        .map(|values| {
+            values
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    coded.with_code(class, subclass).with_values(values)
 }
 
 /// Map the steward's wire-op error envelope to a
@@ -502,14 +603,19 @@ fn plugin_system_principal() -> evo_runtime_http::Principal {
 /// Capabilities the framework grants to in-process plugin
 /// dispatches: `network_admin`, the household network door, so a
 /// glass `library.remove_source` can reach the USB writer behind it
-/// without a second password. The rank is StepUp, which lets a nest
-/// carry the sitting of the consumer it serves into a step-up verb;
-/// the rank is never a sitting of its own. Destination manifests
-/// still gate. This set is not the operator bootstrap —
-/// `system_admin` stays off it.
+/// without a second password, and `write:plugins`, which a verb that
+/// declares no capability needs, so one plugin reaches another's
+/// undeclared verbs as it always has. The `network_admin` rank is
+/// StepUp, which lets a nest carry the sitting of the consumer it
+/// serves into a step-up verb; the rank is never a sitting of its own.
+/// Destination manifests still gate. This set is not the operator
+/// bootstrap — `system_admin` stays off it.
 fn plugin_system_capabilities() -> evo_auth_bearer::CapabilitySet {
     use evo_auth_bearer::{Capability, CapabilitySet};
-    CapabilitySet::new(vec![Capability::step_up("network_admin")])
+    CapabilitySet::new(vec![
+        Capability::step_up("network_admin"),
+        Capability::write("plugins"),
+    ])
 }
 
 #[cfg(test)]
@@ -534,6 +640,12 @@ mod tests {
                 .iter()
                 .any(|c| c.scope() == "system_admin"),
             "plugin-system must not hold system_admin"
+        );
+        assert!(
+            set.satisfies(&evo_projection_core::CapabilityRequirement::write(
+                "plugins"
+            )),
+            "a nest must reach another plugin's undeclared verbs"
         );
     }
 
@@ -651,7 +763,8 @@ mod tests {
         let bytes = b"{\"v\":1,\"status\":\"ok\"}".to_vec();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let env = serde_json::json!({ "payload_b64": b64 });
-        let decoded = decode_dispatch_response(env).unwrap();
+        let decoded =
+            decode_dispatch_response(env).map_err(|e| e.kind).unwrap();
         assert_eq!(decoded, bytes);
     }
 
@@ -664,7 +777,7 @@ mod tests {
                 "details": { "shelf": "artwork.providers" }
             }
         });
-        match decode_dispatch_response(env) {
+        match decode_dispatch_response(env).map_err(|e| e.kind) {
             Err(ShelfDispatchError::NoPluginOnShelf { shelf }) => {
                 assert_eq!(shelf, "artwork.providers");
             }
@@ -675,9 +788,65 @@ mod tests {
     #[test]
     fn decode_malformed_envelope_is_substrate_failure() {
         let env = serde_json::json!({ "unexpected_field": 42 });
-        match decode_dispatch_response(env) {
+        match decode_dispatch_response(env).map_err(|e| e.kind) {
             Err(ShelfDispatchError::SubstrateFailure { .. }) => {}
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    /// A destination error of `class`, coded `share_busy`, naming the
+    /// share.
+    fn coded_error(class: &str) -> Value {
+        serde_json::json!({
+            "class": class,
+            "message": "the share is in use",
+            "details": {
+                "subclass": "share_busy",
+                "values": { "share": "Music", "minutes": 30 },
+            },
+        })
+    }
+
+    #[test]
+    fn a_coded_error_keeps_its_code_and_values_for_every_class() {
+        use evo_plugin_sdk::error_taxonomy::ErrorClass;
+        for (wire, class) in [
+            ("transient", ErrorClass::Transient),
+            ("contract_violation", ErrorClass::ContractViolation),
+            ("permission_denied", ErrorClass::PermissionDenied),
+            ("not_found", ErrorClass::NotFound),
+            ("unavailable", ErrorClass::Unavailable),
+            ("internal", ErrorClass::Internal),
+        ] {
+            let coded = coded_error_payload(&coded_error(wire));
+            assert_eq!(coded.class, Some(class), "{wire}");
+            assert_eq!(coded.subclass.as_deref(), Some("share_busy"), "{wire}");
+            assert_eq!(coded.values["share"], serde_json::json!("Music"));
+            assert_eq!(coded.values["minutes"], serde_json::json!(30));
+        }
+    }
+
+    #[test]
+    fn a_coded_error_is_still_the_failure_dispatch_answers() {
+        for wire in ["transient", "contract_violation", "permission_denied"] {
+            let err = coded_error(wire);
+            assert_eq!(
+                format!("{:?}", coded_error_payload(&err).kind),
+                format!("{:?}", classify_error_payload(&err)),
+                "{wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_error_without_a_code_carries_none() {
+        let err = serde_json::json!({
+            "class": "transient",
+            "message": "blip",
+        });
+        let coded = coded_error_payload(&err);
+        assert_eq!(coded.class, None);
+        assert_eq!(coded.subclass, None);
+        assert!(coded.values.is_empty());
     }
 }

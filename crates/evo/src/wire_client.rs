@@ -1220,6 +1220,20 @@ fn plugin_error_to_wire_error(
             })),
         };
     }
+    // WithValues: the same, with the values beside the subclass.
+    if let (PluginError::WithValues { class, message, .. }, Some(mut details)) =
+        (&err, err.coded_details())
+    {
+        details["op"] = serde_json::Value::from(op);
+        return WireFrame::Error {
+            v,
+            cid,
+            plugin,
+            class: *class,
+            message: message.clone(),
+            details: Some(details),
+        };
+    }
 
     let class = match &err {
         PluginError::Transient(_) | PluginError::Timeout { .. } => {
@@ -3184,8 +3198,12 @@ async fn forward_plugin_request(
                 // stamped on the wire frame (connection identity)
                 // rather than the in-process `"plugin-system"`
                 // principal. See shelf_dispatcher.rs module docs.
+                // Coded: the answer keeps the destination's code and
+                // values beside the dispatch error, for a plugin that
+                // asks `dispatch_coded`; one that asks `dispatch` reads
+                // the dispatch error alone, as it always has.
                 match dispatcher
-                    .dispatch_as_caller(
+                    .dispatch_coded_as_caller(
                         &plugin,
                         &shelf,
                         &request_type,
@@ -5084,6 +5102,30 @@ fn wire_error_to_plugin_error(
                 .and_then(|v| v.as_str())
                 .map(str::to_owned)
             {
+                // Values beside the subclass restore WithValues; a
+                // subclass alone restores WithSubclass, as it always has.
+                let values: std::collections::BTreeMap<
+                    String,
+                    serde_json::Value,
+                > = details
+                    .as_ref()
+                    .and_then(|d| d.get("values"))
+                    .and_then(|v| v.as_object())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .map(|(name, value)| (name.clone(), value.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !values.is_empty() {
+                    return PluginError::WithValues {
+                        class,
+                        subclass,
+                        message,
+                        values,
+                    };
+                }
                 return PluginError::WithSubclass {
                     class,
                     subclass,
@@ -10217,5 +10259,196 @@ name = "track"
             }
             other => panic!("expected Refused, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wire_error_restores_with_values_from_details() {
+        let err = WireClientError::PluginReturnedError {
+            message: "the share is in use".into(),
+            class: ErrorClass::Transient,
+            details: Some(serde_json::json!({
+                "subclass": "share_busy",
+                "values": { "share": "Music", "minutes": 30 },
+            })),
+        };
+        match wire_error_to_plugin_error(err, "handle_request") {
+            PluginError::WithValues {
+                class,
+                subclass,
+                message,
+                values,
+            } => {
+                assert_eq!(class, ErrorClass::Transient);
+                assert_eq!(subclass, "share_busy");
+                assert_eq!(message, "the share is in use");
+                assert_eq!(values["share"], serde_json::json!("Music"));
+                assert_eq!(values["minutes"], serde_json::json!(30));
+            }
+            other => panic!("expected PluginError::WithValues, got {other:?}"),
+        }
+        // No values: the subclass alone, as it always was.
+        let err = WireClientError::PluginReturnedError {
+            message: "no responder".into(),
+            class: ErrorClass::PermissionDenied,
+            details: Some(serde_json::json!({
+                "subclass": "no_responder_available",
+                "values": {},
+            })),
+        };
+        assert!(matches!(
+            wire_error_to_plugin_error(err, "handle_request"),
+            PluginError::WithSubclass { .. }
+        ));
+    }
+
+    #[test]
+    fn a_steward_error_with_values_reaches_the_plugin_with_them() {
+        let frame = plugin_error_to_wire_error(
+            1,
+            7,
+            "org.test.peer".into(),
+            "subject_lookup",
+            PluginError::WithValues {
+                class: ErrorClass::ContractViolation,
+                subclass: "too_long".into(),
+                message: "the name is too long".into(),
+                values: [("limit".to_string(), serde_json::json!(64))]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        let WireFrame::Error {
+            class,
+            message,
+            details,
+            ..
+        } = frame
+        else {
+            panic!("expected an Error frame");
+        };
+        assert_eq!(class, ErrorClass::ContractViolation);
+        assert_eq!(message, "the name is too long");
+        assert_eq!(
+            details,
+            Some(serde_json::json!({
+                "subclass": "too_long",
+                "values": { "limit": 64 },
+                "op": "subject_lookup",
+            }))
+        );
+    }
+
+    // A nested dispatch keeps the destination's code and values for an
+    // out-of-process plugin that asks `dispatch_coded`, whatever the
+    // class; one that reads the frame as `dispatch` does reads the
+    // failure it always did.
+    struct CodingDispatcher;
+
+    impl evo_plugin_sdk::contract::ShelfRequestDispatcher for CodingDispatcher {
+        fn dispatch<'a>(
+            &'a self,
+            _shelf: &'a str,
+            _request_type: &'a str,
+            _payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::ShelfDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { panic!("the steward asks the coded path") })
+        }
+
+        fn dispatch_coded_as_caller<'a>(
+            &'a self,
+            _caller_plugin: &'a str,
+            _shelf: &'a str,
+            _request_type: &'a str,
+            _payload: Vec<u8>,
+            _instance_id: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Vec<u8>,
+                            evo_plugin_sdk::contract::CodedDispatchError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            use evo_plugin_sdk::contract::{
+                CodedDispatchError, ShelfDispatchError,
+            };
+            Box::pin(async {
+                Err(CodedDispatchError::new(ShelfDispatchError::Transient {
+                    detail: "the share is in use".into(),
+                })
+                .with_code(ErrorClass::Transient, "share_busy")
+                .with_values(
+                    [("share".to_string(), serde_json::json!("Music"))]
+                        .into_iter()
+                        .collect(),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_coded_nest_reaches_the_plugin_with_its_code_and_values() {
+        use evo_plugin_sdk::contract::{
+            CodedDispatchError, ShelfDispatchError,
+        };
+        let mut sink = sink_with_subject_admin(None);
+        sink.shelf_request_dispatcher = Some(Arc::new(CodingDispatcher));
+        let (out_tx, mut out_rx) = mpsc::channel::<WireFrame>(4);
+        let request = WireFrame::ShelfDispatchRequest {
+            v: PROTOCOL_VERSION,
+            cid: 92,
+            plugin: "org.test.relay".into(),
+            shelf: "network.shares".into(),
+            request_type: "network.share.remove".into(),
+            payload: b"{}".to_vec(),
+            instance_id: None,
+        };
+        forward_plugin_request(request, &sink, &out_tx).await;
+
+        let sent = out_rx.recv().await.expect("response frame");
+        let bytes = evo_plugin_sdk::codec::encode_json(&sent).unwrap();
+        let received = evo_plugin_sdk::codec::decode_json(&bytes).unwrap();
+        let WireFrame::Error {
+            message, details, ..
+        } = received
+        else {
+            panic!("expected an Error frame, got {received:?}");
+        };
+        let coded = CodedDispatchError::from_wire(
+            &message,
+            details.as_ref(),
+            "network.shares",
+            "network.share.remove",
+        );
+        assert!(
+            matches!(&coded.kind, ShelfDispatchError::Transient { .. }),
+            "{coded:?}"
+        );
+        assert_eq!(coded.class, Some(ErrorClass::Transient));
+        assert_eq!(coded.subclass.as_deref(), Some("share_busy"));
+        assert_eq!(coded.values["share"], serde_json::json!("Music"));
+        assert!(matches!(
+            ShelfDispatchError::from_wire(
+                &message,
+                details.as_ref(),
+                "network.shares",
+                "network.share.remove",
+            ),
+            ShelfDispatchError::Transient { .. }
+        ));
     }
 }

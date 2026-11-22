@@ -1714,7 +1714,7 @@ async fn a_read_bearer_does_not_pass_a_write_verb() {
 
     let reader = mint_bearer(
         &booted,
-        vec![Capability::write("plugins"), Capability::read(GATED_SCOPE)],
+        vec![Capability::write("request"), Capability::read(GATED_SCOPE)],
     );
     let (status, body) =
         post_as(&booted, &reader, "request", request_body()).await;
@@ -1727,7 +1727,7 @@ async fn a_read_bearer_does_not_pass_a_write_verb() {
 
     let writer = mint_bearer(
         &booted,
-        vec![Capability::write("plugins"), Capability::write(GATED_SCOPE)],
+        vec![Capability::write("request"), Capability::write(GATED_SCOPE)],
     );
     let (status, body) =
         post_as(&booted, &writer, "request", request_body()).await;
@@ -1744,7 +1744,7 @@ async fn a_bound_at_read_rank_keeps_the_lan_off_the_network_writer() {
         open_policy(),
         LanPrivilege::default(),
         Some(CapabilitySet::new(vec![
-            Capability::write("plugins"),
+            Capability::write("request"),
             Capability::read("network_admin"),
         ])),
     )
@@ -1762,7 +1762,7 @@ async fn a_bound_at_read_rank_keeps_the_lan_off_the_network_writer() {
         open_policy(),
         LanPrivilege::default(),
         Some(CapabilitySet::new(vec![
-            Capability::write("plugins"),
+            Capability::write("request"),
             Capability::write("network_admin"),
         ])),
     )

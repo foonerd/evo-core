@@ -88,6 +88,16 @@ removes it, all in the same directory.
 `EVO_HTTPS_STATE_DIR` overrides the parent dir for `https/`; default is
 the persistence-store parent.
 
+When the listener does not start (the address does not parse or bind,
+its state cannot be read or written, or the distribution's
+`HttpsSetup` fails), the steward logs the failure at `error` and runs on
+its local socket alone. A distribution whose steward is of no use
+without HTTPS sets `RunOptions::with_https_requirement(HttpsRequirement::Required)`.
+Then a listener that does not start, or an unset
+`EVO_HTTPS_LISTEN_ADDR`, ends `evo::run` with an error before the local
+socket is bound, and the process exits non-zero. The shipped `evo`
+binary keeps the default, `HttpsRequirement::Optional`.
+
 A connection the listener has accepted but that has not yet sent a
 request is bounded two ways:
 

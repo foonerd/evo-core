@@ -2,13 +2,19 @@
 #
 # scripts/release/cut-release.sh — cut(V) workstation half.
 #
-# Operator input is --tag only (vV or V). The machine:
+# Operator input is --tag (+ channel). The machine:
+#   0. Refuses unless every eng checkout is on the cut's own branch
+#      (named vV) with a clean tree, before anything is written
 #   1. Writes V into eng trees (CUT_VERSION / VERSION / pins)
-#   2. Commits + tags eng tip as vV
+#   2. Commits + tags eng tip as vV; tags the schemas and core eng
+#      tips as vV too, so every promote archives the tip it is given
 #   3. pre-tag-check + promote in order:
 #        schemas → core → audio → evo-ui → evo-kiosk
+#      Each promote pushes public tag AND creates GitHub Release
+#      vV on that sibling. Tag alone is refused.
 #   4. Dispatches public foonerd/evo-device-audio cut.yml with
-#      that same tag (pieces → wait slots → bake)
+#      tag + channel (sibling Releases belt-check → pieces →
+#      wait → bake → channel __cut__)
 #
 # Each promote step is REFUSED if its pre-tag-check does not pass
 # locally. Any refusal aborts the cut (no partial promotion).
@@ -63,7 +69,8 @@ Usage: $(basename "$0") \\
     [--no-push] \\
     [--skip-public-cut]
 
-cut(V): write V, promote five repos, dispatch public cut.yml.
+cut(V): write V, promote five repos (tag + GitHub Release each),
+dispatch public cut.yml (releases belt-check → pieces → bake → channel).
 EOF
     exit 1
 }
@@ -86,6 +93,12 @@ done
 [[ -z "${TAG}" ]]    && { echo "--tag required" >&2; exit 1; }
 [[ -z "${CONFIG}" ]] && { echo "--config required" >&2; exit 1; }
 [[ -r "${CONFIG}" ]] || { echo "config not readable: ${CONFIG}" >&2; exit 1; }
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# The identity a cut's own commits carry.
+CUT_COMMIT_NAME="Just a nerd"
+CUT_COMMIT_EMAIL="157698061+foonerd@users.noreply.github.com"
 
 log() { printf '\n[cut-release] %s\n' "$*" >&2; }
 die() { printf '\n[cut-release] REFUSE: %s\n' "$*" >&2; exit 1; }
@@ -217,66 +230,105 @@ commit_cut_version_and_tag() {
         fi
         if [[ -n "$(git status --porcelain)" ]]; then
             git add -A
-            git commit -m "cut(${CUT_V}): set cut version"
+            GIT_AUTHOR_NAME="${CUT_COMMIT_NAME}" \
+                GIT_AUTHOR_EMAIL="${CUT_COMMIT_EMAIL}" \
+                GIT_COMMITTER_NAME="${CUT_COMMIT_NAME}" \
+                GIT_COMMITTER_EMAIL="${CUT_COMMIT_EMAIL}" \
+                git commit -m "cut(${CUT_V}): set cut version"
         fi
-        if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
-            if (( ALLOW_RETAG == 1 )); then
-                git tag -f "${TAG}" HEAD
-            else
-                # Tag already points somewhere; refuse drift unless --allow-retag.
-                tip="$(git rev-parse HEAD)"
-                tagged="$(git rev-parse "${TAG}^{}")"
-                if [[ "${tip}" != "${tagged}" ]]; then
-                    echo "${repo_name}: tag ${TAG} exists at ${tagged}, HEAD is ${tip}; pass --allow-retag" >&2
-                    exit 1
-                fi
-            fi
-        else
-            git tag "${TAG}" HEAD
-        fi
+        tag_head "${repo_name}"
     ) || die "${repo_name}: write cut version / tag failed"
 }
 
+# Mint (or, with --allow-retag, move) eng tag vV at HEAD of the current
+# directory. Refuses a tag that already points elsewhere unless
+# --allow-retag was given.
+tag_head() {
+    local repo_name="$1"
+    if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+        if (( ALLOW_RETAG == 1 )); then
+            git tag -f "${TAG}" HEAD
+        else
+            local tip tagged
+            tip="$(git rev-parse HEAD)"
+            tagged="$(git rev-parse "${TAG}^{}")"
+            if [[ "${tip}" != "${tagged}" ]]; then
+                echo "${repo_name}: tag ${TAG} exists at ${tagged}, HEAD is ${tip}; pass --allow-retag" >&2
+                exit 1
+            fi
+        fi
+    else
+        git tag "${TAG}" HEAD
+    fi
+}
+
+# Tag an eng tip that carries no cut-version file (schemas, core), so
+# its promote archives the tip the cut was given.
+tag_cut_tip() {
+    local repo_path="$1" repo_name="$2"
+    log "${repo_name}: tag ${TAG} at its tip"
+    if (( DRY_RUN == 1 )); then
+        log "${repo_name}: dry-run — would tag ${TAG} at $(git -C "${repo_path}" rev-parse --short HEAD)"
+        return 0
+    fi
+    (cd "${repo_path}" && tag_head "${repo_name}") \
+        || die "${repo_name}: tag failed"
+}
+
+watch_workflow_run() {
+    local repo="$1" workflow="$2" label="$3"
+    local before run_id cand
+    before="$(gh run list --repo "${repo}" --workflow="${workflow}" \
+        --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+    run_id=""
+    for _ in $(seq 1 45); do
+        sleep 4
+        cand="$(gh run list --repo "${repo}" --workflow="${workflow}" \
+            --limit 1 --json databaseId --jq '.[0].databaseId')"
+        if [[ -n "${cand}" && "${cand}" != "${before}" ]]; then
+            run_id="${cand}"
+            break
+        fi
+    done
+    [[ -n "${run_id}" ]] || die "no ${label} run appeared for ${workflow}"
+    log "watching ${label} run ${run_id}"
+    gh run watch "${run_id}" --repo "${repo}" --exit-status \
+        || die "${label} run ${run_id} failed"
+}
+
 dispatch_public_cut() {
-    local run_id
-    log "=== Public cut.yml: pieces → wait slots → bake (${TAG}) ==="
+    log "=== Public cut.yml (mint → wait → bake) for ${TAG} ==="
     if (( SKIP_PUBLIC_CUT == 1 )); then
-        log "skip-public-cut set; not dispatching cut.yml"
+        log "skip-public-cut set; not dispatching public cut"
         return 0
     fi
     if (( DRY_RUN == 1 )) || (( NO_PUSH == 1 )); then
-        log "dry-run/no-push — would: gh workflow run cut.yml -f tag=${TAG}"
+        log "dry-run/no-push — would: gh workflow run cut.yml -f tag=${TAG} -f channel=${CHANNEL}"
         return 0
     fi
-    command -v gh >/dev/null || die "gh CLI required to dispatch public cut.yml"
+    command -v gh >/dev/null || die "gh CLI required to dispatch public cut"
+
+    # Piece mints + sibling Release belt-check + channel live inside
+    # cut.yml. Workstation only kicks it; tag alone is not a cut.
+    log "dispatch cut.yml -f tag=${TAG} -f channel=${CHANNEL}"
     gh workflow run cut.yml \
         --repo foonerd/evo-device-audio \
         -f "tag=${TAG}" \
+        -f "channel=${CHANNEL}" \
         || die "failed to dispatch public cut.yml for ${TAG}"
-    # Resolve the run we just kicked and block until it finishes.
-    sleep 5
-    run_id="$(gh run list --repo foonerd/evo-device-audio \
-        --workflow=cut.yml --limit 5 --json databaseId,event,displayTitle,status,createdAt \
-        --jq "[.[] | select(.displayTitle | test(\"${TAG}\"))] | .[0].databaseId // empty")"
-    if [[ -z "${run_id}" ]]; then
-        run_id="$(gh run list --repo foonerd/evo-device-audio \
-            --workflow=cut.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
-    fi
-    [[ -n "${run_id}" ]] || die "could not find cut.yml run for ${TAG}"
-    log "watching cut.yml run ${run_id}"
-    gh run watch "${run_id}" --repo foonerd/evo-device-audio --exit-status \
-        || die "public cut.yml run ${run_id} failed"
-    log "public cut.yml PASS for ${TAG}"
+    watch_workflow_run foonerd/evo-device-audio cut.yml "cut.yml through-and-through"
+    log "public cut PASS for ${TAG} (releases + pieces + bake + channel ${CHANNEL})"
 }
 
 log "Cut order:"
-log "  0. write cut(${CUT_V}) on eng audio / ui / kiosk + eng tag ${TAG}"
+log "  0. every eng checkout on ${TAG} and clean; write cut(${CUT_V}) on eng"
+log "     audio / ui / kiosk; eng tag ${TAG} on all five"
 log "  1. evo-catalogue-schemas"
 log "  2. evo-core"
 log "  3. evo-device-audio"
 log "  4. evo-ui"
 log "  5. evo-kiosk"
-log "  6. public cut.yml (pieces → wait → bake)"
+log "  6. public cut.yml (sibling Releases → pieces → bake → channel ${CHANNEL})"
 log "Tag: ${TAG}"
 log "Channel: ${CHANNEL}"
 log "Prev-tag: ${PREV_TAG:-<auto>}"
@@ -285,12 +337,18 @@ if (( DRY_RUN == 1 )); then
     log "Mode: dry-run (no repo mutations)"
 fi
 
-# ---- Step 0: V reaches eng tags ----
+# ---- Step 0: every eng checkout on the cut's branch, then V reaches eng tags ----
+log "=== Step 0: eng checkouts on ${TAG} ==="
+bash "${SCRIPT_DIR}/check-cut-checkouts.sh" "${TAG}" \
+    "${SCHEMAS_ENG}" "${CORE_ENG}" "${AUDIO_ENG}" "${UI_ENG}" "${KIOSK_ENG}" \
+    || die "every eng checkout must be on branch ${TAG} with a clean tree before the cut writes anything"
 commit_cut_version_and_tag "${AUDIO_ENG}" "evo-device-audio (eng)" \
     "${AUDIO_ENG}/scripts/release/set-cut-version.sh"
 commit_cut_version_and_tag "${UI_ENG}" "evo-ui-eng" \
     "${UI_ENG}/scripts/release/set-cut-version.sh"
 commit_cut_version_and_tag "${KIOSK_ENG}" "evo-kiosk-eng" ""
+tag_cut_tip "${SCHEMAS_ENG}" "evo-catalogue-schemas"
+tag_cut_tip "${CORE_ENG}" "evo-core (eng)"
 
 # ---- Step 1: evo-catalogue-schemas ----
 

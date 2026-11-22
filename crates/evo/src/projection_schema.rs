@@ -117,9 +117,11 @@ pub fn canonical_schema() -> Vec<WireOp> {
 
     // Streaming subscriptions — read scope, no per-frame audit
     // (the subscription start is the auditable event if any).
-    s.read(
+    // Any caller may open the stream. It delivers each happening only
+    // to a session that holds the read scope of what it reports, so a
+    // caller that holds no read hears nothing.
+    s.anonymous(
         "subscribe_happenings",
-        "subjects",
         "Subscribe to the durable happenings bus with optional cursor replay.",
     );
     s.read(
@@ -131,9 +133,12 @@ pub fn canonical_schema() -> Vec<WireOp> {
     // Plugin dispatch — write scope. The plugin handles its own
     // dispatch-level audit via the framework's ledger primitive;
     // we do not double-emit at the projection layer.
+    // `request` is the dispatch key. A verb that declares a capability
+    // needs it as well; one that declares none needs `write:plugins`
+    // (both checked at the plugin gate).
     s.write(
         "request",
-        "plugins",
+        "request",
         "Dispatch a plugin request on a specific shelf.",
     );
     s.write(

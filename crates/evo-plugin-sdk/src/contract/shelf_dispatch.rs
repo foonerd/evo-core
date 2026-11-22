@@ -159,6 +159,64 @@ pub trait ShelfRequestDispatcher: Send + Sync {
     > {
         self.dispatch(shelf, request_type, payload, instance_id)
     }
+
+    /// [`Self::dispatch`], answering a failure with the code and values
+    /// it carried, whatever its class. See [`CodedDispatchError`]; its
+    /// [`kind`](CodedDispatchError::kind) is what [`Self::dispatch`]
+    /// answers.
+    ///
+    /// The default forwards to [`Self::dispatch`] and carries no code.
+    /// The steward's dispatchers, in process and over the wire, carry
+    /// it.
+    fn dispatch_coded<'a>(
+        &'a self,
+        shelf: &'a str,
+        request_type: &'a str,
+        payload: Vec<u8>,
+        instance_id: Option<&'a str>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<u8>, CodedDispatchError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.dispatch(shelf, request_type, payload, instance_id)
+                .await
+                .map_err(CodedDispatchError::from)
+        })
+    }
+
+    /// [`Self::dispatch_as_caller`], answering a failure as
+    /// [`Self::dispatch_coded`] does. The default forwards to
+    /// [`Self::dispatch_as_caller`] and carries no code.
+    fn dispatch_coded_as_caller<'a>(
+        &'a self,
+        caller_plugin: &'a str,
+        shelf: &'a str,
+        request_type: &'a str,
+        payload: Vec<u8>,
+        instance_id: Option<&'a str>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<u8>, CodedDispatchError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.dispatch_as_caller(
+                caller_plugin,
+                shelf,
+                request_type,
+                payload,
+                instance_id,
+            )
+            .await
+            .map_err(CodedDispatchError::from)
+        })
+    }
 }
 
 /// Failure modes surfaced by a [`ShelfRequestDispatcher::dispatch`]
@@ -376,6 +434,135 @@ impl ShelfDispatchError {
     }
 }
 
+/// A nested dispatch's failure, with the code and values the error
+/// carried, whatever its class.
+///
+/// [`ShelfRequestDispatcher::dispatch`] answers with a
+/// [`ShelfDispatchError`] alone, which keeps an error's subclass for a
+/// refusal only. [`ShelfRequestDispatcher::dispatch_coded`] answers
+/// with this: the same [`Self::kind`], and beside it the class,
+/// subclass and values of the error the destination or the steward
+/// gave. A plugin that dispatched on a consumer's behalf can hand the
+/// consumer the error it would have met asking directly.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{kind}")]
+#[non_exhaustive]
+pub struct CodedDispatchError {
+    /// How the dispatch failed, as [`ShelfRequestDispatcher::dispatch`]
+    /// reports it.
+    pub kind: ShelfDispatchError,
+    /// The error's class, when it carried a code.
+    pub class: Option<crate::error_taxonomy::ErrorClass>,
+    /// The error's subclass, when it carried one.
+    pub subclass: Option<String>,
+    /// The values the error names, each under its name. Empty when it
+    /// named none.
+    pub values: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl CodedDispatchError {
+    /// A failure that carried no code.
+    pub fn new(kind: ShelfDispatchError) -> Self {
+        Self {
+            kind,
+            class: None,
+            subclass: None,
+            values: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The failure with the class and subclass its error carried.
+    #[must_use]
+    pub fn with_code(
+        mut self,
+        class: crate::error_taxonomy::ErrorClass,
+        subclass: impl Into<String>,
+    ) -> Self {
+        self.class = Some(class);
+        self.subclass = Some(subclass.into());
+        self
+    }
+
+    /// The failure with the values its error named.
+    #[must_use]
+    pub fn with_values(
+        mut self,
+        values: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Self {
+        self.values = values;
+        self
+    }
+
+    /// The `details` object the steward puts on the wire error frame
+    /// it answers an out-of-process plugin's coded dispatch with:
+    /// [`ShelfDispatchError::wire_details`], and, when the error carried
+    /// a code, a `coded` object beside it holding `class`, `subclass`
+    /// and, when there are any, `values`. A plugin built against an SDK
+    /// that predates this reads the same [`ShelfDispatchError`] it
+    /// always did. [`Self::from_wire`] is the reader.
+    pub fn wire_details(&self) -> serde_json::Value {
+        let mut details = self.kind.wire_details();
+        if let (Some(class), Some(subclass)) = (self.class, &self.subclass) {
+            let mut coded = serde_json::json!({
+                "class": class,
+                "subclass": subclass,
+            });
+            if !self.values.is_empty() {
+                coded["values"] = serde_json::Value::Object(
+                    self.values.clone().into_iter().collect(),
+                );
+            }
+            details["coded"] = coded;
+        }
+        details
+    }
+
+    /// Rebuild the failure from the wire error frame a coded dispatch
+    /// was answered with. The [`Self::kind`] is
+    /// [`ShelfDispatchError::from_wire`] of the same frame.
+    pub fn from_wire(
+        message: &str,
+        details: Option<&serde_json::Value>,
+        shelf: &str,
+        request_type: &str,
+    ) -> Self {
+        let mut coded = Self::new(ShelfDispatchError::from_wire(
+            message,
+            details,
+            shelf,
+            request_type,
+        ));
+        let code = details.and_then(|d| d.get("coded"));
+        let class = code
+            .and_then(|c| c.get("class"))
+            .and_then(|c| serde_json::from_value(c.clone()).ok());
+        let subclass = code
+            .and_then(|c| c.get("subclass"))
+            .and_then(serde_json::Value::as_str);
+        if let (Some(class), Some(subclass)) = (class, subclass) {
+            coded = coded.with_code(class, subclass);
+            if let Some(values) = code
+                .and_then(|c| c.get("values"))
+                .and_then(serde_json::Value::as_object)
+            {
+                coded = coded.with_values(
+                    values
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                );
+            }
+        }
+        coded
+    }
+}
+
+impl From<ShelfDispatchError> for CodedDispatchError {
+    fn from(kind: ShelfDispatchError) -> Self {
+        Self::new(kind)
+    }
+}
+
 /// Helper trait alias for the boxed-future return type of
 /// [`ShelfRequestDispatcher::dispatch`].
 ///
@@ -535,5 +722,78 @@ mod tests {
         // Compile-time assertion via the helper above; the test
         // body just calls it to anchor the dependency.
         _arc_object_is_thread_safe();
+    }
+
+    fn coded_transient() -> CodedDispatchError {
+        use crate::error_taxonomy::ErrorClass;
+        CodedDispatchError::new(ShelfDispatchError::Transient {
+            detail: "the share is in use".into(),
+        })
+        .with_code(ErrorClass::Transient, "share_busy")
+        .with_values(
+            [
+                ("share".to_string(), serde_json::json!("Music")),
+                ("minutes".to_string(), serde_json::json!(30)),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    }
+
+    #[test]
+    fn a_coded_failure_round_trips_the_wire() {
+        use crate::error_taxonomy::ErrorClass;
+        let sent = coded_transient();
+        let details = sent.wire_details();
+        let read = CodedDispatchError::from_wire(
+            "shelf_dispatch: transient error: the share is in use",
+            Some(&details),
+            "network.shares",
+            "network.share.remove",
+        );
+        assert!(
+            matches!(&read.kind, ShelfDispatchError::Transient { .. }),
+            "{read:?}"
+        );
+        assert_eq!(read.class, Some(ErrorClass::Transient));
+        assert_eq!(read.subclass.as_deref(), Some("share_busy"));
+        assert_eq!(read.values, sent.values);
+    }
+
+    #[test]
+    fn a_reader_that_predates_codes_reads_the_same_failure() {
+        // A plugin on an SDK without `dispatch_coded` reads the frame
+        // with `ShelfDispatchError::from_wire`: the `coded` object is a
+        // key it does not know.
+        let details = coded_transient().wire_details();
+        assert_eq!(details["subclass"], "transient");
+        assert!(matches!(
+            ShelfDispatchError::from_wire(
+                "transient error: the share is in use",
+                Some(&details),
+                "network.shares",
+                "network.share.remove",
+            ),
+            ShelfDispatchError::Transient { .. }
+        ));
+    }
+
+    #[test]
+    fn a_frame_without_a_code_reads_as_a_failure_without_one() {
+        // A steward that predates codes answers without `coded`.
+        let details = ShelfDispatchError::Refused {
+            subclass: "household_policy_locked".into(),
+            detail: "locked".into(),
+        }
+        .wire_details();
+        let read =
+            CodedDispatchError::from_wire("locked", Some(&details), "s", "v");
+        assert!(
+            matches!(&read.kind, ShelfDispatchError::Refused { subclass, .. } if subclass == "household_policy_locked"),
+            "{read:?}"
+        );
+        assert_eq!(read.class, None);
+        assert_eq!(read.subclass, None);
+        assert!(read.values.is_empty());
     }
 }

@@ -418,9 +418,15 @@ async fn handle_connection(
     // operator's own browser on a trusted LAN without a
     // credential, while external API consumers continue to
     // require one.
-    let router = router.layer(axum::Extension(peer));
-
-    let svc = TowerToHyperService::new(router);
+    //
+    // The router is wrapped, not layered. `Router::layer` lays the
+    // layer on every route and fallback, which builds a route table
+    // of the connection's own; the wrap adds the peer to each request
+    // and hands it to the one table every connection shares.
+    let svc = TowerToHyperService::new(tower::Layer::layer(
+        &axum::Extension(peer),
+        router,
+    ));
     let io = TokioIo::new(Rewind {
         first,
         inner: tls_stream,

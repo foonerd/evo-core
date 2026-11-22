@@ -149,8 +149,8 @@ pub use plugin::{
 pub use relations::{RelationAssertion, RelationRetraction};
 pub use respondent::{Request, Respondent, Response};
 pub use shelf_dispatch::{
-    ShelfDispatchError, ShelfDispatchFuture, ShelfRequestDispatcher,
-    HOUSEHOLD_REQUIRE, HOUSEHOLD_SHELF,
+    CodedDispatchError, ShelfDispatchError, ShelfDispatchFuture,
+    ShelfRequestDispatcher, HOUSEHOLD_REQUIRE, HOUSEHOLD_SHELF,
 };
 pub use source_verbs::{ResumeState, SourceVerb, TransportState};
 pub use streams::{

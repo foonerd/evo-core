@@ -471,11 +471,14 @@ pub async fn boot_https(
     //    The bootstrap credential records itself in the
     //    operator inventory so it appears in
     //    `list_bearer_tokens` output and the operator can
-    //    revoke + replace it via the standard flow.
+    //    revoke + replace it via the standard flow. It carries
+    //    what a pair mint carries: the operator bootstrap set and
+    //    every scope the plugins admitted by now declare.
     let bootstrap_token_path = https_dir.join("bootstrap.token");
     let bootstrap_token_b64 = if !bootstrap_token_path.exists() {
         let now = now_ms();
-        let capabilities = operator_bootstrap_capability_set();
+        let capabilities =
+            merged_operator_bootstrap_capability_set(server.plugin_router());
         let token = issuer
             .issue(
                 capabilities.clone(),
@@ -1232,7 +1235,7 @@ pub fn operator_bootstrap_capability_set() -> CapabilitySet {
 }
 
 /// Return the operator bootstrap capability set unioned with
-/// every step-up scope declared by an admitted plugin's
+/// every scope declared by an admitted plugin's
 /// `[capabilities.respondent.verb_capabilities]` or
 /// `[capabilities.warden.verb_capabilities]` manifest map.
 ///
@@ -1249,19 +1252,13 @@ pub fn operator_bootstrap_capability_set() -> CapabilitySet {
 /// wire. The merge closes that gap systemically for every
 /// plugin's declared scopes, not one-by-one.
 ///
-/// Every plugin-added scope enters as `StepUp` because the
-/// only manifest declaration shape that names a scope AND
-/// implies operator-tier authority is `VerbCapability::StepUp`.
-/// Rank fidelity is preserved: a bearer minted from this set
-/// carrying `step_up:network_admin` composes with the runtime
-/// dispatcher's step-up gate the same as any framework-declared
-/// admin scope.
-///
-/// Duplicate scope names are collapsed by [`CapabilitySet`]'s
-/// internal representation on iteration; the framework's
-/// hardcoded entry wins on rank tie (framework already declared
-/// `plugins_admin` as StepUp; a plugin re-declaring the same
-/// scope is a no-op).
+/// A plugin-added scope enters at the highest rank any declaration
+/// gives it (`read` < `write` < `step_up`), so a scope declared
+/// `write` on one verb and `read` on another enters as `write` and
+/// a bearer minted with it passes both. A scope the framework set
+/// already holds keeps the framework's rank: a plugin declaring
+/// `plugins_admin`, or `write` on a scope the framework holds at
+/// `read`, changes nothing.
 pub fn merged_operator_bootstrap_capability_set(
     router: &crate::router::PluginRouter,
 ) -> CapabilitySet {
@@ -1280,11 +1277,11 @@ pub fn merged_operator_bootstrap_capability_set(
 }
 
 /// Pure merge logic: union the base capability set with every
-/// `StepUp` scope observed in the supplied iterator. Non-StepUp
-/// variants and `VerbCapability::None` entries are ignored (only
-/// step-up scopes gate operator-tier authority). Base entries
-/// win on scope-name collision (a plugin re-declaring
-/// `plugins_admin` produces no new entry).
+/// scope observed in the supplied iterator, each at the highest rank
+/// declared for it, in the order the scopes first appear.
+/// `VerbCapability::None` entries name no scope and are ignored.
+/// Base entries win on scope-name collision (a plugin re-declaring
+/// `plugins_admin` produces no new entry and no new rank).
 ///
 /// Isolated from [`merged_operator_bootstrap_capability_set`] so
 /// the merge invariants can be unit-tested against a fixture set
@@ -1297,19 +1294,32 @@ pub(crate) fn merge_bootstrap_with_plugin_scopes<'a>(
 ) -> CapabilitySet {
     use evo_plugin_sdk::manifest::VerbCapability;
     use std::collections::HashSet;
-    let mut seen: HashSet<String> = base
-        .capabilities()
-        .iter()
-        .map(|c| c.scope().to_string())
-        .collect();
-    let mut merged: Vec<Capability> = base.capabilities().to_vec();
+    let framework: HashSet<&str> =
+        base.capabilities().iter().map(|c| c.scope()).collect();
+    // Each scope the plugins add, at the highest rank declared for it:
+    // 1 read, 2 write, 3 step-up.
+    let mut added: Vec<(String, u8)> = Vec::new();
     for cap in verb_capabilities {
-        if let VerbCapability::StepUp { scope } = cap {
-            if seen.insert(scope.clone()) {
-                merged.push(Capability::step_up(scope.as_str()));
-            }
+        let (scope, rank) = match cap {
+            VerbCapability::None => continue,
+            VerbCapability::Read { scope } => (scope, 1),
+            VerbCapability::Write { scope } => (scope, 2),
+            VerbCapability::StepUp { scope } => (scope, 3),
+        };
+        if framework.contains(scope.as_str()) {
+            continue;
+        }
+        match added.iter_mut().find(|(s, _)| s == scope) {
+            Some((_, held)) => *held = (*held).max(rank),
+            None => added.push((scope.clone(), rank)),
         }
     }
+    let mut merged: Vec<Capability> = base.capabilities().to_vec();
+    merged.extend(added.into_iter().map(|(scope, rank)| match rank {
+        1 => Capability::read(scope),
+        2 => Capability::write(scope),
+        _ => Capability::step_up(scope),
+    }));
     CapabilitySet::new(merged)
 }
 
@@ -1796,33 +1806,92 @@ mod tests {
     }
 
     #[test]
-    fn merge_ignores_non_step_up_verb_capabilities() {
-        // Only StepUp variants contribute to the merged set —
-        // Read / Write / None declare per-verb access shape but
-        // do not add operator-tier authority beyond what the
-        // base set already carries.
+    fn merge_admits_plugin_declared_read_and_write_scopes() {
+        // A plugin's own `read` and `write` scopes enter the set a
+        // bearer is minted from, each at its declared rank. `None`
+        // names no scope and adds nothing.
         use evo_plugin_sdk::manifest::VerbCapability;
         let base = operator_bootstrap_capability_set();
         let plugin_declared = [
             VerbCapability::None,
             VerbCapability::Read {
-                scope: "some_read_scope".to_string(),
+                scope: "voucher_list".to_string(),
             },
             VerbCapability::Write {
-                scope: "some_write_scope".to_string(),
+                scope: "voucher_issue".to_string(),
             },
         ];
         let merged =
             merge_bootstrap_with_plugin_scopes(&base, plugin_declared.iter());
+        assert_eq!(merged.len(), base.len() + 2);
+        let added: Vec<&Capability> =
+            merged.capabilities()[base.len()..].iter().collect();
         assert_eq!(
-            merged.len(),
-            base.len(),
-            "non-StepUp variants must not change the merged set size"
+            added,
+            vec![
+                &Capability::read("voucher_list"),
+                &Capability::write("voucher_issue"),
+            ]
         );
-        let scopes: Vec<&str> =
-            merged.capabilities().iter().map(|c| c.scope()).collect();
-        assert!(!scopes.contains(&"some_read_scope"));
-        assert!(!scopes.contains(&"some_write_scope"));
+    }
+
+    #[test]
+    fn merge_takes_the_highest_rank_declared_for_a_scope() {
+        // One scope declared at several ranks, by one plugin or many,
+        // in any order, enters once at the highest of them, so a bearer
+        // minted with it passes every verb that declares it.
+        use evo_plugin_sdk::manifest::VerbCapability;
+        let base = operator_bootstrap_capability_set();
+        let read = |s: &str| VerbCapability::Read {
+            scope: s.to_string(),
+        };
+        let write = |s: &str| VerbCapability::Write {
+            scope: s.to_string(),
+        };
+        let step_up = |s: &str| VerbCapability::StepUp {
+            scope: s.to_string(),
+        };
+        let plugin_declared = [
+            read("voucher_issue"),
+            write("voucher_issue"),
+            read("voucher_issue"),
+            write("desk_admin"),
+            step_up("desk_admin"),
+            read("desk_admin"),
+        ];
+        let merged =
+            merge_bootstrap_with_plugin_scopes(&base, plugin_declared.iter());
+        assert_eq!(
+            merged.capabilities()[base.len()..].to_vec(),
+            vec![
+                Capability::write("voucher_issue"),
+                Capability::step_up("desk_admin"),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_never_raises_a_framework_scope() {
+        // The framework's set holds `system` and `audio` at read and
+        // the admin scopes at step-up. A plugin declaring another rank
+        // on them changes nothing: a plugin manifest cannot widen what
+        // every pair and kiosk bearer holds on the framework's scopes.
+        use evo_plugin_sdk::manifest::VerbCapability;
+        let base = operator_bootstrap_capability_set();
+        let plugin_declared = [
+            VerbCapability::Write {
+                scope: "system".to_string(),
+            },
+            VerbCapability::StepUp {
+                scope: "audio".to_string(),
+            },
+            VerbCapability::Read {
+                scope: "network_admin".to_string(),
+            },
+        ];
+        let merged =
+            merge_bootstrap_with_plugin_scopes(&base, plugin_declared.iter());
+        assert_eq!(merged, base);
     }
 
     #[test]

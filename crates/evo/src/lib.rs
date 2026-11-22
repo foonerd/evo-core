@@ -1186,6 +1186,33 @@ pub struct RunOptions {
     /// [`Self::with_no_bearer_capabilities`]. `None` (the default)
     /// keeps the no-bearer sets every steward has had.
     pub no_bearer_capabilities: Option<evo_auth_bearer::CapabilitySet>,
+
+    /// Whether the steward runs without its HTTPS listener. See
+    /// [`HttpsRequirement`]. Defaults to
+    /// [`HttpsRequirement::Optional`].
+    pub https_requirement: HttpsRequirement,
+}
+
+/// Whether [`run`] keeps the steward running when its HTTPS listener
+/// does not start.
+///
+/// The listener starts when `EVO_HTTPS_LISTEN_ADDR` is set. It does
+/// not start when that address does not parse or bind, when its state
+/// cannot be read or written, or when the distribution's
+/// [`HttpsSetup`] fails.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HttpsRequirement {
+    /// The steward runs on its local socket alone when HTTPS is not
+    /// configured, and when the listener does not start; the failure
+    /// is logged at `error`. The shape for a device that may run with
+    /// no network face.
+    #[default]
+    Optional,
+    /// The steward does not run without its HTTPS listener. When
+    /// `EVO_HTTPS_LISTEN_ADDR` is unset, or the listener does not
+    /// start, [`run`] returns an error before it binds the local
+    /// socket, so the process exits non-zero.
+    Required,
 }
 
 /// What a no-bearer caller whose effective origin is the LAN is
@@ -1229,6 +1256,7 @@ impl RunOptions {
             household_groups: None,
             lan_privilege: LanPrivilege::default(),
             no_bearer_capabilities: None,
+            https_requirement: HttpsRequirement::default(),
         }
     }
 
@@ -1244,6 +1272,7 @@ impl RunOptions {
             household_groups: None,
             lan_privilege: LanPrivilege::default(),
             no_bearer_capabilities: None,
+            https_requirement: HttpsRequirement::default(),
         }
     }
 
@@ -1323,6 +1352,57 @@ impl RunOptions {
     ) -> Self {
         self.no_bearer_capabilities = Some(capabilities);
         self
+    }
+
+    /// Choose whether the steward runs without its HTTPS listener.
+    /// See the [`Self::https_requirement`] field and
+    /// [`HttpsRequirement`].
+    #[must_use]
+    pub fn with_https_requirement(
+        mut self,
+        https_requirement: HttpsRequirement,
+    ) -> Self {
+        self.https_requirement = https_requirement;
+        self
+    }
+}
+
+/// What [`run`] keeps of its HTTPS boot under `requirement`: the
+/// listener's handles, nothing (the steward runs on its local socket
+/// alone), or the error that ends the run.
+fn settle_https_boot<T>(
+    requirement: HttpsRequirement,
+    booted: anyhow::Result<Option<T>>,
+) -> anyhow::Result<Option<T>> {
+    match (requirement, booted) {
+        (_, Ok(Some(handles))) => Ok(Some(handles)),
+        (HttpsRequirement::Optional, Ok(None)) => Ok(None),
+        (HttpsRequirement::Optional, Err(e)) => {
+            // LOGGING.md §2: error (fault — the listener asked for did
+            // not start; the steward runs on with no network face).
+            tracing::error!(
+                error = %e,
+                "HTTPS boot failed; UDS listener will run without HTTPS"
+            );
+            Ok(None)
+        }
+        (HttpsRequirement::Required, Ok(None)) => {
+            let e = anyhow::anyhow!(
+                "HTTPS is required and EVO_HTTPS_LISTEN_ADDR is not set"
+            );
+            // LOGGING.md §2: error (fault — a required listener is not
+            // configured; the run ends).
+            tracing::error!(error = %e, "the steward does not start");
+            Err(e)
+        }
+        (HttpsRequirement::Required, Err(e)) => {
+            let e =
+                e.context("HTTPS is required and its listener did not start");
+            // LOGGING.md §2: error (fault — a required listener did not
+            // start; the run ends).
+            tracing::error!(error = %format!("{e:#}"), "the steward does not start");
+            Err(e)
+        }
     }
 }
 
@@ -2445,6 +2525,7 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
         household_groups,
         lan_privilege,
         no_bearer_capabilities,
+        https_requirement,
     } = opts;
     // A subcommand is an operator command, not a boot. Answer it and
     // return before anything a steward starts: config, logging,
@@ -4748,25 +4829,21 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     // listener runs alongside the existing UDS slow-path and
     // (when wired) Fast Path; a single shutdown signal fans out
     // to all three.
-    let https_handles = match maybe_boot_https(
-        Arc::clone(&server),
-        &persistence_path,
-        Some(Arc::clone(&asset_cache)),
-        https_setup,
-        lan_privilege,
-        no_bearer_capabilities,
-    )
-    .await
-    {
-        Ok(handles) => handles,
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "HTTPS boot failed; UDS listener will run without HTTPS"
-            );
-            None
-        }
-    };
+    //
+    // Under `HttpsRequirement::Required` a listener that does not
+    // start ends the run here, before the local socket is bound.
+    let https_handles = settle_https_boot(
+        https_requirement,
+        maybe_boot_https(
+            Arc::clone(&server),
+            &persistence_path,
+            Some(Arc::clone(&asset_cache)),
+            https_setup,
+            lan_privilege,
+            no_bearer_capabilities,
+        )
+        .await,
+    )?;
 
     // Hand the bearer-token issuer + credential store +
     // revocation list to the shared steward state so the
@@ -5259,4 +5336,69 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     // the top of run().
     tracing::info!("evo exited");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn https_is_optional_unless_a_distribution_requires_it() {
+        assert_eq!(HttpsRequirement::default(), HttpsRequirement::Optional);
+        let args = <cli::Args as clap::Parser>::parse_from(["evo"]);
+        assert_eq!(
+            RunOptions::from_args(args).https_requirement,
+            HttpsRequirement::Optional
+        );
+    }
+
+    #[test]
+    fn an_optional_listener_that_does_not_start_leaves_the_local_socket() {
+        let kept = settle_https_boot::<()>(
+            HttpsRequirement::Optional,
+            Err(anyhow::anyhow!("bind refused")),
+        );
+        assert!(matches!(kept, Ok(None)), "{kept:?}");
+        let kept =
+            settle_https_boot::<()>(HttpsRequirement::Optional, Ok(None));
+        assert!(matches!(kept, Ok(None)), "{kept:?}");
+    }
+
+    #[test]
+    fn a_required_listener_that_does_not_start_ends_the_run() {
+        let ended = settle_https_boot::<()>(
+            HttpsRequirement::Required,
+            Err(anyhow::anyhow!("bind refused")),
+        )
+        .expect_err("a required listener that did not start ends the run");
+        let said = format!("{ended:#}");
+        assert!(
+            said.contains("HTTPS is required and its listener did not start")
+                && said.contains("bind refused"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_required_listener_that_is_not_configured_ends_the_run() {
+        let ended =
+            settle_https_boot::<()>(HttpsRequirement::Required, Ok(None))
+                .expect_err("a required listener with no address ends the run");
+        assert!(
+            ended
+                .to_string()
+                .contains("EVO_HTTPS_LISTEN_ADDR is not set"),
+            "{ended}"
+        );
+    }
+
+    #[test]
+    fn a_listener_that_started_is_kept_either_way() {
+        for requirement in
+            [HttpsRequirement::Optional, HttpsRequirement::Required]
+        {
+            let kept = settle_https_boot(requirement, Ok(Some(())));
+            assert!(matches!(kept, Ok(Some(()))), "{requirement:?}");
+        }
+    }
 }

@@ -1431,17 +1431,18 @@ fn plugin_error_to_frame(
     plugin: &str,
     err: PluginError,
 ) -> WireFrame {
-    // WithSubclass is the plugin's authoritative wire taxonomy: bare
-    // message + details.subclass. Do not route through Display (other
-    // variants wrap with "permanent error:" / similar) and do not drop
-    // subclass — the steward restores PluginError::WithSubclass from
-    // this envelope; without it the OOP hop irreversibly collapses.
-    // Same contract as steward-side `plugin_error_to_wire_error`.
-    if let PluginError::WithSubclass {
-        class,
-        subclass,
-        message,
-    } = &err
+    // WithSubclass and WithValues are the plugin's authoritative wire
+    // taxonomy: bare message + details.subclass (+ details.values). Do
+    // not route through Display (other variants wrap with "permanent
+    // error:" / similar) and do not drop subclass or values — the
+    // steward restores the variant from this envelope; without it the
+    // OOP hop irreversibly collapses. Same contract as steward-side
+    // `plugin_error_to_wire_error`.
+    if let (
+        PluginError::WithSubclass { class, message, .. }
+        | PluginError::WithValues { class, message, .. },
+        Some(details),
+    ) = (&err, err.coded_details())
     {
         return WireFrame::Error {
             v,
@@ -1449,7 +1450,7 @@ fn plugin_error_to_frame(
             plugin: plugin.to_string(),
             class: *class,
             message: message.clone(),
-            details: Some(serde_json::json!({ "subclass": subclass })),
+            details: Some(details),
         };
     }
     let class = plugin_error_class(&err);
@@ -1475,7 +1476,8 @@ fn plugin_error_class(err: &PluginError) -> ErrorClass {
         // raised an unrecoverable error".
         PluginError::Fatal { .. } => ErrorClass::Internal,
         // Structured wire error: plugin supplied the class directly.
-        PluginError::WithSubclass { class, .. } => *class,
+        PluginError::WithSubclass { class, .. }
+        | PluginError::WithValues { class, .. } => *class,
     }
 }
 
@@ -4473,8 +4475,10 @@ struct WireShelfRequestDispatcher {
     plugin_name: String,
 }
 
-impl crate::contract::ShelfRequestDispatcher for WireShelfRequestDispatcher {
-    fn dispatch<'a>(
+impl WireShelfRequestDispatcher {
+    /// Send one dispatch over the wire and await its answer. A failure
+    /// keeps the code and values the steward's answer carried.
+    fn request<'a>(
         &'a self,
         shelf: &'a str,
         request_type: &'a str,
@@ -4485,12 +4489,13 @@ impl crate::contract::ShelfRequestDispatcher for WireShelfRequestDispatcher {
             dyn Future<
                     Output = Result<
                         Vec<u8>,
-                        crate::contract::ShelfDispatchError,
+                        crate::contract::CodedDispatchError,
                     >,
                 > + Send
                 + 'a,
         >,
     > {
+        use crate::contract::{CodedDispatchError, ShelfDispatchError};
         let tx = self.tx.clone();
         let pending = Arc::clone(&self.pending);
         let plugin = self.plugin_name.clone();
@@ -4511,11 +4516,11 @@ impl crate::contract::ShelfRequestDispatcher for WireShelfRequestDispatcher {
             };
             if tx.send(frame).await.is_err() {
                 remove_pending(&pending, cid);
-                return Err(
-                    crate::contract::ShelfDispatchError::SubstrateFailure {
+                return Err(CodedDispatchError::new(
+                    ShelfDispatchError::SubstrateFailure {
                         detail: "wire transport closed".to_string(),
                     },
-                );
+                ));
             }
             match rx.await {
                 Ok(WireFrame::ShelfDispatchResponse { payload, .. }) => {
@@ -4523,27 +4528,96 @@ impl crate::contract::ShelfRequestDispatcher for WireShelfRequestDispatcher {
                 }
                 Ok(WireFrame::Error {
                     message, details, ..
-                }) => Err(crate::contract::ShelfDispatchError::from_wire(
+                }) => Err(CodedDispatchError::from_wire(
                     &message,
                     details.as_ref(),
                     &shelf,
                     &request_type,
                 )),
-                Ok(other) => {
-                    Err(crate::contract::ShelfDispatchError::SubstrateFailure {
+                Ok(other) => Err(CodedDispatchError::new(
+                    ShelfDispatchError::SubstrateFailure {
                         detail: format!(
                             "unexpected response frame: {}",
                             variant_name(&other)
                         ),
-                    })
-                }
-                Err(_) => {
-                    Err(crate::contract::ShelfDispatchError::SubstrateFailure {
+                    },
+                )),
+                Err(_) => Err(CodedDispatchError::new(
+                    ShelfDispatchError::SubstrateFailure {
                         detail: "oneshot dropped".to_string(),
-                    })
-                }
+                    },
+                )),
             }
         })
+    }
+}
+
+impl crate::contract::ShelfRequestDispatcher for WireShelfRequestDispatcher {
+    fn dispatch<'a>(
+        &'a self,
+        shelf: &'a str,
+        request_type: &'a str,
+        payload: Vec<u8>,
+        instance_id: Option<&'a str>,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<u8>,
+                        crate::contract::ShelfDispatchError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.request(shelf, request_type, payload, instance_id)
+                .await
+                .map_err(|coded| coded.kind)
+        })
+    }
+
+    fn dispatch_coded<'a>(
+        &'a self,
+        shelf: &'a str,
+        request_type: &'a str,
+        payload: Vec<u8>,
+        instance_id: Option<&'a str>,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<u8>,
+                        crate::contract::CodedDispatchError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        self.request(shelf, request_type, payload, instance_id)
+    }
+
+    fn dispatch_coded_as_caller<'a>(
+        &'a self,
+        _caller_plugin: &'a str,
+        shelf: &'a str,
+        request_type: &'a str,
+        payload: Vec<u8>,
+        instance_id: Option<&'a str>,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        Vec<u8>,
+                        crate::contract::CodedDispatchError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        // The caller is the connection's own plugin, stamped on the
+        // wire frame, as for `dispatch_as_caller`.
+        self.request(shelf, request_type, payload, instance_id)
     }
 }
 
@@ -7428,6 +7502,37 @@ mod tests {
     // details.subclass is dropped here, no steward-side code can
     // recover the plugin's intended taxonomy.
     // -----------------------------------------------------------------
+
+    #[test]
+    fn with_values_error_frame_carries_its_values_beside_the_subclass() {
+        let err = PluginError::WithValues {
+            class: ErrorClass::Transient,
+            subclass: "share_busy".into(),
+            message: "the share is in use".into(),
+            values: [("share".to_string(), serde_json::json!("Music"))]
+                .into_iter()
+                .collect(),
+        };
+        match plugin_error_to_frame(1, 43, "org.test.shares", err) {
+            WireFrame::Error {
+                class,
+                message,
+                details,
+                ..
+            } => {
+                assert_eq!(class, ErrorClass::Transient);
+                assert_eq!(message, "the share is in use");
+                assert_eq!(
+                    details,
+                    Some(serde_json::json!({
+                        "subclass": "share_busy",
+                        "values": { "share": "Music" },
+                    }))
+                );
+            }
+            other => panic!("expected an Error frame, got {other:?}"),
+        }
+    }
 
     #[test]
     fn with_subclass_error_frame_carries_class_subclass_and_clean_message() {

@@ -69,7 +69,7 @@ Fourteen operations. Twelve are synchronous request/response (three of them pagi
 | `list_relations` | Request / response (paginated) | Page through every live relation edge; carries `current_seq`. |
 | `enumerate_addressings` | Request / response (paginated) | Page through every claimed addressing; carries `current_seq`. |
 | `list_plugins` | Request / response | Read-only inventory of admitted plugins. |
-| `subscribe_happenings` | Streaming | Stream every happening the bus emits. |
+| `subscribe_happenings` | Streaming | Stream the happenings the bus emits; over HTTPS, those the session may read (§4.5). |
 | `subscribe_subject` | Streaming | Per-subject push subscription: re-projects the subject on every `Happening` that affects it. |
 | `describe_capabilities` | Request / response | Discover the steward's supported ops and named features. |
 | `negotiate` | Request / response | Per-connection capability negotiation. SHOULD be the first frame on a new connection. |
@@ -113,9 +113,9 @@ For factory-stocked shelves, include `instance_id` to route the request to a spe
 | `instance_id` | string \| null | Optional. Names a specific factory-announced instance. Singleton-stocked shelves ignore the field; factory-stocked shelves MAY refuse the request when the field is absent. |
 | `step_up_token` | string \| null | Optional. A step-up token from `step_up_auth_verify`, for a verb declared `step_up`. It is validated for this call only and never reaches the plugin. Over the WebSocket it is a field of the frame's `payload`, beside `shelf`; the frame itself accepts no extra fields. |
 
-Each verb's capability comes from the target plugin's manifest (`[capabilities.respondent.verb_capabilities]`), and the steward checks it before the plugin sees the request:
+Over HTTPS the op itself requires `write:request`. Each verb's capability comes from the target plugin's manifest (`[capabilities.respondent.verb_capabilities]`), and the steward checks it before the plugin sees the request:
 
-- `none` — no check.
+- `none` — a network caller must hold `write:plugins`; a verb that declares no capability belongs to the plugins as a whole. The local socket checks nothing. Otherwise the request is refused with `verb_capability_scope_not_granted`.
 - `read` / `write` — the caller must hold the named scope at that rank or above (`read` < `write` < `step_up`), so a caller holding the scope at `read` does not pass a `write` verb. Over the local socket, `negotiate` grants capability names, and the name is enough. Otherwise the request is refused with `verb_capability_scope_not_granted`.
 - `step_up` — the caller must hold the named scope and a step-up session on this call: the `step_up_token` above, or, for a dispatch one plugin makes while answering a consumer, that consumer's session. Holding the scope at `step_up` rank on a bearer does not count as a session. Otherwise the request is refused with `step_up_required`, `step_up_invalid` or `step_up_expired`.
 
@@ -551,6 +551,8 @@ Response:
 
 Promote the connection to streaming mode. Receive every happening the bus emits for the lifetime of the subscription.
 
+Over HTTPS (the WebSocket and the other network projections) any admitted caller may subscribe, and the stream carries only what the caller's session may read. A happening reaches it when the session holds, at `read` rank or above, the scope of the read ops that report the same state: `subjects` for subject, relation, claim and grammar changes; `plugins` for custody, factory instances, the catalogue, plugin lifecycle and UI admission; `plugins_admin` for device roles; `multiroom` for peers, the domain, groups and the chain; `audio` for reconciliation and playback; `plans` for appointments and watches; `updates` for updates; `system` for persistence, clock trust, flight mode, the device name and its restart; `auth` for the household policy. A plugin's own event (`plugin_event`) reaches a session holding any scope that plugin declares on its verbs, or `read:plugins` when it declares none. A caller holding none of these hears nothing. The local socket is the operator's and its stream is not filtered.
+
 Request:
 
 ```json
@@ -963,7 +965,7 @@ All four gated by `user_interaction_responder`. Refusals:
 
 On the HTTPS-arriving transport the single-responder identity is the bearer token: two ops carrying the same bearer share one slot claim (idempotent same-holder re-claim on renegotiate); two different bearers minted for the responder role are correctly refused as different claimants. Release semantics on that transport are bounded by bearer TTL rather than steward lifetime, and the explicit `release_user_interaction_responder` op above short-circuits the TTL wait on operator log-out.
 
-**Minimal working browser-responder mint.** The responder ops above gate on `user_interaction_responder`, but the reactive path the responder consumer needs to track live prompt state relies on `subscribe_happenings`, which itself gates on `read:subjects` (the happenings bus carries subject-state changes). A responder session that mints with only `--scope user_interaction_responder` seeds the prompt list once via `list_user_interactions` and never sees updates. The minimal working mint is therefore two scopes:
+**Minimal working browser-responder mint.** The responder ops above gate on `user_interaction_responder`, but the reactive path the responder consumer needs to track live prompt state relies on `subscribe_happenings`, whose stream carries subject-state changes only to a session holding `read:subjects`. A responder session that mints with only `--scope user_interaction_responder` seeds the prompt list once via `list_user_interactions` and never sees updates. The minimal working mint is therefore two scopes:
 
 ```
 evo-plugin-tool admin auth mint-bearer-token \
@@ -1044,6 +1046,8 @@ Every failure on a synchronous op surfaces as a structured envelope:
 ```
 
 The contract is on `class` and `details.subclass`. The `message` field is advisory and may change between releases; consumers MUST NOT parse it for structured information. `details` is optional and class-specific; when omitted the envelope contains only `class` and `message`.
+
+An error a plugin raises may name values beside its subclass, in `details.values`: a JSON object holding each value under its name (a share's name, a limit, a number of minutes), left out when the error names none. A face that says the error in words of its own reads them there instead of from `message`.
 
 ### 5.1 Error classes
 

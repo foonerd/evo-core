@@ -1532,10 +1532,11 @@ enum ClientRequest {
         ttl_seconds: Option<u64>,
         /// Optional list of scope names to narrow the issued
         /// token's capability set. Semantics: intersection
-        /// with `operator_bootstrap_capability_set()` — for
-        /// each supplied scope name, the framework keeps the
-        /// matching capability from the bootstrap set (with
-        /// its bootstrap-declared rank preserved). A supplied
+        /// with `merged_operator_bootstrap_capability_set()` —
+        /// the bootstrap set and every scope the admitted
+        /// plugins declare. For each supplied scope name, the
+        /// framework keeps the matching capability at the rank
+        /// that set gives it. A supplied
         /// scope that does not appear in the bootstrap set is
         /// silently dropped; if the resulting intersection is
         /// empty the mint is refused with
@@ -9603,6 +9604,68 @@ fn connection_id_for_principal(
     crate::prompts::ResponderConnectionId::new(h.finish())
 }
 
+/// What a network subscriber to the happenings may read.
+///
+/// A happening reaches the subscriber when its session holds, at read
+/// rank or above, the scope [`Happening::read_scope`] names for it. A
+/// plugin's own event reaches a session holding any scope its plugin
+/// declares on its verbs; one from a plugin that declares none goes by
+/// `read:plugins`. The local socket's subscribers are the operator's
+/// and are not filtered.
+#[derive(Clone)]
+struct HappeningReads {
+    capabilities: evo_auth_bearer::CapabilitySet,
+    router: Arc<PluginRouter>,
+}
+
+impl HappeningReads {
+    fn holds(&self, scope: &str) -> bool {
+        self.capabilities
+            .satisfies(&evo_projection_core::CapabilityRequirement::read(scope))
+    }
+
+    fn admits(&self, happening: &crate::happenings::Happening) -> bool {
+        if let Some(scope) = happening.read_scope() {
+            return self.holds(scope);
+        }
+        let crate::happenings::Happening::PluginEvent { plugin, .. } =
+            happening
+        else {
+            return false;
+        };
+        let declared = plugin_declared_scopes(&self.router, plugin);
+        if declared.is_empty() {
+            return self.holds("plugins");
+        }
+        declared.iter().any(|scope| self.holds(scope))
+    }
+}
+
+/// Every scope the admitted plugin named `plugin` declares on its
+/// verbs, at any rank. Empty when the plugin declares none or is not
+/// admitted.
+fn plugin_declared_scopes(router: &PluginRouter, plugin: &str) -> Vec<String> {
+    let mut scopes = Vec::new();
+    for entry in router.entries_in_order() {
+        if entry.name != plugin {
+            continue;
+        }
+        let policy = entry.load_policy();
+        for cap in policy
+            .respondent_verb_capabilities
+            .values()
+            .chain(policy.warden_verb_capabilities.values())
+        {
+            if let Some(scope) = cap.scope() {
+                if !scopes.iter().any(|s| s == scope) {
+                    scopes.push(scope.to_string());
+                }
+            }
+        }
+    }
+    scopes
+}
+
 /// Mutable per-connection session state.
 ///
 /// Constructed once at accept time alongside the peer credentials,
@@ -10045,6 +10108,13 @@ impl Server {
     /// originates in a crate that cannot depend on this one.
     pub(crate) fn happening_bus(&self) -> Arc<crate::happenings::HappeningBus> {
         Arc::clone(&self.state.bus)
+    }
+
+    /// The plugin router this server dispatches through. The HTTPS boot
+    /// reads the admitted plugins' declared capabilities from it to mint
+    /// the first-boot bearer.
+    pub(crate) fn plugin_router(&self) -> &Arc<PluginRouter> {
+        &self.router
     }
 
     /// Construct a server bound to a socket path and sharing a plugin
@@ -10923,7 +10993,7 @@ impl Server {
         &self,
         op_id: &str,
         payload: serde_json::Value,
-        _principal: &evo_runtime_http::Principal,
+        principal: &evo_runtime_http::Principal,
     ) -> Result<
         evo_runtime_http::SubscriptionOpened,
         evo_runtime_http::DispatchError,
@@ -10978,13 +11048,23 @@ impl Server {
                     interest_subject_types,
                 );
 
+                // Each happening reaches the subscriber only when its
+                // session holds the read scope of what it reports.
+                let readable = HappeningReads {
+                    capabilities: principal.capabilities.clone(),
+                    router: Arc::clone(&self.router),
+                };
                 let rx = self.state.bus.subscribe();
                 let events = tokio_stream::wrappers::BroadcastStream::new(rx)
                     .filter_map(move |item| {
                         let filter = filter.clone();
+                        let readable = readable.clone();
                         async move {
                             match item {
-                                Ok(happening) if filter.accepts(&happening) => {
+                                Ok(happening)
+                                    if filter.accepts(&happening)
+                                        && readable.admits(&happening) =>
+                                {
                                     serde_json::to_value(&happening).ok()
                                 }
                                 _ => None,
@@ -18132,10 +18212,9 @@ async fn handle_mint_bearer_token(
     }
 
     // Merge framework-declared operator scopes with every
-    // step-up scope any admitted plugin's manifest declares.
-    // Without the merge, plugin-declared step-up scopes
-    // (`network_admin`, and any future plugin's admin scope)
-    // are unreachable from mint — a
+    // scope any admitted plugin's manifest declares, at the
+    // highest rank declared for it. Without the merge,
+    // plugin-declared scopes are unreachable from mint — a
     // `mint-bearer-token --scope <plugin_scope>` would return
     // `empty_capability_intersection` and no HTTPS client
     // could ever call the gated verb.
@@ -30086,6 +30165,25 @@ async fn handle_plugin_request(
             let policy = entry.load_policy();
             match policy.respondent_verb_capabilities.get(&request_type) {
                 Some(evo_plugin_sdk::manifest::VerbCapability::None) | None => {
+                    // A verb that declares no capability is the
+                    // plugins' own: a network caller needs
+                    // `write:plugins` for it. The `request` op asks
+                    // `write:request` only, so a bearer narrowed to a
+                    // plugin's scopes reaches the verbs that declare
+                    // them and no other. The local socket is the
+                    // operator's and its names carry no rank.
+                    if conn.network_principal.is_some() {
+                        if let Some(refusal) = verb_requirement_refusal(
+                            conn,
+                            granted_capabilities,
+                            &request_type,
+                            &evo_projection_core::CapabilityRequirement::write(
+                                "plugins",
+                            ),
+                        ) {
+                            return refusal;
+                        }
+                    }
                     (None, false)
                 }
                 Some(evo_plugin_sdk::manifest::VerbCapability::Read {
@@ -38994,10 +39092,14 @@ charter = "minimal test rack"
         ))
     }
 
+    /// A network subscriber that may read subject changes, which is
+    /// what the filter pins below stream.
     fn anon_principal() -> evo_runtime_http::Principal {
         evo_runtime_http::Principal::new(
             "test-token",
-            evo_auth_bearer::CapabilitySet::default(),
+            evo_auth_bearer::CapabilitySet::new(vec![
+                evo_auth_bearer::Capability::read("subjects"),
+            ]),
         )
     }
 
